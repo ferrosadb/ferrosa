@@ -30,6 +30,7 @@ use ferrosa_cluster::pair::ddl::DdlOperation;
 use ferrosa_cluster::{DdlPath, WritePath};
 use ferrosa_common::DataType;
 use ferrosa_index::IndexType;
+use ferrosa_schema::auth::permission::BorrowedResource;
 use ferrosa_schema::{
     query_columns, query_keyspaces, query_local_with_view, query_peers_with_view,
     query_role_members, query_role_permissions, query_tables, AuthContext,
@@ -3991,10 +3992,10 @@ pub async fn route(
                         .as_deref()
                         .or(ctx.current_keyspace.as_deref())
                         .ok_or_else(|| CqlError::Invalid("no keyspace specified".into()))?;
-                    state.schema.check_permission(
+                    state.schema.check_permission_borrowed(
                         ctx.auth,
                         Permission::Select,
-                        &Resource::Table(ks.to_string(), s.table.clone()),
+                        BorrowedResource::Table(ks, &s.table),
                     )?;
                 }
                 _ => {
@@ -5351,10 +5352,10 @@ async fn route_prepared_select_fast_inner(
     };
 
     let result = async {
-        state.schema.check_permission(
+        state.schema.check_permission_borrowed(
             ctx.auth,
             Permission::Select,
-            &Resource::Table(ks.to_string(), s.table.clone()),
+            BorrowedResource::Table(ks, &s.table),
         )?;
 
         let mut bind_idx = 0usize;
@@ -6109,10 +6110,10 @@ async fn route_select_user_table_inner(
     validate_keyspace_exists(&state.schema, ks)?;
 
     // Permission check (M8)
-    state.schema.check_permission(
+    state.schema.check_permission_borrowed(
         ctx.auth,
         Permission::Select,
-        &Resource::Table(ks.to_string(), s.table.clone()),
+        BorrowedResource::Table(ks, &s.table),
     )?;
 
     let snap = state.schema.snapshot();
@@ -8923,10 +8924,10 @@ pub async fn route_prepared_insert_fast(
         let ks = resolve_keyspace(&s.keyspace, ctx.current_keyspace)?;
         validate_keyspace_exists(&state.schema, ks)?;
 
-        state.schema.check_permission(
+        state.schema.check_permission_borrowed(
             ctx.auth,
             Permission::Modify,
-            &Resource::Table(ks.to_string(), s.table.clone()),
+            BorrowedResource::Table(ks, &s.table),
         )?;
 
         let snap = state.schema.snapshot();

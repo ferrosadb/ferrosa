@@ -961,6 +961,19 @@ impl Schema {
         crate::auth::permission::check_permission(&self.snapshot(), auth, perm, resource)
     }
 
+    /// Borrowed-target variant of [`Self::check_permission`] for hot paths that
+    /// would otherwise allocate an owned [`crate::auth::permission::Resource`]
+    /// per statement. See
+    /// [`crate::auth::permission::check_permission_borrowed`].
+    pub fn check_permission_borrowed(
+        &self,
+        auth: &AuthContext,
+        perm: crate::auth::permission::Permission,
+        resource: crate::auth::permission::BorrowedResource<'_>,
+    ) -> crate::Result<()> {
+        crate::auth::permission::check_permission_borrowed(&self.snapshot(), auth, perm, resource)
+    }
+
     /// Emit an audit event through the configured sink.
     fn emit_audit(&self, kind: AuditEventKind) {
         self.audit_sink.emit(&AuditEvent {
