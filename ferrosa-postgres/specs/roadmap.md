@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-09-27
+last_updated: 2026-10-09
 ---
 
 # ferrosa-postgres — Roadmap
@@ -12,6 +12,16 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 `feature_not_supported` paths and documented lossy fallbacks instead.
 
 ## Done (recent)
+
+- **Declared primary key visible to a client.** `catalog` now projects `pg_index`,
+  `pg_constraint` and a `<table>_pkey` index row in `pg_class`, all built from
+  `pg_key::of`. psql's describe-table joins `pg_index.indisprimary` to `pg_class` and reads
+  `pg_constraint`, so a declared `PRIMARY KEY` — including one `ALTER TABLE ADD PRIMARY KEY`
+  recorded — now shows instead of a keyless table. A table whose only key is the synthesized
+  `_sys_ck_` reports **none**: `pg_key::of` returns the DECLARED key, and the rows are built
+  from it, so the front end can never advertise ferrosa's internal column as a PostgreSQL key.
+  `indkey`/`conkey` carry the same attnums `pg_attribute` gives the columns (a synthesized
+  `_sys_ck_` is a negative system attnum; a real key column keeps its positive ordinal).
 
 - **PK-less `CREATE TABLE` end to end.** A table that declares no `PRIMARY KEY` gets a
   synthetic `_sys_ck_` column (a v1 TimeUUID, reported as `uuid`) as its partition key, so
@@ -126,10 +136,11 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
      `apply_or_buffer` uses, so COPY cannot commit differently from an INSERT.
 
   Until it exists a `CopyData` with no COPY in progress is refused `08P01` rather than ignored.
-  **Not yet done:** minting on `COPY`, and any projection that *reads* `pg_key` — psql's
-  describe-table wants `pg_index` (`indisprimary`) plus index rows in `pg_class`, neither of
-  which exists yet, so the recorded key is written but not yet visible to a client. See
-  `ferrosa-common`'s README section "Reserved `_sys_` columns"
+  **Not yet done:** minting on `COPY`. The projection that *reads* `pg_key` now exists
+  (`pg_index`/`pg_constraint` plus the `<table>_pkey` index row in `pg_class`), so the key
+  a table declared — or `ALTER TABLE ADD PRIMARY KEY` recorded — is visible to psql's
+  describe-table, which joins `pg_index.indisprimary` to `pg_class` and reads `pg_constraint`.
+  See `ferrosa-common`'s README section "Reserved `_sys_` columns"
 - **Binary `numeric`** result/param encoding (FMEA PG-7), removing the
   text-bytes fallback.
 - **Real query cancellation** (FMEA PG-8) — mint a real `BackendKeyData`

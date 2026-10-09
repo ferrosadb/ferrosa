@@ -120,7 +120,11 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   upserts/tombstones keyed by a full-primary-key equality `WHERE` (reported as
   `UPDATE 1` / `DELETE 1`).
 - **`pg_catalog` projection** — `catalog` projects `pg_namespace`/`pg_class`/
-  `pg_attribute`/`pg_type` from live schema metadata with deterministic OIDs.
+  `pg_attribute`/`pg_type`/`pg_index`/`pg_constraint` from live schema metadata
+  with deterministic OIDs. `pg_index`/`pg_constraint` report a table's primary key
+  (with a matching `<table>_pkey` index row in `pg_class`), so psql's describe-table
+  shows a declared `PRIMARY KEY`; a table whose only key is the synthesized
+  `_sys_ck_` reports no key.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
   a tokio `TcpListener`, sharing the auth store and the storage+schema context.
 
@@ -273,7 +277,7 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Simple query | `query::execute_query` |
 | Extended query | `extended::Session` (`on_parse`/`on_bind`/`on_close`/`on_sync`), `query::decode_param_checked` (fails loud: `22P02` text parse, `22P03` binary, `42704` unmapped OID)/`encode_value` |
 | Storage glue | `storage_provider::load_table`, `cql_to_value`, `LoadError` |
-| Catalog | `catalog::{pg_attribute, pg_type, catalog_tables}` (fallible: `PgTypeError`) |
+| Catalog | `catalog::{pg_namespace, pg_class, pg_attribute, pg_type, pg_index, pg_constraint, catalog_tables}` (`pg_attribute`/`pg_type`/`catalog_tables` are fallible: `PgTypeError`) |
 | Synthetic key | `synthetic_key::next_synthetic_key` — the per-row v1 TimeUUID for the `_sys_ck_` key of a PK-less table |
 | DDL | `ddl::DdlExecutor` (`create_table`/`drop_table`/`alter_table`/`create_index`), `ddl::execute_alter_table` — `ALTER TABLE ... ADD PRIMARY KEY` / `ADD COLUMN` / `DROP COLUMN`; every other ALTER form is refused by name |
 | Declared key | `pg_key::{of, recorded, encode, PRIMARY_KEY_EXTENSION}` — the *PostgreSQL* primary key, which is not the storage key |
