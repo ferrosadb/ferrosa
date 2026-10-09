@@ -274,6 +274,8 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Extended query | `extended::Session` (`on_parse`/`on_bind`/`on_close`/`on_sync`), `query::decode_param_checked` (fails loud: `22P02` text parse, `22P03` binary, `42704` unmapped OID)/`encode_value` |
 | Storage glue | `storage_provider::load_table`, `cql_to_value`, `LoadError` |
 | Catalog | `catalog::{pg_attribute, pg_type, catalog_tables}` (fallible: `PgTypeError`) |
+| Synthetic key | `synthetic_key::next_synthetic_key` — the per-row v1 TimeUUID for the `_sys_ck_` key of a PK-less table |
+| Declared key | `pg_key::{of, recorded, encode, PRIMARY_KEY_EXTENSION}` — the *PostgreSQL* primary key, which is not the storage key |
 | Type map | `pg_types::{pg_type_of, pg_type_of_column, for_column_type, cql_type_for_pg_name, PgType, PgTypeError}` — the one `CqlType` ↔ Postgres type map (OID, typname, typlen, engine `ColumnType`, binary support); catalog, storage provider, RowDescription and parameter inference all read it |
 | Codec / messages | `codec::{read_startup, read_frontend, MAX_MESSAGE_LEN}`, `messages::{FrontendMessage, BackendMessage, TransactionStatus, …}` |
 

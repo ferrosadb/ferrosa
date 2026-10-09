@@ -302,9 +302,27 @@ pub(crate) fn plan_create_table(
             .collect(),
         params: TableParams::default(),
         flags: HashSet::new(),
-        extensions: HashMap::new(),
+        extensions: declared_key_extension(&stmt.primary_key),
         is_system: false,
     })
+}
+
+/// The primary key PostgreSQL should later report, recorded on the table as
+/// [`crate::pg_key::PRIMARY_KEY_EXTENSION`].
+///
+/// Only a **declared** key is recorded. A synthesized `_sys_ck_` key is deliberately left
+/// out: PostgreSQL would report no primary key for a table created without one, and showing
+/// it ferrosa's internal column instead would be a lie a client cannot detect. `pg_key::of`
+/// falls back to the storage key for tables that never came through the Postgres front end.
+fn declared_key_extension(declared: &[String]) -> HashMap<String, String> {
+    let mut extensions = HashMap::new();
+    if !declared.is_empty() {
+        extensions.insert(
+            crate::pg_key::PRIMARY_KEY_EXTENSION.to_string(),
+            crate::pg_key::encode(declared),
+        );
+    }
+    extensions
 }
 
 /// D3 (PG-T154a-01): jsonb cannot be in a key. Postgres accepts
@@ -496,6 +514,31 @@ mod tests {
                 Some(ColumnKind::Regular)
             );
         }
+    }
+
+    /// The declared key is recorded so introspection can report it. PostgreSQL would report
+    /// no primary key for a table that declared none — so a *synthesized* key must not be
+    /// recorded as one, or `\d` would advertise ferrosa's internal column as the table's key.
+    #[test]
+    fn the_declared_key_is_recorded_and_a_synthesized_one_is_not() {
+        let declared =
+            plan("CREATE TABLE t (a int, b int, PRIMARY KEY (a, b))").expect("must plan");
+        assert_eq!(
+            crate::pg_key::recorded(&declared),
+            Some(vec!["a".to_string(), "b".to_string()]),
+            "the declared key must be reported"
+        );
+
+        let synthesized = plan("CREATE TABLE t (aid int, bid int)").expect("must plan");
+        assert_eq!(
+            crate::pg_key::recorded(&synthesized),
+            None,
+            "a table that declared no key must report none, not the synthetic one"
+        );
+        assert!(
+            crate::pg_key::of(&synthesized).is_empty(),
+            "and the synthetic key must not surface through the derived path either"
+        );
     }
 
     /// A declared key is honoured exactly, and nothing is synthesized.

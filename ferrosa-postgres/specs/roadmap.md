@@ -13,6 +13,14 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **PK-less `CREATE TABLE` end to end.** A table that declares no `PRIMARY KEY` gets a
+  synthetic `_sys_ck_` column (a v1 TimeUUID, reported as `uuid`) as its partition key, so
+  every row is unique by construction. The front end mints a key per row on `INSERT`; the
+  column is hidden from `SELECT *` but selectable by name and listed by `pg_attribute` at a
+  negative `attnum`. The declared PostgreSQL key is recorded separately
+  (`pg_key`/`pg.primary_key`) because it is not the storage key: a PK-less table reports
+  *none*, and `ALTER TABLE ADD PRIMARY KEY` will give it one the storage key does not have.
+
 - **PostgreSQL MVCC transaction semantics.** Explicit SERIALIZABLE begins
   pin a read timestamp; simple and extended SELECT use version overlays; buffered
   writes are visible to their own transaction; commit checks table-level read

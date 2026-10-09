@@ -22,6 +22,7 @@ pub mod handshake;
 pub mod jsonb_wire;
 pub mod messages;
 mod mvcc;
+pub mod pg_key;
 pub mod pg_types;
 pub mod portal_limits;
 pub mod query;
