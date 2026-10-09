@@ -612,6 +612,7 @@ pub(crate) async fn connect_once_cancelable(
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::Mutex;
 
     /// Assert delay is within [base, base + 25%] range (accounting for jitter).
     fn assert_in_range(actual: Duration, base_ms: u64) {
@@ -798,5 +799,89 @@ mod tests {
             before,
             "cancelled reconnect should not record an attempt"
         );
+    }
+
+    /// The three lane knobs are independent resolver functions over the
+    /// environment. They share `parse_positive`, so a change to that helper
+    /// could silently move one knob while another looks correct — this pins
+    /// each one's own value, its own fallback, and their independence.
+    ///
+    /// `set_var` is process-global and these tests run in parallel, so the body
+    /// holds a process-wide mutex AND takes the `serial` key: a plain mutex
+    /// alone would not stop a *different* env-reading test from observing a
+    /// half-set environment.
+    #[test]
+    #[serial(lane_env)]
+    fn lane_knobs_honour_the_env_and_the_knobs_are_independent() {
+        static ENV_GUARD: Mutex<()> = Mutex::new(());
+        let _guard = ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        const THRESHOLD: &str = ENV_LANE_FAILURE_THRESHOLD;
+        const WINDOW: &str = ENV_LANE_FAILURE_WINDOW_MS;
+        const PROBE: &str = ENV_LANE_PROBE_TIMEOUT_MS;
+        let default_window = Duration::from_millis(DEFAULT_LANE_FAILURE_WINDOW_MS);
+        let default_probe = Duration::from_millis(DEFAULT_LANE_PROBE_TIMEOUT_MS);
+
+        for name in [THRESHOLD, WINDOW, PROBE] {
+            std::env::remove_var(name);
+        }
+
+        // Unset: every knob reports its documented default.
+        assert_eq!(lane_failure_threshold(), DEFAULT_LANE_FAILURE_THRESHOLD);
+        assert_eq!(lane_failure_window(), default_window);
+        assert_eq!(lane_probe_timeout(), default_probe);
+
+        // Valid values are honoured.
+        std::env::set_var(THRESHOLD, "7");
+        std::env::set_var(WINDOW, "5000");
+        std::env::set_var(PROBE, "250");
+        assert_eq!(lane_failure_threshold(), 7);
+        assert_eq!(lane_failure_window(), Duration::from_millis(5_000));
+        assert_eq!(lane_probe_timeout(), Duration::from_millis(250));
+
+        // Unusable values fall back to the default instead of panicking, and the
+        // knob recovers as soon as a valid value returns.
+        for bad in ["", "abc", "0", "-1", "1.5", "NaN"] {
+            std::env::set_var(THRESHOLD, bad);
+            assert_eq!(
+                lane_failure_threshold(),
+                DEFAULT_LANE_FAILURE_THRESHOLD,
+                "threshold {bad:?} must fall back"
+            );
+        }
+        std::env::set_var(THRESHOLD, "7");
+        for bad in ["", "abc", "0", "-1", "NaN"] {
+            std::env::set_var(WINDOW, bad);
+            assert_eq!(
+                lane_failure_window(),
+                default_window,
+                "window {bad:?} must fall back"
+            );
+        }
+        std::env::set_var(WINDOW, "5000");
+        for bad in ["", "abc", "0", "-1", "NaN"] {
+            std::env::set_var(PROBE, bad);
+            assert_eq!(
+                lane_probe_timeout(),
+                default_probe,
+                "probe timeout {bad:?} must fall back"
+            );
+        }
+        std::env::set_var(PROBE, "250");
+
+        // Independence: a malformed value for one knob must not move the others.
+        std::env::set_var(THRESHOLD, "not-a-number");
+        assert_eq!(lane_failure_window(), Duration::from_millis(5_000));
+        assert_eq!(lane_probe_timeout(), Duration::from_millis(250));
+        std::env::set_var(THRESHOLD, "7");
+        std::env::set_var(WINDOW, "nonsense");
+        assert_eq!(lane_failure_threshold(), 7);
+        assert_eq!(lane_probe_timeout(), Duration::from_millis(250));
+
+        for name in [THRESHOLD, WINDOW, PROBE] {
+            std::env::remove_var(name);
+        }
     }
 }

@@ -78,12 +78,16 @@ Done (10 tests, pure logic, no sockets):
 - [x] a zero window means no time limit (the guard is not permanently disarmed)
 - [x] control: `mark_failed_transitions_through_exhaustion_to_dormant` stays green
 
+Done (env + independence):
+
+- [x] each knob honours its env var, falls back on `""` / `abc` / `0` / `-1` / `1.5` /
+      `NaN` rather than panicking, and recovers once a valid value returns
+- [x] the three knobs are independent — a malformed value for one does not move the others
+      (test holds a process-wide `Mutex` and takes the `serial` key: a mutex alone cannot
+      stop another env-reading test observing a half-set environment)
+
 Still to do:
 
-- [ ] threshold is read from `FERROSA_NET_LANE_FAILURE_THRESHOLD`; a malformed / zero /
-      negative value falls back to the default and warns once (needs an
-      env-mutating test guarded by a process-wide mutex)
-- [ ] the three knobs are independent: setting one malformed must not move the others
 - [ ] **live verification**: wedge a lane on a real cluster and watch it probe,
       condemn, reconnect, and re-drive the dropped Applies
 
