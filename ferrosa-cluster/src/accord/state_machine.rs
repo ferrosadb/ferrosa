@@ -388,6 +388,75 @@ impl AccordStateMachine {
         pending
     }
 
+    /// Diagnostic detail for every conflicting transaction a read at `t` is
+    /// still waiting on: `(t0, node, phase, deps, agreed t)`.
+    ///
+    /// Names the poison. The live symptom of the barrier stall is only the
+    /// message "dependencies were not applied locally"; a dependency that is
+    /// `PreAccepted` or `Accepted` with its coordinator gone is the one that
+    /// never clears, and `Committed` with an earlier `t` is the one that should
+    /// have applied. Without the phase and the agreed timestamp the two are
+    /// indistinguishable from the log.
+    pub fn pending_conflicts_detail(
+        &self,
+        key: &[u8],
+        t: &Timestamp,
+    ) -> Vec<(u64, u64, &'static str, usize, u64)> {
+        self.unapplied_conflicts_before(key, t)
+            .into_iter()
+            .map(|dep_id| {
+                let (phase, deps, agreed_t) = self
+                    .txn_states
+                    .get(&dep_id)
+                    .map(|state| (state.phase, state.deps.len(), state.t.time))
+                    .unwrap_or((TxnPhase::PreAccepted, 0, 0));
+                let phase = match phase {
+                    TxnPhase::PreAccepted => "PreAccepted",
+                    TxnPhase::Accepted => "Accepted",
+                    TxnPhase::Committed => "Committed",
+                    TxnPhase::Applied => "Applied",
+                };
+                (dep_id.0.time, dep_id.0.node, phase, deps, agreed_t)
+            })
+            .collect()
+    }
+
+    /// Diagnostic detail for a transaction's resolved dependency list: for each
+    /// dep, `(t0, node, phase)` where phase is `"absent"` when THIS replica never
+    /// registered it.
+    ///
+    /// Names the apply-side poison. `DepWaitApplier` gates on
+    /// `DepWaitGraph::is_applied`, which only knows transactions this replica
+    /// itself applied, so a dependency whose Apply never landed here parks its
+    /// waiter forever. From the bare "Apply timed out … refusing ApplyOK" line the
+    /// two causes are indistinguishable: a dep that is registered here but stuck
+    /// (needs re-driving) versus a dep that is `absent` here (nothing will ever
+    /// apply it locally).
+    pub fn dep_detail(&self, txn_id: &TxnId) -> Vec<(u64, u64, &'static str)> {
+        self.txn_states
+            .get(txn_id)
+            .map(|state| {
+                state
+                    .deps
+                    .iter()
+                    .map(|dep| match self.txn_states.get(dep) {
+                        Some(dep_state) => (
+                            dep.0.time,
+                            dep.0.node,
+                            match dep_state.phase {
+                                TxnPhase::PreAccepted => "PreAccepted",
+                                TxnPhase::Accepted => "Accepted",
+                                TxnPhase::Committed => "Committed",
+                                TxnPhase::Applied => "Applied",
+                            },
+                        ),
+                        None => (dep.0.time, dep.0.node, "absent"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Get the current state for a transaction (if any).
     pub fn get_state(&self, txn_id: &TxnId) -> Option<&TxnState> {
         self.txn_states.get(txn_id)
@@ -1123,6 +1192,135 @@ impl AccordStateMachine {
 /// (`bug-accord-lwt-acks-phantom-write.md`), where a replica recorded
 /// `(txn_id, t)` and returned `ApplyOK` while nothing was persisted.
 ///
+/// Environment variable tuning the **apply** bound: how long a transaction may
+/// wait for its ordered dependencies to reach `Applied` before the coordinator
+/// abandons it — rolls it back, never commits it — and tells the client to retry.
+///
+/// This is the knob an operator raises for a slow mutator: a client updating many
+/// rows in one transaction legitimately needs a larger window than a benchmark
+/// burst.
+pub const TXN_TIMEOUT_ENV: &str = "FERROSA_ACCORD_TXN_TIMEOUT_SECS";
+
+/// Environment variable tuning the **barrier** bound: how long the PostgreSQL
+/// snapshot-barrier read-vote (and every inbound `ReadVote`) waits for its
+/// conflicting transactions to reach `Applied` before it ABSTAINS.
+///
+/// A separate knob, and deliberately tighter than the apply bound, because the
+/// two waits have opposite costs. Raising the apply bound buys a slow
+/// transaction time to finish; raising the barrier bound only makes a *failing*
+/// transaction slower — an abstain is fail-loud and the client retries, so there
+/// is nothing to wait longer for.
+pub const BARRIER_TIMEOUT_ENV: &str = "FERROSA_ACCORD_BARRIER_TIMEOUT_SECS";
+
+/// Default **apply** bound.
+///
+/// Single-sourced from [`crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT`] on
+/// purpose: the epoch drain period is sized as `SkewMax + DEFAULT_TXN_TIMEOUT`,
+/// so an in-flight transaction is never cut off by a drain shorter than the
+/// transaction bound. An operator who raises this must raise the drain with it.
+pub const DEFAULT_TXN_TIMEOUT: std::time::Duration =
+    crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT;
+
+/// Default **barrier** abstain bound — the historical dependency-wait value.
+pub const DEFAULT_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sentinel meaning "not yet resolved".
+const TIMEOUT_UNRESOLVED: u64 = u64::MAX;
+
+/// The resolved apply bound, cached as nanoseconds.
+///
+/// Read on the hot path — every inbound Apply and every abandoned transaction —
+/// so it is a single relaxed atomic load: no lock, no allocation, no
+/// `spawn_blocking` hop, no repeated `getenv`. An operator setting is
+/// process-wide by nature (it comes from the environment at startup), so one
+/// atomic is the whole store; there is deliberately no per-instance copy to
+/// drift out of sync.
+static TXN_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TIMEOUT_UNRESOLVED);
+
+/// The resolved barrier abstain bound, cached as nanoseconds (same rationale).
+static BARRIER_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TIMEOUT_UNRESOLVED);
+
+/// Parse an operator setting into a bound.
+///
+/// Pure, so it is testable without touching the process environment — `set_var`
+/// is process-global and racy under parallel tests. A non-numeric,
+/// non-positive, or non-finite value is reported and ignored rather than
+/// silently clamped to zero: zero would fail every transaction the instant it
+/// parked, which is a footgun, not a configuration.
+fn resolve_bound(
+    raw: Option<&str>,
+    env: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    match raw {
+        Some(value) => match value.trim().parse::<f64>() {
+            Ok(secs) if secs.is_finite() && secs > 0.0 => std::time::Duration::from_secs_f64(secs),
+            _ => {
+                tracing::warn!(
+                    value = %value,
+                    env,
+                    "accord: ignoring invalid timeout; using the default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Parse [`TXN_TIMEOUT_ENV`] into the apply bound.
+pub fn resolve_txn_timeout(raw: Option<&str>) -> std::time::Duration {
+    resolve_bound(raw, TXN_TIMEOUT_ENV, DEFAULT_TXN_TIMEOUT)
+}
+
+/// Parse [`BARRIER_TIMEOUT_ENV`] into the barrier abstain bound.
+pub fn resolve_barrier_timeout(raw: Option<&str>) -> std::time::Duration {
+    resolve_bound(raw, BARRIER_TIMEOUT_ENV, DEFAULT_BARRIER_TIMEOUT)
+}
+
+/// A cached nanosecond bound: one relaxed load once resolved, `parse` on the
+/// first caller. First writer wins; a racing writer resolves the same
+/// environment, so the loser's value is identical and either store is correct.
+#[inline]
+fn cached_bound(
+    slot: &std::sync::atomic::AtomicU64,
+    env: &str,
+    parse: fn(Option<&str>) -> std::time::Duration,
+) -> std::time::Duration {
+    let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != TIMEOUT_UNRESOLVED {
+        return std::time::Duration::from_nanos(cached);
+    }
+    let resolved = parse(std::env::var(env).ok().as_deref());
+    let nanos = resolved.as_nanos().min(u64::MAX as u128) as u64;
+    let _ = slot.compare_exchange(
+        TIMEOUT_UNRESOLVED,
+        nanos,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    resolved
+}
+
+/// The process-wide **apply** bound (see [`TXN_TIMEOUT_ENV`]), a lock-free read.
+#[inline]
+pub fn configured_txn_timeout() -> std::time::Duration {
+    cached_bound(&TXN_TIMEOUT_NANOS, TXN_TIMEOUT_ENV, resolve_txn_timeout)
+}
+
+/// The process-wide **barrier abstain** bound (see [`BARRIER_TIMEOUT_ENV`]),
+/// a lock-free read.
+#[inline]
+pub fn configured_barrier_timeout() -> std::time::Duration {
+    cached_bound(
+        &BARRIER_TIMEOUT_NANOS,
+        BARRIER_TIMEOUT_ENV,
+        resolve_barrier_timeout,
+    )
+}
+
 /// `node_id` is the Accord node identifier, `sync_writer` the protocol-log
 /// fsync writer, and `storage` the live engine handle whose write/batch path
 /// the applier persists through.
@@ -1185,8 +1383,120 @@ impl TxnPhaseExt for TxnPhase {
 mod tests {
     use super::*;
     use crate::accord::apply::{ApplyError, ApplyMutation, StorageApplier};
+    use crate::accord::handlers::DEFAULT_TXN_TIMEOUT;
     use ferrosa_storage::accord::sync_writer::{MockSyncWriter, SyncWriteCall};
     use parking_lot::Mutex;
+
+    /// The operator tunable resolves to the bound the operator asked for, and every
+    /// malformed or nonsensical value falls back to the default rather than silently
+    /// disabling the bound — a 0 s bound would abandon every transaction the instant
+    /// it parked, turning a config typo into an outage.
+    #[test]
+    fn txn_timeout_resolver_honours_valid_values_and_rejects_the_rest() {
+        assert_eq!(resolve_txn_timeout(None), DEFAULT_TXN_TIMEOUT);
+        assert_eq!(
+            resolve_txn_timeout(Some("30")),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_txn_timeout(Some(" 2.5 ")),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+        for bad in ["", "   ", "abc", "0", "-1", "0.0", "inf", "-inf", "NaN"] {
+            assert_eq!(
+                resolve_txn_timeout(Some(bad)),
+                DEFAULT_TXN_TIMEOUT,
+                "{bad:?} must fall back to the default, never disable the bound"
+            );
+        }
+    }
+
+    /// The apply bound and the barrier abstain bound are independent knobs, and
+    /// both resolve/reject the same way.
+    ///
+    /// The apply bound buys a slow transaction time to finish; the barrier bound
+    /// only paces a *failing* transaction, so it must be tunable separately and
+    /// must never silently inherit the apply value.
+    #[test]
+    fn the_apply_and_barrier_bounds_are_independently_tunable() {
+        assert_eq!(resolve_barrier_timeout(None), DEFAULT_BARRIER_TIMEOUT);
+        assert_eq!(
+            resolve_barrier_timeout(Some("12")),
+            std::time::Duration::from_secs(12)
+        );
+        for bad in ["", "nope", "0", "-3", "inf", "NaN"] {
+            assert_eq!(
+                resolve_barrier_timeout(Some(bad)),
+                DEFAULT_BARRIER_TIMEOUT,
+                "{bad:?} must fall back to the barrier default"
+            );
+        }
+        // A malformed value for one knob must not move the other.
+        assert_eq!(resolve_txn_timeout(Some("nope")), DEFAULT_TXN_TIMEOUT);
+        assert_ne!(
+            DEFAULT_BARRIER_TIMEOUT, DEFAULT_TXN_TIMEOUT,
+            "the defaults are deliberately different: an abstain has nothing to wait longer for"
+        );
+    }
+
+    /// Both cached reads are stable: the first resolution wins and every later
+    /// call returns the identical value from the lock-free atomic, so two
+    /// concurrent waiters cannot disagree about either bound.
+    #[test]
+    fn configured_bounds_are_stable_across_calls() {
+        let first = configured_txn_timeout();
+        assert_eq!(first, configured_txn_timeout());
+        assert!(first > std::time::Duration::ZERO);
+        let barrier = configured_barrier_timeout();
+        assert_eq!(barrier, configured_barrier_timeout());
+        assert!(barrier > std::time::Duration::ZERO);
+    }
+
+    /// `dep_detail` must separate a dependency this replica never registered
+    /// ("absent") from one it registered but never applied.
+    ///
+    /// They need different fixes, and the live log otherwise shows only a
+    /// dependency count — which is why the apply-side stall could not be
+    /// attributed from production.
+    #[test]
+    fn dep_detail_names_absent_dependencies_separately() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, applier);
+
+        let absent = txn(9, 900);
+        let stuck = txn(1, 1000);
+        let waiter = txn(2, 2000);
+        let key = b"dep-detail-key";
+
+        // `stuck` is registered here but never applied.
+        sm.handle_preaccept(stuck, ts(1000), key, BallotNumber(0), 0);
+        sm.handle_accept(stuck, ts(1000), ts(1001), vec![], BallotNumber(1));
+        sm.handle_commit(stuck, ts(1000), ts(1001), vec![]);
+        // `absent` is never registered on this replica at all; the waiter's
+        // dependency set is the union agreed across replicas, so it can name it.
+        sm.handle_preaccept(waiter, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(
+            waiter,
+            ts(2000),
+            ts(2001),
+            vec![stuck, absent],
+            BallotNumber(1),
+        );
+        sm.handle_commit(waiter, ts(2000), ts(2001), vec![stuck, absent]);
+
+        let detail = sm.dep_detail(&waiter);
+        assert_eq!(detail.len(), 2, "both deps must be reported: {detail:?}");
+        let phases: Vec<&str> = detail.iter().map(|(_, _, phase)| *phase).collect();
+        assert!(
+            phases.contains(&"Committed"),
+            "a registered-but-unapplied dep must show its phase: {detail:?}"
+        );
+        assert!(
+            phases.contains(&"absent"),
+            "a never-registered dep must read 'absent': {detail:?}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers

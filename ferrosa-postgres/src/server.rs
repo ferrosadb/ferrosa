@@ -1021,6 +1021,19 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 &format!("transaction refused: {error}"),
             )]
         }
+        // An abandoned transaction — the operator-configured dependency-wait
+        // bound expired and the transaction was rolled back — is NOT committed
+        // and is safe to retry. Report it as a retryable serialization failure
+        // (40001), never as an opaque 58000 fault: the client must be able to
+        // tell "retry me" from "something is broken". Classified by the
+        // `abandoned:` prefix for the same reason `is_backpressure()` above is.
+        Err(MvccCommitError::Storage(error)) if matches!(&error, ferrosa_common::Error::InvalidData(msg) if msg.contains("abandoned:")) =>
+        {
+            vec![query::error_response(
+                "40001",
+                &format!("transaction was abandoned and NOT committed: {error}"),
+            )]
+        }
         Err(e @ MvccCommitError::Storage(_)) => vec![query::error_response(
             "58000",
             &format!("transaction commit failed: {e:?}"),

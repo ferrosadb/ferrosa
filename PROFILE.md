@@ -128,10 +128,44 @@ protocol, so the combined multi-key replica set cannot bypass snapshot freshness
 | `FERROSA_ACCORD_PREACCEPT_FAST_PATH_TIMEOUT_MS` | Maximum wait for a possible final fast-path PreAccept response before using an already-collected slow quorum | `1000` ms |
 
 The default leaves time for Accept and local dependency application within the
-existing 5-second read dependency wait while allowing ordinary sub-second
-replica responses to retain the one-round fast path. Increase it when healthy
-replica response latency regularly exceeds one second; decrease it only when
-the extra Accept round is preferable to waiting for the final fast-path vote.
+barrier abstain bound (`FERROSA_ACCORD_BARRIER_TIMEOUT_SECS`, 5 s by default)
+while allowing ordinary sub-second replica responses to retain the one-round fast
+path. Increase it when healthy replica response latency regularly exceeds one
+second; decrease it only when the extra Accept round is preferable to waiting for
+the final fast-path vote.
+
+### Accord dependency-wait bounds
+
+Two bounds govern how long an Accord transaction waits on the replicas that
+ordered before it. They are separate settings on purpose, because the two waits
+have opposite costs, and both are per-process values read once and cached in a
+lock-free atomic — changing them needs a restart, not a rebuild.
+
+- **Apply bound.** How long the coordinator waits for its ordered dependencies to
+  reach `Applied` before it abandons the transaction. Abandoning rolls the
+  transaction back (it is never applied), releases any successor parked behind
+  it, and tells the client the transaction was not committed and may be retried
+  (PostgreSQL SQLSTATE `40001`; CQL a retryable server error). Raise this for a
+  slow mutator: a client updating many rows in one transaction legitimately needs
+  a longer window than a benchmark burst. It is single-sourced from the epoch
+  drain period's `DEFAULT_TXN_TIMEOUT` (10 s) because the drain is sized as
+  `SkewMax + DEFAULT_TXN_TIMEOUT` — raising this without raising the drain would
+  let a drain cut off a transaction still inside its bound.
+- **Barrier abstain bound.** How long the PostgreSQL snapshot-barrier read-vote,
+  and every inbound `ReadVote`, waits for its conflicting transactions to reach
+  `Applied` before it abstains. Deliberately tighter than the apply bound:
+  raising it only makes a *failing* transaction slower. An abstain is fail-loud
+  and the client retries, so there is nothing to wait longer for. Keep it at or
+  below the apply bound.
+
+| Environment variable | What it bounds | Default |
+|---|---|---:|
+| `FERROSA_ACCORD_TXN_TIMEOUT_SECS` | Apply bound: how long a transaction may wait for its dependencies before it is abandoned (rolled back, client told to retry) | `10` s |
+| `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` | Barrier bound: how long the snapshot-barrier read-vote and inbound `ReadVote` wait before abstaining | `5` s |
+
+A non-numeric, zero, or negative value logs one warning and uses the default.
+Zero is refused rather than clamped: it would fail every transaction the instant
+it parked.
 
 ### SSTable write, compression, and reader buffers
 
