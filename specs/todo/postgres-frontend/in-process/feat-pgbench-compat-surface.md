@@ -59,6 +59,33 @@ Item 4 is the largest single piece (a wire-protocol handshake).
   rows 2..N. Silent row loss is the failure mode this repo treats as unacceptable, so
   fail-loud is the deliberate holding position, not an oversight.
 
+### CRITICAL: the naive execution writes only row 1 on the live server
+
+An implementation was written and **reverted**. What it did:
+
+- in-process (`execute_query` in a unit test): correct — 3 rows written, all 3 read
+  back, one `CommandComplete "INSERT 0 3"`;
+- **live server: `INSERT 0 3` reported, only row 1 persisted.** Reproduced twice on a
+  fresh table:
+
+```
+insert into mr2 (k, v) values (1,'a'), (2,'b'), (3,'c');   -> INSERT 0 3
+select count(*) from mr2;                                  -> 1
+select k, v from mr2 where k = 2;                          -> (0 rows)
+select k, v from mr2 where k = 3;                          -> (0 rows)
+```
+
+A silent row-drop announced as `INSERT 0 3` is strictly worse than an error, so the
+`0A000` fail-loud guard is **back in place** and pinned by
+`multi_row_insert_fails_loud_rather_than_dropping_rows`.
+
+**Root cause is OPEN.** `execute_insert` *is* the live path (`exec.rs` is the
+SELECT/streaming executor and has no INSERT path), so the difference between the two
+environments is not a second executor. Next step: instrument which mutation the live
+path actually persists per row — start by checking whether the live server passes
+`txn = Some(buffer)` and how the buffered write-set is applied at COMMIT, since that is
+the one structural difference between the two call paths.
+
 ### What execution needs
 
 `execute_insert` (`ferrosa-postgres/src/query.rs`) resolves, per row: the column values,
