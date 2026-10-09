@@ -17,6 +17,7 @@ pub mod catalog;
 pub mod codec;
 pub mod connection;
 pub mod copy_decode;
+mod copy_stdin;
 pub mod ddl;
 pub mod extended;
 pub mod handshake;

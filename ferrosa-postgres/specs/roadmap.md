@@ -97,35 +97,30 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   key — plus `ADD COLUMN` and `DROP COLUMN`. The remaining ALTER forms (RENAME, ALTER COLUMN
   TYPE/DEFAULT, non-key constraints) are refused by name, because `TableUpdates` cannot express
   them and approximating one would leave a client believing a change took effect.
-  **COPY FROM STDIN — everything except the connection state machine.**
+  **COPY FROM STDIN — complete end to end.** The wire frames, the statement, the payload decoder
+  and the connection state machine are all in and tested (`FrontendMessage::{CopyData, CopyDone,
+  CopyFail}`, `BackendMessage::CopyInResponse`, `CopyFromStdin`, `copy_decode`, `copy_stdin`).
 
-  Done and tested: the wire frames (`FrontendMessage::{CopyData, CopyDone, CopyFail}`,
-  `BackendMessage::CopyInResponse`, 5 tests); the statement (`CopyFromStdin`, bare and options
-  forms, 4 tests); and the payload decoder (`copy_decode`, text + csv, 14 tests) which holds an
-  incomplete row across `CopyData` boundaries — client frame boundaries are NOT row boundaries.
+  The state machine (`copy_stdin::drive`) exists because COPY is the one statement that cannot be
+  answered in a single step: the client sends the payload only AFTER `CopyInResponse`. It is driven
+  from `query_loop`, where the frame buffer and the stream are in scope; a leading-`COPY` byte
+  compare guards the intercept so ordinary statements are not parsed twice.
 
-  NOT done: the connection state machine, which is the last piece. Its design is settled:
+  Three properties are the whole point, and each has a test:
 
-  1. In `query_loop`, intercept a `Query` whose SQL parses to `Statement::CopyFromStdin` BEFORE
-     `handle_frontend` — COPY cannot be answered in one call, and only that scope owns `frames`,
-     `read_buf` and the stream.
-  2. Refuse `in_txn` (`25001`) and a missing table (`42P01`) BEFORE acknowledging: `CopyInResponse`
-     tells the client to start sending, so nothing may be acknowledged that is not runnable.
-  3. Send `CopyInResponse { format: 0, column_formats: vec![] }`, then read frames: `CopyData` →
-     `decoder.push` → insert; `CopyDone` → `decoder.finish` and reply
-     `CommandComplete { tag: "COPY <n>" }`; `CopyFail` → `57014`; anything else → `08P01`;
-     `Ok(None)` → read the socket, and EOF means the peer vanished mid-COPY.
-  4. On any failure, KEEP reading until `CopyDone`/`CopyFail`, discarding payload — the client is
-     still sending and those frames must not be reinterpreted as SQL. Then send the error.
-  5. Insert through the existing machinery rather than a second path: build a one-row
-     `InsertStmt` per decoded row with `ScalarValue::Literal(Value::Text(..))` and call
-     `query::execute_insert(dml_context(ctx, Some(&mut buffer)), ..)`, which already does type
-     coercion and mints the synthetic `_sys_ck_` key. Buffer into `Vec<PgWrite>` and flush every
-     ~1000 rows with `mvcc.commit_guard().await` + `commit_mutations(engine, schema, mvcc,
-     &mvcc.snapshot(), &HashSet::new(), mutations)` — byte-for-byte the autocommit path
-     `apply_or_buffer` uses, so COPY cannot commit differently from an INSERT.
+  - **Nothing is acknowledged that cannot run.** The table, the column list and the payload options
+    are resolved *before* `CopyInResponse`, so a COPY that is going to fail never has the client
+    stream a payload at it (`42P01` / `42P16` / `42703` / `25001` inside a transaction).
+  - **A failure keeps draining.** Once the payload starts the client is sending regardless, so a
+    failure is remembered, the remaining frames are consumed and discarded, and the error is sent
+    when the client finishes. Returning early would leave those bytes for the statement parser to
+    read as SQL.
+  - **No second write path.** Rows go through `query::execute_insert`, so COPY gets the same type
+    coercion and the same synthetic `_sys_ck_` minting as an INSERT, and the write set is flushed
+    with the very parameters the autocommit path uses. A failed COPY drops the unflushed tail
+    rather than committing part of it.
 
-  Until it exists a `CopyData` with no COPY in progress is refused `08P01` rather than ignored.
+  A row whose field count does not match the column list is refused (`22P04`) rather than padded.
   **Not yet done:** minting on `COPY`, and any projection that *reads* `pg_key` — psql's
   describe-table wants `pg_index` (`indisprimary`) plus index rows in `pg_class`, neither of
   which exists yet, so the recorded key is written but not yet visible to a client. See

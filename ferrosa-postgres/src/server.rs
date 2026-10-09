@@ -331,6 +331,35 @@ where
     loop {
         match codec::read_frontend(frames) {
             Ok(Some(msg)) => {
+                // `COPY ... FROM STDIN` is the one statement that cannot be answered in a single
+                // step: the client sends the payload only AFTER `CopyInResponse`. So it is driven
+                // here, where the frame buffer, the stream and the read buffer are in scope,
+                // rather than from `handle_frontend`.
+                if let FrontendMessage::Query(sql) = &msg {
+                    // A leading `COPY` is the ONLY shape that can need this path, and the check is
+                    // a byte compare rather than a parse: every ordinary statement must not pay for
+                    // a second parse here (`execute_simple_to` parses it once, below).
+                    let head = sql.trim_start();
+                    if !session.is_error_pending()
+                        && head.len() >= 4
+                        && head.as_bytes()[..4].eq_ignore_ascii_case(b"copy")
+                    {
+                        if let Ok(ferrosa_sql::Statement::CopyFromStdin(copy)) =
+                            ferrosa_sql::parse_statement(sql)
+                        {
+                            crate::copy_stdin::drive(
+                                stream,
+                                frames,
+                                read_buf,
+                                ctx,
+                                &mut session,
+                                &copy,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
                 if handle_frontend(stream, ctx, &mut session, msg).await? {
                     return Ok(()); // Terminate
                 }
@@ -696,7 +725,7 @@ fn read_env<'a>(
 }
 
 /// The storage and limits context for one extended-protocol DML statement.
-fn dml_context<'a>(
+pub(crate) fn dml_context<'a>(
     ctx: &'a QueryContext,
     txn: Option<&'a mut Vec<crate::PgWrite>>,
 ) -> query::DmlContext<'a> {
@@ -1685,7 +1714,7 @@ where
 /// buffers its DML and commits through the local MVCC manager. ROLLBACK discards
 /// the buffer. These tests do not establish cluster-wide commit ordering.
 #[cfg(test)]
-mod txn_atomicity_tests {
+pub(crate) mod txn_atomicity_tests {
     use super::*;
     use crate::extended::Session;
     use ferrosa_schema::{
@@ -1743,7 +1772,7 @@ mod txn_atomicity_tests {
         }
     }
 
-    fn superuser() -> AuthContext {
+    pub(crate) fn superuser() -> AuthContext {
         AuthContext {
             role: "cassandra".to_string(),
             is_superuser: true,
@@ -1853,7 +1882,7 @@ mod txn_atomicity_tests {
         }
     }
 
-    fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
+    pub(crate) fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
         QueryContext {
             engine,
             schema,
@@ -1866,7 +1895,7 @@ mod txn_atomicity_tests {
         }
     }
 
-    async fn make_ctx() -> (tempfile::TempDir, QueryContext) {
+    pub(crate) async fn make_ctx() -> (tempfile::TempDir, QueryContext) {
         let dir = tempfile::tempdir().unwrap();
         let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
         engine.register_table(kv_storage_schema()).unwrap();
@@ -1892,7 +1921,7 @@ mod txn_atomicity_tests {
 
     /// Rows visible for key `k`, read back through the `execute_query` SELECT
     /// path with no transaction buffer.
-    async fn row_count(ctx: &QueryContext, key: &str) -> usize {
+    pub(crate) async fn row_count(ctx: &QueryContext, key: &str) -> usize {
         let msgs = query::execute_query(
             &ctx.engine,
             &ctx.schema,

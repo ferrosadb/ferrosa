@@ -1062,7 +1062,7 @@ pub(crate) fn encode_data_row(
 /// `Error::is_backpressure()` is the shared classifier (it covers
 /// `Error::Overloaded` and the disk-reserve refusal), so this stays in step with
 /// the CQL front end rather than re-deciding what counts as backpressure.
-fn write_error_response(error: &ferrosa_common::Error) -> BackendMessage {
+pub(crate) fn write_error_response(error: &ferrosa_common::Error) -> BackendMessage {
     if error.is_backpressure() {
         // `is_backpressure()` has two branches: the typed `Error::Overloaded`,
         // and a legacy STRING match on `InvalidData` (`starts_with("overloaded:")`)
