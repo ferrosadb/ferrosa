@@ -10,8 +10,8 @@
 
 use super::{ParseError, Parser, Tok};
 use crate::ast::{
-    AddPrimaryKeyStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType, Statement, TableRef,
-    UnsupportedClause,
+    AlterOperation, AlterTableStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType,
+    Statement, TableRef, UnsupportedClause,
 };
 
 /// The one schema a table may be qualified with. Other schemas are refused
@@ -115,10 +115,9 @@ impl Parser {
         }
     }
 
-    /// `ALTER TABLE <name> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`.
+    /// `ALTER TABLE <name> <operation>`.
     ///
-    /// Only this form is accepted; every other `ALTER TABLE` is refused by name rather than
-    /// parsed loosely, so a change ferrosa does not implement can never look like it applied.
+    /// Only the operations ferrosa can apply are accepted; anything else is refused by name.
     pub(super) fn parse_alter_table(&mut self) -> Result<Statement, ParseError> {
         self.expect_ident_kw("ALTER")?;
         if !self.peek_is_kw("TABLE") {
@@ -127,36 +126,87 @@ impl Parser {
             ));
         }
         self.next(); // TABLE
-                     // `ONLY` restricts the change to the named table and not its descendants. ferrosa
-                     // has no inheritance, so accepting it is exact rather than approximate.
+                     // `ONLY` restricts the change to the named table and not its descendants. ferrosa has
+                     // no inheritance, so accepting it is exact rather than approximate.
         if self.peek_is_kw("ONLY") {
             self.next();
         }
         let table = self.parse_qualified_table()?;
-        if !self.peek_is_kw("ADD") {
+
+        let operation = if self.peek_is_kw("ADD") {
+            self.next(); // ADD
+            self.parse_alter_add()?
+        } else if self.peek_is_kw("DROP") {
+            self.next(); // DROP
+                         // `DROP COLUMN` and `DROP` are the same thing here; the keyword is optional in
+                         // Postgres. `DROP CONSTRAINT` is not implemented, and is caught by the ident check.
+            if self.peek_is_kw("COLUMN") {
+                self.next();
+            } else if !matches!(self.peek(), Some(Tok::Ident(_))) {
+                return Err(ParseError::UnsupportedAlter(
+                    "only DROP COLUMN is supported".into(),
+                ));
+            }
+            AlterOperation::DropColumn(self.ident()?)
+        } else if self.peek_is_kw("RENAME") {
             return Err(ParseError::UnsupportedAlter(
-                "only ADD PRIMARY KEY is supported".into(),
+                "RENAME is not supported: ferrosa has no rename path".into(),
             ));
-        }
-        self.next(); // ADD
-                     // `CONSTRAINT <name>` is accepted and ignored: Postgres does not require the name to
-                     // mean anything, and the key is described by its columns.
+        } else if self.peek_is_kw("ALTER") {
+            return Err(ParseError::UnsupportedAlter(
+                "changing a column's type or default is not supported".into(),
+            ));
+        } else {
+            return Err(ParseError::UnsupportedAlter(
+                "expected ADD, DROP, RENAME or ALTER COLUMN".into(),
+            ));
+        };
+
+        Ok(Statement::AlterTable(Box::new(AlterTableStmt {
+            table,
+            operation,
+        })))
+    }
+
+    /// The clause after `ALTER TABLE t ADD`.
+    fn parse_alter_add(&mut self) -> Result<AlterOperation, ParseError> {
+        // `ADD CONSTRAINT <name> PRIMARY KEY (...)`. The name is accepted and ignored: Postgres
+        // does not require it to mean anything, and the key is described by its columns.
         if self.peek_is_kw("CONSTRAINT") {
             self.next();
             self.ident()?; // the constraint name
+            return self.parse_add_primary_key();
         }
-        if !self.peek_is_kw("PRIMARY") {
+        if self.peek_is_kw("PRIMARY") {
+            return self.parse_add_primary_key();
+        }
+        // `ADD [COLUMN] <name> <type>`. Postgres allows the keyword to be omitted, which is what
+        // pgbench-style DDL and most ORMs emit.
+        if self.peek_is_kw("COLUMN") {
+            self.next();
+        } else if !matches!(self.peek(), Some(Tok::Ident(_))) {
             return Err(ParseError::UnsupportedAlter(
-                "only ADD PRIMARY KEY is supported".into(),
+                "only ADD COLUMN and ADD PRIMARY KEY are supported".into(),
             ));
         }
-        self.next(); // PRIMARY
+        let def = self.parse_column_def()?;
+        // A column-level PRIMARY KEY would be a second way to say `ADD PRIMARY KEY`, and the two
+        // would have to agree about order and about the storage key. Refuse it rather than pick.
+        if def.primary_key {
+            return Err(ParseError::UnsupportedAlter(
+                "a column-level PRIMARY KEY in ADD COLUMN is not supported: use ADD PRIMARY KEY"
+                    .into(),
+            ));
+        }
+        Ok(AlterOperation::AddColumn(def))
+    }
+
+    fn parse_add_primary_key(&mut self) -> Result<AlterOperation, ParseError> {
+        self.expect_ident_kw("PRIMARY")?;
         self.expect_ident_kw("KEY")?;
-        let columns = self.parse_paren_ident_list()?;
-        Ok(Statement::AddPrimaryKey(Box::new(AddPrimaryKeyStmt {
-            table,
-            columns,
-        })))
+        Ok(AlterOperation::AddPrimaryKey(
+            self.parse_paren_ident_list()?,
+        ))
     }
 
     /// `( ident [, ident]* )` — the column list of a table-level PRIMARY KEY.

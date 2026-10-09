@@ -2151,26 +2151,63 @@ mod tests {
     #[test]
     fn alter_table_add_primary_key_parses() {
         let apk = |sql: &str| match parse_statement(sql) {
-            Ok(Statement::AddPrimaryKey(a)) => *a,
-            other => panic!("expected AddPrimaryKey for `{sql}`, got {other:?}"),
+            Ok(Statement::AlterTable(a)) => match a.operation {
+                crate::ast::AlterOperation::AddPrimaryKey(cols) => (a.table, cols),
+                other => panic!("expected AddPrimaryKey for `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
         };
 
-        let one = apk("ALTER TABLE t ADD PRIMARY KEY (a)");
-        assert_eq!(one.table.table, "t");
-        assert_eq!(one.table.schema, None);
-        assert_eq!(one.columns, vec!["a".to_string()]);
+        let (table, columns) = apk("ALTER TABLE t ADD PRIMARY KEY (a)");
+        assert_eq!(table.table, "t");
+        assert_eq!(table.schema, None);
+        assert_eq!(columns, vec!["a".to_string()]);
 
         // Schema-qualified, a constraint name, multiple key columns, and ONLY: all accepted,
         // because all are things a client actually writes.
-        let many = apk("ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)");
-        assert_eq!(many.table.schema.as_deref(), Some("public"));
-        assert_eq!(many.table.table, "t");
-        assert_eq!(many.columns, vec!["a".to_string(), "b".to_string()]);
+        let (table, columns) = apk("ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)");
+        assert_eq!(table.schema.as_deref(), Some("public"));
+        assert_eq!(table.table, "t");
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
 
-        assert_eq!(
-            apk("ALTER TABLE ONLY t ADD PRIMARY KEY (a)").columns,
-            vec!["a".to_string()]
-        );
+        let (_, columns) = apk("ALTER TABLE ONLY t ADD PRIMARY KEY (a)");
+        assert_eq!(columns, vec!["a".to_string()]);
+    }
+
+    /// `ADD COLUMN` and `DROP COLUMN` map straight onto the schema layer's `TableUpdates`, so
+    /// they are implemented rather than refused. `COLUMN` is optional, as in Postgres.
+    #[test]
+    fn alter_table_add_and_drop_column_parse() {
+        let add = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => match a.operation {
+                crate::ast::AlterOperation::AddColumn(def) => def,
+                other => panic!("expected AddColumn for `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        };
+        assert_eq!(add("ALTER TABLE t ADD COLUMN c int").name, "c");
+        assert_eq!(add("ALTER TABLE t ADD c int").name, "c");
+        assert!(add("ALTER TABLE t ADD COLUMN c int NOT NULL").not_null);
+
+        let drop = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => match a.operation {
+                crate::ast::AlterOperation::DropColumn(name) => name,
+                other => panic!("expected DropColumn for `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        };
+        assert_eq!(drop("ALTER TABLE t DROP COLUMN c"), "c");
+        assert_eq!(drop("ALTER TABLE t DROP c"), "c");
+    }
+
+    /// Adding a PRIMARY KEY as a column constraint would be a second way to say
+    /// `ADD PRIMARY KEY`, with its own idea of order and the storage key. Refused, not guessed.
+    #[test]
+    fn add_column_with_an_inline_primary_key_is_refused() {
+        match parse_statement("ALTER TABLE t ADD COLUMN c int PRIMARY KEY") {
+            Err(ParseError::UnsupportedAlter(form)) => assert!(form.contains("ADD PRIMARY KEY")),
+            other => panic!("must be refused by name, got {other:?}"),
+        }
     }
 
     /// Every other `ALTER TABLE` is refused BY NAME. Parsing one loosely would let a client
@@ -2178,9 +2215,8 @@ mod tests {
     #[test]
     fn other_alter_forms_are_refused_by_name() {
         for sql in [
-            "ALTER TABLE t DROP COLUMN c",
             "ALTER TABLE t RENAME TO u",
-            "ALTER TABLE t ADD COLUMN c int",
+            "ALTER TABLE t ALTER COLUMN c TYPE bigint",
             "ALTER INDEX i RENAME TO j",
         ] {
             match parse_statement(sql) {

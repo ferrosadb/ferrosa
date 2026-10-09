@@ -1151,17 +1151,17 @@ async fn execute_statement(
             )
             .await
         }
-        // ALTER TABLE ... ADD PRIMARY KEY: the step pgbench -i runs right after creating its
-        // tables without a key. Same schema-change path.
-        Statement::AddPrimaryKey(apk) => {
-            crate::ddl::execute_add_primary_key(
+        // ALTER TABLE: the step pgbench -i runs right after creating its tables without a key.
+        // Same schema-change path.
+        Statement::AlterTable(alter) => {
+            crate::ddl::execute_alter_table(
                 crate::ddl::DdlEnv {
                     executor: ddl,
                     schema,
                     default_schema,
                     in_txn: txn.is_some(),
                 },
-                &apk,
+                &alter,
             )
             .await
         }
@@ -3769,17 +3769,17 @@ mod txn_buffer_tests {
         }
     }
 
-    fn add_primary_key(sql: &str) -> ferrosa_sql::AddPrimaryKeyStmt {
+    fn alter(sql: &str) -> ferrosa_sql::AlterTableStmt {
         match parse_statement(sql) {
-            Ok(Statement::AddPrimaryKey(a)) => *a,
-            other => panic!("expected AddPrimaryKey, got {other:?}"),
+            Ok(Statement::AlterTable(a)) => *a,
+            other => panic!("expected AlterTable, got {other:?}"),
         }
     }
 
     /// Run `ALTER TABLE ... ADD PRIMARY KEY` against a recording executor.
     async fn add_key(schema: &Schema, ddl: &RecordingDdl, sql: &str) -> Vec<BackendMessage> {
-        let stmt = add_primary_key(sql);
-        crate::ddl::execute_add_primary_key(
+        let stmt = alter(sql);
+        crate::ddl::execute_alter_table(
             crate::ddl::DdlEnv {
                 executor: Some(ddl),
                 schema,
@@ -3856,6 +3856,88 @@ mod txn_buffer_tests {
             ddl.indexed.lock().unwrap().is_empty(),
             "the storage key must not be indexed twice"
         );
+    }
+
+    /// `ADD COLUMN` maps straight onto the schema layer's `add_columns`, as a regular column —
+    /// a key column is added by re-creating the table, and `TableUpdates` cannot change the key.
+    #[tokio::test]
+    async fn alter_table_add_column_applies_a_regular_column() {
+        let schema = schema_with_synthetic_key();
+        let ddl = RecordingDdl::default();
+
+        let msgs = add_key(&schema, &ddl, "ALTER TABLE sk ADD COLUMN w int").await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "ALTER TABLE"),
+            "reply must be one ALTER TABLE completion: {msgs:?}"
+        );
+        let altered = ddl.altered.lock().unwrap();
+        assert_eq!(altered.len(), 1);
+        assert_eq!(altered[0].1, "sk");
+        assert!(altered[0].2.drop_columns.is_empty(), "nothing dropped");
+        let added = &altered[0].2.add_columns;
+        assert_eq!(added.len(), 1, "one column added");
+        assert_eq!(added[0].name, "w");
+        assert_eq!(added[0].kind, ColumnKind::Regular);
+        assert_eq!(
+            added[0].column_type, "int",
+            "the declared type is carried through"
+        );
+    }
+
+    /// `DROP COLUMN` maps onto `drop_columns` for an ordinary column...
+    #[tokio::test]
+    async fn alter_table_drop_column_applies_for_a_regular_column() {
+        let schema = schema_with_synthetic_key();
+        let ddl = RecordingDdl::default();
+
+        let msgs = add_key(&schema, &ddl, "ALTER TABLE sk DROP COLUMN v").await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { .. }]),
+            "must succeed: {msgs:?}"
+        );
+        let altered = ddl.altered.lock().unwrap();
+        assert_eq!(altered[0].2.drop_columns, vec!["v".to_string()]);
+        assert!(altered[0].2.add_columns.is_empty());
+    }
+
+    /// ...but not for a key column: dropping it would leave rows with no identity.
+    #[tokio::test]
+    async fn alter_table_refuses_to_drop_the_key_column() {
+        let (_dir, _engine, schema) = new_engine_and_schema().await;
+        let ddl = RecordingDdl::default();
+
+        let msgs = add_key(&schema, &ddl, "ALTER TABLE kv DROP COLUMN k").await;
+        let got = format!("{msgs:?}");
+        assert!(
+            got.contains("2BP01"),
+            "dropping the partition key must be refused: {got}"
+        );
+        assert!(
+            ddl.altered.lock().unwrap().is_empty(),
+            "nothing may be applied"
+        );
+    }
+
+    /// `ADD COLUMN` refuses a name that already exists and one in ferrosa's own namespace, both
+    /// before anything is applied.
+    #[tokio::test]
+    async fn alter_table_add_column_refuses_duplicates_and_reserved_names() {
+        let schema = schema_with_synthetic_key();
+        for (sql, expected) in [
+            ("ALTER TABLE sk ADD COLUMN v int", "42701"),
+            ("ALTER TABLE sk ADD COLUMN _sys_x int", "42P16"),
+            // NB: an unknown column TYPE never reaches here — `parse_pg_type` rejects it as a
+            // parse error (`42704`), so it is the parser's case, not the executor's.
+        ] {
+            let ddl = RecordingDdl::default();
+            let msgs = add_key(&schema, &ddl, sql).await;
+            let got = format!("{msgs:?}");
+            assert!(got.contains(expected), "{sql} must be {expected}: {got}");
+            assert!(
+                ddl.altered.lock().unwrap().is_empty(),
+                "{sql} must not have applied anything"
+            );
+        }
     }
 
     /// Refusals: a missing table, an unknown key column, ferrosa's own reserved column, and an

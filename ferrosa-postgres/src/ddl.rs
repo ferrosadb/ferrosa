@@ -26,7 +26,9 @@ use ferrosa_common::timeuuid::{is_reserved_column_name, SYNTHETIC_KEY_COLUMN};
 use ferrosa_schema::{
     ClusteringOrder, ColumnKind, ColumnMetadata, Schema, TableMetadata, TableParams, TableUpdates,
 };
-use ferrosa_sql::{AddPrimaryKeyStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType};
+use ferrosa_sql::{
+    AlterOperation, AlterTableStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType,
+};
 use indexmap::IndexMap;
 
 use crate::messages::BackendMessage;
@@ -152,23 +154,21 @@ fn complete_with(tag: &str) -> Vec<BackendMessage> {
     }]
 }
 
-/// Execute `ALTER TABLE ... ADD PRIMARY KEY (...)`, the only `ALTER TABLE` form ferrosa accepts
-/// and the one `pgbench -i` runs immediately after creating tables without a key.
+/// Execute `ALTER TABLE <table> <operation>`.
 ///
-/// Two effects, and the second is why the first exists:
+/// Three operations, and what each is for:
 ///
-/// 1. the **declared** key is recorded ([`crate::pg_key`]), so a client introspecting the
-///    catalog reports the key the user asked for — never the synthetic `_sys_ck_` a PK-less
-///    table was given;
-/// 2. when that key is not the storage key, a secondary index is built over it. On a table
-///    whose storage key is the synthetic column this is always the case, and without the index
-///    a lookup by the declared key degrades to a full scan.
+/// - **ADD PRIMARY KEY** records the *declared* key ([`crate::pg_key`]) so introspection reports
+///   the key the user asked for rather than the synthetic `_sys_ck_` a PK-less table was given,
+///   and builds a **secondary index** over it when that key is not the storage key — without
+///   which a lookup by the declared key degrades to a full scan.
+/// - **ADD COLUMN** and **DROP COLUMN** map straight onto `TableUpdates`.
 ///
-/// The record is applied first, so a failure to index still leaves the declared key correct
-/// rather than losing it. The reply distinguishes the two: `58000` names which step failed.
-pub(crate) async fn execute_add_primary_key(
+/// Everything else is refused by the parser, so nothing here has to guess. Each validation runs
+/// before the first write, so a refused statement applies nothing.
+pub(crate) async fn execute_alter_table(
     env: DdlEnv<'_>,
-    stmt: &AddPrimaryKeyStmt,
+    stmt: &AlterTableStmt,
 ) -> Vec<BackendMessage> {
     if env.in_txn {
         return refuse(
@@ -190,10 +190,118 @@ pub(crate) async fn execute_add_primary_key(
             &format!("relation \"{}\" does not exist", stmt.table.table),
         );
     };
-    if stmt.columns.is_empty() {
+
+    match &stmt.operation {
+        AlterOperation::AddPrimaryKey(columns) => {
+            execute_add_primary_key(executor, keyspace, &meta, columns).await
+        }
+        AlterOperation::AddColumn(def) => {
+            if is_reserved_column_name(&def.name) {
+                return refuse(
+                    "42P16",
+                    &format!(
+                        "column name \"{}\" is reserved: the `_sys_` prefix belongs to ferrosa",
+                        def.name
+                    ),
+                );
+            }
+            if meta.columns.contains_key(&def.name) {
+                return refuse(
+                    "42701",
+                    &format!(
+                        "column \"{}\" of relation \"{}\" already exists",
+                        def.name, meta.name
+                    ),
+                );
+            }
+            // The type must map before anything is written, so an unknown type is a refusal
+            // rather than a half-applied change.
+            let column_type = match cql_type_string(def) {
+                Ok(t) => t,
+                Err(msg) => return vec![msg],
+            };
+            let updates = TableUpdates {
+                params: None,
+                add_columns: vec![ColumnMetadata {
+                    name: def.name.clone(),
+                    // A column added by ALTER is a regular column: a key column is added by
+                    // re-creating the table, and `TableUpdates` cannot change the key anyway.
+                    kind: ColumnKind::Regular,
+                    position: 0,
+                    column_type: column_type.to_string(),
+                    clustering_order: ClusteringOrder::None,
+                    mask: None,
+                }],
+                drop_columns: Vec::new(),
+                extensions: None,
+            };
+            if let Err(error) = executor
+                .alter_table(keyspace, &stmt.table.table, updates)
+                .await
+            {
+                return refuse("58000", &format!("ALTER TABLE failed: {error}"));
+            }
+            complete_with("ALTER TABLE")
+        }
+        AlterOperation::DropColumn(name) => {
+            if is_reserved_column_name(name) {
+                return refuse(
+                    "42P16",
+                    &format!(
+                        "column name \"{name}\" is reserved: the `_sys_` prefix belongs to ferrosa"
+                    ),
+                );
+            }
+            if !meta.columns.contains_key(name) {
+                return refuse(
+                    "42703",
+                    &format!(
+                        "column \"{name}\" of relation \"{}\" does not exist",
+                        meta.name
+                    ),
+                );
+            }
+            // Dropping a key column would leave rows with no identity — and, for a declared key,
+            // an extension naming a column that no longer exists.
+            if crate::pg_key::storage_key_columns(&meta).contains(name)
+                || crate::pg_key::of(&meta).contains(name)
+            {
+                return refuse(
+                    "2BP01",
+                    &format!("cannot drop column \"{name}\" because the primary key depends on it"),
+                );
+            }
+            let updates = TableUpdates {
+                params: None,
+                add_columns: Vec::new(),
+                drop_columns: vec![name.clone()],
+                extensions: None,
+            };
+            if let Err(error) = executor
+                .alter_table(keyspace, &stmt.table.table, updates)
+                .await
+            {
+                return refuse("58000", &format!("ALTER TABLE failed: {error}"));
+            }
+            complete_with("ALTER TABLE")
+        }
+    }
+}
+
+/// Record the declared key and, when it is not the storage key, index it.
+///
+/// The record is applied FIRST, so a failure to index still leaves the declared key correct
+/// rather than losing it; `58000` names which step failed.
+async fn execute_add_primary_key(
+    executor: &dyn DdlExecutor,
+    keyspace: &str,
+    meta: &TableMetadata,
+    columns: &[String],
+) -> Vec<BackendMessage> {
+    if columns.is_empty() {
         return refuse("42601", "a PRIMARY KEY must name at least one column");
     }
-    for name in &stmt.columns {
+    for name in columns {
         if is_reserved_column_name(name) {
             return refuse(
                 "42P16",
@@ -216,20 +324,19 @@ pub(crate) async fn execute_add_primary_key(
         drop_columns: Vec::new(),
         extensions: Some(HashMap::from([(
             crate::pg_key::PRIMARY_KEY_EXTENSION.to_string(),
-            crate::pg_key::encode(&stmt.columns),
+            crate::pg_key::encode(columns),
         )])),
     };
-    if let Err(error) = executor
-        .alter_table(keyspace, &stmt.table.table, updates)
-        .await
-    {
+    if let Err(error) = executor.alter_table(keyspace, &meta.name, updates).await {
         return refuse("58000", &format!("ALTER TABLE failed: {error}"));
     }
 
-    if stmt.columns != crate::pg_key::storage_key_columns(&meta) {
-        let name = format!("{}_pkey", stmt.table.table);
+    // Only when it ADDs something: a key that already is the storage key is served by the
+    // primary structure, and indexing it again would be pure write overhead.
+    if columns != crate::pg_key::storage_key_columns(meta) {
+        let name = format!("{}_pkey", meta.name);
         if let Err(error) = executor
-            .create_index(keyspace, &stmt.table.table, &name, &stmt.columns)
+            .create_index(keyspace, &meta.name, &name, columns)
             .await
         {
             return refuse(

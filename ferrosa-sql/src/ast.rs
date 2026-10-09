@@ -54,8 +54,8 @@ pub enum Statement {
     /// client-side schema reset drop several tables in one statement; each
     /// named table is dropped by the front-end. Boxed for size parity.
     DropTable(Box<DropTableStatement>),
-    /// `ALTER TABLE t ADD [CONSTRAINT name] PRIMARY KEY (col, ...)`.
-    AddPrimaryKey(Box<AddPrimaryKeyStmt>),
+    /// `ALTER TABLE t <operation>` (see [`AlterOperation`]).
+    AlterTable(Box<AlterTableStmt>),
 }
 
 /// `DROP TABLE [IF EXISTS] a [, b, ...]`. `tables` is non-empty; every entry
@@ -66,19 +66,35 @@ pub struct DropTableStatement {
     pub tables: Vec<TableRef>,
 }
 
-/// `ALTER TABLE <table> ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`.
+/// `ALTER TABLE <table> <operation>`.
 ///
-/// The only `ALTER TABLE` form ferrosa accepts — and the one `pgbench -i` runs immediately
-/// after creating its tables without a key. Other forms are refused *by name* rather than
-/// parsed loosely: a change we do not implement must not look like it took effect.
-///
-/// The key named here is the **PostgreSQL** primary key, which is not necessarily the storage
-/// partition key: a table created without one has a synthetic `_sys_ck_` storage key and no
-/// PostgreSQL key at all until this runs. See `ferrosa-postgres`'s `pg_key`.
+/// Only the operations ferrosa can actually apply are accepted. Every other `ALTER TABLE` form
+/// is refused *by name* rather than parsed loosely: a change we do not implement must not look
+/// like it took effect.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AddPrimaryKeyStmt {
+pub struct AlterTableStmt {
     pub table: TableRef,
-    pub columns: Vec<String>,
+    pub operation: AlterOperation,
+}
+
+/// What an `ALTER TABLE` changes.
+///
+/// The set is exactly what ferrosa's schema layer can express — the operations of
+/// `ferrosa_schema::TableUpdates` — plus the declared key, which is recorded in the table's
+/// extensions. Forms that would need machinery ferrosa does not have (renaming, changing a
+/// column's type, constraints other than a key) are refused, not approximated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlterOperation {
+    /// `ADD [CONSTRAINT <name>] PRIMARY KEY (<cols>)`.
+    ///
+    /// The **PostgreSQL** primary key, which is not necessarily the storage partition key: a
+    /// table created without one has a synthetic `_sys_ck_` storage key and no PostgreSQL key at
+    /// all until this runs. See `ferrosa-postgres`'s `pg_key`.
+    AddPrimaryKey(Vec<String>),
+    /// `ADD [COLUMN] <name> <type> [NOT NULL]`.
+    AddColumn(ColumnDef),
+    /// `DROP [COLUMN] <name>`.
+    DropColumn(String),
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] [public.]name (col type [NOT NULL]..., PRIMARY KEY (...))`.

@@ -92,9 +92,11 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   `plan_create_table`; per-row minting on `INSERT` (`synthetic_key.rs`), proven end to end;
   `SELECT *` hiding the column (`result_stream.rs`, filtered only for a star projection, so
   naming the column still returns it); `pg_attribute` giving it a **negative `attnum`**
-  (`catalog.rs`); and `ALTER TABLE ... ADD PRIMARY KEY` (`ddl.rs::execute_add_primary_key`),
-  which records the declared key and builds a secondary index when that key is not the
-  storage key.
+  (`catalog.rs`); and `ALTER TABLE` (`ddl.rs::execute_alter_table`) for `ADD PRIMARY KEY` —
+  which records the declared key and builds a secondary index when that key is not the storage
+  key — plus `ADD COLUMN` and `DROP COLUMN`. The remaining ALTER forms (RENAME, ALTER COLUMN
+  TYPE/DEFAULT, non-key constraints) are refused by name, because `TableUpdates` cannot express
+  them and approximating one would leave a client believing a change took effect.
   **Not yet done:** minting on `COPY`, and any projection that *reads* `pg_key` — psql's
   describe-table wants `pg_index` (`indisprimary`) plus index rows in `pg_class`, neither of
   which exists yet, so the recorded key is written but not yet visible to a client. See
