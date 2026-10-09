@@ -190,12 +190,19 @@ clone** — the O(N^2) fill pathology `e440b60f` removed, i.e. the fix for this 
 regression. This is why the t512 throughput drops while CPU per request falls: the
 writer is doing allocator/drop work on a slower path rather than useful work.
 
-**Measured, not inferred** (`ferrosa-storage/tests/refcount_cow_probe.rs`):
+**Pinned, not inferred.** `ferrosa-storage/tests/memtable_read_does_not_block_writes.rs`
+holds a clone of the partition's `Arc`, issues one write, and asserts the *staleness*
+that copy-on-write produces: the holder keeps the pre-write image while the memtable
+owns the post-write one. The inverse (no holder → the write is visible immediately)
+is the negative control. Asserted as behaviour rather than an allocation count,
+because a process-wide counter is not usable across parallel tests — an earlier
+draft measured it that way and was flaky (12/12 parallel failures).
 
-```
-baseline (no reader holding Arc):        3 allocs
-with reader holding Arc (400 rows):  1,210 allocs   ← COW deep clone
-```
+An earlier probe also recorded 3 allocations without a holder vs 1,210 with one for
+a 400-row partition. Those absolute numbers are indicative only: a per-write count
+includes amortized `Vec` growth, so it is not a stable assertion (the same write
+costs 3–167 in the 5-crate run depending on concurrent load). The *ratio* — orders
+of magnitude, growing with the partition — is the signal.
 
 `filter()` + per-entry bound comparisons and the `start`/`end` clones are real but
 secondary — a few comparisons against an O(rows) clone.
@@ -274,7 +281,8 @@ the wrong direction, and it violates the no-materialization rule.
 Tests: `ferrosa-storage/tests/memtable_read_does_not_block_writes.rs` (8 tests, incl.
 two negative controls that fail if the guard loses its teeth),
 `ferrosa-storage/tests/fulltext_scratch_equivalence.rs` (4 tests),
-`ferrosa-storage/tests/refcount_cow_probe.rs` (the measurement behind §2).
+and the staleness pin inside `memtable_read_does_not_block_writes.rs` is the
+measurement behind §2.
 
 ### 7. Follow-ups (not in this PR)
 

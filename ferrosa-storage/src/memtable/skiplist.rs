@@ -219,9 +219,9 @@ impl Memtable for SkipListMemtable {
     /// the partition's strong count to > 1, so the next `put` on that partition
     /// finds `Arc::make_mut` with refcount > 1 and deep-clones the whole
     /// partition before merging — O(rows-in-partition) per write, i.e. the
-    /// O(N^2) fill pathology `e440b60f` removed. Measured by
-    /// `tests/refcount_cow_probe.rs`: 1 write = 1210 allocations while a reader
-    /// holds the `Arc`, vs 3 when it does not.
+    /// O(N^2) fill pathology `e440b60f` removed. Pinned by
+    /// `a_held_arc_makes_the_next_write_copy_on_write_and_stale`: a holder keeps
+    /// the pre-write image while the memtable owns the post-write one.
     ///
     /// Here the guard is held for the callback and the value is borrowed, never
     /// cloned out, so the memtable stays the sole owner of each partition and
