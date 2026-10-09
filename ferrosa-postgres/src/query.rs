@@ -1151,6 +1151,14 @@ async fn execute_statement(
             )
             .await
         }
+        // `COPY ... FROM STDIN` cannot be answered in one step: the payload arrives AFTER the
+        // acknowledgement, as `CopyData` frames, so the connection loop drives it. Reaching here
+        // means it came in over a path that cannot carry a COPY — the extended protocol, or a tool
+        // calling `execute_query` directly — which is refused rather than half-done.
+        Statement::CopyFromStdin(_) => vec![error_response(
+            "0A000",
+            "COPY FROM STDIN must be driven by the connection loop, not answered directly",
+        )],
         // ALTER TABLE: the step pgbench -i runs right after creating its tables without a key.
         // Same schema-change path.
         Statement::AlterTable(alter) => {

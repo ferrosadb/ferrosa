@@ -97,6 +97,10 @@ pub(crate) fn statement_permissions(
         Statement::AlterTable(alter) => {
             vec![(Permission::Alter, table(&alter.table, default_schema))]
         }
+        // COPY FROM STDIN writes rows, so it needs MODIFY — the same permission an INSERT needs.
+        Statement::CopyFromStdin(copy) => {
+            vec![(Permission::Modify, table(&copy.table, default_schema))]
+        }
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit

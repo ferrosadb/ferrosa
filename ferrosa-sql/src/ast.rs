@@ -56,6 +56,8 @@ pub enum Statement {
     DropTable(Box<DropTableStatement>),
     /// `ALTER TABLE t <operation>` (see [`AlterOperation`]).
     AlterTable(Box<AlterTableStmt>),
+    /// `COPY t [(cols)] FROM STDIN [(options)]`.
+    CopyFromStdin(Box<CopyFromStdinStmt>),
 }
 
 /// `DROP TABLE [IF EXISTS] a [, b, ...]`. `tables` is non-empty; every entry
@@ -64,6 +66,33 @@ pub enum Statement {
 pub struct DropTableStatement {
     pub if_exists: bool,
     pub tables: Vec<TableRef>,
+}
+
+/// `COPY <table> [(<cols>)] FROM STDIN [[WITH] (<options>)]`.
+///
+/// The payload does not appear here: it arrives afterwards, as `CopyData` frames, which is why
+/// this is a statement the connection loop must drive rather than one that can be answered in a
+/// single step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyFromStdinStmt {
+    pub table: TableRef,
+    /// The columns named, or `None` meaning "the table's columns, in order".
+    pub columns: Option<Vec<String>>,
+    pub format: CopyFormatKind,
+    /// `DELIMITER`, defaulted per format when absent.
+    pub delimiter: Option<char>,
+    /// `NULL`, defaulted per format when absent.
+    pub null: Option<String>,
+    /// `HEADER` — csv only.
+    pub header: bool,
+}
+
+/// The `FORMAT` of a `COPY` payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormatKind {
+    /// PostgreSQL's default.
+    Text,
+    Csv,
 }
 
 /// `ALTER TABLE <table> <operation>`.

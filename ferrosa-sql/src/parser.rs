@@ -195,6 +195,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
             "CREATE" => p.parse_create(),
+            "COPY" => p.parse_copy(),
             "ALTER" => p.parse_alter_table(),
             "DROP" => p.parse_drop(),
             other => Err(ParseError::Unexpected {
@@ -2172,6 +2173,67 @@ mod tests {
 
         let (_, columns) = apk("ALTER TABLE ONLY t ADD PRIMARY KEY (a)");
         assert_eq!(columns, vec!["a".to_string()]);
+    }
+
+    /// `COPY <t> [(cols)] FROM STDIN [(options)]`. The payload is not part of the statement: it
+    /// arrives afterwards as `CopyData` frames, which is why the connection loop drives it.
+    #[test]
+    fn copy_from_stdin_parses() {
+        let copy = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::CopyFromStdin(c)) => *c,
+            other => panic!("expected CopyFromStdin for `{sql}`, got {other:?}"),
+        };
+
+        // The bare form pgbench emits: every column, text format.
+        let bare = copy("COPY pgbench_accounts FROM STDIN");
+        assert_eq!(bare.table.table, "pgbench_accounts");
+        assert_eq!(bare.columns, None, "no list means every column, in order");
+        assert_eq!(bare.format, crate::ast::CopyFormatKind::Text);
+        assert_eq!(
+            bare.delimiter, None,
+            "defaulted per format, not baked in here"
+        );
+        assert!(!bare.header);
+
+        // A column list, schema qualification, and the parenthesised options.
+        let full = copy(
+            "COPY public.t (a, b) FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER ';', NULL '')",
+        );
+        assert_eq!(full.table.schema.as_deref(), Some("public"));
+        assert_eq!(full.columns, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(full.format, crate::ast::CopyFormatKind::Csv);
+        assert_eq!(full.delimiter, Some(';'));
+        assert_eq!(full.null.as_deref(), Some(""));
+        assert!(full.header);
+
+        // `WITH` and the option list are both optional.
+        assert_eq!(
+            copy("COPY t FROM STDIN (FORMAT csv)").format,
+            crate::ast::CopyFormatKind::Csv
+        );
+    }
+
+    /// `COPY ... TO` and an unknown option are refused by name. A client that asked for csv and
+    /// silently got text would store garbage, so the option is not ignored.
+    #[test]
+    fn unsupported_copy_forms_are_refused_by_name() {
+        for sql in [
+            "COPY t TO STDOUT",
+            "COPY t FROM STDIN (FORMAT binary)",
+            "COPY t FROM STDIN (NOSUCHOPT)",
+            "COPY t FROM STDIN (DELIMITER 'too long')",
+            "COPY t FROM STDIN WITH CSV",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedAlter(form)) => {
+                    assert!(
+                        !form.is_empty(),
+                        "{sql}: the refusal must say what is unsupported"
+                    );
+                }
+                other => panic!("{sql} must be refused by name, got {other:?}"),
+            }
+        }
     }
 
     /// `ADD COLUMN` and `DROP COLUMN` map straight onto the schema layer's `TableUpdates`, so

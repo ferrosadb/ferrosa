@@ -10,8 +10,8 @@
 
 use super::{ParseError, Parser, Tok};
 use crate::ast::{
-    AlterOperation, AlterTableStmt, ColumnDef, CreateTableStmt, DropTableStatement, PgType,
-    Statement, TableRef, UnsupportedClause,
+    AlterOperation, AlterTableStmt, ColumnDef, CopyFormatKind, CopyFromStdinStmt, CreateTableStmt,
+    DropTableStatement, PgType, Statement, TableRef, UnsupportedClause,
 };
 
 /// The one schema a table may be qualified with. Other schemas are refused
@@ -111,6 +111,137 @@ impl Parser {
             _ => Err(ParseError::Unexpected {
                 expected: "PRIMARY KEY, FOREIGN KEY, CHECK or UNIQUE",
                 found: word,
+            }),
+        }
+    }
+
+    /// `COPY <name> [(<cols>)] FROM STDIN [[WITH] (<options>)]`.
+    ///
+    /// Only the `FROM STDIN` direction is parsed: `COPY ... TO` writes a payload the client reads,
+    /// which is a different exchange and is refused by name. Options are the modern parenthesised
+    /// form; an unrecognised option is refused rather than ignored, because a client that asked for
+    /// csv and silently got text would store garbage.
+    pub(super) fn parse_copy(&mut self) -> Result<Statement, ParseError> {
+        self.expect_ident_kw("COPY")?;
+        let table = self.parse_qualified_table()?;
+
+        // The column list is optional; `(a, b)` restricts and orders the payload's fields.
+        let columns = if matches!(self.peek(), Some(Tok::LParen)) {
+            Some(self.parse_paren_ident_list()?)
+        } else {
+            None
+        };
+
+        // `COPY ... TO` writes a payload the client reads — the opposite exchange — and is refused
+        // by name rather than reported as a stray token.
+        if self.peek_is_kw("TO") {
+            return Err(ParseError::UnsupportedAlter(
+                "COPY ... TO is not supported; only COPY ... FROM STDIN".into(),
+            ));
+        }
+        // `FROM` is a KEYWORD token here, not an identifier, so it is matched directly.
+        if !matches!(self.peek(), Some(Tok::From)) {
+            return Err(ParseError::Unexpected {
+                expected: "FROM",
+                found: format!("{:?}", self.peek()),
+            });
+        }
+        self.next(); // FROM
+        if !self.peek_is_kw("STDIN") {
+            return Err(ParseError::UnsupportedAlter(
+                "only COPY ... FROM STDIN is supported".into(),
+            ));
+        }
+        self.next(); // STDIN
+
+        let mut stmt = CopyFromStdinStmt {
+            table,
+            columns,
+            format: CopyFormatKind::Text,
+            delimiter: None,
+            null: None,
+            header: false,
+        };
+        // `WITH` is optional, as is the parenthesised list entirely.
+        if self.peek_is_kw("WITH") {
+            self.next();
+        }
+        if matches!(self.peek(), Some(Tok::LParen)) {
+            self.parse_copy_options(&mut stmt)?;
+        } else if self.peek().is_some() {
+            return Err(ParseError::UnsupportedAlter(
+                "only the parenthesised COPY option list is supported".into(),
+            ));
+        }
+        Ok(Statement::CopyFromStdin(Box::new(stmt)))
+    }
+
+    /// `(key [value] [, ...])`, applied to `stmt`.
+    fn parse_copy_options(&mut self, stmt: &mut CopyFromStdinStmt) -> Result<(), ParseError> {
+        self.expect(&Tok::LParen, "(")?;
+        loop {
+            let key = self.ident()?.to_ascii_uppercase();
+            match key.as_str() {
+                "FORMAT" => {
+                    let value = self.ident()?.to_ascii_uppercase();
+                    stmt.format = match value.as_str() {
+                        "TEXT" => CopyFormatKind::Text,
+                        "CSV" => CopyFormatKind::Csv,
+                        other => {
+                            return Err(ParseError::UnsupportedAlter(format!(
+                                "COPY format `{other}` is not supported"
+                            )))
+                        }
+                    };
+                }
+                "DELIMITER" => stmt.delimiter = Some(self.copy_option_char()?),
+                "NULL" => stmt.null = Some(self.copy_option_string()?),
+                "HEADER" => stmt.header = true,
+                other => {
+                    return Err(ParseError::UnsupportedAlter(format!(
+                        "COPY option `{other}` is not supported"
+                    )))
+                }
+            }
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.next();
+                }
+                Some(Tok::RParen) => {
+                    self.next();
+                    return Ok(());
+                }
+                _ => {
+                    return Err(ParseError::Unexpected {
+                        expected: ", or )",
+                        found: format!("{:?}", self.peek()),
+                    })
+                }
+            }
+        }
+    }
+
+    /// A single-character COPY option value, written as a string literal (`DELIMITER ','`).
+    fn copy_option_char(&mut self) -> Result<char, ParseError> {
+        let text = self.copy_option_string()?;
+        let mut chars = text.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(c),
+            _ => Err(ParseError::UnsupportedAlter(format!(
+                "DELIMITER must be a single character, got {text:?}"
+            ))),
+        }
+    }
+
+    /// A string-literal COPY option value.
+    fn copy_option_string(&mut self) -> Result<String, ParseError> {
+        match self.next() {
+            Some(Tok::Str(s)) => Ok(s),
+            // An identifier is accepted too, so `DELIMITER |`-style unquoted values read.
+            Some(Tok::Ident(s)) => Ok(s),
+            other => Err(ParseError::Unexpected {
+                expected: "a string literal",
+                found: format!("{other:?}"),
             }),
         }
     }
