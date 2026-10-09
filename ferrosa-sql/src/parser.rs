@@ -2366,6 +2366,27 @@ mod tests {
         }
     }
 
+    /// PostgreSQL's fixed-length `char[(n)]` / `character[(n)]` and
+    /// `character varying[(n)]` must parse. pgbench's own schema uses
+    /// `filler char(84)`, so without this `pgbench -i` cannot create its tables.
+    ///
+    /// ferrosa stores `char(n)` as `varchar(n)` — UTF-8 text, NO blank padding.
+    /// That is a deliberate, documented deviation: the type is accepted and stored
+    /// faithfully as text, but `bpchar` padding semantics are not implemented.
+    #[test]
+    fn create_table_accepts_char_and_character_varying() {
+        for sql in [
+            "CREATE TABLE t (k int PRIMARY KEY, filler char(84))",
+            "CREATE TABLE t (k int PRIMARY KEY, filler char)",
+            "CREATE TABLE t (k int PRIMARY KEY, filler character(10))",
+            "CREATE TABLE t (k int PRIMARY KEY, filler character varying(10))",
+            "CREATE TABLE t (k int PRIMARY KEY, filler character varying)",
+        ] {
+            let got = parse_statement(sql);
+            assert!(got.is_ok(), "{sql} must parse: {got:?}");
+        }
+    }
+
     #[test]
     fn create_table_malformed_input_fails_loud() {
         let bad = [

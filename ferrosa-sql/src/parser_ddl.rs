@@ -258,8 +258,15 @@ impl Parser {
                 self.expect_ident_kw("PRECISION")?;
                 Ok(PgType::DoublePrecision)
             }
-            "character" => {
-                self.expect_ident_kw("VARYING")?;
+            "character" | "char" => {
+                // `character varying[(n)]` is varchar. Bare `character[(n)]` /
+                // `char[(n)]` is PostgreSQL's fixed-length, blank-padded `bpchar`;
+                // ferrosa stores it as `varchar(n)` — UTF-8 text with NO blank
+                // padding. A deliberate, documented deviation: pgbench's
+                // `filler char(84)` is the motivating case and never reads it back.
+                if self.peek_is_kw("VARYING") {
+                    self.next();
+                }
                 Ok(PgType::Varchar(self.optional_length()?))
             }
             "timestamp" | "time" => self.parse_temporal(&first),
