@@ -59,7 +59,9 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
 - **Authorization** (t_e1c819ad, `authz`) — every statement is checked with
   `Schema::check_permission`, the CQL router's model: `SELECT` needs `SELECT` on
   each table read, `INSERT`/`UPDATE`/`DELETE` need `MODIFY`, `RETURNING` also
-  needs `SELECT`, table-free statements need nothing. Checked on simple query,
+  needs `SELECT`, `TRUNCATE` needs `MODIFY` on each named table (the CQL
+  router's `route_truncate` rule), `VACUUM`/`ANALYZE` are maintenance and need
+  no table permission, table-free statements need nothing. Checked on simple query,
   extended `Describe`, and `Execute`; a denial is `42501`
   `insufficient_privilege`. The mapping is an exhaustive match, so a new
   statement kind cannot compile without a rule.
@@ -134,6 +136,27 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   (with a matching `<table>_pkey` index row in `pg_class`), so psql's describe-table
   shows a declared `PRIMARY KEY`; a table whose only key is the synthesized
   `_sys_ck_` reports no key.
+- **`TRUNCATE [TABLE] t [, …]` — replicated** (`truncate`) — removes every row
+  of each named table through the **replicated** cluster write path (the same
+  `ferrosa_cluster::WritePath` the CQL router's `route_truncate` uses), never a
+  node-local `StorageEngine::truncate` that would empty one replica and leave
+  the others holding the old data. Reply `TRUNCATE TABLE`. Refusals: `0A000`
+  when the front-end has no write path, `25001` inside a transaction block (it
+  cannot be rolled back), `42P01` for a missing table (checked before the write).
+  `TRUNCATE … CASCADE`/`RESTART IDENTITY` are refused at parse time.
+- **`VACUUM` (flush + compact) / `ANALYZE` (accepted no-op)** — `VACUUM [FULL]
+  [ANALYZE|ANALYSE]` answers `CommandComplete "VACUUM"` and `ANALYZE|ANALYSE`
+  answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds.
+  `VACUUM` is **not** a no-op: in an LSM/SSTable store, flushing the memtables
+  down and submitting compaction IS the vacuum, so it calls
+  `StorageEngine::flush` for the named table (every table when none is named) and
+  then `force_compact_all`. Three things it does not do, stated plainly: it does
+  not **wait** for compaction (`force_compact_all` submits and returns, so the
+  tag means "flushed and submitted", not "space reclaimed"); it does not promise
+  reclamation, which depends on the purge policy gated by
+  `compaction_purge_enabled()`; and because that engine entry point is
+  all-tables, a named `VACUUM t` flushes only `t` but submits compaction
+  cluster-wide. `ANALYZE` really is a no-op — no statistics are collected.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
   a tokio `TcpListener`, sharing the auth store and the storage+schema context.
 
@@ -262,6 +285,20 @@ keyspace is `3F000`; DDL in a transaction block is `25001`; a context without a
 `CREATE TABLE` requires `CREATE` on the target keyspace, checked at dispatch
 in `authz::statement_permissions` before the executor reads the schema (42501). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
 
+**`TRUNCATE` (replicated) and `VACUUM` (flush + compact) / `ANALYZE` (no-op).** `TRUNCATE
+[TABLE] t [, …]` executes in `truncate.rs`: each named table (resolved in the
+default schema) is truncated through `QueryContext.truncate` — a
+`TruncateExecutor` whose production implementation (`ClusterTruncate`) calls the
+SAME `ferrosa_cluster::WritePath::truncate` the CQL router's `route_truncate`
+uses (coordinator fan-out to every node in cluster mode, the local engine
+standalone). It is **never** the local `StorageEngine::truncate`, which would
+empty one replica and leave the cluster disagreeing about the table. No
+executor → `0A000`; in a transaction block → `25001`; missing table → `42P01`.
+`VACUUM [FULL] [ANALYZE|ANALYSE]` flushes the named table (all tables when none
+is named) and submits compaction, then answers `CommandComplete "VACUUM"`;
+`ANALYZE|ANALYSE` is answered `"ANALYZE"` and collects nothing. Unlike DDL they
+are also accepted inside a transaction block — neither is rolled back.
+
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder CQL uses) →
@@ -289,6 +326,7 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Catalog | `catalog::{pg_namespace, pg_class, pg_attribute, pg_type, pg_index, pg_constraint, catalog_tables}` (`pg_attribute`/`pg_type`/`catalog_tables` are fallible: `PgTypeError`) |
 | Synthetic key | `synthetic_key::next_synthetic_key` — the per-row v1 TimeUUID for the `_sys_ck_` key of a PK-less table |
 | DDL | `ddl::DdlExecutor` (`create_table`/`drop_table`/`alter_table`/`create_index`), `ddl::execute_alter_table` — `ALTER TABLE ... ADD PRIMARY KEY` / `ADD COLUMN` / `DROP COLUMN`; every other ALTER form is refused by name |
+| Truncate (replicated) | `truncate::TruncateExecutor` (`truncate`), `truncate::ClusterTruncate`, `truncate::execute_truncate` — `TRUNCATE` over the same `WritePath` CQL uses, never a node-local truncate |
 | Declared key | `pg_key::{of, recorded, encode, PRIMARY_KEY_EXTENSION}` — the *PostgreSQL* primary key, which is not the storage key |
 | Type map | `pg_types::{pg_type_of, pg_type_of_column, for_column_type, cql_type_for_pg_name, PgType, PgTypeError}` — the one `CqlType` ↔ Postgres type map (OID, typname, typlen, engine `ColumnType`, binary support); catalog, storage provider, RowDescription and parameter inference all read it |
 | Codec / messages | `codec::{read_startup, read_frontend, MAX_MESSAGE_LEN}`, `messages::{FrontendMessage, BackendMessage, TransactionStatus, …}` |
@@ -308,6 +346,10 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
   (`scram_credential`) the verifier reads, the shared login limiter
   (`check_login_rate_limit` / `record_login_failure` / `complete_login`) and
   `check_permission`.
+- **`ferrosa-cluster`** — `ddl_path::DdlPath` (the DDL path `ClusterDdl` adapts)
+  and `write_path::WritePath` (the replicated write path `ClusterTruncate`
+  calls for `TRUNCATE`), so PG DDL and `TRUNCATE` reach the cluster through the
+  SAME paths CQL uses.
 - **`ferrosa-net`** — `tls::optional_server_config`, the shared TLS acceptor
   builder and crypto provider.
 - **`ferrosa-sql`** — the bespoke relational engine: `parse_statement`,
@@ -324,9 +366,13 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
 ## Tests
 
-134 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
-query/storage_provider/catalog/store + `mvcc`/transaction tests) run with no
-infrastructure, plus integration tests:
+256 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
+query/storage_provider/catalog/store + `mvcc`/transaction tests, `ddl`, `authz`
+and `truncate`) run with no infrastructure, plus integration tests. The new
+`TRUNCATE`/`VACUUM` coverage is in `server` tests (a recorded `TruncateExecutor`
+proves the replicated path is taken and the local engine is left untouched; a
+context with no write path is refused `0A000`; `VACUUM`/`ANALYZE` answer the
+expected tag) and in `authz` (per-table `MODIFY` for `TRUNCATE`):
 
 - `tests/m1_join_live.rs` (15) — full stack over a real `tokio-postgres` driver
   in-process: SCRAM → JOIN, parameterized extended query, GROUP BY/ORDER

@@ -64,6 +64,57 @@ pub enum Statement {
     AlterTable(Box<AlterTableStmt>),
     /// `COPY t [(cols)] FROM STDIN [(options)]`.
     CopyFromStdin(Box<CopyFromStdinStmt>),
+    /// `TRUNCATE [TABLE] a [, b, ...]` (see [`TruncateStatement`]). Routed by
+    /// the front-end through the **replicated** cluster write path — never a
+    /// node-local storage truncate, which would leave the replicas disagreeing
+    /// about the table's contents.
+    Truncate(Box<TruncateStatement>),
+    /// `VACUUM [FULL] [ANALYZE] [table]` (see [`VacuumStmt`]). Accepted and
+    /// answered as a successful no-op: ferrosa has no heap to vacuum.
+    Vacuum(VacuumStmt),
+    /// `ANALYZE [table]` (see [`AnalyzeStmt`]). Accepted and answered as a
+    /// successful no-op: no statistics are collected.
+    Analyze(AnalyzeStmt),
+}
+
+/// `TRUNCATE [TABLE] a [, b, ...]`. `tables` is non-empty; every entry names a
+/// table (optionally schema-qualified) whose rows are to be removed.
+///
+/// Removal is a **cluster** operation. The front-end routes it through the
+/// deployment's replicated write path (the same path CQL `TRUNCATE` uses), so
+/// every node agrees the table is empty afterwards. A node-local storage
+/// truncate is never used: it would empty one replica and leave the others
+/// holding the old data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncateStatement {
+    pub tables: Vec<TableRef>,
+}
+
+/// `VACUUM [FULL] [ANALYZE|ANALYSE] [table]`.
+///
+/// Parsed so the front-end can answer it as an accepted, successful no-op:
+/// ferrosa stores data in an LSM tree with no dead-tuple heap to vacuum, so
+/// nothing is reclaimed and (with `ANALYZE`) no statistics are collected. It is
+/// recognized rather than refused because a client (e.g. `pgbench -i`) issues it
+/// as routine maintenance and expects success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VacuumStmt {
+    /// `FULL` was written. Accepted; it does not change what runs (the storage engine has
+    /// one compaction path, with no separate "full" mode).
+    pub full: bool,
+    /// `ANALYZE`/`ANALYSE` was written. Accepted; no statistics are collected.
+    pub analyze: bool,
+    /// The table named, if any. Execution flushes this table (or every table when absent) and
+    /// submits compaction — see the `Statement::Vacuum` arm in `ferrosa-postgres`.
+    pub table: Option<TableRef>,
+}
+
+/// `ANALYZE [table]` — accepted and answered as a successful no-op: no
+/// statistics are collected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnalyzeStmt {
+    /// The table named, if any. Recorded for fidelity; execution ignores it.
+    pub table: Option<TableRef>,
 }
 
 /// `DROP TABLE [IF EXISTS] a [, b, ...]`. `tables` is non-empty; every entry

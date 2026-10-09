@@ -881,6 +881,7 @@ pub async fn execute_query(
         mvcc: None,
         snapshot: None,
         ddl: None,
+        truncate: None,
         jsonb_limits,
     };
     execute_query_with_mvcc(env, sql, txn).await
@@ -982,6 +983,9 @@ pub(crate) struct ReadEnv<'a> {
     pub(crate) mvcc: Option<&'a MvccManager>,
     pub(crate) snapshot: Option<&'a MvccSnapshot>,
     pub(crate) ddl: Option<&'a dyn crate::ddl::DdlExecutor>,
+    /// Replicated write path for `TRUNCATE`; `None` refuses the statement with
+    /// `0A000` rather than truncating only this node's replica.
+    pub(crate) truncate: Option<&'a dyn crate::truncate::TruncateExecutor>,
     /// Tunable jsonb ingest limits (D14b), for text coerced into jsonb columns.
     pub(crate) jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
@@ -1096,6 +1100,7 @@ async fn execute_statement(
         default_schema,
         mvcc,
         ddl,
+        truncate,
         jsonb_limits,
         ..
     } = env;
@@ -1174,6 +1179,77 @@ async fn execute_statement(
             )
             .await
         }
+        // TRUNCATE [TABLE] t [, ...]: rows are removed through the **replicated**
+        // cluster write path (the same one CQL `TRUNCATE` uses), never a node-local
+        // truncate — which would empty one replica and leave the others holding the
+        // old data. Refused `0A000` when this front-end has no write path and
+        // `25001` inside a transaction block (it cannot be rolled back).
+        Statement::Truncate(table_list) => {
+            crate::truncate::execute_truncate(
+                crate::truncate::TruncateEnv {
+                    executor: truncate,
+                    schema,
+                    default_schema,
+                    in_txn: txn.is_some(),
+                },
+                &table_list,
+            )
+            .await
+        }
+        // VACUUM: flush the table's memtables down and submit compaction. In an LSM/SSTable
+        // store that IS what VACUUM means — it is not a no-op, and calling it one would be a lie
+        // about a maintenance operation that really does run.
+        //
+        // What it does NOT do, stated plainly:
+        //
+        //   * It does not WAIT for compaction. `force_compact_all` submits tasks and returns, so
+        //     the `VACUUM` tag means "flushed and compaction submitted", not "space reclaimed".
+        //     (Real VACUUM likewise returns before all cleanup is guaranteed.)
+        //   * It does not promise reclamation. Whether tombstoned data is actually dropped depends
+        //     on the purge policy, gated by `compaction_purge_enabled()` in ferrosa-storage; this
+        //     statement neither forces purge on nor claims a specific outcome.
+        //   * `force_compact_all` is the storage engine's only force entry point and it considers
+        //     EVERY table, so a named `VACUUM t` flushes only `t` but submits compaction for all
+        //     tables with at least two SSTables. Maintenance either way, but a real difference
+        //     from PostgreSQL, where `VACUUM t` touches only `t`.
+        Statement::Vacuum(vacuum) => {
+            let targets: Vec<ferrosa_storage::TableId> = match &vacuum.table {
+                Some(named) => {
+                    let found: Vec<ferrosa_storage::TableId> = engine
+                        .registered_table_ids()
+                        .into_iter()
+                        .filter(|id| {
+                            engine
+                                .table_schema(id)
+                                .is_some_and(|schema| schema.table == named.table)
+                        })
+                        .collect();
+                    if found.is_empty() {
+                        return vec![error_response(
+                            "42P01",
+                            &format!("relation \"{}\" does not exist", named.table),
+                        )];
+                    }
+                    found
+                }
+                None => engine.registered_table_ids(),
+            };
+            // Flush first: compaction operates on SSTables, so anything still in memory has to be
+            // pushed down before there is anything to compact.
+            for id in &targets {
+                if let Err(error) = engine.flush(id) {
+                    return vec![write_error_response(&error)];
+                }
+            }
+            engine.force_compact_all();
+            vec![BackendMessage::CommandComplete {
+                tag: "VACUUM".to_string(),
+            }]
+        }
+        // ANALYZE: likewise a deliberate successful no-op — no statistics are collected.
+        Statement::Analyze(_) => vec![BackendMessage::CommandComplete {
+            tag: "ANALYZE".to_string(),
+        }],
         // DML: single-row INSERT / UPDATE / DELETE. The simple-query path has no
         // bound parameters (`&[]`); a `$N` in simple SQL is therefore a fail-loud
         // error (no value to bind). With `txn = Some(buffer)` (an open
@@ -4817,6 +4893,7 @@ mod txn_buffer_tests {
                 mvcc: Some(&mvcc),
                 snapshot: None,
                 ddl: None,
+                truncate: None,
                 jsonb_limits: &limits,
             };
             // txn = None: autocommit, but through the MVCC commit path.
@@ -4862,6 +4939,7 @@ mod txn_buffer_tests {
             mvcc: Some(&mvcc),
             snapshot: None,
             ddl: None,
+            truncate: None,
             jsonb_limits: &limits,
         };
         let msgs = execute_query_with_mvcc(

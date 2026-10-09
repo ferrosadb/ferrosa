@@ -10,6 +10,8 @@
 //! | `SELECT … FROM t [JOIN u]` | `SELECT` on each table read |
 //! | `INSERT` / `UPDATE` / `DELETE` on `t` | `MODIFY` on `t` |
 //! | … `RETURNING` | additionally `SELECT` on `t` (the row is read back) |
+//! | `TRUNCATE [TABLE] t [, …]` | `MODIFY` on EACH `t` (the CQL router's rule) |
+//! | `VACUUM …`, `ANALYZE …` | nothing — a deliberate no-op touches no table |
 //! | `SELECT <exprs>` (no `FROM`), `BEGIN`/`COMMIT`/`ROLLBACK`, `SET`/`RESET` | nothing — no table is touched |
 //!
 //! | `CREATE TABLE` | `CREATE` on the target keyspace |
@@ -101,6 +103,21 @@ pub(crate) fn statement_permissions(
         Statement::CopyFromStdin(copy) => {
             vec![(Permission::Modify, table(&copy.table, default_schema))]
         }
+        // TRUNCATE removes every row of each named table, so it needs MODIFY on
+        // EACH table — the SAME permission the CQL `TRUNCATE` router requires
+        // (`ferrosa-cql/src/router.rs::route_truncate`). Checked per table here,
+        // before the executor looks at the schema, so a denial reveals nothing
+        // about whether a table exists, and the two front ends cannot disagree
+        // about who may empty a table.
+        Statement::Truncate(truncate) => truncate
+            .tables
+            .iter()
+            .map(|t| (Permission::Modify, table(t, default_schema)))
+            .collect(),
+        // VACUUM and ANALYZE are deliberate no-ops that touch no data and read no
+        // rows, so they need no table permission — the same treatment a session
+        // statement gets.
+        Statement::Vacuum(_) | Statement::Analyze(_) => Vec::new(),
         Statement::SelectExprs(_)
         | Statement::Begin { .. }
         | Statement::Commit
@@ -214,6 +231,35 @@ mod tests {
     #[test]
     fn table_free_statements_need_nothing() {
         for sql in ["SELECT 1", "BEGIN", "COMMIT", "ROLLBACK"] {
+            assert!(perms(sql).is_empty(), "{sql}");
+        }
+    }
+
+    #[test]
+    fn truncate_needs_modify_on_every_named_table() {
+        // Parity with the CQL router's `route_truncate` (Permission::Modify).
+        assert_eq!(
+            perms("TRUNCATE TABLE kv"),
+            vec![(Permission::Modify, t("public", "kv"))]
+        );
+        assert_eq!(
+            perms("TRUNCATE public.a, b"),
+            vec![
+                (Permission::Modify, t("public", "a")),
+                (Permission::Modify, t("public", "b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn vacuum_and_analyze_require_no_table_permission() {
+        for sql in [
+            "VACUUM",
+            "VACUUM FULL",
+            "VACUUM ANALYZE kv",
+            "ANALYZE",
+            "ANALYSE kv",
+        ] {
             assert!(perms(sql).is_empty(), "{sql}");
         }
     }

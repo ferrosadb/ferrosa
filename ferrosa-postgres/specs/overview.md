@@ -58,6 +58,8 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `portal_limits` (`src/portal_limits.rs`) | ~380 | `PortalLimits`/`SuspendedPortals`: per-connection and per-node caps on suspended portals (`53000`), idle timeout (`57014`), metrics |
 | `synthetic_key` (`src/synthetic_key.rs`) | ~147 | Mints the per-row v1 TimeUUID value for the synthetic `_sys_ck_` key column of a PK-less table: random per-process node field, monotonic time field, process-local clock sequence |
 | `pg_key` (`src/pg_key.rs`) | ~168 | The **declared** PostgreSQL primary key (`pg.primary_key` extension), which is not the storage key: a PK-less table reports none, and `ALTER TABLE ADD PRIMARY KEY` gives one the storage key does not have |
+| `ddl` (`src/ddl.rs`) | ~823 | PG DDL execution (`CREATE`/`DROP`/`ALTER TABLE`) through the same `ferrosa_cluster::ddl_path::DdlPath` CQL DDL uses |
+| `truncate` (`src/truncate.rs`) | ~150 | `TRUNCATE` over the same `ferrosa_cluster::WritePath` CQL uses (`TruncateExecutor`/`ClusterTruncate`); never a node-local `StorageEngine::truncate` |
 | `lib` (`src/lib.rs`) | ~37 | Module wiring + public re-exports |
 
 ## Connection lifecycle
@@ -130,6 +132,18 @@ through `ferrosa_cluster::ddl_path::DdlPath`, the path CQL DDL uses (Raft in
 cluster mode). `QueryContext.ddl` carries the executor into `ReadEnv`. Parse
 errors map to typed SQLSTATEs (`query::parse_error_sqlstate`). See FMEA
 `PG-T132a-*`.
+
+**TRUNCATE / VACUUM / ANALYZE.** `Statement::Truncate` executes in `truncate.rs`
+through `TruncateExecutor`; the production `ClusterTruncate` calls
+`ferrosa_cluster::WritePath::truncate` — the SAME replicated write path the CQL
+router's `route_truncate` uses — so every node removes the rows (never a
+node-local `StorageEngine::truncate`, which would desync the replicas).
+`QueryContext.truncate` carries the executor into `ReadEnv` beside `ddl`; with no
+executor the statement is refused `0A000`. `Statement::Vacuum` flushes the
+named table's memtables and submits compaction (`force_compact_all`, all tables)
+before answering `CommandComplete "VACUUM"` — asynchronous, and reclamation depends
+on the purge policy, so the tag does not mean "space reclaimed". `Statement::Analyze`
+is answered `"ANALYZE"` and collects no statistics.
 
 `query` renders/parses each `ferrosa_sql::Value` to/from its exact Postgres text
 form and (for most) the binary form, with OIDs/sizes advertised in

@@ -33,6 +33,7 @@ pub mod scram;
 pub mod server;
 pub mod storage_provider;
 pub mod store;
+pub mod truncate;
 
 mod accord_access;
 
@@ -40,6 +41,7 @@ pub use connection::{ConnError, Connection, TlsPolicy};
 pub use ddl::{ClusterDdl, DdlExecutor};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;
+pub use truncate::{ClusterTruncate, TruncateExecutor};
 
 pub use codec::{CodecError, MAX_MESSAGE_LEN};
 pub use messages::{
