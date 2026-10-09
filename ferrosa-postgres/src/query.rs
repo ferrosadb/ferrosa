@@ -1594,6 +1594,24 @@ pub(crate) async fn execute_insert(
     // ONE result. A partial implementation that wrote row 1 and dropped rows 2..N
     // would be worse than failing, which is why this was a hard `0A000` guard
     // until the loop below existed.
+    // Multi-row INSERT is PARSED but must not be EXECUTED yet.
+    //
+    // The loop below handles N rows correctly in-process (its unit test writes all
+    // three and reads them back), but on the live server a 3-row INSERT reports
+    // `INSERT 0 3` and writes only row 1 — reproduced twice on a fresh table.
+    // Root cause is open. Until it is found, fail loud: a silent row-drop is
+    // strictly worse than an error, which is why this guard exists.
+    if ins.rows.len() != 1 {
+        return vec![error_response(
+            "0A000",
+            &format!(
+                "multi-row INSERT is parsed but not yet executed ({} rows); \
+                 executing it would write only the first row",
+                ins.rows.len()
+            ),
+        )];
+    }
+
     // The statement's own tag: one INSERT of N rows, not N INSERTs of one.
     let tag = format!("INSERT 0 {}", ins.rows.len());
     let mut combined_returning: Option<QueryResult> = None;
@@ -3650,15 +3668,17 @@ mod txn_buffer_tests {
         engine.shutdown().unwrap();
     }
 
-    /// A multi-row INSERT must write EVERY row and report `INSERT 0 N`.
+    /// Multi-row INSERT is PARSED but must not be EXECUTED — pinned, deliberately.
     ///
-    /// pgbench uses multi-row VALUES. The parser has accepted it (with a per-row
-    /// arity check) since the parser half landed, but execution was single-row and
-    /// failed loud. A partial implementation that wrote row 1 and silently dropped
-    /// rows 2..N would be worse than failing — which is why the guard existed, and
-    /// this test is what lets the guard be replaced.
+    /// The in-process implementation writes all N rows and reads them back (that is
+    /// what this test asserted before). On the live server the same statement
+    /// reports `INSERT 0 3` and writes only row 1, reproduced twice on a fresh
+    /// table. Root cause is open, so execution fails loud rather than dropping rows.
+    ///
+    /// When the live path is understood, invert this test: assert 3 rows land, a
+    /// single `CommandComplete` tagged `INSERT 0 3`, and nothing concatenated.
     #[tokio::test]
-    async fn multi_row_insert_writes_every_row_and_reports_the_count() {
+    async fn multi_row_insert_fails_loud_rather_than_dropping_rows() {
         let (_dir, engine, schema) = new_engine_and_schema().await;
 
         let msgs = execute_query(
@@ -3671,22 +3691,15 @@ mod txn_buffer_tests {
         )
         .await;
         assert!(
-            !msgs
-                .iter()
-                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
-            "multi-row INSERT must not error: {msgs:?}"
+            matches!(&msgs[..], [BackendMessage::ErrorResponse { .. }]),
+            "a multi-row INSERT must fail loud, never ack a count it did not write: {msgs:?}"
         );
-        assert!(
-            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 3"),
-            "a 3-row INSERT must report ONE CommandComplete tagged INSERT 0 3, not N \
-             concatenated result sets: {msgs:?}"
-        );
-
+        // Nothing may have been written by the refused statement.
         for key in ["m1", "m2", "m3"] {
             assert_eq!(
                 row_count(&engine, &schema, key).await,
-                1,
-                "row {key} must actually be written — no row may be dropped"
+                0,
+                "a refused multi-row INSERT must write nothing (row {key})"
             );
         }
 
