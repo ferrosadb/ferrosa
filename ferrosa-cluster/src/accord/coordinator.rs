@@ -2404,15 +2404,29 @@ impl AccordCoordinatorDriver {
             } else {
                 None
             };
+            let timeout = crate::accord::state_machine::configured_txn_timeout();
             tracing::error!(
                 txn_id = ?txn_id,
                 ?state,
                 owned_write_count = self.write_set.iter().filter(|entry| self.replica_owns_key(self_id, &entry.key)).count(),
-                "accord: coordinator local Apply did not reach Applied before the bounded wait"
+                ?timeout,
+                "accord: coordinator local Apply did not reach Applied within the dependency-wait \
+                 bound — abandoning the transaction (NOT committed; safe to retry)"
             );
-            return Err(AccordDriverError::Network(format!(
-                "coordinator local Apply did not reach Applied (state={state:?})"
-            )));
+            // The LOCAL replica is the one this coordinator must be able to serve
+            // from, and its Apply could not resolve its dependencies inside the
+            // same bound the remote quorum uses. That is the SAME condition as a
+            // failed remote apply quorum, so it must take the same path: roll the
+            // transaction back, release anything parked behind it, and tell the
+            // client it did not commit so it can retry.
+            //
+            // Returning a bare `Network(..)` here — which is what this did before —
+            // bypassed the abandon entirely. The client then received an opaque,
+            // non-retryable failure for a transaction that had never been applied,
+            // which is exactly what stalled the PostgreSQL front end and what the
+            // Jepsen workload could not classify as retryable.
+            self.finalize_no_write().await;
+            return Err(AccordDriverError::TxnAbandoned { timeout });
         }
         let apply_ok = apply_result?;
         if !apply_ok {
