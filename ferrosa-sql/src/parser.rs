@@ -1945,7 +1945,10 @@ mod tests {
             Statement::Insert(ins) => {
                 assert_eq!(ins.table.schema, None);
                 assert_eq!(ins.table.table, "t");
-                assert_eq!(ins.rows, vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]);
+                assert_eq!(
+                    ins.rows,
+                    vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]
+                );
             }
             other => panic!("expected Insert, got {other:?}"),
         }
@@ -2026,7 +2029,10 @@ mod tests {
             parse_statement("INSERT INTO t (id, v) VALUES ($1, $2) RETURNING id, v").unwrap();
         match stmt {
             Statement::Insert(ins) => {
-                assert_eq!(ins.rows, vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]);
+                assert_eq!(
+                    ins.rows,
+                    vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]
+                );
                 assert_eq!(
                     ins.returning,
                     Some(Returning::Columns(vec!["id".to_string(), "v".to_string()]))
@@ -2443,7 +2449,11 @@ mod tests {
 
     #[test]
     fn drop_table_with_no_table_is_a_parse_error() {
-        for sql in ["DROP TABLE", "DROP TABLE IF EXISTS", "DROP TABLE IF EXISTS a,"] {
+        for sql in [
+            "DROP TABLE",
+            "DROP TABLE IF EXISTS",
+            "DROP TABLE IF EXISTS a,",
+        ] {
             assert!(
                 parse_statement(sql).is_err(),
                 "must reject `{sql}` rather than silently dropping nothing"

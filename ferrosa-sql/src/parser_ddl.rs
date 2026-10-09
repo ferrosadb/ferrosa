@@ -9,7 +9,9 @@
 //! Every loop here iterates over the token vector once; there is no recursion.
 
 use super::{ParseError, Parser, Tok};
-use crate::ast::{ColumnDef, CreateTableStmt, DropTableStatement, PgType, Statement, TableRef, UnsupportedClause};
+use crate::ast::{
+    ColumnDef, CreateTableStmt, DropTableStatement, PgType, Statement, TableRef, UnsupportedClause,
+};
 
 /// The one schema a table may be qualified with. Other schemas are refused
 /// (`UnsupportedClause::ForeignSchema`) until schema-to-keyspace mapping exists.

@@ -1779,7 +1779,11 @@ pub(crate) fn dml_param_oids(
 
 /// Collect the `$N` placeholder indices referenced by an `INSERT`'s VALUES.
 pub(crate) fn insert_placeholders(ins: &InsertStmt) -> Vec<usize> {
-    ins.rows.iter().flatten().filter_map(scalar_param_index).collect()
+    ins.rows
+        .iter()
+        .flatten()
+        .filter_map(scalar_param_index)
+        .collect()
 }
 
 /// Collect the `$N` placeholder indices referenced by an `UPDATE` (SET + WHERE).
