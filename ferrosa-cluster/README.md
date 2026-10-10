@@ -750,9 +750,15 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`
   parks a transaction's WHOLE write-set and applies every key on resolve;
   `StorageApplier::apply_writeset` commits all of a txn's partitions in ONE atomic
-  `apply_batch` (all-or-nothing — a failure on any key persists none); idempotency
+  all-or-nothing batch (a failure on any key persists none); idempotency
   is keyed by `(txn_id, partition_key, t)` so writes 2..N of one transaction are
-  never deduped/dropped. **Parked residency is bounded:** a parked write-set whose
+  never deduped/dropped. **The decoded batch is never materialized:** the apply
+  resolves the survivors (idempotency + PostgreSQL MVCC metadata) in a pass that
+  decodes each partition, keeps only its `(txn,key,t)` triple and view index, and
+  drops its rows; the survivors then STREAM through ONE atomic `write_atomic_batch`
+  (`AccordWriteSet: WriteSetSource`), which decodes one partition per visit — so the
+  whole decoded `Vec<BatchOp>` the path used to build first is gone, not merely
+  consumed (FMEA `CL-54`). **Parked residency is bounded:** a parked write-set whose
   payloads reach the staging floor is held as a `ParkedWriteSet::Staged`
   (`Arc<WriteSetSpill>` + per-entry indices) rather than resident bytes, so the
   park keeps a pointer plus indices, not the payload; `parked_residency()` reports

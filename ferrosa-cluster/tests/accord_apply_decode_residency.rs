@@ -41,7 +41,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
-use ferrosa_cluster::accord::apply::{ApplyMutation, EngineStorageApplier, StorageApplier};
+use ferrosa_cluster::accord::apply::{
+    ApplyMutation, EngineStorageApplier, MutationView, StorageApplier,
+};
 use ferrosa_common::accord::{Timestamp, TxnId};
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
@@ -275,7 +277,176 @@ fn apply_writeset_peak_stays_within_the_input_size() {
     );
 }
 
-/// NEGATIVE CONTROL: the guard above MUST be able to fail. Holding a clone of the
+// ---------------------------------------------------------------------------
+// OUTPUT-residency guard: the DECODED-APPLY term
+// ---------------------------------------------------------------------------
+//
+// The two tests above measure the INPUT's residency. They are blind to the other
+// half of the same claim: `apply_writeset_views` also accumulated the whole
+// decoded `Vec<BatchOp>` — one op per row, with a key/keyspace/table clone and an
+// owned restamped row each — and `apply_batch` lowered that into a resident
+// `Vec<Mutation>` BEFORE committing anything. The decoded OUTPUT was therefore
+// resident for the entire write-set even when no input was pinned. That is the
+// largest single term of the measured COMMIT peak: `apply_writeset.decoded`
+// reports +495 MiB over 329 873 ops (~1.5 KB/op) on node1 at N=1 000 114, and the
+// coordinator is then SIGKILLed (exit 137) once the 3.7 GB heap stacks up with the
+// 542 MB spill mmap on a 4 GB node.
+//
+// To isolate the OUTPUT the guard drives the BORROWED entry point:
+// `apply_writeset_borrowed` takes `&[MutationView<'_>]`, so the encoded payloads
+// live in a buffer built BEFORE `measure_peak` arms and are never counted in the
+// window. What the window sees is the DECODED batch plus the engine's own
+// memtable copy — the output term, with the input held constant. A decode that
+// never materializes the whole op list keeps that window near the engine floor; a
+// decode that builds `Vec<BatchOp>` first must push it up by ~the whole input.
+
+/// One encoded mutation frame per entry (raw `Mutation::serialize_into` frames, the
+/// wire shape `apply_writeset_borrowed` decodes), carrying a `ROW_BYTES` cell.
+fn build_payloads(cell_ts: i64) -> Vec<Vec<u8>> {
+    let value = vec![b'x'; ROW_BYTES];
+    (0..N)
+        .map(|i| {
+            let row = Row {
+                clustering: vec![0x00, 0x00, 0x00, 0x01],
+                cells: vec![(0, CellValue::live(value.clone(), cell_ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
+            };
+            let m = Mutation::new(
+                KS.to_string(),
+                TABLE.to_string(),
+                make_key(i),
+                vec![row],
+                cell_ts,
+            );
+            let mut buf = vec![0u8; m.serialized_size()];
+            m.serialize_into(&mut buf);
+            buf
+        })
+        .collect()
+}
+
+/// Decode every payload the way the applier does — the DECODED OUTPUT a
+/// materializing decode would hold resident. Used only by the negative control.
+fn decode_payloads(payloads: &[Vec<u8>], t: Timestamp) -> Vec<Mutation> {
+    payloads
+        .iter()
+        .map(|bytes| {
+            let (storage_data, _) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(bytes).unwrap();
+            Mutation::deserialize_from_rebinding_list_paths(storage_data, t).unwrap()
+        })
+        .collect()
+}
+
+/// Peak additional heap during ONE `apply_writeset_borrowed` of an `N`-entry
+/// write-set whose ENCODED payloads were built outside the window.
+///
+/// `hold_decoded` is the deliberate bug the negative control injects: decode the
+/// whole write-set into a resident `Vec<Mutation>` and hold it across the apply —
+/// exactly the decoded-OUTPUT residency the fix removes.
+fn borrowed_writeset_peak(hold_decoded: bool) -> (i64, i64) {
+    let _guard = MEASURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (engine, dir) = make_engine(if hold_decoded {
+        "borrowed-control"
+    } else {
+        "borrowed-positive"
+    });
+    let applier = EngineStorageApplier::new(engine);
+    let txn = TxnId::new(7, accord_ts(1_000));
+    let t = accord_ts(1_000);
+    // Built OUTSIDE the window: the encoded input is not a term of the measurement.
+    let payloads = build_payloads(1_000);
+    let input_bytes: i64 = payloads
+        .iter()
+        .map(|bytes| i64::try_from(bytes.len()).unwrap())
+        .sum();
+    let views: Vec<MutationView<'_>> = payloads
+        .iter()
+        .map(|bytes| MutationView {
+            data: bytes.as_slice(),
+            t,
+            deps: &[],
+        })
+        .collect();
+    let (_, peak) = measure_peak(|| {
+        if hold_decoded {
+            // NEGATIVE CONTROL: a full decoded copy of the write-set held across
+            // the call — the residency a materializing decode leaves behind.
+            let retained = decode_payloads(&payloads, t);
+            applier
+                .apply_writeset_borrowed(txn, &views)
+                .expect("apply_writeset_borrowed must persist the write-set");
+            std::hint::black_box(&retained);
+        } else {
+            applier
+                .apply_writeset_borrowed(txn, &views)
+                .expect("apply_writeset_borrowed must persist the write-set");
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    (input_bytes, peak)
+}
+
+/// Measure BOTH borrowed paths ONCE and cache `(input_bytes, consuming_peak,
+/// holding_peak)`. The pair is the evidence: a materializing decode makes the
+/// holding path the consuming path plus ~a whole decoded write-set.
+fn measured_borrowed() -> (i64, i64, i64) {
+    static MEASURED: std::sync::OnceLock<(i64, i64, i64)> = std::sync::OnceLock::new();
+    *MEASURED.get_or_init(|| {
+        let (input_bytes, consuming_peak) = borrowed_writeset_peak(false);
+        let (_, holding_peak) = borrowed_writeset_peak(true);
+        (input_bytes, consuming_peak, holding_peak)
+    })
+}
+
+/// `apply_writeset_borrowed` MUST feed the decoded rows into the atomic apply as
+/// it decodes them, never accumulating the whole decoded write-set first. With the
+/// input held constant (and outside the window), a materializing decode makes the
+/// window hold a full extra write-set of decoded rows on top of the engine's own
+/// copy; a streaming decode holds only the engine's.
+#[test]
+fn apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident() {
+    let (input_bytes, consuming_peak, holding_peak) = measured_borrowed();
+    eprintln!(
+        "borrowed decoded-output residency: N={N} row_bytes={ROW_BYTES} input={input_bytes} B, \
+         consume-peak={consuming_peak} B ({:.2}x input), hold-peak={holding_peak} B ({:.2}x input)",
+        consuming_peak as f64 / input_bytes as f64,
+        holding_peak as f64 / input_bytes as f64,
+    );
+    assert!(
+        consuming_peak * 2 <= input_bytes * 3,
+        "REGRESSION: apply_writeset_borrowed holds the whole DECODED write-set resident while \
+         committing it — the window (input excluded) peaked at {consuming_peak} B for a \
+         {input_bytes} B write-set ({:.2}x input). Streaming decode feeds each op into the atomic \
+         apply as it decodes, so the window must stay at the engine's own copy, not the whole \
+         decoded set on top of it.",
+        consuming_peak as f64 / input_bytes as f64
+    );
+}
+
+/// NEGATIVE CONTROL: the guard above MUST be able to fail. Materializing the whole
+/// decoded write-set and holding it across the call re-introduces exactly the
+/// residency the fix removes, so it MUST push the window at least ~a write-set
+/// above the streaming path. If this stops separating, the guard has gone blind to
+/// the decoded output and proves nothing.
+#[test]
+fn a_materialized_decoded_batch_trips_the_residency_guard() {
+    let (input_bytes, consuming_peak, holding_peak) = measured_borrowed();
+    let input = input_bytes.max(1);
+    eprintln!(
+        "negative control (decoded output): input={input_bytes} B, consume-peak={consuming_peak} B, \
+         hold-peak={holding_peak} B, separation={} B",
+        holding_peak - consuming_peak
+    );
+    assert!(
+        holding_peak * 2 > input * 3,
+        "the decoded-output guard is blind: materializing the whole decoded write-set did NOT \
+         push the window above 1.5x the input (input={input_bytes} B, consume-peak={consuming_peak} \
+         B, hold-peak={holding_peak} B). The guard no longer measures the decoded output."
+    );
+}
+
 /// write-set across the call re-introduces exactly the residency the fix removes,
 /// so it MUST separate the pinning peak from the consuming peak by ~the input's
 /// size. If this test ever stops seeing that separation, the guard has gone blind
