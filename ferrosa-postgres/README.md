@@ -113,7 +113,13 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   and the distributed map and is never bounded by SIZE, so a very large single load
   retains roughly 1.8 KB per key after commit; see `PG-ACC-02` in `specs/fmea.md`. The
   commit path builds the Accord write-set in one streaming pass with a per-commit table
-  codec, so it holds no whole-table row images and reads each row once. The
+  codec, so it holds no whole-table row images and reads each row once. Per mutation
+  the cost is bounded too: the table identity used as the per-table cache key is an
+  interned `Arc<str>` pair, rebuilt only when the table changes (a bulk load writes one
+  table at a time) rather than two `String` clones per mutation; one serialize buffer is
+  reused across the whole write-set instead of a fresh zeroed `Vec` per mutation; and the
+  mutation's partition-key bytes plus each row-version SQL key and partition value are
+  MOVED out of the consumed mutation and its per-mutation map instead of cloned. The
   buffered write set defaults to a 10,000 mutation cap, and each storage scan
   defaults to a 64-row channel; both are startup-configurable. PostgreSQL also
   expires active snapshots past a configurable maximum age so old transactions

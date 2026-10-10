@@ -43,6 +43,32 @@ memory by sending SEQUENTIALLY made the coordinator pay the SUM of replica apply
 latencies instead of the MAX, which measured as 57% of a large commit. Hence the
 test asserts both — peak in-flight > 1 and <= the window. See FMEA `CL-50`.
 
+The coordinator's own replica apply runs inside the SAME `tokio::join!` as the
+remote fan-out and the local dependency wait, so the Apply phase pays
+`max(local, remote)` instead of `local + remote`. It used to run serially ahead of
+the fan-out (measured 889 ms at N=100 000). See FMEA `CL-51`.
+
+A large write-set is **staged in local temp storage**: `drive_accord` pushes the
+transaction's encoded mutation payloads through `ferrosa_storage::WriteSetSpill`
+once they cross an 8 MiB floor and hands the driver `with_spilled_write_set`, so
+the resident write-set is the KEYS (Accord's conflict ordering and the per-shard
+participant set need them) plus a ~1.2 MB offset index at N=100 000 — never the
+~51 MB payload bulk. The fan-out and the coordinator's own apply resolve each
+payload through `entry_mutation`, so a staged entry's empty `mutation` never
+reaches the wire; small write-sets stay wholly resident. See FMEA `CL-51` and
+`ferrosa-storage`'s `write_set_spill`.
+
+When the write-set is the **same for every peer** — no per-key resolver, or every
+key resolving to the same replica set (the `RF == node count` shape) — the payload
+is built and `bincode`-serialized ONCE (`ApplyV2PayloadRef` borrows the write-set, so
+not even one clone is materialized) and the resulting frame is handed to each peer
+by refcount. That removes N-1 write-set copies, N-1 staged-payload re-reads and N-1
+whole-frame serializations from Apply. A genuinely per-peer write-set (a token-aware
+ring with `RF < node count`) still gets its OWN scoped frame and never a shared one —
+sharing a frame across scopes would put a key on a peer that does not own it. The
+`FERROSA_PG_COMMIT_PROFILE` fan-out line reports `frame_bytes` (the largest frame on
+the wire, which is what the Data-lane wait bound is spent on) and `shared_frame`.
+
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and
 > simulated-nemesis). There is **no external/public Jepsen run yet** — the
