@@ -34,7 +34,17 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 ## Not yet supported (fail-loud gaps)
 
 - `UPDATE`/`DELETE … RETURNING` → `0A000` (only `INSERT … RETURNING` is wired).
-- `ON CONFLICT` (upsert) → parse error; multi-row `INSERT … VALUES (…),(…)`.
+- `ON CONFLICT` (upsert) → parse error; multi-row `INSERT … VALUES (…),(…)` is
+  parsed but REFUSED `0A000` at execution. It is refused, not unimplemented: a
+  live 3-node cluster reported `INSERT 0 2` while persisting one row, so the
+  statement fails loud rather than announce a count it did not write. A real
+  clustered repro attempt (3 Accord nodes + real storage + real PG wire, the
+  exact statement) did **not** reproduce the loss — see
+  `tests/pg_multirow_cluster_rowdrop.rs` and the work item
+  `specs/todo/postgres-frontend/in-process/feat-pgbench-compat-surface.md`.
+  Still to build: the same test over a REAL internode transport (the one
+  component the harness elides), with `is_apply_ok`'s empty-body `AccordApplyOK`
+  acceptance the first thing to audit.
 - `= ANY($N)` / IN-list parameter expansion.
 - `UPDATE`/`DELETE` with a non-key or range `WHERE` (only full-PK equality).
 - **Full PostgreSQL strict-serializability scope is not yet verified** — the
@@ -102,6 +112,13 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
   RETURNING` fail-loud, and extended-protocol DML inside a transaction
   (BEGIN/INSERT RETURNING/ROLLBACK discards; BEGIN/INSERT/COMMIT applies via
   Accord, including cross-node snapshot and predicate-conflict cases).
+- `tests/pg_multirow_cluster_rowdrop.rs` — a REAL 3-node cluster (3 independent
+  `AccordStateMachine`s + 3 `StorageEngine`s + 3 PG wire listeners) driven by the
+  real `AccordTransactionCommitter`. Pins the multi-row `INSERT` fail-loud guard
+  at the cluster boundary, and characterizes that a multi-key commit persists
+  every key on every owner in both the RF=3 and RF=1-one-shard-per-key topologies.
+  It documents the row-drop **non-reproduction**: this is the test to flip to
+  `INSERT 0 2` once the live loss is reproduced behind the real transport.
 - `server::txn_atomicity_tests` — local PostgreSQL MVCC snapshots, read-your-
   writes, serializable conflicts, phantoms, rollback, and extended protocol.
 - in-crate unit tests for codecs, SQLSTATE mapping, SCRAM vectors, the R15

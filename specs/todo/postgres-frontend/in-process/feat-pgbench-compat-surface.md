@@ -111,6 +111,56 @@ multi-mutation batch before suspecting the SQL layer again.
 assert one `CommandComplete` tagged `INSERT 0 3`, three rows landed, each carrying its
 own value.
 
+### CLUSTERED REPRO ATTEMPT — NOT REPRODUCED (2026-10-09)
+
+A real multi-node clustered test now exists and **does not reproduce the loss**:
+`ferrosa-postgres/tests/pg_multirow_cluster_rowdrop.rs`. It stands up 3 independent
+Accord nodes — each with a real `AccordStateMachine`, a real `StorageEngine`, a real
+`AccordHandler`, and its own real PG wire listener — wired to the real
+`AccordTransactionCommitter` (`commit_postgres`). Only the peer *socket* is elided (an
+in-process transport routes every message to the addressee's real handler); the
+protocol, state machines, storage, SQL layer and PG front end are the production ones.
+
+What was tried, and what was observed:
+
+| # | Experiment | Result |
+|---|---|---|
+| 1 | **The exact live statement, guard lifted**: `INSERT INTO users (id,name) VALUES (201,'m-one'),(202,'m-two')` over a native `tokio-postgres` client to node 0, RF=3 (every key on all three nodes), implicit transaction → `commit_postgres` → Accord. | client received **`INSERT 0 2`**, and **both rows were readable from ALL THREE nodes**. 3/3 runs. No drop. |
+| 2 | Same statement, RF=1 **one shard per key** (each row owned by a *different* node — the multi-shard shape of a real ring). | both rows present on their owners. No drop. |
+| 3 | Direct committer-level multi-key commit (two raw key mutations) on the same cluster, RF=3 and RF=1. | every key lands on every owning replica once the post-quorum apply converges (bounded 5 s window). No drop. |
+
+Accord's apply is asynchronous: the coordinator returns at apply **quorum**, and a
+non-quorum replica applies in the background — experiment 3 needed that bounded window
+to see the third replica, which is normal Accord, not divergence.
+
+**Conclusion.** The multi-node apply path *below* `ferrosa-postgres` persists every key
+of an N-key write-set on a real 3-node cluster, in both the single-shard (RF=3) and the
+multi-shard (RF=1-per-key) topology. The live row-drop is **not** reproduced, so the
+`0A000` guard stays: a silently dropped row announced as `INSERT 0 N` is still strictly
+worse than an error. No speculative fix is applied — the SQL/MVCC/buffered-write-set
+hypotheses stay disproved and the clustered apply path is now shown correct too.
+
+**Next concrete hypothesis — the real internode transport.** The one component the
+harness elides is the real wire: `PeerManager`/TCP lanes with connection pools,
+per-lane timeouts, retries, and the `AccordAccess::live` committer factory (gated on
+`WritePath::Cluster`). Everything above the socket is already exercised. The next step
+is to stand up real `RpcServer`s on loopback with the Accord `MsgType`s registered and a
+real `PeerManager` transport — the exact shape `tests/range_scan_multi_replica_paging.rs`
+already uses for range reads — and drive the same statement. The specific thing to audit
+there is the one place a transport anomaly can satisfy a shard quorum **without** the
+write being applied: `is_apply_ok` in `coordinator.rs` accepts an **empty-body**
+`AccordApplyOK` (`b.is_empty()`) as an ack for *any* transaction, so a stale/duplicate/
+misrouted empty ack can count a shard as applied when it was not. If the loss appears
+only behind the real transport, look there first.
+
+Re-run the whole-statement experiment with the guard temporarily lifted (`if false &&`
+on the `rows.len() != 1` check in `execute_insert`) and:
+
+```
+cargo test -p ferrosa-postgres --test pg_multirow_cluster_rowdrop -- --nocapture
+```
+
+
 ### PK-less CREATE TABLE: use a synthetic incrementing-id column at position 0
 
 `CREATE TABLE` with no PRIMARY KEY is refused (`MissingPrimaryKey` -> 0A000), and that is
