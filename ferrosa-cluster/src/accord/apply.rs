@@ -58,6 +58,32 @@ impl std::error::Error for ApplyError {}
 ///
 /// For Gap 5, this is an opaque byte vector. The production implementation
 /// will decode it as a `(TableId, DecoratedKey, Row)` triple.
+///
+/// `data` is **owned**, and that is a contract rather than an accident. The apply
+/// seam runs the coordinator's payload on a `'static` blocking task, and the
+/// dep-wait engine PARKS a whole write-set across calls when a dependency is
+/// unresolved (see [`DepWaitApplier::try_apply_writeset`]), so the bytes must
+/// outlive the call that produced them. A borrowed payload satisfies neither, and
+/// the obstruction is a compile error rather than a runtime hazard — a closure
+/// capturing a borrow of the payload cannot satisfy the `'static` bound a blocking
+/// apply task imposes:
+///
+/// ```compile_fail
+/// // The coordinator's local-apply payload is dispatched through a blocking task
+/// // (tokio::task::spawn_blocking), which requires the closure AND its captures to
+/// // be `'static`. A borrow sliced out of a local buffer does not qualify — so a
+/// // `&[u8]` payload cannot reach the apply seam.
+/// let owned = vec![1u8, 2, 3];
+/// let borrowed: &[u8] = &owned;
+/// std::thread::spawn(move || borrowed.len());
+/// // error[E0597]: `owned` does not live long enough
+/// //   ... argument requires that `owned` is borrowed for `'static`
+/// ```
+///
+/// (This is why `ferrosa-cluster`'s coordinator reads a STAGED write-set entry back
+/// into an owned `Vec<u8>` for its own local apply, even though the Apply fan-out
+/// borrows the very same bytes out of the spill's memory map — see
+/// `AccordCoordinatorDriver::entry_mutation`.)
 #[derive(Clone)]
 pub struct ApplyMutation {
     /// Serialized mutation payload (table_id + key + row + etc).

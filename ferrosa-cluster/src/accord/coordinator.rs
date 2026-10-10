@@ -1159,6 +1159,39 @@ impl AccordCoordinatorDriver {
     ///
     /// Reads the staged bytes when the write-set is spilled, else clones the resident
     /// entry — so every Apply caller is written once and works on both paths.
+    ///
+    /// # Why this stays OWNED at the local-apply seam
+    ///
+    /// Unlike [`Self::borrowed_write_set_entries`] (the Apply **fan-out**, where each
+    /// entry resolves to a slice of the spill's memory map and copies NOTHING), the
+    /// coordinator's **own local apply** cannot borrow a slice out of that mapping.
+    /// Its consumer genuinely requires owned bytes, for two independent structural
+    /// reasons — this is a contract, not an accident:
+    ///
+    /// 1. **The state-machine dispatch is `'static`.** The resolved payloads are
+    ///    handed to `crate::accord::handlers::on_state_machine`, which runs the
+    ///    caller's closure on `tokio::task::spawn_blocking` and therefore requires
+    ///    `F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static`. A closure that
+    ///    captured a borrow of the spill mapping is not `'static` and does not
+    ///    compile (`error[E0597]: ... does not live long enough ... requires that ...
+    ///    is borrowed for 'static`). The blocking pool is not incidental — every
+    ///    Apply step fsyncs the protocol log while holding the state machine's mutex,
+    ///    which must not run on an async worker (it froze the runtime; see
+    ///    `on_state_machine`'s doc), so the dispatch cannot be scoped to the borrow's
+    ///    lifetime.
+    /// 2. **The dep-wait engine RETAINS the bytes past the call.** These bytes are
+    ///    applied through
+    ///    [`crate::accord::state_machine::AccordStateMachine::handle_apply_writeset`]
+    ///    → [`crate::accord::apply::DepWaitApplier::try_apply_writeset`], which PARKS
+    ///    the WHOLE write-set in its `pending` map when a dependency is unresolved and
+    ///    applies it on a **later** call when that dependency resolves. The payload
+    ///    must outlive the coordinator's call, so it cannot be a borrow of the mmap
+    ///    the coordinator is about to release.
+    ///
+    /// Both reasons pin [`crate::accord::apply::ApplyMutation::data`] to owned bytes,
+    /// so a borrow here would either fail to type-check or dangle. The staged entry is
+    /// therefore read back into a fresh `Vec<u8>` per owned key, exactly once, for this
+    /// replica's shard only. The FAN-OUT (the bulk of the bytes) remains zero-copy.
     fn entry_mutation(&self, index: usize) -> Result<Vec<u8>, AccordDriverError> {
         match &self.write_blobs {
             Some(blobs) => blobs

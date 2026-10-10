@@ -147,6 +147,24 @@ mapping plus the staging file are released on the LAST drop of that `Arc`
 (`WriteSetSpill` declares `map` before the temp-dir reservation, so it unmaps before
 the directory is removed).
 
+**The coordinator's OWN local apply does not borrow — and cannot.** The fan-out above
+is zero-copy, but the coordinator's self-apply resolves each owned entry back into an
+owned `Vec<u8>` (`entry_mutation`) because its consumer genuinely requires owned bytes,
+for two independent structural reasons. (1) The payload is dispatched through
+`handlers::on_state_machine`, which runs the caller's closure on
+`tokio::task::spawn_blocking` and therefore demands `F: FnOnce(&mut AccordStateMachine)
+-> R + Send + 'static` — a closure capturing a borrow of the spill mapping is not
+`'static` and does not compile (`error[E0597]: ... is borrowed for 'static`). The
+blocking pool is load-bearing (the apply fsyncs the protocol log under the state
+machine's mutex, which must not run on an async worker), so the dispatch cannot be
+scoped to the borrow's lifetime. (2) `DepWaitApplier::try_apply_writeset` PARKS the
+whole write-set in its `pending` map when a dependency is unresolved and applies it on
+a LATER call, so the bytes must outlive the coordinator's call regardless. A borrow is
+therefore impossible without putting the fsync back on the async worker or
+lifetime-parameterising the shared apply engine across replicas. The
+`ApplyMutation::data` doc carries a `compile_fail` doctest pinning the `'static`
+obstruction; see `coordinator.rs::entry_mutation` for the full argument.
+
 **Version skew.** A peer that did not advertise `CAP_ACCORD_APPLY_REGION` receives
 the capnp-inline `AccordApplyV2Capnp` frame (if it advertised `CAP_ACCORD_CAPNP`) or
 the bincode `AccordApplyV2` frame (if it did not) — never a type byte it would reject.
