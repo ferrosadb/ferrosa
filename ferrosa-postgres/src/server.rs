@@ -942,116 +942,54 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
             Err(error)
         } else {
-            let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations);
-            match changes {
-                Err(error) => Err(error),
-                Ok(changes) => {
-                    let mut changes_by_partition =
-                        std::collections::HashMap::<Vec<u8>, Vec<_>>::new();
-                    for change in changes {
-                        changes_by_partition
-                            .entry(change.partition_key.clone())
-                            .or_default()
-                            .push(change);
-                    }
-                    let accord_writes = mutations
-                                  .iter()
-                                  .map(|mutation| {
-                                      let mut bytes = vec![0; mutation.serialized_size()];
-                                      mutation.serialize_into(&mut bytes);
-                                      let partition_key = mutation.key.key.as_bytes().to_vec();
-                                      let metadata = changes_by_partition.remove(&partition_key);
-                                      let mutation_bytes = match metadata {
-                                          Some(changes) => {
-                                              let metadata = serde_json::to_vec(&changes).map_err(|error| {
-                                                  MvccCommitError::Storage(ferrosa_common::Error::InvalidData(
-                                                      format!("serialize PostgreSQL MVCC row versions: {error}"),
-                                                  ))
-                                              })?;
-                                              ferrosa_storage::accord::encode_postgres_mvcc_mutation(
-                                                  &bytes,
-                                                  &metadata,
-                                              )
-                                              .map_err(|error| {
-                                                  MvccCommitError::Storage(
-                                                      ferrosa_common::Error::InvalidData(error),
-                                                  )
-                                              })?
-                                          }
-                                          None => bytes,
-                                      };
-                                      Ok(ferrosa_storage::accord::TransactionWrite {
-                                          keyspace: mutation.keyspace.clone(),
-                                          key: partition_key,
-                                          mutation: mutation_bytes,
-                                      })
-                                  })
-                                  .collect::<Result<Vec<_>, MvccCommitError>>()
-                                  .and_then(|writes| {
-                                      if changes_by_partition.is_empty() {
-                                          Ok(writes)
-                                      } else {
-                                          Err(MvccCommitError::Storage(
-                                              ferrosa_common::Error::InvalidData(format!(
-                                                  "{} PostgreSQL row version(s) were not attached to an Accord partition",
-                                                  changes_by_partition.values().map(Vec::len).sum::<usize>()
-                                              )),
-                                          ))
-                                      }
-                                  });
-                    let accord_writes = match accord_writes {
-                        Ok(writes) => writes,
-                        Err(error) => {
-                            session.end_txn();
-                            return vec![query::error_response(
-                                "58000",
-                                &format!("transaction commit failed: {error:?}"),
-                            )];
-                        }
-                    };
-                    let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
+            // One streaming pass builds the Accord write-set: each partition's
+            // row-version metadata is produced, encoded and handed off as the
+            // mutation is visited, so no whole-table row-image map and no
+            // per-partition re-grouping map exist at the COMMIT peak. `mutations`
+            // is consumed here; the raw whole-table write-set is therefore gone by
+            // the time Accord runs, instead of staying resident alongside
+            // `accord_writes` for the whole PreAccept/Commit/Apply sequence.
+            let accord_writes =
+                match query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations) {
+                    Ok(writes) => writes,
+                    Err(error) => {
                         session.end_txn();
                         return vec![query::error_response(
                             "58000",
-                            "cluster PostgreSQL transaction has no Accord snapshot timestamp",
+                            &format!("transaction commit failed: {error:?}"),
                         )];
-                    };
-                    let tables = write_tables.iter().cloned().collect();
-                    // `mutations` has been fully encoded into `accord_writes`; the
-                    // Accord protocol below never reads it again. Without this the
-                    // raw whole-table write-set stays resident for the entire
-                    // PreAccept/Commit/Apply sequence — a second full copy of the
-                    // transaction alongside `accord_writes`.
-                    drop(mutations);
-                    match committer
-                        .commit_postgres(
-                            &ctx.default_schema,
-                            accord_writes,
-                            tables,
-                            cluster_snapshot,
-                        )
-                        .await
-                    {
-                        Ok(ferrosa_storage::accord::CommitOutcome::Committed) => {
-                            Ok(ctx.mvcc.current_commit_seq())
-                        }
-                        Ok(ferrosa_storage::accord::CommitOutcome::Aborted { .. }) => {
-                            Err(MvccCommitError::SerializationFailure)
-                        }
-                        // Accord's `CommitError` is itself only a `reason: String`,
-                        // so the typed error is already gone by the time it
-                        // reaches here — a THIRD erasure, in the committer trait,
-                        // too deep to widen in this change. Wrapping the reason in
-                        // `InvalidData` at least reaches `is_backpressure()`'s
-                        // documented string branch (`starts_with("overloaded:")`),
-                        // which matches `Error::Overloaded`'s Display, so a
-                        // distributed commit refused for pressure can still be
-                        // classified. Best-effort by construction, not by accident.
-                        Err(error) => Err(MvccCommitError::Storage(
-                            ferrosa_common::Error::InvalidData(error.reason),
-                        )),
                     }
+                };
+            let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
+                session.end_txn();
+                return vec![query::error_response(
+                    "58000",
+                    "cluster PostgreSQL transaction has no Accord snapshot timestamp",
+                )];
+            };
+            let tables = write_tables.iter().cloned().collect();
+            match committer
+                .commit_postgres(&ctx.default_schema, accord_writes, tables, cluster_snapshot)
+                .await
+            {
+                Ok(ferrosa_storage::accord::CommitOutcome::Committed) => {
+                    Ok(ctx.mvcc.current_commit_seq())
                 }
+                Ok(ferrosa_storage::accord::CommitOutcome::Aborted { .. }) => {
+                    Err(MvccCommitError::SerializationFailure)
+                }
+                // Accord's `CommitError` is itself only a `reason: String`,
+                // so the typed error is already gone by the time it
+                // reaches here — a THIRD erasure, in the committer trait,
+                // too deep to widen in this change. Wrapping the reason in
+                // `InvalidData` at least reaches `is_backpressure()`'s
+                // documented string branch (`starts_with("overloaded:")`),
+                // which matches `Error::Overloaded`'s Display, so a
+                // distributed commit refused for pressure can still be
+                // classified. Best-effort by construction, not by accident.
+                Err(error) => Err(MvccCommitError::Storage(
+                    ferrosa_common::Error::InvalidData(error.reason),
+                )),
             }
         }
     } else {
@@ -2918,6 +2856,83 @@ pub(crate) mod txn_atomicity_tests {
             &metadata_batch,
         )
         .unwrap();
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// The cluster COMMIT now builds its Accord write-set in ONE streaming pass
+    /// (`prepare_accord_writes`) instead of a whole-table `Vec<RowChange>` plus a
+    /// `changes_by_partition` re-grouping. The output must be **identical** to the
+    /// old path, partition by partition: same write order, same storage bytes, and
+    /// the same JSON row-version metadata attached to each partition.
+    #[tokio::test]
+    async fn streaming_accord_writes_match_prepare_row_changes_per_partition() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut writer = Session::new(superuser());
+        execute_simple(&ctx, &mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        for i in 0..8 {
+            execute_simple(
+                &ctx,
+                &mut writer,
+                &format!("INSERT INTO kv (k, v) VALUES ('stream-{i}', 'v-{i}')"),
+            )
+            .await;
+        }
+        let mutations: Vec<_> = writer
+            .take_txn_writes()
+            .into_iter()
+            .map(|write| write.0)
+            .collect();
+        assert_eq!(mutations.len(), 8);
+
+        // Old path: whole-table row images, then grouped by partition bytes.
+        let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
+        let mut by_partition: std::collections::HashMap<Vec<u8>, Vec<crate::mvcc::RowChange>> =
+            std::collections::HashMap::new();
+        for change in changes {
+            by_partition
+                .entry(change.partition_key.clone())
+                .or_default()
+                .push(change);
+        }
+
+        // New path: one streaming pass, no whole-table map.
+        let writes =
+            query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations.clone()).unwrap();
+        assert_eq!(
+            writes.len(),
+            mutations.len(),
+            "one Accord write per buffered mutation, in order"
+        );
+
+        for (write, mutation) in writes.iter().zip(&mutations) {
+            let partition_key = mutation.key.key.as_bytes().to_vec();
+            assert_eq!(
+                write.key, partition_key,
+                "write order must follow mutation order"
+            );
+            let expected = by_partition
+                .get(&partition_key)
+                .expect("every buffered partition has a row-version entry");
+
+            let (storage, metadata) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
+                    .expect("the streaming path must emit a valid MVCC envelope");
+            let metadata = metadata.expect("a data row partition carries row-version metadata");
+            let got: Vec<crate::mvcc::RowChange> = serde_json::from_slice(metadata).unwrap();
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                serde_json::to_string(expected).unwrap(),
+                "per-partition row-version metadata must be byte-identical to the whole-table path"
+            );
+
+            let mut bytes = vec![0; mutation.serialized_size()];
+            mutation.serialize_into(&mut bytes);
+            assert_eq!(
+                storage,
+                bytes.as_slice(),
+                "the storage mutation must survive the streaming path unchanged"
+            );
+        }
         ctx.engine.shutdown().unwrap();
     }
 

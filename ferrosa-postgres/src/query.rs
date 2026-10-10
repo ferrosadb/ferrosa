@@ -47,6 +47,7 @@ use crate::mvcc::{
     MvccCommitError, MvccManager, MvccSnapshot, PgWrite, RowChange, DEFAULT_MAX_TXN_WRITES,
 };
 use crate::result_stream::{open_stream, ResultStream};
+use crate::storage_provider::TableCodec;
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 use crate::synthetic_key::next_synthetic_key;
 
@@ -1669,13 +1670,28 @@ pub(crate) fn prepare_row_changes(
         let mut partition_keys: std::collections::HashMap<Vec<SqlValue>, Vec<u8>> =
             std::collections::HashMap::new();
         let mut touched_tables = std::collections::HashSet::new();
+        // One decode projection per table, not one per row: `read_row_image` used
+        // to rebuild the declared names, parsed types and key indices on every
+        // call, which a 1.1M-row commit paid 1.1M times.
+        let mut codecs: std::collections::HashMap<(String, String), TableCodec> =
+            std::collections::HashMap::new();
         for mutation in mutations {
             let table = (mutation.keyspace.clone(), mutation.table.clone());
             touched_tables.insert(table.clone());
+            if !codecs.contains_key(&table) {
+                codecs.insert(
+                    table.clone(),
+                    TableCodec::build(&mutation.keyspace, &mutation.table, schema)
+                        .map_err(ferrosa_common::Error::InvalidData)?,
+                );
+            }
+            let codec = codecs
+                .get(&table)
+                .expect("codec was just inserted for this table");
             for row in &mutation.rows {
                 let before = crate::storage_provider::read_row_image(
                     engine,
-                    schema,
+                    codec,
                     mutation,
                     &row.clustering,
                 )
@@ -1696,17 +1712,23 @@ pub(crate) fn prepare_row_changes(
             }
         }
         for (keyspace, table) in touched_tables {
+            let codec = codecs
+                .get(&(keyspace.clone(), table.clone()))
+                .expect("a touched table always has a codec");
             let overlay = table_rows
                 .entry((keyspace.clone(), table.clone()))
                 .or_default();
             crate::storage_provider::apply_pending_writes_with_partition_keys(
                 engine,
-                schema,
+                codec,
                 &keyspace,
                 &table,
                 overlay,
                 mutations.iter(),
-                Some(&mut partition_keys),
+                crate::storage_provider::ApplyOutputs {
+                    partition_keys: Some(&mut partition_keys),
+                    before_images: None,
+                },
             )
             .map_err(|error| {
                 ferrosa_common::Error::InvalidData(format!(
@@ -1736,6 +1758,127 @@ pub(crate) fn prepare_row_changes(
         Ok(changes)
     })()
     .map_err(MvccCommitError::Storage)
+}
+
+/// Build a PostgreSQL `COMMIT`'s Accord write-set in **ONE streaming pass**,
+/// without materializing whole-table row images.
+///
+/// The former shape called [`prepare_row_changes`], which built whole-table
+/// images (`table_rows`, a duplicated `before_rows`, a global `partition_keys`)
+/// and returned them as a `Vec<RowChange>` — one entry per row, each carrying its
+/// before *and* after image — which the caller then re-grouped into a
+/// `changes_by_partition` map. For the `pgbench -i --scale 10` shape (1.1M rows in
+/// one transaction) that is four to five simultaneous full copies of the write-set
+/// on the coordinator's COMMIT peak, which is what OOM-killed the node. None of
+/// them is required: a `Mutation` **is** one storage partition, so its row
+/// versions belong to that partition alone and can be encoded and handed to the
+/// committer as the mutation is visited.
+///
+/// The only cross-mutation state that must survive is the per-table overlay —
+/// and only because a transaction may write the same SQL key twice, in which case
+/// its later write must build on its earlier one. The resident row-image count is
+/// therefore O(one mutation + the overlay), never O(rows x copies).
+///
+/// The emitted `TransactionWrite` order matches the input mutation order, and the
+/// per-partition metadata is identical to
+/// `prepare_row_changes`-then-group for a write-set whose SQL keys are distinct —
+/// the transactional `COPY` case, and every case except a transaction that writes
+/// one key twice, where this streams each intermediate row image rather than only
+/// the final one (a duplicate-key write-set is last-write-wins at the MVCC apply
+/// anyway; see `record_applied_accord_commit`).
+pub(crate) fn prepare_accord_writes(
+    engine: &StorageEngine,
+    schema: &Schema,
+    mutations: Vec<Mutation>,
+) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError> {
+    use ferrosa_storage::accord::TransactionWrite;
+
+    type TableKey = (String, String);
+    let mut codecs: std::collections::HashMap<TableKey, TableCodec> =
+        std::collections::HashMap::new();
+    let mut overlays: std::collections::HashMap<
+        TableKey,
+        std::collections::HashMap<Vec<SqlValue>, Option<Row>>,
+    > = std::collections::HashMap::new();
+    let mut writes: Vec<TransactionWrite> = Vec::with_capacity(mutations.len());
+
+    for mutation in mutations {
+        let table: TableKey = (mutation.keyspace.clone(), mutation.table.clone());
+        let mut bytes = vec![0; mutation.serialized_size()];
+        mutation.serialize_into(&mut bytes);
+        let partition_key = mutation.key.key.as_bytes().to_vec();
+
+        // A table tombstone (`TRUNCATE`) marker carries no row image; the cluster
+        // committer routes it to every serving node at CL=ALL from its own bytes.
+        if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
+            writes.push(TransactionWrite {
+                keyspace: mutation.keyspace,
+                key: partition_key,
+                mutation: bytes,
+            });
+            continue;
+        }
+
+        let codec = match codecs.entry(table.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                TableCodec::build(&table.0, &table.1, schema).map_err(|error| {
+                    MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error))
+                })?,
+            ),
+        };
+        let overlay = overlays.entry(table.clone()).or_default();
+        // Scoped to this one mutation; dropped at the end of the iteration.
+        let mut before_images: std::collections::HashMap<Vec<SqlValue>, Option<Row>> =
+            std::collections::HashMap::new();
+        let mut partition_keys: std::collections::HashMap<Vec<SqlValue>, Vec<u8>> =
+            std::collections::HashMap::new();
+        crate::storage_provider::apply_pending_writes_with_partition_keys(
+            engine,
+            codec,
+            &table.0,
+            &table.1,
+            overlay,
+            std::iter::once(&mutation),
+            crate::storage_provider::ApplyOutputs {
+                partition_keys: Some(&mut partition_keys),
+                before_images: Some(&mut before_images),
+            },
+        )
+        .map_err(|error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)))?;
+
+        // Encode this partition's row-version metadata now, while only its own
+        // images are resident, and never keep the `RowChange` list.
+        let mutation_bytes = if partition_keys.is_empty() {
+            bytes
+        } else {
+            let changes: Vec<RowChange> = partition_keys
+                .keys()
+                .map(|key| RowChange {
+                    table: format!("{}.{}", table.0, table.1),
+                    key: key.clone(),
+                    partition_key: partition_key.clone(),
+                    before: before_images.get(key).cloned().flatten(),
+                    after: overlay.get(key).cloned().flatten(),
+                })
+                .collect();
+            let metadata = serde_json::to_vec(&changes).map_err(|error| {
+                MvccCommitError::Storage(ferrosa_common::Error::InvalidData(format!(
+                    "serialize PostgreSQL MVCC row versions: {error}"
+                )))
+            })?;
+            ferrosa_storage::accord::encode_postgres_mvcc_mutation(&bytes, &metadata).map_err(
+                |error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)),
+            )?
+        };
+
+        writes.push(TransactionWrite {
+            keyspace: mutation.keyspace,
+            key: partition_key,
+            mutation: mutation_bytes,
+        });
+    }
+    Ok(writes)
 }
 
 /// Resolve a DML scalar to a concrete [`SqlValue`], substituting bound

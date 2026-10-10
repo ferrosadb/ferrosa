@@ -248,6 +248,64 @@ fn storage_to_table_indices(meta: &TableMetadata) -> Vec<usize> {
     pairs.into_iter().map(|(_, table_idx)| table_idx).collect()
 }
 
+/// The per-table decode projections a row image needs — computed **once** per
+/// table for a commit, not once per row.
+///
+/// `read_row_image` used to rebuild every one of these on each call: the
+/// declared column names, the per-column CQL types (each a keyspace-scoped
+/// parse), the partition/clustering key indices, and the storage-ordinal ->
+/// declared-index map. A transactional `COPY` calls it once per row, so a
+/// 1.1M-row load rebuilt data that cannot change within one COMMIT ~1.1M times —
+/// an O(rows x columns) cost where O(columns) suffices. The projections are a
+/// pure function of the registered table schema, so hoisting them is
+/// behaviour-preserving. This is the "the allocations themselves are the
+/// defect" rule applied to the read path: remove the repeated allocation rather
+/// than shrink the schema.
+pub(crate) struct TableCodec {
+    /// Declared column names, in declared order.
+    names: Vec<String>,
+    /// Parsed CQL type per declared column, in declared order.
+    types: Vec<CqlType>,
+    /// Declared-index positions of the partition key, in key order.
+    pk: Vec<usize>,
+    /// Declared-index positions of the clustering key, in clustering order.
+    ck: Vec<usize>,
+    /// Storage ordinal -> declared-index map for regular/static columns.
+    storage_to_table: Vec<usize>,
+}
+
+impl TableCodec {
+    /// Build the projections for `keyspace.table`. Fails loud if the table is
+    /// not registered or a column type cannot be parsed in its keyspace.
+    pub(crate) fn build(keyspace: &str, table: &str, schema: &Schema) -> Result<Self, String> {
+        let snapshot = schema.snapshot();
+        let meta = snapshot
+            .tables
+            .get(&(keyspace.to_string(), table.to_string()))
+            .ok_or_else(|| format!("table {keyspace}.{table} is not registered"))?;
+        let names: Vec<String> = meta.columns.keys().cloned().collect();
+        let types = meta
+            .columns
+            .values()
+            .map(|column| {
+                ferrosa_row_bridge::parse_cql_type_in_keyspace(
+                    &column.column_type,
+                    keyspace,
+                    schema,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            names,
+            types,
+            pk: pk_indices(meta),
+            ck: ck_indices(meta),
+            storage_to_table: storage_to_table_indices(meta),
+        })
+    }
+}
+
 /// How many decoded rows may sit between the async producer and the sync
 /// consumer at once.
 ///
@@ -591,14 +649,15 @@ pub(crate) fn apply_pending_writes(
     overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
     writes: &[crate::mvcc::PgWrite],
 ) -> Result<(), String> {
+    let codec = TableCodec::build(keyspace, table, schema)?;
     apply_pending_writes_with_partition_keys(
         engine,
-        schema,
+        &codec,
         keyspace,
         table,
         overlay,
         writes.iter().map(|w| &w.0),
-        None,
+        ApplyOutputs::default(),
     )
 }
 
@@ -609,36 +668,40 @@ pub(crate) fn apply_pending_writes(
 /// throwaway `Vec<PgWrite>` first. That clone was a full extra copy of every
 /// buffered row (a megabyte-per-thousand-rows of pure waste on the commit's
 /// peak), since this function makes a single pass.
+///
+/// The per-table decode projections arrive as a prebuilt [`TableCodec`] rather
+/// than being rebuilt here, so a caller that visits many mutations of one table
+/// pays for them once.
+///
+/// `before_images`, when supplied, records the **storage** before-image of every
+/// key this call had to read (i.e. every key the transaction's overlay did not
+/// already hold). A streaming caller can then attach the correct before-image to
+/// each partition's row-version metadata without a second storage read — the
+/// commit path used to read every row twice for exactly this reason.
+#[derive(Default)]
+pub(crate) struct ApplyOutputs<'a> {
+    /// Per-key partition bytes, when the caller needs them for the commit payload.
+    pub partition_keys: Option<&'a mut std::collections::HashMap<Vec<Value>, Vec<u8>>>,
+    /// Before-image of every key this call had to read from storage, so a streaming
+    /// caller can attach it to that partition's row-version metadata instead of
+    /// reading the row a second time.
+    pub before_images: Option<&'a mut std::collections::HashMap<Vec<Value>, Option<Row>>>,
+}
+
 pub(crate) fn apply_pending_writes_with_partition_keys<'a, I>(
     engine: &StorageEngine,
-    schema: &Schema,
+    codec: &TableCodec,
     keyspace: &str,
     table: &str,
     overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
     writes: I,
-    mut partition_keys: Option<&mut std::collections::HashMap<Vec<Value>, Vec<u8>>>,
+    outputs: ApplyOutputs<'_>,
 ) -> Result<(), String>
 where
     I: IntoIterator<Item = &'a ferrosa_storage::Mutation>,
 {
-    let snapshot = schema.snapshot();
-    let meta = snapshot
-        .tables
-        .get(&(keyspace.to_string(), table.to_string()))
-        .ok_or_else(|| format!("table {keyspace}.{table} is not registered"))?;
-    let names: Vec<String> = meta.columns.keys().cloned().collect();
-    let types = meta
-        .columns
-        .values()
-        .map(|column| {
-            ferrosa_row_bridge::parse_cql_type_in_keyspace(&column.column_type, keyspace, schema)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let pk = pk_indices(meta);
-    let ck = ck_indices(meta);
-    let storage_to_table = storage_to_table_indices(meta);
-
+    let mut partition_keys = outputs.partition_keys;
+    let mut before_images = outputs.before_images;
     for mutation in writes {
         if mutation.keyspace != keyspace || mutation.table != table {
             continue;
@@ -654,21 +717,21 @@ where
         if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
             continue;
         }
-        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, pk.len());
+        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, codec.pk.len());
         for mutation_row in &mutation.rows {
             let ck_parts =
-                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, ck.len());
-            let mut key = Vec::with_capacity(pk.len() + ck.len());
-            let mut values = vec![Value::Null; names.len()];
-            for (index, part) in pk.iter().zip(pk_parts.iter()) {
-                let cql = ferrosa_row_bridge::decode_value(&types[*index], part)
+                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, codec.ck.len());
+            let mut key = Vec::with_capacity(codec.pk.len() + codec.ck.len());
+            let mut values = vec![Value::Null; codec.names.len()];
+            for (index, part) in codec.pk.iter().zip(pk_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
                     .map_err(|error| error.to_string())?;
                 let value = cql_to_value(&cql)?;
                 key.push(value.clone());
                 values[*index] = value;
             }
-            for (index, part) in ck.iter().zip(ck_parts.iter()) {
-                let cql = ferrosa_row_bridge::decode_value(&types[*index], part)
+            for (index, part) in codec.ck.iter().zip(ck_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
                     .map_err(|error| error.to_string())?;
                 let value = cql_to_value(&cql)?;
                 key.push(value.clone());
@@ -681,8 +744,12 @@ where
             let base = if let Some(snapshot_row) = overlay.get(&key) {
                 snapshot_row.clone()
             } else {
-                read_row_image(engine, schema, mutation, &mutation_row.clustering)?
-                    .map(|(_, row)| row)
+                let image = read_row_image(engine, codec, mutation, &mutation_row.clustering)?
+                    .map(|(_, row)| row);
+                if let Some(before) = before_images.as_deref_mut() {
+                    before.insert(key.clone(), image.clone());
+                }
+                image
             };
             if let Some(base) = base {
                 values = base.0;
@@ -693,13 +760,14 @@ where
             }
             for (storage_index, cell) in &mutation_row.cells {
                 let storage_index = usize::from(*storage_index & 0x3fff);
-                let Some(table_index) = storage_to_table.get(storage_index).copied() else {
+                let Some(table_index) = codec.storage_to_table.get(storage_index).copied() else {
                     continue;
                 };
                 values[table_index] = match &cell.value {
                     Some(bytes) => {
-                        let cql = ferrosa_row_bridge::decode_value(&types[table_index], bytes)
-                            .map_err(|error| error.to_string())?;
+                        let cql =
+                            ferrosa_row_bridge::decode_value(&codec.types[table_index], bytes)
+                                .map_err(|error| error.to_string())?;
                         cql_to_value(&cql)?
                     }
                     None => Value::Null,
@@ -713,38 +781,16 @@ where
 
 /// Read one PostgreSQL row image by its storage partition and clustering key.
 /// Returns the SQL primary-key tuple with the decoded row for MVCC history.
+///
+/// The per-table projections come from a prebuilt [`TableCodec`]; hoisting them
+/// out of this call is what keeps a 1.1M-row commit from rebuilding the same
+/// schema projection once per row.
 pub(crate) fn read_row_image(
     engine: &StorageEngine,
-    schema: &Schema,
+    codec: &TableCodec,
     mutation: &ferrosa_storage::Mutation,
     clustering: &[u8],
 ) -> Result<Option<(Vec<Value>, Row)>, String> {
-    let snapshot = schema.snapshot();
-    let meta = snapshot
-        .tables
-        .get(&(mutation.keyspace.clone(), mutation.table.clone()))
-        .ok_or_else(|| {
-            format!(
-                "table {}.{} is not registered",
-                mutation.keyspace, mutation.table
-            )
-        })?;
-    let names: Vec<String> = meta.columns.keys().cloned().collect();
-    let types = meta
-        .columns
-        .values()
-        .map(|column| {
-            ferrosa_row_bridge::parse_cql_type_in_keyspace(
-                &column.column_type,
-                &mutation.keyspace,
-                schema,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let pk = pk_indices(meta);
-    let ck = ck_indices(meta);
-    let storage_to_table = storage_to_table_indices(meta);
     let Some(partition) = engine
         .read_clustering_row(
             &TableId::new(&mutation.keyspace, &mutation.table),
@@ -757,11 +803,11 @@ pub(crate) fn read_row_image(
     };
     let rows = ferrosa_row_bridge::partition_to_rows_with_clustering(
         &partition,
-        &names,
-        &types,
-        &pk,
-        &ck,
-        &storage_to_table,
+        &codec.names,
+        &codec.types,
+        &codec.pk,
+        &codec.ck,
+        &codec.storage_to_table,
     )
     .map_err(|error| {
         error
@@ -778,9 +824,10 @@ pub(crate) fn read_row_image(
             None => Ok(Value::Null),
         })
         .collect::<Result<_, _>>()?;
-    let key = pk
+    let key = codec
+        .pk
         .iter()
-        .chain(ck.iter())
+        .chain(codec.ck.iter())
         .map(|index| values[*index].clone())
         .collect();
     Ok(Some((key, Row::new(values))))

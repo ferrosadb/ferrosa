@@ -108,7 +108,12 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   discard uncommitted mutations. Only explicit `SERIALIZABLE` is supported;
   explicit `READ COMMITTED` and `REPEATABLE READ` fail with `0A000`. Unqualified
   `BEGIN` retains its legacy behavior and is not labeled strict serializable.
-  Versions older than every live snapshot are reclaimed automatically. The
+  Versions older than every live snapshot are reclaimed automatically — note this is
+  an AGE bound only. The version history holds a full row per write in both the local
+  and the distributed map and is never bounded by SIZE, so a very large single load
+  retains roughly 1.8 KB per key after commit; see `PG-ACC-02` in `specs/fmea.md`. The
+  commit path builds the Accord write-set in one streaming pass with a per-commit table
+  codec, so it holds no whole-table row images and reads each row once. The
   buffered write set defaults to a 10,000 mutation cap, and each storage scan
   defaults to a 64-row channel; both are startup-configurable. PostgreSQL also
   expires active snapshots past a configurable maximum age so old transactions
