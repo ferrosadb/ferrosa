@@ -3,6 +3,8 @@
 //! This module contains the deterministic test harness ([`TestCluster`]) for
 //! protocol-level testing of the Accord (EPaxos-family) consensus protocol.
 
+#[cfg(test)]
+mod abandon_durability;
 pub mod apply;
 pub mod chaos_minority_kill;
 pub mod clock;
