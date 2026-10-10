@@ -84,6 +84,9 @@ coordinator starts its local Apply, it drives remote Apply quorum fanout in
 parallel with waiting for local `Applied`; it reports success only after both
 conditions hold. This lets remote replicas progress when the coordinator is
 parked behind an unresolved dependency without acknowledging a local write early.
+A remote Apply counts toward the quorum only when its `AccordApplyOK` payload
+carries THIS transaction's `txn_id`; an empty or unparseable body is not an ack
+(a bare ApplyOK proves nothing about which transaction the peer applied).
 An explicit no-write Apply resolves an absent local dependency and cascades any
 parked dependent writes. A missing target with real mutation bytes still fails
 without an Apply acknowledgement.
