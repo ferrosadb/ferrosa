@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use ferrosa_common::accord::{Timestamp, TxnId};
 use ferrosa_storage::write_set_spill::WriteSetSpill;
-use ferrosa_storage::{BatchOp, Mutation, StorageEngine};
+use ferrosa_storage::{Mutation, StorageEngine};
 use parking_lot::Mutex;
 
 use crate::accord::dep_wait::DepWaitGraph;
@@ -872,28 +872,25 @@ impl StorageApplier for EngineStorageApplier {
     ///
     /// # Residency contract
     ///
-    /// The decode MUST NOT hold the whole encoded write-set resident while it
-    /// builds the decoded batch. Each [`ApplyMutation`] is consumed the moment it
-    /// is decoded — `decode_postgres_mvcc_mutation` only borrows the payload and
-    /// the deserialize copies what it needs into owned rows — so once an entry is
-    /// decoded nothing references its `data` again and the input shrinks as the
-    /// decoded `Vec<BatchOp>` grows. Pinning every input payload next to that
-    /// output instead is the RESIDENT term the COMMIT peak attributes to
-    /// `mvcc.prepare_postgres_apply` (~2.4 KB per decoded op; see
+    /// Neither the encoded INPUT nor the DECODED output is held whole. The
+    /// input is borrowed (`&[u8]` frames) and the decode copies only what it needs
+    /// into owned rows, so nothing references an entry's `data` once it is decoded;
+    /// and the decoded output is streamed into ONE atomic `write_atomic_batch`
+    /// rather than accumulated as a `Vec<BatchOp>`. Pinning the input payloads, or
+    /// materializing the whole decoded batch, is the RESIDENT term the COMMIT peak
+    /// attributes to this path (~1.5 KB per decoded op; see
     /// `ferrosa-cluster/specs/fmea.md` CL-54).
     ///
     /// This contract is PROVEN by
-    /// `tests/accord_apply_decode_residency.rs::apply_writeset_peak_stays_within_the_input_size`,
-    /// which arms a counting global allocator and measures the call TWICE: the
-    /// consuming path under test, and a pinning control that holds a clone of every
-    /// entry's payload across the call. The control must sit ~a full input-size
-    /// ABOVE the consuming path — proving the decode frees each payload as it goes.
-    /// The negative control `a_retained_input_payload_trips_the_residency_guard`
-    /// asserts that same separation, so the guard cannot pass blind to the input.
-    /// (An ABSOLUTE bound on the call's peak cannot prove this: `apply_writeset`
-    /// inherently holds ~2x the input even when nothing is pinned, because the
-    /// decoded batch then co-exists with `apply_batch`'s memtable copy of the same
-    /// rows.)
+    /// `tests/accord_apply_decode_residency.rs::apply_writeset_peak_stays_within_the_input_size`
+    /// (the INPUT: a pinning control must sit ~a full input-size above the consuming
+    /// path) and
+    /// `::apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident`
+    /// (the OUTPUT: with the input held outside the window, a materializing decode
+    /// must be separable from the streaming one). Each has a non-vacuous negative
+    /// control — `a_retained_input_payload_trips_the_residency_guard` and
+    /// `a_materialized_decoded_batch_trips_the_residency_guard` — that asserts the
+    /// guard can fail, so neither passes blind.
     ///
     /// The proof needs a real write-set and a real commit-log flush, so it costs
     /// seconds — which is why it lives in that integration test and NOT here. A
@@ -945,25 +942,115 @@ impl StorageApplier for EngineStorageApplier {
     }
 }
 
+/// A [`ferrosa_storage::write_set_stage::WriteSetSource`] over a committed Accord
+/// write-set's BORROWED payloads.
+///
+/// The storage layer's atomic batch visits its source more than once (preflight,
+/// commit-log append, memtable apply, observer notify) and hands each mutation to
+/// the visit callback **one at a time**. This source decodes and re-stamps exactly
+/// ONE partition per visit and drops its decoded rows when the visit returns, so
+/// the whole decoded write-set is never resident — the streaming replacement for
+/// the `Vec<BatchOp>` the apply path used to build first (the largest single term
+/// of the measured COMMIT peak; PG-ACC-03 / CL-54).
+///
+/// It borrows `mutations` and `survivors`; `write_atomic_batch` consumes it inside
+/// one call, so no decoded payload outlives the apply.
+struct AccordWriteSet<'s, 'v> {
+    /// The write-set's partitions, in append order.
+    mutations: &'s [MutationView<'v>],
+    /// Indices into `mutations` the idempotency gate let through, ascending.
+    survivors: &'s [usize],
+    /// Total rows across the surviving partitions. Read by `write_atomic_batch`
+    /// only to decide the empty ⇒ no-op case, never as a capacity bound.
+    op_count: usize,
+}
+
+impl ferrosa_storage::write_set_stage::WriteSetSource for AccordWriteSet<'_, '_> {
+    fn mutation_count(&self) -> usize {
+        self.op_count
+    }
+
+    fn for_each_mutation(
+        &self,
+        visit: &mut dyn FnMut(&Mutation) -> ferrosa_common::Result<()>,
+    ) -> ferrosa_common::Result<()> {
+        for &index in self.survivors {
+            let view = &self.mutations[index];
+            // Decode + rebind exactly as the materializing path did, but for ONE
+            // partition: the decoder borrows `view.data`, and nothing here holds
+            // the decoded rows past the visits below.
+            let (storage_data, _) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(view.data)
+                    .map_err(ferrosa_common::Error::InvalidData)?;
+            let mut decoded = Mutation::deserialize_from_rebinding_list_paths(storage_data, view.t)
+                .map_err(|e| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "failed to decode apply mutation: {e}"
+                    ))
+                })?;
+            // Re-stamp every cell to the Accord-agreed execution timestamp. The
+            // coordinator stamps cells at materialize time with its own wall clock,
+            // BEFORE consensus picks `t`; honoring that clock for LWW would let
+            // coordinator skew invert the Accord total order. The agreed `t` — not
+            // the wall clock — drives the last-write-wins cell timestamp.
+            let cell_ts = accord_cell_timestamp(view.t);
+            let keyspace = decoded.keyspace;
+            let table = decoded.table;
+            let key = decoded.key;
+            // ONE op per row, the shape `BatchOp::Write` lowered to, so the
+            // commit-log framing (one entry per row) stays byte-identical to the
+            // path this replaces.
+            for mut row in std::mem::take(&mut decoded.rows) {
+                restamp_row(&mut row, cell_ts);
+                let op = Mutation::new(
+                    keyspace.clone(),
+                    table.clone(),
+                    key.clone(),
+                    vec![row],
+                    cell_ts,
+                );
+                visit(&op)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl EngineStorageApplier {
     /// Decode + restamp every partition of a write-set and commit it atomically,
-    /// driven from a BORROWED view of the payloads.
+    /// driven from a BORROWED view of the payloads, **without materializing the
+    /// decoded batch**.
     ///
     /// Both [`StorageApplier::apply_writeset`] (owned bytes moved in) and
     /// [`StorageApplier::apply_writeset_borrowed`] (a staged write-set's mapped
     /// slices) funnel here; neither pays a payload copy that this body does not
     /// need, because the decoder (`decode_postgres_mvcc_mutation` /
     /// `Mutation::deserialize_from_rebinding_list_paths`) already takes `&[u8]`.
+    ///
+    /// # Residency contract
+    ///
+    /// The decoded write-set is NEVER held whole. The resolve pass decodes each
+    /// partition once, records only its small `(txn,key,t)` triple and view index,
+    /// and drops its rows; the commit then streams the survivors through ONE
+    /// atomic `write_atomic_batch`, which decodes one partition per visit. The
+    /// earlier shape built a `Vec<BatchOp>` (one op per row, each with a
+    /// keyspace/table/key clone and an owned restamped row) for the WHOLE write-set
+    /// before committing — the single largest term of the measured COMMIT peak
+    /// (+495 MiB over 329 873 ops, node1 at N=1 000 114). This contract is PROVEN
+    /// by
+    /// `tests/accord_apply_decode_residency.rs::apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident`,
+    /// with `a_materialized_decoded_batch_trips_the_residency_guard` as the
+    /// non-vacuous negative control.
     fn apply_writeset_views(
         &self,
         txn_id: TxnId,
         mutations: &[MutationView<'_>],
     ) -> Result<(), ApplyError> {
-        // Decode + restamp every partition, filtering out any (txn,key,t) already
-        // durable, and accumulate the BatchOps for the rest. The whole set then
-        // commits through ONE `apply_batch`, which preflights every target table
-        // BEFORE appending any commit-log record — so either all surviving keys
-        // land durably or none do (all-or-nothing; no partial / torn apply).
+        // Resolve survivors (idempotency + MVCC metadata) WITHOUT materializing,
+        // then commit every surviving op through ONE atomic `write_atomic_batch`
+        // that preflights every target table BEFORE appending any commit-log
+        // record — so either all surviving keys land durably or none do
+        // (all-or-nothing; no partial / torn apply).
         let profile_apply = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
         if profile_apply {
             tracing::info!(
@@ -973,23 +1060,27 @@ impl EngineStorageApplier {
                 "accord apply residency"
             );
         }
-        let mut ops: Vec<BatchOp> = Vec::new();
-        let decode_started = profile_apply.then(std::time::Instant::now);
+        // Pass 1 — RESOLVE, do NOT materialize. Decode each partition ONCE to
+        // (a) pull out its PostgreSQL MVCC metadata envelope and (b) decide its
+        // idempotency, recording ONLY the surviving view indices and their small
+        // `(txn,key,t)` triples. Every decoded row set is dropped at the end of
+        // its iteration, so this pass' residency is one mutation, never the whole
+        // decoded write-set. The `Vec<BatchOp>` this replaces was the largest
+        // single term of the measured COMMIT peak (+495 MiB over 329 873 ops on
+        // node1 at N=1 000 114; see ferrosa-cluster/specs/fmea.md CL-54).
+        let mut survivors: Vec<usize> = Vec::new();
         // The (txn,key,t) triples this call will newly persist — recorded only
         // AFTER the batch is durable, so a failed apply leaves them re-appliable.
         let mut newly_applied: Vec<(TxnId, Vec<u8>, u64)> = Vec::new();
-        let mut postgres_mvcc_metadata = Vec::new();
+        let mut postgres_mvcc_metadata: Vec<Vec<u8>> = Vec::new();
+        // Total rows across the surviving partitions — the op count. Handed to
+        // the storage batch so an all-zero-row writeset stays the true no-op it
+        // was when it lowered to an empty `Vec<BatchOp>`.
+        let mut op_count: usize = 0;
+        let decode_started = profile_apply.then(std::time::Instant::now);
 
         // Capture what the post-loop steps need (the agreed stamp, the
-        // all-one-timestamp invariant, and the count) BEFORE the decode loop
-        // consumes `mutations`, so each entry's payload can be dropped the
-        // moment it has been decoded rather than being pinned resident for the
-        // whole loop. `decode_postgres_mvcc_mutation` BORROWS the payload and
-        // `Mutation::deserialize_from_rebinding_list_paths` copies what it needs
-        // into owned rows, so once an entry is decoded nothing references its
-        // `data` again. Holding all 352 515 encoded payloads (~670 MB at
-        // N=1 100 000) live next to the decoded `Vec<BatchOp>` is what made the
-        // Apply peak hold input AND output at once (PG-ACC-03).
+        // all-one-timestamp invariant, and the count) BEFORE the resolve pass.
         let mutation_count = mutations.len();
         let apply_t = match mutations.first() {
             Some(first) => first.t,
@@ -1001,7 +1092,7 @@ impl EngineStorageApplier {
         {
             // Snapshot the idempotency set under the lock to decide what to skip.
             let already = self.applied.lock();
-            for mutation in mutations {
+            for (index, mutation) in mutations.iter().enumerate() {
                 // Decode the self-describing commit-log mutation (one partition),
                 // rebinding any Accord `list` append cell's path from the
                 // coordinator-local wall clock to the agreed execution timestamp
@@ -1013,7 +1104,7 @@ impl EngineStorageApplier {
                 if let Some(metadata) = metadata.filter(|metadata| !metadata.is_empty()) {
                     postgres_mvcc_metadata.push(metadata.to_vec());
                 }
-                let mut decoded =
+                let decoded =
                     Mutation::deserialize_from_rebinding_list_paths(storage_data, mutation.t)
                         .map_err(|e| ApplyError {
                             txn_id,
@@ -1029,31 +1120,11 @@ impl EngineStorageApplier {
                 if already.contains(&idem) {
                     continue;
                 }
-
-                // Re-stamp every cell to the Accord-agreed execution timestamp.
-                //
-                // The coordinator stamps cells at materialize time with its own
-                // wall clock, BEFORE consensus picks `t`. Honoring that wall clock
-                // for LWW would let coordinator clock skew invert the Accord total
-                // order (lost update / non-linearizable). The agreed `t` exists
-                // precisely to order conflicting writes, so it — not the wall
-                // clock — must drive the last-write-wins cell timestamp.
-                let cell_ts = accord_cell_timestamp(mutation.t);
-                let keyspace = decoded.keyspace.clone();
-                let table = decoded.table.clone();
-                let key = decoded.key.clone();
-                for row in &mut decoded.rows {
-                    restamp_row(row, cell_ts);
-                }
-                for row in decoded.rows {
-                    ops.push(BatchOp::Write {
-                        keyspace: keyspace.clone(),
-                        table: table.clone(),
-                        key: key.clone(),
-                        row,
-                        timestamp: cell_ts,
-                    });
-                }
+                // Only the small (txn,key,t) triple and the view INDEX survive this
+                // iteration; the decoded rows are dropped right here, so nothing
+                // decoded accumulates across the write-set.
+                op_count += decoded.rows.len();
+                survivors.push(index);
                 newly_applied.push(idem);
             }
         }
@@ -1092,17 +1163,29 @@ impl EngineStorageApplier {
         if profile_apply {
             tracing::info!(
                 phase = "apply_writeset.decoded",
-                ops = ops.len(),
+                ops = op_count,
                 metadata_entries = postgres_mvcc_metadata.len(),
                 live_mib = ferrosa_common::mem_probe::live_mib(),
                 "accord apply residency"
             );
         }
         let apply_started = profile_apply.then(std::time::Instant::now);
-        self.engine.apply_batch(ops).map_err(|e| ApplyError {
-            txn_id,
-            reason: format!("storage apply_batch failed for writeset: {e}"),
-        })?;
+        // ONE atomic call under ONE lock. The storage layer walks its source
+        // (preflight, commit-log append, memtable apply, observer notify) and this
+        // source decodes + re-stamps exactly ONE partition per visit, so the whole
+        // decoded write-set is never resident — the `Vec<BatchOp>`/`Vec<Mutation>`
+        // this replaces is gone, not merely consumed. Atomicity is unchanged: it is
+        // still a single all-or-nothing batch, never split across calls.
+        self.engine
+            .write_atomic_batch(AccordWriteSet {
+                mutations,
+                survivors: &survivors,
+                op_count,
+            })
+            .map_err(|e| ApplyError {
+                txn_id,
+                reason: format!("storage apply_batch failed for writeset: {e}"),
+            })?;
         if let Some(started) = apply_started {
             let metadata_kib: usize =
                 postgres_mvcc_metadata.iter().map(Vec::len).sum::<usize>() / 1024;
@@ -3129,6 +3212,71 @@ mod engine_applier_tests {
         assert_eq!(read_cell0(&engine, &k1).as_deref(), Some(b"a".as_slice()));
         assert_eq!(read_cell0(&engine, &k2).as_deref(), Some(b"b".as_slice()));
         assert_eq!(applier.applied_count(), 2, "both (txn,key,t) recorded");
+    }
+
+    /// The streaming apply splits a multi-row mutation into one op per row (the
+    /// commit-log framing shape it replaced). Every row's VALUE must survive
+    /// exactly once — a count-only assertion would miss a stream that drops or
+    /// duplicates rows 2..N of a partition.
+    #[test]
+    fn apply_writeset_preserves_every_row_value_of_a_multi_row_mutation() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let id = txn(1, 1000);
+        let t = accord_ts(1000);
+        let key = make_key("pk-multi");
+
+        let clustered_row = |clustering: u8, value: &[u8], cell_ts: i64| Row {
+            clustering: vec![0x00, 0x00, 0x00, clustering],
+            cells: vec![(0, CellValue::live(value.to_vec(), cell_ts))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(cell_ts),
+        };
+        // THREE clustered rows in ONE mutation.
+        let m = Mutation::new(
+            KS.to_string(),
+            TABLE.to_string(),
+            key.clone(),
+            vec![
+                clustered_row(1, b"a", 1000),
+                clustered_row(2, b"b", 1000),
+                clustered_row(3, b"c", 1000),
+            ],
+            1000,
+        );
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        let mutation = ApplyMutation {
+            data: buf,
+            t,
+            deps: vec![],
+        };
+
+        applier
+            .apply_writeset(id, vec![mutation])
+            .expect("a multi-row writeset must persist");
+
+        let partition = engine
+            .read(&TableId::new(KS, TABLE), &key)
+            .unwrap()
+            .expect("the written partition must be readable");
+        let mut got: Vec<Vec<u8>> = partition
+            .rows
+            .iter()
+            .filter_map(|row| row.cells.first().and_then(|(_, cell)| cell.value.clone()))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            "every clustered row VALUE of a multi-row mutation must survive exactly once"
+        );
+        assert_eq!(
+            applier.applied_count(),
+            1,
+            "one (txn,key,t) recorded for the multi-row partition"
+        );
     }
 
     #[test]
