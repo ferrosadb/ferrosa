@@ -50,6 +50,10 @@ default = []
 # fails them with nothing wrong. Run them on a quiet machine with
 # `cargo test -p ferrosa-cluster --features perf-tests --lib accord::perf`; the nightly
 # `perf-regression` job (all features) does. Do not widen a bound that trips.
+#
+# The same gate covers the test target below, whose bounds are ABSOLUTE resident
+# bytes rather than wall clock. Its load-independent replacement
+# (`tests/accord_apply_decode_streaming_budget.rs`) is NOT gated: it runs on every PR.
 perf-tests = []
 # Sprint 3 (ADR-012): the engine-side PreVote wire-up has landed in the openraft
 # fork (commit pinned in the workspace Cargo.toml), so the W3.12 PreVote
@@ -63,3 +67,19 @@ sprint-03-engine-transfer = []
 # feature on and the env unset (or flyctl missing) the test panics loudly with
 # setup instructions rather than silently passing (repo test policy).
 live-infra-tests = []
+
+# ── test targets ────────────────────────────────────────────────────────
+# Absolute-measurement test binaries. Gated so a plain `cargo test -p
+# ferrosa-cluster` never runs a measurement of the host, exactly like the
+# `accord::perf` benchmarks the `perf-tests` feature covers above. Under
+# `--all-features` the gate is open, so ci.yml additionally skips each of these
+# BY NAME (`Run tests`) and nightly-fuzz.yml's `perf-regression` job runs them
+# where the machine is not competing with the rest of the PR gate. Add a new
+# absolute assertion to BOTH lists.
+#
+# `tests/accord_apply_decode_residency.rs`: the apply path's peak live bytes
+# against a multiple of the input size (input residency, decoded-output
+# residency, and their negative controls).
+[[test]]
+name = "accord_apply_decode_residency"
+required-features = ["perf-tests"]

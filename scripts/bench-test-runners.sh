@@ -18,7 +18,8 @@ SELECT=(--all-features --workspace --lib --tests
         --exclude ferrosa-jepsen --exclude ferrosa-loadgen)
 
 # Exactly the ci.yml "Run tests" skip list. Keep in sync if that changes.
-SKIP=(--skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume
+SKIP=(--skip ::slow:: --skip accord::perf --skip accord_apply_decode_residency
+      --skip batch_atomicity --skip pause_resume
       --skip recovery_coordinator --skip cassandra_reads_compacted
       --skip compaction_end_to_end_pipeline --skip dep_wait_ordering
       --skip lwt_batch_atomicity_all --skip clock_skew_large_preaccept --skip binary_

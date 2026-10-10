@@ -34,6 +34,10 @@ fi
 SKIPS=(
   --skip ::slow::
   --skip accord::perf
+  # Absolute resident-byte bounds (measures the host, not the decode).
+  # ci.yml skips it here and nightly-fuzz.yml's `perf-regression` job runs it;
+  # the load-independent replacement runs on every PR and is NOT skipped.
+  --skip accord_apply_decode_residency
   --skip batch_atomicity
   --skip pause_resume
   --skip recovery_coordinator

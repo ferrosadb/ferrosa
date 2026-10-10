@@ -892,6 +892,14 @@ impl StorageApplier for EngineStorageApplier {
     /// `a_materialized_decoded_batch_trips_the_residency_guard` — that asserts the
     /// guard can fail, so neither passes blind.
     ///
+    /// The per-PR gate carries the LOAD-INDEPENDENT half of that proof:
+    /// `tests/accord_apply_decode_streaming_budget.rs` counts the entry-sized buffers
+    /// live AT ONCE (an allocation count, not a byte watermark or a wall clock), so it
+    /// cannot measure the runner, and asserts the apply holds at most one per input
+    /// entry with a non-vacuous negative control. The resident-byte bounds above are
+    /// ABSOLUTE, so they moved to nightly-fuzz.yml's `perf-regression` job and ci.yml
+    /// skips them by name (`--skip accord_apply_decode_residency`).
+    ///
     /// The proof needs a real write-set and a real commit-log flush, so it costs
     /// seconds — which is why it lives in that integration test and NOT here. A
     /// doctest runs on *every* `cargo test --doc` and must stay in the millisecond
@@ -1036,8 +1044,10 @@ impl EngineStorageApplier {
     /// earlier shape built a `Vec<BatchOp>` (one op per row, each with a
     /// keyspace/table/key clone and an owned restamped row) for the WHOLE write-set
     /// before committing — the single largest term of the measured COMMIT peak
-    /// (+495 MiB over 329 873 ops, node1 at N=1 000 114). This contract is PROVEN
-    /// by
+    /// (+495 MiB over 329 873 ops, node1 at N=1 000 114). PROVEN per-PR by
+    /// `tests/accord_apply_decode_streaming_budget.rs` — a live entry-sized buffer
+    /// count that does not measure the machine — and nightly by the absolute
+    /// resident-byte test
     /// `tests/accord_apply_decode_residency.rs::apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident`,
     /// with `a_materialized_decoded_batch_trips_the_residency_guard` as the
     /// non-vacuous negative control.

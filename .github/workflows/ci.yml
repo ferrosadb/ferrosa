@@ -240,6 +240,15 @@ jobs:
           # nightly, in nightly-fuzz.yml's `perf-regression` job where the
           # machine is not competing with the rest of the PR gate. Keep the two
           # in sync: a new perf assertion added here must run there.
+          # `accord_apply_decode_residency` (tests/) is the same class with a
+          # resident-byte bound instead of a wall-clock one: a counting allocator
+          # compares the apply path's peak live bytes against a multiple of the
+          # input size, so it measures the runner's allocator watermarks and the
+          # engine's own buffers as much as the decode — it failed this job on an
+          # unchanged tree. It is skipped here and runs in the SAME
+          # `perf-regression` job. Its load-independent replacement — the live
+          # entry-sized buffer budget in tests/accord_apply_decode_streaming_budget.rs
+          # — stays HERE, on every PR.
           # `--skip ::slow::` excludes the tests under the `slow-tests` feature
           # (compiled here under --all-features, but too slow for per-PR CI);
           # they run nightly in nightly-slow-tests.yml.
@@ -261,7 +270,9 @@ jobs:
           # values in both runners. The `--` separator is the only difference.
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -- --skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
+            -- --skip ::slow:: --skip accord::perf \
+               --skip accord_apply_decode_residency \
+               --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering \
                --skip lwt_batch_atomicity_all \
