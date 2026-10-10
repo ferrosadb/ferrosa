@@ -565,9 +565,37 @@ const POSTGRES_DEFAULT_KEYSPACE: &str = "public";
 /// agrees the keyspace exists; a local-only insert leaves PostgreSQL writes
 /// failing `Accord quorum unavailable`.
 ///
+/// The replication factor the PostgreSQL default keyspace must use so the
+/// PostgreSQL-wire front end can serve a key from ANY node.
+///
+/// `storage_provider::produce_scan` answers a query from this node's LOCAL
+/// `TableStore` and never fans a range read across the ring, so a full-table scan
+/// is complete only when the backing keyspace is replicated to every node — the
+/// same `RF == node_count` case the CQL range-read path special-cases. A keyspace
+/// created at RF=1 places each partition on a single owner, so a keyed
+/// `SELECT ... WHERE id = $1` on any other node scans past it and returns zero
+/// rows (`query_one`: "query returned an unexpected number of rows") — a
+/// committed row, invisible.
+///
+/// The node cannot read the fully-formed ring at boot: it creates this keyspace
+/// on the transient standalone path, ~0.5s before the `standalone -> pair ->
+/// cluster` transition (observed in the Jepsen node log at 2026-10-10), while the
+/// ring is still self-only. So it seeds the factor from the cluster it is
+/// CONFIGURED to join: itself plus every configured seed. In the supported
+/// topology (every node seeds every other) that IS the cluster size. A genuinely
+/// standalone node (no seeds) keeps RF=1.
+fn postgres_default_keyspace_replication_factor(configured_seeds: usize) -> usize {
+    configured_seeds.saturating_add(1)
+}
+
 /// The action a boot-time ensure should take for a keyspace, given the keyspace
 /// is absent and the current DDL path kind. `Some(op)` means "create it through
 /// this DDL operation"; `None` means "wait" (the path cannot complete a creation).
+///
+/// The created keyspace carries `replication_factor` — the caller's
+/// [`postgres_default_keyspace_replication_factor`], NEVER a hardcoded single-node
+/// factor, so every node holds every partition and the local-only PostgreSQL scan
+/// is complete.
 ///
 /// Kept pure and total so the decision is unit-testable without a live cluster.
 /// `Forming` (buffers) and `Unavailable` (rejects) map to "wait" instead of
@@ -575,7 +603,10 @@ const POSTGRES_DEFAULT_KEYSPACE: &str = "public";
 /// back to a local insert the node would report the keyspace while the cluster
 /// never learns of it — the exact divergence seen as `Accord quorum unavailable`
 /// on PostgreSQL writes.
-fn default_keyspace_boot_action(kind: &str) -> Option<ferrosa_cluster::pair::ddl::DdlOperation> {
+fn default_keyspace_boot_action(
+    kind: &str,
+    replication_factor: usize,
+) -> Option<ferrosa_cluster::pair::ddl::DdlOperation> {
     if !ddl_path_kind_can_create_keyspace(kind) {
         return None;
     }
@@ -584,7 +615,7 @@ fn default_keyspace_boot_action(kind: &str) -> Option<ferrosa_cluster::pair::ddl
             name: POSTGRES_DEFAULT_KEYSPACE.into(),
             replication: ferrosa_schema::ReplicationParams {
                 strategy: "SimpleStrategy".into(),
-                options: [("replication_factor".into(), "1".into())]
+                options: [("replication_factor".into(), replication_factor.to_string())]
                     .into_iter()
                     .collect(),
             },
@@ -619,6 +650,7 @@ fn ddl_path_kind_can_create_keyspace(kind: &str) -> bool {
 async fn ensure_postgres_default_keyspace(
     schema: &std::sync::Arc<ferrosa_schema::Schema>,
     ddl_path: &std::sync::Arc<arc_swap::ArcSwap<ferrosa_cluster::DdlPath>>,
+    replication_factor: usize,
 ) -> std::result::Result<bool, ferrosa_cluster::ClusterError> {
     // Nothing to do once the keyspace exists (any prior ensure, or a cluster DDL).
     if schema
@@ -639,7 +671,7 @@ async fn ensure_postgres_default_keyspace(
             let guard = ddl_path.load();
             guard.kind()
         };
-        if let Some(action) = default_keyspace_boot_action(kind) {
+        if let Some(action) = default_keyspace_boot_action(kind, replication_factor) {
             op = Some(action);
             break;
         }
@@ -3211,8 +3243,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         {
             let schema = schema.clone();
             let ddl_path = shared_state.ddl_path.clone();
+            // The PostgreSQL front end scans only THIS node's local storage, so
+            // its default keyspace must be replicated to every node it is
+            // configured to cluster with — itself plus its seeds — or a committed
+            // row is invisible on every non-owner node. See
+            // `postgres_default_keyspace_replication_factor`.
+            let pg_keyspace_rf = postgres_default_keyspace_replication_factor(
+                parse_seed_list(&config_val(
+                    "FERROSA_SEED",
+                    &file_config,
+                    "internode",
+                    "seed",
+                    "",
+                ))
+                .len(),
+            );
             runtimes.background.spawn(async move {
-                match ensure_postgres_default_keyspace(&schema, &ddl_path).await {
+                match ensure_postgres_default_keyspace(&schema, &ddl_path, pg_keyspace_rf).await {
                     Ok(true) | Ok(false) => {}
                     Err(error) => tracing::error!(
                         %error,
@@ -3649,11 +3696,37 @@ mod tests {
     const SEGMENT_32_MIB: u64 = 32 * 1024 * 1024;
 
     #[test]
+    fn postgres_default_keyspace_replicates_across_the_configured_cluster() {
+        // The PostgreSQL-wire front end answers a query from THIS node's local
+        // `TableStore` and never fans a range read across the ring, so a scan is
+        // complete only when the backing keyspace is replicated to every node it
+        // is configured to cluster with. Created at RF=1, each partition lands on
+        // a single owner and a keyed `SELECT ... WHERE id = $1` on any other node
+        // scans past it, returning zero rows — the `query returned an unexpected
+        // number of rows` data-loss seen by the strict-serializability workload.
+        assert_eq!(
+            postgres_default_keyspace_replication_factor(2),
+            3,
+            "a node seeding two peers must replicate its default keyspace across all three"
+        );
+        assert_eq!(
+            postgres_default_keyspace_replication_factor(1),
+            2,
+            "a two-node pair must replicate to both nodes"
+        );
+        assert_eq!(
+            postgres_default_keyspace_replication_factor(0),
+            1,
+            "a standalone node (no seeds) replicates to itself alone"
+        );
+    }
+
+    #[test]
     fn postgres_default_keyspace_boot_action_creates_on_an_applicable_ddl_path() {
         use ferrosa_cluster::pair::ddl::DdlOperation;
         // Direct (standalone), Pair and Cluster all complete a keyspace creation.
         for kind in ["direct", "pair", "cluster"] {
-            let action = default_keyspace_boot_action(kind)
+            let action = default_keyspace_boot_action(kind, 3)
                 .unwrap_or_else(|| panic!("{kind} must be able to create the keyspace"));
             match action {
                 DdlOperation::CreateKeyspace(ks) => {
@@ -3666,8 +3739,10 @@ mod tests {
                             .options
                             .get("replication_factor")
                             .map(String::as_str),
-                        Some("1"),
-                        "{kind}: a fresh keyspace is created RF=1"
+                        Some("3"),
+                        "{kind}: the created keyspace must carry the caller's replication \
+                         factor so every node holds every partition, never a hardcoded \
+                         single-node one"
                     );
                 }
                 _ => panic!("{kind}: expected a CreateKeyspace operation"),
@@ -3682,7 +3757,7 @@ mod tests {
         // divergence seen as `Accord quorum unavailable` on PostgreSQL writes.
         for kind in ["forming", "unavailable"] {
             assert!(
-                default_keyspace_boot_action(kind).is_none(),
+                default_keyspace_boot_action(kind, 3).is_none(),
                 "{kind} must wait, not attempt a creation the path cannot complete"
             );
         }
