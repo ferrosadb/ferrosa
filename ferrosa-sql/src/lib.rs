@@ -19,9 +19,10 @@ pub mod types;
 pub use ast::SelectStmt;
 pub use ast::{
     AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ColumnDef, CopyFormatKind,
-    CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr, InsertStmt,
-    IsolationLevel, Operand, OrderItem, PgType, Projection, Returning, ScalarItem, ScalarValue,
-    SelectItem, Statement, Term, TruncateStatement, UnsupportedClause, UpdateStmt, VacuumStmt,
+    CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr, ForeignKeyConstraint,
+    InsertStmt, IsolationLevel, Operand, OrderItem, PgType, Projection, Returning, ScalarItem,
+    ScalarValue, SelectItem, Statement, Term, TruncateStatement, UnsupportedClause, UpdateStmt,
+    VacuumStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{

@@ -13,6 +13,49 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **Enforced `FOREIGN KEY`s, backed by real secondary indexes** (`pg_fk.rs`,
+  `ddl::execute_add_foreign_key`, `query::execute_{insert,update,delete}`). `ALTER TABLE …
+  ADD [CONSTRAINT <name>] FOREIGN KEY (<col>) REFERENCES <parent> [(<pcol>)]` — with the
+  referenced-column list omitted, defaulting to the parent's primary key, exactly what
+  `pgbench -i --foreign-keys` emits — now parses (`ferrosa-sql`), is recorded as a
+  `pg.foreign_key.<name>` extension on the child, and is **enforced**. `ADD FOREIGN KEY`
+  also builds a **real secondary index** over the child's referencing column (through the
+  same `DdlExecutor::create_index` path `ADD PRIMARY KEY` uses), so the parent-side check is
+  a lookup. The check is a **normal read**: a point read when the referenced column is the
+  parent's storage key, otherwise a lookup through the parent's `<parent>_pkey` index (or
+  the child's FK index for the parent side). Because the read lands in the read set a
+  serializable COMMIT validates — a concurrent delete of the other side bumps that table's
+  epoch and fails the commit (`mvcc::validate_snapshot`). Child `INSERT`/`UPDATE` with a
+  missing parent is `23503`; parent `DELETE` with live children is `23503`; each names the
+  constraint, the child `table.column` and the value, and a present parent is admitted (the
+  positive control). `CREATE TABLE … FOREIGN KEY …` / column `REFERENCES` parse in
+  `ferrosa-sql` but are **refused by name** (`0A000`) at the front end rather than accepted: a
+  CREATE-time FK cannot be enforced (`CREATE TABLE` cannot build the child index the
+  constraint needs), so accepting it would record a constraint that is never checked. The
+  enforced form is `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`, which `pgbench -i
+  --foreign-keys` emits.
+
+  **Refused by name rather than recorded and mis-enforced (`0A000`):** a multi-column FK or
+  multi-column referenced key (ferrosa secondary indexes are single-column —
+  `build_replicated_index` uses `target_columns.first()`); a referenced column that is not
+  the parent's key (would force a scan per check).
+
+  **Unimplemented (named gaps, in priority order):**
+  1. **Referential actions.** `ON DELETE`/`ON UPDATE CASCADE`, `SET NULL`, `SET DEFAULT`,
+     `MATCH FULL`/`PARTIAL`, `DEFERRABLE`/`INITIALLY`, `NOT VALID` are refused by the parser
+     (`0A000`). There is no cascade, no deferral, no skip-validation — a client that asked
+     for one is told, never handed a `NO ACTION` constraint in its place.
+  2. **A parent row written earlier in the same uncommitted transaction is not visible to the
+     child-side check** — the probe reads committed storage, not the session's pending
+     write-set. Cross-statement parent-then-child inserts in one transaction (and a
+     self-referencing table) can therefore be wrongly refused. This is a REAL semantic
+     deviation from PostgreSQL, which sees a transaction's own uncommitted writes; this
+     front end is not referential-integrity-equivalent. `pgbench` loads parents and children
+     in separate statements that flush, so it is unaffected.
+  3. **The parent-side probe iterates every table in the schema** for constraints that
+     reference the parent (O(tables) per parent DELETE, not per row). Fine for a handful of
+     tables; revisit if a schema grows large.
+
 - **`CREATE TABLE ... WITH (key = value, ...)` (table storage parameters).** pgbench's
   own schema emits `with (fillfactor=100)`, which stopped `pgbench -i` at
   `expected end of statement, found Ident("with")`. `ferrosa-sql` now parses the clause:

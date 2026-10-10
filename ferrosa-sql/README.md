@@ -55,7 +55,7 @@ in-memory table in tests and by Ferrosa storage in production.
   precision, numeric(p,s), boolean, text, varchar(n), bytea, uuid, date, time,
   timestamp[tz], inet, `jsonb`, `json` (`PgType::storage()` maps `json` to
   `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
-  `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
+  `ParseError::UnsupportedClause`: `CHECK`,
   `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`. An optional
   trailing `WITH (key = value, ...)` storage-parameter clause is parsed and each
   accepted pair is recorded on `CreateTableStmt::storage_parameters` — `fillfactor`
@@ -64,6 +64,24 @@ in-memory table in tests and by Ferrosa storage in production.
   autovacuum), so they are recorded but not applied. Any other option name is refused
   by name (`ParseError::UnsupportedStorageParameter`, `0A000`) rather than dropped;
   pgbench's `create table ... with (fillfactor=100)` is the motivating case.
+- **`FOREIGN KEY` / column `REFERENCES` grammar** (parsed here; **enforced** by the
+  Postgres front end — see `ferrosa-postgres`'s README and roadmap). A table-level
+  `[CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]` and a
+  column-level `REFERENCES` both parse into `ForeignKeyConstraint` and are recorded on
+  `CreateTableStmt::foreign_keys` / `AlterOperation::AddForeignKey`. The referenced-column
+  list is optional: `REFERENCES parent` leaves `parent_columns` `None`, meaning the
+  parent's primary key — the executor resolves it, so the AST records only what was
+  written. **An FK that parses but is not enforced is a lie**: the grammar accepts only
+  the referential actions the front end actually implements — the default **NO ACTION**
+  and its immediate equivalent **RESTRICT** — and refuses `ON DELETE`/`ON UPDATE`
+  `CASCADE`, `SET NULL`, `SET DEFAULT`, `MATCH FULL`/`PARTIAL`, `DEFERRABLE`, `INITIALLY`
+  and `NOT VALID` **by name** (`ParseError::UnsupportedAlter`), so a client that asked to
+  CASCADE never receives a NO ACTION constraint in its place. The five statements
+  `pgbench -i --foreign-keys` emits are pinned by
+  `the_five_pgbench_foreign_keys_parse`. `ferrosa-postgres` **enforces** the
+  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` form and **refuses a `CREATE TABLE`-time
+  `FOREIGN KEY` / column `REFERENCES` by name** (`0A000`) rather than accepting a constraint
+  it cannot enforce — so a parsed FK is never silently left unchecked.
 - Maintenance statements **parsed** (executed by the Postgres front end):
   `TRUNCATE [TABLE] t [, …]` into `Statement::Truncate`; `VACUUM [FULL]
   [ANALYZE|ANALYSE] [t]` into `Statement::Vacuum`; `ANALYZE|ANALYSE [t]` into

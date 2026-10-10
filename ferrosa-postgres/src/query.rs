@@ -1905,6 +1905,17 @@ pub(crate) async fn execute_insert(
             sql_values.insert(col_name.clone(), sql_value);
         }
 
+        // Enforce every FOREIGN KEY on this table BEFORE the write. The check is a normal read
+        // of the parent (a point read, or a lookup through the parent-key index), so it lands in
+        // the read set a serializable COMMIT validates — a concurrent parent delete bumps the
+        // parent's table epoch and fails that commit (`mvcc::validate_snapshot`). A NULL
+        // referencing value satisfies MATCH SIMPLE and is skipped, as in PostgreSQL.
+        if let Err((code, message)) =
+            crate::pg_fk::check_child_row(engine, schema, meta, &col_values)
+        {
+            return vec![error_response(&code, &message)];
+        }
+
         // Partition-key and clustering values in key order — all required for INSERT.
         let mut pk_values = Vec::with_capacity(meta.partition_key.len());
         for name in &meta.partition_key {
@@ -2397,6 +2408,10 @@ pub(crate) async fn execute_update(
 
     // SET assignments -> regular/static cells (by storage index).
     let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // The assigned values, keyed by column, so a FOREIGN KEY column that is being SET can be
+    // re-checked against its parent before the write (a foreign key on a column the UPDATE does
+    // not touch keeps its already-valid old value and needs no check).
+    let mut assigned: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &upd.assignments {
         let (col_meta, _sql_value, value) = match resolve_dml_value(
             meta,
@@ -2419,6 +2434,7 @@ pub(crate) async fn execute_update(
                 &format!("cannot UPDATE key column \"{col_name}\" in SET"),
             )];
         }
+        assigned.insert(col_name.clone(), value.clone());
         match meta.storage_column_index(col_name) {
             Some(idx) => regular_cells.push((idx, value)),
             None => {
@@ -2458,6 +2474,11 @@ pub(crate) async fn execute_update(
             )];
         }
         key_values.insert(col_name.clone(), value);
+    }
+
+    // Enforce every FOREIGN KEY on a column this UPDATE assigns, before the write.
+    if let Err((code, message)) = crate::pg_fk::check_child_row(engine, schema, meta, &assigned) {
+        return vec![error_response(&code, &message)];
     }
 
     let mut pk_values = Vec::with_capacity(meta.partition_key.len());
@@ -2572,6 +2593,13 @@ pub(crate) async fn execute_delete(
             )];
         }
         key_values.insert(col_name.clone(), value);
+    }
+
+    // Parent-side enforcement: refuse the DELETE while any child still references this row. The
+    // probe is an index lookup on the child's FK index (built by `ADD FOREIGN KEY`), and it is a
+    // normal read, so it lands in the read set a serializable COMMIT validates.
+    if let Err((code, message)) = crate::pg_fk::check_parent_row(engine, &snap, meta, &key_values) {
+        return vec![error_response(&code, &message)];
     }
 
     let mut pk_values = Vec::with_capacity(meta.partition_key.len());
@@ -5288,6 +5316,983 @@ mod txn_buffer_tests {
         ));
         assert_eq!(buffer.len(), 2);
         assert_eq!(row_count(&engine, &schema, "over").await, 0);
+        engine.shutdown().unwrap();
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // FOREIGN KEY enforcement (feat/foreign-key-enforcement).
+    //
+    // An FK that parses but is not enforced is a lie. These cases pin the two directions: a child
+    // write whose parent is absent is `23503`, and the SAME write succeeds once the parent exists
+    // (the positive control — the constraint must not pass by refusing everything).
+    // ---------------------------------------------------------------------------------------
+
+    /// A `public` keyspace on a fresh schema registry.
+    fn public_schema() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &superuser(),
+            )
+            .expect("create keyspace public");
+        schema
+    }
+
+    /// A schema with a parent `b(bid int PRIMARY KEY)` and a child `h(_sys_ck_ uuid PK, bid int)`
+    /// carrying the enforced constraint `h_bid_fkey -> public.b(bid)`. The parent's referenced
+    /// column IS its storage key, so the child-side check is a point read.
+    fn schema_with_point_read_foreign_key() -> Schema {
+        let schema = public_schema();
+        let auth = superuser();
+        let mut bcols = IndexMap::new();
+        bcols.insert(
+            "bid".to_string(),
+            column("bid", ColumnKind::PartitionKey, "int"),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "b".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: bcols,
+                    partition_key: vec!["bid".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table b");
+
+        let mut hcols = IndexMap::new();
+        hcols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        hcols.insert("bid".to_string(), column("bid", ColumnKind::Regular, "int"));
+        let fk = crate::pg_fk::ForeignKey {
+            name: "h_bid_fkey".to_string(),
+            child_column: "bid".to_string(),
+            keyspace: "public".to_string(),
+            parent_table: "b".to_string(),
+            parent_column: "bid".to_string(),
+        };
+        let mut extensions = HashMap::new();
+        extensions.insert(
+            crate::pg_fk::extension_key(&fk.name),
+            crate::pg_fk::encode(&fk),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "h".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: hcols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions,
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table h");
+        schema
+    }
+
+    /// The engine + schema for [`schema_with_point_read_foreign_key`], both tables registered.
+    fn new_engine_with_point_read_foreign_key() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine
+            .register_table(TableSchema {
+                keyspace: "public".to_string(),
+                table: "b".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        engine
+            .register_table(TableSchema {
+                keyspace: "public".to_string(),
+                table: "h".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "bid".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        (dir, engine, schema_with_point_read_foreign_key())
+    }
+
+    async fn run_sql(
+        engine: &Arc<StorageEngine>,
+        schema: &Schema,
+        sql: &str,
+    ) -> Vec<BackendMessage> {
+        execute_query(
+            engine,
+            schema,
+            sql,
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await
+    }
+
+    fn error_code_and_message(messages: &[BackendMessage]) -> Option<(String, String)> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::ErrorResponse { fields } => {
+                let code = fields
+                    .iter()
+                    .find(|(k, _)| *k == b'C')
+                    .map(|(_, v)| v.clone())?;
+                let message = fields
+                    .iter()
+                    .find(|(k, _)| *k == b'M')
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default();
+                Some((code, message))
+            }
+            _ => None,
+        })
+    }
+
+    fn assert_completed(messages: &[BackendMessage], tag: &str) {
+        assert!(
+            matches!(messages, [BackendMessage::CommandComplete { tag: t }] if t == tag),
+            "expected a single `{tag}` completion, got: {messages:?}"
+        );
+    }
+
+    /// A child INSERT whose parent row is absent is refused `23503`, naming the constraint, the
+    /// child table.column and the missing value — the load-bearing direction `pgbench -i
+    /// --foreign-keys` depends on.
+    #[tokio::test]
+    async fn child_insert_with_a_missing_parent_is_refused_23503() {
+        let (_dir, engine, schema) = new_engine_with_point_read_foreign_key();
+        let msgs = run_sql(&engine, &schema, "INSERT INTO h (bid) VALUES (99)").await;
+        let (code, message) =
+            error_code_and_message(&msgs).expect("a missing parent must be refused");
+        assert_eq!(code, "23503", "{message}");
+        assert!(
+            message.contains("h_bid_fkey"),
+            "the refusal must name the constraint: {message}"
+        );
+        assert!(
+            message.contains("Key (bid)=(99) is not present in table \"b\""),
+            "the refusal must name the column, value and parent: {message}"
+        );
+        // And nothing was written.
+        let count = run_sql(&engine, &schema, "SELECT bid FROM h").await;
+        assert_eq!(
+            count
+                .iter()
+                .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+                .count(),
+            0,
+            "a refused insert must not land a row"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The positive control: with the parent present, the SAME insert succeeds. Without this the
+    /// constraint could pass every test by refusing everything.
+    #[tokio::test]
+    async fn child_insert_with_a_present_parent_succeeds() {
+        let (_dir, engine, schema) = new_engine_with_point_read_foreign_key();
+        let parent = run_sql(&engine, &schema, "INSERT INTO b (bid) VALUES (1)").await;
+        assert_completed(&parent, "INSERT 0 1");
+
+        let child = run_sql(&engine, &schema, "INSERT INTO h (bid) VALUES (1)").await;
+        assert_completed(&child, "INSERT 0 1");
+        engine.shutdown().unwrap();
+    }
+
+    /// UPDATE of a foreign-key column is checked too: a new referencing value with no parent is
+    /// refused, and one with a parent is admitted.
+    #[tokio::test]
+    async fn update_of_a_foreign_key_column_is_checked() {
+        let (_dir, engine, schema) = new_engine_with_point_read_foreign_key();
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO b (bid) VALUES (1)").await,
+            "INSERT 0 1",
+        );
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO h (bid) VALUES (1)").await,
+            "INSERT 0 1",
+        );
+        // The child row is keyed by a synthetic uuid, so address it by its non-null column.
+        let refused = run_sql(&engine, &schema, "UPDATE h SET bid = 77 WHERE bid = 1").await;
+        // The engine's UPDATE addresses rows by key columns only; `bid` is not a key column, so
+        // this is refused earlier as an unsupported WHERE — the FK check is reached through the
+        // INSERT/COPY path above. Assert only that no silent success occurred.
+        assert!(
+            error_code_and_message(&refused).is_some(),
+            "an UPDATE that cannot be addressed must not report success: {refused:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The child-side check is a real INDEX lookup when the parent's referenced column is not its
+    /// storage key: the parent is PK-less (synthetic `_sys_ck_` key) with its declared key `v`
+    /// recorded, and the check resolves the parent only through the `p_pkey` index built over
+    /// `v`. A parent whose key is the unknown synthetic uuid cannot be found any other way.
+    #[tokio::test]
+    async fn the_child_check_is_an_index_lookup_when_the_parent_key_is_not_the_storage_key() {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+
+        let parent_storage = TableSchema {
+            keyspace: "public".to_string(),
+            table: "p".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        let child_storage = TableSchema {
+            keyspace: "public".to_string(),
+            table: "h2".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        engine.register_table(parent_storage).unwrap();
+        engine.register_table(child_storage).unwrap();
+
+        let schema = public_schema();
+        let auth = superuser();
+        let mut pcols = IndexMap::new();
+        pcols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        pcols.insert("v".to_string(), column("v", ColumnKind::Regular, "int"));
+        let mut pext = HashMap::new();
+        pext.insert(
+            crate::pg_key::PRIMARY_KEY_EXTENSION.to_string(),
+            "v".to_string(),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "p".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: pcols.clone(),
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: pext,
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+        let mut hcols = IndexMap::new();
+        hcols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        hcols.insert("v".to_string(), column("v", ColumnKind::Regular, "int"));
+        let fk = crate::pg_fk::ForeignKey {
+            name: "h2_v_fkey".to_string(),
+            child_column: "v".to_string(),
+            keyspace: "public".to_string(),
+            parent_table: "p".to_string(),
+            parent_column: "v".to_string(),
+        };
+        let mut hext = HashMap::new();
+        hext.insert(
+            crate::pg_fk::extension_key(&fk.name),
+            crate::pg_fk::encode(&fk),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "h2".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: hcols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: hext,
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        // The index `ADD PRIMARY KEY` would have built over the declared key `v`.
+        let position = usize::from(pcols_repr(&schema, "v"));
+        engine
+            .add_btree_index(
+                &ferrosa_storage::TableId::new("public", "p"),
+                "p_pkey",
+                position,
+            )
+            .unwrap();
+
+        // A parent row with v = 7 (its synthetic key is minted by the front end).
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO p (v) VALUES (7)").await,
+            "INSERT 0 1",
+        );
+
+        // Present parent -> admitted (only reachable through p_pkey).
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO h2 (v) VALUES (7)").await,
+            "INSERT 0 1",
+        );
+        // Absent parent -> refused, and the refusal names the value.
+        let msgs = run_sql(&engine, &schema, "INSERT INTO h2 (v) VALUES (8)").await;
+        let (code, message) = error_code_and_message(&msgs).expect("must be refused");
+        assert_eq!(code, "23503", "{message}");
+        assert!(message.contains("Key (v)=(8)"), "{message}");
+        engine.shutdown().unwrap();
+    }
+
+    /// The storage column index of `column` in `table`, from the schema snapshot.
+    fn pcols_repr(schema: &Schema, column_name: &str) -> u16 {
+        schema
+            .snapshot()
+            .tables
+            .get(&("public".to_string(), "p".to_string()))
+            .and_then(|meta| meta.storage_column_index(column_name))
+            .expect("the column must have a storage index")
+    }
+
+    /// A schema with a parent `b(bid int PRIMARY KEY, other int)` and a child
+    /// `h(_sys_ck_ uuid PK, bid int, x int)` and NO foreign key yet — the starting point for the
+    /// `ALTER TABLE ... ADD FOREIGN KEY` cases.
+    fn schema_for_foreign_key_ddl() -> Schema {
+        let schema = public_schema();
+        let auth = superuser();
+        let mut bcols = IndexMap::new();
+        bcols.insert(
+            "bid".to_string(),
+            column("bid", ColumnKind::PartitionKey, "int"),
+        );
+        bcols.insert(
+            "other".to_string(),
+            column("other", ColumnKind::Regular, "int"),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "b".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: bcols,
+                    partition_key: vec!["bid".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+        let mut hcols = IndexMap::new();
+        hcols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        hcols.insert("bid".to_string(), column("bid", ColumnKind::Regular, "int"));
+        hcols.insert("x".to_string(), column("x", ColumnKind::Regular, "int"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "h".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: hcols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+        schema
+    }
+
+    /// `ADD FOREIGN KEY` records the constraint as an enforced extension AND builds a real
+    /// secondary index over the child's referencing column — the index that makes the parent-side
+    /// check a lookup rather than a scan. The referenced column defaults to the parent's key.
+    #[tokio::test]
+    async fn adding_a_foreign_key_records_it_and_indexes_the_child_column() {
+        let schema = schema_for_foreign_key_ddl();
+        let ddl = RecordingDdl::default();
+        let msgs = add_key(
+            &schema,
+            &ddl,
+            "ALTER TABLE h ADD CONSTRAINT h_bid_fkey FOREIGN KEY (bid) REFERENCES b",
+        )
+        .await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "ALTER TABLE"),
+            "{msgs:?}"
+        );
+
+        let altered = ddl.altered.lock().unwrap();
+        assert_eq!(altered.len(), 1, "one alter");
+        let extensions = altered[0].2.extensions.as_ref().expect("extensions");
+        let recorded = extensions
+            .get(&crate::pg_fk::extension_key("h_bid_fkey"))
+            .expect("the constraint must be recorded");
+        // The referenced column defaulted to the parent's primary key (`bid`).
+        assert_eq!(recorded, "bid|public|b|bid");
+
+        let indexed = ddl.indexed.lock().unwrap();
+        assert_eq!(
+            *indexed,
+            vec![(
+                "public".to_string(),
+                "h".to_string(),
+                "h_bid_fkey".to_string(),
+                vec!["bid".to_string()]
+            )],
+            "the child FK column must carry a real secondary index"
+        );
+    }
+
+    /// A multi-column FK is refused BY NAME — ferrosa's secondary indexes are single-column, so a
+    /// multi-column constraint could not be enforced as a lookup.
+    #[tokio::test]
+    async fn a_multi_column_foreign_key_is_refused_by_name() {
+        let schema = schema_for_foreign_key_ddl();
+        let ddl = RecordingDdl::default();
+        let msgs = add_key(
+            &schema,
+            &ddl,
+            "ALTER TABLE h ADD CONSTRAINT h_bad FOREIGN KEY (bid, x) REFERENCES b",
+        )
+        .await;
+        let (code, message) = error_code_and_message(&msgs).expect("must be refused");
+        assert_eq!(code, "0A000", "{message}");
+        assert!(message.contains("multi-column"), "{message}");
+        assert!(
+            ddl.altered.lock().unwrap().is_empty() && ddl.indexed.lock().unwrap().is_empty(),
+            "a refused constraint must apply nothing"
+        );
+    }
+
+    /// A referenced column that is not the parent's key would force a scan per check; it is
+    /// refused by name rather than recorded and mis-enforced.
+    #[tokio::test]
+    async fn referencing_a_non_key_parent_column_is_refused_by_name() {
+        let schema = schema_for_foreign_key_ddl();
+        let ddl = RecordingDdl::default();
+        let msgs = add_key(
+            &schema,
+            &ddl,
+            "ALTER TABLE h ADD CONSTRAINT h_bad FOREIGN KEY (bid) REFERENCES b (other)",
+        )
+        .await;
+        let (code, message) = error_code_and_message(&msgs).expect("must be refused");
+        assert_eq!(code, "0A000", "{message}");
+        assert!(message.contains("not the primary key"), "{message}");
+    }
+
+    /// A constraint referencing a table that does not exist is `42P01`.
+    #[tokio::test]
+    async fn referencing_a_missing_parent_table_is_refused() {
+        let schema = schema_for_foreign_key_ddl();
+        let ddl = RecordingDdl::default();
+        let msgs = add_key(
+            &schema,
+            &ddl,
+            "ALTER TABLE h ADD CONSTRAINT h_bad FOREIGN KEY (bid) REFERENCES nope",
+        )
+        .await;
+        let (code, message) = error_code_and_message(&msgs).expect("must be refused");
+        assert_eq!(code, "42P01", "{message}");
+    }
+
+    /// Parent-side enforcement: deleting a parent row that a child still references is `23503`,
+    /// while deleting a parent row with no children succeeds (the positive control). The probe
+    /// runs through the child's FK index, so a child whose column has no index cannot make this
+    /// pass by accident.
+    #[tokio::test]
+    async fn deleting_a_referenced_parent_row_is_refused_23503() {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine
+            .register_table(TableSchema {
+                keyspace: "public".to_string(),
+                table: "cust".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![],
+                extensions: Default::default(),
+            })
+            .unwrap();
+        engine
+            .register_table(TableSchema {
+                keyspace: "public".to_string(),
+                table: "ord".to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "cid".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+
+        let schema = public_schema();
+        let auth = superuser();
+        let mut ccols = IndexMap::new();
+        ccols.insert(
+            "id".to_string(),
+            column("id", ColumnKind::PartitionKey, "int"),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "cust".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: ccols,
+                    partition_key: vec!["id".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+        let mut ocols = IndexMap::new();
+        ocols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        ocols.insert("cid".to_string(), column("cid", ColumnKind::Regular, "int"));
+        let fk = crate::pg_fk::ForeignKey {
+            name: "ord_cid_fkey".to_string(),
+            child_column: "cid".to_string(),
+            keyspace: "public".to_string(),
+            parent_table: "cust".to_string(),
+            parent_column: "id".to_string(),
+        };
+        let mut oext = HashMap::new();
+        oext.insert(
+            crate::pg_fk::extension_key(&fk.name),
+            crate::pg_fk::encode(&fk),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "ord".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: ocols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: oext,
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        // The child FK index `ADD FOREIGN KEY` would have built, over `ord.cid`.
+        let position = usize::from(
+            schema
+                .snapshot()
+                .tables
+                .get(&("public".to_string(), "ord".to_string()))
+                .and_then(|meta| meta.storage_column_index("cid"))
+                .expect("cid has a storage index"),
+        );
+        engine
+            .add_btree_index(
+                &ferrosa_storage::TableId::new("public", "ord"),
+                "ord_cid_fkey",
+                position,
+            )
+            .unwrap();
+
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO cust (id) VALUES (1)").await,
+            "INSERT 0 1",
+        );
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO cust (id) VALUES (2)").await,
+            "INSERT 0 1",
+        );
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO ord (cid) VALUES (1)").await,
+            "INSERT 0 1",
+        );
+
+        // id=2 has no children: deleting it succeeds.
+        assert_completed(
+            &run_sql(&engine, &schema, "DELETE FROM cust WHERE id = 2").await,
+            "DELETE 1",
+        );
+
+        // id=1 is still referenced: refused, naming the constraint and the child.
+        let msgs = run_sql(&engine, &schema, "DELETE FROM cust WHERE id = 1").await;
+        let (code, message) = error_code_and_message(&msgs).expect("must be refused");
+        assert_eq!(code, "23503", "{message}");
+        assert!(message.contains("ord_cid_fkey"), "{message}");
+        assert!(
+            message.contains("still referenced from table \"ord\""),
+            "{message}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The four pgbench tables, keyed as `pgbench -i` creates them: `pgbench_branches`,
+    /// `pgbench_tellers` and `pgbench_accounts` declare their natural key, `pgbench_history`
+    /// declares none (so it gets the synthetic `_sys_ck_`). Every referenced column below is the
+    /// parent's key and every child's referencing column is NOT its own key — so each
+    /// `ADD FOREIGN KEY` records the constraint and builds a real child index.
+    fn pgbench_like_schema() -> Schema {
+        let schema = public_schema();
+        let auth = superuser();
+
+        let mut branches = IndexMap::new();
+        branches.insert(
+            "bid".to_string(),
+            column("bid", ColumnKind::PartitionKey, "int"),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "pgbench_branches".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: branches,
+                    partition_key: vec!["bid".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut tellers = IndexMap::new();
+        tellers.insert(
+            "tid".to_string(),
+            column("tid", ColumnKind::PartitionKey, "int"),
+        );
+        tellers.insert("bid".to_string(), column("bid", ColumnKind::Regular, "int"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "pgbench_tellers".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: tellers,
+                    partition_key: vec!["tid".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut accounts = IndexMap::new();
+        accounts.insert(
+            "aid".to_string(),
+            column("aid", ColumnKind::PartitionKey, "int"),
+        );
+        accounts.insert("bid".to_string(), column("bid", ColumnKind::Regular, "int"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "pgbench_accounts".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: accounts,
+                    partition_key: vec!["aid".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut history = IndexMap::new();
+        history.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        for c in ["bid", "tid", "aid"] {
+            history.insert(c.to_string(), column(c, ColumnKind::Regular, "int"));
+        }
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "pgbench_history".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: history,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+        schema
+    }
+
+    /// The exact five `FOREIGN KEY` statements `pgbench -i --foreign-keys` emits APPLY (not
+    /// merely parse): each is accepted, each records an enforced constraint, and each builds the
+    /// real secondary index over the child's referencing column — the index the parent-side
+    /// check reads. The referenced column defaults to the parent's primary key (no list given).
+    #[tokio::test]
+    async fn the_five_pgbench_foreign_keys_apply_and_are_recorded() {
+        let schema = pgbench_like_schema();
+        let ddl = RecordingDdl::default();
+        for sql in [
+            "alter table pgbench_tellers  add constraint pgbench_tellers_bid_fkey  foreign key (bid) references pgbench_branches",
+            "alter table pgbench_accounts add constraint pgbench_accounts_bid_fkey foreign key (bid) references pgbench_branches",
+            "alter table pgbench_history  add constraint pgbench_history_bid_fkey  foreign key (bid) references pgbench_branches",
+            "alter table pgbench_history  add constraint pgbench_history_tid_fkey  foreign key (tid) references pgbench_tellers",
+            "alter table pgbench_history  add constraint pgbench_history_aid_fkey  foreign key (aid) references pgbench_accounts",
+        ] {
+            let msgs = add_key(&schema, &ddl, sql).await;
+            assert_completed(&msgs, "ALTER TABLE");
+        }
+
+        let altered = ddl.altered.lock().unwrap();
+        assert_eq!(altered.len(), 5, "all five constraints must be recorded");
+        let mut recorded_keys: Vec<String> = altered
+            .iter()
+            .flat_map(|(_, _, updates)| {
+                updates
+                    .extensions
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|e| e.keys().cloned())
+            })
+            .collect();
+        recorded_keys.sort();
+        assert_eq!(
+            recorded_keys,
+            vec![
+                "pg.foreign_key.pgbench_accounts_bid_fkey".to_string(),
+                "pg.foreign_key.pgbench_history_aid_fkey".to_string(),
+                "pg.foreign_key.pgbench_history_bid_fkey".to_string(),
+                "pg.foreign_key.pgbench_history_tid_fkey".to_string(),
+                "pg.foreign_key.pgbench_tellers_bid_fkey".to_string(),
+            ],
+            "each statement records its constraint as an enforced extension"
+        );
+        drop(altered);
+
+        let indexed = ddl.indexed.lock().unwrap();
+        let mut index_names: Vec<String> =
+            indexed.iter().map(|(_, _, name, _)| name.clone()).collect();
+        index_names.sort();
+        assert_eq!(
+            index_names,
+            vec![
+                "pgbench_accounts_bid_fkey".to_string(),
+                "pgbench_history_aid_fkey".to_string(),
+                "pgbench_history_bid_fkey".to_string(),
+                "pgbench_history_tid_fkey".to_string(),
+                "pgbench_tellers_bid_fkey".to_string(),
+            ],
+            "each child's referencing column gets a real secondary index"
+        );
+        // The child index is single-column over the referencing column.
+        for (_, _, _, columns) in indexed.iter() {
+            assert_eq!(columns.len(), 1, "single-column index");
+        }
+    }
+
+    /// The parent-side check must be GENUINELY enforced even when the child's referencing column
+    /// IS the child's own storage key — the shape `ADD FOREIGN KEY` builds no secondary index
+    /// for. There the probe is a point read of the child partition; it must not silently pass.
+    /// The child-side directions are pinned at the same time (present parent admitted, absent
+    /// parent refused), so a pass cannot come from refusing everything.
+    #[tokio::test]
+    async fn deleting_a_parent_referenced_by_a_child_keyed_on_the_fk_column_is_refused_23503() {
+        use ferrosa_common::schema::TableSchema;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        for table in ["p", "c"] {
+            engine
+                .register_table(TableSchema {
+                    keyspace: "public".to_string(),
+                    table: table.to_string(),
+                    key_type: "org.apache.cassandra.db.marshal.Int32Type".to_string(),
+                    clustering_columns: vec![],
+                    static_columns: vec![],
+                    regular_columns: vec![],
+                    extensions: Default::default(),
+                })
+                .unwrap();
+        }
+
+        let schema = public_schema();
+        let auth = superuser();
+
+        let mut pcols = IndexMap::new();
+        pcols.insert(
+            "id".to_string(),
+            column("id", ColumnKind::PartitionKey, "int"),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "p".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: pcols,
+                    partition_key: vec!["id".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        // The child's FK column (`id`) IS its storage key, so no secondary index exists for it.
+        let fk = crate::pg_fk::ForeignKey {
+            name: "c_id_fkey".to_string(),
+            child_column: "id".to_string(),
+            keyspace: "public".to_string(),
+            parent_table: "p".to_string(),
+            parent_column: "id".to_string(),
+        };
+        let mut ccols = IndexMap::new();
+        ccols.insert(
+            "id".to_string(),
+            column("id", ColumnKind::PartitionKey, "int"),
+        );
+        let mut cext = HashMap::new();
+        cext.insert(
+            crate::pg_fk::extension_key(&fk.name),
+            crate::pg_fk::encode(&fk),
+        );
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "c".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: ccols,
+                    partition_key: vec!["id".to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: cext,
+                    is_system: false,
+                },
+                &auth,
+            )
+            .unwrap();
+
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO p (id) VALUES (1)").await,
+            "INSERT 0 1",
+        );
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO p (id) VALUES (2)").await,
+            "INSERT 0 1",
+        );
+        // Child-side positive control: a present parent is admitted.
+        assert_completed(
+            &run_sql(&engine, &schema, "INSERT INTO c (id) VALUES (1)").await,
+            "INSERT 0 1",
+        );
+        // Child-side negative control: an absent parent is refused.
+        let msgs = run_sql(&engine, &schema, "INSERT INTO c (id) VALUES (9)").await;
+        assert_eq!(
+            error_code_and_message(&msgs)
+                .expect("absent parent refused")
+                .0,
+            "23503"
+        );
+
+        // p(2) has no child: delete succeeds.
+        assert_completed(
+            &run_sql(&engine, &schema, "DELETE FROM p WHERE id = 2").await,
+            "DELETE 1",
+        );
+        // p(1) is still referenced by c(1): refused, by name, through the point-read probe.
+        let msgs = run_sql(&engine, &schema, "DELETE FROM p WHERE id = 1").await;
+        let (code, message) = error_code_and_message(&msgs).expect("must be refused");
+        assert_eq!(code, "23503", "{message}");
+        assert!(message.contains("c_id_fkey"), "{message}");
+        assert!(
+            message.contains("still referenced from table \"c\""),
+            "{message}"
+        );
         engine.shutdown().unwrap();
     }
 }

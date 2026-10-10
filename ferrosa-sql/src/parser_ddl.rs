@@ -11,8 +11,8 @@
 use super::{ParseError, Parser, Tok};
 use crate::ast::{
     AlterOperation, AlterTableStmt, AnalyzeStmt, ColumnDef, CopyFormatKind, CopyFromStdinStmt,
-    CreateTableStmt, DropTableStatement, PgType, Statement, TableRef, TruncateStatement,
-    UnsupportedClause, VacuumStmt,
+    CreateTableStmt, DropTableStatement, ForeignKeyConstraint, PgType, Statement, TableRef,
+    TruncateStatement, UnsupportedClause, VacuumStmt,
 };
 
 /// The one schema a table may be qualified with. Other schemas are refused
@@ -48,8 +48,9 @@ impl Parser {
         self.expect(&Tok::LParen, "(")?;
         let mut columns: Vec<ColumnDef> = Vec::new();
         let mut table_pk: Option<Vec<String>> = None;
+        let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
         loop {
-            self.parse_table_element(&mut columns, &mut table_pk)?;
+            self.parse_table_element(&mut columns, &mut table_pk, &mut foreign_keys)?;
             match self.next() {
                 Some(Tok::Comma) => {}
                 Some(Tok::RParen) => break,
@@ -64,7 +65,14 @@ impl Parser {
         }
         let storage_parameters = self.parse_optional_storage_parameters()?;
         self.expect_end()?;
-        finish_create_table(if_not_exists, name, columns, table_pk, storage_parameters)
+        finish_create_table(
+            if_not_exists,
+            name,
+            columns,
+            table_pk,
+            foreign_keys,
+            storage_parameters,
+        )
     }
 
     /// `WITH ( key = value [, ...] )`, an optional clause after the table body.
@@ -146,21 +154,27 @@ impl Parser {
         &mut self,
         columns: &mut Vec<ColumnDef>,
         table_pk: &mut Option<Vec<String>>,
+        foreign_keys: &mut Vec<ForeignKeyConstraint>,
     ) -> Result<(), ParseError> {
         if self.peek_is_kw("CONSTRAINT") {
             self.next();
-            self.ident()?; // constraint name; the constraint kind follows
-            return self.parse_table_constraint(table_pk);
+            let name = self.ident()?; // constraint name; the constraint kind follows
+            return self.parse_table_constraint(table_pk, Some(name), foreign_keys);
         }
         if let Some(Tok::Ident(w)) = self.peek() {
             if matches!(
                 w.to_ascii_uppercase().as_str(),
                 "PRIMARY" | "FOREIGN" | "CHECK" | "UNIQUE"
             ) {
-                return self.parse_table_constraint(table_pk);
+                return self.parse_table_constraint(table_pk, None, foreign_keys);
             }
         }
-        let col = self.parse_column_def()?;
+        let (col, reference) = self.parse_column_def()?;
+        // A column-level `REFERENCES` is a foreign-key constraint on that column. Fold it
+        // into the table's constraint list.
+        if let Some(reference) = reference {
+            foreign_keys.push(reference);
+        }
         columns.push(col);
         Ok(())
     }
@@ -168,6 +182,8 @@ impl Parser {
     fn parse_table_constraint(
         &mut self,
         table_pk: &mut Option<Vec<String>>,
+        name: Option<String>,
+        foreign_keys: &mut Vec<ForeignKeyConstraint>,
     ) -> Result<(), ParseError> {
         let word = self.ident()?.to_ascii_uppercase();
         match word.as_str() {
@@ -179,13 +195,129 @@ impl Parser {
                 *table_pk = Some(self.parse_paren_ident_list()?);
                 Ok(())
             }
-            "FOREIGN" => Err(ParseError::UnsupportedClause(UnsupportedClause::ForeignKey)),
+            "FOREIGN" => {
+                self.expect_ident_kw("KEY")?;
+                let columns = self.parse_paren_ident_list()?;
+                let fk = self.parse_foreign_key_tail(name, columns)?;
+                foreign_keys.push(fk);
+                Ok(())
+            }
             "CHECK" => Err(ParseError::UnsupportedClause(UnsupportedClause::Check)),
             "UNIQUE" => Err(ParseError::UnsupportedClause(UnsupportedClause::Unique)),
             _ => Err(ParseError::Unexpected {
                 expected: "PRIMARY KEY, FOREIGN KEY, CHECK or UNIQUE",
                 found: word,
             }),
+        }
+    }
+
+    /// The tail of a foreign-key clause after `FOREIGN KEY`: `(<cols>) REFERENCES <parent>
+    /// [(<pcols>)]`, plus the referential-action / deferrability tail (which must be empty
+    /// or an accepted `NO ACTION`/`RESTRICT`).
+    fn parse_foreign_key_tail(
+        &mut self,
+        name: Option<String>,
+        columns: Vec<String>,
+    ) -> Result<ForeignKeyConstraint, ParseError> {
+        self.expect_ident_kw("REFERENCES")?;
+        let parent = self.parse_qualified_table()?;
+        let parent_columns = if matches!(self.peek(), Some(Tok::LParen)) {
+            Some(self.parse_paren_ident_list()?)
+        } else {
+            None
+        };
+        self.parse_referential_tail()?;
+        Ok(ForeignKeyConstraint {
+            name,
+            columns,
+            parent,
+            parent_columns,
+        })
+    }
+
+    /// The referential-action / deferrability tail of a foreign-key clause.
+    ///
+    /// ferrosa implements PostgreSQL's default **NO ACTION** (and the equivalent
+    /// immediate **RESTRICT**): a child write is refused when the parent is absent, and a
+    /// parent delete is refused while referencing children remain. `ON DELETE`/`ON UPDATE`
+    /// `CASCADE`, `SET NULL` and `SET DEFAULT`, `MATCH` forms other than the default
+    /// `SIMPLE`, and `DEFERRABLE`/`INITIALLY` are all refused **by name** — a client that
+    /// asked for cascading deletes must never receive a plain NO ACTION constraint in its
+    /// place. `NOT VALID` is refused for the same reason: skipping validation of existing
+    /// rows would make the constraint a lie.
+    fn parse_referential_tail(&mut self) -> Result<(), ParseError> {
+        loop {
+            match self.peek() {
+                Some(Tok::On) => {
+                    self.next();
+                    let event = self.ident()?.to_ascii_uppercase();
+                    if event != "DELETE" && event != "UPDATE" {
+                        return Err(ParseError::Unexpected {
+                            expected: "DELETE or UPDATE",
+                            found: event,
+                        });
+                    }
+                    let action = self.ident()?.to_ascii_uppercase();
+                    match action.as_str() {
+                        // The default. `NO ACTION` and `RESTRICT` are the same here: both
+                        // refuse the write that would leave a dangling reference.
+                        "NO" => {
+                            self.expect_ident_kw("ACTION")?;
+                        }
+                        "RESTRICT" => {}
+                        // `SET NULL` / `SET DEFAULT` are two words; consume the second so the
+                        // refusal NAMES the whole action the client wrote, never just `SET`.
+                        "SET" => {
+                            let fill = self.ident()?.to_ascii_uppercase();
+                            return Err(ParseError::UnsupportedAlter(format!(
+                                "ON {event} SET {fill} is not supported: ferrosa implements \
+                                 NO ACTION (refuse) only, never CASCADE, SET NULL or SET DEFAULT"
+                            )));
+                        }
+                        other => {
+                            return Err(ParseError::UnsupportedAlter(format!(
+                                "ON {event} {other} is not supported: ferrosa implements \
+                                 NO ACTION (refuse) only, never CASCADE, SET NULL or SET DEFAULT"
+                            )))
+                        }
+                    }
+                }
+                Some(Tok::Not) => {
+                    // `NOT DEFERRABLE` (the default) is a no-op; `NOT VALID` is not.
+                    self.next();
+                    if self.peek_is_kw("VALID") {
+                        return Err(ParseError::UnsupportedAlter(
+                            "NOT VALID is not supported: ferrosa validates the constraint \
+                             immediately rather than accepting one it does not check"
+                                .into(),
+                        ));
+                    }
+                    self.expect_ident_kw("DEFERRABLE")?;
+                }
+                Some(Tok::Ident(w)) => {
+                    match w.to_ascii_uppercase().as_str() {
+                        "MATCH" => return Err(ParseError::UnsupportedAlter(
+                            "MATCH FULL/PARTIAL is not supported (only the default MATCH SIMPLE)"
+                                .into(),
+                        )),
+                        "DEFERRABLE" => {
+                            return Err(ParseError::UnsupportedAlter(
+                                "DEFERRABLE foreign keys are not supported: checks run immediately"
+                                    .into(),
+                            ))
+                        }
+                        "INITIALLY" => {
+                            return Err(ParseError::UnsupportedAlter(
+                                "INITIALLY DEFERRED/IMMEDIATE is not supported: checks run \
+                             immediately"
+                                    .into(),
+                            ))
+                        }
+                        _ => return Ok(()),
+                    }
+                }
+                _ => return Ok(()),
+            }
         }
     }
 
@@ -375,12 +507,18 @@ impl Parser {
 
     /// The clause after `ALTER TABLE t ADD`.
     fn parse_alter_add(&mut self) -> Result<AlterOperation, ParseError> {
-        // `ADD CONSTRAINT <name> PRIMARY KEY (...)`. The name is accepted and ignored: Postgres
-        // does not require it to mean anything, and the key is described by its columns.
+        // `ADD CONSTRAINT <name> <kind>`. The name is meaningful for a FOREIGN KEY (it names
+        // the constraint and its index); PostgreSQL does not require it for a PRIMARY KEY.
         if self.peek_is_kw("CONSTRAINT") {
             self.next();
-            self.ident()?; // the constraint name
+            let name = self.ident()?; // the constraint name
+            if self.peek_is_kw("FOREIGN") {
+                return self.parse_add_foreign_key(Some(name));
+            }
             return self.parse_add_primary_key();
+        }
+        if self.peek_is_kw("FOREIGN") {
+            return self.parse_add_foreign_key(None);
         }
         if self.peek_is_kw("PRIMARY") {
             return self.parse_add_primary_key();
@@ -391,10 +529,10 @@ impl Parser {
             self.next();
         } else if !matches!(self.peek(), Some(Tok::Ident(_))) {
             return Err(ParseError::UnsupportedAlter(
-                "only ADD COLUMN and ADD PRIMARY KEY are supported".into(),
+                "only ADD COLUMN, ADD PRIMARY KEY and ADD FOREIGN KEY are supported".into(),
             ));
         }
-        let def = self.parse_column_def()?;
+        let (def, reference) = self.parse_column_def()?;
         // A column-level PRIMARY KEY would be a second way to say `ADD PRIMARY KEY`, and the two
         // would have to agree about order and about the storage key. Refuse it rather than pick.
         if def.primary_key {
@@ -403,7 +541,28 @@ impl Parser {
                     .into(),
             ));
         }
+        // A column-level REFERENCES in ADD COLUMN is a foreign-key constraint; it is parsed but
+        // the ALTER layer applies one operation, so it is refused by name rather than dropped.
+        if reference.is_some() {
+            return Err(ParseError::UnsupportedAlter(
+                "a column-level REFERENCES in ADD COLUMN is not supported: \
+                 use ADD CONSTRAINT <name> FOREIGN KEY (<col>) REFERENCES <parent>"
+                    .into(),
+            ));
+        }
         Ok(AlterOperation::AddColumn(def))
+    }
+
+    /// `ADD [CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]`.
+    fn parse_add_foreign_key(
+        &mut self,
+        name: Option<String>,
+    ) -> Result<AlterOperation, ParseError> {
+        self.expect_ident_kw("FOREIGN")?;
+        self.expect_ident_kw("KEY")?;
+        let columns = self.parse_paren_ident_list()?;
+        let fk = self.parse_foreign_key_tail(name, columns)?;
+        Ok(AlterOperation::AddForeignKey(fk))
     }
 
     fn parse_add_primary_key(&mut self) -> Result<AlterOperation, ParseError> {
@@ -427,8 +586,12 @@ impl Parser {
     }
 
     /// `name type [column-constraint]*`. A column-level `PRIMARY KEY` is recorded
-    /// on the returned def (`primary_key`) and folded into the table key later.
-    fn parse_column_def(&mut self) -> Result<ColumnDef, ParseError> {
+    /// on the returned def (`primary_key`) and folded into the table key later. A
+    /// column-level `REFERENCES` is returned separately as a foreign-key constraint
+    /// (it names this column as the referencing side).
+    fn parse_column_def(
+        &mut self,
+    ) -> Result<(ColumnDef, Option<ForeignKeyConstraint>), ParseError> {
         let name = self.ident()?;
         let ty = self.parse_pg_type()?;
         let mut def = ColumnDef {
@@ -437,16 +600,21 @@ impl Parser {
             not_null: false,
             primary_key: false,
         };
+        let mut reference = None;
         while let Some(tok) = self.peek() {
             if matches!(tok, Tok::Comma | Tok::RParen) {
                 break;
             }
-            self.parse_column_constraint(&mut def)?;
+            self.parse_column_constraint(&mut def, &mut reference)?;
         }
-        Ok(def)
+        Ok((def, reference))
     }
 
-    fn parse_column_constraint(&mut self, def: &mut ColumnDef) -> Result<(), ParseError> {
+    fn parse_column_constraint(
+        &mut self,
+        def: &mut ColumnDef,
+        reference: &mut Option<ForeignKeyConstraint>,
+    ) -> Result<(), ParseError> {
         if matches!(self.peek(), Some(Tok::Not)) {
             self.next();
             self.expect_ident_kw("NULL")?;
@@ -464,7 +632,27 @@ impl Parser {
             "DEFAULT" => Err(ParseError::UnsupportedClause(
                 UnsupportedClause::DefaultExpr,
             )),
-            "REFERENCES" => Err(ParseError::UnsupportedClause(UnsupportedClause::ForeignKey)),
+            "REFERENCES" => {
+                if reference.is_some() {
+                    return Err(ParseError::UnsupportedAlter(
+                        "a column may carry at most one REFERENCES clause".into(),
+                    ));
+                }
+                let parent = self.parse_qualified_table()?;
+                let parent_columns = if matches!(self.peek(), Some(Tok::LParen)) {
+                    Some(self.parse_paren_ident_list()?)
+                } else {
+                    None
+                };
+                self.parse_referential_tail()?;
+                *reference = Some(ForeignKeyConstraint {
+                    name: None,
+                    columns: vec![def.name.clone()],
+                    parent,
+                    parent_columns,
+                });
+                Ok(())
+            }
             "CHECK" => Err(ParseError::UnsupportedClause(UnsupportedClause::Check)),
             "UNIQUE" => Err(ParseError::UnsupportedClause(UnsupportedClause::Unique)),
             _ => Err(ParseError::Unexpected {
@@ -755,6 +943,7 @@ fn finish_create_table(
     name: TableRef,
     mut columns: Vec<ColumnDef>,
     table_pk: Option<Vec<String>>,
+    foreign_keys: Vec<ForeignKeyConstraint>,
     storage_parameters: Vec<(String, String)>,
 ) -> Result<Statement, ParseError> {
     if columns.is_empty() {
@@ -793,6 +982,7 @@ fn finish_create_table(
         name,
         columns,
         primary_key,
+        foreign_keys,
         storage_parameters,
     })))
 }

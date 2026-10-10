@@ -2489,12 +2489,9 @@ mod tests {
     #[test]
     fn pg_ddl_out_of_scope_clause_named_in_error() {
         // Each clause fails with a typed error whose message names it (D10);
-        // the per-clause tests below pin the exact variant.
+        // the per-clause tests below pin the exact variant. `FOREIGN KEY` is no
+        // longer in this list — it parses and is enforced (see the foreign-key tests).
         let cases = [
-            (
-                "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p (id))",
-                "FOREIGN KEY",
-            ),
             (
                 "CREATE TABLE t (id int PRIMARY KEY, n int, CHECK (n > 0))",
                 "CHECK",
@@ -2516,22 +2513,189 @@ mod tests {
         }
     }
 
+    /// Parse an `ALTER TABLE` statement, asserting it is one.
+    fn alter(sql: &str) -> crate::ast::AlterTableStmt {
+        match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => *a,
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn foreign_key_table_constraint_is_refused_by_name() {
+    fn foreign_key_table_constraint_is_parsed() {
+        let c = create(
+            "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p)",
+        );
+        assert_eq!(c.foreign_keys.len(), 1, "one FK clause");
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.name, None, "an unnamed table constraint");
+        assert_eq!(fk.columns, vec!["o".to_string()]);
+        assert_eq!(fk.parent.table, "p");
         assert_eq!(
-            refused(
-                "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p (id))"
-            ),
-            UnsupportedClause::ForeignKey
+            fk.parent_columns, None,
+            "no referenced column list: it defaults to the parent's primary key"
         );
     }
 
     #[test]
-    fn foreign_key_column_references_is_refused_by_name() {
-        assert_eq!(
-            refused("CREATE TABLE t (id int PRIMARY KEY, o int REFERENCES p (id))"),
-            UnsupportedClause::ForeignKey
+    fn foreign_key_named_table_constraint_keeps_its_name_and_parent_columns() {
+        let c = create(
+            "CREATE TABLE t (id int, o int, PRIMARY KEY (id), \
+             CONSTRAINT t_o_fkey FOREIGN KEY (o) REFERENCES p (id))",
         );
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.name.as_deref(), Some("t_o_fkey"));
+        assert_eq!(fk.parent_columns, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn foreign_key_column_references_is_parsed() {
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, o int REFERENCES p (id))");
+        assert_eq!(c.foreign_keys.len(), 1);
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.name, None, "a column REFERENCES is auto-named");
+        assert_eq!(fk.columns, vec!["o".to_string()]);
+        assert_eq!(fk.parent.table, "p");
+        assert_eq!(fk.parent_columns, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn add_constraint_foreign_key_parses_with_and_without_a_referenced_column() {
+        use crate::ast::AlterOperation;
+        for (sql, expect_parent_cols) in [
+            (
+                "ALTER TABLE h ADD CONSTRAINT h_bid_fkey FOREIGN KEY (bid) REFERENCES b",
+                None,
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT h_bid_fkey FOREIGN KEY (bid) REFERENCES b (bid)",
+                Some(vec!["bid".to_string()]),
+            ),
+        ] {
+            let a = alter(sql);
+            let AlterOperation::AddForeignKey(fk) = a.operation else {
+                panic!("expected AddForeignKey for `{sql}`");
+            };
+            assert_eq!(fk.name.as_deref(), Some("h_bid_fkey"));
+            assert_eq!(fk.columns, vec!["bid".to_string()]);
+            assert_eq!(fk.parent.table, "b");
+            assert_eq!(fk.parent_columns, expect_parent_cols);
+        }
+        // Without `CONSTRAINT <name>`, PostgreSQL auto-names it.
+        let a = alter("ALTER TABLE h ADD FOREIGN KEY (bid) REFERENCES b");
+        let AlterOperation::AddForeignKey(fk) = a.operation else {
+            panic!("expected AddForeignKey");
+        };
+        assert_eq!(fk.name, None);
+    }
+
+    /// The exact five `FOREIGN KEY` statements `pgbench -i --foreign-keys` emits. Each omits the
+    /// referenced-column list, so the referenced column defaults to the parent's primary key. The
+    /// parser must accept every one — this is the grammar half of the acceptance; `ferrosa-postgres`
+    /// proves they APPLY and are enforced.
+    #[test]
+    fn the_five_pgbench_foreign_keys_parse() {
+        use crate::ast::AlterOperation;
+        for (sql, child, parent) in [
+            (
+                "alter table pgbench_tellers  add constraint pgbench_tellers_bid_fkey  foreign key (bid) references pgbench_branches",
+                "pgbench_tellers",
+                "pgbench_branches",
+            ),
+            (
+                "alter table pgbench_accounts add constraint pgbench_accounts_bid_fkey foreign key (bid) references pgbench_branches",
+                "pgbench_accounts",
+                "pgbench_branches",
+            ),
+            (
+                "alter table pgbench_history  add constraint pgbench_history_bid_fkey  foreign key (bid) references pgbench_branches",
+                "pgbench_history",
+                "pgbench_branches",
+            ),
+            (
+                "alter table pgbench_history  add constraint pgbench_history_tid_fkey  foreign key (tid) references pgbench_tellers",
+                "pgbench_history",
+                "pgbench_tellers",
+            ),
+            (
+                "alter table pgbench_history  add constraint pgbench_history_aid_fkey  foreign key (aid) references pgbench_accounts",
+                "pgbench_history",
+                "pgbench_accounts",
+            ),
+        ] {
+            let a = alter(sql);
+            assert_eq!(a.table.table, child, "{sql}");
+            let AlterOperation::AddForeignKey(fk) = a.operation else {
+                panic!("expected AddForeignKey for `{sql}`");
+            };
+            assert_eq!(fk.parent.table, parent, "{sql}");
+            assert_eq!(
+                fk.parent_columns, None,
+                "{sql}: no referenced-column list -> the parent's primary key"
+            );
+        }
+    }
+
+    #[test]
+    fn add_primary_key_is_unchanged_by_the_foreign_key_grammar() {
+        use crate::ast::AlterOperation;
+        let a = alter("ALTER TABLE t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)");
+        assert_eq!(
+            a.operation,
+            AlterOperation::AddPrimaryKey(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_action_and_restrict_are_accepted_and_cascade_is_refused_by_name() {
+        // Accepted: the default NO ACTION and its immediate equivalent RESTRICT.
+        for sql in [
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE NO ACTION",
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON UPDATE NO ACTION",
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE RESTRICT",
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE NO ACTION \
+             ON UPDATE RESTRICT NOT DEFERRABLE",
+        ] {
+            alter(sql);
+        }
+        // Refused by name: a client that asked to cascade must never get a NO ACTION
+        // constraint silently in its place.
+        for (sql, named) in [
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE CASCADE",
+                "ON DELETE CASCADE",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE SET NULL",
+                "ON DELETE SET NULL",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON UPDATE SET DEFAULT",
+                "ON UPDATE SET DEFAULT",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b DEFERRABLE",
+                "DEFERRABLE",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b NOT VALID",
+                "NOT VALID",
+            ),
+            (
+                "CREATE TABLE t (o int REFERENCES p MATCH FULL)",
+                "MATCH",
+            ),
+        ] {
+            let err = parse_statement(sql).expect_err(sql);
+            assert!(
+                matches!(err, ParseError::UnsupportedAlter(_)),
+                "{sql}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(named),
+                "the refusal must name the action: {sql}: {err}"
+            );
+        }
     }
 
     #[test]

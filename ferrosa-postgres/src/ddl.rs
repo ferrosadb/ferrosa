@@ -156,12 +156,16 @@ fn complete_with(tag: &str) -> Vec<BackendMessage> {
 
 /// Execute `ALTER TABLE <table> <operation>`.
 ///
-/// Three operations, and what each is for:
+/// Four operations, and what each is for:
 ///
 /// - **ADD PRIMARY KEY** records the *declared* key ([`crate::pg_key`]) so introspection reports
 ///   the key the user asked for rather than the synthetic `_sys_ck_` a PK-less table was given,
 ///   and builds a **secondary index** over it when that key is not the storage key — without
 ///   which a lookup by the declared key degrades to a full scan.
+/// - **ADD FOREIGN KEY** records an *enforced* constraint ([`crate::pg_fk`]) and builds a
+///   **secondary index** over the child's referencing column, so the parent-side check is a
+///   lookup too. The referenced column must be the parent's key, which the child-side check
+///   can also look up as a lookup.
 /// - **ADD COLUMN** and **DROP COLUMN** map straight onto `TableUpdates`.
 ///
 /// Everything else is refused by the parser, so nothing here has to guess. Each validation runs
@@ -194,6 +198,9 @@ pub(crate) async fn execute_alter_table(
     match &stmt.operation {
         AlterOperation::AddPrimaryKey(columns) => {
             execute_add_primary_key(executor, keyspace, &meta, columns).await
+        }
+        AlterOperation::AddForeignKey(fk) => {
+            execute_add_foreign_key(executor, keyspace, &meta, fk, env.schema).await
         }
         AlterOperation::AddColumn(def) => {
             if is_reserved_column_name(&def.name) {
@@ -349,6 +356,157 @@ async fn execute_add_primary_key(
     complete_with("ALTER TABLE")
 }
 
+/// Record an enforced foreign key and index the child's referencing column.
+///
+/// The validation is deliberately strict, and every refusal NAMES the reason: an FK that is
+/// recorded but only half-enforced would be a constraint the client believes is checked.
+///
+/// - a **multi-column** FK or referenced key is `0A000` — ferrosa's secondary indexes are
+///   single-column, so the parent-side lookup those need cannot exist;
+/// - the referenced column must be the parent's **key** (declared key, or storage key): that is
+///   the only column the parent-side row can be point-read or index-looked-up by. Anything else
+///   would need a scan per check;
+/// - the child and parent columns must exist (`42703`) and the parent table must exist (`42P01`).
+///
+/// The durable record is applied BEFORE the index, as `ADD PRIMARY KEY` does, and `58000` names
+/// which half failed so the client can retry the right thing.
+async fn execute_add_foreign_key(
+    executor: &dyn DdlExecutor,
+    keyspace: &str,
+    child: &TableMetadata,
+    fk: &ferrosa_sql::ForeignKeyConstraint,
+    schema: &Schema,
+) -> Vec<BackendMessage> {
+    // ferrosa secondary indexes cover a single column (`build_replicated_index` uses
+    // `target_columns.first()`), so a multi-column constraint cannot be enforced as a lookup.
+    if fk.columns.len() != 1 {
+        return refuse(
+            "0A000",
+            &format!(
+                "a multi-column FOREIGN KEY ({} columns) is not supported: ferrosa secondary \
+                 indexes cover a single column, so the constraint could not be checked as a lookup",
+                fk.columns.len()
+            ),
+        );
+    }
+    let child_column = &fk.columns[0];
+    if !child.columns.contains_key(child_column) {
+        return refuse(
+            "42703",
+            &format!(
+                "column \"{child_column}\" named in the FOREIGN KEY does not exist in relation \"{}\"",
+                child.name
+            ),
+        );
+    }
+
+    // The parent is resolved in the child's keyspace unless the statement qualified it.
+    let parent_keyspace = fk.parent.schema.as_deref().unwrap_or(keyspace);
+    let parent_key = (parent_keyspace.to_string(), fk.parent.table.clone());
+    let Some(parent) = schema.snapshot().tables.get(&parent_key).cloned() else {
+        return refuse(
+            "42P01",
+            &format!("relation \"{}\" does not exist", fk.parent.table),
+        );
+    };
+
+    // No referenced-column list defaults to the parent's primary key, exactly as PostgreSQL does.
+    let parent_columns = match &fk.parent_columns {
+        Some(columns) => columns.clone(),
+        None => crate::pg_key::of(&parent),
+    };
+    if parent_columns.is_empty() {
+        return refuse(
+            "42830",
+            &format!(
+                "there is no primary key for referenced relation \"{}\": the FOREIGN KEY has no \
+                 column to reference",
+                parent.name
+            ),
+        );
+    }
+    if parent_columns.len() != 1 {
+        return refuse(
+            "0A000",
+            &format!(
+                "a {}-column referenced key is not supported: ferrosa secondary indexes cover a \
+                 single column",
+                parent_columns.len()
+            ),
+        );
+    }
+    let parent_column = &parent_columns[0];
+    if !parent.columns.contains_key(parent_column) {
+        return refuse(
+            "42703",
+            &format!(
+                "column \"{parent_column}\" referenced by the FOREIGN KEY does not exist in \
+                 relation \"{}\"",
+                parent.name
+            ),
+        );
+    }
+    // The referenced column must be the parent's key: a point read when it is the storage key,
+    // otherwise the `<parent>_pkey` secondary index. A non-key column would need a per-check
+    // scan, which is not a lookup and is refused by name rather than recorded.
+    if crate::pg_key::of(&parent) != parent_columns {
+        return refuse(
+            "0A000",
+            &format!(
+                "the referenced column \"{parent_column}\" is not the primary key of relation \
+                 \"{}\": ferrosa can only look a parent row up by its key",
+                parent.name
+            ),
+        );
+    }
+
+    let name = fk
+        .name
+        .clone()
+        .unwrap_or_else(|| crate::pg_fk::default_name(&child.name, child_column));
+    let constraint = crate::pg_fk::ForeignKey {
+        name: name.clone(),
+        child_column: child_column.clone(),
+        keyspace: keyspace.to_string(),
+        parent_table: parent.name.clone(),
+        parent_column: parent_column.clone(),
+    };
+    let updates = TableUpdates {
+        params: None,
+        add_columns: Vec::new(),
+        drop_columns: Vec::new(),
+        extensions: Some(HashMap::from([(
+            crate::pg_fk::extension_key(&name),
+            crate::pg_fk::encode(&constraint),
+        )])),
+    };
+    if let Err(error) = executor.alter_table(keyspace, &child.name, updates).await {
+        return refuse("58000", &format!("ALTER TABLE failed: {error}"));
+    }
+
+    // Index the child's referencing column unless it already IS the child's storage key — the
+    // primary structure already serves lookups by it, so a second index would be pure write
+    // overhead. This is the index the parent-side check reads.
+    if crate::pg_key::storage_key_columns(child) != vec![child_column.clone()] {
+        if let Err(error) = executor
+            .create_index(
+                keyspace,
+                &child.name,
+                &constraint.child_index_name(),
+                std::slice::from_ref(child_column),
+            )
+            .await
+        {
+            return refuse(
+                "58000",
+                &format!("the constraint was recorded but indexing its column failed: {error}"),
+            );
+        }
+    }
+
+    complete_with("ALTER TABLE")
+}
+
 /// Execute `CREATE TABLE [IF NOT EXISTS]` (FMEA PG-T132a-01..05).
 ///
 /// Reply is `CREATE TABLE` on success and on `IF NOT EXISTS` over an existing
@@ -473,6 +631,20 @@ pub(crate) fn plan_create_table(
     stmt: &CreateTableStmt,
     keyspace: &str,
 ) -> Result<TableMetadata, BackendMessage> {
+    // A table-level FOREIGN KEY in `CREATE TABLE` is refused BY NAME rather than accepted and
+    // silently dropped: this front end cannot record it here (the referenced column defaults to
+    // the parent's primary key, which needs the schema snapshot `CREATE TABLE` does not carry)
+    // and an accepted-but-unenforced constraint is exactly the lie this feature exists to
+    // remove. The enforced form is `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`, which is
+    // what `pgbench -i --foreign-keys` emits.
+    if !stmt.foreign_keys.is_empty() {
+        return Err(error_response(
+            "0A000",
+            "FOREIGN KEY in CREATE TABLE is not supported: a constraint added at CREATE time \
+             would be accepted without being enforced. Add it with ALTER TABLE ... ADD \
+             CONSTRAINT <name> FOREIGN KEY (<col>) REFERENCES <parent>, which is enforced",
+        ));
+    }
     // The `_sys_` prefix is ferrosa's own. The front end recognises it by name to filter
     // the column out of `SELECT *` and to give it a negative `attnum` in `pg_attribute`,
     // so accepting a user column in that namespace would make both those rules lie.
@@ -819,5 +991,29 @@ mod tests {
             );
         }
         assert!(is_reserved_column_name(SYNTHETIC_KEY_COLUMN));
+    }
+
+    /// A `FOREIGN KEY` written inline in `CREATE TABLE` is refused BY NAME (`0A000`), never
+    /// accepted-and-dropped: this front end cannot record it here, and an accepted constraint
+    /// that is not enforced is exactly the lie the feature exists to remove. The enforced form
+    /// is `ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY`, which `pgbench -i --foreign-keys`
+    /// emits.
+    #[test]
+    fn a_create_table_foreign_key_is_refused_by_name() {
+        for sql in [
+            "CREATE TABLE c (id int, bid int, FOREIGN KEY (bid) REFERENCES b)",
+            "CREATE TABLE c (id int, bid int, CONSTRAINT c_bid_fkey FOREIGN KEY (bid) REFERENCES b)",
+            "CREATE TABLE c (id int, bid int REFERENCES b)",
+        ] {
+            let text = plan_err(sql);
+            assert!(
+                text.contains("0A000"),
+                "{sql} must be refused with 0A000: {text}"
+            );
+            assert!(
+                text.contains("FOREIGN KEY in CREATE TABLE is not supported"),
+                "{sql} must name the reason: {text}"
+            );
+        }
     }
 }

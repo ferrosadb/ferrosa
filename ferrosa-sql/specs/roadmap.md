@@ -46,6 +46,22 @@ toward the Postgres queries real clients send.
   compaction; `ANALYZE` is an accepted no-op).
   `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused by name.
 
+- **(done) `FOREIGN KEY` / column `REFERENCES` grammar.** `[CONSTRAINT <name>]
+  FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]` (table level) and a column-level
+  `REFERENCES` parse into `ForeignKeyConstraint`, recorded on
+  `CreateTableStmt::foreign_keys` and `AlterOperation::AddForeignKey`; `ALTER TABLE …
+  ADD [CONSTRAINT <name>] FOREIGN KEY …` is accepted. The referenced-column list is
+  optional (`parent_columns: None` ⇒ the parent's primary key; the executor resolves it).
+  The grammar accepts only what the front end enforces — the default `NO ACTION` and
+  `RESTRICT` — and refuses `ON DELETE`/`ON UPDATE CASCADE`/`SET NULL`/`SET DEFAULT`,
+  `MATCH FULL`/`PARTIAL`, `DEFERRABLE`, `INITIALLY`, `NOT VALID` **by name**
+  (`ParseError::UnsupportedAlter`). `ALTER TABLE` has no `expect_end`, so the referential
+  tail must be validated explicitly; it is. The five statements `pgbench -i
+  --foreign-keys` emits are pinned by `the_five_pgbench_foreign_keys_parse`; ENFORCEMENT
+  (the index-backed child-side and parent-side checks) lives in `ferrosa-postgres`, which
+  enforces the `ALTER TABLE … ADD FOREIGN KEY` form and refuses a `CREATE TABLE`-time
+  `FOREIGN KEY` by name (`0A000`) rather than accept one it cannot enforce.
+
 - **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).
   `execute_streaming` + `RowSink` deliver rows as the pipeline yields them and
   the Postgres front end forwards them with backpressure. Follow-up: retire the

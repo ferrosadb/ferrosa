@@ -139,6 +139,32 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   (with a matching `<table>_pkey` index row in `pg_class`), so psql's describe-table
   shows a declared `PRIMARY KEY`; a table whose only key is the synthesized
   `_sys_ck_` reports no key.
+- **Enforced `FOREIGN KEY`s, backed by real secondary indexes** (`pg_fk`, `ddl::execute_add_foreign_key`).
+  `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY (<col>) REFERENCES <parent> [(<pcol>)]`
+  records the constraint on the child table (as `pg.foreign_key.<name>` in `TableMetadata::extensions`,
+  beside `pg.primary_key`) and builds a **real secondary index** over the child's referencing column,
+  so the parent-side check is a lookup, not a scan. The referenced column defaults to the parent's
+  primary key when the list is omitted (what `pgbench -i --foreign-keys` emits). Both directions are
+  enforced: a child `INSERT`/`UPDATE` whose parent row is absent is refused `23503`, and a parent
+  `DELETE` with live children is refused `23503`, each naming the constraint, the child
+  `table.column` and the value. The check is a **normal read** (a point read when the referenced
+  column is the parent's storage key, otherwise a lookup through the parent's `<parent>_pkey`
+  index), so it lands in the read set a serializable COMMIT validates — a concurrent parent delete
+  bumps the parent's table epoch and fails that commit. **Refused by name** rather than recorded and
+  mis-enforced: a multi-column FK or referenced key (`0A000`; ferrosa secondary indexes are
+  single-column), a referenced column that is not the parent's key (`0A000`; a scan per check).
+  **Unimplemented referential actions** — `ON DELETE`/`ON UPDATE CASCADE`, `SET NULL`, `SET DEFAULT`,
+  `MATCH FULL`/`PARTIAL`, `DEFERRABLE`/`INITIALLY`, `NOT VALID` — are refused by the parser
+  (`0A000`); there is no cascade, no deferral, and no skip-validation. A `FOREIGN KEY` written
+  inline in `CREATE TABLE` is **refused by name** (`0A000`), never accepted-and-dropped, because
+  `CREATE TABLE` cannot build the child index the constraint needs; add it with `ALTER TABLE … ADD
+  CONSTRAINT … FOREIGN KEY`. A child whose FK column is its own storage key carries no FK index, so
+  the parent-side probe reads that child partition directly (a point read) — both directions stay
+  enforced. One REAL deviation remains: a parent row written earlier in the **same uncommitted
+  transaction** is not visible to the child-side check (the probe reads committed storage, not the
+  session write-set), so a cross-statement parent-then-child insert in one transaction can be
+  wrongly refused — this front end is not referential-integrity-equivalent to PostgreSQL. See
+  `specs/roadmap.md` for the named gaps.
 - **`TRUNCATE [TABLE] t [, …]` — replicated** (`truncate`) — removes every row
   of each named table through the **replicated** cluster write path (the same
   `ferrosa_cluster::WritePath` the CQL router's `route_truncate` uses), never a
@@ -333,9 +359,10 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Storage glue | `storage_provider::load_table`, `cql_to_value`, `LoadError` |
 | Catalog | `catalog::{pg_namespace, pg_class, pg_attribute, pg_type, pg_index, pg_constraint, catalog_tables}` (`pg_attribute`/`pg_type`/`catalog_tables` are fallible: `PgTypeError`) |
 | Synthetic key | `synthetic_key::next_synthetic_key` — the per-row v1 TimeUUID for the `_sys_ck_` key of a PK-less table |
-| DDL | `ddl::DdlExecutor` (`create_table`/`drop_table`/`alter_table`/`create_index`), `ddl::execute_alter_table` — `ALTER TABLE ... ADD PRIMARY KEY` / `ADD COLUMN` / `DROP COLUMN`; every other ALTER form is refused by name |
+| DDL | `ddl::DdlExecutor` (`create_table`/`drop_table`/`alter_table`/`create_index`), `ddl::execute_alter_table` — `ALTER TABLE ... ADD PRIMARY KEY` / `ADD FOREIGN KEY` / `ADD COLUMN` / `DROP COLUMN`; every other ALTER form is refused by name |
 | Truncate (replicated) | `truncate::TruncateExecutor` (`truncate`), `truncate::ClusterTruncate`, `truncate::execute_truncate` — `TRUNCATE` over the same `WritePath` CQL uses, never a node-local truncate |
 | Declared key | `pg_key::{of, recorded, encode, PRIMARY_KEY_EXTENSION}` — the *PostgreSQL* primary key, which is not the storage key |
+| Foreign keys | `pg_fk::{ForeignKey, recorded, encode, decode, check_child_row, check_parent_row}` — enforced FK constraints, recorded as `pg.foreign_key.<name>` extensions and checked as index lookups |
 | Type map | `pg_types::{pg_type_of, pg_type_of_column, for_column_type, cql_type_for_pg_name, PgType, PgTypeError}` — the one `CqlType` ↔ Postgres type map (OID, typname, typlen, engine `ColumnType`, binary support); catalog, storage provider, RowDescription and parameter inference all read it |
 | Codec / messages | `codec::{read_startup, read_frontend, MAX_MESSAGE_LEN}`, `messages::{FrontendMessage, BackendMessage, TransactionStatus, …}` |
 
