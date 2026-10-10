@@ -246,6 +246,16 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
     does not honor it decodes the two bytes as an unknown escape (`22P04`) and the whole load fails
     at the client's `PQendcopy`. `copy_decode` recognises a lone `\.` line as end-of-data: it is
     never a row, and anything the client flushes after it is ignored.
+  - **Acknowledged exactly once.** `CopyInResponse` is the single cue for the client to start
+    streaming, so it is sent **once and only once**: the frame is written before the payload is
+    read, and the reply buffer is emptied before the tail (`COPY n` / the error, plus
+    `ReadyForQuery`) is written. A second `G` arriving *after* the payload re-cues a real client
+    into copy mode — psql answers `CopyFail "trying to exit copy mode"` (and the server then
+    reports `08P01 COPY data received outside a COPY operation`) and `pgbench -i` dies with a bare
+    `PQendcopy failed`. Pinned by `copy_from_stdin_is_acknowledged_exactly_once`,
+    `a_failed_copy_is_acknowledged_exactly_once`, and the single-ack assertion in the
+    `query_loop`-crossing tests `pgbench_legacy_copy_end_marker_lands_rows` and
+    `copy_inside_a_transaction_over_the_wire_enters_copy_mode_and_lands_rows`.
 - **`VACUUM` (flush + compact) / `ANALYZE` (accepted no-op)** — `VACUUM [FULL]
   [ANALYZE|ANALYSE]` answers `CommandComplete "VACUUM"` and `ANALYZE|ANALYSE`
   answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds.

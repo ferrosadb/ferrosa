@@ -219,7 +219,7 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   from `query_loop`, where the frame buffer and the stream are in scope; a leading-`COPY` byte
   compare guards the intercept so ordinary statements are not parsed twice.
 
-  Four properties are the whole point, and each has a test:
+  Five properties are the whole point, and each has a test:
 
   - **Nothing is acknowledged that cannot run.** The table, the column list and the payload options
     are resolved *before* `CopyInResponse`, so a COPY that is going to fail never has the client
@@ -246,6 +246,16 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
     Tested end to end through `query_loop` (`pgbench_legacy_copy_end_marker_lands_rows`), together
     with the fast-path gate agreeing with the parser on a trailing-`;` statement
     (`a_copy_statement_with_a_trailing_semicolon_still_enters_copy_mode`).
+  - **Exactly one `CopyInResponse`.** The ack is the single cue to start streaming, so it is sent
+    once and only once: the reply buffer is written for the ack, then **emptied** before the tail
+    (`COPY n` / the error, plus `ReadyForQuery`) is written. Reusing it unemptied re-emitted the `G`
+    *after* the payload, which re-cued the client into copy mode — psql answered
+    `CopyFail "trying to exit copy mode"` and `pgbench -i` died with a bare `PQendcopy failed`. A
+    two-direction wire capture on a live cluster confirmed the double dispatch was the server's,
+    for a single client `Q`. Tested by `copy_from_stdin_is_acknowledged_exactly_once`,
+    `a_failed_copy_is_acknowledged_exactly_once`, and the single-ack assertions through
+    `query_loop` (`pgbench_legacy_copy_end_marker_lands_rows`,
+    `copy_inside_a_transaction_over_the_wire_enters_copy_mode_and_lands_rows`).
 
   A row whose field count does not match the column list is refused (`22P04`) rather than padded.
   The option list is parsed by `ferrosa-sql`: `FREEZE [ON|OFF]` — a heap-page concept an LSM has no

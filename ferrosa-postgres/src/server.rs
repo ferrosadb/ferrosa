@@ -3373,6 +3373,20 @@ pub(crate) mod txn_atomicity_tests {
         String::from_utf8_lossy(&reply).into_owned()
     }
 
+    /// Count the `CopyInResponse` frames in a server reply — the 8-byte ack `G`, length `7`,
+    /// format `0`, column count `0`. Counting the FRAME rather than the letter `G` is deliberate:
+    /// a payload line or a command tag may legitimately contain a `G`.
+    ///
+    /// The ack is the one and only cue for the client to start streaming, so a second one — a
+    /// stale copy carried into the tail write — re-cues a real client into copy mode.
+    fn copy_in_responses(text: &str) -> usize {
+        const FRAME: [u8; 8] = [b'G', 0, 0, 0, 7, 0, 0, 0];
+        text.as_bytes()
+            .windows(FRAME.len())
+            .filter(|window| *window == FRAME)
+            .count()
+    }
+
     /// `pgbench -i` (client-side data generation) speaks the LEGACY libpq copy protocol: it sends
     /// the copy rows, then the in-band end-of-data marker `\.` as a `CopyData` line, and only then
     /// calls `PQendcopy`, which sends a `CopyDone`. A server that does not honor `\.` decodes it as
@@ -3410,6 +3424,11 @@ pub(crate) mod txn_atomicity_tests {
             "the trailing CopyDone from PQendcopy must not be a protocol violation: {text:?}"
         );
         assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "pgbench's legacy COPY is acknowledged exactly once: {text:?}"
+        );
+        assert_eq!(
             row_count(&ctx, "a").await,
             1,
             "the row must have landed, not merely been acknowledged"
@@ -3436,5 +3455,129 @@ pub(crate) mod txn_atomicity_tests {
         );
         assert!(text.contains("COPY 1"), "the row is counted: {text:?}");
         assert_eq!(row_count(&ctx, "z").await, 1, "the row must have landed");
+    }
+
+    /// `pgbench -i` wraps its whole data load in `begin` → 3× `COPY` → `commit`. The
+    /// SAME `COPY ... FROM STDIN` that works in autocommit must therefore also enter
+    /// COPY mode when a transaction block is open. The gate that decides this lives in
+    /// `query_loop` (the fast-path `COPY` check), NOT in `copy_stdin::drive`, so this
+    /// test drives the whole `BEGIN`/`Query(copy)`/`CopyData`/`CopyDone`/`COMMIT` byte
+    /// stream through `query_loop` — the seam the existing transactional COPY tests
+    /// (`run_copy_in`) bypass by calling `drive()` directly. That bypass is why a green
+    /// suite coexisted with a live `PQendcopy failed`.
+    ///
+    /// RED first: before the fix, the COPY's `Query` never reaches `drive`, the client's
+    /// payload arrives as stray frames, and the server answers `08P01` instead of
+    /// `CopyInResponse`. Asserting the rows LAND (read back) is the point: an
+    /// acknowledgement that drops the payload would also "not error".
+    #[tokio::test]
+    async fn copy_inside_a_transaction_over_the_wire_enters_copy_mode_and_lands_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("BEGIN"));
+        wire.extend(pg_query("copy kv from stdin"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        wire.extend(pg_frame(b'c', &[])); // CopyDone
+        wire.extend(pg_query("COMMIT"));
+        wire.extend(pg_frame(b'X', &[])); // Terminate
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.contains('G'),
+            "a COPY inside a transaction must still be acknowledged with \
+             CopyInResponse: {text:?}"
+        );
+        assert!(
+            !text.contains("08P01"),
+            "the payload must not be rejected as stray frames outside a COPY: {text:?}"
+        );
+        assert!(
+            text.contains("COPY 1"),
+            "the COPY still reports its own row count: {text:?}"
+        );
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "the COPY is acknowledged exactly once: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "the row must land after COMMIT — the whole point of the fix"
+        );
+    }
+
+    /// The ACID half, through the same `query_loop` seam: a COPY inside a transaction
+    /// whose `ROLLBACK` follows must leave NO rows. Without this, "it entered COPY mode"
+    /// could still mean a COPY that writes regardless of the block's outcome.
+    #[tokio::test]
+    async fn copy_inside_a_rolled_back_transaction_over_the_wire_leaves_no_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("BEGIN"));
+        wire.extend(pg_query("copy kv from stdin"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_query("ROLLBACK"));
+        wire.extend(pg_frame(b'X', &[]));
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.contains("COPY 1"),
+            "the COPY itself succeeds inside the block: {text:?}"
+        );
+        assert!(
+            !text.contains("08P01"),
+            "no stray-frame rejection: {text:?}"
+        );
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "the COPY is acknowledged exactly once: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            0,
+            "ROLLBACK must discard the buffered COPY rows"
+        );
+    }
+
+    /// The legacy `\.` end-of-data marker must keep working when the COPY runs inside a
+    /// transaction too — `pgbench -i` sends it in exactly that shape.
+    #[tokio::test]
+    async fn copy_inside_a_transaction_honors_the_legacy_marker() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("BEGIN"));
+        wire.extend(pg_query("copy kv from stdin with (freeze on)"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        wire.extend(pg_copy_data(b"\\.\n"));
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_query("COMMIT"));
+        wire.extend(pg_frame(b'X', &[]));
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.contains('G'),
+            "COPY mode must open inside the transaction: {text:?}"
+        );
+        assert!(
+            !text.contains("22P04"),
+            "the `\\.` marker must not be decoded as a payload error: {text:?}"
+        );
+        assert!(text.contains("COPY 1"), "the row is counted: {text:?}");
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "the COPY is acknowledged exactly once, marker and all: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "the row before the marker must land on COMMIT"
+        );
     }
 }
