@@ -380,6 +380,23 @@ early acknowledgement.
   after PreAccept and return that effective set in AcceptOK; the coordinator
   unions the accepted quorum's dependencies before Commit. This prevents a
   delayed Accept from dropping a conflict discovered during the first round.
+  **The conflict index is a hard floor on the largest decidable transaction.**
+  A PreAccept registers the transaction under EVERY key in its write-set and is
+  all-or-nothing: if any `ConflictIndex::register` fails (capacity) the replica
+  rolls back the partial registration and answers with no vote. The capacity
+  therefore caps the size of any single transaction the cluster can decide, so
+  it MUST cover every write-set the front end admits. It resolves, cached
+  process-wide, from `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY`, else from the
+  PostgreSQL front end's own `FERROSA_POSTGRES_MAX_TXN_WRITES`, floored at the
+  historical 100 000 (`state_machine::resolve_conflict_index_capacity`). Before
+  this the capacity was a fixed 100 000 that no setting could raise: a
+  ~1,000,112-key transactional `COPY` (`pgbench -i`, admitted because
+  `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000`) was refused by all three replicas —
+  `key_count=1000112 e=conflict index at capacity`, zero votes — and surfaced as
+  an opaque "Accord quorum unavailable" on a healthy cluster (CL-49). The driver
+  also refuses an oversized write-set **by name**
+  (`AccordDriverError::WriteSetExceedsCapacity`), before the protocol registers
+  anything, instead of letting it fail as a mystery quorum error.
   The read-vote phase is the LWT `IF`-condition gate: every conditional
   statement, `INSERT IF NOT EXISTS` included, sends `ReadClusteringRow`, the
   replicas read only that table's row at `t` (`StorageReader::

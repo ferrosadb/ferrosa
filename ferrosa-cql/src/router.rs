@@ -3810,6 +3810,14 @@ async fn finish_lwt_via_accord(
         Err(AccordDriverError::SnapshotStale) => Err(CqlError::ServerError(
             "Accord snapshot stale before LWT commit".into(),
         )),
+        Err(AccordDriverError::WriteSetExceedsCapacity { keys, capacity }) => {
+            Err(CqlError::ServerError(format!(
+                "Accord transaction write-set of {keys} keys exceeds the node's conflict-index \
+                 capacity of {capacity}; raise FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY (or lower \
+                 FERROSA_POSTGRES_MAX_TXN_WRITES) — no replica can register it, so it can never \
+                 reach a quorum"
+            )))
+        }
     }
 }
 

@@ -354,6 +354,7 @@ rebuilding Ferrosa:
 | Environment variable | What it bounds | Default |
 |---|---|---:|
 | `FERROSA_POSTGRES_MAX_TXN_WRITES` | Mutations buffered by one PostgreSQL transaction before it fails with a resource-limit error | `10000` |
+| `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` | Keys one Accord transaction may register in the conflict index. Defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES` (floored at `100000`), so the front end cannot admit a transaction consensus is unable to register | derived |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | Rows buffered between a storage scan producer and the synchronous SQL executor | `64` |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | Maximum lifetime of an active PostgreSQL snapshot/transaction; later use fails with SQLSTATE `40001` | `600000` ms |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | Background cadence for expiring old snapshots and pruning history they retain | `1000` ms |

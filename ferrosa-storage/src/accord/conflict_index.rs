@@ -461,6 +461,15 @@ impl ConflictIndex {
         self.current_entries == 0
     }
 
+    /// The configured capacity (see [`ConflictIndex::new`]) — the maximum number
+    /// of in-flight `(key, transaction)` registrations the index will hold. A
+    /// write-set larger than this can never be registered: `register` is
+    /// all-or-nothing and the caller rolls back, so a transaction of more than
+    /// `capacity` keys cannot be decided.
+    pub fn capacity(&self) -> usize {
+        self.max_entries
+    }
+
     /// Look up indexed write projections for a given column and value.
     pub fn get_indexed_writes(&self, column: &str, value: &[u8]) -> Option<&[TxnId]> {
         self.indexed_writes
