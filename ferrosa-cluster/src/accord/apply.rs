@@ -527,6 +527,54 @@ impl StorageApplier for EngineStorageApplier {
         self.apply_writeset(txn_id, vec![mutation])
     }
 
+    /// Apply every partition of a multi-key transaction **atomically**, decoding
+    /// the write-set as it goes.
+    ///
+    /// # Residency contract
+    ///
+    /// The decode MUST NOT hold the whole encoded write-set resident while it
+    /// builds the decoded batch. Each [`ApplyMutation`] is consumed the moment it
+    /// is decoded — `decode_postgres_mvcc_mutation` only borrows the payload and
+    /// the deserialize copies what it needs into owned rows — so once an entry is
+    /// decoded nothing references its `data` again and the input shrinks as the
+    /// decoded `Vec<BatchOp>` grows. Pinning every input payload next to that
+    /// output instead is the RESIDENT term the COMMIT peak attributes to
+    /// `mvcc.prepare_postgres_apply` (~2.4 KB per decoded op; see
+    /// `ferrosa-cluster/specs/fmea.md` CL-54).
+    ///
+    /// This contract is PROVEN by
+    /// `tests/accord_apply_decode_residency.rs::apply_writeset_peak_stays_within_the_input_size`,
+    /// which arms a counting global allocator and measures the call TWICE: the
+    /// consuming path under test, and a pinning control that holds a clone of every
+    /// entry's payload across the call. The control must sit ~a full input-size
+    /// ABOVE the consuming path — proving the decode frees each payload as it goes.
+    /// The negative control `a_retained_input_payload_trips_the_residency_guard`
+    /// asserts that same separation, so the guard cannot pass blind to the input.
+    /// (An ABSOLUTE bound on the call's peak cannot prove this: `apply_writeset`
+    /// inherently holds ~2x the input even when nothing is pinned, because the
+    /// decoded batch then co-exists with `apply_batch`'s memtable copy of the same
+    /// rows.)
+    ///
+    /// The proof needs a real write-set and a real commit-log flush, so it costs
+    /// seconds — which is why it lives in that integration test and NOT here. A
+    /// doctest runs on *every* `cargo test --doc` and must stay in the millisecond
+    /// range; the example below only pins the call's public shape and is
+    /// `no_run`, so it compiles but never executes.
+    ///
+    /// ```no_run
+    /// use ferrosa_cluster::accord::apply::{ApplyMutation, EngineStorageApplier, StorageApplier};
+    /// use ferrosa_common::accord::{Timestamp, TxnId};
+    ///
+    /// # fn run(applier: &EngineStorageApplier, txn: TxnId, t: Timestamp, frames: Vec<Vec<u8>>) {
+    /// // One already-framed apply mutation per partition the transaction wrote.
+    /// let mutations: Vec<ApplyMutation> = frames
+    ///     .into_iter()
+    ///     .map(|data| ApplyMutation { data, t, deps: Vec::new() })
+    ///     .collect();
+    /// // Every partition commits through ONE atomic `apply_batch`.
+    /// applier.apply_writeset(txn, mutations).unwrap();
+    /// # }
+    /// ```
     fn apply_writeset(
         &self,
         txn_id: TxnId,
