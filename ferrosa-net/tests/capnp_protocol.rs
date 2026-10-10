@@ -379,3 +379,49 @@ fn an_un_negotiated_peer_still_receives_and_decodes_the_legacy_frame() {
         "RequireCapnp against a peer that cannot decode is an error, never a mis-framed send"
     );
 }
+
+/// The LIVE coordinator-side encoder writes each write-set entry straight from borrowed
+/// `(key, mutation)` slices into the capnp arena (no intermediate owned `Vec`). The frame
+/// it produces must be a standalone Accord `ApplyV2` envelope, ride the `AccordApplyV2Capnp`
+/// wire type (0x7D, sent only to a `CAP_ACCORD_CAPNP` peer), and survive the full
+/// `Message::encode`/`Message::decode` round trip byte-for-byte.
+#[test]
+fn borrowed_apply_v2_encoder_carries_the_capnp_wire_type_and_decodes_identically() {
+    use ferrosa_net::protocol::{decode_accord_apply_v2, encode_accord_apply_v2};
+
+    let txn = accord_txn(0, 1_791_651_610_000_000_000, 3, 0x1122_3344_5566_7788);
+    let writes: Vec<(Vec<u8>, Vec<u8>)> = vec![
+        (b"key-1".to_vec(), vec![0x11u8; 512]),
+        (b"key-2\x00with-nul".to_vec(), Vec::new()),
+    ];
+    let frame = encode_accord_apply_v2(
+        txn,
+        writes.iter().map(|(k, m)| (k.as_slice(), m.as_slice())),
+    )
+    .expect("borrowed apply v2 encodes");
+
+    match decode_accord_apply_v2(&frame).expect("borrowed frame decodes") {
+        AccordControlMessage::ApplyV2 {
+            txn_id,
+            writes: decoded,
+        } => {
+            assert_eq!(txn_id, txn);
+            assert_eq!(decoded.len(), 2);
+            assert_eq!(decoded[0].key, b"key-1");
+            assert_eq!(decoded[0].mutation, vec![0x11u8; 512]);
+            assert_eq!(decoded[1].key, b"key-2\x00with-nul");
+            assert!(decoded[1].mutation.is_empty());
+        }
+        other => panic!("expected an ApplyV2 payload, got {other:?}"),
+    }
+
+    let msg = Message::AccordApplyV2Capnp(bytes::Bytes::from(frame.clone()));
+    assert_eq!(msg.msg_type(), MsgType::AccordApplyV2Capnp);
+    let mut body = bytes::BytesMut::new();
+    msg.encode(&mut body).expect("message encodes");
+    match Message::decode(MsgType::AccordApplyV2Capnp, &mut body.freeze()).expect("message decodes")
+    {
+        Message::AccordApplyV2Capnp(decoded) => assert_eq!(decoded.as_ref(), frame.as_slice()),
+        other => panic!("expected AccordApplyV2Capnp, got {other:?}"),
+    }
+}

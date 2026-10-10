@@ -22,6 +22,18 @@ pub trait AccordTransport: Send + Sync {
         msg: Message,
         lane: Lane,
     ) -> ferrosa_net::error::Result<Message>;
+
+    /// Whether `host_id` advertised [`ferrosa_net::handshake::CAP_ACCORD_CAPNP`],
+    /// i.e. decodes the Cap'n Proto `AccordApplyV2Capnp` body.
+    ///
+    /// Defaults to `false`: a transport that cannot positively confirm the peer's
+    /// capability must fall back to the bincode `AccordApplyV2` frame. Sending the
+    /// Cap'n Proto type to a peer that does not know the type byte drops the whole
+    /// internode connection — a rolled-back (version-skewed) peer must still be sent
+    /// a frame it can decode.
+    async fn supports_accord_capnp(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -34,5 +46,11 @@ impl AccordTransport for PeerManager {
     ) -> ferrosa_net::error::Result<Message> {
         // Forward to the inherent method (this trait impl only adds the dyn seam).
         PeerManager::send(self, host_id, msg, lane).await
+    }
+
+    async fn supports_accord_capnp(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_CAPNP != 0)
     }
 }

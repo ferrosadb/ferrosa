@@ -60,9 +60,11 @@ reaches the wire; small write-sets stay wholly resident. See FMEA `CL-51` and
 
 When the write-set is the **same for every peer** — no per-key resolver, or every
 key resolving to the same replica set (the `RF == node count` shape) — the payload
-is built and `bincode`-serialized ONCE (`ApplyV2PayloadRef` borrows the write-set, so
-not even one clone is materialized) and the resulting frame is handed to each peer
-by refcount. That removes N-1 write-set copies, N-1 staged-payload re-reads and N-1
+is built and CAPNP-encoded ONCE (`borrowed_write_set_entries` borrows `(key, mutation)`
+slices straight out of the resident write-set, or out of the spill's mmap, so not even
+one clone is materialized) and the resulting frame is handed to each peer by refcount.
+The Apply frame is capnproto (`encode_accord_apply_v2`), not bincode; a peer that has
+not advertised `CAP_ACCORD_CAPNP` still receives the legacy bincode frame. That removes N-1 write-set copies, N-1 staged-payload re-reads and N-1
 whole-frame serializations from Apply. A genuinely per-peer write-set (a token-aware
 ring with `RF < node count`) still gets its OWN scoped frame and never a shared one —
 sharing a frame across scopes would put a key on a peer that does not own it. The
@@ -76,7 +78,7 @@ phase, with the peer-side `accord apply_writeset attribution` lines:
 
 | Component | Before mmap (N=1.1M) | After mmap (see below) |
 |---|---|---|
-| (a) coordinator frame build + bincode serialize | **15.2 s** (`serialize_ms=15229`) | reduced — see residual |
+| (a) coordinator frame build + serialize | **15.2 s** (`serialize_ms=15229`, bincode) | **86 ms** at N=100 000 after the capnp rewire (`serialize_ms=86.13`, **15.6x**; `frame_bytes` +22%) |
 | (b) transport + peer-side frame deserialize | **~9.4 s** (`max_ack_ms=17442` minus peer apply) | unchanged (still bincode) |
 | (c) peer's own local apply (decode+`apply_batch`) | **~8.0 s** (node1 7.4 s, node2 8.0 s, node3 7.6 s) | unchanged |
 | per-peer payload bytes | **195 MB** (`frame_bytes=204541573`), `shared_frame=false` | unchanged |

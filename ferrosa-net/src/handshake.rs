@@ -34,10 +34,17 @@ pub const CAP_RESULT_CURSOR_PAGE: u32 = 1 << 1;
 /// sent that type, and the downgrade is refused instead.
 pub const CAP_PAIR_DISSOLVE: u32 = 1 << 2;
 
+/// The node decodes `MsgType::AccordApplyV2Capnp`: a multi-key Accord Apply whose
+/// body is a Cap'n Proto `accord.applyV2` frame rather than the bincode
+/// `ApplyV2Payload`. The coordinator sends that type ONLY to a peer that advertised
+/// this bit — a peer without it is sent the bincode `AccordApplyV2` it already
+/// understands, and an unknown type byte would otherwise drop the whole connection.
+pub const CAP_ACCORD_CAPNP: u32 = 1 << 3;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
 pub const LOCAL_CAPABILITIES: u32 =
-    CAP_RPC_ERROR_REPLY | CAP_RESULT_CURSOR_PAGE | CAP_PAIR_DISSOLVE;
+    CAP_RPC_ERROR_REPLY | CAP_RESULT_CURSOR_PAGE | CAP_PAIR_DISSOLVE | CAP_ACCORD_CAPNP;
 
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

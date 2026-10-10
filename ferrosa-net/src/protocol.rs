@@ -513,35 +513,46 @@ impl From<std::str::Utf8Error> for CapnpDecodeError {
     }
 }
 
+/// Stamp the common envelope header fields (everything except the payload
+/// union) from `envelope` onto a freshly-initialized root builder.
+///
+/// Shared by the generic [`encode_envelope`] path and the direct-from-borrow
+/// Accord Apply encoder [`encode_accord_apply_v2`], so both stamp transport
+/// version, feature bits and trace fields identically and a peer sees one
+/// envelope shape.
+fn stamp_envelope_header(root: &mut envelope::Builder<'_>, envelope: &CapnpEnvelope) {
+    root.set_magic(MAGIC);
+    root.set_transport_version(envelope.transport_version);
+    root.set_min_supported_transport_version(envelope.min_supported_transport_version);
+    root.set_schema_version(envelope.schema_version);
+    root.set_flags(0);
+    root.set_required_features(envelope.required_features);
+    root.set_optional_features(envelope.optional_features);
+    fill_node(root.reborrow().init_sender(), &envelope.sender);
+    if let Some(recipient) = &envelope.recipient {
+        fill_node(root.reborrow().init_recipient(), recipient);
+    }
+    root.set_cluster_id(envelope.cluster_id.as_bytes());
+    root.set_epoch(envelope.epoch);
+    root.set_correlation_id(envelope.correlation_id.as_bytes());
+    if let Some(causation_id) = envelope.causation_id {
+        root.set_causation_id(causation_id.as_bytes());
+    }
+    root.set_stream_id(envelope.stream_id);
+    root.set_sequence(envelope.sequence);
+    root.set_deadline_unix_nanos(envelope.deadline_unix_nanos.unwrap_or(0));
+    root.set_trace_id(&envelope.trace_id);
+    root.set_span_id(&envelope.span_id);
+    root.set_trace_flags(envelope.trace_flags);
+}
+
 pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeError> {
     validate_envelope(envelope)?;
 
     let mut message = message::Builder::new_default();
     {
         let mut root = message.init_root::<envelope::Builder>();
-        root.set_magic(MAGIC);
-        root.set_transport_version(envelope.transport_version);
-        root.set_min_supported_transport_version(envelope.min_supported_transport_version);
-        root.set_schema_version(envelope.schema_version);
-        root.set_flags(0);
-        root.set_required_features(envelope.required_features);
-        root.set_optional_features(envelope.optional_features);
-        fill_node(root.reborrow().init_sender(), &envelope.sender);
-        if let Some(recipient) = &envelope.recipient {
-            fill_node(root.reborrow().init_recipient(), recipient);
-        }
-        root.set_cluster_id(envelope.cluster_id.as_bytes());
-        root.set_epoch(envelope.epoch);
-        root.set_correlation_id(envelope.correlation_id.as_bytes());
-        if let Some(causation_id) = envelope.causation_id {
-            root.set_causation_id(causation_id.as_bytes());
-        }
-        root.set_stream_id(envelope.stream_id);
-        root.set_sequence(envelope.sequence);
-        root.set_deadline_unix_nanos(envelope.deadline_unix_nanos.unwrap_or(0));
-        root.set_trace_id(&envelope.trace_id);
-        root.set_span_id(&envelope.span_id);
-        root.set_trace_flags(envelope.trace_flags);
+        stamp_envelope_header(&mut root, envelope);
 
         match &envelope.payload {
             CapnpPayload::Cluster(cluster) => {
@@ -2100,6 +2111,69 @@ pub fn decode_accord_envelope(bytes: &[u8]) -> Result<AccordControlMessage, Capn
     }
 }
 
+/// Encode a multi-key Accord Apply (`AccordControlMessage::ApplyV2`) directly from
+/// borrowed `(key, mutation)` byte slices, writing each entry straight into the
+/// capnp arena as it is visited.
+///
+/// This is the hot-path encoder for a transactional bulk load (`pgbench -i`'s
+/// `TRUNCATE + COPY + COMMIT`, ~1M rows in ONE transaction). The coordinator walks
+/// its write-set once and copies each entry's bytes once INTO the message. There is
+/// no intermediate owned `Vec<AccordWriteSetEntry>` and no clone of the write-set —
+/// which is exactly the extra alloc-per-entry plus full-write-set clone that a
+/// `encode_accord_envelope(&ApplyV2Payload::to_capnp())` call would pay on top of the
+/// copy the wire itself needs.
+///
+/// `writes` is an `ExactSizeIterator` so the capnp list is sized once
+/// (`init_writes(len)`) and never reallocated.
+pub fn encode_accord_apply_v2<'a, I>(
+    txn_id: AccordTxnId,
+    writes: I,
+) -> Result<Vec<u8>, CapnpDecodeError>
+where
+    I: ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    // Build the header from the same shape `encode_accord_envelope` stamps, so a
+    // peer cannot tell the two encoders apart except by the payload bytes.
+    let base = base_envelope(
+        Uuid::nil(),
+        0,
+        CapnpPayload::Accord(AccordControlMessage::ApplyV2 {
+            txn_id,
+            writes: Vec::new(),
+        }),
+    );
+    let mut message = message::Builder::new_default();
+    {
+        let mut root = message.init_root::<envelope::Builder>();
+        stamp_envelope_header(&mut root, &base);
+        root.set_message_family(MessageFamily::Accord);
+        root.set_message_kind(MsgType::AccordApplyV2 as u16);
+        let mut apply = root.init_payload().init_accord().init_op().init_apply_v2();
+        write_accord_txn_id(txn_id, apply.reborrow().init_txn_id());
+        let mut list = apply.init_writes(writes.len() as u32);
+        for (idx, (key, mutation)) in writes.enumerate() {
+            let mut entry = list.reborrow().get(idx as u32);
+            entry.set_key(key);
+            entry.set_mutation(mutation);
+        }
+    }
+    Ok(serialize::write_message_to_words(&message))
+}
+
+/// Decode a frame produced by [`encode_accord_apply_v2`] (or the generic
+/// [`encode_accord_envelope`]) and assert it is the multi-key Apply payload.
+///
+/// Fails loud on a frame that is a valid Accord envelope of a DIFFERENT kind: a
+/// mis-routed Apply reply must never be silently reinterpreted as an Apply.
+pub fn decode_accord_apply_v2(bytes: &[u8]) -> Result<AccordControlMessage, CapnpDecodeError> {
+    match decode_accord_envelope(bytes)? {
+        payload @ AccordControlMessage::ApplyV2 { .. } => Ok(payload),
+        other => Err(CapnpDecodeError::UnknownPayload(format!(
+            "expected an ApplyV2 payload, found a different Accord kind: {other:?}"
+        ))),
+    }
+}
+
 fn read_required_uuid(field: &str, data: &[u8]) -> Result<Uuid, CapnpDecodeError> {
     let id = read_optional_uuid(data)?.ok_or_else(|| {
         CapnpDecodeError::InvalidRequiredField(format!("{field} must be 16 bytes"))
@@ -2228,7 +2302,8 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::AccordRecover
             | MsgType::AccordRecoverOK
             | MsgType::AccordPreAcceptV2
-            | MsgType::AccordApplyV2,
+            | MsgType::AccordApplyV2
+            | MsgType::AccordApplyV2Capnp,
         ) => MessageFamily::Accord,
         Ok(MsgType::BootstrapComplete | MsgType::BootstrapCompleteAck) => MessageFamily::Bootstrap,
         Ok(MsgType::ClusterMembershipForward | MsgType::ClusterMembershipForwardAck) => {

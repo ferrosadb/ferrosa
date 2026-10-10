@@ -97,24 +97,6 @@ pub(crate) struct ApplyV2Payload {
     pub(crate) writes: Vec<WriteSetEntry>,
 }
 
-/// Borrowed twin of [`ApplyV2Payload`], for serializing a write-set the caller
-/// still owns.
-///
-/// The apply fan-out sends the SAME write-set to every replica when every key
-/// resolves to a replica set containing every peer (the single-shard case, and
-/// `RF == node count`). Cloning that write-set and `bincode`-serializing it once
-/// per peer is pure waste: bincode is not self-describing, so it encodes a
-/// `&[WriteSetEntry]` as exactly the length-prefixed sequence a
-/// `Vec<WriteSetEntry>` encodes — the frame is BYTE-IDENTICAL to an owned
-/// [`ApplyV2Payload`]'s. The fan-out therefore serializes once, borrowing the
-/// write-set, and hands the resulting `Bytes` to each peer by refcount.
-#[derive(serde::Serialize)]
-pub(crate) struct ApplyV2PayloadRef<'a> {
-    pub(crate) txn_id: TxnId,
-    /// The same `(key, mutation)` writes an owned [`ApplyV2Payload`] would carry.
-    pub(crate) writes: &'a [WriteSetEntry],
-}
-
 /// PreAccept request for a multi-key transaction.
 ///
 /// Carries every partition key the transaction writes so the replica registers
@@ -463,35 +445,65 @@ mod tests {
         });
     }
 
-    /// The borrowed [`ApplyV2PayloadRef`] the apply fan-out serializes once must
-    /// produce EXACTLY the bytes an owned [`ApplyV2Payload`] would — bincode is not
-    /// self-describing, so `&[T]` and `Vec<T>` must encode identically, and a replica
-    /// that deserializes the shared frame as `ApplyV2Payload` must see the same
-    /// write-set. Across empty, single and multi-entry write-sets, and keys /
-    /// mutations with embedded NULs.
+    /// The DIRECT-FROM-BORROW capnp encoder the live apply fan-out uses
+    /// (`ferrosa_net::protocol::encode_accord_apply_v2`, which writes each borrowed
+    /// `(key, mutation)` slice straight into the capnp arena) must produce a frame that
+    /// decodes to exactly the `ApplyV2Payload` the bincode path decodes to — for the
+    /// empty, single-entry and multi-entry write-sets, and keys / mutations with
+    /// embedded NULs. This is the wire-equivalence the migrated send path relies on: a
+    /// replica decoding the capnp frame applies the same write-set it always did.
     #[test]
-    fn borrowed_apply_payload_serializes_byte_identically_to_the_owned_one() {
+    fn capnp_apply_v2_from_borrowed_slices_matches_the_bincode_frame() {
+        use ferrosa_net::protocol::{
+            decode_accord_apply_v2, encode_accord_apply_v2, AccordControlMessage, AccordTxnId,
+        };
+
         let txn_id = txn(21, 4_242, 3, 22);
+        let accord = AccordTxnId {
+            epoch: txn_id.0.epoch,
+            time: txn_id.0.time,
+            seq: txn_id.0.seq,
+            node: txn_id.0.node,
+        };
         let case = |writes: Vec<WriteSetEntry>| {
-            let owned = bincode::serialize(&ApplyV2Payload {
-                txn_id,
-                writes: writes.clone(),
-            })
-            .expect("owned payload serializes");
-            let borrowed = bincode::serialize(&ApplyV2PayloadRef {
-                txn_id,
-                writes: &writes,
-            })
-            .expect("borrowed payload serializes");
+            let bincode_decoded: ApplyV2Payload = bincode::deserialize(
+                &bincode::serialize(&ApplyV2Payload {
+                    txn_id,
+                    writes: writes.clone(),
+                })
+                .expect("bincode encodes"),
+            )
+            .expect("bincode decodes");
+            let frame = encode_accord_apply_v2(
+                accord,
+                writes
+                    .iter()
+                    .map(|w| (w.key.as_slice(), w.mutation.as_slice())),
+            )
+            .expect("capnp frame encodes");
+            let capnp = match decode_accord_apply_v2(&frame).expect("capnp frame decodes") {
+                AccordControlMessage::ApplyV2 { txn_id, writes } => ApplyV2Payload {
+                    txn_id: TxnId(Timestamp {
+                        epoch: txn_id.epoch,
+                        time: txn_id.time,
+                        seq: txn_id.seq,
+                        node: txn_id.node,
+                    }),
+                    writes: writes
+                        .into_iter()
+                        .map(|w| WriteSetEntry {
+                            key: w.key,
+                            mutation: w.mutation,
+                        })
+                        .collect(),
+                },
+                other => panic!("expected an ApplyV2 payload, got {other:?}"),
+            };
             assert_eq!(
-                owned, borrowed,
-                "a borrowed write-set must serialize to the frame an owned one does"
+                capnp, bincode_decoded,
+                "the capnp frame must decode to exactly what the bincode frame decoded to"
             );
-            // The shared frame still decodes into the owned shape, unchanged.
-            let decoded: ApplyV2Payload =
-                bincode::deserialize(&borrowed).expect("the shared frame decodes");
-            assert_eq!(decoded.txn_id, txn_id);
-            assert_eq!(decoded.writes, writes);
+            assert_eq!(capnp, ApplyV2Payload { txn_id, writes });
         };
 
         case(vec![]);
