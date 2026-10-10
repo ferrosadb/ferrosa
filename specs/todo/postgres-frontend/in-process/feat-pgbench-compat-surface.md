@@ -280,3 +280,20 @@ TDD it: a RED test asserting 3 rows land (all three readable back) and that
 `FERROSA_ACCORD_TXN_TIMEOUT_SECS` (10) · `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` (5) ·
 `FERROSA_NET_LANE_FAILURE_THRESHOLD` (3) · `FERROSA_NET_LANE_FAILURE_WINDOW_MS` (30000) ·
 `FERROSA_NET_LANE_PROBE_TIMEOUT_MS` (2000)
+
+## TRUNCATE semantics to document (operator directive)
+
+Record in the crate docs when the table-tombstone change lands — this is the wording the
+operator asked for, in substance rather than verbatim:
+
+- On ferrosa a `TRUNCATE` is **logically immediate**: reads return no rows as soon as it
+  commits, because the tombstone hides everything older than it.
+- **Physical reclamation is lazy** — the bytes go away at the next compaction, not at commit.
+- `TRUNCATE` followed by `VACUUM` is therefore what forces reclamation promptly, and that pair
+  is **strictly equivalent in effect** to an immediate truncate.
+- For **client compatibility** the logical effect is deliberately kept synchronous and
+  reclamation deliberately left lazy. Making reclamation synchronous would be a **purposeful,
+  separate change**, not something to slip in.
+
+The point of writing it down: a client that truncates and immediately measures disk will see
+no change, and that must be an understood, documented property rather than a surprise.
