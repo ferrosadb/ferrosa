@@ -876,6 +876,9 @@ pub async fn wait_for_local_apply(
     }
 }
 
+/// Invariant: a DROP that this node could not apply must fail loud to the
+/// client, never be reported as done.
+///
 /// Propose a DDL operation through Raft consensus.
 ///
 /// On success the state machine has applied the command on all live nodes
@@ -885,7 +888,12 @@ pub async fn wait_for_local_apply(
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
 /// and transparently forwards the request to the leader instead of propagating
 /// the error to the CQL client.
-pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
+///
+/// On an apply that was committed but refused on the applying node (the state
+/// machine folds a storage failure into `RaftResponse::Error`), this returns an
+/// error: a DROP that did not take effect must not be reported as success.
+#[doc(hidden)]
+pub async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
