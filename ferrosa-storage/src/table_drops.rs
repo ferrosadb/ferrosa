@@ -33,14 +33,84 @@ use ferrosa_common::{Error, Result};
 /// File under the data dir that holds the ledger.
 pub const DROPPED_TABLES_FILE: &str = "dropped-tables.json";
 
+/// File under the data dir that lists table names whose DROP/TRUNCATE could not
+/// remove their SSTable directory.
+///
+/// A destructive table operation reports success only after its data files are
+/// gone (invariant: no read path may return a dropped row). When the removal
+/// fails — the live incident: an aborted bulk load left an entry under
+/// `public.pgbench_accounts` that `remove_dir_all` could not delete — the drop
+/// must not silently succeed, and the survivors must never be loaded again.
+///
+/// This set is the durable half of that contract. A name is added **before** the
+/// removal is attempted and removed **after** it succeeds, so:
+/// - a removal that fails leaves the name recorded: the drop fails loud AND the
+///   next `build_table_state` for that name sweeps the directory before loading,
+///   so a same-name CREATE can never reload the dropped rows;
+/// - a removal that succeeds clears the name, so a legitimately re-created table
+///   is untouched.
+///
+/// Everything in such a directory at registration time was written before the
+/// drop (registration precedes any write), so the whole directory is orphaned
+/// debris and is removed, not merely hidden.
+pub const PENDING_SWEEPS_FILE: &str = "pending-table-sweeps.json";
+
 static WRITE_SERIAL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// `keyspace.table` to the wall-clock milliseconds of its latest drop.
 pub type DropLedger = BTreeMap<String, u64>;
 
+/// Table names whose SSTable directory must be swept before it is next loaded.
+pub type PendingSweeps = std::collections::BTreeSet<String>;
+
 /// Key of a table in the ledger.
 pub fn ledger_key(keyspace: &str, table: &str) -> String {
     format!("{keyspace}.{table}")
+}
+
+/// Reads the pending-sweep set. A missing file is an empty set; a file that does
+/// not parse is an error, because treating it as empty would let orphaned rows be
+/// loaded again.
+pub fn load_pending_sweeps(data_dir: &Path) -> Result<PendingSweeps> {
+    let path = data_dir.join(PENDING_SWEEPS_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(PendingSweeps::new()),
+        Err(e) => return Err(e.into()),
+    };
+    serde_json::from_slice(&bytes).map_err(|e| {
+        Error::InvalidData(format!(
+            "{} does not parse; refusing to guess whether a dropped table's orphans may load: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Whether `keyspace.table` has a pending sweep (a drop that could not remove
+/// its SSTables).
+pub fn is_pending_sweep(data_dir: &Path, keyspace: &str, table: &str) -> Result<bool> {
+    Ok(load_pending_sweeps(data_dir)?.contains(&ledger_key(keyspace, table)))
+}
+
+/// Durably records that `keyspace.table`'s SSTable directory must be swept before
+/// it is loaded again. Written before the removal is attempted.
+pub fn mark_pending_sweep(data_dir: &Path, keyspace: &str, table: &str) -> Result<()> {
+    let _serial = WRITE_SERIAL.lock();
+    let mut sweeps = load_pending_sweeps(data_dir)?;
+    if sweeps.insert(ledger_key(keyspace, table)) {
+        crate::schema_snapshot::persist_bounded_json(data_dir, PENDING_SWEEPS_FILE, &sweeps)?;
+    }
+    Ok(())
+}
+
+/// Clears the pending sweep for `keyspace.table` once its directory is gone.
+pub fn clear_pending_sweep(data_dir: &Path, keyspace: &str, table: &str) -> Result<()> {
+    let _serial = WRITE_SERIAL.lock();
+    let mut sweeps = load_pending_sweeps(data_dir)?;
+    if sweeps.remove(&ledger_key(keyspace, table)) {
+        crate::schema_snapshot::persist_bounded_json(data_dir, PENDING_SWEEPS_FILE, &sweeps)?;
+    }
+    Ok(())
 }
 
 /// Wall-clock milliseconds since the epoch. A clock before 1970 is an error,
