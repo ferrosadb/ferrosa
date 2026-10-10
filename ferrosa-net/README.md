@@ -57,7 +57,10 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   0) and ignores ours. A feature that adds a message type or frame kind gates
   sending it on the peer's bit, because an older node drops the whole connection
   on an unknown type byte. Bits: `CAP_RPC_ERROR_REPLY` (1<<0) — the peer
-  understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_RESULT_CURSOR_PAGE`
+  understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_ACCORD_CAPNP` (1<<3) —
+  the peer decodes the capnproto Accord Apply frame (`AccordApplyV2Capnp`, `0x7D`),
+  so the coordinator sends it capnp and falls back to legacy bincode for any peer
+  that has not advertised the bit; `CAP_RESULT_CURSOR_PAGE`
   `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
   phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).
   (1<<1) — the peer serves `ResultCursorPage` (`0x68`) /

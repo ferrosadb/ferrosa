@@ -146,6 +146,30 @@ impl AccordHandler {
             local_node_id,
         }
     }
+
+    /// Apply a decoded multi-key write-set on this replica and ack, or `None` if the
+    /// transaction could not be brought to `Applied`.
+    ///
+    /// Shared by the bincode `AccordApplyV2` arm and the Cap'n Proto
+    /// `AccordApplyV2Capnp` arm so both apply the SAME way — the wire encoding is a
+    /// transport detail, never an apply-behaviour fork.
+    async fn apply_writeset_and_ack(&self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> Option<Message> {
+        let apply_status = on_state_machine(&self.state, move |sm| {
+            sm.handle_apply_writeset(txn_id, writes)
+        })
+        .await?;
+        if !matches!(apply_status, SmResponse::NoWriteFinalized)
+            && !await_txn_applied(&self.state, txn_id).await
+        {
+            return None;
+        }
+        let ok = ApplyOkPayload {
+            txn_id,
+            from: self.local_node_id,
+        };
+        let bytes = bincode::serialize(&ok).ok()?;
+        Some(Message::AccordApplyOK(Bytes::from(bytes)))
+    }
 }
 
 /// Run `f` against the state machine on tokio's blocking pool.
@@ -499,35 +523,51 @@ impl RpcHandler for AccordHandler {
             }
 
             Message::AccordApplyV2(b) => {
-                // Multi-key Apply: the coordinator already scoped this payload to
-                // exactly the keys this replica is a participant for (per-replica
-                // filtered fan-out), so the replica applies every write it was
-                // sent — the same "coordinator scopes, replica trusts" invariant
-                // as the v1 AccordApply arm, generalized to N partitions. The
-                // writes are routed as ONE write-set so they park/apply atomically
+                // Multi-key Apply (bincode body — sent to every peer that has NOT
+                // advertised `CAP_ACCORD_CAPNP`): the coordinator already scoped this
+                // payload to exactly the keys this replica is a participant for
+                // (per-replica filtered fan-out), so the replica applies every write it
+                // was sent — the same "coordinator scopes, replica trusts" invariant as
+                // the v1 AccordApply arm, generalized to N partitions. The writes are
+                // routed as ONE write-set so they park/apply atomically
                 // (DATA-LOSS-CRITICAL: writes 2..N must never be dropped).
                 let payload: ApplyV2Payload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordApplyV2: deserialize failed: {e}"))
                     .ok()?;
                 let txn_id = payload.txn_id;
                 let writes: Vec<Vec<u8>> = payload.writes.into_iter().map(|w| w.mutation).collect();
-                let apply_status = on_state_machine(&self.state, move |sm| {
-                    sm.handle_apply_writeset(txn_id, writes)
-                })
-                .await?;
-                if !matches!(
-                    apply_status,
-                    crate::accord::state_machine::SmResponse::NoWriteFinalized
-                ) && !await_txn_applied(&self.state, txn_id).await
-                {
-                    return None;
-                }
-                let ok = ApplyOkPayload {
-                    txn_id,
-                    from: self.local_node_id,
+                self.apply_writeset_and_ack(txn_id, writes).await
+            }
+
+            Message::AccordApplyV2Capnp(b) => {
+                // Same multi-key Apply, but the body is a Cap'n Proto `accord.applyV2`
+                // frame (`ferrosa_net::protocol::encode_accord_apply_v2`). Only a peer
+                // that advertised `CAP_ACCORD_CAPNP` is ever sent this type.
+                let (txn_id, writes) = match ferrosa_net::protocol::decode_accord_apply_v2(&b) {
+                    Ok(ferrosa_net::protocol::AccordControlMessage::ApplyV2 { txn_id, writes }) => {
+                        let txn_id = TxnId(Timestamp {
+                            epoch: txn_id.epoch,
+                            time: txn_id.time,
+                            seq: txn_id.seq,
+                            node: txn_id.node,
+                        });
+                        let writes = writes.into_iter().map(|w| w.mutation).collect();
+                        (txn_id, writes)
+                    }
+                    Ok(other) => {
+                        // A valid Accord envelope of the wrong kind on the Apply type is a
+                        // routing bug, not a payload to reinterpret as a write-set.
+                        tracing::error!(
+                            "AccordApplyV2Capnp: expected an ApplyV2 payload, got {other:?}"
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::error!("AccordApplyV2Capnp: capnp decode failed: {error}");
+                        return None;
+                    }
                 };
-                let bytes = bincode::serialize(&ok).ok()?;
-                Some(Message::AccordApplyOK(Bytes::from(bytes)))
+                self.apply_writeset_and_ack(txn_id, writes).await
             }
 
             Message::AccordRecover(b) => {
