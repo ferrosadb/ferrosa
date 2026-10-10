@@ -111,6 +111,11 @@ where
     }
     .encode(&mut out);
     stream.write_all(&out).await?;
+    // The ack is on the wire. The tail below is a SEPARATE write, so the buffer must be emptied
+    // first: a second `CopyInResponse` arriving after the payload re-cues a real client into copy
+    // mode — psql answers `CopyFail "trying to exit copy mode"` and `pgbench -i` dies with a bare
+    // `PQendcopy failed`, both of them reading our stale ack as "start copying again".
+    out.clear();
 
     let mut decoder = CopyDecoder::new(plan.options.clone());
     let mut inserted: u64 = 0;
@@ -628,6 +633,67 @@ mod tests {
         for key in ["a", "b", "c"] {
             assert_eq!(row_count(&ctx, key).await, 1, "row {key} must be persisted");
         }
+    }
+
+    /// The number of `CopyInResponse` frames in a server reply.
+    ///
+    /// The ack is 8 bytes: tag `G`, a length of `7` (which includes the length word itself), a
+    /// format byte of `0`, and a zero column count. Counting the FRAME rather than the letter
+    /// `G` is deliberate — a payload line or a command tag may legitimately contain a `G`.
+    fn copy_in_responses(reply: &[u8]) -> usize {
+        const FRAME: [u8; 8] = [b'G', 0, 0, 0, 7, 0, 0, 0];
+        reply.windows(FRAME.len()).filter(|w| *w == FRAME).count()
+    }
+
+    /// `COPY ... FROM STDIN` is acknowledged with `CopyInResponse` EXACTLY ONCE.
+    ///
+    /// The ack is the one and only cue for the client to start streaming its payload. A SECOND
+    /// `G` arriving *after* the payload makes a real client (psql, `pgbench -i`) believe it has
+    /// been re-cued into copy mode: psql answers `CopyFail "trying to exit copy mode"` and
+    /// pgbench dies with a bare `PQendcopy failed`. The reply buffer is written once for the ack
+    /// and once for the tail, and the tail must not carry a stale copy of the ack.
+    #[tokio::test]
+    async fn copy_from_stdin_is_acknowledged_exactly_once() {
+        let (_dir, ctx) = make_ctx().await;
+        let (reply, text) = run_copy(
+            &ctx,
+            "COPY kv (k) FROM STDIN",
+            &[copy_data(b"a\nb\n"), frame(b'c', &[])],
+        )
+        .await;
+
+        assert_eq!(
+            copy_in_responses(&reply),
+            1,
+            "the COPY must be acknowledged exactly once: {text:?}"
+        );
+        assert!(
+            text.contains("COPY 2"),
+            "and still report its own count: {text:?}"
+        );
+    }
+
+    /// The same invariant on the FAILURE tail: an error reply must not re-send the ack either.
+    /// This is the exact shape a bad `pgbench -i` row takes — ack, payload, then the error.
+    #[tokio::test]
+    async fn a_failed_copy_is_acknowledged_exactly_once() {
+        let (_dir, ctx) = make_ctx().await;
+        let (reply, text) = run_copy(
+            &ctx,
+            "COPY kv (k) FROM STDIN",
+            &[copy_data(b"good\nbad\textra\n"), frame(b'c', &[])],
+        )
+        .await;
+
+        assert_eq!(
+            copy_in_responses(&reply),
+            1,
+            "even a failed COPY keeps a single ack: {text:?}"
+        );
+        assert!(
+            text.contains("22P04"),
+            "the failure is still reported: {text:?}"
+        );
     }
 
     /// A malformed row is reported, the remaining payload is DRAINED (so it cannot be read as
