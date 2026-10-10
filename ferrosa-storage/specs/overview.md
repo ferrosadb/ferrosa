@@ -66,6 +66,7 @@ without changing the process environment. Digest verification is unconditional.
 | `data_store` | `DataStore` trait + `LocalDataStore` |
 | `spill_budget` | Process RAM-budget detection (cgroup v2/v1 → `/proc/meminfo` → floor, injectable + cached) and the ORDER BY spill threshold (50% default; `FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`) |
 | `external_sort` | Bounded-memory spilling external merge sort of CQL rows (`ExternalSorter`, cascade k-way merge, `MERGE_FANIN`) for unbounded `ORDER BY`; `SortedRows::into_disk_backed` parks a remainder on disk for CQL result cursors; fail-loud on spill/merge I/O |
+| `write_set_spill` | Local temp staging for a large transaction's write-set mutation payloads (`WriteSetSpill`): `stage` drains the payloads to a temp file (reusing `TempSortTableReservation` cleanup) once they cross `WRITE_SET_SPILL_FLOOR_BYTES` (8 MiB), and `mutation(i)` reads them back by write-set index. Keeps the coordinator's resident write-set at the KEYS + a small index instead of the payload bulk; below the floor nothing is staged |
 | `metrics`, `virtual_tables`, `observer`, `subscription_observer` | Prometheus metrics; system virtual tables; write observers (CDC/SUBSCRIBE) |
 | `batchlog` | Batchlog manager for atomic multi-partition batches |
 

@@ -310,7 +310,7 @@ impl TransactionCommitter for AccordTransactionCommitter {
 
 async fn drive_accord(
     committer: &AccordTransactionCommitter,
-    writes: Vec<TransactionWrite>,
+    mut writes: Vec<TransactionWrite>,
     predicate: ReadPredicate,
     snapshot_ts: Option<ferrosa_common::accord::Timestamp>,
 ) -> Result<ferrosa_common::accord::Timestamp, AccordDriverError> {
@@ -349,6 +349,34 @@ async fn drive_accord(
 
     // 2. Build the write-set + the per-key participant resolver for the driver.
     let t_write_set = profile.then(std::time::Instant::now);
+    // Stage the payloads in local temp storage when the write-set is large enough to
+    // be the commit's memory problem, so the coordinator never holds ~1.1M encoded
+    // mutations resident. The KEYS stay in memory — Accord orders conflicts on them
+    // and the per-shard participant set is derived from them — while the payload
+    // bulk moves to a temp file and is read back on demand at Apply. Small
+    // write-sets stay wholly resident (no filesystem touch).
+    let payload_bytes: u64 = writes.iter().map(|w| w.mutation.len() as u64).sum();
+    let write_blobs =
+        if ferrosa_storage::write_set_spill::WriteSetSpill::should_stage(payload_bytes) {
+            let reservation = ferrosa_storage::write_set_spill::reserve_write_set_stage()
+                .map_err(|e| AccordDriverError::Codec(format!("write-set spill: {e}")))?;
+            let mut blobs: Vec<Vec<u8>> = writes
+                .iter_mut()
+                .map(|write| std::mem::take(&mut write.mutation))
+                .collect();
+            let staged =
+                ferrosa_storage::write_set_spill::WriteSetSpill::stage(reservation, &mut blobs)
+                    .map_err(|e| AccordDriverError::Codec(format!("write-set spill: {e}")))?;
+            tracing::info!(
+                entries = staged.len(),
+                payload_bytes = staged.bytes(),
+                resident_index_bytes = staged.resident_index_bytes(),
+                "accord: staged the write-set payloads in local temp storage"
+            );
+            Some(Arc::new(staged))
+        } else {
+            None
+        };
     let write_set: Vec<(Vec<u8>, Vec<u8>)> =
         writes.into_iter().map(|w| (w.key, w.mutation)).collect();
     let write_set_len_hint = write_set.len();
@@ -369,6 +397,9 @@ async fn drive_accord(
     .with_per_key_replicas(Arc::new(participant_resolver))
     .with_local_applier(committer.applier.clone())
     .with_read_predicate(predicate);
+    if let Some(blobs) = write_blobs {
+        driver = driver.with_spilled_write_set(blobs);
+    }
     if let Some(snapshot_ts) = snapshot_ts {
         driver = driver.with_postgres_snapshot(snapshot_ts);
     }

@@ -888,6 +888,17 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   run file so a CQL result cursor can be parked between pages holding only a
   merge head, not up to a spill threshold of rows. With an empty `RowOrder` the
   sorter is a spill-backed FIFO (stable runs, run-index tie-break).
+- **Write-set payload staging** (`write_set_spill.rs`) — `WriteSetSpill` stages a
+  large transaction's encoded mutation payloads in a local temp file and hands the
+  bytes back by write-set index on demand, so the COMMIT coordinator's resident
+  write-set is the KEYS (Accord's conflict ordering and per-shard participant set
+  need them) plus a small offset/length index, never the payload bulk. Reuses the
+  `TempSortTableReservation` cleanup guard (dropping the spill removes its staging
+  dir) and gates on an absolute floor (`WRITE_SET_SPILL_FLOOR_BYTES = 8 MiB`), not
+  the `spill_budget` ORDER BY threshold — that is a fraction of the *process*
+  budget, the wrong scale for one transaction's write-set. Below the floor the
+  write-set stays wholly resident. `stage` drains each payload as it writes;
+  `mutation(i)` fails loud on an un-staged index, never returning an empty mutation.
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per
@@ -1014,7 +1025,7 @@ replayed commit log or in-process writes.
 | Snapshot/PITR | `create_snapshot_with_store`, `open_from_snapshot_with_store`, `open_from_snapshot` (builds the object store from `config.object_store`; the restore-on-boot entry point), `list/delete_snapshot_with_store` |
 | Restore intent | `restore::RestoreIntent` (`from_env`, `from_vars`, `point_in_time_micros`, `already_applied`, `mark_applied`), `restore::parse_rfc3339_micros`, `ENV_RESTORE_SNAPSHOT` / `ENV_RESTORE_POINT_IN_TIME` / `ENV_RESTORE_FORCE` |
 | Abstraction | `DataStore` / `LocalDataStore` (the `Arc<dyn DataStore>` boundary) |
-| Spill/sort | `ExternalSorter`, `RowOrder`, `SortedRows`, `spill_budget::process_spill_threshold_bytes`, `reserve_order_by_temp_sort_table`/`TempSortTableReservation` |
+| Spill/sort | `ExternalSorter`, `RowOrder`, `SortedRows`, `spill_budget::process_spill_threshold_bytes`, `reserve_order_by_temp_sort_table`/`TempSortTableReservation`, `WriteSetSpill`/`reserve_write_set_stage` (write-set payload staging) |
 | Config types | `CommitLogConfig`, `SyncStrategyConfig`, `CompactionConfig`, `ObjectStoreConfig`, `Mutation`, `TableId` |
 
 ## Dependencies

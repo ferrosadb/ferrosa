@@ -1577,4 +1577,213 @@ mod tests {
 
         engine.shutdown().unwrap();
     }
+
+    /// OWED RED-FIRST GUARD for the batched before-image read landed in b9900eb3.
+    ///
+    /// That commit replaced a point read per row with one batched read per
+    /// 4096-mutation window (`prefetch_before_images` -> `read_clustering_rows_batch`)
+    /// and shipped WITHOUT the differential guard it owed. This is that guard.
+    ///
+    /// The SAME request set is driven through BOTH reads:
+    ///   * the PER-ROW path — `query::prepare_row_changes`, which calls
+    ///     `read_row_image` once per row; and
+    ///   * the BATCHED path — `query::prepare_accord_writes`, which resolves a whole
+    ///     4096-row window of before-images against ONE store view.
+    ///
+    /// Their per-partition row-version metadata must be byte-identical: batching is a
+    /// different read SHAPE, never a different ANSWER. The request set deliberately
+    /// includes a MISSING key (a mutation whose key has no live storage row, so its
+    /// before-image is `None`) and crosses the 4096-row window boundary
+    /// (4096 + 64 mutations), so the batching walks two windows and must carry no
+    /// overlay / before-cache state incorrectly across the seam.
+    #[test]
+    fn batched_before_images_match_per_row_across_a_chunk_boundary() {
+        /// The prefetch window `prepare_accord_writes` walks in
+        /// (`BEFORE_IMAGE_PREFETCH_CHUNK`). Hard-coded in the test on purpose: if the
+        /// production window moves, this guard must be revisited rather than silently
+        /// no longer crossing it.
+        const CHUNK_BOUNDARY: usize = 4096;
+        const TOTAL: usize = CHUNK_BOUNDARY + 64;
+        const SEEDED: usize = 8;
+        const TS: i64 = 5_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let tid = TableId::new("ks", "t");
+
+        // Seed a handful of PRE-EXISTING rows, so a few mutations have a live
+        // before-image while the rest are genuinely absent.
+        for i in 0..SEEDED {
+            let key = DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes()));
+            engine
+                .write(
+                    &tid,
+                    &key,
+                    storage_row(1, "old", 100 + i as i32, 1_000),
+                    1_000,
+                )
+                .unwrap();
+        }
+
+        // One mutation per distinct PK. The first SEEDED reuse the seeded keys (present
+        // before-image); the rest are MISSING (no storage row).
+        let mutations: Vec<ferrosa_storage::Mutation> = (0..TOTAL)
+            .map(|i| ferrosa_storage::Mutation {
+                mutation_id: [0x42u8; 16],
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key: DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes())),
+                rows: vec![storage_row(1, "new", i as i32, TS)],
+                timestamp: TS,
+            })
+            .collect();
+        assert!(
+            mutations.len() > CHUNK_BOUNDARY,
+            "the request set must cross the {CHUNK_BOUNDARY}-row prefetch window"
+        );
+
+        // Per-row oracle.
+        let changes = crate::query::prepare_row_changes(&engine, &schema, &mutations)
+            .expect("the per-row path must build row versions");
+        let mut by_partition: HashMap<Vec<u8>, Vec<crate::mvcc::RowChange>> = HashMap::new();
+        for change in changes {
+            by_partition
+                .entry(change.partition_key.clone())
+                .or_default()
+                .push(change);
+        }
+
+        // Batched path (4096-row prefetch windows).
+        let writes = crate::query::prepare_accord_writes(&engine, &schema, mutations.clone())
+            .expect("the batched path must build row versions");
+        assert_eq!(
+            writes.len(),
+            mutations.len(),
+            "one Accord write per mutation, in order"
+        );
+
+        let mut saw_present_before = false;
+        let mut saw_missing_before = false;
+        for (write, mutation) in writes.iter().zip(&mutations) {
+            let partition_key = mutation.key.key.as_bytes().to_vec();
+            assert_eq!(
+                write.key, partition_key,
+                "write order must follow mutation order"
+            );
+            let expected = by_partition
+                .get(&partition_key)
+                .expect("every mutation partition has a row-version entry");
+
+            let (storage, metadata) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
+                    .expect("the batched path must emit a valid MVCC envelope");
+            let metadata = metadata.expect("a data row carries row-version metadata");
+            let got: Vec<crate::mvcc::RowChange> = serde_json::from_slice(metadata).unwrap();
+            assert_eq!(
+                serde_json::to_string(&got).unwrap(),
+                serde_json::to_string(expected).unwrap(),
+                "batched before-images must equal the per-row answer for {partition_key:?}"
+            );
+
+            saw_present_before |= got.iter().any(|change| change.before.is_some());
+            saw_missing_before |= got.iter().any(|change| change.before.is_none());
+
+            let mut bytes = vec![0; mutation.serialized_size()];
+            mutation.serialize_into(&mut bytes);
+            assert_eq!(
+                storage,
+                bytes.as_slice(),
+                "the storage mutation must survive the batched path unchanged"
+            );
+        }
+        assert!(
+            saw_present_before,
+            "the request set must include a PRESENT key (a live before-image)"
+        );
+        assert!(
+            saw_missing_before,
+            "the request set must include a MISSING key (an absent before-image)"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// `prepare_accord_writes` must reuse ONE serialize buffer without ever letting a
+    /// previous, larger mutation's tail leak into a smaller frame, and must MOVE the
+    /// partition-key bytes out of the consumed mutation rather than copy them.
+    ///
+    /// The request set deliberately alternates LARGE → small → LARGE → small
+    /// serialized sizes: a buffer that only truncated (instead of clearing and
+    /// resizing to the exact `serialized_size`) would carry the predecessor's tail
+    /// into the short frame. Each emitted mutation is compared byte-for-byte against a
+    /// FRESH-buffer serialization of the same mutation, and each emitted key against
+    /// the `as_bytes().to_vec()` copy the old path made.
+    #[test]
+    fn prepare_accord_writes_reuses_one_buffer_without_leaking_a_stale_tail() {
+        const TS: i64 = 7_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+
+        let widths = [64usize, 1, 200, 2];
+        let mutations: Vec<ferrosa_storage::Mutation> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, width)| ferrosa_storage::Mutation {
+                mutation_id: [0x5Au8; 16],
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key: DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes())),
+                rows: vec![storage_row(1, &"n".repeat(*width), 100 + i as i32, TS)],
+                timestamp: TS,
+            })
+            .collect();
+
+        // Fresh-buffer oracle, and the copied-key oracle the moved path must match.
+        let fresh: Vec<Vec<u8>> = mutations
+            .iter()
+            .map(|mutation| {
+                let mut bytes = vec![0; mutation.serialized_size()];
+                mutation.serialize_into(&mut bytes);
+                bytes
+            })
+            .collect();
+        let expected_keys: Vec<Vec<u8>> = mutations
+            .iter()
+            .map(|mutation| mutation.key.key.as_bytes().to_vec())
+            .collect();
+        assert!(
+            fresh[0].len() != fresh[1].len() && fresh[2].len() != fresh[3].len(),
+            "the request set must vary in serialized size, else it proves nothing"
+        );
+
+        let writes = crate::query::prepare_accord_writes(&engine, &schema, mutations)
+            .expect("the batched path builds row versions");
+        assert_eq!(writes.len(), widths.len());
+
+        for (index, write) in writes.iter().enumerate() {
+            assert_eq!(
+                write.key, expected_keys[index],
+                "the MOVED partition-key bytes must equal the copied path's bytes"
+            );
+            let (storage, metadata) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
+                    .expect("a valid MVCC envelope");
+            assert!(
+                metadata.is_some(),
+                "a written row carries row-version metadata"
+            );
+            assert_eq!(
+                storage, fresh[index],
+                "the reused buffer must serialize mutation {index} exactly as a fresh \
+                 one would (a stale tail from the previous mutation would show here)"
+            );
+        }
+
+        engine.shutdown().unwrap();
+    }
 }

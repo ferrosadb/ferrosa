@@ -97,6 +97,24 @@ pub(crate) struct ApplyV2Payload {
     pub(crate) writes: Vec<WriteSetEntry>,
 }
 
+/// Borrowed twin of [`ApplyV2Payload`], for serializing a write-set the caller
+/// still owns.
+///
+/// The apply fan-out sends the SAME write-set to every replica when every key
+/// resolves to a replica set containing every peer (the single-shard case, and
+/// `RF == node count`). Cloning that write-set and `bincode`-serializing it once
+/// per peer is pure waste: bincode is not self-describing, so it encodes a
+/// `&[WriteSetEntry]` as exactly the length-prefixed sequence a
+/// `Vec<WriteSetEntry>` encodes — the frame is BYTE-IDENTICAL to an owned
+/// [`ApplyV2Payload`]'s. The fan-out therefore serializes once, borrowing the
+/// write-set, and hands the resulting `Bytes` to each peer by refcount.
+#[derive(serde::Serialize)]
+pub(crate) struct ApplyV2PayloadRef<'a> {
+    pub(crate) txn_id: TxnId,
+    /// The same `(key, mutation)` writes an owned [`ApplyV2Payload`] would carry.
+    pub(crate) writes: &'a [WriteSetEntry],
+}
+
 /// PreAccept request for a multi-key transaction.
 ///
 /// Carries every partition key the transaction writes so the replica registers
@@ -443,6 +461,54 @@ mod tests {
             txn_id,
             writes: vec![],
         });
+    }
+
+    /// The borrowed [`ApplyV2PayloadRef`] the apply fan-out serializes once must
+    /// produce EXACTLY the bytes an owned [`ApplyV2Payload`] would — bincode is not
+    /// self-describing, so `&[T]` and `Vec<T>` must encode identically, and a replica
+    /// that deserializes the shared frame as `ApplyV2Payload` must see the same
+    /// write-set. Across empty, single and multi-entry write-sets, and keys /
+    /// mutations with embedded NULs.
+    #[test]
+    fn borrowed_apply_payload_serializes_byte_identically_to_the_owned_one() {
+        let txn_id = txn(21, 4_242, 3, 22);
+        let case = |writes: Vec<WriteSetEntry>| {
+            let owned = bincode::serialize(&ApplyV2Payload {
+                txn_id,
+                writes: writes.clone(),
+            })
+            .expect("owned payload serializes");
+            let borrowed = bincode::serialize(&ApplyV2PayloadRef {
+                txn_id,
+                writes: &writes,
+            })
+            .expect("borrowed payload serializes");
+            assert_eq!(
+                owned, borrowed,
+                "a borrowed write-set must serialize to the frame an owned one does"
+            );
+            // The shared frame still decodes into the owned shape, unchanged.
+            let decoded: ApplyV2Payload =
+                bincode::deserialize(&borrowed).expect("the shared frame decodes");
+            assert_eq!(decoded.txn_id, txn_id);
+            assert_eq!(decoded.writes, writes);
+        };
+
+        case(vec![]);
+        case(vec![WriteSetEntry {
+            key: b"only-key".to_vec(),
+            mutation: b"only-mutation".to_vec(),
+        }]);
+        case(vec![
+            WriteSetEntry {
+                key: b"key-alpha".to_vec(),
+                mutation: b"mutation-for-alpha".to_vec(),
+            },
+            WriteSetEntry {
+                key: b"key-beta\0bin".to_vec(),
+                mutation: b"mutation-for-beta".to_vec(),
+            },
+        ]);
     }
 
     #[test]

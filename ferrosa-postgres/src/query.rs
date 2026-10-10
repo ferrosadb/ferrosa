@@ -1761,6 +1761,35 @@ pub(crate) fn prepare_row_changes(
     .map_err(MvccCommitError::Storage)
 }
 
+/// Table identity used to key the per-table codec/overlay caches of
+/// [`prepare_accord_writes`].
+///
+/// `Arc<str>` so a repeated lookup is a refcount bump rather than two `String`
+/// heap allocations: a bulk `COPY` writes ONE table at a time, so the identity
+/// changes O(tables) times across a whole write-set, never O(mutations).
+type TableKey = (std::sync::Arc<str>, std::sync::Arc<str>);
+
+/// Hands out the current table's [`TableKey`], rebuilding it only when the
+/// mutation's table differs from the last one seen — allocation-free for the
+/// grouped-by-table order a bulk load produces, and still correct for an
+/// interleaved one (it just pays one rebuild per change).
+struct TableKeyCache {
+    current: Option<TableKey>,
+}
+
+impl TableKeyCache {
+    fn key_for(&mut self, keyspace: &str, table: &str) -> TableKey {
+        let stale = match &self.current {
+            Some((ks, name)) => &**ks != keyspace || &**name != table,
+            None => true,
+        };
+        if stale {
+            self.current = Some((std::sync::Arc::from(keyspace), std::sync::Arc::from(table)));
+        }
+        self.current.clone().expect("the cache was just populated")
+    }
+}
+
 /// Build a PostgreSQL `COMMIT`'s Accord write-set in **ONE streaming pass**,
 /// without materializing whole-table row images.
 ///
@@ -1794,7 +1823,6 @@ pub(crate) fn prepare_accord_writes(
 ) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError> {
     use ferrosa_storage::accord::TransactionWrite;
 
-    type TableKey = (String, String);
     let mut codecs: std::collections::HashMap<TableKey, TableCodec> =
         std::collections::HashMap::new();
     let mut overlays: std::collections::HashMap<
@@ -1817,6 +1845,12 @@ pub(crate) fn prepare_accord_writes(
     /// O(write-set), so the streaming shape (and its commit peak) is preserved.
     const BEFORE_IMAGE_PREFETCH_CHUNK: usize = 4096;
 
+    // ONE serialization buffer for the whole write-set, reused per mutation
+    // instead of a fresh `vec![0; n]` allocation each time (see `serialize_into`
+    // below). `mutations` is CONSUMED by this function, so nothing needs the
+    // per-mutation buffer to outlive its iteration.
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut table_keys = TableKeyCache { current: None };
     let mut pending: Vec<Mutation> = mutations;
     while !pending.is_empty() {
         let take = BEFORE_IMAGE_PREFETCH_CHUNK.min(pending.len());
@@ -1829,7 +1863,7 @@ pub(crate) fn prepare_accord_writes(
             if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
                 continue;
             }
-            let table: TableKey = (mutation.keyspace.clone(), mutation.table.clone());
+            let table = table_keys.key_for(&mutation.keyspace, &mutation.table);
             if !chunk_tables.contains(&table) {
                 chunk_tables.push(table);
             }
@@ -1863,22 +1897,28 @@ pub(crate) fn prepare_accord_writes(
         }
 
         for mutation in chunk {
-            let table: TableKey = (mutation.keyspace.clone(), mutation.table.clone());
-            let mut bytes = vec![0; mutation.serialized_size()];
+            let table = table_keys.key_for(&mutation.keyspace, &mutation.table);
+            // Reuse the ONE buffer: `clear` + `resize` to this mutation's exact
+            // `serialized_size` writes exactly what a fresh zeroed buffer would, so a
+            // previous (larger) mutation's tail can never leak into this frame.
+            bytes.clear();
+            bytes.resize(mutation.serialized_size(), 0);
             let serialize_started = profile.then(std::time::Instant::now);
             mutation.serialize_into(&mut bytes);
             if let Some(started) = serialize_started {
                 serialize_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             }
-            let partition_key = mutation.key.key.as_bytes().to_vec();
 
             // A table tombstone (`TRUNCATE`) marker carries no row image; the cluster
             // committer routes it to every serving node at CL=ALL from its own bytes.
             if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
                 writes.push(TransactionWrite {
                     keyspace: mutation.keyspace,
-                    key: partition_key,
-                    mutation: bytes,
+                    // MOVED out of the consumed mutation, never copied.
+                    key: mutation.key.key.into_bytes(),
+                    // The shared buffer lives on, so a tombstone takes a copy. A
+                    // tombstone is ONE entry per TRUNCATE, not one per row.
+                    mutation: bytes.clone(),
                 });
                 continue;
             }
@@ -1918,17 +1958,30 @@ pub(crate) fn prepare_accord_writes(
 
             // Encode this partition's row-version metadata now, while only its own
             // images are resident, and never keep the `RowChange` list.
+            //
+            // The partition bytes are MOVED out of the consumed mutation instead of
+            // copied with `as_bytes().to_vec()`.
+            let partition_key = mutation.key.key.into_bytes();
             let mutation_bytes = if partition_keys.is_empty() {
-                bytes
+                // The shared serialize buffer is reused, so this rare no-row path takes
+                // a copy (a bulk `COPY` always carries rows, so it is not the hot path).
+                bytes.clone()
             } else {
+                // Each partition's SQL key and partition bytes are MOVED out of
+                // `partition_keys` (dropped at the end of this iteration) rather than
+                // cloned: the map already holds exactly the bytes the metadata needs.
                 let changes: Vec<RowChange> = partition_keys
-                    .keys()
-                    .map(|key| RowChange {
-                        table: format!("{}.{}", table.0, table.1),
-                        key: key.clone(),
-                        partition_key: partition_key.clone(),
-                        before: before_images.get(key).cloned().flatten(),
-                        after: overlay.get(key).cloned().flatten(),
+                    .into_iter()
+                    .map(|(key, partition_bytes)| {
+                        let before = before_images.get(&key).cloned().flatten();
+                        let after = overlay.get(&key).cloned().flatten();
+                        RowChange {
+                            table: format!("{}.{}", table.0, table.1),
+                            key,
+                            partition_key: partition_bytes,
+                            before,
+                            after,
+                        }
                     })
                     .collect();
                 let metadata = serde_json::to_vec(&changes).map_err(|error| {
@@ -3568,6 +3621,36 @@ pub(crate) fn render_execute_result(
 mod tests {
     use super::*;
     use ferrosa_sql::Value as SqlValue;
+
+    /// `TableKeyCache` must hand back the SAME table identity without allocating
+    /// while the table is unchanged, and a fresh one when it changes — including in
+    /// an interleaved order. This is what removes two `String` heap allocations per
+    /// mutation from the COMMIT's prepare phase.
+    #[test]
+    fn table_key_cache_reuses_the_identity_until_the_table_changes() {
+        let mut cache = TableKeyCache { current: None };
+
+        let a = cache.key_for("ks", "a");
+        assert_eq!(&*a.0, "ks");
+        assert_eq!(&*a.1, "a");
+
+        // The SAME table must reuse the same allocation (no rebuild).
+        let a_again = cache.key_for("ks", "a");
+        assert!(
+            std::sync::Arc::ptr_eq(&a.0, &a_again.0) && std::sync::Arc::ptr_eq(&a.1, &a_again.1),
+            "an unchanged table must reuse its cached identity, not allocate a new one"
+        );
+
+        // A different table rebuilds.
+        let b = cache.key_for("ks", "b");
+        assert!(!std::sync::Arc::ptr_eq(&a.1, &b.1));
+        assert_eq!(&*b.1, "b");
+
+        // Interleaved order still resolves the right identity each time.
+        assert_eq!(&*cache.key_for("ks", "a").1, "a");
+        assert_eq!(&*cache.key_for("ks", "b").1, "b");
+        assert_eq!(&*cache.key_for("other", "b").0, "other");
+    }
 
     fn encode_value(format: i16, col_type: ColumnType, value: &SqlValue) -> Option<Vec<u8>> {
         super::encode_value(format, col_type, value).expect("test value should encode")
