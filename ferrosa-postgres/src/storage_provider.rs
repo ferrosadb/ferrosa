@@ -626,6 +626,17 @@ pub(crate) fn apply_pending_writes_with_partition_keys(
         if mutation.keyspace != keyspace || mutation.table != table {
             continue;
         }
+        // A whole-table tombstone (`TRUNCATE`) is buffered as a partition-tombstone
+        // MARKER under a RESERVED partition key, not as a data row: its key bytes are
+        // the marker magic, not a value of any key column. Decoding them as this
+        // table's declared key type is meaningless — for a length-constrained key (a
+        // PK-less table's synthetic `_sys_ck_` uuid, or an `int`) it fails loud and
+        // takes the whole statement or transaction with it. The marker carries no row
+        // image, so skip it here; the COMMIT path applies and replicates it itself
+        // (the cluster committer routes it to every serving node at CL=ALL).
+        if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
+            continue;
+        }
         let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, pk.len());
         for mutation_row in &mutation.rows {
             let ck_parts =
