@@ -144,7 +144,14 @@ impl SessionCore {
             ferrosa_cluster::accord::AccordTransactionCommitter::new(
                 node_id, clock, peers, applier, resolve,
             )
-            .with_local_accord_state_slot(&self.accord_state),
+            .with_local_accord_state_slot(&self.accord_state)
+            // Table-level tombstones (TRUNCATE) are replicated to EVERY serving
+            // node at ConsistencyLevel::All — not routed by the reserved key's
+            // token to its RF subset — so the marker reaches nodes that key's
+            // replica set would miss.
+            .with_marker_writer(Arc::new(
+                ferrosa_cluster::WritePathAllServingMarkerWriter::new(self.write_path.clone()),
+            )),
         ))
     }
 

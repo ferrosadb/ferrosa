@@ -378,7 +378,6 @@ async fn start_pg_on_node(
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::fixed(query_committer),
         ddl: None,
-        truncate: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Default::default(),
     });

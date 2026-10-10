@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-10-03
+last_updated: 2026-10-09
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -202,6 +202,24 @@ volume or changing query results.
     immutable and bound to its memtable; index DDL and `ALTER` rotate the
     memtable. Invariant: a memtable's index postings are exactly the sidecars
     its flush writes for the catalog it is bound to (ST-70).
+14. **A table tombstone is a normal row, and is never purged.** A whole-table
+    `TRUNCATE` is ONE reserved-partition row in the table's own LSM
+    (`src/table_tombstone.rs`); every read path folds its `DeletionTime` into the
+    partition it reads (`merge::apply_table_deletion`) so the table reads as empty
+    *immediately* on commit, while `merge::reclaim_covers_table` drops the covered
+    rows only at the next compaction — **logically immediate, physically lazy**.
+    `TRUNCATE` then `VACUUM` is strictly equivalent in effect to an immediate
+    truncate; the split is deliberate for client compatibility, and making
+    reclamation synchronous would be a separate change. The marker's lifetime rule
+    is *no resurrection*: it is EXEMPT from purge in `compaction::purge` and
+    retained until the table is dropped, so a stale replica's older copy can never
+    re-appear. Cluster-scope caveat: the marker is a single key, so the ordinary
+    write path would route it to only that key's RF replica set — a proper subset of
+    the ring when `RF < node count`. It is therefore replicated to **every node
+    serving the table at `ConsistencyLevel::All`**, with the target set being the
+    whole ring (not one key's RF set) and a loud failure if any node does not ack;
+    `CL=ALL` alone is not sufficient because it only filters the replica slice it is
+    handed.
 
 ## Concurrency
 

@@ -3270,13 +3270,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ddl: Some(std::sync::Arc::new(ferrosa_postgres::ClusterDdl::new(
                 shared_state.ddl_path.clone(),
             ))),
-            // The SAME swappable WRITE path the CQL router truncates through:
-            // PG `TRUNCATE` goes through the replicated cluster write path (or
-            // standalone local engine), never a node-local truncate that would
-            // leave the cluster's replicas disagreeing.
-            truncate: Some(std::sync::Arc::new(ferrosa_postgres::ClusterTruncate::new(
-                shared_state.write_path.clone(),
-            ))),
             // The jsonb limits resolved at startup (`[jsonb]` TOML, then env, then
             // the compiled defaults, ceilings enforced). No default is applied
             // here: the PG front end gets exactly what startup resolved.

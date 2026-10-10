@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 status: developer-preview
-last_updated: 2026-09-27
+last_updated: 2026-10-09
 executive_summary: >
   The PostgreSQL v3 wire-protocol front-end for ferrosa. Implements the
   frontend/backend protocol (startup, SCRAM-SHA-256, simple + extended query),
@@ -50,7 +50,7 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `connection` (`src/connection.rs`) | ~520 | Sans-IO `Connection`: startup/`SSLRequest` (`TlsPolicy`)/SASL → `Ready`; `take_inbuf` for pipelined first query |
 | `authz` (`src/authz.rs`) | ~180 | Statement → required `(Permission, Resource)`; `authorize` via `Schema::check_permission`, `42501` on denial |
 | `extended` (`src/extended.rs`) | ~453 | Per-connection `Session`: Parse/Bind/Close/Sync, prepared statements + portals, txn `I`/`T`/`E` |
-| `query` (`src/query.rs`) | ~1927 | `execute_query`, DML (INSERT/UPDATE/DELETE), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
+| `query` (`src/query.rs`) | ~2000 | `execute_query`, DML (INSERT/UPDATE/DELETE), `execute_truncate` (table-tombstone `TRUNCATE`), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
 | `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: bounded async-to-sync streaming provider; `cql_to_value`; R15 guard |
 | `catalog` (`src/catalog.rs`) | ~956 | `pg_catalog` projection (`pg_namespace`/`pg_class`/`pg_attribute`/`pg_type`/`pg_index`/`pg_constraint`) with deterministic OIDs. Ordinary columns take attnums 1..n; a reserved `_sys_` column takes a NEGATIVE attnum, as Postgres numbers its own system columns, so it cannot shift every other column's ordinal. `pg_index`/`pg_constraint` carry a table's *primary key* (a `<table>_pkey` index row in `pg_class` too); a table whose only key is the synthesized `_sys_ck_` gets none |
 | `server` (`src/server.rs`) | ~540 | tokio TCP front-end: `serve`, `QueryContext`, `handle_connection`, the post-auth query loop (wakes to expire idle suspended portals) |
@@ -59,7 +59,6 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `synthetic_key` (`src/synthetic_key.rs`) | ~147 | Mints the per-row v1 TimeUUID value for the synthetic `_sys_ck_` key column of a PK-less table: random per-process node field, monotonic time field, process-local clock sequence |
 | `pg_key` (`src/pg_key.rs`) | ~168 | The **declared** PostgreSQL primary key (`pg.primary_key` extension), which is not the storage key: a PK-less table reports none, and `ALTER TABLE ADD PRIMARY KEY` gives one the storage key does not have |
 | `ddl` (`src/ddl.rs`) | ~823 | PG DDL execution (`CREATE`/`DROP`/`ALTER TABLE`) through the same `ferrosa_cluster::ddl_path::DdlPath` CQL DDL uses |
-| `truncate` (`src/truncate.rs`) | ~150 | `TRUNCATE` over the same `ferrosa_cluster::WritePath` CQL uses (`TruncateExecutor`/`ClusterTruncate`); never a node-local `StorageEngine::truncate` |
 | `lib` (`src/lib.rs`) | ~37 | Module wiring + public re-exports |
 
 ## Connection lifecycle
@@ -133,13 +132,17 @@ cluster mode). `QueryContext.ddl` carries the executor into `ReadEnv`. Parse
 errors map to typed SQLSTATEs (`query::parse_error_sqlstate`). See FMEA
 `PG-T132a-*`.
 
-**TRUNCATE / VACUUM / ANALYZE.** `Statement::Truncate` executes in `truncate.rs`
-through `TruncateExecutor`; the production `ClusterTruncate` calls
-`ferrosa_cluster::WritePath::truncate` — the SAME replicated write path the CQL
-router's `route_truncate` uses — so every node removes the rows (never a
-node-local `StorageEngine::truncate`, which would desync the replicas).
-`QueryContext.truncate` carries the executor into `ReadEnv` beside `ddl`; with no
-executor the statement is refused `0A000`. `Statement::Vacuum` flushes the
+**TRUNCATE / VACUUM / ANALYZE.** `Statement::Truncate` executes in
+`query::execute_truncate`. Each named table is truncated by writing ONE
+**table-level tombstone** — a reserved-partition `Mutation`
+(`ferrosa_storage::table_tombstone::table_tombstone_row`) — through the SAME
+`apply_or_buffer` seam every DML write uses, so it is a **normal replicated
+write**; the front-end never truncates locally (never a node-local
+`StorageEngine::truncate`, which would empty one replica and leave the others
+holding the old data). `Statement::Truncate` is in the "data statement" set, so in
+autocommit it is wrapped in the implicit transaction and, in cluster mode, commits
+through the cluster (`AccordTransactionCommitter`) like any other write;
+standalone it applies locally. `Statement::Vacuum` flushes the
 named table's memtables and submits compaction (`force_compact_all`, all tables)
 before answering `CommandComplete "VACUUM"` — asynchronous, and reclamation depends
 on the purge policy, so the tag does not mean "space reclaimed". `Statement::Analyze`
@@ -197,6 +200,24 @@ query-materialization caveats are in the public
    to the sync executor through a bounded channel and blocking iterator, and the
    executor's rows return to the async side through another. Neither the scan
    nor the result is ever gathered.
+6. **`TRUNCATE` is a replicated table tombstone, and its scope is the whole
+   ring.** `TRUNCATE` writes ONE reserved-partition table tombstone through the
+   ordinary `apply_or_buffer` write seam, so it is transactional (buffers in a
+   `BEGIN`, applies on `COMMIT`, discarded by `ROLLBACK`) and replicated as a
+   write. It is *logically immediate* (reads return no rows the moment it commits,
+   table-wide, via `apply_table_deletion`) but *physically lazy* (bytes go at the
+   next compaction); `TRUNCATE` then `VACUUM` is strictly equivalent in effect to
+   an immediate truncate, and that split is deliberate for client compatibility.
+   In cluster mode the tombstone's commit is replicated to **every node serving
+   the table at `ConsistencyLevel::All`**: `CL=ALL` alone is not sufficient,
+   because the ordinary write path would route the marker by its reserved key's
+   token to that key's **RF replica set** — a proper subset of the ring when
+   `RF < node count` — leaving the nodes outside it serving the truncated rows. So
+   the marker is *also* fanned out to the **whole ring**
+   (`WritePath::write_all_serving_nodes`) and **every** target must acknowledge;
+   a node that does not ack fails the commit **loudly** — no quorum degrade and no
+   hint fallback. The reserved marker is exempt from purge, so nothing can be
+   resurrected; it lives until the table is dropped.
 
 ## Position in the dependency graph
 

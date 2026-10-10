@@ -54,19 +54,26 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   from it, so the front end can never advertise ferrosa's internal column as a PostgreSQL key.
   `indkey`/`conkey` carry the same attnums `pg_attribute` gives the columns (a synthesized
   `_sys_ck_` is a negative system attnum; a real key column keeps its positive ordinal).
-- **`TRUNCATE` (replicated) + `VACUUM` (flush + compact) / `ANALYZE` (no-op)** (pgbench
-  `-i`/reset and routine maintenance). `TRUNCATE [TABLE] t [, …]` routes through
-  `truncate::TruncateExecutor` — `ClusterTruncate` over the SAME
-  `ferrosa_cluster::WritePath` the CQL router's `route_truncate` uses — so the
-  truncation is replicated to every node, never a node-local
-  `StorageEngine::truncate` that would leave the replicas disagreeing. No write
-  path → `0A000`; in a transaction block → `25001`; missing table → `42P01`.
+- **`TRUNCATE` (replicated table tombstone) + `VACUUM` (flush + compact) / `ANALYZE` (no-op)**
+  (pgbench `-i`/reset and routine maintenance). `TRUNCATE [TABLE] t [, …]` executes in
+  `query::execute_truncate`: each named table is truncated by writing ONE
+  **table-level tombstone** (a reserved-partition `Mutation`) through the SAME
+  `apply_or_buffer` write seam every DML uses, so it is a transactional, replicated
+  write bufferable in a `BEGIN` and discarded by `ROLLBACK` — never a node-local
+  `StorageEngine::truncate` that would leave the replicas disagreeing. It is
+  *logically immediate* (reads return no rows at once, table-wide) and *physically
+  lazy* (bytes go at the next compaction); `TRUNCATE` then `VACUUM` is strictly
+  equivalent in effect to an immediate truncate, and that split is deliberate for
+  client compatibility. In cluster mode the tombstone is replicated to **every node
+  serving the table at `ConsistencyLevel::All`** — `CL=ALL` alone is not enough,
+  because the ordinary write path would scope it to the reserved key's RF replica
+  set — and the commit fails **loudly** if any serving node does not acknowledge.
+  Missing table → `42P01`.
   `VACUUM [FULL] [ANALYZE|ANALYSE]` flushes and submits compaction — in an LSM
   store that is the vacuum, so it is NOT a no-op — then answers `CommandComplete
   "VACUUM"`. Asynchronous: it does not wait for compaction, and reclamation
   depends on the purge policy. `ANALYZE|ANALYSE` answers `"ANALYZE"` and collects
   no statistics, which is a real no-op.
-  `QueryContext` carries the executor in `ReadEnv` beside `ddl`.
 
 - **PK-less `CREATE TABLE` end to end.** A table that declares no `PRIMARY KEY` gets a
   synthetic `_sys_ck_` column (a v1 TimeUUID, reported as `uuid`) as its partition key, so

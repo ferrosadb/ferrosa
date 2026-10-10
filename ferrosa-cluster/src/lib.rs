@@ -54,4 +54,4 @@ pub use repair::{
     RepairMerkleHandler, RepairStore, SessionExecutor, SessionStats, StorageEngineRepairStore,
 };
 pub use state::{PairClusterState, RaftClusterState, SingleNodeClusterState};
-pub use write_path::WritePath;
+pub use write_path::{WritePath, WritePathAllServingMarkerWriter};

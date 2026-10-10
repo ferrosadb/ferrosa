@@ -61,6 +61,13 @@ There is a single module. No submodule tree, no constructor, no tests.
    `self.engine`, `self.schema`, `self.write_path`, etc. transparently.
 4. On cluster-mode transitions, the host swaps `write_path` / `ddl_path` /
    `cluster_state` via their `ArcSwap` wrappers — no rebuild of `SessionCore`.
+5. When the host builds the cluster `AccordTransactionCommitter`, it wires the
+   **all-serving marker writer** (`WritePathAllServingMarkerWriter` over
+   `write_path`). A table-level tombstone (`TRUNCATE`) is then replicated to
+   *every* node serving the table at `ConsistencyLevel::All` instead of being
+   routed per-key to the reserved key's RF replica set (a proper subset of the
+   ring when `RF &lt; node count`); if any serving node does not acknowledge, the
+   commit fails loud rather than truncating a subset.
 
 ```mermaid
 flowchart TD

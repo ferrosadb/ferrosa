@@ -139,14 +139,53 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   (with a matching `<table>_pkey` index row in `pg_class`), so psql's describe-table
   shows a declared `PRIMARY KEY`; a table whose only key is the synthesized
   `_sys_ck_` reports no key.
-- **`TRUNCATE [TABLE] t [, …]` — replicated** (`truncate`) — removes every row
-  of each named table through the **replicated** cluster write path (the same
-  `ferrosa_cluster::WritePath` the CQL router's `route_truncate` uses), never a
-  node-local `StorageEngine::truncate` that would empty one replica and leave
-  the others holding the old data. Reply `TRUNCATE TABLE`. Refusals: `0A000`
-  when the front-end has no write path, `25001` inside a transaction block (it
-  cannot be rolled back), `42P01` for a missing table (checked before the write).
-  `TRUNCATE … CASCADE`/`RESTART IDENTITY` are refused at parse time.
+- **`TRUNCATE [TABLE] t [, …]` — a transactional table tombstone** (`truncate`) —
+  removes every row of each named table by writing ONE **table-level tombstone**:
+  a reserved-partition `Mutation` carrying
+  `ferrosa_storage::table_tombstone::table_tombstone_row`, through the SAME
+  `apply_or_buffer` seam every DML write uses. It is therefore a normal replicated
+  write, not a node-local `StorageEngine::truncate` (which would empty one replica
+  and leave the others holding the old data). Reply `TRUNCATE TABLE`.
+  - **Transactional.** Inside a `BEGIN` it BUFFERS into the write-set, applies
+    atomically on `COMMIT`, and is discarded by `ROLLBACK` — the old `25001`
+    refusal is gone; autocommit applies it at once.
+  - **Logically immediate; physical reclamation is lazy.** Reads return no rows for
+    the table *the moment the tombstone commits*, because the marker suppresses
+    every row older than its `marked_for_delete_at` on every read path table-wide —
+    the same predicate a per-partition `DELETE` uses, via
+    `ferrosa_storage::merge::apply_table_deletion`. The **bytes**, however, are
+    reclaimed lazily, at the next compaction, not at commit.
+  - **`TRUNCATE` then `VACUUM` forces reclamation promptly, and the pair is
+    strictly equivalent in effect to an immediate truncate.** `VACUUM` flushes the
+    memtables and submits compaction, which drops the tombstoned rows. This
+    synchronous-logical / lazy-physical split is **deliberate, for client
+    compatibility**: a driver that issues `TRUNCATE` then `VACUUM` (pgbench's
+    reset) reaches the same end state as one that issued a blocking truncate.
+    Making reclamation itself synchronous at `TRUNCATE` would be a **purposeful,
+    separate change** — not a fix to this one.
+  - **Cluster replication: the whole ring, at `ConsistencyLevel::All`.** The
+    tombstone is ONE reserved partition key, which the ordinary write path would
+    replicate only to that key's RF replica set — a proper subset of the ring
+    whenever `RF < node count` — leaving the nodes outside it serving the truncated
+    rows (**resurrection**). So the commit splits the tombstone out of the per-key
+    path and replicates it to **every node that can serve the table** at
+    `ConsistencyLevel::All` (`WritePath::write_all_serving_nodes`, driven by
+    `AccordTransactionCommitter::replicate_tombstones_all_nodes`). `CL=ALL` on its own
+    is **not** sufficient: `eligible_replicas_for_cl` only filters the replica slice
+    it is handed, which for one reserved key is its RF set. The marker therefore also
+    **targets the whole ring** (`WritePath::all_serving_host_ids`), and **every** node
+    must acknowledge. If any node does not — or the writer is unwired — the commit
+    **fails loud** (`AccordTransactionCommitter` refuses); there is no quorum degrade
+    and no hint fallback, because an unconfirmed truncate is a lie. Standalone/pair
+    write locally, which is already table-wide. Pinned by
+    `all_serving_host_ids_returns_the_whole_ring_not_the_rf_subset` and the
+    `transaction_commit` tombstone-routing tests.
+  - **Lifetime rule (no resurrection).** The reserved marker is **EXEMPT from
+    purge**, so a stale replica's older copy can never re-appear; it is retained
+    until the table itself is dropped. See the `ferrosa-storage` README.
+  - Refusals: `42P01` for a missing table (checked BEFORE any write, so a refused
+    statement changes nothing). `TRUNCATE … CASCADE` / `RESTART IDENTITY` are
+    refused at parse time.
 - **`VACUUM` (flush + compact) / `ANALYZE` (accepted no-op)** — `VACUUM [FULL]
   [ANALYZE|ANALYSE]` answers `CommandComplete "VACUUM"` and `ANALYZE|ANALYSE`
   answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds.
@@ -293,15 +332,17 @@ this exists for.
 `CREATE TABLE` requires `CREATE` on the target keyspace, checked at dispatch
 in `authz::statement_permissions` before the executor reads the schema (42501). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
 
-**`TRUNCATE` (replicated) and `VACUUM` (flush + compact) / `ANALYZE` (no-op).** `TRUNCATE
-[TABLE] t [, …]` executes in `truncate.rs`: each named table (resolved in the
-default schema) is truncated through `QueryContext.truncate` — a
-`TruncateExecutor` whose production implementation (`ClusterTruncate`) calls the
-SAME `ferrosa_cluster::WritePath::truncate` the CQL router's `route_truncate`
-uses (coordinator fan-out to every node in cluster mode, the local engine
-standalone). It is **never** the local `StorageEngine::truncate`, which would
-empty one replica and leave the cluster disagreeing about the table. No
-executor → `0A000`; in a transaction block → `25001`; missing table → `42P01`.
+**`TRUNCATE` (replicated table tombstone) and `VACUUM` (flush + compact) / `ANALYZE` (no-op).**
+`TRUNCATE [TABLE] t [, …]` executes in `query::execute_truncate`: each named table
+(resolved in the default schema) is truncated by writing ONE **table-level tombstone**
+through the same `apply_or_buffer` write seam every DML uses — a normal replicated
+write, never the local `StorageEngine::truncate`, which would empty one replica and
+leave the cluster disagreeing about the table. In autocommit `Statement::Truncate` is
+in the "data statement" set, so it enters the implicit transaction and, in cluster
+mode, commits through the cluster committer (where the tombstone is fanned out to
+every serving node at `ConsistencyLevel::All`, failing loud on any missing ack).
+Inside an explicit transaction it buffers and applies on `COMMIT` — the old `25001`
+refusal is gone — and `ROLLBACK` discards it. Missing table → `42P01`.
 `VACUUM [FULL] [ANALYZE|ANALYSE]` flushes the named table (all tables when none
 is named) and submits compaction, then answers `CommandComplete "VACUUM"`;
 `ANALYZE|ANALYSE` is answered `"ANALYZE"` and collects nothing. Unlike DDL they
@@ -334,7 +375,7 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Catalog | `catalog::{pg_namespace, pg_class, pg_attribute, pg_type, pg_index, pg_constraint, catalog_tables}` (`pg_attribute`/`pg_type`/`catalog_tables` are fallible: `PgTypeError`) |
 | Synthetic key | `synthetic_key::next_synthetic_key` — the per-row v1 TimeUUID for the `_sys_ck_` key of a PK-less table |
 | DDL | `ddl::DdlExecutor` (`create_table`/`drop_table`/`alter_table`/`create_index`), `ddl::execute_alter_table` — `ALTER TABLE ... ADD PRIMARY KEY` / `ADD COLUMN` / `DROP COLUMN`; every other ALTER form is refused by name |
-| Truncate (replicated) | `truncate::TruncateExecutor` (`truncate`), `truncate::ClusterTruncate`, `truncate::execute_truncate` — `TRUNCATE` over the same `WritePath` CQL uses, never a node-local truncate |
+| Truncate (replicated) | `query::execute_truncate` — `TRUNCATE` as ONE reserved-partition **table tombstone** through the same write seam as DML; never a node-local truncate |
 | Declared key | `pg_key::{of, recorded, encode, PRIMARY_KEY_EXTENSION}` — the *PostgreSQL* primary key, which is not the storage key |
 | Type map | `pg_types::{pg_type_of, pg_type_of_column, for_column_type, cql_type_for_pg_name, PgType, PgTypeError}` — the one `CqlType` ↔ Postgres type map (OID, typname, typlen, engine `ColumnType`, binary support); catalog, storage provider, RowDescription and parameter inference all read it |
 | Codec / messages | `codec::{read_startup, read_frontend, MAX_MESSAGE_LEN}`, `messages::{FrontendMessage, BackendMessage, TransactionStatus, …}` |
@@ -355,8 +396,9 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
   (`check_login_rate_limit` / `record_login_failure` / `complete_login`) and
   `check_permission`.
 - **`ferrosa-cluster`** — `ddl_path::DdlPath` (the DDL path `ClusterDdl` adapts)
-  and `write_path::WritePath` (the replicated write path `ClusterTruncate`
-  calls for `TRUNCATE`), so PG DDL and `TRUNCATE` reach the cluster through the
+  and `write_path::WritePath` (the replicated write path the cluster committer
+  replicates a `TRUNCATE` table tombstone over, at `ConsistencyLevel::All` to every
+  serving node), so PG DDL and `TRUNCATE` reach the cluster through the
   SAME paths CQL uses.
 - **`ferrosa-net`** — `tls::optional_server_config`, the shared TLS acceptor
   builder and crypto provider.
@@ -374,13 +416,14 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
 ## Tests
 
-256 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
-query/storage_provider/catalog/store + `mvcc`/transaction tests, `ddl`, `authz`
-and `truncate`) run with no infrastructure, plus integration tests. The new
-`TRUNCATE`/`VACUUM` coverage is in `server` tests (a recorded `TruncateExecutor`
-proves the replicated path is taken and the local engine is left untouched; a
-context with no write path is refused `0A000`; `VACUUM`/`ANALYZE` answer the
-expected tag) and in `authz` (per-table `MODIFY` for `TRUNCATE`):
+284 in-crate unit tests (codec/messages/scram/handshake/connection/extended/
+query/storage_provider/catalog/store + `mvcc`/transaction tests, `ddl`, `authz`)
+run with no infrastructure, plus integration tests. The `TRUNCATE`/`VACUUM`
+coverage is in `server` tests — `TRUNCATE` writes a table tombstone rather than a
+local truncate, an autocommit `TRUNCATE` on a cluster reaches the committer instead
+of local storage, and inside a transaction it buffers then applies on `COMMIT` or
+is discarded by `ROLLBACK`; `VACUUM`/`ANALYZE` answer the expected tag — and in
+`authz` (per-table `MODIFY` for `TRUNCATE`):
 
 - `tests/m1_join_live.rs` (15) — full stack over a real `tokio-postgres` driver
   in-process: SCRAM → JOIN, parameterized extended query, GROUP BY/ORDER

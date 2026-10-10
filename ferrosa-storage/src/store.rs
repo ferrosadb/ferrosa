@@ -41,7 +41,7 @@ use ferrosa_common::Result;
 use ferrosa_index::{FilterPredicate, IndexKey, IndexType, RowPosition};
 use ferrosa_sstable::io::ReadAt;
 use ferrosa_sstable::reader::SSTableReader;
-use ferrosa_sstable::types::{Partition, Row};
+use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles, SSTableWriter};
 use ferrosa_sstable::WriteOptions;
 use rayon::prelude::*;
@@ -2022,6 +2022,11 @@ struct RangeScan<F: FlushTarget> {
     skip: Option<Delivered>,
     /// Resumes so far; bounded by [`RANGE_SCAN_MAX_RESUMES`].
     resumes: u32,
+    /// The table-level tombstone resolved against the scan's initial view.
+    /// Folded into every partition the scan yields so a TRUNCATE hides rows on the
+    /// streaming scan path too. A scan is not a snapshot, so a truncate committed
+    /// after the scan started may not be seen by that scan (documented behaviour).
+    table_delete: DeletionTime,
 }
 
 /// The last partition a scan delivered (some or all of), for resuming it.
@@ -2208,6 +2213,21 @@ where
                 Ok(None) => return ScanRun::Finished,
                 Err(e) if self.resume_after_retired_input(&e) => continue,
                 Err(e) => return deliver_failure(slot, tx, e),
+            };
+            // The reserved table-tombstone partition is bookkeeping, not data:
+            // never surface it to a scan's consumer, and fold its watermark into
+            // every real partition so a TRUNCATE hides earlier rows table-wide.
+            if crate::table_tombstone::is_table_tombstone_key(&partition.key) {
+                continue;
+            }
+            let partition = if !self.table_delete.is_live()
+                && self.table_delete.marked_for_delete_at > partition.deletion.marked_for_delete_at
+            {
+                let mut owned = Arc::unwrap_or_clone(partition);
+                merge::apply_table_deletion(&mut owned, self.table_delete);
+                Arc::new(owned)
+            } else {
+                partition
             };
             let partition = match &self.skip {
                 Some(skip) if skip.key == partition.key => match skip.remainder(partition) {
@@ -4259,6 +4279,58 @@ impl<F: FlushTarget> TableStore<F> {
         ))
     }
 
+    /// The table-level tombstone currently visible in `guard`, or
+    /// [`DeletionTime::LIVE`] if the table has not been truncated.
+    ///
+    /// A TRUNCATE is stored as one reserved partition
+    /// ([`crate::table_tombstone::table_tombstone_key`]) whose `deletion` is the
+    /// table tombstone. This folds that partition's deletion across the active
+    /// memtable, every flushing memtable and every SSTable whose token range covers
+    /// the reserved key, returning the newest.
+    ///
+    /// Fails loud if an overlapping SSTable cannot be opened or read: a missing
+    /// tombstone would resurrect truncated data, so a partial answer is worse than
+    /// an error. Only SSTables whose `[min_token, max_token]` covers the reserved
+    /// key are opened, and a Bloom check (`may_contain_key`) skips the rest, so this
+    /// is a bounded, single-key probe on a table that has ever been truncated.
+    fn table_deletion(&self, guard: &StoreView) -> Result<DeletionTime> {
+        let key = crate::table_tombstone::table_tombstone_key();
+        let mut best = DeletionTime::LIVE;
+        if let Some(p) = guard.active.get(&key)? {
+            best = crate::table_tombstone::newest_deletion(best, p.deletion);
+        }
+        for sealed in guard.flushing.iter() {
+            if let Some(p) = sealed.memtable.get(&key)? {
+                best = crate::table_tombstone::newest_deletion(best, p.deletion);
+            }
+        }
+        let token = key.token.0;
+        for desc in guard.sstables.iter() {
+            if token < desc.min_token || token > desc.max_token {
+                continue;
+            }
+            let reader = self
+                .open_reader(desc)
+                .map_err(|e| self.unreadable_sstable("table_tombstone", "open", desc, &e))?;
+            if !reader.may_contain_key(&key) {
+                continue;
+            }
+            match reader.get_partition(&key) {
+                Ok(Some(p)) => best = crate::table_tombstone::newest_deletion(best, p.deletion),
+                Ok(None) => {}
+                Err(e) => return Err(self.unreadable_sstable("table_tombstone", "read", desc, &e)),
+            }
+        }
+        Ok(best)
+    }
+
+    /// The table tombstone as of the store's current view, or
+    /// [`DeletionTime::LIVE`]. The store-internal entry point for callers outside
+    /// this module (compaction, which must reclaim rows a truncate covers).
+    pub(crate) fn table_tombstone(&self) -> Result<DeletionTime> {
+        self.table_deletion(&self.view.load())
+    }
+
     /// One attempt of [`read_limited_rows`] against a fixed `view` snapshot.
     /// Returns the merged partition (if any) plus the identity of any
     /// snapshotted SSTable that could not be consulted — the signal the caller
@@ -4439,6 +4511,8 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let mut merged = merge::merge_partitions(sources);
+        let table_delete = self.table_deletion(guard)?;
+        merge::apply_table_deletion(&mut merged, table_delete);
         if row_limit > 0 {
             merge::apply_deletions(&mut merged);
             merged.rows.truncate(row_limit);
@@ -4571,6 +4645,8 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let mut merged = merge::merge_partitions(sources);
+        let table_delete = self.table_deletion(guard)?;
+        merge::apply_table_deletion(&mut merged, table_delete);
         merged.rows.retain(|row| row.clustering == clustering);
         if merged.rows.is_empty() {
             Ok((None, corrupt))
@@ -6277,10 +6353,22 @@ impl<F: FlushTarget> TableStore<F> {
         // live count. Static rows count as one row (Cassandra
         // semantics for COUNT(*) include the static row when
         // present).
+        // The reserved table-tombstone partition itself holds no rows, but its
+        // watermark still suppresses rows table-wide; fold it in before counting.
+        let table_delete = self.table_deletion(&view)?;
         while let Some(p) = merger.next_merged_partition()? {
-            if !matches(&p.key) {
+            if !matches(&p.key) || crate::table_tombstone::is_table_tombstone_key(&p.key) {
                 continue;
             }
+            let p = if !table_delete.is_live()
+                && table_delete.marked_for_delete_at > p.deletion.marked_for_delete_at
+            {
+                let mut owned = Arc::unwrap_or_clone(p);
+                merge::apply_table_deletion(&mut owned, table_delete);
+                owned
+            } else {
+                Arc::unwrap_or_clone(p)
+            };
             total = total.saturating_add(p.rows.len() as u64);
             if p.static_row.is_some() {
                 total = total.saturating_add(1);
@@ -6359,6 +6447,13 @@ impl<F: FlushTarget> TableStore<F> {
         // reserved), not the unbounded blocking pool, so a broad scan cannot
         // oversubscribe the cores and starve raft heartbeats. Every such scan
         // is `ScanPlan::FullScan`-class work, weighted Bulk.
+        // Resolve the table tombstone once for the scan. A failure to read an
+        // overlapping SSTable is surfaced as a stream error, never silently
+        // dropped (a missing tombstone would resurrect truncated data).
+        let table_delete = match self.table_deletion(&self.view.load()) {
+            Ok(d) => d,
+            Err(e) => return Box::pin(futures::stream::once(async move { Err(e) })),
+        };
         let scan = RangeScan {
             view: self.view.load_full(),
             schema: self.schema.load_full(),
@@ -6376,6 +6471,7 @@ impl<F: FlushTarget> TableStore<F> {
             delivered: None,
             skip: None,
             resumes: 0,
+            table_delete,
         };
         spawn_resumable_range_scan(tx, scan);
 
@@ -6615,10 +6711,15 @@ impl<F: FlushTarget> TableStore<F> {
             }
             merged.push(p);
         }
+        let table_delete = self.table_deletion(&guard)?;
         for p in &mut merged {
-            merge::apply_deletions(p);
+            merge::apply_table_deletion(p, table_delete);
         }
-        Ok(merged.into_iter().take(limit).collect())
+        Ok(merged
+            .into_iter()
+            .filter(|p| !crate::table_tombstone::is_table_tombstone_key(&p.key))
+            .take(limit)
+            .collect())
     }
 
     /// Approximate heap footprint of a materialised partition, used to bound
@@ -6693,6 +6794,9 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
         let schema = self.schema.load();
         let in_range = |t: i64| t >= start_token && t < end_token;
+        // The table tombstone, resolved once against this view and folded into
+        // every merged partition below (a TRUNCATE must hide rows table-wide).
+        let table_delete = self.table_deletion(&guard)?;
 
         // Token-ordered, peekable source streams. Memtable sources are staged
         // into sorted vecs (already range-filtered, so bounded by matches);
@@ -6842,23 +6946,33 @@ impl<F: FlushTarget> TableStore<F> {
                 }
             }
             let is_multi = sources.len() > 1;
+            let needs_table_suppression = !table_delete.is_live();
             let merged = if !is_multi {
                 // Single source: serve the `Arc` straight through unless a
-                // tombstone means deletion suppression would rewrite it.
+                // tombstone (the partition's own, or the table's) means deletion
+                // suppression would rewrite it.
                 let only = sources.pop().expect("len checked");
-                if crate::range_merger::partition_needs_deletion_suppression(&only) {
+                if needs_table_suppression
+                    || crate::range_merger::partition_needs_deletion_suppression(&only)
+                {
                     let mut owned = Arc::unwrap_or_clone(only);
-                    merge::apply_deletions(&mut owned);
+                    merge::apply_table_deletion(&mut owned, table_delete);
                     Arc::new(owned)
                 } else {
                     only
                 }
             } else {
                 let owned: Vec<Partition> = sources.into_iter().map(Arc::unwrap_or_clone).collect();
-                Arc::new(merge::merge_partitions(owned))
+                let mut merged = merge::merge_partitions(owned);
+                merge::apply_table_deletion(&mut merged, table_delete);
+                Arc::new(merged)
             };
             out_bytes += Self::partition_heap_bytes(&merged);
-            out.push(merged);
+            // The reserved table-tombstone partition is consumed (so the merge
+            // advances past it) but never surfaced to the caller.
+            if !crate::table_tombstone::is_table_tombstone_key(&merged.key) {
+                out.push(merged);
+            }
         };
         Ok((out, next_cursor))
     }
@@ -7785,14 +7899,18 @@ impl<F: FlushTarget> TableStore<F> {
         // need row-level and partition-level deletions applied because
         // the memtable's merge-on-write sets deletion markers but does
         // not suppress the covered cells.
+        let table_delete = self.table_deletion(&guard)?;
         for p in &mut merged {
-            merge::apply_deletions(p);
+            merge::apply_table_deletion(p, table_delete);
         }
 
         // Apply range filter and limit
         let filtered: Vec<Partition> = merged
             .into_iter()
             .filter(|p| {
+                if crate::table_tombstone::is_table_tombstone_key(&p.key) {
+                    return false;
+                }
                 if let Some(s) = start {
                     if p.key < *s {
                         return false;
@@ -11137,6 +11255,146 @@ mod tests {
                 ..WriteOptions::default()
             },
         )
+    }
+    // ---------------------------------------------------------------------
+    // Table-level tombstone (TRUNCATE as a normal replicated write).
+    // ---------------------------------------------------------------------
+
+    /// Write a table tombstone into `store` at `marked_for_delete_at` micros.
+    fn write_table_tombstone(store: &TableStore<InMemoryFlushTarget>, marked_for_delete_at: i64) {
+        store
+            .write(
+                &crate::table_tombstone::table_tombstone_key(),
+                crate::table_tombstone::table_tombstone_row(marked_for_delete_at, 1_700_000_000),
+            )
+            .expect("write the table tombstone");
+    }
+
+    fn visible_rows(store: &TableStore<InMemoryFlushTarget>, key: &DecoratedKey) -> Vec<Row> {
+        store
+            .read_limited_rows(key, 0)
+            .expect("read")
+            .map(|partition| partition.rows)
+            .unwrap_or_default()
+    }
+
+    /// I. IMMEDIATE LOGICAL EFFECT: a row written before the truncate is invisible
+    ///    to a read immediately after the tombstone write lands (property 4's twin).
+    #[test]
+    fn table_tombstone_hides_rows_written_before_it_immediately() {
+        let store = test_store();
+        store
+            .write(&make_key("a"), make_row(b"before", 100))
+            .unwrap();
+        store
+            .write(&make_key("b"), make_row(b"before", 100))
+            .unwrap();
+        assert_eq!(visible_rows(&store, &make_key("a")).len(), 1);
+
+        write_table_tombstone(&store, 200);
+        assert!(
+            visible_rows(&store, &make_key("a")).is_empty(),
+            "a row older than the table tombstone must be invisible at once"
+        );
+        assert!(visible_rows(&store, &make_key("b")).is_empty());
+    }
+
+    /// IV. NEWER DATA SURVIVES: a row written AFTER the truncate (newer timestamp)
+    ///     must not be deleted by it.
+    #[test]
+    fn a_row_written_after_the_table_tombstone_survives() {
+        let store = test_store();
+        store
+            .write(&make_key("a"), make_row(b"before", 100))
+            .unwrap();
+        write_table_tombstone(&store, 200);
+        store
+            .write(&make_key("a"), make_row(b"after", 300))
+            .unwrap();
+
+        let rows = visible_rows(&store, &make_key("a"));
+        assert_eq!(rows.len(), 1, "the post-truncate row must survive");
+        assert_eq!(rows[0].cells[0].1.value.as_deref(), Some(b"after".as_ref()));
+
+        // Boundary: the tombstone suppresses strictly older timestamps only, so a
+        // row at exactly the tombstone timestamp survives (>= predicate).
+        let store2 = test_store();
+        store2
+            .write(&make_key("e"), make_row(b"edge", 200))
+            .unwrap();
+        write_table_tombstone(&store2, 200);
+        assert_eq!(
+            visible_rows(&store2, &make_key("e")).len(),
+            1,
+            "a row at exactly the tombstone timestamp is newer-or-equal and survives"
+        );
+    }
+
+    /// III. NO RESURRECTION (the critical one): once the truncate has landed, a
+    ///      stale replica that still holds the pre-truncate row cannot bring it
+    ///      back — a copy re-merged at its ORIGINAL, older timestamp stays
+    ///      suppressed. The table tombstone may only be dropped once every replica
+    ///      has purged the data it covers; until then it must dominate any stale
+    ///      copy.
+    #[test]
+    fn a_stale_older_copy_cannot_resurrect_a_truncated_row() {
+        let store = test_store();
+        store
+            .write(&make_key("a"), make_row(b"before", 100))
+            .unwrap();
+        write_table_tombstone(&store, 200);
+
+        // A stale replica's copy of the pre-truncate row, replayed at its original
+        // older timestamp (what repair / read-repair would write back).
+        store
+            .write(&make_key("a"), make_row(b"before", 100))
+            .unwrap();
+
+        assert!(
+            visible_rows(&store, &make_key("a")).is_empty(),
+            "a stale older copy must not resurrect a truncated row"
+        );
+    }
+
+    /// VI. NEGATIVE CONTROL: with no table tombstone the earlier row stays visible,
+    ///     so the suppression above is caused by the tombstone and nothing else.
+    #[test]
+    fn without_a_table_tombstone_an_earlier_row_stays_visible() {
+        let store = test_store();
+        store
+            .write(&make_key("a"), make_row(b"before", 100))
+            .unwrap();
+        assert_eq!(
+            visible_rows(&store, &make_key("a")).len(),
+            1,
+            "control: no tombstone means no suppression"
+        );
+    }
+
+    /// The tombstone suppresses on scans and COUNT(*) too, and the reserved marker
+    /// partition is never surfaced to a scan.
+    #[test]
+    fn table_tombstone_hides_rows_from_scans_and_counts() {
+        let store = test_store();
+        store
+            .write(&make_key("a"), make_row(b"before", 100))
+            .unwrap();
+        store
+            .write(&make_key("b"), make_row(b"before", 100))
+            .unwrap();
+        write_table_tombstone(&store, 200);
+
+        let all = store.read_range_limited_rows(None, None, 100, 0).unwrap();
+        assert!(
+            all.iter().all(|p| p.rows.is_empty()),
+            "no rows may be visible in a scan after a truncate"
+        );
+        assert!(
+            all.iter()
+                .all(|p| !crate::table_tombstone::is_table_tombstone_key(&p.key)),
+            "the reserved table-tombstone partition is bookkeeping, never surfaced"
+        );
+        assert_eq!(store.count_range(None, None).unwrap(), 0);
     }
 
     /// Phase 0 (index-type threading): `add_index` records the declared

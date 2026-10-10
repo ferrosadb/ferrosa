@@ -275,7 +275,6 @@ async fn start() -> (tokio_postgres::Client, tempfile::TempDir) {
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
         ddl: None,
-        truncate: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Default::default(),
     });

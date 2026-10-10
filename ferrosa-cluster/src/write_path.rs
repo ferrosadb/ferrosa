@@ -1457,6 +1457,86 @@ impl WritePath {
         Ok(self.replicas_for_key(token, &strategy))
     }
 
+    /// Every host id that can serve `keyspace` — the **whole ring** in cluster
+    /// mode, or the local node(s) outside it.
+    ///
+    /// A table-level tombstone (`TRUNCATE`) is stored under ONE reserved
+    /// partition key, which the ordinary write path routes to that key's **RF
+    /// replica set** — a proper subset of the ring whenever the replication
+    /// factor is below the node count. The nodes outside it never learn of the
+    /// truncate and keep serving the truncated rows. So the tombstone is instead
+    /// fanned out to every id this returns, at `ConsistencyLevel::All`: the
+    /// serving set IS the scope of the truncate, and it must be the whole
+    /// cluster, never the reserved key's replica set.
+    ///
+    /// - `Some(ids)` in **cluster** mode — every ring member's host id.
+    /// - `None` outside cluster mode (no ring): the caller writes locally, which
+    ///   is already table-wide.
+    pub fn all_serving_host_ids(&self) -> Option<Vec<uuid::Uuid>> {
+        let Self::Cluster(coordinator) = self else {
+            return None;
+        };
+        let ring = coordinator.ring.load();
+        let mut ids: Vec<uuid::Uuid> = ring
+            .node_ids()
+            .into_iter()
+            .filter_map(|node_id| ring.get_node(node_id).map(|info| info.host_id))
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+
+    /// Replicate a table-level tombstone marker under `key` to **every node that
+    /// can serve `table_id`**, requiring all of them to acknowledge
+    /// (`ConsistencyLevel::All`).
+    ///
+    /// This is the all-node half of the truncate's replication: it is the reason
+    /// the marker reaches nodes outside the reserved key's RF replica set. It
+    /// fails loud if any serving node does not acknowledge — an unconfirmed
+    /// truncate is a lie, so there is no quorum degrade and no hint fallback.
+    pub async fn write_all_serving_nodes(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        rows: Vec<Row>,
+        timestamp: i64,
+    ) -> ferrosa_common::Result<()> {
+        match self {
+            Self::Direct(engine) => {
+                for row in rows {
+                    engine.write(table_id, key, row, timestamp)?;
+                }
+                Ok(())
+            }
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => {
+                let engine = coordinator.local_storage();
+                for row in rows {
+                    engine.write(table_id, key, row, timestamp)?;
+                }
+                Ok(())
+            }
+            Self::Cluster(coordinator) => {
+                for row in rows {
+                    coordinator
+                        .coordinate_all_serving_write(
+                            table_id,
+                            key,
+                            row,
+                            timestamp,
+                            ConsistencyLevel::All,
+                        )
+                        .await
+                        .map_err(cluster_error_to_common)?;
+                }
+                Ok(())
+            }
+            Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
+                "pair mode: primary unavailable, writes rejected until operator promotes".into(),
+            )),
+        }
+    }
+
     /// Truncate a table. In standalone/pair mode this truncates local storage.
     /// In cluster mode the coordinator fans out to all nodes.
     pub async fn truncate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
@@ -1564,6 +1644,40 @@ impl WritePath {
                 res
             }
         }
+    }
+}
+
+/// [`AllServingMarkerWriter`](crate::accord::AllServingMarkerWriter) over the
+/// live [`WritePath`].
+///
+/// Decodes a table-level tombstone marker and replicates it to every node that
+/// serves the table, at `ConsistencyLevel::All`. Wired into the PostgreSQL
+/// transaction committer ([`crate::accord::AccordTransactionCommitter`]) so a
+/// `TRUNCATE`'s commit reaches every serving node, not just the reserved key's
+/// RF replica set.
+pub struct WritePathAllServingMarkerWriter {
+    write_path: Arc<arc_swap::ArcSwap<WritePath>>,
+}
+
+impl WritePathAllServingMarkerWriter {
+    /// Wrap the node's live, swappable write path.
+    pub fn new(write_path: Arc<arc_swap::ArcSwap<WritePath>>) -> Self {
+        Self { write_path }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::accord::AllServingMarkerWriter for WritePathAllServingMarkerWriter {
+    async fn write_marker_to_all_serving_nodes(&self, mutation_bytes: &[u8]) -> Result<(), String> {
+        // Fail loud on garbage: a marker we cannot decode cannot be replicated,
+        // and reporting success would truncate nothing while claiming to.
+        let mutation = Mutation::deserialize_from(mutation_bytes).map_err(|e| e.to_string())?;
+        let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+        self.write_path
+            .load()
+            .write_all_serving_nodes(&table_id, &mutation.key, mutation.rows, mutation.timestamp)
+            .await
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1870,6 +1984,83 @@ mod tests {
                 .expect("a valid strategy parses"),
             None
         );
+    }
+
+    /// The serving set of a table tombstone is the **whole ring**, not the
+    /// reserved key's RF replica set. `all_serving_host_ids` returns every ring
+    /// member's host id, so a `TRUNCATE` fanned out over it reaches nodes the
+    /// key's RF subset would miss — the exact resurrection case. Only a cluster
+    /// has a ring; other modes return `None` and write locally.
+    #[test]
+    fn all_serving_host_ids_returns_the_whole_ring_not_the_rf_subset() {
+        use ferrosa_net::peer::{PeerEventListener, PeerManager};
+        use ferrosa_net::rpc::handler::PeerId;
+
+        struct NoopListener;
+        impl PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: PeerId) {}
+            fn on_peer_disconnected(&self, _: PeerId) {}
+            fn on_peer_suspected(&self, _: PeerId) {}
+            fn on_peer_recovered(&self, _: uuid::Uuid) {}
+            fn on_peer_failed(&self, _: uuid::Uuid) {}
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+
+        let mut ring = crate::ring::TokenRing::new();
+        let mut host_ids = Vec::new();
+        for (id, addr, token) in [
+            (1u64, "10.0.0.1:7000", -3_000_000_000_000_000_000i64),
+            (2, "10.0.0.2:7000", 0),
+            (3, "10.0.0.3:7000", 3_000_000_000_000_000_000),
+        ] {
+            let host_id = uuid::Uuid::from_u128(id as u128);
+            host_ids.push(host_id);
+            ring.add_node(
+                id,
+                crate::raft::NodeInfo {
+                    host_id,
+                    addr: addr.to_string(),
+                    data_center: "dc1".to_string(),
+                    rack: "rack1".to_string(),
+                    state: crate::raft::NodeState::Normal,
+                    cql_broadcast: None,
+                },
+            );
+            ring.assign_tokens(id, &[token]);
+        }
+
+        let coordinator = ClusterCoordinator::new(
+            std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            std::sync::Arc::new(PeerManager::new(
+                std::sync::Arc::new(ferrosa_net::config::NetConfig::default()),
+                uuid::Uuid::new_v4(),
+                std::sync::Arc::new(NoopListener),
+            )),
+            1,
+            storage,
+            3,
+            ConsistencyLevel::One,
+        );
+        let write_path = WritePath::cluster(std::sync::Arc::new(coordinator));
+
+        // All three ring members, regardless of the reserved key's RF (which for
+        // RF < node count is a proper subset and would miss a node).
+        let mut got = write_path
+            .all_serving_host_ids()
+            .expect("cluster has a ring");
+        got.sort_unstable();
+        let mut expected = host_ids;
+        expected.sort_unstable();
+        assert_eq!(
+            got, expected,
+            "the serving set must be the WHOLE ring, not the reserved key's RF subset"
+        );
+
+        // Only a cluster ring can enumerate the serving set; other modes write
+        // locally (already table-wide).
+        assert_eq!(WritePath::unavailable().all_serving_host_ids(), None);
     }
 
     #[test]

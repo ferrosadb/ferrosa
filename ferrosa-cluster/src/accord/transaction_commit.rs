@@ -34,6 +34,26 @@ use crate::accord::wire::ReadPredicate;
 /// commit fails loud rather than guessing.
 pub type ReplicaResolver = Arc<dyn Fn(&str, &[u8]) -> Option<Vec<Uuid>> + Send + Sync>;
 
+/// Replicates a table-level tombstone (`TRUNCATE`) marker to **every node that
+/// serves the table**, requiring every one to acknowledge
+/// (`ConsistencyLevel::All`).
+///
+/// Accord orders a transaction by per-shard **quorum**, but a table tombstone is
+/// ONE reserved partition key whose write Accord would route to that key's RF
+/// replica set — a proper subset of the ring whenever `RF < node count`. A
+/// quorum on that subset leaves the nodes outside it serving the truncated rows
+/// (resurrection), and Accord's quorum can also decide without a node that is
+/// down and repair it later. A table tombstone must be held by every serving
+/// node NOW, so this seam is deliberately NOT Accord's quorum path: it fans the
+/// marker to the whole serving set and fails loud on any missing acknowledgement.
+#[async_trait]
+pub trait AllServingMarkerWriter: Send + Sync {
+    /// Write the table-tombstone `mutation_bytes` (a serialized single-partition
+    /// `Mutation`) to every node serving the table. `Err` if ANY node does not
+    /// acknowledge — never a silent degrade to quorum.
+    async fn write_marker_to_all_serving_nodes(&self, mutation_bytes: &[u8]) -> Result<(), String>;
+}
+
 /// Cluster-side [`TransactionCommitter`]: commits a buffered multi-key write-set
 /// as one unconditional Accord transaction.
 pub struct AccordTransactionCommitter {
@@ -56,6 +76,11 @@ pub struct AccordTransactionCommitter {
     /// Production creates the committer before cluster formation publishes the
     /// local state, so retain the slot and load it when each transaction runs.
     local_accord_state_slot: Option<crate::accord::handlers::AccordStateSlot>,
+    /// Replicates a table-level tombstone to every serving node (see
+    /// [`AllServingMarkerWriter`]). `None` refuses such a commit loudly rather
+    /// than routing it through per-key Accord, which would reach only the
+    /// reserved key's RF replica set.
+    marker_writer: Option<Arc<dyn AllServingMarkerWriter>>,
 }
 
 impl AccordTransactionCommitter {
@@ -74,7 +99,16 @@ impl AccordTransactionCommitter {
             resolve,
             local_accord_state: None,
             local_accord_state_slot: None,
+            marker_writer: None,
         }
+    }
+
+    /// Wire the all-serving-node writer used for table-level tombstones
+    /// (`TRUNCATE`). Production passes a writer over the live `WritePath`; left
+    /// unwired, a commit that contains a tombstone is refused loudly.
+    pub fn with_marker_writer(mut self, writer: Arc<dyn AllServingMarkerWriter>) -> Self {
+        self.marker_writer = Some(writer);
+        self
     }
 
     /// Wire the coordinator node's own Accord state machine so a
@@ -100,6 +134,37 @@ impl AccordTransactionCommitter {
     ) -> Self {
         self.local_accord_state_slot = Some(slot.clone());
         self
+    }
+
+    /// Replicate each table-level tombstone to EVERY node that serves the table,
+    /// requiring all of them to acknowledge (`ConsistencyLevel::All`).
+    ///
+    /// Fail loud: an unwired writer, or any node that does not acknowledge,
+    /// refuses the commit — an unconfirmed truncate would leave that node
+    /// serving the truncated rows (resurrection). There is deliberately no
+    /// quorum fallback and no hint: a truncate is not eventually consistent.
+    async fn replicate_tombstones_all_nodes(
+        &self,
+        tombstones: &[TransactionWrite],
+    ) -> Result<(), CommitError> {
+        let writer = self.marker_writer.as_ref().ok_or_else(|| CommitError {
+            reason: "cluster committer has no all-serving marker writer; refusing to route a \
+                     TRUNCATE tombstone through per-key Accord (it would reach only the \
+                     reserved key's RF replica set, resurrecting the rows on every other node)"
+                .to_string(),
+        })?;
+        for write in tombstones {
+            writer
+                .write_marker_to_all_serving_nodes(&write.mutation)
+                .await
+                .map_err(|reason| CommitError {
+                    reason: format!(
+                        "TRUNCATE was not acknowledged by every serving node; refusing rather \
+                         than truncating a subset: {reason}"
+                    ),
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -197,6 +262,23 @@ impl TransactionCommitter for AccordTransactionCommitter {
         use ferrosa_storage::accord::conflict_index::{
             POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
         };
+        use ferrosa_storage::table_tombstone;
+
+        // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The
+        // per-key Accord commit below would route it to that key's RF replica
+        // set — a proper subset of the ring whenever RF < node count — leaving
+        // the nodes outside it serving the truncated rows (resurrection). So a
+        // tombstone is split out and replicated to EVERY serving node at CL=ALL
+        // instead, failing loud if any node does not acknowledge. The reserved
+        // key's placement never decides a truncate's scope again.
+        let tombstone_key = table_tombstone::table_tombstone_key();
+        let (tombstones, ordinary): (Vec<TransactionWrite>, Vec<TransactionWrite>) = writes
+            .into_iter()
+            .partition(|w| w.key == tombstone_key.key.as_bytes());
+        if !tombstones.is_empty() {
+            self.replicate_tombstones_all_nodes(&tombstones).await?;
+        }
+        writes = ordinary;
 
         // The barrier key orders all BEGIN/COMMIT barriers. A second commit-only
         // marker advances only for data transaction completions, so a BEGIN after
@@ -935,5 +1017,154 @@ mod tests {
             .await
             .expect_err("unplaceable key must fail loud");
         assert!(err.reason.contains("no replicas"), "got: {}", err.reason);
+    }
+
+    /// Records the marker bytes handed to the all-serving writer, and can be told
+    /// to fail (a serving node that did not acknowledge).
+    struct MarkerRecorder {
+        seen: Mutex<Vec<Vec<u8>>>,
+        result: Result<(), String>,
+    }
+
+    impl MarkerRecorder {
+        fn ok() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                result: Ok(()),
+            }
+        }
+
+        fn failing(reason: &str) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                result: Err(reason.to_string()),
+            }
+        }
+
+        fn seen(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().expect("marker recorder mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl AllServingMarkerWriter for MarkerRecorder {
+        async fn write_marker_to_all_serving_nodes(
+            &self,
+            mutation_bytes: &[u8],
+        ) -> Result<(), String> {
+            self.seen
+                .lock()
+                .expect("marker recorder mutex")
+                .push(mutation_bytes.to_vec());
+            self.result.clone()
+        }
+    }
+
+    fn tombstone_write() -> TransactionWrite {
+        TransactionWrite {
+            keyspace: "ks".to_string(),
+            key: ferrosa_storage::table_tombstone::table_tombstone_key()
+                .key
+                .as_bytes()
+                .to_vec(),
+            mutation: b"marker-bytes".to_vec(),
+        }
+    }
+
+    fn snapshot() -> ferrosa_common::accord::Timestamp {
+        ferrosa_common::accord::Timestamp {
+            epoch: 0,
+            time: 1,
+            seq: 0,
+            node: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn table_tombstone_is_routed_to_all_serving_nodes_not_per_key_accord() {
+        // A tombstone (TRUNCATE) must NOT travel the per-key Accord path: that
+        // routes it by its token to the reserved key's RF replica set and misses
+        // the rest of the ring (a node outside the set keeps serving the truncated
+        // rows). It must go to the all-serving marker writer instead, whatever the
+        // resolver would have answered for its token.
+        let recorder = Arc::new(MarkerRecorder::ok());
+        let resolver_keys: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = resolver_keys.clone();
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, key: &[u8]| {
+            seen.lock().expect("resolver mutex").push(key.to_vec());
+            // An RF-subset that does NOT include every node.
+            Some(vec![Uuid::from_u128(0xAA)])
+        });
+        let committer = AccordTransactionCommitter::new(
+            7u64,
+            Arc::new(HybridLogicalClock::new(7, 0)),
+            Arc::new(NoPeersTransport),
+            Arc::new(RecordingApplier::new()),
+            resolve,
+        )
+        .with_marker_writer(recorder.clone());
+
+        // Only the tombstone is in the write-set; the barrier keys still drive
+        // Accord and (with no peers) fail, but the tombstone fan-out has already
+        // run. The assertion is on the ROUTING, which is decided before Accord.
+        let _ = committer
+            .commit_postgres("ks", vec![tombstone_write()], vec![], snapshot())
+            .await;
+
+        assert_eq!(
+            recorder.seen(),
+            vec![b"marker-bytes".to_vec()],
+            "the tombstone must be replicated to every serving node"
+        );
+        let keys = resolver_keys.lock().expect("resolver mutex").clone();
+        assert!(
+            !keys.contains(&tombstone_write().key),
+            "the tombstone must NOT be routed by its token to the per-key RF replica set"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_tombstone_commit_fails_loud_when_a_serving_node_does_not_acknowledge() {
+        // An unacknowledged replica must REFUSE the truncate loudly — never a
+        // silent degrade to quorum. An unconfirmed truncate is a lie.
+        let recorder = Arc::new(MarkerRecorder::failing("node C did not acknowledge"));
+        let resolve: ReplicaResolver =
+            Arc::new(|_ks: &str, _key: &[u8]| Some(vec![Uuid::from_u128(0xAA)]));
+        let committer = AccordTransactionCommitter::new(
+            7u64,
+            Arc::new(HybridLogicalClock::new(7, 0)),
+            Arc::new(NoPeersTransport),
+            Arc::new(RecordingApplier::new()),
+            resolve,
+        )
+        .with_marker_writer(recorder);
+
+        let err = committer
+            .commit_postgres("ks", vec![tombstone_write()], vec![], snapshot())
+            .await
+            .expect_err("a truncate that not every serving node acknowledged must be refused");
+        let reason = err.reason.to_lowercase();
+        assert!(
+            reason.contains("every serving node") || reason.contains("subset"),
+            "the refusal must say the truncate did not reach every node, got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn table_tombstone_commit_refuses_without_an_all_serving_writer() {
+        // No all-serving writer wired: refuse the tombstone commit loudly rather
+        // than let it fall through to per-key Accord (the RF-subset scope hole).
+        let committer = committer_with(Uuid::from_u128(0xAA), Arc::new(RecordingApplier::new()));
+
+        let err = committer
+            .commit_postgres("ks", vec![tombstone_write()], vec![], snapshot())
+            .await
+            .expect_err("a tombstone with no all-serving writer must be refused");
+        assert!(
+            err.reason.to_lowercase().contains("all-serving"),
+            "got: {}",
+            err.reason
+        );
     }
 }

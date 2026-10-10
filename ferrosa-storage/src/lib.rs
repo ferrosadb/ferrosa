@@ -63,6 +63,7 @@ mod static_column_flush_tests;
 pub mod store;
 pub mod subscription_observer;
 pub mod table_drops;
+pub mod table_tombstone;
 #[cfg(feature = "test-generators")]
 pub mod test_support;
 pub mod timeseries;
