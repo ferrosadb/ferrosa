@@ -5037,7 +5037,10 @@ impl StorageEngine {
             if tables.contains_key(&table_id) {
                 drop(tables);
                 if !pending_sweep {
-                    self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
+                    self.merge_index_declarations_for_registered_table(
+                        &table_id,
+                        &indexed_columns,
+                    )?;
                     self.replay_deferred_mutations_for_table(&table_id);
                     return Ok(());
                 }
