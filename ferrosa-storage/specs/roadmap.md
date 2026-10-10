@@ -103,11 +103,39 @@ open work lives in specs and the items below.
   HVQ contract); current vector sidecars are whole-blob.
 - **Grace-period GC + orphan sweep.** Confirm superseded-SSTable deletion grace
   and a periodic sweep of unreferenced S3 objects are bounded and observable.
-- **Index reload read-cap pagination (t_1ec2e3fc).** `reload_indexes_from_system_schema`
-  and `read_persisted_indexes` cap the `system_schema.indexes` scan at 10k rows
-  and warn on truncation. The DROP TABLE cascade (t_ae06e925, landed) stops the
-  table growing with orphans, but a legitimately huge index population still
-  needs pagination instead of a cap.
+- **No hard data caps (bound census).** The bound policy is: only streaming
+  buffers (externalized tunable size, overflow SPILLS to disk) and
+  concurrency/retry/timeout/backoff/log-rotation/backpressure bounds are
+  allowed; any bound that REFUSES or silently truncates DATA is a bug. The
+  `MAX_ENTRY_SIZE`/`OversizedEntryError` refusal, `framed_log`'s 64 MiB
+  `MAX_RECORD_LEN`, `replay_set_aside`'s 256 MiB `MAX_FRAME_BYTES`, and CDC's
+  single-event-over-byte-budget refusal are already removed (see the crate
+  README "Bound policy" census). Still to convert — each needs a
+  streaming/spill replacement, so removing the bound alone would allow
+  unbounded materialization:
+  - **Range read materialization cap (10k).** `read_range` refuses a limit
+    above `RANGE_READ_MATERIALIZATION_CAP`; re-point the materializing path at
+    the existing streaming twin `range_iter`.
+  - **Index result cap (10k).** Partition-scoped and geo index consults refuse
+    above `INDEX_RESULT_CAP`; stream/spill the postings (as
+    `read_by_index_each` already does) instead of erroring.
+  - **`system_schema` read caps (10k).** `reload_indexes_from_system_schema`
+    and `read_persisted_indexes` cap the `system_schema.indexes` scan at 10k
+    rows and warn on truncation (t_1ec2e3fc); `MAX_INDEXES_TO_READ`,
+    `MAX_TYPES_TO_READ` and `MAX_FUNCTIONS_TO_READ` silently truncate the same
+    way. A legitimately huge schema population needs pagination instead of a
+    cap. The DROP TABLE cascade (t_ae06e925, landed) stops the table growing
+    with orphans.
+  - **Schema-snapshot size bound.** `schema_snapshot.rs` refuses to persist or
+    load a registry document above `DEFAULT_MAX_BYTES`; externalize the bound
+    and stream the document.
+  - **Eviction-audit per-record cap.** `eviction_audit.rs` refuses a single
+    audit record above `MAX_RECORD_BYTES`, losing that pass; the ring already
+    bounds the total, so drop the per-record cap.
+  - **RRD ring memory budget.** `timeseries/aggregator.rs` SKIPS a rollup ring
+    when the budget is exhausted; spill rollups to disk instead of skipping.
+  - **u32 staging bounds.** `write_set_spill.rs` and `external_sort.rs` refuse
+    a single payload above 4 GiB; the spill format needs a `u64` length prefix.
 
 ## Recently landed
 
