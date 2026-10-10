@@ -882,7 +882,6 @@ pub async fn execute_query(
         mvcc: None,
         snapshot: None,
         ddl: None,
-        truncate: None,
         jsonb_limits,
     };
     execute_query_with_mvcc(env, sql, txn).await
@@ -985,9 +984,6 @@ pub(crate) struct ReadEnv<'a> {
     pub(crate) mvcc: Option<&'a MvccManager>,
     pub(crate) snapshot: Option<&'a MvccSnapshot>,
     pub(crate) ddl: Option<&'a dyn crate::ddl::DdlExecutor>,
-    /// Replicated write path for `TRUNCATE`; `None` refuses the statement with
-    /// `0A000` rather than truncating only this node's replica.
-    pub(crate) truncate: Option<&'a dyn crate::truncate::TruncateExecutor>,
     /// Tunable jsonb ingest limits (D14b), for text coerced into jsonb columns.
     pub(crate) jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
@@ -1102,7 +1098,6 @@ async fn execute_statement(
         default_schema,
         mvcc,
         ddl,
-        truncate,
         jsonb_limits,
         ..
     } = env;
@@ -1185,18 +1180,20 @@ async fn execute_statement(
             )
             .await
         }
-        // TRUNCATE [TABLE] t [, ...]: rows are removed through the **replicated**
-        // cluster write path (the same one CQL `TRUNCATE` uses), never a node-local
-        // truncate — which would empty one replica and leave the others holding the
-        // old data. Refused `0A000` when this front-end has no write path and
-        // `25001` inside a transaction block (it cannot be rolled back).
+        // TRUNCATE [TABLE] t [, ...]: a normal replicated WRITE of a table-level
+        // tombstone (ferrosa_storage::table_tombstone), through the SAME seam as an
+        // INSERT/UPDATE/DELETE. That makes the statement transactional — it buffers
+        // in `txn`, applies atomically on COMMIT, and is discarded by ROLLBACK — and
+        // it replicates through the ordinary write path, so the node-local
+        // `StorageEngine::truncate` (which would empty one replica) is never used.
         Statement::Truncate(table_list) => {
-            crate::truncate::execute_truncate(
-                crate::truncate::TruncateEnv {
-                    executor: truncate,
+            execute_truncate(
+                TruncateContext {
+                    engine,
                     schema,
                     default_schema,
-                    in_txn: txn.is_some(),
+                    mvcc,
+                    txn,
                 },
                 &table_list,
             )
@@ -1320,22 +1317,40 @@ async fn apply_or_buffer(
     mutation: Mutation,
     ok_tag: &str,
 ) -> Vec<BackendMessage> {
+    match apply_or_buffer_silent(engine, schema, mvcc, txn, mutation).await {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: ok_tag.to_string(),
+        }],
+        Err(messages) => messages,
+    }
+}
+
+/// The write half of [`apply_or_buffer`]: buffer the mutation in the open
+/// transaction, or apply it immediately (autocommit). Returns `Ok(())` on
+/// success and the error response(s) to send on failure — no `CommandComplete`,
+/// so a caller that writes several mutations for ONE statement (TRUNCATE of a
+/// table list) can emit a single tag.
+async fn apply_or_buffer_silent(
+    engine: &StorageEngine,
+    schema: &Schema,
+    mvcc: Option<&MvccManager>,
+    txn: Option<&mut Vec<PgWrite>>,
+    mutation: Mutation,
+) -> Result<(), Vec<BackendMessage>> {
     let max_txn_writes = mvcc.map_or(DEFAULT_MAX_TXN_WRITES, MvccManager::max_txn_writes);
     match txn {
         Some(buffer) => {
             if buffer.len() >= max_txn_writes {
-                return vec![error_response(
+                return Err(vec![error_response(
                     "53400",
                     &format!(
                         "transaction write-set exceeds the {max_txn_writes}-write limit; \
                          ROLLBACK required"
                     ),
-                )];
+                )]);
             }
             buffer.push(PgWrite(mutation));
-            vec![BackendMessage::CommandComplete {
-                tag: ok_tag.to_string(),
-            }]
+            Ok(())
         }
         None => match mvcc {
             Some(mvcc) => {
@@ -1348,30 +1363,117 @@ async fn apply_or_buffer(
                     &std::collections::HashSet::new(),
                     vec![mutation],
                 ) {
-                    Ok(_) => vec![BackendMessage::CommandComplete {
-                        tag: ok_tag.to_string(),
-                    }],
-                    Err(MvccCommitError::SerializationFailure) => vec![error_response(
+                    Ok(_) => Ok(()),
+                    Err(MvccCommitError::SerializationFailure) => Err(vec![error_response(
                         "40001",
                         "could not serialize PostgreSQL transaction",
-                    )],
+                    )]),
                     // Now that `Storage` carries the typed error, a commit
                     // refused for backpressure answers 53000 like the direct
                     // write path, instead of collapsing into 58000.
-                    Err(MvccCommitError::Storage(error)) => vec![write_error_response(&error)],
-                    Err(error) => {
-                        vec![error_response("58000", &format!("write failed: {error:?}"))]
-                    }
+                    Err(MvccCommitError::Storage(error)) => Err(vec![write_error_response(&error)]),
+                    Err(error) => Err(vec![error_response(
+                        "58000",
+                        &format!("write failed: {error:?}"),
+                    )]),
                 }
             }
             None => match engine.write_atomic_batch(vec![mutation]) {
-                Ok(()) => vec![BackendMessage::CommandComplete {
-                    tag: ok_tag.to_string(),
-                }],
-                Err(e) => vec![write_error_response(&e)],
+                Ok(()) => Ok(()),
+                Err(e) => Err(vec![write_error_response(&e)]),
             },
         },
     }
+}
+
+/// What a `TRUNCATE` runs against: the same storage engine, schema registry and
+/// transaction write-set an `INSERT`/`UPDATE`/`DELETE` runs against. TRUNCATE is a
+/// write now, so it shares the write seam and inherits its transactionality.
+pub(crate) struct TruncateContext<'a> {
+    pub(crate) engine: &'a StorageEngine,
+    pub(crate) schema: &'a Schema,
+    pub(crate) default_schema: &'a str,
+    pub(crate) mvcc: Option<&'a MvccManager>,
+    pub(crate) txn: Option<&'a mut Vec<PgWrite>>,
+}
+
+/// Execute `TRUNCATE [TABLE] a [, b, ...]`.
+///
+/// Each named table is resolved in its schema (defaulting to `env.default_schema`)
+/// and truncated by writing a **table-level tombstone** — one reserved-partition
+/// [`Mutation`] carrying [`ferrosa_storage::table_tombstone::table_tombstone_row`] —
+/// through [`apply_or_buffer_silent`], the SAME seam every DML write uses. The
+/// tombstone is a normal replicated write, so:
+///
+/// - inside a transaction it buffers and is discarded by `ROLLBACK` (no `25001`);
+/// - in autocommit it applies at once and, in cluster mode, replicates through the
+///   ordinary write path — never the node-local `StorageEngine::truncate`.
+///
+/// In cluster mode the tombstone's commit is replicated to **every node that can
+/// serve the table** at `ConsistencyLevel::All` (`AccordTransactionCommitter`),
+/// so a node outside the reserved key's RF replica set still learns of the
+/// truncate. That is the difference between a working `TRUNCATE` and a silent
+/// resurrection of the rows on the nodes the key's RF set misses.
+///
+/// Every named table's existence is checked BEFORE any write so a refused statement
+/// changes nothing (`42P01`). Reply is one `TRUNCATE TABLE` command tag.
+pub(crate) async fn execute_truncate(
+    context: TruncateContext<'_>,
+    stmt: &ferrosa_sql::TruncateStatement,
+) -> Vec<BackendMessage> {
+    let TruncateContext {
+        engine,
+        schema,
+        default_schema,
+        mvcc,
+        mut txn,
+    } = context;
+
+    // Resolve and validate every name first: a missing table must not truncate the
+    // tables named before it, so a refused TRUNCATE writes nothing at all.
+    let mut resolved: Vec<(String, String)> = Vec::with_capacity(stmt.tables.len());
+    for target in &stmt.tables {
+        let keyspace = target.schema.as_deref().unwrap_or(default_schema);
+        if !schema
+            .snapshot()
+            .tables
+            .contains_key(&(keyspace.to_string(), target.table.clone()))
+        {
+            return vec![error_response(
+                "42P01",
+                &format!("relation \"{}\" does not exist", target.table),
+            )];
+        }
+        resolved.push((keyspace.to_string(), target.table.clone()));
+    }
+
+    for (keyspace, table) in resolved {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| (d.as_micros() as i64, d.as_secs() as u32))
+            .unwrap_or((0, 0));
+        let (marked_for_delete_at, local_deletion_time) = now;
+        let marker = ferrosa_storage::table_tombstone::table_tombstone_row(
+            marked_for_delete_at,
+            local_deletion_time,
+        );
+        let mutation = Mutation::new(
+            keyspace,
+            table,
+            ferrosa_storage::table_tombstone::table_tombstone_key(),
+            vec![marker],
+            marked_for_delete_at,
+        );
+        if let Err(messages) =
+            apply_or_buffer_silent(engine, schema, mvcc, txn.as_deref_mut(), mutation).await
+        {
+            return messages;
+        }
+    }
+
+    vec![BackendMessage::CommandComplete {
+        tag: "TRUNCATE TABLE".to_string(),
+    }]
 }
 
 /// Apply a PostgreSQL write batch atomically and publish row versions only after
@@ -5254,7 +5356,6 @@ mod txn_buffer_tests {
                 mvcc: Some(&mvcc),
                 snapshot: None,
                 ddl: None,
-                truncate: None,
                 jsonb_limits: &limits,
             };
             // txn = None: autocommit, but through the MVCC commit path.
@@ -5300,7 +5401,6 @@ mod txn_buffer_tests {
             mvcc: Some(&mvcc),
             snapshot: None,
             ddl: None,
-            truncate: None,
             jsonb_limits: &limits,
         };
         let msgs = execute_query_with_mvcc(

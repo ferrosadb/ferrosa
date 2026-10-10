@@ -87,6 +87,6 @@ pub use recovery::{
 pub use reorder_buffer::ReorderBuffer;
 pub use state_machine::{AccordStateMachine, SmResponse};
 pub use test_cluster::{TestCluster, TestMessage, TestMessagePayload, TestReplica};
-pub use transaction_commit::{AccordTransactionCommitter, ReplicaResolver};
+pub use transaction_commit::{AccordTransactionCommitter, AllServingMarkerWriter, ReplicaResolver};
 pub use two_phase_ddl::{DdlMarker, DdlOperation, DdlPhase, TwoPhaseDdlError, TwoPhaseDdlManager};
 pub use wire::{ReadPredicate, RowRead};

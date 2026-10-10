@@ -50,12 +50,6 @@ pub struct QueryContext {
     /// front-end has no DDL authority (unit-test contexts): DDL is then refused
     /// with `0A000` rather than reported as done.
     pub ddl: Option<Arc<dyn crate::ddl::DdlExecutor>>,
-    /// Replicated write path for PostgreSQL `TRUNCATE`. `None` means the
-    /// front-end has no cluster write path (unit-test contexts): `TRUNCATE` is
-    /// then refused with `0A000` rather than reported as done with a node-local
-    /// truncate that would leave the cluster's replicas disagreeing. Populated
-    /// in production from the SAME `WritePath` the CQL router truncates through.
-    pub truncate: Option<Arc<dyn crate::truncate::TruncateExecutor>>,
     /// Tunable jsonb ingest limits (D14b), resolved once at startup by the
     /// binary from `[jsonb]` / env and passed in here. There is no default:
     /// every constructor must supply the resolved value. They gate INSERT and
@@ -564,7 +558,13 @@ async fn execute_simple_to<O: ReplySink>(
         Ok(ferrosa_sql::Statement::Select(_)
             | ferrosa_sql::Statement::Insert(_)
             | ferrosa_sql::Statement::Update(_)
-            | ferrosa_sql::Statement::Delete(_))
+            | ferrosa_sql::Statement::Delete(_)
+            // TRUNCATE is a replicated WRITE too. It MUST take this path, or an
+            // autocommit TRUNCATE would bypass Accord entirely and write to LOCAL
+            // storage only — a scope hole worse than the reserved key's RF subset.
+            // Wrapping it in an implicit transaction routes the tombstone through
+            // the cluster commit (and, there, to every serving node at CL=ALL).
+            | ferrosa_sql::Statement::Truncate(_))
     );
     if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
         return execute_simple_inner(ctx, session, sql, out).await;
@@ -726,7 +726,6 @@ fn read_env<'a>(
         mvcc: Some(&ctx.mvcc),
         snapshot: Some(snapshot),
         ddl: ctx.ddl.as_deref(),
-        truncate: ctx.truncate.as_deref(),
         jsonb_limits: &ctx.jsonb_limits,
     }
 }
@@ -1914,7 +1913,6 @@ pub(crate) mod txn_atomicity_tests {
             mvcc: Arc::new(MvccManager::default()),
             accord: AccordAccess::disabled(),
             ddl: None,
-            truncate: None,
             jsonb_limits: crate::jsonb_wire::test_limits(),
             portals: Default::default(),
         }
@@ -1967,24 +1965,6 @@ pub(crate) mod txn_atomicity_tests {
             .count()
     }
 
-    /// A `TruncateExecutor` that records every call, so a test can assert the
-    /// REPLICATED path was taken — and that the local engine was left untouched.
-    #[derive(Default)]
-    struct RecordingTruncate {
-        calls: std::sync::Mutex<Vec<(String, String)>>,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::truncate::TruncateExecutor for RecordingTruncate {
-        async fn truncate(&self, keyspace: &str, table: &str) -> Result<(), String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push((keyspace.to_string(), table.to_string()));
-            Ok(())
-        }
-    }
-
     /// The SQLSTATE of the sole `ErrorResponse` in a reply, if any.
     fn error_sqlstate(messages: &[BackendMessage]) -> Option<String> {
         messages.iter().find_map(|m| match m {
@@ -2003,12 +1983,13 @@ pub(crate) mod txn_atomicity_tests {
         })
     }
 
-    /// `TRUNCATE` must go through the REPLICATED write path, never the local
-    /// `StorageEngine::truncate`. The injected executor records the call without
-    /// touching local storage, so a still-present row proves no local truncate ran.
+    /// `TRUNCATE` is a normal replicated WRITE of a table-level tombstone: the
+    /// row disappears immediately, and the mechanism is a tombstone written into
+    /// the table's own store — NOT a node-local `StorageEngine::truncate`, which
+    /// would leave no marker (and would empty only this replica).
     #[tokio::test]
-    async fn truncate_routes_through_the_replicated_path_not_a_local_truncate() {
-        let (_dir, mut ctx) = make_ctx().await;
+    async fn truncate_writes_a_table_tombstone_not_a_local_truncate() {
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
         execute_simple(
             &ctx,
@@ -2018,27 +1999,64 @@ pub(crate) mod txn_atomicity_tests {
         .await;
         assert_eq!(row_count(&ctx, "k1").await, 1);
 
-        let recorder = Arc::new(RecordingTruncate::default());
-        ctx.truncate = Some(recorder.clone());
-
         let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
         assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
-        assert_eq!(
-            recorder.calls.lock().unwrap().clone(),
-            vec![("public".to_string(), "kv".to_string())]
+        // Logically immediate: the row is gone at once.
+        assert_eq!(row_count(&ctx, "k1").await, 0);
+
+        // The mechanism is a write: the reserved table-tombstone partition is
+        // present in the table's store with a non-LIVE deletion. A node-local
+        // `StorageEngine::truncate` empties the store and would leave no marker.
+        let table_id = ferrosa_storage::TableId::new("public", "kv");
+        let marker = ctx
+            .engine
+            .read_limited_rows(
+                &table_id,
+                &ferrosa_storage::table_tombstone::table_tombstone_key(),
+                0,
+            )
+            .expect("read the tombstone partition")
+            .expect("the table tombstone must have been written");
+        assert!(
+            !marker.deletion.is_live(),
+            "TRUNCATE must write a table tombstone, not empty a replica"
         );
-        assert_eq!(
-            row_count(&ctx, "k1").await,
-            1,
-            "a local StorageEngine::truncate would have emptied this node's replica"
-        );
+
+        // A stale copy of the pre-truncate row, re-inserted at its ORIGINAL older
+        // timestamp (what a repair from a stale replica would do), stays invisible.
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        // The re-insert is newer than the tombstone, so it is NOT the stale-copy
+        // case; the storage-level no-resurrection test covers the older copy. Here
+        // we only pin that the newly written row is visible (property 4).
+        assert_eq!(row_count(&ctx, "k1").await, 1);
     }
 
-    /// With no replicated write path the statement is refused `0A000`, and the
-    /// local replica is untouched — a local truncate is never a fallback.
+    /// A table that does not exist is `42P01`, and the truncate applies nothing.
     #[tokio::test]
-    async fn truncate_without_a_replicated_path_is_refused_0a000() {
-        let (_dir, ctx) = make_ctx().await; // ddl: None, truncate: None
+    async fn truncate_of_a_missing_table_is_refused_42p01() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE nope").await;
+        assert_eq!(error_sqlstate(&messages).as_deref(), Some("42P01"));
+    }
+
+    /// In CLUSTER mode an autocommit `TRUNCATE` must be routed through the cluster
+    /// commit path — NOT applied to local storage directly.
+    ///
+    /// `TRUNCATE` is a replicated write; if it were omitted from the "data
+    /// statement" set it would never enter the implicit-transaction/Accord path
+    /// and the marker would be written locally only, so no cluster replication (and
+    /// no `ConsistencyLevel::All` commit) could ever govern it. This pins the
+    /// routing by asserting the tombstone reaches the committer, and that the
+    /// front-end did not write the marker to its own storage.
+    #[tokio::test]
+    async fn cluster_autocommit_truncate_is_routed_through_the_cluster_not_local_only() {
+        let (_dir, mut ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
         execute_simple(
             &ctx,
@@ -2046,22 +2064,90 @@ pub(crate) mod txn_atomicity_tests {
             "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
         )
         .await;
+
+        let committer =
+            std::sync::Arc::new(ferrosa_storage::accord::MockTransactionCommitter::new());
+        ctx.accord = AccordAccess::fixed(committer.clone());
+
         let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
-        assert_eq!(error_sqlstate(&messages).as_deref(), Some("0A000"));
-        assert_eq!(row_count(&ctx, "k1").await, 1, "a refusal applies nothing");
+        assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
+
+        // The tombstone reached the cluster committer: an autocommit TRUNCATE is
+        // wrapped in an implicit transaction and committed via the cluster path.
+        let tombstone_key = ferrosa_storage::table_tombstone::table_tombstone_key()
+            .key
+            .as_bytes()
+            .to_vec();
+        let routed = committer
+            .committed()
+            .iter()
+            .flatten()
+            .any(|w| w.key == tombstone_key);
+        assert!(
+            routed,
+            "an autocommit TRUNCATE on a cluster must commit through the cluster \
+             (its tombstone must reach the committer), not write local-only"
+        );
+
+        // And the front-end did NOT apply the marker to its own storage — the
+        // write is the cluster's to replicate and apply.
+        let table_id = ferrosa_storage::TableId::new("public", "kv");
+        let local_marker = ctx
+            .engine
+            .read_limited_rows(
+                &table_id,
+                &ferrosa_storage::table_tombstone::table_tombstone_key(),
+                0,
+            )
+            .expect("read the tombstone partition");
+        assert!(
+            local_marker.is_none(),
+            "with a committer present the front-end must not apply the truncate \
+             marker locally; that would bypass cluster replication"
+        );
     }
 
-    /// `TRUNCATE` inside a transaction block is `25001`: ferrosa applies it
-    /// immediately and cannot roll it back.
+    /// TRUNCATE is transactional: inside a transaction it is accepted (no `25001`),
+    /// applies on COMMIT, and is discarded by ROLLBACK.
     #[tokio::test]
-    async fn truncate_inside_a_transaction_block_is_refused() {
-        let (_dir, mut ctx) = make_ctx().await;
-        ctx.truncate = Some(Arc::new(RecordingTruncate::default()));
+    async fn truncate_applies_on_commit_and_is_discarded_by_rollback() {
+        let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+
+        // Inside a transaction TRUNCATE is accepted.
         execute_simple(&ctx, &mut session, "BEGIN").await;
         let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
-        assert_eq!(error_sqlstate(&messages).as_deref(), Some("25001"));
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "TRUNCATE must be accepted inside a transaction now: {messages:?}"
+        );
+        // Buffered, not applied yet.
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+        // ROLLBACK discards it.
         execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            1,
+            "ROLLBACK must discard the buffered truncate"
+        );
+
+        // COMMIT applies it.
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            0,
+            "COMMIT must apply the buffered truncate"
+        );
     }
 
     /// VACUUM / VACUUM FULL / VACUUM ANALYZE are accepted and answered with the tag a client

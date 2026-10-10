@@ -452,6 +452,21 @@ early acknowledgement.
   `handlers::publish_accord_state` fills the slot at cluster formation with the
   SAME `AccordState` the node's `AccordHandler` serves, so the coordinator's
   self-vote and its remote peers agree on dependencies.
+  **Table tombstones (`TRUNCATE`).** A `TRUNCATE` is ONE reserved-partition
+  mutation. Routing it through the per-key Accord path above would place it by
+  that key's token on the key's RF replica set — a proper subset of the ring when
+  `RF < node count` — so the nodes outside it would keep serving the truncated
+  rows. `commit_postgres` therefore splits table-tombstone writes out of the
+  Accord write-set and replicates them through the `AllServingMarkerWriter` seam
+  (`WritePathAllServingMarkerWriter` over the live `WritePath` in production),
+  which fans the marker to **every node serving the table** at
+  `ConsistencyLevel::All`: `ClusterCoordinator::coordinate_all_serving_write` uses
+  the whole ring as the target set (`WritePath::all_serving_host_ids`) and requires
+  **every** target to acknowledge — no quorum shortcut, no hint fallback, because
+  `CL=ALL` alone only filters the replica slice it is handed (that one key's RF
+  set). An unwired writer, or any node that does not ack, **refuses the commit
+  loudly** — an unconfirmed truncate would resurrect the rows on the node that
+  missed it.
 - `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam) +
   `EngineStorageApplier`/`EngineStorageReader` (real persistence and linearizable
   read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`

@@ -143,7 +143,6 @@ async fn start_with(with_public: bool) -> Fixture {
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
         ddl: Some(Arc::new(ClusterDdl::new(path))),
-        truncate: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Default::default(),
     });
@@ -415,6 +414,15 @@ async fn pg_ddl_create_table_jsonb_primary_key_is_invalid_table_definition() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
     let fx = start().await;
+    // A PK-less `CREATE TABLE` is *accepted*, not refused: `ddl::plan_create_table`
+    // gives it a synthetic `_sys_ck_` partition key (the "PK-less CREATE TABLE end to
+    // end" item in the roadmap). It is exercised here as an accepted statement so a
+    // future regression to "refused" is caught, and it is deliberately NOT in the
+    // named-refusal list below.
+    fx.client
+        .batch_execute("CREATE TABLE pk_less (id int, v int)")
+        .await
+        .expect("a PK-less CREATE TABLE is accepted with a synthetic key");
     let cases = [
         // (sql, expected sqlstate)
         ("CREATE TABLE t (id int PRIMARY KEY, v int UNIQUE)", "0A000"),

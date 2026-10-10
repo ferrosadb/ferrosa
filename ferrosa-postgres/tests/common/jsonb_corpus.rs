@@ -227,7 +227,6 @@ pub async fn start_ferrosa_pg() -> FerrosaPg {
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
         ddl: Some(Arc::new(ClusterDdl::new(path))),
-        truncate: None,
         jsonb_limits,
         portals: Default::default(),
     });

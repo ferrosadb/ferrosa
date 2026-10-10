@@ -13387,7 +13387,19 @@ impl StorageEngine {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs() as i64);
-        Some(purge::policy_for(now, gc_grace, guard))
+        let table_delete = match state.store.table_tombstone() {
+            Ok(deletion) => deletion,
+            Err(reason) => {
+                crate::metrics::inc_compaction_purge_policy_errors();
+                tracing::error!(
+                    %table_id,
+                    %reason,
+                    "compaction: unreadable table tombstone; not purging or reclaiming"
+                );
+                return None;
+            }
+        };
+        Some(purge::policy_for(now, gc_grace, guard, table_delete))
     }
 
     /// Collects SSTable metadata for compaction strategy evaluation.

@@ -259,10 +259,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   resurrect older data. `CompactionTask::purge` carries the policy, computed by
   `StorageEngine::purge_policy_for` at submission; a schema with no `gc_grace_seconds`
   means no purge. Kill switch: `FERROSA_COMPACTION_PURGE_TOMBSTONES=0`. A pathless
-  collection tombstone is kept while element cells it shadows remain. If every
-  partition purges away, one is written unpurged (an empty output cannot be swapped
-  in) and counted. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
-  `..._purge_held_back_total`, `..._purge_policy_errors_total`.
+  collection tombstone is kept while element cells it shadows remain. **The
+  reserved table-tombstone key is EXEMPT from purge** (see
+ [Table tombstones](#table-tombstones-whole-table-truncate)): its marker is
+ retained until the table itself is dropped, so a stale replica's pre-truncate
+ copy can never be resurrected. If every
+ partition purges away, one is written unpurged (an empty output cannot be swapped
+ in) and counted. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
+ `..._purge_held_back_total`, `..._purge_policy_errors_total`.
   **Flush fix:** a partition holding only a partition-level delete (no rows, no static
   row) is now flushed; it used to be dropped as empty, losing the delete.
   Existing backlogs drain without waiting for another flush: every maintenance
@@ -918,6 +922,52 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   therefore holds no thread. A run told to yield its slot at a budget
   boundary returns the same way and is re-admitted by the supervisor; no
   producer waits on its thread for anything.
+
+## Table tombstones — whole-table TRUNCATE
+
+A **table tombstone** (`src/table_tombstone.rs`) is a whole-table deletion
+watermark stored as an **ordinary row in the table's own LSM**: one reserved
+partition (`table_tombstone_key()`, magic `\x00ferrosa/table-tombstone/v1`) whose
+`deletion` is the truncate's `DeletionTime`, written through the same write seam
+as any DML. Nothing about the write path knows it means "whole table" — it is the
+exact partition-tombstone shape `DELETE FROM t WHERE pk = ?` produces, lifted by
+the memtable into `Partition::deletion`. The only new thing is **scope**: the
+per-partition predicate is applied *table-wide*.
+
+- **Read scope.** Every read path folds the reserved partition's watermark into
+  the partition it is reading, via `merge::apply_table_deletion` — the SAME
+  predicate and timestamp ordering as a per-partition tombstone, at table scope.
+  A row written at or after `marked_for_delete_at` survives (a later `INSERT`
+  keeps its data); an older row is suppressed immediately.
+- **Reclamation.** `merge::reclaim_covers_table` drops the covered rows and static
+  cells at the next compaction (dropping them is what reclaims the bytes).
+  Reclamation is therefore **lazy** — it happens at compaction, not at the write.
+- **Logically immediate, physically lazy — deliberately.** A committed table
+  tombstone makes reads return no rows at once, but reclaims bytes only later.
+  `VACUUM` (flush + submit compaction) is what forces reclamation promptly, and
+  `TRUNCATE` followed by `VACUUM` is strictly equivalent in effect to an immediate
+  truncate. That split is deliberate for client compatibility; making reclamation
+  synchronous at `TRUNCATE` would be a purposeful, separate change.
+- **Lifetime rule (no resurrection).** The reserved marker may only be dropped
+  once *every replica* has purged every row it covers. ferrosa does not yet track a
+  per-replica purge watermark, so the marker is **never purged by compaction**: it
+  is exempted in `compaction::purge` and retained until the table itself is
+  dropped. Retaining it is the conservative side of the rule — dropping it while a
+  stale replica still held older rows would be the silent resurrection this exists
+  to prevent. `a_stale_older_copy_cannot_resurrect_a_truncated_row` pins it.
+- **Cluster replication: the whole ring, at `CL=ALL`.** The tombstone is a *single*
+  reserved partition key, so the ordinary write path would route it only to that
+  key's RF replica set — a proper subset of the ring whenever `RF < node count`.
+  The nodes outside it would never learn of the truncate and would keep serving the
+  truncated rows. So the marker is replicated to **every node serving the table** at
+  `ConsistencyLevel::All`; `CL=ALL` alone is not enough (it only filters the replica
+  slice it is handed, i.e. that one key's RF set), so the target set is the **whole
+  ring** and **every** target must acknowledge — the write **fails loud** if any
+  does not. See `ferrosa-cluster`'s `WritePath::write_all_serving_nodes` and the
+  `ferrosa-postgres` README.
+- **Reserved-key collision.** The magic is long and namespaced (`\x00ferrosa/…`);
+  a user partition key encoding to exactly those bytes would be shadowed. The
+  accident is astronomically unlikely and documented rather than silently assumed.
 
 ## Legacy nanosecond timestamps (t_cf637b6e)
 

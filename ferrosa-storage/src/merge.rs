@@ -13,7 +13,7 @@
 //! - **Row-level deletion:** When merging two versions of the same row, the
 //!   newer deletion timestamp wins.
 
-use ferrosa_sstable::types::{Partition, Row};
+use ferrosa_sstable::types::{DeletionTime, Partition, Row};
 
 /// Merge multiple partitions (from different SSTables/memtable) into one.
 ///
@@ -250,6 +250,54 @@ pub(crate) fn apply_deletions(partition: &mut Partition) {
             let row_delete_at = row.deletion.marked_for_delete_at;
             row.cells
                 .retain(|(_col, cell)| cell.timestamp >= row_delete_at);
+        }
+    }
+}
+
+/// Apply a **table-level** tombstone to `partition`: if `table_delete` is newer
+/// than the partition's own deletion, adopt it as the effective partition deletion,
+/// then apply deletion suppression.
+///
+/// This is the table-scope twin of `apply_deletions`, and it ALWAYS applies
+/// suppression (as the read paths did before this existed): when there is no table
+/// tombstone it degrades exactly to `apply_deletions`. A TRUNCATE is stored as one
+/// reserved partition whose `deletion` is the table tombstone; every read path folds
+/// that watermark into the partition it is reading here, so rows older than the
+/// truncate are suppressed table-wide with the SAME predicate and timestamp ordering
+/// the per-partition case uses. Rows written at or after
+/// `table_delete.marked_for_delete_at` survive (a later `INSERT` keeps its data).
+pub fn apply_table_deletion(partition: &mut Partition, table_delete: DeletionTime) {
+    if !table_delete.is_live()
+        && table_delete.marked_for_delete_at > partition.deletion.marked_for_delete_at
+    {
+        partition.deletion = table_delete;
+    }
+    apply_deletions(partition);
+}
+
+/// Physically drop the rows and static cells a table tombstone covers, WITHOUT
+/// adopting the tombstone as the partition's own deletion.
+///
+/// Compaction's reclamation of a truncated table's data. Reads already suppress
+/// these rows immediately ([`apply_table_deletion`]); dropping them here is what
+/// reclaims the space at the next compaction. A row written at or after the
+/// truncate (`primary_key_liveness.timestamp >= table_delete.marked_for_delete_at`)
+/// survives — the same predicate `apply_deletions` uses for a partition tombstone,
+/// at table scope.
+pub fn reclaim_covers_table(partition: &mut Partition, table_delete: DeletionTime) {
+    if table_delete.is_live() {
+        return;
+    }
+    let cut = table_delete.marked_for_delete_at;
+    partition
+        .rows
+        .retain(|row| row.primary_key_liveness.timestamp >= cut);
+    if let Some(static_row) = &mut partition.static_row {
+        static_row
+            .cells
+            .retain(|(_col, cell)| cell.timestamp >= cut);
+        if static_row.cells.is_empty() {
+            partition.static_row = None;
         }
     }
 }

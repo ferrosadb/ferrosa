@@ -233,7 +233,6 @@ pub async fn start_server_with(rows: usize, limits: ferrosa_postgres::PortalLimi
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::disabled(),
         ddl: None,
-        truncate: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Arc::clone(&portals),
     });

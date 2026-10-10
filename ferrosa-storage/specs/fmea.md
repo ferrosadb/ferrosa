@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: fmea
-last_updated: 2026-10-07 (ST-87)
+last_updated: 2026-10-09 (ST-81)
 ---
 
 # ferrosa-storage — FMEA / Known Issues
@@ -172,3 +172,4 @@ unselected tasks, repeated requests and empty registries.
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
 | ST-T150-01 | jsonb payload accounted as 0 bytes in the external sorter | Spill threshold never trips; OOM | 8 | 2 | 2 | 32 | `cql_value_payload_bytes` returns `as_bytes().len()`. Test: `jsonb_payload_counts_its_cell_bytes`. |
+| ST-81 | **A committed table tombstone (`TRUNCATE`) is dropped, or does not reach every node, so truncated rows are served again** — the marker is ONE reserved partition, so purge could reclaim it, or a cluster write path could route it by its token to only that key's RF replica set | Deleted whole-table data reappears (resurrection) on a node that missed the truncate, or after the marker is purged | 10 | 3 | 4 | 120 → 12 | **Mitigated:** reads suppress the covered rows immediately, table-wide, by folding the marker's `DeletionTime` into every partition read (`merge::apply_table_deletion`); reclamation of the bytes is lazy (`merge::reclaim_covers_table`, at the next compaction). The marker is **EXEMPT from purge** (`compaction::purge` skips `is_table_tombstone_key`) and retained until the table itself is dropped — the lifetime rule, *no resurrection*. In cluster mode the marker's commit is replicated to every node serving the table at `ConsistencyLevel::All` with the WHOLE RING as the target set (`ferrosa-cluster`'s `coordinate_all_serving_write`), failing loud if any node does not ack. Tests: `a_stale_older_copy_cannot_resurrect_a_truncated_row`, `table_tombstone_hides_rows_written_before_it_immediately`, `a_row_written_after_the_table_tombstone_survives`, `table_tombstone_hides_rows_from_scans_and_counts`. **Residual:** reclamation is not synchronous at `TRUNCATE` (next compaction, or `VACUUM`); a user partition key encoding to exactly the reserved magic bytes would be shadowed by the marker. |
