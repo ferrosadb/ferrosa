@@ -35,6 +35,7 @@ pub mod scram;
 pub mod server;
 pub mod storage_provider;
 pub mod store;
+mod txn_write_set;
 
 mod accord_access;
 
@@ -52,6 +53,7 @@ pub use mvcc::{MvccManager, PgWrite};
 pub use portal_limits::{PortalLimits, SuspendedPortals};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
 pub use server::{PgTls, QueryContext};
+pub use txn_write_set::TxnWriteSet;
 
 pub use accord_access::AccordAccess;
 mod synthetic_key;

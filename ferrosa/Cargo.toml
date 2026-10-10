@@ -81,6 +81,10 @@ full = ["otel", "flight", "ferrosa-cql/asc-udf"]
 # Enables jemalloc's heap profiler with libunwind, which avoids the default
 # unwinder crash on Linux musl. Profiling remains off until MALLOC_CONF opts in.
 profiling = ["tikv-jemallocator/profiling_libunwind"]
+# Installs a counting global allocator (see `counting_alloc` in `src/main.rs`)
+# so `FERROSA_PG_COMMIT_PROFILE` can attribute a COMMIT's residency peak to the
+# phase that caused it. Diagnostic-only; a production build leaves it off.
+alloc-probe = ["ferrosa-common/alloc-probe"]
 
 # Optional OTel dependencies, gated behind the `otel` feature.
 [dependencies.tracing-opentelemetry]

@@ -2461,7 +2461,16 @@ where
 {
     let mut offsets: Vec<u64> = Vec::new();
     let mut lengths: Vec<u32> = Vec::new();
-    let mut region: Vec<u8> = Vec::new();
+    // Resolve the borrowed mutations into a slice list and the parallel
+    // `offsets`/`lengths` index in ONE pass, WITHOUT building the region yet.
+    // The region is appended to the frame exactly once, below. Building it first
+    // and then copying it into the header (the previous shape) needed a full
+    // extra copy of the peer's whole shard: a 236 MB Apply frame briefly cost
+    // ~2x its size in RSS, which the COMMIT residency probe measured as the
+    // fan-out's dominant transient at a ~1.1M-row commit. The slice list costs
+    // 16 bytes per entry and borrows the write-set — it copies nothing.
+    let mut entries: Vec<&[u8]> = Vec::new();
+    let mut region_len: usize = 0;
     for mutation in mutations {
         let len = u32::try_from(mutation.len()).map_err(|_| {
             CapnpDecodeError::InvalidRequiredField(format!(
@@ -2469,32 +2478,39 @@ where
                 mutation.len()
             ))
         })?;
-        offsets.push(region.len() as u64);
+        offsets.push(region_len as u64);
         lengths.push(len);
-        region.extend_from_slice(mutation);
+        region_len += mutation.len();
+        entries.push(mutation);
     }
-    let uncompressed_len = region.len() as u64;
+    let uncompressed_len = region_len as u64;
     // Effective block size: the configured one, or the whole region (one block) when 0.
     let effective_block = if cfg.block_bytes == 0 {
-        region.len().max(1)
+        region_len.max(1)
     } else {
         cfg.block_bytes
     };
-    let try_compress = !cfg.is_none() && !region.is_empty() && region.len() >= cfg.min_bytes;
-    let (compression, block_bytes, payload) = if try_compress {
+    let try_compress = !cfg.is_none() && region_len > 0 && region_len >= cfg.min_bytes;
+    let (compression, block_bytes, compressed) = if try_compress {
+        // A codec needs the region contiguous to block-compress it, so this path
+        // still materializes it once (compression is opt-in and off by default).
+        let mut region: Vec<u8> = Vec::with_capacity(region_len);
+        for entry in &entries {
+            region.extend_from_slice(entry);
+        }
         let compressed = compress_region(&region, cfg.codec, cfg.level, effective_block)?;
         if compressed.len() < region.len() {
             (
                 cfg.codec.tag(),
                 u32::try_from(effective_block).unwrap_or(u32::MAX),
-                compressed,
+                Some(compressed),
             )
         } else {
             // The codec did not shrink the region: never inflate a frame.
-            (RegionCodec::None.tag(), 0u32, region)
+            (RegionCodec::None.tag(), 0u32, None)
         }
     } else {
-        (RegionCodec::None.tag(), 0u32, region)
+        (RegionCodec::None.tag(), 0u32, None)
     };
     let mut header = encode_accord_envelope(&AccordControlMessage::ApplyV2Region {
         txn_id,
@@ -2504,7 +2520,18 @@ where
         uncompressed_len,
         block_bytes,
     })?;
-    header.extend_from_slice(&payload);
+    match compressed {
+        // The compressed block is already contiguous; append it once.
+        Some(compressed) => header.extend_from_slice(&compressed),
+        // Uncompressed: append the region straight from the borrowed write-set
+        // slices into the ONE frame buffer. No intermediate region `Vec`.
+        None => {
+            header.reserve(region_len);
+            for entry in &entries {
+                header.extend_from_slice(entry);
+            }
+        }
+    }
     Ok(header)
 }
 

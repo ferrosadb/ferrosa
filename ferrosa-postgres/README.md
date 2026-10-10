@@ -262,10 +262,13 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   - **Transactional.** Inside a `BEGIN` the rows BUFFER into the transaction's write-set
     (the seam `INSERT` and `TRUNCATE` share), become visible at `COMMIT` and are discarded
     by `ROLLBACK` — the old `25001` refusal is gone. Autocommit instead stages the rows and
-    applies them in bounded `FLUSH_EVERY` batches. Either way the write-set cap (`53400`)
-    is fail-loud, never a silent drop, and a COPY that fails mid-payload **aborts** the
-    transaction rather than committing a partial load. `pgbench -i`, which wraps its
-    `COPY`s in one `BEGIN`/`COMMIT`, therefore loads.
+    applies them in bounded `FLUSH_EVERY` batches. Either staging structure is a
+    threshold-bounded, spilling write-set: a write-set past
+    `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` SPILLS rather than growing front-end memory,
+    and there is deliberately **no** capacity refusal — a COPY is never declined for being
+    large (`53400`) — while a COPY that fails mid-payload **aborts** the transaction rather
+    than committing a partial load. `pgbench -i`, which wraps its `COPY`s in one
+    `BEGIN`/`COMMIT`, therefore loads.
   - **Refusals before the payload.** A missing table (`42P01`), a reserved or unknown column
     (`42P16`/`42703`) and an aborted transaction block (`25P02`) are all refused before
     `CopyInResponse`, so a client never streams a payload at a statement that cannot take
@@ -311,7 +314,9 @@ values log an error and the process uses the complete defaults:
 
 | Environment variable | Default | Bound |
 |---|---:|---|
-| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | Resident mutations buffered per transaction; fails loud `53400` past it. A stopgap on a resident buffer — **retained** until the front end streams the write-set to disk (FMEA `PG-ACC-01`) |
+| `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | `8388608` | Resident buffer a transaction's write-set may hold before it SPILLS (a streaming buffer size, never a cap) |
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | No longer a front-end refusal; is retained only as a consensus/MVCC-side sizing default; the conflict index it once sized is now unbounded |
+| `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` | derived | Keys one Accord txn may register; defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES`, floor `100000` |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |

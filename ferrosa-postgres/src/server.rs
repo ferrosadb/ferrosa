@@ -12,6 +12,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use bytes::BytesMut;
 use ferrosa_schema::Schema;
+use ferrosa_storage::write_set_stage::WriteSetSource as _;
 use ferrosa_storage::StorageEngine;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -738,7 +739,7 @@ fn read_env<'a>(
 /// The storage and limits context for one extended-protocol DML statement.
 pub(crate) fn dml_context<'a>(
     ctx: &'a QueryContext,
-    txn: Option<&'a mut Vec<crate::PgWrite>>,
+    txn: Option<&'a mut crate::TxnWriteSet>,
 ) -> query::DmlContext<'a> {
     query::DmlContext {
         engine: &ctx.engine,
@@ -755,10 +756,10 @@ pub(crate) fn dml_context<'a>(
 /// writes so the inner query sees the caller's uncommitted rows.
 fn scalar_read_ctx<'a>(
     ctx: &'a QueryContext,
-    session: &'a Session,
     snapshot: &'a crate::mvcc::MvccSnapshot,
+    pending: &'a [crate::PgWrite],
 ) -> query::ScalarReadCtx<'a> {
-    query::ScalarReadCtx::new(read_env(ctx, snapshot), Some(session.txn_writes()))
+    query::ScalarReadCtx::new(read_env(ctx, snapshot), Some(pending))
 }
 
 /// The snapshot a read runs at: the transaction's own under serializable
@@ -861,7 +862,16 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         }];
     }
 
-    let writes = session.take_txn_writes();
+    let staged = match session.take_txn_stage() {
+        Ok(staged) => staged,
+        Err(error) => {
+            session.end_txn();
+            return vec![query::error_response(
+                "58000",
+                &format!("transaction commit failed: {error}"),
+            )];
+        }
+    };
     let read_tables = session.take_txn_read_tables();
     let snapshot = session
         .txn_snapshot()
@@ -871,7 +881,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // An empty write-set (`BEGIN; COMMIT;` with no DML, or only reads) is a
     // no-op that commits cleanly — there is nothing to apply, so no atomicity to
     // honor. This is NOT a fake success: zero writes means zero state change.
-    if writes.is_empty() {
+    if staged.is_empty() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &read_tables) {
             session.end_txn();
             return match error {
@@ -930,19 +940,37 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     }
 
     let mut write_tables = read_tables;
-    let mutations: Vec<_> = writes
-        .into_iter()
-        .map(|write| {
-            write_tables.insert(format!("{}.{}", write.0.keyspace, write.0.table));
-            write.0
-        })
-        .collect();
+    // Stream the write-set once to learn the tables it touches. The set is read
+    // one mutation at a time out of the staging (resident prefix or spill), so the
+    // table set is built WITHOUT materializing the write-set.
+    if let Err(error) = staged.for_each_mutation(&mut |mutation| {
+        write_tables.insert(format!("{}.{}", mutation.keyspace, mutation.table));
+        Ok(())
+    }) {
+        session.end_txn();
+        return vec![query::error_response(
+            "58000",
+            &format!("transaction commit failed: {error}"),
+        )];
+    }
     let _commit_guard = ctx.mvcc.commit_guard().await;
     // Per-phase attribution for the COMMIT (see `MvccProfile`). Zero-valued and
     // unused unless `FERROSA_PG_COMMIT_PROFILE` is set.
     let commit_started = std::time::Instant::now();
     let mut prepare_nanos: u64 = 0;
     let mut accord_nanos: u64 = 0;
+    // Residency attribution: `FERROSA_PG_COMMIT_PROFILE=1` on an `alloc-probe`
+    // build logs the live heap at each COMMIT phase boundary, so a peak is
+    // attributed to the phase that caused it rather than guessed at.
+    let residency_profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
+        && ferrosa_common::mem_probe::installed();
+    if residency_profile {
+        tracing::info!(
+            phase = "commit_start",
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "pg commit residency"
+        );
+    }
     let outcome = if let Some(committer) = ctx.accord.committer() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
             Err(error)
@@ -955,6 +983,29 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             // the time Accord runs, instead of staying resident alongside
             // `accord_writes` for the whole PreAccept/Commit/Apply sequence.
             let prepare_started = std::time::Instant::now();
+            // The distributed commit still builds the Accord write-set as an owned
+            // vector: its `TransactionWrite` bytes ARE the apply payload the
+            // coordinator hands to Accord. Streaming that build is the named
+            // follow-up; the front-end write-set is already staged and bounded.
+            let mut mutations: Vec<ferrosa_storage::Mutation> = Vec::new();
+            if let Err(error) = staged.for_each_mutation(&mut |mutation| {
+                mutations.push(mutation.clone());
+                Ok(())
+            }) {
+                session.end_txn();
+                return vec![query::error_response(
+                    "58000",
+                    &format!("transaction commit failed: {error}"),
+                )];
+            }
+            if residency_profile {
+                tracing::info!(
+                    phase = "mutations_cloned",
+                    mutations = mutations.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
             let accord_writes =
                 match query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations) {
                     Ok(writes) => writes,
@@ -966,6 +1017,14 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                         )];
                     }
                 };
+            if residency_profile {
+                tracing::info!(
+                    phase = "accord_writes_built",
+                    writes = accord_writes.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
             prepare_nanos = u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
                 session.end_txn();
@@ -1000,6 +1059,14 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 )),
             };
             accord_nanos = u64::try_from(accord_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if residency_profile {
+                tracing::info!(
+                    phase = "after_accord",
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    peak_mib = ferrosa_common::mem_probe::peak_mib(),
+                    "pg commit residency"
+                );
+            }
             accord_result
         }
     } else {
@@ -1009,7 +1076,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             &ctx.mvcc,
             &snapshot,
             &write_tables,
-            mutations,
+            staged,
         )
     };
     session.end_txn();
@@ -1022,6 +1089,11 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         let total_ms = commit_started.elapsed().as_secs_f64() * 1_000.0;
         tracing::info!(
             total_ms,
+            // The configured front-end write cap. It is NO LONGER a refusal — a
+            // write-set past it spills instead (FMEA PG-12) — but reporting it
+            // keeps the front-end's configured admission ceiling visible next to
+            // the commit's stats.
+            front_end_write_cap = ctx.mvcc.max_txn_writes(),
             prepare_ms = prepare_nanos as f64 / 1_000_000.0,
             accord_ms = accord_nanos as f64 / 1_000_000.0,
             decoded_rows = ctx.mvcc.profile_decoded(),
@@ -1144,7 +1216,11 @@ async fn describe(
                 // so an empty ParameterDescription + columns from the scalars.
                 PreparedKind::Exprs(items) => {
                     let snapshot = read_snapshot(ctx, session);
-                    let scalar_ctx = scalar_read_ctx(ctx, session, &snapshot);
+                    let pending = match session.materialized_txn_writes() {
+                        Ok(pending) => pending,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
                     match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => vec![
                             extended::parameter_description(&[]),
@@ -1251,7 +1327,11 @@ async fn describe(
                 }
                 PreparedKind::Exprs(items) => {
                     let snapshot = read_snapshot(ctx, session);
-                    let scalar_ctx = scalar_read_ctx(ctx, session, &snapshot);
+                    let pending = match session.materialized_txn_writes() {
+                        Ok(pending) => pending,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
                     match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => {
                             vec![extended::describe_portal_rows(
@@ -1470,11 +1550,22 @@ async fn open_portal_stream(
         return Err(error);
     }
     track_select_reads(ctx, session, &select);
+    // Read-your-own-writes: a portal SELECT inside the open transaction must see
+    // its own uncommitted rows, so decode the staged write-set into resident
+    // writes the stream reader folds into the scan. The COMMIT path does NOT do
+    // this — it consumes the staging as a stream.
+    let pending = match session.materialized_txn_writes() {
+        Ok(pending) => pending,
+        Err(error) => {
+            session.mark_txn_failed();
+            return Err(error);
+        }
+    };
     let snapshot = read_snapshot(ctx, session);
     query::open_select_stream(
         read_env(ctx, &snapshot),
         *select,
-        Some(session.txn_writes()),
+        Some(pending.as_slice()),
         params,
     )
     .await
@@ -1604,7 +1695,11 @@ async fn execute_portal_inner(
         // No-FROM expression select: no tables, no params. Evaluate and render.
         PreparedKind::Exprs(items) => {
             let snapshot = read_snapshot(ctx, session);
-            let scalar_ctx = scalar_read_ctx(ctx, session, &snapshot);
+            let pending = match session.materialized_txn_writes() {
+                Ok(pending) => pending,
+                Err(err) => return vec![session.fail(err)],
+            };
+            let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
             match query::execute_scalar_select(&items, scalar_ctx).await {
                 Ok(result) => {
                     let msgs = query::render_execute_result(Ok(result), &result_formats);
@@ -1931,19 +2026,6 @@ pub(crate) mod txn_atomicity_tests {
             .register_table(synthetic_key_storage_schema())
             .unwrap();
         let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_synthetic_key()));
-        (dir, ctx)
-    }
-
-    /// `make_ctx_synthetic_key` with the transaction write-set cap raised, so a COPY large
-    /// enough to matter buffers without hitting the fail-loud `53400` cap first (the deployed
-    /// cluster runs `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000` for `pgbench -i`'s ~1.1M-row load).
-    pub(crate) async fn make_ctx_synthetic_key_with_cap(
-        max_txn_writes: usize,
-    ) -> (tempfile::TempDir, QueryContext) {
-        let (dir, mut ctx) = make_ctx_synthetic_key().await;
-        ctx.mvcc = Arc::new(crate::mvcc::MvccManager::with_max_txn_writes(
-            max_txn_writes,
-        ));
         (dir, ctx)
     }
 
@@ -2716,9 +2798,9 @@ pub(crate) mod txn_atomicity_tests {
         let mut session = Session::new(superuser());
 
         // Fill the memtable with autocommit writes first. The transaction's own
-        // write-set is capped (`max_txn_writes` -> 53400), so the pressure has
-        // to be built outside the transaction, then the COMMIT's write is what
-        // crosses the admission threshold.
+        // write-set no longer refuses for size (a large one SPILLS), so the pressure
+        // is built outside the transaction, then the COMMIT's write is what crosses
+        // the admission threshold.
         let payload = "x".repeat(1024);
         let mut filled = false;
         for seq in 0..4096u32 {
@@ -2822,6 +2904,7 @@ pub(crate) mod txn_atomicity_tests {
         .await;
         let mutations: Vec<_> = writer
             .take_txn_writes()
+            .expect("drain the staged write-set")
             .into_iter()
             .map(|write| write.0)
             .collect();
@@ -2923,6 +3006,7 @@ pub(crate) mod txn_atomicity_tests {
         }
         let mutations: Vec<_> = writer
             .take_txn_writes()
+            .expect("drain the staged write-set")
             .into_iter()
             .map(|write| write.0)
             .collect();

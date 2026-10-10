@@ -867,6 +867,54 @@ impl StorageApplier for EngineStorageApplier {
         self.apply_writeset(txn_id, vec![mutation])
     }
 
+    /// Apply every partition of a multi-key transaction **atomically**, decoding
+    /// the write-set as it goes.
+    ///
+    /// # Residency contract
+    ///
+    /// The decode MUST NOT hold the whole encoded write-set resident while it
+    /// builds the decoded batch. Each [`ApplyMutation`] is consumed the moment it
+    /// is decoded — `decode_postgres_mvcc_mutation` only borrows the payload and
+    /// the deserialize copies what it needs into owned rows — so once an entry is
+    /// decoded nothing references its `data` again and the input shrinks as the
+    /// decoded `Vec<BatchOp>` grows. Pinning every input payload next to that
+    /// output instead is the RESIDENT term the COMMIT peak attributes to
+    /// `mvcc.prepare_postgres_apply` (~2.4 KB per decoded op; see
+    /// `ferrosa-cluster/specs/fmea.md` CL-54).
+    ///
+    /// This contract is PROVEN by
+    /// `tests/accord_apply_decode_residency.rs::apply_writeset_peak_stays_within_the_input_size`,
+    /// which arms a counting global allocator and measures the call TWICE: the
+    /// consuming path under test, and a pinning control that holds a clone of every
+    /// entry's payload across the call. The control must sit ~a full input-size
+    /// ABOVE the consuming path — proving the decode frees each payload as it goes.
+    /// The negative control `a_retained_input_payload_trips_the_residency_guard`
+    /// asserts that same separation, so the guard cannot pass blind to the input.
+    /// (An ABSOLUTE bound on the call's peak cannot prove this: `apply_writeset`
+    /// inherently holds ~2x the input even when nothing is pinned, because the
+    /// decoded batch then co-exists with `apply_batch`'s memtable copy of the same
+    /// rows.)
+    ///
+    /// The proof needs a real write-set and a real commit-log flush, so it costs
+    /// seconds — which is why it lives in that integration test and NOT here. A
+    /// doctest runs on *every* `cargo test --doc` and must stay in the millisecond
+    /// range; the example below only pins the call's public shape and is
+    /// `no_run`, so it compiles but never executes.
+    ///
+    /// ```no_run
+    /// use ferrosa_cluster::accord::apply::{ApplyMutation, EngineStorageApplier, StorageApplier};
+    /// use ferrosa_common::accord::{Timestamp, TxnId};
+    ///
+    /// # fn run(applier: &EngineStorageApplier, txn: TxnId, t: Timestamp, frames: Vec<Vec<u8>>) {
+    /// // One already-framed apply mutation per partition the transaction wrote.
+    /// let mutations: Vec<ApplyMutation> = frames
+    ///     .into_iter()
+    ///     .map(|data| ApplyMutation { data, t, deps: Vec::new() })
+    ///     .collect();
+    /// // Every partition commits through ONE atomic `apply_batch`.
+    /// applier.apply_writeset(txn, mutations).unwrap();
+    /// # }
+    /// ```
     fn apply_writeset(
         &self,
         txn_id: TxnId,
@@ -916,13 +964,39 @@ impl EngineStorageApplier {
         // commits through ONE `apply_batch`, which preflights every target table
         // BEFORE appending any commit-log record — so either all surviving keys
         // land durably or none do (all-or-nothing; no partial / torn apply).
-        let mut ops: Vec<BatchOp> = Vec::new();
         let profile_apply = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+        if profile_apply {
+            tracing::info!(
+                phase = "apply_writeset.entry",
+                mutations = mutations.len(),
+                live_mib = ferrosa_common::mem_probe::live_mib(),
+                "accord apply residency"
+            );
+        }
+        let mut ops: Vec<BatchOp> = Vec::new();
         let decode_started = profile_apply.then(std::time::Instant::now);
         // The (txn,key,t) triples this call will newly persist — recorded only
         // AFTER the batch is durable, so a failed apply leaves them re-appliable.
         let mut newly_applied: Vec<(TxnId, Vec<u8>, u64)> = Vec::new();
         let mut postgres_mvcc_metadata = Vec::new();
+
+        // Capture what the post-loop steps need (the agreed stamp, the
+        // all-one-timestamp invariant, and the count) BEFORE the decode loop
+        // consumes `mutations`, so each entry's payload can be dropped the
+        // moment it has been decoded rather than being pinned resident for the
+        // whole loop. `decode_postgres_mvcc_mutation` BORROWS the payload and
+        // `Mutation::deserialize_from_rebinding_list_paths` copies what it needs
+        // into owned rows, so once an entry is decoded nothing references its
+        // `data` again. Holding all 352 515 encoded payloads (~670 MB at
+        // N=1 100 000) live next to the decoded `Vec<BatchOp>` is what made the
+        // Apply peak hold input AND output at once (PG-ACC-03).
+        let mutation_count = mutations.len();
+        let apply_t = match mutations.first() {
+            Some(first) => first.t,
+            // No mutations is a no-op: nothing to preflight, nothing to apply.
+            None => return Ok(()),
+        };
+        let mut_timestamps_uniform = mutations.iter().all(|mutation| mutation.t == apply_t);
 
         {
             // Snapshot the idempotency set under the lock to decide what to skip.
@@ -998,10 +1072,7 @@ impl EngineStorageApplier {
                     reason: "PostgreSQL MVCC metadata has no registered apply observer".into(),
                 });
             }
-            if mutations
-                .iter()
-                .any(|mutation| mutation.t != mutations[0].t)
-            {
+            if !mut_timestamps_uniform {
                 return Err(ApplyError {
                     txn_id,
                     reason: "PostgreSQL MVCC writeset contains multiple Accord timestamps".into(),
@@ -1009,7 +1080,7 @@ impl EngineStorageApplier {
             }
             for observer in observers.iter() {
                 observer
-                    .prepare_postgres_apply(txn_id, mutations[0].t, &postgres_mvcc_metadata)
+                    .prepare_postgres_apply(txn_id, apply_t, &postgres_mvcc_metadata)
                     .map_err(|reason| ApplyError { txn_id, reason })?;
             }
         }
@@ -1018,6 +1089,15 @@ impl EngineStorageApplier {
         // failure NONE of the ops are applied; propagated as `ApplyError`
         // (never fake success).
         let decode_ms = decode_started.map(|t| t.elapsed().as_millis() as u64);
+        if profile_apply {
+            tracing::info!(
+                phase = "apply_writeset.decoded",
+                ops = ops.len(),
+                metadata_entries = postgres_mvcc_metadata.len(),
+                live_mib = ferrosa_common::mem_probe::live_mib(),
+                "accord apply residency"
+            );
+        }
         let apply_started = profile_apply.then(std::time::Instant::now);
         self.engine.apply_batch(ops).map_err(|e| ApplyError {
             txn_id,
@@ -1027,7 +1107,7 @@ impl EngineStorageApplier {
             let metadata_kib: usize =
                 postgres_mvcc_metadata.iter().map(Vec::len).sum::<usize>() / 1024;
             tracing::info!(
-                mutations = mutations.len(),
+                mutations = mutation_count,
                 decode_ms = decode_ms.unwrap_or(0),
                 apply_batch_ms = started.elapsed().as_millis() as u64,
                 metadata_kib,
@@ -1038,7 +1118,7 @@ impl EngineStorageApplier {
         if !postgres_mvcc_metadata.is_empty() {
             for observer in self.postgres_mvcc_observers.read().iter() {
                 observer
-                    .on_postgres_apply(txn_id, mutations[0].t, &postgres_mvcc_metadata)
+                    .on_postgres_apply(txn_id, apply_t, &postgres_mvcc_metadata)
                     .map_err(|reason| ApplyError { txn_id, reason })?;
             }
         }

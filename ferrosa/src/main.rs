@@ -26,9 +26,58 @@
 //! Last revised: 2026-08-27
 //! Last changed: Kept the process alive but fail-closed after Raft failure.
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(feature = "alloc-probe")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// A counting wrapper around jemalloc, installed only with the `alloc-probe`
+/// cargo feature. It keeps `ferrosa_common::mem_probe` fed with live-heap
+/// bytes so a phase boundary can log the residency it caused, which is how a
+/// COMMIT's memory peak is attributed to a structure rather than guessed at
+/// (see `PROFILE.md`, `FERROSA_PG_COMMIT_PROFILE`). A production build does not
+/// enable the feature and uses [`tikv_jemallocator::Jemalloc`] directly.
+#[cfg(all(not(target_env = "msvc"), feature = "alloc-probe"))]
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout};
+
+    pub struct CountingJemalloc;
+
+    unsafe impl GlobalAlloc for CountingJemalloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = tikv_jemallocator::Jemalloc.alloc(layout);
+            if !ptr.is_null() {
+                ferrosa_common::mem_probe::record_alloc(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            ferrosa_common::mem_probe::record_dealloc(layout.size());
+            tikv_jemallocator::Jemalloc.dealloc(ptr, layout);
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = tikv_jemallocator::Jemalloc.alloc_zeroed(layout);
+            if !ptr.is_null() {
+                ferrosa_common::mem_probe::record_alloc(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size);
+            if !new_ptr.is_null() {
+                ferrosa_common::mem_probe::record_dealloc(layout.size());
+                ferrosa_common::mem_probe::record_alloc(new_size);
+            }
+            new_ptr
+        }
+    }
+}
+
+#[cfg(all(not(target_env = "msvc"), feature = "alloc-probe"))]
+#[global_allocator]
+static GLOBAL: counting_alloc::CountingJemalloc = counting_alloc::CountingJemalloc;
 
 /// jemalloc tuning: release dirty + muzzy pages back to the OS
 /// immediately on free instead of caching them for ~10 s of reuse.

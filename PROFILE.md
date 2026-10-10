@@ -359,7 +359,7 @@ rebuilding Ferrosa:
 
 | Environment variable | What it bounds | Default |
 |---|---|---:|
-| `FERROSA_POSTGRES_MAX_TXN_WRITES` | Resident mutations buffered by one PostgreSQL transaction before it fails loud with `53400`. A stopgap bound on a resident `Vec`, **retained** until the front end streams its buffer to disk (see `ferrosa-postgres` README, FMEA `PG-ACC-01`) | `10000` |
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | No longer a front-end refusal: a write-set past any in-memory buffer SPILLS instead (`FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`). Retained only as the consensus/MVCC-side sizing default | `10000` |
 | `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | Resident buffer size, in bytes, a transaction's write-set payloads may hold before they spill to a local temp file (both the streaming `WriteSetStage` and the coordinator's `WriteSetSpill::should_stage` read it). A streaming BUFFER SIZE, not a cap: a write-set larger than it SPILLS, it is never refused. Absolute bytes on purpose — a fraction of RAM is the wrong scale on a dataset larger than RAM | `8388608` (8 MiB) |
 | `FERROSA_PG_COMMIT_PROFILE` | Per-phase attribution for a PostgreSQL commit (prepare, Accord order/gate, apply fan-out, MVCC observer, prune, WAL) on the coordinator. Unset = zero cost | unset |
 | `FERROSA_ACCORD_COMPRESSION` | Codec for the Accord apply **region** body: `none` (default), `lz4`, `snappy`, `zstd`. Opt-in: compression costs CPU and only pays when the transport term is byte-bound rather than deserialize-bound | `none` |
@@ -424,6 +424,40 @@ What the numbers say:
 > (2) This is a **3-node loopback** run. It characterises the codec's CPU / ratio /
 > memory cost, NOT its benefit on the wire. Do not read it as "enable compression
 > for throughput".
+#### Residency attribution (`alloc-probe`)
+
+`FERROSA_PG_COMMIT_PROFILE=1` also emits `phase=... live_mib=...` residency lines
+at each COMMIT phase boundary, but only in a binary built with the `alloc-probe`
+feature:
+
+```bash
+cargo build -p ferrosa --features alloc-probe     # diagnostic build
+FERROSA_PG_COMMIT_PROFILE=1 ./target/debug/ferrosa
+```
+
+`alloc-probe` installs a counting global allocator (`ferrosa::counting_alloc`)
+that feeds `ferrosa_common::mem_probe` with live-heap bytes, so a line reads the
+exact resident heap at that boundary (`pg commit residency`,
+`accord apply residency`, `accord drive residency`). A production build does not
+enable the feature: it uses jemalloc directly, pays no allocation-path cost, and
+the lines are absent (not zero-valued). Comparing live_MiB with the same
+instant's process RSS splits a COMMIT peak into the heap it holds and the
+non-heap around it (the spill file's mapped pages, allocator metadata, page
+cache).
+
+What the probe found on a 1.1 M-row transactional `COPY` (see
+`ferrosa-cluster/specs/fmea.md` CL-53/CL-54 and `ferrosa-postgres/specs/fmea.md`
+PG-ACC-03): the dominant APPLY term is the DECODED APPLY path — ~2.4 KB per
+decoded op, a ratio stable across an 11x range — NOT the MVCC version store,
+which the same log reports at ~157 MB (`history_kib`/`dist_kib` 160766 each).
+`EngineStorageApplier::apply_writeset` now consumes its input write-set as it
+decodes instead of pinning every payload next to the decoded `Vec<BatchOp>`
+(the guard is `ferrosa-cluster/tests/accord_apply_decode_residency.rs`): live-heap
+peak at N=1 100 000 fell 3650.7 -> 3452.3 MiB and RSS peak 5235 -> 4687 MB. The
+peak is still NOT flat across N — the front-end `mutations` clone, the
+per-key/participant maps, the version history, and the two per-peer Apply frames
+are all still O(N) resident.
+
 
 The maximum snapshot age bounds how long an abandoned or long-running
 transaction can retain old row versions. Once expired, its next query or commit
