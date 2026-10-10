@@ -50,13 +50,24 @@ pub const CAP_ACCORD_CAPNP: u32 = 1 << 3;
 /// connection.
 pub const CAP_ACCORD_APPLY_REGION: u32 = 1 << 4;
 
+/// The node decodes a region-REFERENCE Apply whose region is COMPRESSED (header
+/// `compression` tag 1..=3). The coordinator applies the configured
+/// `FERROSA_ACCORD_COMPRESSION` codec to the region ONLY to a peer that advertised this
+/// bit; a peer without it gets the uncompressed region (or the inline capnp / bincode
+/// frame). A build that advertises the bit supports every codec in the dependency set
+/// (`lz4`/`snappy`/`zstd`), so the effective codec is the configured one; when the
+/// handshake's per-codec `chosenCompression` list is exposed per peer, this bit becomes
+/// the coarse gate over a finer intersection.
+pub const CAP_ACCORD_APPLY_REGION_COMPRESSED: u32 = 1 << 5;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
 pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY
     | CAP_RESULT_CURSOR_PAGE
     | CAP_PAIR_DISSOLVE
     | CAP_ACCORD_CAPNP
-    | CAP_ACCORD_APPLY_REGION;
+    | CAP_ACCORD_APPLY_REGION
+    | CAP_ACCORD_APPLY_REGION_COMPRESSED;
 
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

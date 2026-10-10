@@ -393,9 +393,16 @@ struct AccordApplyV2Region {
   txnId @0 :AccordTxnId;
   # Number of entries; `offsets`/`lengths` are parallel lists of this length.
   entryCount @1 :UInt32;
-  # Byte offset of entry i within the appended region, and its byte length.
+  # Byte offset of entry i within the (UNCOMPRESSED) region, and its byte length.
   offsets @2 :List(UInt64);
   lengths @3 :List(UInt32);
+  # Region codec tag: 0=none, 1=lz4, 2=snappy, 3=zstd. When non-zero the appended
+  # region is a blocked, length-prefixed compression of the same bytes.
+  compression @4 :UInt8;
+  # Uncompressed region length (the decoder sizes its output buffer from this).
+  uncompressedLen @5 :UInt64;
+  # Block size the region was compressed in (0 = whole region as one block).
+  blockBytes @6 :UInt32;
 }
 
 struct AccordApply {

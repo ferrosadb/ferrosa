@@ -344,6 +344,12 @@ pub enum AccordControlMessage {
         offsets: Vec<u64>,
         /// Byte length of entry `i`.
         lengths: Vec<u32>,
+        /// Region codec tag (see [`RegionCodec::tag`]); 0 = uncompressed.
+        compression: u8,
+        /// Uncompressed region length.
+        uncompressed_len: u64,
+        /// Block size the region was compressed in (0 = one block).
+        block_bytes: u32,
     },
     /// Single-key Apply request (`wire.rs` `ApplyPayload`), the degenerate one-key case.
     Apply {
@@ -1844,6 +1850,9 @@ fn write_accord(
             txn_id,
             offsets,
             lengths,
+            compression,
+            uncompressed_len,
+            block_bytes,
         } => {
             let mut out = builder.init_op().init_apply_v2_region();
             write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
@@ -1860,6 +1869,9 @@ fn write_accord(
                     list.set(idx as u32, *len);
                 }
             }
+            out.set_compression(*compression);
+            out.set_uncompressed_len(*uncompressed_len);
+            out.set_block_bytes(*block_bytes);
         }
         AccordControlMessage::Apply {
             txn_id,
@@ -2016,6 +2028,9 @@ fn read_accord(
                 txn_id: read_accord_txn_id(region.get_txn_id()?),
                 offsets,
                 lengths,
+                compression: region.get_compression(),
+                uncompressed_len: region.get_uncompressed_len(),
+                block_bytes: region.get_block_bytes(),
             }
         }
         op::Apply(apply) => {
@@ -2219,7 +2234,193 @@ pub fn decode_accord_apply_v2(bytes: &[u8]) -> Result<AccordControlMessage, Capn
     }
 }
 
-/// Encode a multi-key Accord Apply as a region-REFERENCE frame.
+/// Region payload compression codec — one tag per codec already in the dependency set
+/// (`lz4_flex`, `snap`, `zstd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionCodec {
+    /// No compression: the region is sent verbatim (the default).
+    None,
+    /// LZ4 block format: the cheap, fast end.
+    Lz4,
+    /// Snappy: fast, comparable to LZ4.
+    Snap,
+    /// Zstandard: the ratio end; honours [`RegionCompression::level`].
+    Zstd,
+}
+
+impl RegionCodec {
+    /// The wire tag for this codec.
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Lz4 => 1,
+            Self::Snap => 2,
+            Self::Zstd => 3,
+        }
+    }
+
+    /// Decode a wire tag, failing loud on a codec this build does not know.
+    pub fn from_tag(tag: u8) -> Result<Self, CapnpDecodeError> {
+        Ok(match tag {
+            0 => Self::None,
+            1 => Self::Lz4,
+            2 => Self::Snap,
+            3 => Self::Zstd,
+            other => {
+                return Err(CapnpDecodeError::MalformedFrame(format!(
+                    "unknown region compression codec tag {other}"
+                )))
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for RegionCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Lz4 => "lz4",
+            Self::Snap => "snappy",
+            Self::Zstd => "zstd",
+        })
+    }
+}
+
+/// The compression a coordinator applies to an Apply region.
+///
+/// `codec == None` is the default and reproduces the pre-compression wire exactly. The
+/// other fields only matter when a codec is selected:
+/// - `level` is the codec level where the codec has one (Zstd); the fixed-level codecs
+///   ignore it.
+/// - `block_bytes` is the block size the region is compressed in (0 = one block).
+/// - `min_bytes` is the frame size below which no compression is attempted — on a small
+///   frame the CPU cost plus the block headers lose to just sending the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionCompression {
+    pub codec: RegionCodec,
+    pub level: i32,
+    pub block_bytes: usize,
+    pub min_bytes: usize,
+}
+
+impl RegionCompression {
+    /// The default: no compression, byte-identical to the pre-compression wire.
+    pub const NONE: Self = Self {
+        codec: RegionCodec::None,
+        level: 3,
+        block_bytes: 0,
+        min_bytes: usize::MAX,
+    };
+
+    /// Whether no compression will be applied.
+    pub fn is_none(&self) -> bool {
+        matches!(self.codec, RegionCodec::None)
+    }
+}
+
+fn compress_block(
+    codec: RegionCodec,
+    level: i32,
+    block: &[u8],
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    Ok(match codec {
+        RegionCodec::None => block.to_vec(),
+        RegionCodec::Lz4 => lz4_flex::block::compress(block),
+        RegionCodec::Snap => snap::raw::Encoder::new()
+            .compress_vec(block)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("snappy compress: {e}")))?,
+        RegionCodec::Zstd => zstd::bulk::compress(block, level)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("zstd compress: {e}")))?,
+    })
+}
+
+fn decompress_block(
+    codec: RegionCodec,
+    block: &[u8],
+    expected_len: usize,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    Ok(match codec {
+        RegionCodec::None => block.to_vec(),
+        RegionCodec::Lz4 => lz4_flex::block::decompress(block, expected_len)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("lz4 decompress: {e}")))?,
+        RegionCodec::Snap => snap::raw::Decoder::new()
+            .decompress_vec(block)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("snappy decompress: {e}")))?,
+        RegionCodec::Zstd => zstd::bulk::decompress(block, expected_len)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("zstd decompress: {e}")))?,
+    })
+}
+
+/// Compress a region into a blocked, length-prefixed stream: for each block, a `u32`
+/// little-endian compressed length followed by the compressed bytes. The block's
+/// UNCOMPRESSED size is `block_bytes` except for the last block (which is the
+/// remainder), so the decoder needs only `uncompressed_len` + `block_bytes` to read it.
+fn compress_region(
+    region: &[u8],
+    codec: RegionCodec,
+    level: i32,
+    block_bytes: usize,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    let block_bytes = block_bytes.max(1);
+    let mut out = Vec::with_capacity(region.len());
+    let mut off = 0usize;
+    while off < region.len() {
+        let end = (off + block_bytes).min(region.len());
+        let compressed = compress_block(codec, level, &region[off..end])?;
+        let len = u32::try_from(compressed.len()).map_err(|_| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "compressed block of {} bytes exceeds the u32 framing bound",
+                compressed.len()
+            ))
+        })?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&compressed);
+        off = end;
+    }
+    Ok(out)
+}
+
+fn decompress_region(
+    payload: &[u8],
+    codec: RegionCodec,
+    uncompressed_len: usize,
+    block_bytes: usize,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    let block_bytes = block_bytes.max(1);
+    let mut out = Vec::with_capacity(uncompressed_len);
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        let len_bytes = payload.get(pos..pos + 4).ok_or_else(|| {
+            CapnpDecodeError::MalformedFrame(
+                "region block framing: truncated u32 length prefix".into(),
+            )
+        })?;
+        let len = u32::from_le_bytes(len_bytes.try_into().expect("4 bytes")) as usize;
+        pos += 4;
+        let end = pos.checked_add(len).ok_or_else(|| {
+            CapnpDecodeError::MalformedFrame("region block length overflows usize".into())
+        })?;
+        let block = payload.get(pos..end).ok_or_else(|| {
+            CapnpDecodeError::MalformedFrame(format!(
+                "region block {pos}..{end} escapes the {} byte payload",
+                payload.len()
+            ))
+        })?;
+        let remaining = uncompressed_len.saturating_sub(out.len());
+        let expected = block_bytes.min(remaining);
+        out.extend_from_slice(&decompress_block(codec, block, expected)?);
+        pos = end;
+    }
+    if out.len() != uncompressed_len {
+        return Err(CapnpDecodeError::MalformedFrame(format!(
+            "region decompressed to {} bytes, expected {uncompressed_len}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Encode a multi-key Accord Apply as a region-REFERENCE frame, uncompressed.
 ///
 /// The frame is a capnp HEADER (the transaction stamp plus a parallel
 /// `offsets`/`lengths` index) followed by ONE contiguous REGION that concatenates the
@@ -2239,6 +2440,25 @@ pub fn encode_accord_apply_v2_region<'a, I>(
 where
     I: IntoIterator<Item = &'a [u8]>,
 {
+    encode_accord_apply_v2_region_with_compression(txn_id, mutations, RegionCompression::NONE)
+}
+
+/// [`encode_accord_apply_v2_region`] with an optional region compression.
+///
+/// When `cfg` selects a codec AND the region is at least `cfg.min_bytes`, the region is
+/// compressed in `cfg.block_bytes` blocks (see [`compress_region`]); the header records
+/// the codec tag, the uncompressed length and the block size so the peer can decompress
+/// and address entries by the SAME `(offset, length)` index. If the compressed region is
+/// not smaller than the raw one, or the region is below `min_bytes`, the frame is sent
+/// uncompressed — compression must never inflate a frame.
+pub fn encode_accord_apply_v2_region_with_compression<'a, I>(
+    txn_id: AccordTxnId,
+    mutations: I,
+    cfg: RegionCompression,
+) -> Result<Vec<u8>, CapnpDecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
     let mut offsets: Vec<u64> = Vec::new();
     let mut lengths: Vec<u32> = Vec::new();
     let mut region: Vec<u8> = Vec::new();
@@ -2253,12 +2473,38 @@ where
         lengths.push(len);
         region.extend_from_slice(mutation);
     }
+    let uncompressed_len = region.len() as u64;
+    // Effective block size: the configured one, or the whole region (one block) when 0.
+    let effective_block = if cfg.block_bytes == 0 {
+        region.len().max(1)
+    } else {
+        cfg.block_bytes
+    };
+    let try_compress = !cfg.is_none() && !region.is_empty() && region.len() >= cfg.min_bytes;
+    let (compression, block_bytes, payload) = if try_compress {
+        let compressed = compress_region(&region, cfg.codec, cfg.level, effective_block)?;
+        if compressed.len() < region.len() {
+            (
+                cfg.codec.tag(),
+                u32::try_from(effective_block).unwrap_or(u32::MAX),
+                compressed,
+            )
+        } else {
+            // The codec did not shrink the region: never inflate a frame.
+            (RegionCodec::None.tag(), 0u32, region)
+        }
+    } else {
+        (RegionCodec::None.tag(), 0u32, region)
+    };
     let mut header = encode_accord_envelope(&AccordControlMessage::ApplyV2Region {
         txn_id,
         offsets,
         lengths,
+        compression,
+        uncompressed_len,
+        block_bytes,
     })?;
-    header.extend_from_slice(&region);
+    header.extend_from_slice(&payload);
     Ok(header)
 }
 
@@ -2272,9 +2518,12 @@ where
 pub struct AccordApplyV2RegionView<'a> {
     /// The transaction the write-set belongs to.
     pub txn_id: AccordTxnId,
-    region: &'a [u8],
+    /// The region bytes. Borrowed from the received body when the frame was sent
+    /// uncompressed; OWNED (decompressed into this view) when a codec was applied.
+    region: std::borrow::Cow<'a, [u8]>,
     offsets: Vec<u64>,
     lengths: Vec<u32>,
+    compression: RegionCodec,
 }
 
 impl<'a> AccordApplyV2RegionView<'a> {
@@ -2288,16 +2537,22 @@ impl<'a> AccordApplyV2RegionView<'a> {
         self.offsets.is_empty()
     }
 
-    /// The raw region bytes, borrowed from the received body.
-    pub fn region(&self) -> &'a [u8] {
-        self.region
+    /// The raw region bytes (borrowed from the body, or the view's own decompressed
+    /// buffer when the frame was compressed).
+    pub fn region(&self) -> &[u8] {
+        &self.region
+    }
+
+    /// The codec that was applied to the region ([`RegionCodec::None`] if uncompressed).
+    pub fn compression(&self) -> RegionCodec {
+        self.compression
     }
 
     /// Borrow entry `index` by its `(offset, length)` — a slice of the region.
     ///
     /// FAILS LOUD on an index that was never present and on a range that escapes the
     /// region: a corrupt index must never read past the received body.
-    pub fn entry(&self, index: usize) -> Result<&'a [u8], CapnpDecodeError> {
+    pub fn entry(&self, index: usize) -> Result<&[u8], CapnpDecodeError> {
         let (&offset, &len) = self
             .offsets
             .get(index)
@@ -2327,7 +2582,7 @@ impl<'a> AccordApplyV2RegionView<'a> {
     }
 
     /// Borrow every entry in write-set order.
-    pub fn mutations(&self) -> impl Iterator<Item = Result<&'a [u8], CapnpDecodeError>> + '_ {
+    pub fn mutations(&self) -> impl Iterator<Item = Result<&[u8], CapnpDecodeError>> + '_ {
         (0..self.len()).map(move |index| self.entry(index))
     }
 
@@ -2380,8 +2635,11 @@ impl<'a> AccordApplyV2RegionView<'a> {
 /// Decode a frame produced by [`encode_accord_apply_v2_region`] into a BORROWED view.
 ///
 /// The capnp header is read out of a `Cursor` to find where the message ends; the
-/// region is everything after it. The returned view borrows the region, so no entry is
-/// decoded into an owned structure here.
+/// region is everything after it. When the header names a codec the region is
+/// decompressed into an owned buffer held by the view (see
+/// [`decode_accord_apply_v2_region`]'s `Cow`); when it is uncompressed the view borrows
+/// the received body directly. Either way the entries are read BY OFFSET — no owned
+/// per-entry structure is produced.
 pub fn decode_accord_apply_v2_region(
     bytes: &[u8],
 ) -> Result<AccordApplyV2RegionView<'_>, CapnpDecodeError> {
@@ -2401,29 +2659,61 @@ pub fn decode_accord_apply_v2_region(
             CapnpDecodeError::MalformedFrame("region frame header length overflows usize".into())
         })?
     };
-    let region = bytes.get(header_len..).ok_or_else(|| {
+    let raw_payload = bytes.get(header_len..).ok_or_else(|| {
         CapnpDecodeError::MalformedFrame(format!(
             "region frame header of {header_len} bytes is longer than the {} byte body",
             bytes.len()
         ))
     })?;
-    let (txn_id, offsets, lengths) = match decode_accord_envelope(bytes)? {
-        AccordControlMessage::ApplyV2Region {
-            txn_id,
-            offsets,
-            lengths,
-        } => (txn_id, offsets, lengths),
-        other => {
-            return Err(CapnpDecodeError::UnknownPayload(format!(
-                "expected an applyV2Region payload, found a different Accord kind: {other:?}"
-            )))
+    let (txn_id, offsets, lengths, codec, uncompressed_len, block_bytes) =
+        match decode_accord_envelope(bytes)? {
+            AccordControlMessage::ApplyV2Region {
+                txn_id,
+                offsets,
+                lengths,
+                compression,
+                uncompressed_len,
+                block_bytes,
+            } => (
+                txn_id,
+                offsets,
+                lengths,
+                RegionCodec::from_tag(compression)?,
+                uncompressed_len,
+                block_bytes,
+            ),
+            other => {
+                return Err(CapnpDecodeError::UnknownPayload(format!(
+                    "expected an applyV2Region payload, found a different Accord kind: {other:?}"
+                )))
+            }
+        };
+    let uncompressed_len = usize::try_from(uncompressed_len).map_err(|_| {
+        CapnpDecodeError::MalformedFrame("region uncompressed length overflows usize".into())
+    })?;
+    let region: std::borrow::Cow<'_, [u8]> = match codec {
+        RegionCodec::None => {
+            if raw_payload.len() != uncompressed_len {
+                return Err(CapnpDecodeError::MalformedFrame(format!(
+                    "region frame claims {uncompressed_len} bytes but carries {}",
+                    raw_payload.len()
+                )));
+            }
+            std::borrow::Cow::Borrowed(raw_payload)
         }
+        _ => std::borrow::Cow::Owned(decompress_region(
+            raw_payload,
+            codec,
+            uncompressed_len,
+            block_bytes as usize,
+        )?),
     };
     let view = AccordApplyV2RegionView {
         txn_id,
         region,
         offsets,
         lengths,
+        compression: codec,
     };
     view.validate()?;
     Ok(view)

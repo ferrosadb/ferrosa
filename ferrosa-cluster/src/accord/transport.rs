@@ -46,6 +46,17 @@ pub trait AccordTransport: Send + Sync {
     async fn supports_accord_apply_region(&self, _host_id: uuid::Uuid) -> bool {
         false
     }
+
+    /// Whether `host_id` advertised
+    /// [`ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED`], i.e. decodes a
+    /// COMPRESSED region body.
+    ///
+    /// Gated SEPARATELY from the region bit so that enabling
+    /// `FERROSA_ACCORD_COMPRESSION` can never send a compressed body to a peer that
+    /// understands only the uncompressed region form. Defaults to `false`.
+    async fn supports_accord_apply_region_compressed(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -70,5 +81,11 @@ impl AccordTransport for PeerManager {
         self.peer_capabilities(host_id)
             .await
             .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION != 0)
+    }
+
+    async fn supports_accord_apply_region_compressed(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id).await.is_some_and(|caps| {
+            caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED != 0
+        })
     }
 }

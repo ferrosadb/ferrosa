@@ -2870,6 +2870,7 @@ impl AccordCoordinatorDriver {
         // bulk region instead of a capnp struct per entry.
         let mut capnp = true;
         let mut region = true;
+        let mut compressed_region = true;
         let mut any_remote = false;
         for &peer in self.replica_ids.iter().filter(|&&id| id != self_id) {
             any_remote = true;
@@ -2881,9 +2882,23 @@ impl AccordCoordinatorDriver {
             if !self.peers.supports_accord_apply_region(peer).await {
                 region = false;
             }
+            if !self
+                .peers
+                .supports_accord_apply_region_compressed(peer)
+                .await
+            {
+                compressed_region = false;
+            }
         }
         let capnp = capnp && any_remote;
         let region = region && any_remote;
+        // Compression is opt-in (`FERROSA_ACCORD_COMPRESSION*`, default `none` — see
+        // `accord/compression.rs`) AND requires EVERY peer to advertise
+        // `CAP_ACCORD_APPLY_REGION_COMPRESSED`. Gated separately on purpose: a peer that
+        // decodes the uncompressed region form must never be handed a compressed body, so
+        // turning the tunable on cannot by itself widen what we send.
+        let region_compression = crate::accord::compression::configured_region_compression();
+        let compress_region = region && compressed_region && !region_compression.is_none();
         // The capnp body's total-order stamp, mirrored from the driver's transaction id.
         let accord_txn_id = ferrosa_net::protocol::AccordTxnId {
             epoch: txn_id.0.epoch,
@@ -2900,12 +2915,19 @@ impl AccordCoordinatorDriver {
         // exact bytes that path always shipped.
         let encode_frame = |entries: &[(&[u8], &[u8])]| -> Result<Bytes, AccordDriverError> {
             if region {
-                ferrosa_net::protocol::encode_accord_apply_v2_region(
-                    accord_txn_id,
-                    entries.iter().map(|(_, mutation)| *mutation),
-                )
-                .map(Bytes::from)
-                .map_err(|e| AccordDriverError::Codec(e.to_string()))
+                let mutations = entries.iter().map(|(_, mutation)| *mutation);
+                let encoded = if compress_region {
+                    ferrosa_net::protocol::encode_accord_apply_v2_region_with_compression(
+                        accord_txn_id,
+                        mutations,
+                        region_compression,
+                    )
+                } else {
+                    ferrosa_net::protocol::encode_accord_apply_v2_region(accord_txn_id, mutations)
+                };
+                encoded
+                    .map(Bytes::from)
+                    .map_err(|e| AccordDriverError::Codec(e.to_string()))
             } else if capnp {
                 ferrosa_net::protocol::encode_accord_apply_v2(
                     accord_txn_id,
