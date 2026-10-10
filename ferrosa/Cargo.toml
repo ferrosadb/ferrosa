@@ -116,3 +116,6 @@ tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.26"
 tower = { version = "0.5", features = ["util"] }
+# Real multi-node PROCESS test drives DROP TABLE over the PostgreSQL wire (there
+# is no cqlsh on this host), so the test needs a real Postgres client.
+tokio-postgres = "0.7"
