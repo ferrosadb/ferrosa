@@ -53,10 +53,11 @@ transaction's encoded mutation payloads through `ferrosa_storage::WriteSetSpill`
 once they cross an 8 MiB floor and hands the driver `with_spilled_write_set`, so
 the resident write-set is the KEYS (Accord's conflict ordering and the per-shard
 participant set need them) plus a ~1.2 MB offset index at N=100 000 — never the
-~51 MB payload bulk. The fan-out and the coordinator's own apply resolve each
-payload through `entry_mutation`, so a staged entry's empty `mutation` never
-reaches the wire; small write-sets stay wholly resident. See FMEA `CL-51` and
-`ferrosa-storage`'s `write_set_spill`.
+~51 MB payload bulk. The fan-out borrows each payload as a slice of the spill's mmap,
+and the coordinator's own apply borrows it the same way (see below — no owned
+`Vec<u8>` per entry), so a staged entry's empty `mutation` never reaches the wire and
+never becomes a per-entry copy; small write-sets stay wholly resident. See FMEA
+`CL-51` and `ferrosa-storage`'s `write_set_spill`.
 
 When the write-set is the **same for every peer** — no per-key resolver, or every
 key resolving to the same replica set (the `RF == node count` shape) — the payload
@@ -147,22 +148,41 @@ mapping plus the staging file are released on the LAST drop of that `Arc`
 (`WriteSetSpill` declares `map` before the temp-dir reservation, so it unmaps before
 the directory is removed).
 
-**The coordinator's OWN local apply does not borrow — but that is a signature
-choice, not a lifetime wall.** The fan-out above is zero-copy, but the coordinator's
-self-apply resolves each owned entry back into an owned `Vec<u8>` (`entry_mutation`).
-A previous revision recorded this as *structurally required*; that claim was **wrong
-and is superseded here**. The `'static` bound `handlers::on_state_machine` imposes
+**The coordinator's own local apply BORROWS a staged write-set — the mapping, not a
+copy.** A previous revision recorded the owned read-back as *structurally required*;
+that claim was **wrong and is superseded**. The `'static` bound
+`handlers::on_state_machine` imposes
 (`F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static`) constrains the closure's
-**captures**, not the payload representation: an `Arc` IS `'static`, so a closure can
-OWN the `Arc<WriteSetSpill>` and borrow the mapping INSIDE its body. That is
-compile-verified by `apply.rs`'s
-`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`. And the
-dep-wait engine no longer needs owned bytes to park: a large parked write-set is held
-as `ParkedWriteSet::Staged` — an `Arc<WriteSetSpill>` plus per-entry indices — so the
+**captures**, not the payload representation: an `Arc` IS `'static`, so
+`apply_phase_within` MOVES the `Arc<WriteSetSpill>` into the closure and borrows the
+mapping INSIDE its body via `WriteSetSpill::entry`, handing
+`AccordStateMachine::handle_apply_writeset_borrowed` a `&[&[u8]]` of mapped slices —
+which it forwards to `StorageApplier::apply_writeset_borrowed` with no owned `Vec<u8>`
+per entry. This is compile-verified by `apply.rs`'s
+`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`; the seam
+contract itself is the RUNNABLE doctest on
+`StorageApplier::apply_writeset_borrowed` (an applier handed a `MutationView` sees the
+caller's buffer, not a copy — `cargo test --doc` fails if that changes); the applier
+seam is held by the POINTER-IDENTITY guard
+`staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy` (its in-test
+negative control drives the owned path through the same probe, so the guard can
+fail), and the coordinator wiring is held end to end by
+`coordinator_local_apply_borrows_the_staged_write_set_not_a_copy`, which runs the real
+coordinator driver with a staged write-set and asserts the applier receives the
+spill's OWN addresses (a doc example cannot drive `AccordCoordinatorDriver`).
+
+Two paths still hand over owned bytes, each a deliberate choice rather than a lifetime
+wall: a RESIDENT write-set (below the staging floor — the bytes are already in RAM, so
+a disk round-trip would cost more than it saves) and the no-state-machine
+`local_applier` fallback (which persists but has no `AccordStateMachine` to borrow
+through). Both read back through `entry_mutation`. A write-set that PARKS on an
+unresolved dependency materializes once to outlive the call (and a large park is staged
+to disk), and the dep-cascade that applies a parked set goes through the owned
+`apply_writeset`. See FMEA `CL-53`. The dep-wait engine likewise no
+longer needs owned bytes to park: a large parked write-set is held as
+`ParkedWriteSet::Staged` — an `Arc<WriteSetSpill>` plus per-entry indices — so the
 bytes outlive the coordinator's call behind the Arc, and the file plus mapping are
-freed on its last drop. The only reason the local apply still reads back owned bytes
-is that `handle_apply_writeset` takes `Vec<Vec<u8>>`; the transient copy is freed when
-the park stages the write-set, and the FAN-OUT (the bulk of the bytes) stays zero-copy.
+freed on its last drop.
 
 **A parked write-set is bounded by the buffer, not by the payload.** A parked
 write-set whose payloads reach the staging floor is staged on disk and the park keeps
