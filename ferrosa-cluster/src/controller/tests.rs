@@ -3571,17 +3571,27 @@ fn bootstrap_attempts_sstable_bulk_before_range_materialization() {
         .split("starting bootstrap streaming to new token owners")
         .nth(1)
         .expect("bootstrap streaming block exists");
-    let first_read_range = bootstrap
-        .find("read_range(")
-        .expect("bootstrap block still has a row fallback read_range");
+    // The block must still attempt flush/SSTable bulk FIRST...
     let first_flush = bootstrap
         .find("flush_all()")
         .expect("bootstrap block should flush before SSTable streaming");
+    // ...and its row fallback must be the STREAMING one, which walks every partition
+    // one at a time. The previous assertion required a `read_range(` call to still be
+    // present; that is exactly the materializing path this guards against, so it is
+    // inverted here rather than dropped: the call must be ABSENT, and the streaming
+    // replacement must be PRESENT and must come after the flush attempt.
+    let first_fallback = bootstrap
+        .find("stream_row_fallback_into(")
+        .expect("bootstrap block must fall back to the STREAMING row walk");
 
     assert!(
-        first_flush < first_read_range,
-        "bootstrap must try flush/SSTable bulk streaming before read_range; \
-         read_range materializes all SSTable partitions before applying its limit and can OOM"
+        !bootstrap.contains("read_range("),
+        "bootstrap must not call read_range: it materializes all SSTable partitions \
+         before applying its limit and can OOM; use the streaming row fallback instead"
+    );
+    assert!(
+        first_flush < first_fallback,
+        "bootstrap must try flush/SSTable bulk streaming before the streaming row fallback"
     );
 }
 
