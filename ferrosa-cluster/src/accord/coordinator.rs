@@ -2346,8 +2346,12 @@ impl AccordCoordinatorDriver {
         }
 
         // Apply quorum: the SAME per-shard rule as Commit (reusing the
-        // `participant` built above). An Apply ack is an `AccordApplyOK` for this
-        // txn — an empty body, or a payload whose `txn_id` matches.
+        // `participant` built above). An Apply ack is an `AccordApplyOK` whose
+        // payload's `txn_id` matches THIS transaction. An empty body or an
+        // unparseable payload is NOT an ack: a bare ApplyOK proves nothing about
+        // which transaction (if any) the peer applied, so it must never count
+        // toward the quorum. This is a safety check, not an affordance — the
+        // only senders that ever emitted a bare ApplyOK were test doubles.
         let local_state = if self_is_replica {
             self.local_accord_state.clone()
         } else {
@@ -2371,10 +2375,9 @@ impl AccordCoordinatorDriver {
             let apply_txn = txn_id;
             let is_apply_ok = move |r: &ferrosa_net::error::Result<Message>| {
                 matches!(r, Ok(Message::AccordApplyOK(b))
-                    if b.is_empty()
-                        || bincode::deserialize::<ApplyOkPayload>(b)
-                            .map(|ok| ok.txn_id == apply_txn)
-                            .unwrap_or(false))
+                    if bincode::deserialize::<ApplyOkPayload>(b)
+                        .map(|ok| ok.txn_id == apply_txn)
+                        .unwrap_or(false))
             };
             if self.write_set.len() == 1 {
                 let apply_bytes = self.apply_payload_bytes()?;
@@ -4288,8 +4291,8 @@ mod tests {
                 Message::AccordRead(_) => Err(ferrosa_net::error::NetError::Timeout(
                     "read-vote replica unavailable".into(),
                 )),
-                Message::AccordApply(_) | Message::AccordApplyV2(_) => {
-                    Ok(Message::AccordApplyOK(Bytes::new()))
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
                 }
                 other => panic!("unexpected Accord test message: {other:?}"),
             }
@@ -4304,13 +4307,13 @@ mod tests {
     impl AccordTransport for ApplyObservedTransport {
         async fn send(
             &self,
-            _host_id: uuid::Uuid,
+            host_id: uuid::Uuid,
             msg: Message,
             _lane: ferrosa_net::codec::Lane,
         ) -> ferrosa_net::error::Result<Message> {
             assert!(matches!(msg, Message::AccordApply(_)));
             let _ = self.apply_sent.send(());
-            Ok(Message::AccordApplyOK(Bytes::new()))
+            Ok(structured_apply_ack(msg, node_id_of(host_id)))
         }
     }
 
@@ -4456,6 +4459,157 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Regression: an Apply ack must PROVE it applied THIS transaction.
+    //
+    // The Apply quorum predicate used to accept an `AccordApplyOK` with an EMPTY
+    // body (`b.is_empty() || ...`), so a peer that answered with a bare ApplyOK
+    // was counted toward the quorum for WHATEVER txn the coordinator awaited —
+    // its `txn_id` was never checked. No production sender emits a bare ApplyOK
+    // (`handlers::on_message` always serialises an `ApplyOkPayload`); every
+    // empty-body sender lived in this test module. The arm was a test-only
+    // affordance that weakened a production safety check the moment any peer was
+    // version-skewed (e.g. mid rolling-upgrade) and replied with a bare ApplyOK.
+    // -----------------------------------------------------------------------
+
+    /// How a replica answers a single-key `AccordApply` under test.
+    #[derive(Clone, Copy)]
+    enum ApplyAck {
+        /// Pre-fix wire: a bare `AccordApplyOK` carrying no body.
+        Empty,
+        /// A structured ack for a DIFFERENT transaction than the one awaited.
+        MismatchedTxn,
+        /// A structured ack echoing the awaited transaction's id.
+        MatchingTxn,
+    }
+
+    /// A replica that acks every single-key `AccordApply` per `mode`.
+    struct ApplyAckTransport {
+        mode: ApplyAck,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for ApplyAckTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            match msg {
+                Message::AccordApply(bytes) => {
+                    use crate::accord::wire::{ApplyOkPayload, ApplyPayload};
+                    let payload: ApplyPayload = bincode::deserialize(&bytes).unwrap();
+                    let txn_id = match self.mode {
+                        ApplyAck::Empty => return Ok(Message::AccordApplyOK(Bytes::new())),
+                        ApplyAck::MismatchedTxn => TxnId(Timestamp {
+                            node: payload.txn_id.0.node.wrapping_add(1),
+                            ..payload.txn_id.0
+                        }),
+                        ApplyAck::MatchingTxn => payload.txn_id,
+                    };
+                    let ack = ApplyOkPayload {
+                        txn_id,
+                        from: node_id_of(host_id),
+                    };
+                    Ok(Message::AccordApplyOK(Bytes::from(
+                        bincode::serialize(&ack).unwrap(),
+                    )))
+                }
+                other => panic!("unexpected Apply-phase test message: {other:?}"),
+            }
+        }
+    }
+
+    /// An empty-body `AccordApplyOK` must NOT reach the Apply quorum: it carries
+    /// no `txn_id`, so it cannot prove the sender applied THIS transaction. Fails
+    /// while the `b.is_empty() ||` arm is present (the bare acks then count) and
+    /// passes once the arm is removed.
+    #[tokio::test]
+    async fn apply_quorum_rejects_empty_body_apply_ok() {
+        let replicas = vec![
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        let transport = Arc::new(ApplyAckTransport {
+            mode: ApplyAck::Empty,
+        });
+        let mut driver = driver_with(transport, replicas);
+
+        let result = driver
+            .apply_phase_within(
+                make_ts(2000),
+                std::collections::HashSet::new(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
+            "an empty-body ApplyOK proves nothing about this txn and must not satisfy the \
+             Apply quorum (RF=3, coordinator is not a replica → 0 verified acks of the 2 \
+             required); got {result:?}"
+        );
+    }
+
+    /// A structured ack whose `txn_id` is a DIFFERENT transaction than the one
+    /// awaited must not count toward the quorum either.
+    #[tokio::test]
+    async fn apply_quorum_rejects_mismatched_txn_apply_ok() {
+        let replicas = vec![
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        let transport = Arc::new(ApplyAckTransport {
+            mode: ApplyAck::MismatchedTxn,
+        });
+        let mut driver = driver_with(transport, replicas);
+
+        let result = driver
+            .apply_phase_within(
+                make_ts(2000),
+                std::collections::HashSet::new(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
+            "an ApplyOK for a different txn_id does not prove THIS txn applied; got {result:?}"
+        );
+    }
+
+    /// Positive control: a structured ack echoing THIS transaction's id DOES reach
+    /// the quorum (2 of 3 replicas acked with the awaited `txn_id`).
+    #[tokio::test]
+    async fn apply_quorum_accepts_structured_matching_apply_ok() {
+        let replicas = vec![
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        let transport = Arc::new(ApplyAckTransport {
+            mode: ApplyAck::MatchingTxn,
+        });
+        let mut driver = driver_with(transport, replicas);
+
+        let result = driver
+            .apply_phase_within(
+                make_ts(2000),
+                std::collections::HashSet::new(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a structured ApplyOK carrying the awaited txn_id must satisfy the Apply quorum; \
+             got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn one_true_existence_vote_plus_two_failures_does_not_apply_rf3() {
         let replicas = vec![
@@ -4550,6 +4704,31 @@ mod tests {
         u64::from_be_bytes(host.as_bytes()[..8].try_into().unwrap())
     }
 
+    /// Decode the `txn_id` from an inbound Apply request — the v1 single-key
+    /// `AccordApply` or the multi-key `AccordApplyV2` — and serialise the
+    /// structured `AccordApplyOK` a production replica replies with. Every test
+    /// double that answers an Apply MUST use this: an empty-body ack carries no
+    /// `txn_id` and is NOT counted toward the Apply quorum (it cannot prove which
+    /// transaction, if any, the peer applied).
+    fn structured_apply_ack(msg: Message, from: u64) -> Message {
+        use crate::accord::wire::{ApplyOkPayload, ApplyPayload, ApplyV2Payload};
+        let txn_id = match msg {
+            Message::AccordApply(b) => {
+                bincode::deserialize::<ApplyPayload>(&b)
+                    .expect("v1 Apply payload decodes")
+                    .txn_id
+            }
+            Message::AccordApplyV2(b) => {
+                bincode::deserialize::<ApplyV2Payload>(&b)
+                    .expect("v2 Apply payload decodes")
+                    .txn_id
+            }
+            other => panic!("expected an Apply request, got {other:?}"),
+        };
+        let ack = ApplyOkPayload { txn_id, from };
+        Message::AccordApplyOK(Bytes::from(bincode::serialize(&ack).unwrap()))
+    }
+
     #[async_trait::async_trait]
     impl AccordTransport for SlowPathSelfVoteTransport {
         async fn send(
@@ -4624,8 +4803,11 @@ mod tests {
                         bincode::serialize(&payload).unwrap(),
                     )))
                 }
-                // Commit / Apply / anything else: ack so only Accept is stressed.
-                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                // Commit / anything else: ack so only Accept is stressed.
+                _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
     }
@@ -4981,7 +5163,10 @@ mod tests {
                         .unwrap(),
                     )))
                 }
-                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
     }
@@ -5076,13 +5261,13 @@ mod tests {
                         bincode::serialize(&response).unwrap(),
                     )))
                 }
-                Message::AccordApply(_) => {
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
                     self.events
                         .lock()
                         .push(("apply", host_id, std::time::Instant::now()));
-                    Ok(Message::AccordApplyOK(Bytes::new()))
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
                 }
-                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+                _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
     }
@@ -5254,8 +5439,11 @@ mod tests {
                         bincode::serialize(&payload).unwrap(),
                     )))
                 }
-                // Commit / Apply / anything else: ack.
-                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                // Commit / anything else: ack.
+                _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
     }
@@ -5354,7 +5542,10 @@ mod tests {
                         bincode::serialize(&payload).unwrap(),
                     )))
                 }
-                _ => Ok(Message::AccordApplyOK(Bytes::new())),
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
     }
@@ -5488,8 +5679,14 @@ mod tests {
             msg: Message,
             _lane: ferrosa_net::codec::Lane,
         ) -> ferrosa_net::error::Result<Message> {
+            let reply = match &msg {
+                Message::AccordApply(_) | Message::AccordApplyV2(_) => {
+                    structured_apply_ack(msg.clone(), node_id_of(host_id))
+                }
+                _ => Message::AccordCommit(Bytes::new()),
+            };
             self.sent.lock().insert(host_id, msg);
-            Ok(Message::AccordApplyOK(Bytes::new()))
+            Ok(reply)
         }
     }
 
