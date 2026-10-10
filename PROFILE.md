@@ -162,10 +162,16 @@ lock-free atomic — changing them needs a restart, not a rebuild.
 |---|---|---:|
 | `FERROSA_ACCORD_TXN_TIMEOUT_SECS` | Apply bound: how long a transaction may wait for its dependencies before it is abandoned (rolled back, client told to retry) | `10` s |
 | `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` | Barrier bound: how long the snapshot-barrier read-vote and inbound `ReadVote` wait before abstaining | `5` s |
+| `FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS` | Parked-apply reclamation: how long the dep-wait apply engine may retain a **parked** write-set whose dependency has not arrived before it releases it. This is a TIME bound on residency, never a hard cap on how much may be parked: the park is reclaimed only once its dependency has had far longer than the protocol allows it to arrive. Reclamation is fail-loud (logged at ERROR with the unresolved dependency set; the coordinator abandons the transaction and the client retries), never a silent drop. Keep it **above** the apply bound above | `60` s |
 
 A non-numeric, zero, or negative value logs one warning and uses the default.
 Zero is refused rather than clamped: it would fail every transaction the instant
 it parked.
+
+The parked-apply reclamation bound must stay **strictly above**
+`FERROSA_ACCORD_TXN_TIMEOUT_SECS` and the barrier bound: a park is reclaimed only
+after its dependency has had far longer to arrive than the coordinator will wait,
+so an about-to-resolve park is never released out from under its transaction.
 
 ### SSTable write, compression, and reader buffers
 

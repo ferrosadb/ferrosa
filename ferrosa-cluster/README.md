@@ -572,6 +572,16 @@ the existing single-frame Accord message path.
   this, two transactions whose PreAccepts crossed each waited on the other until
   the dependency wait failed both, with every replica live (FMEA CL-28). A
   dependency cycle among parked transactions is refused loudly, never dropped.
+  A parked write-set that is never resolved is **reclaimed by time**, so it
+  cannot retain its payloads forever: the graph bounds its own
+  `applied`/`aborted` bookkeeping, and `DepWaitApplier::reclaim_stale` is the
+  payload-side counterpart — a park whose dependency never arrives (an abandoned
+  dependency, a lost apply, a dead coordinator) is released after
+  `FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS` (default 60 s, strictly above the
+  apply bound), and every release is **reported at ERROR** with the unresolved
+  dependency set — never a silent drop. The reclaimed transaction's graph waits
+  are cleared, so a dependency that resolves *later* can never wake it into a
+  false `Applied` with nothing left to persist.
   The wait is **bounded and operator-tunable**: `FERROSA_ACCORD_TXN_TIMEOUT_SECS`
   (config `[accord] txn_timeout_secs`), defaulting to
   `epoch_drain::DEFAULT_TXN_TIMEOUT` (10 s, single-sourced so the drain that must

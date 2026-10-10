@@ -24,12 +24,77 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use ferrosa_common::accord::{Timestamp, TxnId};
 use ferrosa_storage::{BatchOp, Mutation, StorageEngine};
 use parking_lot::Mutex;
 
 use crate::accord::dep_wait::DepWaitGraph;
+
+// ---------------------------------------------------------------------------
+// Parked-apply reclamation tunables
+// ---------------------------------------------------------------------------
+
+/// Default time a parked write-set may wait for an unresolved dependency before
+/// the dep-wait engine reclaims it.
+///
+/// A park whose dependency NEVER arrives — an abandoned dependency, a lost
+/// Apply, a dead coordinator — would otherwise retain its whole write-set in
+/// RAM forever (the graph prunes its own bookkeeping; the payloads had no
+/// counterpart). Must stay **strictly greater** than the coordinator's
+/// dependency-wait bound ([`crate::accord::state_machine::DEFAULT_TXN_TIMEOUT`],
+/// 10 s) so a park that is about to resolve is never reclaimed out from under
+/// it. 60 s is six times that bound, matching the decided-txn retention horizon
+/// the state machine already uses.
+///
+/// Externalized tunable; override with
+/// [`PARKED_APPLY_RECLAIM_ENV`]. This is a TIME bound on residency, never a hard
+/// cap on how much may be parked: a park is reclaimed only once its dependency
+/// has provably had far longer than the protocol allows it to arrive.
+pub const DEFAULT_PARKED_APPLY_RECLAIM_SECS: u64 = 60;
+
+/// Environment override for [`DEFAULT_PARKED_APPLY_RECLAIM_SECS`], in seconds.
+pub const PARKED_APPLY_RECLAIM_ENV: &str = "FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS";
+
+/// Resolve the parked-apply reclamation bound from a raw env string.
+///
+/// A missing, empty, zero or malformed value falls back to the default (and
+/// never panics at runtime). Zero is refused rather than clamped, matching the
+/// sibling Accord bounds: a zero reclaim bound would release every park the
+/// instant it parked, i.e. drop parked write-sets before their dependencies
+/// could resolve.
+pub fn resolve_parked_apply_reclaim(raw: Option<&str>) -> Duration {
+    let secs = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_PARKED_APPLY_RECLAIM_SECS);
+    Duration::from_secs(secs)
+}
+
+/// A parked write-set that was reclaimed because its dependency did not arrive
+/// within the configured bound.
+///
+/// Reclamation is a **fail-loud** fact, never a silent drop: the write-set was
+/// NEVER applied (its dependencies were unresolved, so applying it would violate
+/// ordering), and the caller is expected to surface this — the same rule the
+/// coordinator's own dependency-wait abandon follows. `unresolved_deps` names
+/// the dependency set that never arrived so the event is actionable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReclaimedPark {
+    /// The transaction whose parked write-set was released.
+    pub txn_id: TxnId,
+    /// The dependencies that never reached `Applied` on this replica.
+    pub unresolved_deps: Vec<TxnId>,
+}
+
+/// Time a parked write-set has been waiting, plus its (re-constructible) data.
+struct ParkedApply {
+    mutations: Vec<ApplyMutation>,
+    parked_at: Instant,
+}
 
 // ---------------------------------------------------------------------------
 // StorageApplier trait — storage integration seam
@@ -719,7 +784,16 @@ pub struct DepWaitApplier {
     /// applies **every** entry atomically — fixing both the empty-placeholder bug
     /// (queued txns re-applied with `data: vec![]`) and the multi-key drop
     /// (writes 2..N of a parked txn silently lost because only one was stored).
-    pending: Mutex<HashMap<TxnId, Vec<ApplyMutation>>>,
+    ///
+    /// Each entry is timestamped so an unresolvable park (a dependency that never
+    /// arrives) can be reclaimed by TIME — see [`Self::reclaim_stale`]. Without
+    /// that, a park whose dependency never arrives retains its whole write-set in
+    /// RAM forever while the graph prunes its own bookkeeping.
+    pending: Mutex<HashMap<TxnId, ParkedApply>>,
+    /// How long a park may wait before [`Self::reclaim_stale`] releases it.
+    /// Externalized: [`PARKED_APPLY_RECLAIM_ENV`], default
+    /// [`DEFAULT_PARKED_APPLY_RECLAIM_SECS`].
+    reclaim_bound: Duration,
 }
 
 impl DepWaitApplier {
@@ -728,6 +802,9 @@ impl DepWaitApplier {
             graph: Mutex::new(DepWaitGraph::new()),
             applier,
             pending: Mutex::new(HashMap::new()),
+            reclaim_bound: resolve_parked_apply_reclaim(
+                std::env::var(PARKED_APPLY_RECLAIM_ENV).ok().as_deref(),
+            ),
         }
     }
 
@@ -738,6 +815,105 @@ impl DepWaitApplier {
     #[cfg(test)]
     pub fn prune_graph_for_test(&self, max_age: std::time::Duration) -> usize {
         self.graph.lock().prune(max_age)
+    }
+
+    /// Park a whole write-set behind its unresolved dependencies, timestamped so
+    /// an unresolvable park can be reclaimed.
+    fn park(&self, txn_id: TxnId, mutations: Vec<ApplyMutation>) {
+        self.pending.lock().insert(
+            txn_id,
+            ParkedApply {
+                mutations,
+                parked_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Reclaim every parked write-set that has waited at least `max_age` for a
+    /// dependency that never arrived.
+    ///
+    /// This is the payload-side counterpart to [`DepWaitGraph::prune`]: the graph
+    /// bounds its `applied`/`aborted` bookkeeping, and this bounds the parked
+    /// **payloads**. A park whose dependency is never applied — an abandoned
+    /// dependency, a lost Apply, a dead coordinator — would otherwise retain its
+    /// whole write-set in RAM forever.
+    ///
+    /// Reclaiming is **fail loud**, never a silent drop:
+    ///  - the write-set was never applied (its dependencies were unresolved, so
+    ///    applying it would violate Accord ordering) — the coordinator that owns
+    ///    the transaction abandons it on the same bound and tells the client to
+    ///    retry, so nothing durable is lost;
+    ///  - each reclaimed park is returned with the set of unresolved dependencies
+    ///    that never arrived, so the caller logs it at ERROR (a fact worth
+    ///    reporting, not a swallowed failure);
+    ///  - the reclaimed transaction's graph waits are cleared, so a dependency
+    ///    that resolves LATER can never wake it into a false `Applied` with
+    ///    nothing left to persist.
+    ///
+    /// `max_age` of [`Duration::ZERO`] reclaims everything (used by tests). Call
+    /// from the maintenance loop; the bound must exceed the coordinator's
+    /// dependency-wait bound so an about-to-resolve park is never reclaimed.
+    pub fn reclaim_stale(&self, max_age: Duration) -> Vec<ReclaimedPark> {
+        let now = Instant::now();
+        let stale_ids: Vec<TxnId> = self
+            .pending
+            .lock()
+            .iter()
+            .filter(|(_, park)| now.duration_since(park.parked_at) >= max_age)
+            .map(|(txn_id, _)| *txn_id)
+            .collect();
+        if stale_ids.is_empty() {
+            return Vec::new();
+        }
+
+        // Name each park's unresolved deps and clear its graph waits BEFORE the
+        // park is dropped, so a later resolution of an (already-arrived-late)
+        // dependency cannot wake a transaction with no write-set left to apply.
+        let mut reclaimed: Vec<ReclaimedPark> = Vec::with_capacity(stale_ids.len());
+        {
+            let mut graph = self.graph.lock();
+            for txn_id in stale_ids {
+                let mut unresolved_deps: Vec<TxnId> = graph
+                    .deps_of(&txn_id)
+                    .map(|deps| deps.iter().copied().collect())
+                    .unwrap_or_default();
+                unresolved_deps.sort();
+                graph.clear_waits(txn_id);
+                reclaimed.push(ReclaimedPark {
+                    txn_id,
+                    unresolved_deps,
+                });
+            }
+        }
+        // Release the parked bytes (and, once staged, the backing spill).
+        {
+            let mut pending = self.pending.lock();
+            for park in &reclaimed {
+                pending.remove(&park.txn_id);
+            }
+        }
+        for park in &reclaimed {
+            tracing::error!(
+                txn = park.txn_id.0.time,
+                dep_count = park.unresolved_deps.len(),
+                unresolved_deps = ?park.unresolved_deps,
+                "accord apply: reclaiming a parked write-set whose dependency never arrived \
+                 within the bound — the write-set was NOT applied (fail loud, never a silent drop)"
+            );
+        }
+        reclaimed
+    }
+
+    /// Reclaim stale parks using this applier's configured bound (from
+    /// [`PARKED_APPLY_RECLAIM_ENV`], resolved once in [`Self::new`]).
+    pub fn reclaim_stale_default(&self) -> Vec<ReclaimedPark> {
+        self.reclaim_stale(self.reclaim_bound)
+    }
+
+    /// Number of write-sets currently parked (test-only).
+    #[cfg(test)]
+    pub fn parked_count_for_test(&self) -> usize {
+        self.pending.lock().len()
     }
 
     /// Number of transactions the graph currently believes are applied.
@@ -848,7 +1024,7 @@ impl DepWaitApplier {
             // data when the last dependency resolves — not an empty placeholder,
             // and not just the first key.
             drop(graph);
-            self.pending.lock().insert(txn_id, mutations);
+            self.park(txn_id, mutations);
             return Ok(Vec::new());
         }
 
@@ -914,7 +1090,8 @@ impl DepWaitApplier {
             // `try_apply_writeset`). If absent — e.g. a no-write finalize that
             // parked nothing — there is nothing to persist; still mark it applied
             // so its own waiters proceed.
-            if let Some(mutations) = self.pending.lock().remove(&waiter) {
+            if let Some(parked) = self.pending.lock().remove(&waiter) {
+                let mutations = parked.mutations;
                 let datas: Vec<Vec<u8>> = mutations.iter().map(|m| m.data.clone()).collect();
                 if let Err(e) = self.applier.apply_writeset(waiter, mutations) {
                     // Fail loud: the parked write-set did not persist (atomically,
@@ -1560,6 +1737,142 @@ mod tests {
             "A applies, then both of B's writes cascade"
         );
         assert_eq!(noop.apply_count(), 3);
+    }
+
+    // =======================================================================
+    // Parked-apply reclamation — an unresolvable park must not leak forever.
+    // =======================================================================
+
+    /// RED (captured before the fix): `pending` had NO prune/spill/TTL and
+    /// `reclaim_stale` did not exist, so this did not compile against the owned
+    /// shape. A park whose dependency NEVER arrives keeps its whole write-set
+    /// resident in RAM forever — while the graph prunes its own `applied`/`aborted`
+    /// bookkeeping. This pins the payload-side counterpart.
+    #[test]
+    fn an_unresolvable_park_is_reclaimed_and_surfaced_never_retained_forever() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+
+        let dep = txn_id(1, 500);
+        let txn = txn_id(2, 1000);
+
+        // A whole two-key write-set parked behind a dependency that never arrives.
+        let writes = vec![
+            ApplyMutation {
+                data: b"key1-write".to_vec(),
+                t: ts(1000),
+                deps: vec![dep],
+            },
+            ApplyMutation {
+                data: b"key2-write".to_vec(),
+                t: ts(1000),
+                deps: vec![dep],
+            },
+        ];
+        assert!(applier.try_apply_writeset(txn, writes).unwrap().is_empty());
+        assert_eq!(
+            applier.parked_count_for_test(),
+            1,
+            "the whole write-set parks behind the unapplied dependency"
+        );
+        assert_eq!(noop.apply_count(), 0, "nothing applies while parked");
+
+        // After the bound, the park is released — and the release is SURFACED with
+        // the dependency set that never arrived, never swallowed. (`ZERO` reclaims
+        // every park regardless of age; production uses the configured bound.)
+        let reclaimed = applier.reclaim_stale(Duration::ZERO);
+        assert_eq!(reclaimed.len(), 1, "the stale park is reclaimed");
+        assert_eq!(reclaimed[0].txn_id, txn);
+        assert_eq!(
+            reclaimed[0].unresolved_deps,
+            vec![dep],
+            "the unresolved dependency is named, not swallowed"
+        );
+        assert_eq!(
+            applier.parked_count_for_test(),
+            0,
+            "the unresolvable park is released, not retained forever"
+        );
+
+        // Reclaiming must NOT let the abandoned txn be falsely marked applied:
+        // when the (never-arriving) dependency finally resolves, nothing cascades
+        // into it with no write-set left to persist.
+        let woken = applier.notify_applied(dep);
+        assert!(
+            woken.is_empty(),
+            "a reclaimed park must never be woken with nothing to apply"
+        );
+        assert_eq!(
+            noop.apply_count(),
+            0,
+            "no write is applied for a reclaimed park"
+        );
+    }
+
+    /// The positive control for reclamation: a park still inside the bound is
+    /// untouched and still applies EVERY key when its dependency resolves.
+    #[test]
+    fn a_park_inside_the_bound_survives_reclaim_and_still_applies_every_key() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone());
+
+        let dep = txn_id(1, 500);
+        let txn = txn_id(2, 1000);
+        let writes = vec![
+            ApplyMutation {
+                data: b"key1-write".to_vec(),
+                t: ts(1000),
+                deps: vec![dep],
+            },
+            ApplyMutation {
+                data: b"key2-write".to_vec(),
+                t: ts(1000),
+                deps: vec![dep],
+            },
+        ];
+        assert!(applier.try_apply_writeset(txn, writes).unwrap().is_empty());
+
+        // A bound far larger than the park's age reclaims nothing.
+        assert!(
+            applier.reclaim_stale(Duration::from_secs(3600)).is_empty(),
+            "a fresh park is not stale"
+        );
+        assert_eq!(applier.parked_count_for_test(), 1);
+
+        // The dependency resolves normally → BOTH keys apply, no write lost.
+        let woken = applier.notify_applied(dep);
+        let datas: Vec<Vec<u8>> = woken.into_iter().map(|(_, d)| d).collect();
+        assert_eq!(noop.apply_count(), 2);
+        assert!(
+            datas.contains(&b"key1-write".to_vec()) && datas.contains(&b"key2-write".to_vec()),
+            "a park inside the bound must still apply every key on resolve"
+        );
+    }
+
+    #[test]
+    fn the_parked_apply_reclaim_bound_is_externalized_and_malformed_values_fall_back() {
+        assert_eq!(
+            resolve_parked_apply_reclaim(None),
+            Duration::from_secs(DEFAULT_PARKED_APPLY_RECLAIM_SECS)
+        );
+        assert_eq!(
+            resolve_parked_apply_reclaim(Some(" 30 ")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_parked_apply_reclaim(Some("nope")),
+            Duration::from_secs(DEFAULT_PARKED_APPLY_RECLAIM_SECS),
+            "a malformed value fails back to the default, never panics"
+        );
+        assert_eq!(
+            resolve_parked_apply_reclaim(Some("")),
+            Duration::from_secs(DEFAULT_PARKED_APPLY_RECLAIM_SECS)
+        );
+        assert_eq!(
+            resolve_parked_apply_reclaim(Some("0")),
+            Duration::from_secs(DEFAULT_PARKED_APPLY_RECLAIM_SECS),
+            "zero is refused rather than clamped, matching the sibling Accord bounds"
+        );
     }
 
     // =======================================================================

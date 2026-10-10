@@ -178,6 +178,24 @@ impl AccordStateMachine {
         self.apply_engine.applied_count_for_test()
     }
 
+    /// Reclaim parked write-sets whose dependency never arrived within the
+    /// configured bound, returning each with its unresolved dependency set so the
+    /// caller can surface it (fail loud, never a silent drop). See
+    /// [`crate::accord::apply::DepWaitApplier::reclaim_stale`].
+    pub fn reclaim_stale_parked_applies(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Vec<crate::accord::apply::ReclaimedPark> {
+        self.apply_engine.reclaim_stale(max_age)
+    }
+
+    /// Reclaim stale parked write-sets using the dep-wait engine's configured
+    /// bound ([`crate::accord::apply::PARKED_APPLY_RECLAIM_ENV`]). See
+    /// [`Self::reclaim_stale_parked_applies`].
+    pub fn reclaim_stale_parked_applies_default(&self) -> Vec<crate::accord::apply::ReclaimedPark> {
+        self.apply_engine.reclaim_stale_default()
+    }
+
     /// Create a new state machine for the given node.
     ///
     /// Uses a [`NoopStorageApplier`]: the apply seam records `(txn_id, t)` but
