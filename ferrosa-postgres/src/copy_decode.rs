@@ -107,7 +107,17 @@ pub struct CopyDecoder {
     pending: Vec<u8>,
     /// `csv` + `header`: whether the header row has been consumed.
     header_consumed: bool,
+    /// Set once the in-band end-of-data marker (`\.` alone on a line, text format) is seen.
+    ///
+    /// Pre-3.0 clients — `pgbench -i` among them — end a COPY payload with that marker on the wire
+    /// and only then send `CopyDone`; PostgreSQL honors the marker and stops reading rows. Without
+    /// this, the two bytes `\.` are decoded as a row and refused as an unknown escape, and the
+    /// whole load fails. Once seen, no further bytes are rows.
+    ended: bool,
 }
+
+/// The legacy end-of-data marker: a text-format line consisting of exactly a backslash and a dot.
+const TEXT_END_OF_DATA_MARKER: &[u8] = b"\\.";
 
 impl CopyDecoder {
     pub fn new(opts: CopyOptions) -> Self {
@@ -115,7 +125,14 @@ impl CopyDecoder {
             opts,
             pending: Vec::new(),
             header_consumed: false,
+            ended: false,
         }
+    }
+
+    /// Whether the in-band `\.` end-of-data marker has been seen. Once it has, the payload is
+    /// over: any later `CopyData` frames are the client flushing, not more rows.
+    pub fn ended(&self) -> bool {
+        self.ended
     }
 
     /// Feed one `CopyData` payload and return the rows it completed.
@@ -130,6 +147,11 @@ impl CopyDecoder {
     ///
     /// A malformed payload — see [`CopyDecodeError`].
     pub fn push(&mut self, chunk: Vec<u8>) -> Result<Vec<CopyRow>, CopyDecodeError> {
+        if self.ended {
+            // The payload already ended at the in-band marker; a client still flushing bytes after
+            // it is not sending rows.
+            return Ok(Vec::new());
+        }
         if self.pending.is_empty() {
             self.pending = chunk;
         } else {
@@ -147,6 +169,12 @@ impl CopyDecoder {
             if self.skip_as_header() {
                 continue;
             }
+            // In TEXT format only `\.` (a backslash-dot written `\\.`) can be a literal
+            // backslash-dot, so a complete `\.` line is the legacy end-of-data marker, never a row.
+            if self.opts.format == CopyFormat::Text && raw == TEXT_END_OF_DATA_MARKER {
+                self.ended = true;
+                break;
+            }
             rows.push(self.decode_row(&raw)?);
         }
         Ok(rows)
@@ -159,10 +187,18 @@ impl CopyDecoder {
     ///
     /// A trailing partial row, or a malformed one.
     pub fn finish(&mut self) -> Result<Vec<CopyRow>, CopyDecodeError> {
+        if self.ended {
+            self.pending.clear();
+            return Ok(Vec::new());
+        }
         if self.pending.is_empty() {
             return Ok(Vec::new());
         }
         let raw = std::mem::take(&mut self.pending);
+        if self.opts.format == CopyFormat::Text && raw == TEXT_END_OF_DATA_MARKER {
+            self.ended = true;
+            return Ok(Vec::new());
+        }
         if self.skip_as_header() {
             return Ok(Vec::new());
         }
@@ -457,6 +493,45 @@ mod tests {
             1,
             "...and it does, so this was the escape rather than a malformed field"
         );
+    }
+
+    /// The legacy in-band end-of-data marker: pre-3.0 clients (`pgbench -i` among them) end a COPY
+    /// payload with a line `\.` and only then send `CopyDone`. It ends the payload — it is not a
+    /// row, and a later `CopyData` frame is a client flushing, not data.
+    #[test]
+    fn the_legacy_end_of_data_marker_ends_the_payload_and_is_not_a_row() {
+        let mut d = text();
+        // `row1\n` then a `\.\n` marker, both in one chunk.
+        let rows = d.push_owned(b"row1\n\\.\n").unwrap();
+        assert_eq!(rows.len(), 1, "only the row before the marker is a row");
+        assert_eq!(rows[0][0], Some(b"row1".to_vec()));
+        assert!(d.ended(), "the marker must end the payload");
+
+        assert!(
+            d.push_owned(b"late\trow\n").unwrap().is_empty(),
+            "bytes after the marker are not rows"
+        );
+        assert!(d.finish().unwrap().is_empty(), "and there is no tail row");
+    }
+
+    /// The marker can be split across two `CopyData` frames, exactly as a row can.
+    #[test]
+    fn the_end_of_data_marker_may_arrive_split_across_frames() {
+        let mut d = text();
+        assert_eq!(d.push_owned(b"row1\n\\").unwrap().len(), 1);
+        assert!(!d.ended(), "a lone backslash is not yet the marker");
+        assert!(d.push_owned(b".\n").unwrap().is_empty());
+        assert!(d.ended());
+    }
+
+    /// `\\.` (backslash-dot) is the only spelling of a literal backslash-dot in text format, so a
+    /// payload may carry it as data. Only a LONE `\.` is the end marker.
+    #[test]
+    fn an_escaped_backslash_dot_is_a_value_not_the_end_marker() {
+        let mut d = text();
+        let rows = d.push_owned(b"\\\\.\n").unwrap();
+        assert_eq!(rows[0][0], Some(b"\\.".to_vec()));
+        assert!(!d.ended(), "only a lone `\\.` ends the payload");
     }
 
     /// A trailing partial row is an error at the end: storing half a row is worse than refusing.

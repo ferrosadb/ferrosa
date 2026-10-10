@@ -241,6 +241,11 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
     terminator — client data is never reinterpreted as SQL. `FREEZE [ON|OFF]` is
     accepted-and-recorded (an LSM has no frozen rows, and it is what `pgbench -i` sends);
     other options, a bad option value, and `COPY … TO` are refused **by name** (`0A000`).
+  - **The legacy end-of-data marker is honored.** A pre-3.0 client ends a text payload with a line
+    `\.` on the wire and only then sends `CopyDone` — exactly what `pgbench -i` does. A server that
+    does not honor it decodes the two bytes as an unknown escape (`22P04`) and the whole load fails
+    at the client's `PQendcopy`. `copy_decode` recognises a lone `\.` line as end-of-data: it is
+    never a row, and anything the client flushes after it is ignored.
 - **`VACUUM` (flush + compact) / `ANALYZE` (accepted no-op)** — `VACUUM [FULL]
   [ANALYZE|ANALYSE]` answers `CommandComplete "VACUUM"` and `ANALYZE|ANALYSE`
   answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds.

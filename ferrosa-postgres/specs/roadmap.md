@@ -239,6 +239,13 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
     mid-payload **aborts** the transaction, so a later `COMMIT` rolls back rather than committing a
     partial load: the partial-commit trap the old `25001` refusal stood in front of. This is what
     lets `pgbench -i`, which wraps its `COPY`s in one `BEGIN`/`COMMIT`, load.
+  - **The legacy `\.` end-of-data marker ends the payload.** `pgbench -i` streams its rows, then a
+    `\.` line, and only then a `CopyDone`. `copy_decode` treats a lone `\.` line as end-of-data —
+    never a row — so the marker is not refused as a malformed escape (`22P04`) and the load the
+    client's `PQendcopy` waits on completes. Bytes the client flushes after the marker are ignored.
+    Tested end to end through `query_loop` (`pgbench_legacy_copy_end_marker_lands_rows`), together
+    with the fast-path gate agreeing with the parser on a trailing-`;` statement
+    (`a_copy_statement_with_a_trailing_semicolon_still_enters_copy_mode`).
 
   A row whose field count does not match the column list is refused (`22P04`) rather than padded.
   The option list is parsed by `ferrosa-sql`: `FREEZE [ON|OFF]` — a heap-page concept an LSM has no

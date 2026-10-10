@@ -3315,4 +3315,126 @@ pub(crate) mod txn_atomicity_tests {
             _ => None,
         })
     }
+
+    /// Frame one frontend message exactly as a client would: a tag byte, a big-endian length
+    /// that includes the length word itself, then the body.
+    fn pg_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + body.len());
+        out.push(tag);
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A simple-query (`Q`) message carrying one NUL-terminated SQL string.
+    fn pg_query(sql: &str) -> Vec<u8> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        pg_frame(b'Q', &body)
+    }
+
+    /// A `CopyData` (`d`) frame.
+    fn pg_copy_data(data: &[u8]) -> Vec<u8> {
+        pg_frame(b'd', data)
+    }
+
+    /// Drive a whole client byte stream through the REAL connection loop (`query_loop`) and
+    /// return everything the server wrote back, as text.
+    ///
+    /// This is the seam the `COPY` tests in `copy_stdin.rs` do NOT cross: they call
+    /// `copy_stdin::drive` directly. Only `query_loop` holds the fast-path gate that decides
+    /// whether a `COPY` statement is handed to `drive` at all, so only a test that runs through
+    /// here can prove the handshake actually happens.
+    async fn run_wire(ctx: &QueryContext, wire: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        // The pipe must hold the whole request plus the server's reply without a reader running.
+        client.write_all(wire).await.unwrap();
+
+        let mut frames = bytes::BytesMut::new();
+        let mut read_buf = vec![0u8; 1 << 16];
+        let auth = superuser();
+        query_loop(&mut server, &mut frames, ctx, auth, &mut read_buf)
+            .await
+            .expect("query_loop returns on Terminate or EOF");
+        // Close our end so the read below reaches EOF instead of blocking forever.
+        drop(server);
+
+        let mut reply = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), client.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => reply.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    /// `pgbench -i` (client-side data generation) speaks the LEGACY libpq copy protocol: it sends
+    /// the copy rows, then the in-band end-of-data marker `\.` as a `CopyData` line, and only then
+    /// calls `PQendcopy`, which sends a `CopyDone`. A server that does not honor `\.` decodes it as
+    /// a bad payload (a lone `\` before `.` is an unknown escape) and the whole load fails.
+    ///
+    /// This drives the exact byte stream through `query_loop` and asserts the rows LAND.
+    #[tokio::test]
+    async fn pgbench_legacy_copy_end_marker_lands_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("copy kv from stdin with (freeze on)"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        // pgbench's `PQputline(con, "\\.\n")`.
+        wire.extend(pg_copy_data(b"\\.\n"));
+        // `PQendcopy` sends `CopyDone`.
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_frame(b'X', &[])); // Terminate
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.starts_with('G'),
+            "the COPY must be acknowledged with CopyInResponse first: {text:?}"
+        );
+        assert!(
+            text.contains("COPY 1"),
+            "the row before the `\\.` marker must be reported as loaded: {text:?}"
+        );
+        assert!(
+            !text.contains("22P04"),
+            "the `\\.` marker must not be decoded as a payload error: {text:?}"
+        );
+        assert!(
+            !text.contains("08P01"),
+            "the trailing CopyDone from PQendcopy must not be a protocol violation: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "the row must have landed, not merely been acknowledged"
+        );
+    }
+
+    /// The fast-path gate in `query_loop` and the ordinary parser must agree on what a COPY
+    /// statement is. psql appends the statement terminator, so the wire text carries a trailing
+    /// `;`; the gate must still route it to `copy_stdin::drive`.
+    #[tokio::test]
+    async fn a_copy_statement_with_a_trailing_semicolon_still_enters_copy_mode() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("copy kv from stdin;"));
+        wire.extend(pg_copy_data(b"z\tq\n"));
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_frame(b'X', &[]));
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.starts_with('G'),
+            "a trailing `;` must still open COPY mode: {text:?}"
+        );
+        assert!(text.contains("COPY 1"), "the row is counted: {text:?}");
+        assert_eq!(row_count(&ctx, "z").await, 1, "the row must have landed");
+    }
 }
