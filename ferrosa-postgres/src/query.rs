@@ -1528,6 +1528,93 @@ fn decimal_from_numeric_text(text: &str) -> Result<CqlValue, BackendMessage> {
     }
 }
 
+/// Parse a TEXT value into the [`SqlValue`] the target column's arm expects.
+///
+/// Only the types with an unambiguous text form are handled; anything else is refused by name
+/// rather than guessed at, because a silently misread value is worse than a refusal. A value that
+/// has a text form but does not parse is refused `22P02`, matching PostgreSQL's
+/// `invalid_text_representation` — never defaulted to zero, empty, or NULL.
+fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessage> {
+    let trimmed = text.trim();
+    let bad = |what: &str| {
+        Err(error_response(
+            "22P02",
+            &format!("invalid input syntax for type {what}: \"{text}\""),
+        ))
+    };
+    match ty {
+        CqlType::Int | CqlType::Bigint | CqlType::Counter => trimmed
+            .parse::<i64>()
+            .map(SqlValue::Int)
+            .or_else(|_| bad("integer")),
+        CqlType::Smallint => trimmed
+            .parse::<i16>()
+            .map(|v| SqlValue::Int(v as i64))
+            .or_else(|_| bad("smallint")),
+        CqlType::Tinyint => trimmed
+            .parse::<i8>()
+            .map(|v| SqlValue::Int(v as i64))
+            .or_else(|_| bad("tinyint")),
+        CqlType::Float | CqlType::Double => trimmed
+            .parse::<f64>()
+            .map(|v| SqlValue::Float(v.into()))
+            .or_else(|_| bad("float")),
+        // PostgreSQL's boolean input accepts these spellings; anything else is not a boolean.
+        CqlType::Boolean => match trimmed.to_ascii_lowercase().as_str() {
+            "t" | "true" | "y" | "yes" | "on" | "1" => Ok(SqlValue::Bool(true)),
+            "f" | "false" | "n" | "no" | "off" | "0" => Ok(SqlValue::Bool(false)),
+            _ => bad("boolean"),
+        },
+        CqlType::Uuid | CqlType::Timeuuid => trimmed
+            .parse::<uuid::Uuid>()
+            .map(SqlValue::Uuid)
+            .or_else(|_| bad("uuid")),
+        CqlType::Inet => trimmed
+            .parse::<std::net::IpAddr>()
+            .map(SqlValue::Inet)
+            .or_else(|_| bad("inet")),
+        // PostgreSQL's bytea text form: `\x` followed by an even number of hex digits.
+        CqlType::Blob => {
+            let Some(hex) = trimmed.strip_prefix("\\x") else {
+                return bad("bytea");
+            };
+            if hex.len() % 2 != 0 {
+                return bad("bytea");
+            }
+            let mut bytes = Vec::with_capacity(hex.len() / 2);
+            for pair in hex.as_bytes().chunks(2) {
+                let Ok(byte) = u8::from_str_radix(std::str::from_utf8(pair).unwrap_or(""), 16)
+                else {
+                    return bad("bytea");
+                };
+                bytes.push(byte);
+            }
+            Ok(SqlValue::Bytea(bytes))
+        }
+        // Types whose text form is NOT implemented here. Refused by name rather than guessed,
+        // and deliberately not routed through the `42804` catch-all so the message says which
+        // thing is missing instead of blaming the client's value.
+        CqlType::Timestamp
+        | CqlType::Date
+        | CqlType::Time
+        | CqlType::Duration
+        | CqlType::Varint
+        | CqlType::List(_)
+        | CqlType::Map(_, _)
+        | CqlType::Set(_)
+        | CqlType::Tuple(_)
+        | CqlType::Udt { .. }
+        | CqlType::Vector(_, _)
+        | CqlType::Varchar
+        | CqlType::Ascii
+        | CqlType::Decimal
+        | CqlType::Jsonb => Err(error_response(
+            "0A000",
+            &format!("no text form is implemented for column type {ty:?}"),
+        )),
+    }
+}
+
 /// Convert a SQL [`SqlValue`] literal to the [`CqlValue`] the engine stores,
 /// driven by the target column's [`CqlType`]. The inverse of
 /// `storage_provider::cql_to_value`; `Null` maps to a tombstone for any type,
@@ -1604,6 +1691,22 @@ pub(crate) fn value_to_cql(
             let doc = parse_text_input(text.as_bytes(), jsonb_limits, InputEdge::Literal)
                 .map_err(|e| error_response(e.sqlstate, &e.message))?;
             CqlValue::Jsonb(doc)
+        }
+        // A COPY payload carries NO TYPES: every field arrives as bytes, so the destination COLUMN
+        // is the only thing that can say what a field means. PostgreSQL parses COPY input per the
+        // target column's type for the same reason. Without this arm, `COPY t FROM STDIN` into any
+        // non-text column fails `42804` — observed live as
+        // `ERROR: value does not match column type Int`.
+        //
+        // The text is parsed into the SqlValue the target type already expects and the call
+        // recurses, so units and conversions stay in ONE place: a text `1.5` bound to a Decimal
+        // goes down the very arm the literal `1.5` takes, and cannot drift from it.
+        //
+        // This sits AFTER the specific text arms above (varchar/ascii/decimal/jsonb), which keep
+        // their own meaning, and BEFORE the catch-all, which still refuses a NON-text value whose
+        // type does not match.
+        (ty, SqlValue::Text(text)) => {
+            value_to_cql(&text_to_sql_value(ty, text)?, ty, jsonb_limits)?
         }
         (CqlType::Ascii, _)
         | (CqlType::Bigint, _)
@@ -3539,6 +3642,90 @@ mod tests {
         assert_eq!(row[0], SqlValue::Int(1));
         assert!(matches!(&row[1], SqlValue::Text(s) if s.contains("ferrosa")));
         assert_eq!(row[2], SqlValue::Text("myks".to_string()));
+    }
+
+    /// A COPY payload has no types at all: every field arrives as text and the destination COLUMN
+    /// is the only thing that can say what it means. So every scalar type needs a text form, or
+    /// `COPY t FROM STDIN` into that column is simply impossible. This is the coercion the live
+    /// probe was failing on (`value does not match column type Int`).
+    #[test]
+    fn text_has_a_form_for_every_scalar_column_type() {
+        use ferrosa_common::CqlValue as C;
+        let limits = crate::jsonb_wire::test_limits();
+        let c =
+            |text: &str, ty: &CqlType| value_to_cql(&SqlValue::Text(text.to_string()), ty, &limits);
+        assert_eq!(c("42", &CqlType::Int).unwrap(), C::Int(42));
+        assert_eq!(c("-7", &CqlType::Bigint).unwrap(), C::Bigint(-7));
+        assert_eq!(c("5", &CqlType::Smallint).unwrap(), C::Smallint(5));
+        assert_eq!(c("1", &CqlType::Tinyint).unwrap(), C::Tinyint(1));
+        assert_eq!(c("9", &CqlType::Counter).unwrap(), C::Counter(9));
+        assert_eq!(
+            c("1.5", &CqlType::Double).unwrap(),
+            C::Double(1.5f64.to_bits())
+        );
+        assert_eq!(
+            c("1.5", &CqlType::Float).unwrap(),
+            C::Float(1.5f32.to_bits())
+        );
+        assert_eq!(c("true", &CqlType::Boolean).unwrap(), C::Boolean(true));
+        assert_eq!(c("off", &CqlType::Boolean).unwrap(), C::Boolean(false));
+        let u = uuid::Uuid::nil();
+        assert_eq!(c(&u.to_string(), &CqlType::Uuid).unwrap(), C::Uuid(u));
+        assert_eq!(
+            c("127.0.0.1", &CqlType::Inet).unwrap(),
+            C::Inet("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            c("\\x0a0b", &CqlType::Blob).unwrap(),
+            C::Blob(vec![0x0a, 0x0b])
+        );
+        // The decimal text form still works, through the same recursion.
+        assert!(c("1.5", &CqlType::Decimal).is_ok());
+    }
+
+    /// A value with a text form that does not parse is refused `22P02`, NOT defaulted to zero,
+    /// empty, or NULL. A silent default would store a value the client never sent.
+    #[test]
+    fn malformed_text_is_refused_rather_than_defaulted() {
+        let limits = crate::jsonb_wire::test_limits();
+        for (text, ty) in [
+            ("abc", CqlType::Int),
+            ("1.2.3", CqlType::Double),
+            ("maybe", CqlType::Boolean),
+            ("nope", CqlType::Uuid),
+            ("999.1.1.1", CqlType::Inet),
+            ("\\x0", CqlType::Blob),
+        ] {
+            let err = value_to_cql(&SqlValue::Text(text.to_string()), &ty, &limits)
+                .expect_err(&format!("`{text}` into {ty:?} must be refused"));
+            assert!(
+                format!("{err:?}").contains("22P02"),
+                "`{text}` into {ty:?} must be a 22P02, got {err:?}"
+            );
+        }
+    }
+
+    /// A type with no text form is refused by NAME rather than blamed on the client's value, so
+    /// the message says what is missing. Timestamp/Date/Time are not implemented for text input
+    /// yet; that is a documented gap, not a silent misread.
+    #[test]
+    fn a_column_type_without_a_text_form_is_refused_by_name() {
+        let limits = crate::jsonb_wire::test_limits();
+        let err = value_to_cql(
+            &SqlValue::Text("2024-01-01".to_string()),
+            &CqlType::Timestamp,
+            &limits,
+        )
+        .expect_err("text into timestamp is not implemented");
+        let dbg = format!("{err:?}");
+        assert!(
+            dbg.contains("0A000"),
+            "unimplemented, not a value mismatch: {dbg}"
+        );
+        assert!(
+            dbg.contains("Timestamp"),
+            "the message must name the type: {dbg}"
+        );
     }
 
     #[test]
