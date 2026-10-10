@@ -91,82 +91,9 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = lex(trimmed)?;
     let mut p = Parser::new(toks);
-
-    p.expect(&Tok::Select, "SELECT")?;
-    let distinct = if matches!(p.peek(), Some(Tok::Distinct)) {
-        p.next();
-        true
-    } else {
-        false
-    };
-    let projection = p.parse_projection()?;
-    p.expect(&Tok::From, "FROM")?;
-    let from = p.parse_table_ref()?;
-    let join = if matches!(p.peek(), Some(Tok::Join | Tok::Inner)) {
-        Some(p.parse_join()?)
-    } else {
-        None
-    };
-    let filter = if matches!(p.peek(), Some(Tok::Where)) {
-        p.next();
-        Some(p.parse_expr()?)
-    } else {
-        None
-    };
-    let group_by = if matches!(p.peek(), Some(Tok::Group)) {
-        p.next();
-        p.expect(&Tok::By, "BY")?;
-        p.parse_column_list()?
-    } else {
-        Vec::new()
-    };
-    let having = if matches!(p.peek(), Some(Tok::Having)) {
-        p.next();
-        Some(p.parse_expr()?)
-    } else {
-        None
-    };
-    let order_by = if matches!(p.peek(), Some(Tok::Order)) {
-        p.next();
-        p.expect(&Tok::By, "BY")?;
-        p.parse_order_by()?
-    } else {
-        Vec::new()
-    };
-    // LIMIT and OFFSET in either order, both optional.
-    let mut limit = None;
-    let mut offset = None;
-    loop {
-        match p.peek() {
-            Some(Tok::Limit) if limit.is_none() => {
-                p.next();
-                limit = Some(p.parse_u64()?);
-            }
-            Some(Tok::Offset) if offset.is_none() => {
-                p.next();
-                offset = Some(p.parse_u64()?);
-            }
-            _ => break,
-        }
-    }
-    if let Some(t) = p.peek() {
-        return Err(ParseError::Unexpected {
-            expected: "end of statement",
-            found: format!("{t:?}"),
-        });
-    }
-    Ok(SelectStmt {
-        distinct,
-        projection,
-        from,
-        join,
-        filter,
-        group_by,
-        having,
-        order_by,
-        limit,
-        offset,
-    })
+    let stmt = p.parse_select_stmt()?;
+    p.expect_end()?;
+    Ok(stmt)
 }
 
 /// Parse a top-level statement off the Postgres wire: a table `SELECT`, a
@@ -588,6 +515,83 @@ impl Parser {
         }
     }
 
+    /// Parse a full table `SELECT` (`SELECT ... FROM ...`) starting at the
+    /// `SELECT` token, stopping after its last clause. Does NOT require the
+    /// statement to end there: a scalar subquery's inner select is followed by
+    /// the `)` that closes it and possibly a `||`. The public [`parse`] adds the
+    /// end-of-statement check for a top-level statement.
+    fn parse_select_stmt(&mut self) -> Result<SelectStmt, ParseError> {
+        self.expect(&Tok::Select, "SELECT")?;
+        let distinct = if matches!(self.peek(), Some(Tok::Distinct)) {
+            self.next();
+            true
+        } else {
+            false
+        };
+        let projection = self.parse_projection()?;
+        self.expect(&Tok::From, "FROM")?;
+        let from = self.parse_table_ref()?;
+        let join = if matches!(self.peek(), Some(Tok::Join | Tok::Inner)) {
+            Some(self.parse_join()?)
+        } else {
+            None
+        };
+        let filter = if matches!(self.peek(), Some(Tok::Where)) {
+            self.next();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let group_by = if matches!(self.peek(), Some(Tok::Group)) {
+            self.next();
+            self.expect(&Tok::By, "BY")?;
+            self.parse_column_list()?
+        } else {
+            Vec::new()
+        };
+        let having = if matches!(self.peek(), Some(Tok::Having)) {
+            self.next();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let order_by = if matches!(self.peek(), Some(Tok::Order)) {
+            self.next();
+            self.expect(&Tok::By, "BY")?;
+            self.parse_order_by()?
+        } else {
+            Vec::new()
+        };
+        // LIMIT and OFFSET in either order, both optional.
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            match self.peek() {
+                Some(Tok::Limit) if limit.is_none() => {
+                    self.next();
+                    limit = Some(self.parse_u64()?);
+                }
+                Some(Tok::Offset) if offset.is_none() => {
+                    self.next();
+                    offset = Some(self.parse_u64()?);
+                }
+                _ => break,
+            }
+        }
+        Ok(SelectStmt {
+            distinct,
+            projection,
+            from,
+            join,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
     fn parse_projection(&mut self) -> Result<Projection, ParseError> {
         // A single bare `*` is `SELECT *`.
         if matches!(self.peek(), Some(Tok::Star))
@@ -610,6 +614,11 @@ impl Parser {
     fn is_expr_select(&self) -> bool {
         match self.toks.get(self.pos + 1) {
             Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_)) => true,
+            // A leading `( SELECT ...` begins a scalar subquery operand, so this
+            // is an expression select. An LParen not followed by SELECT stays a
+            // table select (whose projection then refuses the LParen loudly);
+            // no table select's projection can start with `(`, so this is safe.
+            Some(Tok::LParen) => matches!(self.toks.get(self.pos + 2), Some(Tok::Select)),
             Some(Tok::Ident(w)) => {
                 let up = w.to_ascii_uppercase();
                 matches!(up.as_str(), "TRUE" | "FALSE" | "NULL")
@@ -649,13 +658,26 @@ impl Parser {
         Ok(ScalarItem { value, alias })
     }
 
-    /// The operand of a `||` (or a lone select item): a `$N` param, a zero-arg
-    /// function call, or a literal.
+    /// The operand of a `||` (or a lone select item): a `$N` param, a scalar
+    /// subquery `( SELECT ... )`, a zero-arg function call, or a literal.
     fn parse_scalar_primary(&mut self) -> Result<ScalarValue, ParseError> {
         if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
             Ok(ScalarValue::Param(n))
+        } else if matches!(self.peek(), Some(Tok::LParen))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Select))
+        {
+            // `( SELECT ... )` — a scalar subquery operand. Consume the `(`, read
+            // the inner table select (`parse_select_stmt` stops at its last
+            // clause), then require the matching `)`. An LParen NOT followed by
+            // SELECT falls through to the literal path below and stays as refused
+            // as it was: an ordinary parenthesised scalar (`(1)`) is still
+            // unsupported, never silently accepted.
+            self.next(); // `(`
+            let inner = self.parse_select_stmt()?;
+            self.expect(&Tok::RParen, ")")?;
+            Ok(ScalarValue::Subquery(Box::new(inner)))
         } else if matches!(self.peek(), Some(Tok::Ident(_)))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
         {
@@ -2948,5 +2970,119 @@ mod tests {
                 other => panic!("`{sql}` must be refused by name, got {other:?}"),
             }
         }
+    }
+
+    // ---- scalar subqueries `( SELECT ... )` in the SELECT list ----
+
+    /// Flatten a left-associative `||` tree into its operands, left to right.
+    fn concat_operands(value: &ScalarValue) -> Vec<&ScalarValue> {
+        match value {
+            ScalarValue::Concat { left, right } => {
+                let mut parts = concat_operands(left);
+                parts.push(right);
+                parts
+            }
+            other => vec![other],
+        }
+    }
+
+    /// The `count(*)`-over-`table` a scalar subquery must be, or a panic naming
+    /// what was found instead.
+    fn count_star_table(value: &ScalarValue) -> &str {
+        let ScalarValue::Subquery(stmt) = value else {
+            panic!("expected a scalar subquery, got {value:?}");
+        };
+        assert!(
+            matches!(
+                &stmt.projection,
+                Projection::Items(items)
+                    if items.len() == 1
+                        && matches!(
+                            &items[0],
+                            SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star }
+                        )
+            ),
+            "expected `count(*)`, got {:?}",
+            stmt.projection
+        );
+        assert!(stmt.filter.is_none(), "the probe subquery has no WHERE");
+        stmt.from.table.as_str()
+    }
+
+    #[test]
+    fn a_scalar_subquery_parses_as_a_concatenation_operand_in_order() {
+        // RED before the change: a leading `(` made this a table select, which
+        // died `expected identifier, found `LParen``. Afterwards the three
+        // subqueries parse as `||` operands, left to right, each `count(*)` over
+        // its own relation — the pgbench census line.
+        let items = scalar_items(
+            "select (select count(*) from pgbench_accounts)||'|'||\
+             (select count(*) from pgbench_tellers)||'|'||\
+             (select count(*) from pgbench_branches)",
+        );
+        assert_eq!(items.len(), 1);
+        let parts = concat_operands(&items[0].value);
+        assert_eq!(parts.len(), 5, "three subqueries and two `|` literals");
+        assert_eq!(
+            [0, 2, 4]
+                .iter()
+                .map(|&i| count_star_table(parts[i]))
+                .collect::<Vec<_>>(),
+            ["pgbench_accounts", "pgbench_tellers", "pgbench_branches"],
+            "the subqueries keep their written order"
+        );
+        for i in [1, 3] {
+            assert_eq!(
+                *parts[i],
+                ScalarValue::Literal(Value::Text("|".into())),
+                "the separators are the `|` literals, in order"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_subquery_may_be_the_whole_select_item() {
+        let items = scalar_items("SELECT (SELECT count(*) FROM t) AS n");
+        assert_eq!(items[0].alias.as_deref(), Some("n"));
+        assert_eq!(count_star_table(&items[0].value), "t");
+    }
+
+    #[test]
+    fn a_parenthesised_scalar_that_is_not_a_select_is_still_refused() {
+        // Negative control: only `( SELECT ... )` becomes a subquery. An ordinary
+        // parenthesised scalar was unsupported before and stays so — this must
+        // never be silently accepted as something else.
+        for sql in ["SELECT (1)", "SELECT ('a')", "SELECT (version())"] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "`{sql}` must still be refused: parenthesised scalars are not a subquery"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_scalar_subquery_is_refused() {
+        // Negative control: a subquery that is not a well-formed `( SELECT ... )`
+        // fails loud — an unclosed paren, an extra paren, and an inner query with
+        // no `FROM` (the probe's shape needs a relation to count over).
+        for sql in [
+            "SELECT (SELECT count(*) FROM t",
+            "SELECT (SELECT count(*) FROM t))",
+            "SELECT (SELECT 1)",
+            "SELECT (SELECT count(*) FROM t) || ",
+        ] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "`{sql}` is malformed and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_subquery_outside_the_select_list_is_refused() {
+        // The new grammar reaches only the select-list scalar primary. A subquery
+        // in WHERE stays unsupported (the WHERE grammar takes a column/aggregate
+        // operand or a literal/`$N` term), and is refused loudly, not ignored.
+        assert!(parse_statement("SELECT a FROM t WHERE k = (SELECT 1)").is_err());
     }
 }

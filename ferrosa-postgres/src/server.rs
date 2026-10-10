@@ -746,6 +746,17 @@ pub(crate) fn dml_context<'a>(
     }
 }
 
+/// The context for a no-`FROM` expression select: storage over the session's
+/// current snapshot (so a scalar subquery can run), plus the session's pending
+/// writes so the inner query sees the caller's uncommitted rows.
+fn scalar_read_ctx<'a>(
+    ctx: &'a QueryContext,
+    session: &'a Session,
+    snapshot: &'a crate::mvcc::MvccSnapshot,
+) -> query::ScalarReadCtx<'a> {
+    query::ScalarReadCtx::new(read_env(ctx, snapshot), Some(session.txn_writes()))
+}
+
 /// The snapshot a read runs at: the transaction's own under serializable
 /// isolation, otherwise the current one.
 fn read_snapshot(ctx: &QueryContext, session: &Session) -> crate::mvcc::MvccSnapshot {
@@ -1140,7 +1151,9 @@ async fn describe(
                 // No-FROM expression select: no parameters (rejected at parse),
                 // so an empty ParameterDescription + columns from the scalars.
                 PreparedKind::Exprs(items) => {
-                    match query::execute_scalar_select(&items, &ctx.default_schema) {
+                    let snapshot = read_snapshot(ctx, session);
+                    let scalar_ctx = scalar_read_ctx(ctx, session, &snapshot);
+                    match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => vec![
                             extended::parameter_description(&[]),
                             extended::describe_statement_rows(&result.columns),
@@ -1245,7 +1258,9 @@ async fn describe(
                     }
                 }
                 PreparedKind::Exprs(items) => {
-                    match query::execute_scalar_select(&items, &ctx.default_schema) {
+                    let snapshot = read_snapshot(ctx, session);
+                    let scalar_ctx = scalar_read_ctx(ctx, session, &snapshot);
+                    match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => {
                             vec![extended::describe_portal_rows(
                                 &result.columns,
@@ -1596,7 +1611,9 @@ async fn execute_portal_inner(
         ))],
         // No-FROM expression select: no tables, no params. Evaluate and render.
         PreparedKind::Exprs(items) => {
-            match query::execute_scalar_select(&items, &ctx.default_schema) {
+            let snapshot = read_snapshot(ctx, session);
+            let scalar_ctx = scalar_read_ctx(ctx, session, &snapshot);
+            match query::execute_scalar_select(&items, scalar_ctx).await {
                 Ok(result) => {
                     let msgs = query::render_execute_result(Ok(result), &result_formats);
                     if matches!(msgs.first(), Some(BackendMessage::ErrorResponse { .. })) {

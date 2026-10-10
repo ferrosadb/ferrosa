@@ -376,6 +376,17 @@ pub enum ScalarValue {
         left: Box<ScalarValue>,
         right: Box<ScalarValue>,
     },
+    /// `( SELECT ... )` — a scalar subquery used as an operand.
+    ///
+    /// Boxed because [`SelectStmt`] is far larger than the other variants (and
+    /// is itself boxed inside [`Statement`]). The front-end executes the inner
+    /// query and uses its single value (PostgreSQL `EXPR_SUBLINK` semantics):
+    /// no rows → SQL NULL; more than one row → `21000 cardinality_violation`;
+    /// more than one output column → `42601` (refused, never the first column).
+    ///
+    /// Produced only by the select-list scalar grammar's `parse_scalar_primary`;
+    /// the DML/`VALUES` and `FROM`-relation grammars never build one.
+    Subquery(Box<SelectStmt>),
 }
 
 impl ScalarValue {
@@ -383,14 +394,39 @@ impl ScalarValue {
     ///
     /// The extended-protocol `Parse` path refuses expression selects that carry
     /// a parameter (no column to infer its type from), so the check has to walk
-    /// a concatenation rather than only looking at the top level.
+    /// a concatenation rather than only looking at the top level. A scalar
+    /// subquery is walked into through [`SelectStmt::references_param`]: a `$N`
+    /// in the inner `WHERE`/`HAVING` would run unbound, so it is refused here.
     pub fn references_param(&self) -> bool {
         match self {
             ScalarValue::Param(_) => true,
             ScalarValue::Concat { left, right } => {
                 left.references_param() || right.references_param()
             }
+            ScalarValue::Subquery(stmt) => stmt.references_param(),
             ScalarValue::Literal(_) | ScalarValue::Func(_) => false,
+        }
+    }
+}
+
+impl SelectStmt {
+    /// Whether a `$N` parameter placeholder appears anywhere in this table
+    /// select's `WHERE`/`HAVING` — the only clauses whose grammar admits one.
+    pub fn references_param(&self) -> bool {
+        self.filter.as_ref().is_some_and(Expr::references_param)
+            || self.having.as_ref().is_some_and(Expr::references_param)
+    }
+}
+
+impl Expr {
+    /// Whether this boolean expression contains a `$N` parameter placeholder.
+    pub fn references_param(&self) -> bool {
+        match self {
+            Expr::And(left, right) | Expr::Or(left, right) => {
+                left.references_param() || right.references_param()
+            }
+            Expr::Not(inner) => inner.references_param(),
+            Expr::Compare { value, .. } => matches!(value, Term::Param(_)),
         }
     }
 }
