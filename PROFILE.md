@@ -395,6 +395,20 @@ instant's process RSS splits a COMMIT peak into the heap it holds and the
 non-heap around it (the spill file's mapped pages, allocator metadata, page
 cache).
 
+What the probe found on a 1.1 M-row transactional `COPY` (see
+`ferrosa-cluster/specs/fmea.md` CL-53/CL-54 and `ferrosa-postgres/specs/fmea.md`
+PG-ACC-03): the dominant APPLY term is the DECODED APPLY path — ~2.4 KB per
+decoded op, a ratio stable across an 11x range — NOT the MVCC version store,
+which the same log reports at ~157 MB (`history_kib`/`dist_kib` 160766 each).
+`EngineStorageApplier::apply_writeset` now consumes its input write-set as it
+decodes instead of pinning every payload next to the decoded `Vec<BatchOp>`
+(the guard is `ferrosa-cluster/tests/accord_apply_decode_residency.rs`): live-heap
+peak at N=1 100 000 fell 3650.7 -> 3452.3 MiB and RSS peak 5235 -> 4687 MB. The
+peak is still NOT flat across N — the front-end `mutations` clone, the
+per-key/participant maps, the version history, and the two per-peer Apply frames
+are all still O(N) resident.
+
+
 The maximum snapshot age bounds how long an abandoned or long-running
 transaction can retain old row versions. Once expired, its next query or commit
 fails with `40001`; the reaper removes its active lease and allows history
