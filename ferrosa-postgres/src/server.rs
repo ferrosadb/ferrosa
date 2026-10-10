@@ -983,31 +983,24 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             // the time Accord runs, instead of staying resident alongside
             // `accord_writes` for the whole PreAccept/Commit/Apply sequence.
             let prepare_started = std::time::Instant::now();
-            // The distributed commit still builds the Accord write-set as an owned
-            // vector: its `TransactionWrite` bytes ARE the apply payload the
-            // coordinator hands to Accord. Streaming that build is the named
-            // follow-up; the front-end write-set is already staged and bounded.
-            let mut mutations: Vec<ferrosa_storage::Mutation> = Vec::new();
-            if let Err(error) = staged.for_each_mutation(&mut |mutation| {
-                mutations.push(mutation.clone());
-                Ok(())
-            }) {
-                session.end_txn();
-                return vec![query::error_response(
-                    "58000",
-                    &format!("transaction commit failed: {error}"),
-                )];
-            }
             if residency_profile {
                 tracing::info!(
-                    phase = "mutations_cloned",
-                    mutations = mutations.len(),
+                    phase = "accord_build.entry",
+                    staged = staged.len(),
                     live_mib = ferrosa_common::mem_probe::live_mib(),
                     "pg commit residency"
                 );
             }
+            // Stream the staged write-set STRAIGHT into the Accord write-set builder.
+            // The former shape deep-cloned every staged frame into a resident
+            // `Vec<Mutation>` (the `mutations_cloned` phase, ~690 MB at 1.1M rows)
+            // solely to hand it to the builder; the builder now consumes the source
+            // one OWNED mutation at a time and holds at most one bounded prefetch
+            // chunk. The `TransactionWrite` bytes it produces ARE the apply payload
+            // the coordinator hands to Accord. `staged` is BORROWED, not consumed —
+            // the non-Accord commit path below still needs it.
             let accord_writes =
-                match query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations) {
+                match query::prepare_accord_writes_streaming(&ctx.engine, &ctx.schema, &staged) {
                     Ok(writes) => writes,
                     Err(error) => {
                         session.end_txn();
@@ -3025,7 +3018,7 @@ pub(crate) mod txn_atomicity_tests {
 
         // New path: one streaming pass, no whole-table map.
         let writes =
-            query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations.clone()).unwrap();
+            query::prepare_accord_writes_streaming(&ctx.engine, &ctx.schema, &mutations).unwrap();
         assert_eq!(
             writes.len(),
             mutations.len(),

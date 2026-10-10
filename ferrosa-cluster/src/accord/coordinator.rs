@@ -1500,6 +1500,27 @@ impl AccordCoordinatorDriver {
             ReadVotePayload,
         };
 
+        // Residency attribution (see `FERROSA_PG_COMMIT_PROFILE`): a live-heap probe
+        // at each ordering phase boundary, so the bytes that appear between the
+        // driver's `drive.write_set_built` and `apply_phase.entry` are attributed to
+        // the phase that caused them — the PreAccept key clone + local conflict-index
+        // registration, the per-phase wire payloads, the Accept/Commit fan-out —
+        // rather than guessed at. `apply_phase.entry` (Phase 5) is the next boundary.
+        let residency_profile = txn_profile_enabled() && ferrosa_common::mem_probe::installed();
+        macro_rules! residency {
+            ($phase:expr) => {
+                if residency_profile {
+                    tracing::info!(
+                        phase = $phase,
+                        keys = self.write_set.len(),
+                        live_mib = ferrosa_common::mem_probe::live_mib(),
+                        "accord order residency"
+                    );
+                }
+            };
+        }
+        residency!("order.entry");
+
         // Multi-key execution is wired end to end: PreAccept fans `AccordPreAcceptV2`
         // (all keys) so each replica unions dependencies across the whole write-set
         // (t_276e12), and the Apply phase fans a per-replica `AccordApplyV2` (scoped
@@ -1901,6 +1922,8 @@ impl AccordCoordinatorDriver {
             }
         }
 
+        residency!("order.preaccept_decided");
+
         // ------------------------------------------------------------------
         // Phase 2: Accept fanout (slow path only)
         // ------------------------------------------------------------------
@@ -2058,6 +2081,8 @@ impl AccordCoordinatorDriver {
             }
         };
 
+        residency!("order.accept_done");
+
         // ------------------------------------------------------------------
         // Phase 3: Commit broadcast (wait for F+1 CommitOK)
         //
@@ -2146,6 +2171,8 @@ impl AccordCoordinatorDriver {
             rtt = self.coordinator.rtt_count(),
             "accord: transaction committed"
         );
+
+        residency!("order.commit_done");
 
         // ------------------------------------------------------------------
         // Phase 4: Read-vote fanout (Gap 4 — linearizable IF-condition read)
@@ -2454,6 +2481,8 @@ impl AccordCoordinatorDriver {
                 }
             }
         } // end read-vote phase (skipped for ReadPredicate::Always)
+
+        residency!("order.readvote_done");
 
         Ok((commit_t, commit_deps))
     }
@@ -2871,6 +2900,8 @@ impl AccordCoordinatorDriver {
                 // `consensus_logging_is_bounded` guard forbids a per-transaction
                 // log at INFO because such lines saturated the disk the CQL
                 // runtime needs and stopped consensus answering read votes.
+                // Profile-gating alone is not sufficient — the guard is about the
+                // level, not how often the profile is enabled.
                 tracing::debug!(
                     txn_id = ?txn_id,
                     peers = ack_ms.len(),
