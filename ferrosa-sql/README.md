@@ -49,7 +49,14 @@ in-memory table in tests and by Ferrosa storage in production.
   timestamp[tz], inet, `jsonb`, `json` (`PgType::storage()` maps `json` to
   `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
   `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
-  `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`.
+  `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`. An optional
+  trailing `WITH (key = value, ...)` storage-parameter clause is parsed and each
+  accepted pair is recorded on `CreateTableStmt::storage_parameters` — `fillfactor`
+  and `autovacuum_enabled` are PostgreSQL physical-layout / background-maintenance
+  hints ferrosa has no equivalent for (it is an LSM/SSTable store: no heap pages, no
+  autovacuum), so they are recorded but not applied. Any other option name is refused
+  by name (`ParseError::UnsupportedStorageParameter`, `0A000`) rather than dropped;
+  pgbench's `create table ... with (fillfactor=100)` is the motivating case.
 - Maintenance statements **parsed** (executed by the Postgres front end):
   `TRUNCATE [TABLE] t [, …]` into `Statement::Truncate`; `VACUUM [FULL]
   [ANALYZE|ANALYSE] [t]` into `Statement::Vacuum`; `ANALYZE|ANALYSE [t]` into

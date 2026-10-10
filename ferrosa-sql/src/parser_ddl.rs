@@ -19,6 +19,24 @@ use crate::ast::{
 /// (`UnsupportedClause::ForeignSchema`) until schema-to-keyspace mapping exists.
 const MAPPED_SCHEMA: &str = "public";
 
+/// The `CREATE TABLE ... WITH (key = value)` storage parameters ferrosa **records
+/// but does not apply**. Each is a pure physical-layout or background-maintenance
+/// hint with no effect on query results:
+///
+/// - `fillfactor` — the heap page-fill target. It only changes how full Postgres
+///   packs heap pages; it can never change what a query returns. pgbench's own
+///   schema sets `with (fillfactor=100)`, so refusing it would keep `pgbench -i`
+///   broken.
+/// - `autovacuum_enabled` — Postgres's own autovacuum toggle, again layout-only.
+///
+/// ferrosa is an LSM/SSTable store: it has no heap pages and no autovacuum, so it
+/// has no equivalent to honour either. Accepting them is safe precisely because
+/// they are hints, and the AST keeps each one (`CreateTableStmt::storage_parameters`)
+/// so the acceptance is visible rather than a silent swallow. Every other option
+/// name is refused (`ParseError::UnsupportedStorageParameter`), so a client that
+/// asked for real behaviour (e.g. `WITH (oids=false)`) learns immediately.
+const ACCEPTED_STORAGE_PARAMETERS: &[&str] = &["fillfactor", "autovacuum_enabled"];
+
 impl Parser {
     /// `CREATE TABLE [IF NOT EXISTS] name ( elem [, elem]* )`. The leading
     /// `CREATE` token has not been consumed yet.
@@ -44,8 +62,63 @@ impl Parser {
                 None => return Err(ParseError::UnexpectedEnd),
             }
         }
+        let storage_parameters = self.parse_optional_storage_parameters()?;
         self.expect_end()?;
-        finish_create_table(if_not_exists, name, columns, table_pk)
+        finish_create_table(if_not_exists, name, columns, table_pk, storage_parameters)
+    }
+
+    /// `WITH ( key = value [, ...] )`, an optional clause after the table body.
+    ///
+    /// The accepted names are [`ACCEPTED_STORAGE_PARAMETERS`]: PostgreSQL physical-layout
+    /// hints ferrosa **records but does not apply**. Every other name is refused by name
+    /// (`ParseError::UnsupportedStorageParameter`) rather than parsed and discarded — a
+    /// client that asked for real behaviour must not get silent success. A `WITH` not
+    /// followed by `(` (including PostgreSQL's `WITHOUT OIDS`) is not this clause and is
+    /// left to `expect_end` to reject loudly.
+    fn parse_optional_storage_parameters(&mut self) -> Result<Vec<(String, String)>, ParseError> {
+        if !self.peek_is_kw("WITH") {
+            return Ok(Vec::new());
+        }
+        self.next(); // WITH
+        self.expect(&Tok::LParen, "(")?;
+        let mut params = Vec::new();
+        loop {
+            // The key is an identifier, matched case-insensitively and stored lowercased.
+            let key = self.ident()?.to_ascii_lowercase();
+            if !ACCEPTED_STORAGE_PARAMETERS.contains(&key.as_str()) {
+                return Err(ParseError::UnsupportedStorageParameter(key));
+            }
+            self.expect(&Tok::Eq, "=")?;
+            params.push((key, self.parse_storage_parameter_value()?));
+            match self.peek() {
+                Some(Tok::Comma) => {
+                    self.next();
+                }
+                Some(Tok::RParen) => {
+                    self.next();
+                    return Ok(params);
+                }
+                _ => {
+                    return Err(ParseError::Unexpected {
+                        expected: ", or )",
+                        found: format!("{:?}", self.peek()),
+                    })
+                }
+            }
+        }
+    }
+
+    /// A storage-parameter value: a number, a quoted string, or a bare identifier
+    /// (`false`, `on`).
+    fn parse_storage_parameter_value(&mut self) -> Result<String, ParseError> {
+        match self.next() {
+            Some(Tok::Int(n)) => Ok(n.to_string()),
+            Some(Tok::Str(s) | Tok::Ident(s)) => Ok(s),
+            other => Err(ParseError::Unexpected {
+                expected: "a storage parameter value",
+                found: format!("{other:?}"),
+            }),
+        }
     }
 
     fn parse_if_not_exists(&mut self) -> Result<bool, ParseError> {
@@ -682,6 +755,7 @@ fn finish_create_table(
     name: TableRef,
     mut columns: Vec<ColumnDef>,
     table_pk: Option<Vec<String>>,
+    storage_parameters: Vec<(String, String)>,
 ) -> Result<Statement, ParseError> {
     if columns.is_empty() {
         return Err(ParseError::Unexpected {
@@ -719,6 +793,7 @@ fn finish_create_table(
         name,
         columns,
         primary_key,
+        storage_parameters,
     })))
 }
 

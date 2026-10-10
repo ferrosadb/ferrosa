@@ -13,6 +13,15 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **`CREATE TABLE ... WITH (key = value, ...)` (table storage parameters).** pgbench's
+  own schema emits `with (fillfactor=100)`, which stopped `pgbench -i` at
+  `expected end of statement, found Ident("with")`. `ferrosa-sql` now parses the clause:
+  the pure physical-layout hints `fillfactor` and `autovacuum_enabled` are recorded on
+  `CreateTableStmt::storage_parameters` and not applied (ferrosa is an LSM store — no
+  heap pages, no autovacuum, so there is nothing to configure and no query-visible
+  effect to miss); every other option name is refused `0A000` naming it rather than
+  dropped, and a bare unparenthesised `WITH` is a loud parse error.
+
 - **Numeric/decimal literal binding in DML.** `INSERT INTO t (a, b) VALUES (1, 1.5)`
   into a `numeric` column failed `42804 value does not match column type Decimal`,
   which blocked `pgbench -i` and the PostgreSQL smoke check. `query::value_to_cql`

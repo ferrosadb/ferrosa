@@ -198,6 +198,14 @@ pub struct CreateTableStmt {
     /// key (see `ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN`) rather than the parser
     /// refusing the statement.
     pub primary_key: Vec<String>,
+    /// The `WITH (key = value, ...)` table storage parameters, in the order written
+    /// and with each key lowercased. **Recorded, not applied.** ferrosa is an
+    /// LSM/SSTable store with no heap pages and no autovacuum, so these hints have no
+    /// physical meaning here; they are kept on the AST so an option the parser
+    /// accepted is visible (and testable) rather than silently dropped. Anything
+    /// outside the accepted set is refused by name at parse time
+    /// (`ParseError::UnsupportedStorageParameter`).
+    pub storage_parameters: Vec<(String, String)>,
 }
 
 /// One column of a `CREATE TABLE`.
