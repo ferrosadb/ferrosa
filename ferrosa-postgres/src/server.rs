@@ -959,6 +959,18 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     let commit_started = std::time::Instant::now();
     let mut prepare_nanos: u64 = 0;
     let mut accord_nanos: u64 = 0;
+    // Residency attribution: `FERROSA_PG_COMMIT_PROFILE=1` on an `alloc-probe`
+    // build logs the live heap at each COMMIT phase boundary, so a peak is
+    // attributed to the phase that caused it rather than guessed at.
+    let residency_profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
+        && ferrosa_common::mem_probe::installed();
+    if residency_profile {
+        tracing::info!(
+            phase = "commit_start",
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "pg commit residency"
+        );
+    }
     let outcome = if let Some(committer) = ctx.accord.committer() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
             Err(error)
@@ -986,6 +998,14 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                     &format!("transaction commit failed: {error}"),
                 )];
             }
+            if residency_profile {
+                tracing::info!(
+                    phase = "mutations_cloned",
+                    mutations = mutations.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
             let accord_writes =
                 match query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations) {
                     Ok(writes) => writes,
@@ -997,6 +1017,14 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                         )];
                     }
                 };
+            if residency_profile {
+                tracing::info!(
+                    phase = "accord_writes_built",
+                    writes = accord_writes.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
             prepare_nanos = u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
                 session.end_txn();
@@ -1031,6 +1059,14 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 )),
             };
             accord_nanos = u64::try_from(accord_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if residency_profile {
+                tracing::info!(
+                    phase = "after_accord",
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    peak_mib = ferrosa_common::mem_probe::peak_mib(),
+                    "pg commit residency"
+                );
+            }
             accord_result
         }
     } else {

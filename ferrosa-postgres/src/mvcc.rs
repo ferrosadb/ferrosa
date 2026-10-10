@@ -689,6 +689,14 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
                 &self.profile.prepare_decoded,
                 u64::try_from(decoded).unwrap_or(u64::MAX),
             );
+            if ferrosa_common::mem_probe::installed() {
+                tracing::info!(
+                    phase = "mvcc.prepare_postgres_apply",
+                    decoded,
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
         }
         Ok(())
     }
@@ -711,6 +719,14 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
                 &self.profile.apply_decoded,
                 u64::try_from(decoded).unwrap_or(u64::MAX),
             );
+            if ferrosa_common::mem_probe::installed() {
+                tracing::info!(
+                    phase = "mvcc.on_postgres_apply",
+                    decoded,
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
         }
         Ok(())
     }

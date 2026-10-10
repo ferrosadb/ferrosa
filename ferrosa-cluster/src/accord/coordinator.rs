@@ -2536,6 +2536,15 @@ impl AccordCoordinatorDriver {
         let self_id = self.self_id;
         let self_is_replica = self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil();
         let participant = self.participant_set();
+        let residency_profile = txn_profile_enabled() && ferrosa_common::mem_probe::installed();
+        if residency_profile {
+            tracing::info!(
+                phase = "apply_phase.entry",
+                keys = self.write_set.len(),
+                live_mib = ferrosa_common::mem_probe::live_mib(),
+                "accord apply residency"
+            );
+        }
 
         // ------------------------------------------------------------------
         // Phase 5: Apply broadcast (Gap 5 — dep-wait + storage write)
@@ -2586,6 +2595,14 @@ impl AccordCoordinatorDriver {
                 .filter(|(_, e)| self.replica_owns_key(self_id, &e.key))
                 .map(|(index, _)| self.entry_mutation(index).map(|bytes| (index, bytes)))
                 .collect::<Result<Vec<_>, _>>()?;
+            if txn_profile_enabled() && ferrosa_common::mem_probe::installed() {
+                tracing::info!(
+                    phase = "apply.local_owned_resolved",
+                    owned_entries = owned.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "accord apply residency"
+                );
+            }
             if let Some(local_sm) = &self.local_accord_state {
                 let owned_writes: Vec<Vec<u8>> =
                     owned.into_iter().map(|(_, bytes)| bytes).collect();
@@ -2613,6 +2630,7 @@ impl AccordCoordinatorDriver {
             if let Some(started) = t_local_apply {
                 tracing::info!(
                     local_apply_ms = started.elapsed().as_millis() as u64,
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
                     "accord apply_phase: coordinator's own apply (concurrent with the remote fan-out)"
                 );
             }
@@ -2672,6 +2690,14 @@ impl AccordCoordinatorDriver {
         let (local_apply_result, local_applied, apply_result) =
             tokio::join!(local_apply, local_apply_wait, remote_apply);
         local_apply_result?;
+        if residency_profile {
+            tracing::info!(
+                phase = "apply_phase.join_done",
+                live_mib = ferrosa_common::mem_probe::live_mib(),
+                peak_mib = ferrosa_common::mem_probe::peak_mib(),
+                "accord apply residency"
+            );
+        }
 
         if !local_applied {
             let state = if let Some(local_sm) = &self.local_accord_state {
@@ -2856,6 +2882,7 @@ impl AccordCoordinatorDriver {
                     shared_frame = shared,
                     max_ack_ms = ack_ms.iter().copied().max().unwrap_or(0),
                     sum_ack_ms = ack_ms.iter().sum::<u64>(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
                     "accord apply_fanout attribution"
                 );
             }
@@ -3000,6 +3027,15 @@ impl AccordCoordinatorDriver {
                     }
                 };
                 frame_bytes = frame_bytes.max(bytes.len());
+                if profile && ferrosa_common::mem_probe::installed() {
+                    tracing::info!(
+                        phase = "apply.frame_built",
+                        frame_bytes = bytes.len(),
+                        inflight = inflight.len() + 1,
+                        live_mib = ferrosa_common::mem_probe::live_mib(),
+                        "accord apply residency"
+                    );
+                }
                 let msg = if region {
                     Message::AccordApplyV2Region(bytes)
                 } else if capnp {

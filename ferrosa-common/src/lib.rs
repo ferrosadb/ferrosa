@@ -26,6 +26,7 @@ pub mod deployment_mode;
 pub mod error;
 pub mod geometry;
 pub mod key;
+pub mod mem_probe;
 pub mod murmur3;
 pub mod schema;
 pub mod task_pool;

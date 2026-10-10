@@ -374,6 +374,27 @@ with result size; increasing this buffer only changes the storage-side producer
 window. A portal suspended by `Execute` with `max_rows` keeps one blocking
 executor thread until it resumes or is closed.
 
+#### Residency attribution (`alloc-probe`)
+
+`FERROSA_PG_COMMIT_PROFILE=1` also emits `phase=... live_mib=...` residency lines
+at each COMMIT phase boundary, but only in a binary built with the `alloc-probe`
+feature:
+
+```bash
+cargo build -p ferrosa --features alloc-probe     # diagnostic build
+FERROSA_PG_COMMIT_PROFILE=1 ./target/debug/ferrosa
+```
+
+`alloc-probe` installs a counting global allocator (`ferrosa::counting_alloc`)
+that feeds `ferrosa_common::mem_probe` with live-heap bytes, so a line reads the
+exact resident heap at that boundary (`pg commit residency`,
+`accord apply residency`, `accord drive residency`). A production build does not
+enable the feature: it uses jemalloc directly, pays no allocation-path cost, and
+the lines are absent (not zero-valued). Comparing live_MiB with the same
+instant's process RSS splits a COMMIT peak into the heap it holds and the
+non-heap around it (the spill file's mapped pages, allocator metadata, page
+cache).
+
 The maximum snapshot age bounds how long an abandoned or long-running
 transaction can retain old row versions. Once expired, its next query or commit
 fails with `40001`; the reaper removes its active lease and allows history

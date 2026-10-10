@@ -66,6 +66,14 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   here (not `ferrosa-storage`) so a future `ferrosa-sstable` write pump can
   share the exact same token `ferrosa-storage`'s compaction executor uses
   (T-021, `compaction-cancel-safety.md`).
+- **Live-heap probe** — `mem_probe` (the `alloc-probe` feature): a process-wide
+  live-heap counter (`live_bytes`/`peak_bytes`/`live_mib`/`peak_mib`) that the
+  `ferrosa` binary's counting global allocator feeds, so a diagnostics path can
+  read the resident heap at a phase boundary and attribute a memory peak to the
+  phase that caused it (see `PROFILE.md`, `FERROSA_PG_COMMIT_PROFILE`). The
+  feature is OFF by default: without it the recording calls are empty and inline
+  away, the binary uses jemalloc directly, and `installed()` is `false` so a
+  caller logs nothing rather than a fabricated zero.
 - **System-column key minting** — `timeuuid::v1_timeuuid(time_100ns, clock_seq,
   node)` builds the 16 bytes of a v1 TimeUUID (RFC 4122 §4.1.2) and
   `timeuuid::is_reserved_column_name` guards the `_sys_` prefix. Used for the

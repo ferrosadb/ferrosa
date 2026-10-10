@@ -346,6 +346,14 @@ async fn drive_accord(
     }
     let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
     let resolve_ns = t_resolve.map(|t| t.elapsed().as_nanos() as u64);
+    if profile {
+        tracing::info!(
+            phase = "drive.resolve_done",
+            keys = per_key.len(),
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "accord drive residency"
+        );
+    }
 
     // 2. Build the write-set + the per-key participant resolver for the driver.
     let t_write_set = profile.then(std::time::Instant::now);
@@ -380,6 +388,21 @@ async fn drive_accord(
     let write_set: Vec<(Vec<u8>, Vec<u8>)> =
         writes.into_iter().map(|w| (w.key, w.mutation)).collect();
     let write_set_len_hint = write_set.len();
+    if profile {
+        let (staged_entries, staged_bytes, staged_index) = match &write_blobs {
+            Some(spill) => (spill.len(), spill.bytes(), spill.resident_index_bytes()),
+            None => (0, 0, 0),
+        };
+        tracing::info!(
+            phase = "drive.write_set_built",
+            keys = write_set_len_hint,
+            staged_entries,
+            staged_payload_bytes = staged_bytes,
+            staged_index_bytes = staged_index,
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "accord drive residency"
+        );
+    }
     let per_key = Arc::new(per_key);
     let pk = per_key.clone();
     let participant_resolver =
@@ -434,6 +457,7 @@ async fn drive_accord(
             resolve_ms = resolve_ns as f64 / 1_000_000.0,
             write_set_ms = write_set_ns as f64 / 1_000_000.0,
             driver_ms = t_run.elapsed().as_millis() as u64,
+            live_mib = ferrosa_common::mem_probe::live_mib(),
             "drive_accord attribution"
         );
     }

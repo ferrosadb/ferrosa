@@ -537,8 +537,16 @@ impl StorageApplier for EngineStorageApplier {
         // commits through ONE `apply_batch`, which preflights every target table
         // BEFORE appending any commit-log record — so either all surviving keys
         // land durably or none do (all-or-nothing; no partial / torn apply).
-        let mut ops: Vec<BatchOp> = Vec::new();
         let profile_apply = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+        if profile_apply {
+            tracing::info!(
+                phase = "apply_writeset.entry",
+                mutations = mutations.len(),
+                live_mib = ferrosa_common::mem_probe::live_mib(),
+                "accord apply residency"
+            );
+        }
+        let mut ops: Vec<BatchOp> = Vec::new();
         let decode_started = profile_apply.then(std::time::Instant::now);
         // The (txn,key,t) triples this call will newly persist — recorded only
         // AFTER the batch is durable, so a failed apply leaves them re-appliable.
@@ -639,6 +647,15 @@ impl StorageApplier for EngineStorageApplier {
         // failure NONE of the ops are applied; propagated as `ApplyError`
         // (never fake success).
         let decode_ms = decode_started.map(|t| t.elapsed().as_millis() as u64);
+        if profile_apply {
+            tracing::info!(
+                phase = "apply_writeset.decoded",
+                ops = ops.len(),
+                metadata_entries = postgres_mvcc_metadata.len(),
+                live_mib = ferrosa_common::mem_probe::live_mib(),
+                "accord apply residency"
+            );
+        }
         let apply_started = profile_apply.then(std::time::Instant::now);
         self.engine.apply_batch(ops).map_err(|e| ApplyError {
             txn_id,
