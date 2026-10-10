@@ -939,6 +939,15 @@ per-partition predicate is applied *table-wide*.
   predicate and timestamp ordering as a per-partition tombstone, at table scope.
   A row written at or after `marked_for_delete_at` survives (a later `INSERT`
   keeps its data); an older row is suppressed immediately.
+- **The probe is a read, not a hard check.** Resolving the watermark opens the
+  SSTables whose token range covers the reserved key. An overlapping generation
+  that cannot be consulted takes the **same fresh-view retry** as the read's own
+  sources — never an immediate error — and only retry exhaustion quarantines it
+  and fails the read loud. So the transient compaction window (the input was
+  retired and its merged output holds the rows) cannot fail a read that is
+  otherwise answerable; `engine::tests::read_compaction_race_stress` pins it.
+  Compaction's own caller (`TableStore::table_tombstone`) keeps the hard error,
+  because it must not reclaim rows on a partial answer.
 - **Reclamation.** `merge::reclaim_covers_table` drops the covered rows and static
   cells at the next compaction (dropping them is what reclaims the bytes).
   Reclamation is therefore **lazy** — it happens at compaction, not at the write.
