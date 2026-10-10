@@ -67,14 +67,17 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   statement kind cannot compile without a rule.
 - **Simple query protocol (`Q`)** — `execute_query` lowers one SQL string:
   `SELECT` (incl. a single `JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`),
-  no-`FROM` scalar selects (`SELECT 1`, `SELECT version()`,
-  `current_database()`), and single-row `INSERT` / `UPDATE` / `DELETE`.
+  no-`FROM` scalar selects (`SELECT 1`, `SELECT version()`, `current_database()`,
+  `'a' || 'b'`, and a scalar subquery `( SELECT ... )` as an operand — incl.
+  pgbench's `select (select count(*) from a)||'|'||…` census line), and single-row
+  `INSERT` / `UPDATE` / `DELETE`.
 - **Extended query protocol** — `Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`
   with a per-connection [`Session`] (prepared statements + portals), `$N`
   parameter type inference (`ParameterDescription`), text + binary parameter and
   result encodings, and Postgres error-skip-until-`Sync` semantics. `SELECT`,
-  no-`FROM` expression selects, AND parameterized `INSERT` / `UPDATE` / `DELETE`
-  can be prepared. This is the path `Ecto.Repo.insert/update/delete/all` drives.
+  no-`FROM` expression selects (incl. scalar subqueries), AND parameterized
+  `INSERT` / `UPDATE` / `DELETE` can be prepared. This is the path
+  `Ecto.Repo.insert/update/delete/all` drives.
 - **Parameterized DML + `INSERT … RETURNING`** — `$N` placeholders in `INSERT`
   VALUES, `UPDATE` SET/WHERE, and `DELETE` WHERE are bound at `Bind` and
   substituted at `Execute` (fail-loud `08P01` if a `$N` has no bound value).

@@ -274,6 +274,25 @@ impl ResultStream {
         &self.columns
     }
 
+    /// Pull the next output row as raw values, or `None` at the end of the
+    /// result. For an internal nested query (a scalar subquery) that needs the
+    /// values, not the client encoding; the client path pulls through [`pump`].
+    ///
+    /// # Errors
+    ///
+    /// The `ErrorResponse` for a failure that interrupts the result (a storage
+    /// error mid-scan, or a cancelled executor).
+    pub(crate) async fn next_row(&mut self) -> Result<Option<Row>, BackendMessage> {
+        if self.buffered.is_empty() {
+            match self.next_batch().await {
+                Batch::Rows => {}
+                Batch::End => return Ok(None),
+                Batch::Failed(error) => return Err(error),
+            }
+        }
+        Ok(self.buffered.pop_front())
+    }
+
     /// Wait for the in-flight fetch and buffer its rows, starting the next
     /// fetch at once if the result goes on. Rows are reported before the end
     /// or failure that followed them.

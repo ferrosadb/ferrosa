@@ -13,16 +13,28 @@ toward the Postgres queries real clients send.
 
 ## Now (highest value)
 
-- **(narrowly done) `||` string concatenation in the no-`FROM` select list.**
-  `SELECT 'a' || 'b'` parses (one `Concat` token; a lone `|` is still
-  `bad token: |`), evaluates left-associatively over scalars, propagates NULL
-  (either side NULL gives NULL, not the empty string) and reports text (OID
-  25). A non-text operand is coerced through the existing PG text renderer.
+- **(done) Scalar subqueries `( SELECT ... )` in the no-`FROM` select list.** An
+  LParen followed by `SELECT` in `parse_scalar_primary` begins a scalar subquery
+  operand (`ScalarValue::Subquery`), closed by the matching RParen; the inner
+  select reuses the full table-`SELECT` grammar (`parse_select_stmt`). The
+  front end (`ferrosa-postgres::query::eval_scalar_subquery`) runs the inner query
+  and takes its single value with PostgreSQL `EXPR_SUBLINK` semantics: no rows ⇒
+  NULL (distinct from the empty string), more than one row ⇒ `21000`
+  `cardinality_violation`, more than one output column ⇒ `42601` refused *before*
+  any row. The subquery's column type is the inner query's single output column
+  type (so `count(*)` types as int), and `||` still coerces it to text. This is
+  what makes pgbench's census line
+  `select (select count(*) from pgbench_accounts)||'|'||…` evaluate. An LParen not
+  followed by `SELECT` (`SELECT (1)`) is still refused.
 
   **NOT supported, and refused by name (`0A000`)**: `||` over a `FROM` relation
   (`SELECT name || '!' FROM t`) and every other select-list expression form
-  (arithmetic, function calls over columns, `CASE`). The reason is structural,
-  not an omission: the planner's projection is a `Vec<usize>` of column indices
+  (arithmetic, function calls over columns, `CASE`). A scalar subquery is only a
+  no-`FROM` select-list operand: it does not appear in a `FROM` relation's
+  projection, in `WHERE`/`HAVING`, in `VALUES`, or nested in another subquery's
+  projection, and those forms are refused at parse (or, in DML values, by
+  `substitute_param`). The reason is structural, not an omission: the planner's
+  projection is a `Vec<usize>` of column indices
   (`plan.rs::simple_projection` + `exec::try_project`), not computed cells, so
   expressions over a relation need a real select-list expression tree, a new
   projection operator, an aggregate-mode `Slot` variant, authz walking, and a

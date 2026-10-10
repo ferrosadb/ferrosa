@@ -37,7 +37,8 @@ use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
     parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
-    QueryResult, Returning, Row, ScalarItem, ScalarValue, Statement, UpdateStmt, Value as SqlValue,
+    QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, Statement, UpdateStmt,
+    Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -1111,11 +1112,15 @@ async fn execute_statement(
             "XX000",
             "internal error: a table SELECT reached the non-streaming path",
         )],
-        // No-`FROM` expression query: `SELECT 1`, `SELECT version()`, etc.
-        Statement::SelectExprs(items) => match execute_scalar_select(&items, default_schema) {
-            Ok(result) => render_result(result, &[]),
-            Err(err_msg) => vec![err_msg],
-        },
+        // No-`FROM` expression query: `SELECT 1`, `SELECT version()`,
+        // `SELECT (SELECT count(*) FROM t)`, etc.
+        Statement::SelectExprs(items) => {
+            let ctx = ScalarReadCtx::new(env, txn.as_deref().map(Vec::as_slice));
+            match execute_scalar_select(&items, ctx).await {
+                Ok(result) => render_result(result, &[]),
+                Err(err_msg) => vec![err_msg],
+            }
+        }
         // Unreachable on the server path: `server::execute_simple` intercepts
         // BEGIN/COMMIT/ROLLBACK and drives them against the session's buffered
         // PostgreSQL MVCC write-set (`server::commit_txn`), and the
@@ -1512,6 +1517,14 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
             let right = substitute_param(right, params)?;
             concat_text(&left, &right)
         }
+        // The DML/`VALUES` grammar never builds a scalar subquery, so this arm is
+        // unreachable today; it refuses loudly rather than guessing if a future
+        // grammar reaches it (there is no read environment on this synchronous,
+        // value-resolving path to run the inner query against).
+        ScalarValue::Subquery(_) => Err(error_response(
+            "0A000",
+            "a scalar subquery in a DML value is not supported",
+        )),
     }
 }
 
@@ -2606,23 +2619,57 @@ pub(crate) async fn execute_delete(
     apply_or_buffer(engine, schema, mvcc, txn, mutation, "DELETE 1").await
 }
 
+/// The context a no-`FROM` expression select is evaluated in.
+///
+/// Beyond the schema name the info functions report, a scalar subquery must be
+/// *executed* against storage, so the read environment (engine, schema, MVCC
+/// snapshot) travels with the scalar items. `read` is `None` only in a context
+/// with no storage at all — the expression-select unit tests, which exercise
+/// literals/functions/`||` — and a subquery there is refused with `0A000`
+/// rather than guessed (the same convention as [`ReadEnv::ddl`]).
+#[derive(Clone, Copy)]
+pub(crate) struct ScalarReadCtx<'a> {
+    /// The schema name bare table names resolve under, and the value
+    /// `current_database()` reports.
+    pub(crate) default_schema: &'a str,
+    /// The environment a scalar subquery reads against; `None` = no storage.
+    pub(crate) read: Option<ReadEnv<'a>>,
+    /// The session's uncommitted write-set (empty outside a transaction), so an
+    /// inner query sees the caller's own uncommitted rows.
+    pub(crate) pending_writes: Option<&'a [PgWrite]>,
+}
+
+impl<'a> ScalarReadCtx<'a> {
+    /// The wire path's context: storage available, schema name taken from `env`.
+    pub(crate) fn new(env: ReadEnv<'a>, pending_writes: Option<&'a [PgWrite]>) -> Self {
+        Self {
+            default_schema: env.default_schema,
+            read: Some(env),
+            pending_writes,
+        }
+    }
+}
+
 /// Evaluate a no-`FROM` expression SELECT (`SELECT 1`, `SELECT version()`,
-/// `SELECT current_database()`, `SELECT 'a' || 'b'`) into a one-row
-/// [`QueryResult`]. Literals are returned as-is; a small set of info/session
-/// functions are evaluated from the connection's context; `||` concatenates its
-/// operands as text.
-pub(crate) fn execute_scalar_select(
+/// `SELECT current_database()`, `SELECT 'a' || 'b'`, `SELECT (SELECT count(*)
+/// FROM t)`) into a one-row [`QueryResult`]. Literals are returned as-is; a
+/// small set of info/session functions are evaluated from the connection's
+/// context; `||` concatenates its operands as text; a scalar subquery runs its
+/// inner query and takes its single value.
+pub(crate) async fn execute_scalar_select(
     items: &[ScalarItem],
-    default_schema: &str,
+    ctx: ScalarReadCtx<'_>,
 ) -> Result<QueryResult, BackendMessage> {
     let mut columns = Vec::with_capacity(items.len());
     let mut values = Vec::with_capacity(items.len());
     for item in items {
-        let value = eval_scalar_value(&item.value, default_schema)?;
+        // Value and type come back together: a scalar subquery's type is its
+        // inner query's single output column type, known only once the inner
+        // query is resolved, so the two cannot be computed independently.
+        let (value, ty) = eval_scalar_value(&item.value, ctx).await?;
         // Type from the EXPRESSION, not from the value: a concatenation is `text`
         // even when it evaluates to SQL NULL, so the `RowDescription` advertises
         // OID 25 either way and the client decodes the value correctly.
-        let ty = scalar_expr_type(&item.value);
         let name = item
             .alias
             .clone()
@@ -2636,28 +2683,98 @@ pub(crate) fn execute_scalar_select(
     })
 }
 
-/// Evaluate one scalar select value, recursing through `||`.
+/// Evaluate one scalar select value to its `(value, output column type)`,
+/// recursing through `||` and into a scalar subquery.
 ///
 /// A `$N` placeholder is only bound on the extended-query path, which routes
 /// expression selects through `Parse` (where such a value is refused) — so it is
 /// a fail-loud error here, never a guess.
-fn eval_scalar_value(
+///
+/// The `||` arm boxes the recursive call: an `async fn` cannot await itself
+/// directly (E0733), and a concatenation tree is the one recursive shape here.
+async fn eval_scalar_value(
     value: &ScalarValue,
-    default_schema: &str,
-) -> Result<SqlValue, BackendMessage> {
+    ctx: ScalarReadCtx<'_>,
+) -> Result<(SqlValue, ColumnType), BackendMessage> {
     match value {
-        ScalarValue::Literal(v) => Ok(v.clone()),
-        ScalarValue::Func(name) => eval_scalar_func(name, default_schema),
+        ScalarValue::Literal(v) => Ok((v.clone(), value_column_type(v))),
+        ScalarValue::Func(name) => Ok((
+            eval_scalar_func(name, ctx.default_schema)?,
+            ColumnType::Text,
+        )),
         ScalarValue::Param(_) => Err(error_response(
             "0A000",
             "$N parameters require the extended-query protocol",
         )),
         ScalarValue::Concat { left, right } => {
-            let left = eval_scalar_value(left, default_schema)?;
-            let right = eval_scalar_value(right, default_schema)?;
-            concat_text(&left, &right)
+            let (left, _) = Box::pin(eval_scalar_value(left, ctx)).await?;
+            let (right, _) = Box::pin(eval_scalar_value(right, ctx)).await?;
+            Ok((concat_text(&left, &right)?, ColumnType::Text))
         }
+        ScalarValue::Subquery(stmt) => eval_scalar_subquery(stmt, ctx).await,
     }
+}
+
+/// Run a scalar subquery `( SELECT ... )` and return its single value and its
+/// output column type (PostgreSQL `EXPR_SUBLINK` semantics).
+///
+/// The inner query reads the same storage and MVCC snapshot the outer select
+/// does: [`open_select_stream`] loads its tables (a missing one is `42P01`,
+/// never an empty scan) and runs the executor off the async worker.
+///
+/// Cardinality matches PostgreSQL exactly (both SQLSTATEs taken from the
+/// PostgreSQL sources, `parse_expr.c` and `nodeSubplan.c`):
+/// - zero rows -> SQL NULL (distinct from an empty string);
+/// - more than one row -> `21000 cardinality_violation`;
+/// - more than one column -> `42601 syntax_error` ("subquery must return only one
+///   column"), refused BEFORE any row is read, as PostgreSQL's parser does — the
+///   first column is never silently taken.
+///
+/// The `SelectStmt` is cloned into the executor because it is borrowed from the
+/// parsed statement but the executor takes ownership; there is no read-only
+/// entry point that would avoid it.
+async fn eval_scalar_subquery(
+    stmt: &SelectStmt,
+    ctx: ScalarReadCtx<'_>,
+) -> Result<(SqlValue, ColumnType), BackendMessage> {
+    let Some(env) = ctx.read else {
+        return Err(error_response(
+            "0A000",
+            "a scalar subquery requires a storage context",
+        ));
+    };
+    let mut stream = open_select_stream(env, stmt.clone(), ctx.pending_writes, Vec::new()).await?;
+    // The output column count is known before any row: refuse a multi-column
+    // subquery here, exactly as PostgreSQL's parser does, never reading a row.
+    let ty = match stream.columns() {
+        [column] => column.ty,
+        _ => {
+            return Err(error_response(
+                "42601",
+                "subquery must return only one column",
+            ))
+        }
+    };
+    // Read up to two rows: the second is the cardinality violation, proved
+    // without scanning the rest of the relation. The stream is dropped (which cancels
+    // the scan) either way.
+    let first = stream.next_row().await?;
+    if stream.next_row().await?.is_some() {
+        return Err(error_response(
+            "21000",
+            "more than one row returned by a subquery used as an expression",
+        ));
+    }
+    let value = match first {
+        Some(row) => row.0.into_iter().next().ok_or_else(|| {
+            error_response(
+                "XX000",
+                "internal error: a one-column subquery row had no value",
+            )
+        })?,
+        None => SqlValue::Null,
+    };
+    Ok((value, ty))
 }
 
 /// PostgreSQL's `||` text concatenation over already-evaluated operands.
@@ -2683,18 +2800,6 @@ fn concat_text(left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMes
         )
     })?;
     Ok(SqlValue::Text(text))
-}
-
-/// The Postgres result type of a scalar select expression, independent of the
-/// value it evaluates to. A concatenation is always `text` (OID 25): `'a' || NULL`
-/// is a text column holding NULL, not an untyped null.
-fn scalar_expr_type(value: &ScalarValue) -> ColumnType {
-    match value {
-        ScalarValue::Literal(v) => value_column_type(v),
-        ScalarValue::Func(_) | ScalarValue::Param(_) | ScalarValue::Concat { .. } => {
-            ColumnType::Text
-        }
-    }
 }
 
 /// Evaluate a zero-arg info/session function. Unsupported names fail loud
@@ -2926,6 +3031,19 @@ mod tests {
             &crate::jsonb_wire::test_limits(),
         )
         .expect_err("test parameter should be refused")
+    }
+
+    /// A scalar-evaluation context with no storage. Only valid for expressions
+    /// that hold no scalar subquery (literals, info functions, `||`); a subquery
+    /// reached through it is refused (`0A000`) rather than run, which is what the
+    /// storage-less guard asserts. The end-to-end subquery tests build a context
+    /// over a real engine instead (see `subquery_tests`).
+    fn bare_ctx(default_schema: &str) -> ScalarReadCtx<'_> {
+        ScalarReadCtx {
+            default_schema,
+            read: None,
+            pending_writes: None,
+        }
     }
 
     #[test]
@@ -3616,8 +3734,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scalar_select_literal_and_info_functions() {
+    #[tokio::test]
+    async fn scalar_select_literal_and_info_functions() {
         let items = vec![
             ScalarItem {
                 value: ScalarValue::Literal(SqlValue::Int(1)),
@@ -3632,7 +3750,9 @@ mod tests {
                 alias: Some("db".into()),
             },
         ];
-        let result = execute_scalar_select(&items, "myks").expect("scalar select");
+        let result = execute_scalar_select(&items, bare_ctx("myks"))
+            .await
+            .expect("scalar select");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.columns.len(), 3);
         // Default names: ?column? for a literal, the function name for a call.
@@ -3855,14 +3975,14 @@ mod tests {
         assert!(dec(&SqlValue::Text("1.2.3".into())).is_err());
     }
 
-    #[test]
-    fn scalar_select_unsupported_function_fails_loud() {
+    #[tokio::test]
+    async fn scalar_select_unsupported_function_fails_loud() {
         // An unmodeled function errors (0A000) rather than guessing a value.
         let items = vec![ScalarItem {
             value: ScalarValue::Func("NOW".into()),
             alias: None,
         }];
-        assert!(execute_scalar_select(&items, "ks").is_err());
+        assert!(execute_scalar_select(&items, bare_ctx("ks")).await.is_err());
     }
 
     // ---- `||` string concatenation in the SELECT list (pgbench init / census) ----
@@ -3875,12 +3995,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scalar_select_concatenation_parses_evaluates_and_advertises_text() {
+    #[tokio::test]
+    async fn scalar_select_concatenation_parses_evaluates_and_advertises_text() {
         // End to end: the statement dies as `bad token: |` before the `||` token
         // exists; afterwards it must parse, evaluate, and report OID 25 on the wire.
         let items = parsed_scalar_items("SELECT 'a' || 'b' AS greeting");
-        let result = execute_scalar_select(&items, "ks").expect("evaluate concatenation");
+        let result = execute_scalar_select(&items, bare_ctx("ks"))
+            .await
+            .expect("evaluate concatenation");
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.columns[0].name, "greeting");
         // A wrong OID here makes the client mis-decode an otherwise correct value.
@@ -3898,8 +4020,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn scalar_select_concatenation_propagates_null_not_an_empty_string() {
+    #[tokio::test]
+    async fn scalar_select_concatenation_propagates_null_not_an_empty_string() {
         // PostgreSQL: NULL on either side yields NULL. That is NOT the same as
         // concatenating an empty string, and the two must stay distinguishable.
         for sql in [
@@ -3908,7 +4030,9 @@ mod tests {
             "SELECT NULL || NULL",
         ] {
             let items = parsed_scalar_items(sql);
-            let result = execute_scalar_select(&items, "ks").expect("evaluate concatenation");
+            let result = execute_scalar_select(&items, bare_ctx("ks"))
+                .await
+                .expect("evaluate concatenation");
             // The column is text even though the value is NULL.
             assert_eq!(column_type_oid(result.columns[0].ty), 25, "{sql}");
             assert_eq!(result.rows[0].0[0], SqlValue::Null, "{sql}");
@@ -3916,17 +4040,21 @@ mod tests {
         }
         // Control: an empty string really is an empty string.
         let items = parsed_scalar_items("SELECT '' || ''");
-        let result = execute_scalar_select(&items, "ks").expect("evaluate");
+        let result = execute_scalar_select(&items, bare_ctx("ks"))
+            .await
+            .expect("evaluate");
         assert_eq!(result.rows[0].0[0], SqlValue::Text(String::new()));
     }
 
-    #[test]
-    fn scalar_select_concatenation_renders_a_non_text_operand_as_text() {
+    #[tokio::test]
+    async fn scalar_select_concatenation_renders_a_non_text_operand_as_text() {
         // PostgreSQL coerces the non-text operand with its text output function:
         // `1 || '2'` is '12' (not integer addition, not a type error), and
         // `TRUE || 'x'` is 'tx'.
         let items = parsed_scalar_items("SELECT 1 || '2', TRUE || 'x', 'x' || 1.5");
-        let result = execute_scalar_select(&items, "ks").expect("evaluate concatenation");
+        let result = execute_scalar_select(&items, bare_ctx("ks"))
+            .await
+            .expect("evaluate concatenation");
         let row = &result.rows[0].0;
         assert_eq!(row[0], SqlValue::Text("12".into()));
         assert_eq!(row[1], SqlValue::Text("tx".into()));
@@ -3934,6 +4062,23 @@ mod tests {
         for column in &result.columns {
             assert_eq!(column_type_oid(column.ty), 25);
         }
+    }
+
+    #[tokio::test]
+    async fn a_scalar_subquery_without_a_storage_context_is_refused() {
+        // Negative control for the storage-less context: with no read environment
+        // a scalar subquery is refused (0A000), never run against nothing and
+        // never guessed. The wire path always supplies storage; only
+        // expression-only unit tests build a context without it.
+        let items = parsed_scalar_items("SELECT (SELECT count(*) FROM t)");
+        let err = execute_scalar_select(&items, bare_ctx("ks"))
+            .await
+            .expect_err("a subquery with no storage must be refused");
+        assert!(matches!(
+            &err,
+            BackendMessage::ErrorResponse { fields }
+                if fields[1] == (b'C', "0A000".to_string())
+        ));
     }
 
     #[test]
@@ -5234,5 +5379,379 @@ mod param_decode_proptest {
             let limits = crate::jsonb_wire::test_limits();
             prop_assert!(decode_param_checked(1, type_oid, Some(&raw), &limits).is_err());
         }
+    }
+}
+
+/// End-to-end scalar subqueries `( SELECT ... )` in a `SELECT` list, over a real
+/// in-memory `StorageEngine`, through the SAME `execute_query` entry point the
+/// wire front end serves. The three tables mirror pgbench's census line.
+#[cfg(test)]
+mod scalar_subquery_tests {
+    use super::*;
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    use ferrosa_schema::{
+        AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
+        EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
+        ReplicationParams, Schema, SchemaConfig, TableMetadata, TableParams, TestAuditSink,
+    };
+    use ferrosa_storage::{
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    };
+    use indexmap::IndexMap;
+    use std::collections::{HashMap, HashSet};
+    use std::path::Path;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    /// The three relations of pgbench's census line, each `(k text PK, pad text)`.
+    const PGBENCH_TABLES: [&str; 3] = ["pgbench_accounts", "pgbench_tellers", "pgbench_branches"];
+
+    fn schema_config() -> SchemaConfig {
+        SchemaConfig {
+            hasher: PasswordHasher::Bcrypt { cost: 4 },
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        }
+    }
+
+    fn superuser() -> AuthContext {
+        AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        }
+    }
+
+    fn engine_config(dir: &Path) -> StorageEngineConfig {
+        StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 256 * 1024,
+                max_segment_age: Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
+                batch: Default::default(),
+                log_dir: dir.join("commitlog"),
+                checkpoint_dir: dir.join("commitlog"),
+                archive: None,
+            },
+            compaction: CompactionConfig::from_env(dir.join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
+            write_verify: false,
+        }
+    }
+
+    fn storage_schema(table: &str) -> TableSchema {
+        TableSchema {
+            keyspace: "public".to_string(),
+            table: table.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "pad".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn column(name: &str, kind: ColumnKind) -> ColumnMetadata {
+        ColumnMetadata {
+            name: name.to_string(),
+            kind,
+            position: 0,
+            column_type: "text".to_string(),
+            clustering_order: ClusteringOrder::None,
+            mask: None,
+        }
+    }
+
+    /// An engine + schema holding the three pgbench tables, each `(k text PK,
+    /// pad text)`, ready for INSERTs.
+    fn new_engine() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        for table in PGBENCH_TABLES {
+            engine.register_table(storage_schema(table)).unwrap();
+            let mut cols = IndexMap::new();
+            cols.insert("k".to_string(), column("k", ColumnKind::PartitionKey));
+            cols.insert("pad".to_string(), column("pad", ColumnKind::Regular));
+            schema
+                .create_table(
+                    TableMetadata {
+                        keyspace: "public".to_string(),
+                        name: table.to_string(),
+                        id: Uuid::new_v4(),
+                        columns: cols,
+                        partition_key: vec!["k".to_string()],
+                        clustering_key: vec![],
+                        params: TableParams::default(),
+                        flags: HashSet::new(),
+                        extensions: HashMap::new(),
+                        is_system: false,
+                    },
+                    &auth,
+                )
+                .expect("create table");
+        }
+        (dir, engine, schema)
+    }
+
+    async fn run(engine: &Arc<StorageEngine>, schema: &Schema, sql: &str) -> Vec<BackendMessage> {
+        execute_query(
+            engine,
+            schema,
+            sql,
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await
+    }
+
+    /// Seed `n` rows `k0..k{n-1}` (each `pad = 'p'`) into `table` through the wire path.
+    async fn seed(engine: &Arc<StorageEngine>, schema: &Schema, table: &str, n: usize) {
+        for i in 0..n {
+            let msgs = run(
+                engine,
+                schema,
+                &format!("INSERT INTO {table} (k, pad) VALUES ('k{i}', 'p')"),
+            )
+            .await;
+            assert!(
+                !msgs
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "seeding {table} row {i} failed: {msgs:?}"
+            );
+        }
+    }
+
+    /// The single text cell of a one-row `SELECT` (`None` for a SQL NULL), or a
+    /// panic describing the reply.
+    fn single_text(messages: &[BackendMessage]) -> Option<String> {
+        let rows: Vec<&Vec<Option<Vec<u8>>>> = messages
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "expected exactly one row: {messages:?}");
+        rows[0][0]
+            .as_deref()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+
+    fn row_description_oid(messages: &[BackendMessage]) -> i32 {
+        let fields = messages
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::RowDescription { fields } => Some(fields),
+                _ => None,
+            })
+            .expect("a SELECT leads with a RowDescription");
+        fields[0].type_oid
+    }
+
+    fn error_sqlstate(messages: &[BackendMessage]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::ErrorResponse { fields } => Some(fields[1].1.clone()),
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn pgbench_census_line_runs_end_to_end() {
+        // The acceptance query: three `count(*)` scalar subqueries concatenated by
+        // `||`. RED before the change: it died `expected identifier, found
+        // `LParen`` at parse time, because a leading `(` made it a table select.
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 4).await;
+        seed(&engine, &schema, "pgbench_tellers", 2).await;
+        seed(&engine, &schema, "pgbench_branches", 1).await;
+
+        let msgs = run(
+            &engine,
+            &schema,
+            "select (select count(*) from pgbench_accounts)||'|'||\
+             (select count(*) from pgbench_tellers)||'|'||\
+             (select count(*) from pgbench_branches)",
+        )
+        .await;
+
+        // Distinct counts, so the assertion pins the ORDER of the three, not just
+        // the set of values.
+        assert_eq!(
+            single_text(&msgs).as_deref(),
+            Some("4|2|1"),
+            "the census line must join the three counts in order: {msgs:?}"
+        );
+        // The whole expression is text (OID 25): `||` decides the type.
+        assert_eq!(row_description_oid(&msgs), 25);
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scalar_subquery_alone_reports_its_inner_column_type() {
+        // The subquery's column type is the INNER query's single output type, not
+        // always text: `count(*)` types as int (OID 23) on this front end.
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_tellers", 3).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT (SELECT count(*) FROM pgbench_tellers)",
+        )
+        .await;
+        assert_eq!(single_text(&msgs).as_deref(), Some("3"));
+        assert_eq!(row_description_oid(&msgs), 23, "count(*) types as int");
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scalar_subquery_operand_of_concat_coerces_to_text() {
+        // `1 || (select ...)`: the non-text operand is rendered with its text
+        // output function, and the column is text (OID 25).
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_tellers", 2).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT 1 || (SELECT count(*) FROM pgbench_tellers)",
+        )
+        .await;
+        assert_eq!(single_text(&msgs).as_deref(), Some("12"));
+        assert_eq!(row_description_oid(&msgs), 25);
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scalar_subquery_with_no_rows_is_null_not_empty_string() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 2).await;
+        // No row matches, so the scalar subquery is NULL...
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT (SELECT pad FROM pgbench_accounts WHERE k = 'absent')",
+        )
+        .await;
+        assert_eq!(
+            single_text(&msgs),
+            None,
+            "no rows must yield NULL: {msgs:?}"
+        );
+        // ...and its column is still text (the inner column's type), not an
+        // untyped null.
+        assert_eq!(row_description_oid(&msgs), 25);
+        // NULL stays distinct from an empty string: `NULL || 'x'` is NULL.
+        let concatenated = run(
+            &engine,
+            &schema,
+            "SELECT (SELECT pad FROM pgbench_accounts WHERE k = 'absent') || 'x'",
+        )
+        .await;
+        assert_eq!(single_text(&concatenated), None, "NULL || 'x' is NULL");
+        // Control: a matched value really comes back.
+        let matched = run(
+            &engine,
+            &schema,
+            "SELECT (SELECT pad FROM pgbench_accounts WHERE k = 'k0')",
+        )
+        .await;
+        assert_eq!(single_text(&matched).as_deref(), Some("p"));
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_multi_row_scalar_subquery_is_a_cardinality_violation() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 3).await;
+        let msgs = run(&engine, &schema, "SELECT (SELECT k FROM pgbench_accounts)").await;
+        assert_eq!(
+            error_sqlstate(&msgs).as_deref(),
+            Some("21000"),
+            "a scalar subquery over many rows must be cardinality_violation: {msgs:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_multi_column_scalar_subquery_is_refused_before_any_row() {
+        // Negative control: a subquery with two columns must be refused (42601),
+        // never silently reduced to its first column. The table has a row, so a
+        // "take the first column of the first row" bug would return 'k0'.
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 1).await;
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT (SELECT k, pad FROM pgbench_accounts)",
+        )
+        .await;
+        assert_eq!(
+            error_sqlstate(&msgs).as_deref(),
+            Some("42601"),
+            "a multi-column subquery must be refused: {msgs:?}"
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { .. })),
+            "no row may be produced for a multi-column subquery: {msgs:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_scalar_subquery_over_a_missing_table_is_undefined_table() {
+        let (_dir, engine, schema) = new_engine();
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT (SELECT count(*) FROM no_such_table)",
+        )
+        .await;
+        assert_eq!(
+            error_sqlstate(&msgs).as_deref(),
+            Some("42P01"),
+            "the R15 guard reaches the inner query too: {msgs:?}"
+        );
+        engine.shutdown().unwrap();
     }
 }

@@ -32,13 +32,20 @@ in-memory table in tests and by Ferrosa storage in production.
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
 - No-`FROM` scalar selects: `SELECT 1`, `SELECT version()` (zero-arg func),
-  `SELECT $1`, `SELECT TRUE`, and `||` string concatenation over those scalars
-  (`SELECT 'a' || 'b'`, `SELECT 'a' || $1 || current_database()`). `||` is
-  left-associative, evaluates to `text`, and propagates NULL (NULL on either
-  side ⇒ NULL, which is *not* the empty string). The `SELECT` list is still not a
-  general expression grammar: `||` over a `FROM` relation
-  (`SELECT name || '!' FROM t`) and every other select-list expression form is
-  refused by name (`ParseError::UnsupportedSelectExpr`).
+  `SELECT $1`, `SELECT TRUE`, `||` string concatenation over those scalars
+  (`SELECT 'a' || 'b'`, `SELECT 'a' || $1 || current_database()`), and a **scalar
+  subquery** `( SELECT ... )` as an operand
+  (`SELECT (SELECT count(*) FROM t) || '|'`). `||` is left-associative, evaluates
+  to `text`, and propagates NULL (NULL on either side ⇒ NULL, which is *not* the
+  empty string). A scalar subquery evaluates to its inner query's single value
+  with PostgreSQL `EXPR_SUBLINK` semantics: no rows ⇒ NULL, more than one row ⇒
+  `21000 cardinality_violation`, more than one output column ⇒ refused by name
+  (`42601`); its column type is the inner query's single output column type. The
+  `SELECT` list is still not a general expression grammar: `||` over a `FROM`
+  relation (`SELECT name || '!' FROM t`), parenthesised non-subquery scalars
+  (`SELECT (1)`), and every other select-list expression form is refused by name
+  (`ParseError::UnsupportedSelectExpr`). A subquery outside the no-`FROM` select
+  list (a `FROM` relation's projection, `WHERE`, `VALUES`) is not parsed.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
   `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
 - PG DDL (T-130, D10), **parsed only** (no execution or schema creation yet; the

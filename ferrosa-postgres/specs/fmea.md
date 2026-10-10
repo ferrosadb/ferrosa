@@ -15,7 +15,8 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 ## Supported surface (what works today)
 
 - **DML/DQL:** `SELECT` (single `JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`,
-  `LIMIT`, aggregates), no-`FROM` scalar selects, and **single-row** `INSERT` /
+  `LIMIT`, aggregates), no-`FROM` scalar selects (incl. `||` concatenation and a
+  scalar subquery `( SELECT ... )` as an operand), and **single-row** `INSERT` /
   `UPDATE` / `DELETE` (key-equality `WHERE`, Cassandra-style blind
   upsert/tombstone). A `numeric`/`decimal` target takes an integer literal, a
   decimal literal, and a TEXT value (untyped string literal / COPY FROM STDIN

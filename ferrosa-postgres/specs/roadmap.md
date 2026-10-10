@@ -22,6 +22,21 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   effect to miss); every other option name is refused `0A000` naming it rather than
   dropped, and a bare unparenthesised `WITH` is a loud parse error.
 
+- **Scalar subqueries `( SELECT ... )` in a no-`FROM` select list.** A scalar
+  subquery used as a select-list operand (`select (select count(*) from
+  pgbench_accounts)||'|'||…`, pgbench's census line) now evaluates end to end.
+  `query::execute_scalar_select`/`eval_scalar_value` became async and carry a
+  `ScalarReadCtx` (the `ReadEnv` a subquery reads over, plus the session's pending
+  writes); `eval_scalar_subquery` runs the inner query and takes its single value
+  with PostgreSQL `EXPR_SUBLINK` semantics: no rows ⇒ NULL (distinct from the empty
+  string), more than one row ⇒ `21000 cardinality_violation`, more than one output
+  column ⇒ `42601` ("subquery must return only one column") refused *before* any
+  row. Its column type is the inner query's single output column type (so
+  `count(*)` types as int), and `||` still coerces it to text. `ResultStream` grew
+  `next_row` for this internal pull. `substitute_param` refuses a subquery in a DML
+  value (`0A000`; the grammar never builds one). A subquery is only a no-`FROM`
+  select-list operand: a `FROM` relation's projection, `WHERE`/`HAVING`, `VALUES`,
+  and nested subqueries are still unsupported (see `ferrosa-sql`'s roadmap).
 - **Numeric/decimal literal binding in DML.** `INSERT INTO t (a, b) VALUES (1, 1.5)`
   into a `numeric` column failed `42804 value does not match column type Decimal`,
   which blocked `pgbench -i` and the PostgreSQL smoke check. `query::value_to_cql`
