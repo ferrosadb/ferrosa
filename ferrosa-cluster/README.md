@@ -147,23 +147,32 @@ mapping plus the staging file are released on the LAST drop of that `Arc`
 (`WriteSetSpill` declares `map` before the temp-dir reservation, so it unmaps before
 the directory is removed).
 
-**The coordinator's OWN local apply does not borrow — and cannot.** The fan-out above
-is zero-copy, but the coordinator's self-apply resolves each owned entry back into an
-owned `Vec<u8>` (`entry_mutation`) because its consumer genuinely requires owned bytes,
-for two independent structural reasons. (1) The payload is dispatched through
-`handlers::on_state_machine`, which runs the caller's closure on
-`tokio::task::spawn_blocking` and therefore demands `F: FnOnce(&mut AccordStateMachine)
--> R + Send + 'static` — a closure capturing a borrow of the spill mapping is not
-`'static` and does not compile (`error[E0597]: ... is borrowed for 'static`). The
-blocking pool is load-bearing (the apply fsyncs the protocol log under the state
-machine's mutex, which must not run on an async worker), so the dispatch cannot be
-scoped to the borrow's lifetime. (2) `DepWaitApplier::try_apply_writeset` PARKS the
-whole write-set in its `pending` map when a dependency is unresolved and applies it on
-a LATER call, so the bytes must outlive the coordinator's call regardless. A borrow is
-therefore impossible without putting the fsync back on the async worker or
-lifetime-parameterising the shared apply engine across replicas. The
-`ApplyMutation::data` doc carries a `compile_fail` doctest pinning the `'static`
-obstruction; see `coordinator.rs::entry_mutation` for the full argument.
+**The coordinator's OWN local apply does not borrow — but that is a signature
+choice, not a lifetime wall.** The fan-out above is zero-copy, but the coordinator's
+self-apply resolves each owned entry back into an owned `Vec<u8>` (`entry_mutation`).
+A previous revision recorded this as *structurally required*; that claim was **wrong
+and is superseded here**. The `'static` bound `handlers::on_state_machine` imposes
+(`F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static`) constrains the closure's
+**captures**, not the payload representation: an `Arc` IS `'static`, so a closure can
+OWN the `Arc<WriteSetSpill>` and borrow the mapping INSIDE its body. That is
+compile-verified by `apply.rs`'s
+`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`. And the
+dep-wait engine no longer needs owned bytes to park: a large parked write-set is held
+as `ParkedWriteSet::Staged` — an `Arc<WriteSetSpill>` plus per-entry indices — so the
+bytes outlive the coordinator's call behind the Arc, and the file plus mapping are
+freed on its last drop. The only reason the local apply still reads back owned bytes
+is that `handle_apply_writeset` takes `Vec<Vec<u8>>`; the transient copy is freed when
+the park stages the write-set, and the FAN-OUT (the bulk of the bytes) stays zero-copy.
+
+**A parked write-set is bounded by the buffer, not by the payload.** A parked
+write-set whose payloads reach the staging floor is staged on disk and the park keeps
+only an `Arc<WriteSetSpill>` plus indices; `DepWaitApplier::parked_residency` reports
+the resident-vs-staged split, and a large park must show `resident_payload_bytes == 0`
+(see `parked_write_sets_spill_so_residency_is_bounded_not_proportional_to_payload`, with
+its negative control `control_resident_parks_grow_with_the_payload_when_staging_is_disabled`).
+An unresolvable park is additionally reclaimed by time (see the apply-phase section
+below); the `ApplyMutation::data` doc carries a compiling doctest showing the Arc-owns
+-and-borrows-inside shape.
 
 **Version skew.** A peer that did not advertise `CAP_ACCORD_APPLY_REGION` receives
 the capnp-inline `AccordApplyV2Capnp` frame (if it advertised `CAP_ACCORD_CAPNP`) or
@@ -644,7 +653,14 @@ the existing single-frame Accord message path.
   `StorageApplier::apply_writeset` commits all of a txn's partitions in ONE atomic
   `apply_batch` (all-or-nothing — a failure on any key persists none); idempotency
   is keyed by `(txn_id, partition_key, t)` so writes 2..N of one transaction are
-  never deduped/dropped.
+  never deduped/dropped. **Parked residency is bounded:** a parked write-set whose
+  payloads reach the staging floor is held as a `ParkedWriteSet::Staged`
+  (`Arc<WriteSetSpill>` + per-entry indices) rather than resident bytes, so the
+  park keeps a pointer plus indices, not the payload; `parked_residency()` reports
+  the resident-vs-staged split. An unresolvable park (a dependency that never
+  arrives) is reclaimed by time (`FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS`) and
+  every release is reported at ERROR — never a silent drop — with its graph waits
+  cleared so a late dependency cannot wake it into a false `Applied`.
 - `wire.rs` — bincode payloads for each protocol message. **Multi-key:**
   `WriteSetEntry` + `ApplyV2Payload` back the additive `AccordPreAcceptV2`/
   `AccordApplyV2` wire codes; `AccordCoordinatorDriver::new_multi(write_set)` is

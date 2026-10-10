@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::accord::{Timestamp, TxnId};
+use ferrosa_storage::write_set_spill::WriteSetSpill;
 use ferrosa_storage::{BatchOp, Mutation, StorageEngine};
 use parking_lot::Mutex;
 
@@ -92,8 +93,136 @@ pub struct ReclaimedPark {
 
 /// Time a parked write-set has been waiting, plus its (re-constructible) data.
 struct ParkedApply {
-    mutations: Vec<ApplyMutation>,
+    set: ParkedWriteSet,
     parked_at: Instant,
+}
+
+/// A parked write-set's payloads, held either resident or staged on disk.
+///
+/// The parked cost must not grow with the payload: a park whose dependency never
+/// arrives is the OOM case, and it must be bounded by the configured buffer
+/// rather than by how much was parked. So a write-set whose payloads reach the
+/// staged floor is written to a [`WriteSetSpill`] and the park keeps only the
+/// `Arc<WriteSetSpill>` plus the per-entry index/`(t, deps)` metadata; the bytes
+/// are read back exactly once, when the park resolves.
+enum ParkedWriteSet {
+    /// Small write-set (below the staging floor): the payloads stay resident,
+    /// because a disk round-trip costs more than the bytes it would save.
+    Resident(Vec<ApplyMutation>),
+    /// Large write-set: payloads live in `spill`, addressed by `entries`. The
+    /// `Arc<WriteSetSpill>` keeps the staging file AND its mapping alive for as
+    /// long as the park can be needed, and frees both on its last drop.
+    Staged {
+        spill: Arc<WriteSetSpill>,
+        entries: Vec<StagedMutation>,
+    },
+}
+
+/// One staged park entry: where its payload lives in the spill, plus the small
+/// per-entry metadata (`t`, `deps`) that stays resident.
+struct StagedMutation {
+    index: usize,
+    t: Timestamp,
+    deps: Vec<TxnId>,
+}
+
+impl ParkedWriteSet {
+    /// Total payload bytes still resident for this park. Zero once staged.
+    fn resident_payload_bytes(&self) -> usize {
+        match self {
+            Self::Resident(mutations) => mutations.iter().map(|m| m.data.len()).sum(),
+            Self::Staged { .. } => 0,
+        }
+    }
+
+    /// Payload bytes staged on disk for this park. Zero while resident.
+    fn staged_spill_bytes(&self) -> u64 {
+        match self {
+            Self::Resident(_) => 0,
+            Self::Staged { spill, .. } => spill.bytes(),
+        }
+    }
+
+    /// Materialize the whole write-set as owned [`ApplyMutation`]s, reading every
+    /// staged payload back exactly once.
+    ///
+    /// FAILS LOUD on a read-back that cannot be resolved: an absent or
+    /// out-of-range staged entry is an internal error, never a silent empty apply
+    /// (which would drop a committed write).
+    fn into_mutations(self, txn_id: TxnId) -> Result<Vec<ApplyMutation>, ApplyError> {
+        match self {
+            Self::Resident(mutations) => Ok(mutations),
+            Self::Staged { spill, entries } => entries
+                .into_iter()
+                .map(|entry| {
+                    let data = spill.mutation(entry.index).map_err(|err| ApplyError {
+                        txn_id,
+                        reason: format!(
+                            "parked write-set read-back failed for staged entry {}: {err}",
+                            entry.index
+                        ),
+                    })?;
+                    Ok(ApplyMutation {
+                        data,
+                        t: entry.t,
+                        deps: entry.deps,
+                    })
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Build the parked representation for `mutations`: staged on disk when the
+/// total payload reaches `floor`, resident otherwise.
+///
+/// Staging DRAINS each payload into the spill as it writes, so the transient
+/// peak residency is one payload, not the whole set.
+fn build_parked_set(
+    txn_id: TxnId,
+    mutations: Vec<ApplyMutation>,
+    floor: u64,
+) -> Result<ParkedWriteSet, ApplyError> {
+    let total: u64 = mutations.iter().map(|m| m.data.len() as u64).sum();
+    if total < floor {
+        return Ok(ParkedWriteSet::Resident(mutations));
+    }
+    let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(mutations.len());
+    let mut meta: Vec<(Timestamp, Vec<TxnId>)> = Vec::with_capacity(mutations.len());
+    for m in mutations {
+        blobs.push(m.data);
+        meta.push((m.t, m.deps));
+    }
+    let reservation =
+        ferrosa_storage::write_set_spill::reserve_write_set_stage().map_err(|e| ApplyError {
+            txn_id,
+            reason: format!("parked write-set staging setup failed: {e}"),
+        })?;
+    let spill = WriteSetSpill::stage(reservation, &mut blobs).map_err(|e| ApplyError {
+        txn_id,
+        reason: format!("parked write-set staging failed: {e}"),
+    })?;
+    let entries = meta
+        .into_iter()
+        .enumerate()
+        .map(|(index, (t, deps))| StagedMutation { index, t, deps })
+        .collect();
+    Ok(ParkedWriteSet::Staged {
+        spill: Arc::new(spill),
+        entries,
+    })
+}
+
+/// Resident cost of the parked write-sets — the observability surface for the
+/// OOM-relevant `pending` structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParkedResidency {
+    /// Number of parked write-sets.
+    pub parks: usize,
+    /// Payload bytes still resident across every park.
+    pub resident_payload_bytes: usize,
+    /// Payload bytes staged on disk behind a staged park (not resident).
+    pub staged_spill_bytes: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,31 +253,35 @@ impl std::error::Error for ApplyError {}
 /// For Gap 5, this is an opaque byte vector. The production implementation
 /// will decode it as a `(TableId, DecoratedKey, Row)` triple.
 ///
-/// `data` is **owned**, and that is a contract rather than an accident. The apply
-/// seam runs the coordinator's payload on a `'static` blocking task, and the
-/// dep-wait engine PARKS a whole write-set across calls when a dependency is
-/// unresolved (see [`DepWaitApplier::try_apply_writeset`]), so the bytes must
-/// outlive the call that produced them. A borrowed payload satisfies neither, and
-/// the obstruction is a compile error rather than a runtime hazard — a closure
-/// capturing a borrow of the payload cannot satisfy the `'static` bound a blocking
-/// apply task imposes:
+/// `data` is **owned** — but that is a property of the apply seam's *input
+/// shape*, NOT a structural lifetime requirement.
 ///
-/// ```compile_fail
-/// // The coordinator's local-apply payload is dispatched through a blocking task
-/// // (tokio::task::spawn_blocking), which requires the closure AND its captures to
-/// // be `'static`. A borrow sliced out of a local buffer does not qualify — so a
-/// // `&[u8]` payload cannot reach the apply seam.
+/// A previous revision claimed a borrowed payload was impossible here. That claim
+/// was wrong, and this doc supersedes it. The `'static` bound the blocking apply
+/// task imposes (`handlers::on_state_machine`:
+/// `F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static`) constrains the
+/// closure's **captures**, not the payload representation: an `Arc` IS `'static`,
+/// so a closure can OWN the `Arc<WriteSetSpill>` and borrow the staging mapping
+/// INSIDE its body. The dep-wait engine does exactly that — a large parked
+/// write-set is held as an `Arc<WriteSetSpill>` plus per-entry indices
+/// (`ParkedWriteSet::Staged`), never as resident payload bytes, so it is the Arc
+/// (not an owned copy) that keeps the data alive past the coordinator's call. See
+/// [`DepWaitApplier::parked_residency`].
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// // An `Arc` is `'static`: a `'static` blocking task can OWN it and borrow its
+/// // contents INSIDE the closure. Only a raw borrow of a stack-local cannot reach
+/// // the seam — a staged `Arc<WriteSetSpill>` can.
 /// let owned = vec![1u8, 2, 3];
-/// let borrowed: &[u8] = &owned;
-/// std::thread::spawn(move || borrowed.len());
-/// // error[E0597]: `owned` does not live long enough
-/// //   ... argument requires that `owned` is borrowed for `'static`
+/// let shared = Arc::new(owned);
+/// let handle = std::thread::spawn(move || shared.len());
+/// assert_eq!(handle.join().unwrap(), 3);
 /// ```
 ///
-/// (This is why `ferrosa-cluster`'s coordinator reads a STAGED write-set entry back
-/// into an owned `Vec<u8>` for its own local apply, even though the Apply fan-out
-/// borrows the very same bytes out of the spill's memory map — see
-/// `AccordCoordinatorDriver::entry_mutation`.)
+/// `ApplyMutation` itself stays owned-bytes because it is the shape the
+/// [`StorageApplier`] seam consumes (the applier decodes and writes each
+/// payload), not because a borrow is impossible.
 #[derive(Clone)]
 pub struct ApplyMutation {
     /// Serialized mutation payload (table_id + key + row + etc).
@@ -778,22 +911,30 @@ impl StorageApplier for EngineStorageApplier {
 pub struct DepWaitApplier {
     graph: Mutex<DepWaitGraph>,
     applier: Arc<dyn StorageApplier>,
-    /// The FULL write-set (one [`ApplyMutation`] per partition) for each
-    /// transaction parked waiting on dependencies, keyed by txn id. When the last
-    /// dependency resolves, the cascade pulls the real write-set from here and
-    /// applies **every** entry atomically — fixing both the empty-placeholder bug
-    /// (queued txns re-applied with `data: vec![]`) and the multi-key drop
-    /// (writes 2..N of a parked txn silently lost because only one was stored).
+    /// The parked write-sets (one [`ParkedWriteSet`] per transaction), keyed by
+    /// txn id. When the last dependency resolves, the cascade pulls the real
+    /// write-set from here and applies **every** entry atomically — fixing both
+    /// the empty-placeholder bug (queued txns re-applied with `data: vec![]`) and
+    /// the multi-key drop (writes 2..N of a parked txn silently lost because only
+    /// one was stored).
     ///
     /// Each entry is timestamped so an unresolvable park (a dependency that never
-    /// arrives) can be reclaimed by TIME — see [`Self::reclaim_stale`]. Without
-    /// that, a park whose dependency never arrives retains its whole write-set in
+    /// arrives) can be reclaimed by TIME — see [`Self::reclaim_stale`]. A large
+    /// parked write-set is STAGED on disk (see [`ParkedWriteSet`]), so the parked
+    /// cost is a pointer plus indices rather than the payload bytes; without the
+    /// spill a park whose dependency never arrives retains its whole write-set in
     /// RAM forever while the graph prunes its own bookkeeping.
     pending: Mutex<HashMap<TxnId, ParkedApply>>,
     /// How long a park may wait before [`Self::reclaim_stale`] releases it.
     /// Externalized: [`PARKED_APPLY_RECLAIM_ENV`], default
     /// [`DEFAULT_PARKED_APPLY_RECLAIM_SECS`].
     reclaim_bound: Duration,
+    /// Payload bytes at or above which a PARKED write-set is staged on disk
+    /// instead of retained resident. Externalized tunable
+    /// (`FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`, default
+    /// [`WriteSetSpill::should_stage`]'s floor), read once here; never a cap —
+    /// a larger write-set is staged, not refused.
+    park_spill_floor_bytes: u64,
 }
 
 impl DepWaitApplier {
@@ -805,7 +946,37 @@ impl DepWaitApplier {
             reclaim_bound: resolve_parked_apply_reclaim(
                 std::env::var(PARKED_APPLY_RECLAIM_ENV).ok().as_deref(),
             ),
+            park_spill_floor_bytes: ferrosa_storage::write_set_stage::resolve_spill_threshold(
+                std::env::var(ferrosa_storage::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV)
+                    .ok()
+                    .as_deref(),
+            ),
         }
+    }
+
+    /// Override the payload-bytes floor at or above which a parked write-set is
+    /// staged on disk instead of retained resident.
+    ///
+    /// The externalized tunable is
+    /// `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`; this builder exists so the
+    /// residency bound is testable without mutating process env. Never a cap.
+    pub fn with_park_spill_floor(mut self, bytes: u64) -> Self {
+        self.park_spill_floor_bytes = bytes;
+        self
+    }
+
+    /// Resident cost of the parked write-sets. Observability for the OOM-relevant
+    /// `pending` structure: `resident_payload_bytes` must stay bounded by the
+    /// configured staging buffer, not grow with the parked payload.
+    pub fn parked_residency(&self) -> ParkedResidency {
+        let pending = self.pending.lock();
+        let mut residency = ParkedResidency::default();
+        for park in pending.values() {
+            residency.parks += 1;
+            residency.resident_payload_bytes += park.set.resident_payload_bytes();
+            residency.staged_spill_bytes += park.set.staged_spill_bytes();
+        }
+        residency
     }
 
     /// Install the PostgreSQL MVCC observer on the storage applier that this
@@ -818,15 +989,18 @@ impl DepWaitApplier {
     }
 
     /// Park a whole write-set behind its unresolved dependencies, timestamped so
-    /// an unresolvable park can be reclaimed.
-    fn park(&self, txn_id: TxnId, mutations: Vec<ApplyMutation>) {
+    /// an unresolvable park can be reclaimed. A large write-set is staged on disk
+    /// so the park's resident cost is a pointer plus indices, never the payload.
+    fn park(&self, txn_id: TxnId, mutations: Vec<ApplyMutation>) -> Result<(), ApplyError> {
+        let set = build_parked_set(txn_id, mutations, self.park_spill_floor_bytes)?;
         self.pending.lock().insert(
             txn_id,
             ParkedApply {
-                mutations,
+                set,
                 parked_at: Instant::now(),
             },
         );
+        Ok(())
     }
 
     /// Reclaim every parked write-set that has waited at least `max_age` for a
@@ -1024,7 +1198,13 @@ impl DepWaitApplier {
             // data when the last dependency resolves — not an empty placeholder,
             // and not just the first key.
             drop(graph);
-            self.park(txn_id, mutations);
+            if let Err(e) = self.park(txn_id, mutations) {
+                // Staging the parked payloads failed: fail loud and leave no
+                // half-parked state and no half-registered waits, so the apply can
+                // be retried rather than the write silently dropped.
+                self.graph.lock().clear_waits(txn_id);
+                return Err(e);
+            }
             return Ok(Vec::new());
         }
 
@@ -1091,7 +1271,17 @@ impl DepWaitApplier {
             // parked nothing — there is nothing to persist; still mark it applied
             // so its own waiters proceed.
             if let Some(parked) = self.pending.lock().remove(&waiter) {
-                let mutations = parked.mutations;
+                // Materialize the write-set: a staged park reads every payload
+                // back from disk exactly once here. A read-back that cannot be
+                // resolved is an internal error — fail loud and leave it
+                // un-applied rather than silently applying an empty write-set.
+                let mutations = match parked.set.into_mutations(waiter) {
+                    Ok(mutations) => mutations,
+                    Err(e) => {
+                        tracing::error!(%e, txn = waiter.0.time, "accord dep-cascade: parked write-set read-back failed — leaving it un-applied (fail loud, never a silent empty apply)");
+                        continue;
+                    }
+                };
                 let datas: Vec<Vec<u8>> = mutations.iter().map(|m| m.data.clone()).collect();
                 if let Err(e) = self.applier.apply_writeset(waiter, mutations) {
                     // Fail loud: the parked write-set did not persist (atomically,
@@ -1873,6 +2063,125 @@ mod tests {
             Duration::from_secs(DEFAULT_PARKED_APPLY_RECLAIM_SECS),
             "zero is refused rather than clamped, matching the sibling Accord bounds"
         );
+    }
+
+    // =======================================================================
+    // Spillable parked representation — RESIDENCY must not grow with payload.
+    // =======================================================================
+
+    /// RESIDENCY (the claim this change makes, and the OOM bug it fixes): a large
+    /// parked write-set is STAGED, so the parked cost is bounded by the configured
+    /// buffer rather than growing with the parked payload. The measurement is
+    /// [`DepWaitApplier::parked_residency`], reported from the actual parked
+    /// representation (resident payload bytes vs bytes staged on disk).
+    #[test]
+    fn parked_write_sets_spill_so_residency_is_bounded_not_proportional_to_payload() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        // Stage above 64 KiB so each 256 KiB write-set below crosses the floor.
+        let applier = DepWaitApplier::new(noop.clone()).with_park_spill_floor(64 * 1024);
+        let dep = txn_id(1, 1);
+
+        // 40 write-sets x 256 KiB = 10 MiB of payload parked behind a dep that never
+        // arrives. This is the OOM shape: N large write-sets parked at once.
+        const N: usize = 40;
+        const PAYLOAD: usize = 256 * 1024;
+        let payload = vec![0xABu8; PAYLOAD];
+        for i in 0..N {
+            let txn = txn_id(2, 100 + i as u64);
+            let writes = vec![ApplyMutation {
+                data: payload.clone(),
+                t: ts(100 + i as u64),
+                deps: vec![dep],
+            }];
+            assert!(applier.try_apply_writeset(txn, writes).unwrap().is_empty());
+        }
+
+        let residency = applier.parked_residency();
+        assert_eq!(residency.parks, N);
+        assert_eq!(
+            residency.resident_payload_bytes, 0,
+            "residency must NOT grow with the parked payload; {N} x {PAYLOAD} bytes are parked"
+        );
+        assert!(
+            residency.staged_spill_bytes >= (N * PAYLOAD) as u64,
+            "the payloads live on disk, staged: {} bytes",
+            residency.staged_spill_bytes
+        );
+
+        // No lost writes across the spill boundary: when the dep resolves, EVERY
+        // parked write-set is read back from disk and applied.
+        let woken = applier.notify_applied(dep);
+        assert_eq!(woken.len(), N);
+        assert_eq!(
+            noop.apply_count(),
+            N,
+            "every parked write-set applies on resolve, read back from the spill"
+        );
+        assert_eq!(applier.parked_residency().parks, 0);
+    }
+
+    /// NEGATIVE CONTROL for the test above: with staging disabled (floor above any
+    /// payload), the SAME measurement grows with the parked payload. This proves
+    /// the residency guard is non-vacuous — it fails when the regression (resident
+    /// parks) is reintroduced.
+    #[test]
+    fn control_resident_parks_grow_with_the_payload_when_staging_is_disabled() {
+        let noop = Arc::new(NoopStorageApplier::new());
+        let applier = DepWaitApplier::new(noop.clone()).with_park_spill_floor(u64::MAX);
+        let dep = txn_id(1, 1);
+
+        const N: usize = 40;
+        const PAYLOAD: usize = 256 * 1024;
+        let payload = vec![0xABu8; PAYLOAD];
+        for i in 0..N {
+            let txn = txn_id(2, 100 + i as u64);
+            let writes = vec![ApplyMutation {
+                data: payload.clone(),
+                t: ts(100 + i as u64),
+                deps: vec![dep],
+            }];
+            assert!(applier.try_apply_writeset(txn, writes).unwrap().is_empty());
+        }
+
+        let residency = applier.parked_residency();
+        assert_eq!(residency.parks, N);
+        assert_eq!(
+            residency.resident_payload_bytes,
+            N * PAYLOAD,
+            "with staging off, residency is exactly the parked payload — the guard above would fail here"
+        );
+        assert_eq!(residency.staged_spill_bytes, 0);
+    }
+
+    /// The `'static` obstacle commit 30a776eb cited as making ownership of the
+    /// payload bytes mandatory is a property of the closure's CAPTURE, not of the
+    /// payload representation. An `Arc<WriteSetSpill>` IS `'static`, so a closure
+    /// can OWN it and borrow the mapping INSIDE itself — which is exactly the bound
+    /// `handlers::on_state_machine` imposes (`F: FnOnce(&mut AccordStateMachine) ->
+    /// R + Send + 'static`). This is a COMPILE-TIME verification: the closure below
+    /// would not type-check if the cited obstruction were structural.
+    #[test]
+    fn an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside() {
+        // The identical bound `on_state_machine` (handlers.rs) imposes on the
+        // closure it hands to `tokio::task::spawn_blocking`.
+        fn requires_static_closure<R, F>(_f: F)
+        where
+            R: Send + 'static,
+            F: FnOnce(&mut crate::accord::state_machine::AccordStateMachine) -> R + Send + 'static,
+        {
+        }
+
+        let mut blobs = vec![b"staged-payload".to_vec()];
+        let reservation = ferrosa_storage::write_set_spill::reserve_write_set_stage().unwrap();
+        let spill = Arc::new(WriteSetSpill::stage(reservation, &mut blobs).unwrap());
+
+        // The closure OWNS the Arc (so it is `'static`) and borrows the mapping
+        // INSIDE its body — a borrow of its own captured value, not a capture of a
+        // borrow. This is the shape the coordinator's local apply can use.
+        let closure = move |_sm: &mut crate::accord::state_machine::AccordStateMachine| -> usize {
+            spill.entry(0).map(<[u8]>::len).unwrap_or(0)
+        };
+        requires_static_closure::<usize, _>(closure);
     }
 
     // =======================================================================
