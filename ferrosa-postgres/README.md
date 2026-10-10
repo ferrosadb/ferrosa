@@ -282,6 +282,11 @@ and precision are not enforced. An existing table is `42P07`, or a success
 under `IF NOT EXISTS` with no NOTICE (there is no `NoticeResponse`). A missing
 keyspace is `3F000`; DDL in a transaction block is `25001`; a context without a
 `ddl` executor refuses `0A000`. Unsupported clauses keep their `0A000` names.
+A trailing `CREATE TABLE ... WITH (key = value, ...)` storage-parameter clause is
+parsed: the accepted hints (`fillfactor`, `autovacuum_enabled`) are recorded on the
+AST but not applied — ferrosa has no heap pages or autovacuum to configure — and any
+other option name is `0A000` naming it. pgbench's `with (fillfactor=100)` is the case
+this exists for.
 `CREATE TABLE` requires `CREATE` on the target keyspace, checked at dispatch
 in `authz::statement_permissions` before the executor reads the schema (42501). `DROP`/`ALTER` are T-132b; extended-protocol `Parse` of DDL is refused.
 

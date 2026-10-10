@@ -32,6 +32,9 @@ pub enum ParseError {
     DuplicateColumn(String),
     /// An `ALTER TABLE` form outside the supported subset, described by the caller.
     UnsupportedAlter(String),
+    /// A `CREATE TABLE ... WITH (key = value)` storage parameter outside the
+    /// accepted set, named. See `parser_ddl::ACCEPTED_STORAGE_PARAMETERS`.
+    UnsupportedStorageParameter(String),
     /// A select-list expression form outside the supported subset, named. `||`
     /// is supported only in a no-`FROM` expression select; any other use is
     /// refused by name rather than mis-parsed.
@@ -68,6 +71,9 @@ impl fmt::Display for ParseError {
             ParseError::DuplicateColumn(c) => write!(f, "column `{c}` is declared twice"),
             ParseError::UnsupportedAlter(form) => {
                 write!(f, "ALTER TABLE form is not supported: {form}")
+            }
+            ParseError::UnsupportedStorageParameter(name) => {
+                write!(f, "table storage parameter `{name}` is not supported")
             }
             ParseError::UnsupportedSelectExpr(form) => {
                 write!(f, "{form} is not supported in a select list")
@@ -2617,6 +2623,115 @@ mod tests {
             let got = parse_statement(sql);
             assert!(got.is_ok(), "{sql} must parse: {got:?}");
         }
+    }
+
+    // ---- CREATE TABLE ... WITH (storage parameters) — pgbench -i ----
+
+    /// pgbench -i emits `... with (fillfactor=100)` on several of its tables. Before
+    /// this clause parsed, `pgbench -i` stopped dead at:
+    /// `ERROR: expected end of statement, found Ident("with")`. The statement below is
+    /// verbatim from that run.
+    #[test]
+    fn create_table_with_fillfactor_parses_pgbench_statement() {
+        let c = create(
+            "create table pgbench_tellers(tid int not null,bid int,tbalance int,filler char(84)) with (fillfactor=100)",
+        );
+        assert_eq!(c.name.table, "pgbench_tellers");
+        assert_eq!(
+            c.storage_parameters,
+            vec![("fillfactor".to_string(), "100".to_string())]
+        );
+        // Nothing else about CREATE TABLE changed: four columns, tid NOT NULL, no key.
+        assert_eq!(c.columns.len(), 4);
+        assert!(c.columns[0].not_null);
+        assert!(c.primary_key.is_empty());
+    }
+
+    /// A multi-option list parses every option, in declaration order.
+    #[test]
+    fn create_table_with_multiple_options_keeps_order() {
+        let c = create(
+            "CREATE TABLE t (k int PRIMARY KEY) WITH (fillfactor=100, autovacuum_enabled=false)",
+        );
+        assert_eq!(
+            c.storage_parameters,
+            vec![
+                ("fillfactor".to_string(), "100".to_string()),
+                ("autovacuum_enabled".to_string(), "false".to_string()),
+            ]
+        );
+    }
+
+    /// The clause is optional and accepts every spacing a client writes: `WITH(...)`
+    /// with no space, spaces around `=`, mixed case, a quoted-string value, and no
+    /// clause at all.
+    #[test]
+    fn create_table_with_clause_spacing_and_value_forms() {
+        // The clause absent leaves the parameter list empty.
+        assert!(create("CREATE TABLE t (k int PRIMARY KEY)")
+            .storage_parameters
+            .is_empty());
+
+        let cases = [
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) WITH (fillfactor=100)",
+                "100",
+            ),
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) WITH(fillfactor=100)",
+                "100",
+            ),
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) with ( fillfactor = 100 )",
+                "100",
+            ),
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) WITH (fillfactor='70')",
+                "70",
+            ),
+        ];
+        for (sql, want) in cases {
+            let c = create(sql);
+            assert_eq!(
+                c.storage_parameters,
+                vec![("fillfactor".to_string(), want.to_string())],
+                "{sql}"
+            );
+        }
+    }
+
+    /// A table created with the clause is identical in every other respect to one
+    /// created without it — only `storage_parameters` differs.
+    #[test]
+    fn create_table_with_clause_is_otherwise_identical() {
+        let with = create("CREATE TABLE t (k int PRIMARY KEY, v text) WITH (fillfactor=100)");
+        let without = create("CREATE TABLE t (k int PRIMARY KEY, v text)");
+        let mut with_cleared = with.clone();
+        with_cleared.storage_parameters.clear();
+        assert_eq!(with_cleared, without);
+    }
+
+    /// An option outside the accepted set is refused by NAME — never parsed and
+    /// dropped, which would let a client believe it configured something.
+    #[test]
+    fn create_table_refuses_unknown_storage_parameter_by_name() {
+        for option in ["toast_tuple_target", "oids", "user_catalog_table", "wibble"] {
+            let sql = format!("CREATE TABLE t (k int PRIMARY KEY) WITH ({option}=1)");
+            let err = parse_statement(&sql).expect_err(&sql);
+            assert!(
+                matches!(&err, ParseError::UnsupportedStorageParameter(name) if name == option),
+                "{sql}: expected a named refusal, got {err:?}"
+            );
+            assert!(err.to_string().contains(option), "{err}");
+        }
+    }
+
+    /// The clause must be parenthesised; a bare `WITH fillfactor=100` is refused,
+    /// not silently accepted as if the option were applied.
+    #[test]
+    fn create_table_bare_with_without_parentheses_is_refused() {
+        let sql = "CREATE TABLE t (k int PRIMARY KEY) WITH fillfactor=100";
+        assert!(parse_statement(sql).is_err(), "{sql} must not parse");
     }
 
     #[test]
