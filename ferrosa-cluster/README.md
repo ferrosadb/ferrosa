@@ -474,6 +474,41 @@ build; the codec's own cost is its delta against `none`.
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
+### No hard bounds on streamed data (cap census)
+
+There is no hard bound on the SIZE of data the engine accepts or returns: a cap that
+refuses `DataError`s or silently truncates streamed/bootstrap data is the smell to
+remove (you either lose the data or blow memory up). A **buffer** is the only bounding
+structure, and exceeding a buffer SPILLS — it never refuses and never truncates.
+Every other constant here is a resource bound that cannot change data completeness.
+Three data-path caps were removed:
+
+| cap (removed) | where | what it did | replacement |
+|---|---|---|---|
+| `DEFAULT_STREAM_MAX_MUTATIONS` 50 000 / `DEFAULT_STREAM_MAX_BYTES` 128 MiB | `streaming/receiver.rs` | `apply_chunk` returned `stream: mutation budget exceeded` / `stream: byte budget exceeded` — a REFUSAL on an inbound stream | resident buffer (tunable `FERROSA_STREAM_RESIDENT_BUFFER_BYTES`, default 4 MiB, `0` = hold nothing) that SPILLS to the staging file; a record larger than the buffer is written straight through |
+| `read_range(.., 10_000)` ×3 | `system_table_loader.rs` | keyspaces/roles/grants cold-start read SILENTLY returned ≤ 10 000 (no error, no flag) — data loss for a larger deployment | `walk_all_partitions` streams every partition via `StorageEngine::walk_token_range`, one resident at a time |
+| `BOUNDED_ROW_FALLBACK_LIMIT` 1 000 | `controller/bootstrap/bootstrap_stream.rs` + `controller/cluster.rs` | the 0-SSTable row fallback read SILENTLY dropped the tail of a table larger than 1 000 partitions | `TableStreamPlan::StreamRows` + `stream_row_fallback_into` streams EVERY partition through `walk_token_range` |
+
+The receiver's only remaining bound on replay is a corrupt-file guard: a staged length
+prefix larger than the staging file fails loud instead of allocating a huge buffer
+(never a cap on how much a session may carry). Red-first evidence:
+`streaming::receiver::tests::{apply_chunk_accepts_a_stream_larger_than_the_former_mutation_budget,
+apply_chunk_accepts_a_record_larger_than_the_former_byte_budget,
+spilling_to_the_staging_file_applies_every_mutation, resident_buffer_knob_is_tunable_and_never_refuses_data}`,
+`system_table_loader::tests::load_keyspace_names_returns_every_persisted_keyspace_past_ten_thousand`,
+`controller::bootstrap::bootstrap_stream::tests::row_fallback_streams_every_partition_past_the_former_cap`.
+
+**Kept, and why** — each cannot affect data completeness: `accord` `APPLY_FANOUT_WINDOW`
+(bounds resident Apply *frames*, not their size — CL-53); `accord/apply.rs`
+`DEFAULT_PARKED_APPLY_RECLAIM_SECS` (a TIME bound; parked write-sets already spill, CL-55);
+`repair` fetch/apply chunk sizes (mid-stream chunks carrying a resume cursor, every batch
+sent); `hints/` per-peer byte budget (`ClusterError::Overloaded` — loud backpressure,
+never a silent drop); `MAX_CONNECTED_PEERS` / `MAX_PENDING_JOINS` / `MAX_SEEN_INVITE_INITIATORS`
+(evict-oldest maps that never refuse a real member); `cluster_rejoin`
+`MAX_REJOIN_ATTEMPTS` / `BACKOFF_MAX_SECS` (retries/backoff); `ferrosa-net` lane
+`channel_capacity` / `pending_stream_capacity` (bounded channels that await, or fail loud
+with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
+
 ### Formation (`controller/`, `mode.rs`, `ring/`, `pair/`, `rebalance.rs`)
 - `DeploymentMode` + `ModeController` — the `Standalone → Pair → Forming →
   Cluster` state machine with degraded states; `ClusterStateHolder` dispatches

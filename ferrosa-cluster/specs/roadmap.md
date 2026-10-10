@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-08-24
+last_updated: 2026-10-10
 ---
 
 # ferrosa-cluster — Roadmap
@@ -10,6 +10,17 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), in-code deprecation markers,
 reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
+
+- **No hard bounds on streamed data (CL-56/57/58).** Three data-path caps that
+  either refused or silently truncated data are gone: the row-stream receiver's
+  `DEFAULT_STREAM_MAX_MUTATIONS`/`DEFAULT_STREAM_MAX_BYTES` refusal (now a tunable
+  resident buffer, `FERROSA_STREAM_RESIDENT_BUFFER_BYTES`, that SPILLS to the staging
+  file); the `system_table_loader` `read_range(.., 10_000)` silent tail-drop (now a
+  streaming `walk_token_range`); and the bootstrap row-fallback `BOUNDED_ROW_FALLBACK_LIMIT`
+  silent tail-drop (now `TableStreamPlan::StreamRows` + a streaming walk). Each removal
+  landed red-first. Remaining resource bounds (Accord fan-out window, repair chunk sizes,
+  hint byte budget, peer-count maps, rejoin backoff, net lane capacities) are kept and
+  documented in the crate README's cap census.
 
 - **Region-REFERENCE Apply wire (CL-52).** `MsgType::AccordApplyV2Region` (0x7E),
   gated on `CAP_ACCORD_APPLY_REGION` (1<<4): the Apply frame is now a capnp HEADER
