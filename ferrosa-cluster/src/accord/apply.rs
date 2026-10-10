@@ -553,10 +553,28 @@ impl StorageApplier for EngineStorageApplier {
         let mut newly_applied: Vec<(TxnId, Vec<u8>, u64)> = Vec::new();
         let mut postgres_mvcc_metadata = Vec::new();
 
+        // Capture what the post-loop steps need (the agreed stamp, the
+        // all-one-timestamp invariant, and the count) BEFORE the decode loop
+        // consumes `mutations`, so each entry's payload can be dropped the
+        // moment it has been decoded rather than being pinned resident for the
+        // whole loop. `decode_postgres_mvcc_mutation` BORROWS the payload and
+        // `Mutation::deserialize_from_rebinding_list_paths` copies what it needs
+        // into owned rows, so once an entry is decoded nothing references its
+        // `data` again. Holding all 352 515 encoded payloads (~670 MB at
+        // N=1 100 000) live next to the decoded `Vec<BatchOp>` is what made the
+        // Apply peak hold input AND output at once (PG-ACC-03).
+        let mutation_count = mutations.len();
+        let apply_t = match mutations.first() {
+            Some(first) => first.t,
+            // No mutations is a no-op: nothing to preflight, nothing to apply.
+            None => return Ok(()),
+        };
+        let mut_timestamps_uniform = mutations.iter().all(|mutation| mutation.t == apply_t);
+
         {
             // Snapshot the idempotency set under the lock to decide what to skip.
             let already = self.applied.lock();
-            for mutation in &mutations {
+            for mutation in mutations {
                 // Decode the self-describing commit-log mutation (one partition),
                 // rebinding any Accord `list` append cell's path from the
                 // coordinator-local wall clock to the agreed execution timestamp
@@ -627,10 +645,7 @@ impl StorageApplier for EngineStorageApplier {
                     reason: "PostgreSQL MVCC metadata has no registered apply observer".into(),
                 });
             }
-            if mutations
-                .iter()
-                .any(|mutation| mutation.t != mutations[0].t)
-            {
+            if !mut_timestamps_uniform {
                 return Err(ApplyError {
                     txn_id,
                     reason: "PostgreSQL MVCC writeset contains multiple Accord timestamps".into(),
@@ -638,7 +653,7 @@ impl StorageApplier for EngineStorageApplier {
             }
             for observer in observers.iter() {
                 observer
-                    .prepare_postgres_apply(txn_id, mutations[0].t, &postgres_mvcc_metadata)
+                    .prepare_postgres_apply(txn_id, apply_t, &postgres_mvcc_metadata)
                     .map_err(|reason| ApplyError { txn_id, reason })?;
             }
         }
@@ -665,7 +680,7 @@ impl StorageApplier for EngineStorageApplier {
             let metadata_kib: usize =
                 postgres_mvcc_metadata.iter().map(Vec::len).sum::<usize>() / 1024;
             tracing::info!(
-                mutations = mutations.len(),
+                mutations = mutation_count,
                 decode_ms = decode_ms.unwrap_or(0),
                 apply_batch_ms = started.elapsed().as_millis() as u64,
                 metadata_kib,
@@ -676,7 +691,7 @@ impl StorageApplier for EngineStorageApplier {
         if !postgres_mvcc_metadata.is_empty() {
             for observer in self.postgres_mvcc_observers.read().iter() {
                 observer
-                    .on_postgres_apply(txn_id, mutations[0].t, &postgres_mvcc_metadata)
+                    .on_postgres_apply(txn_id, apply_t, &postgres_mvcc_metadata)
                     .map_err(|reason| ApplyError { txn_id, reason })?;
             }
         }
