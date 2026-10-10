@@ -4280,7 +4280,9 @@ impl<F: FlushTarget> TableStore<F> {
     }
 
     /// The table-level tombstone currently visible in `guard`, or
-    /// [`DeletionTime::LIVE`] if the table has not been truncated.
+    /// [`DeletionTime::LIVE`] if the table has not been truncated — together with
+    /// the identity of the first SSTable that could not be consulted while
+    /// resolving it.
     ///
     /// A TRUNCATE is stored as one reserved partition
     /// ([`crate::table_tombstone::table_tombstone_key`]) whose `deletion` is the
@@ -4288,14 +4290,27 @@ impl<F: FlushTarget> TableStore<F> {
     /// memtable, every flushing memtable and every SSTable whose token range covers
     /// the reserved key, returning the newest.
     ///
-    /// Fails loud if an overlapping SSTable cannot be opened or read: a missing
-    /// tombstone would resurrect truncated data, so a partial answer is worse than
-    /// an error. Only SSTables whose `[min_token, max_token]` covers the reserved
-    /// key are opened, and a Bloom check (`may_contain_key`) skips the rest, so this
-    /// is a bounded, single-key probe on a table that has ever been truncated.
-    fn table_deletion(&self, guard: &StoreView) -> Result<DeletionTime> {
+    /// An overlapping SSTable that cannot be opened or read is NOT a hard error
+    /// here. A missing tombstone would resurrect truncated data, so no caller may
+    /// proceed on a partial answer — but the ordinary cause is the transient
+    /// compaction window (the input was retired and its merged output lives in a
+    /// newer view), which is exactly what the callers' fresh-view retry exists to
+    /// absorb. So the unconsultable descriptor is returned as a
+    /// [`CorruptSstableId`] for the caller to fold into the retry signal it already
+    /// uses for its own sources; on retry exhaustion that same path quarantines the
+    /// generation and fails the read loud. `Err` is reserved for a failure no fresh
+    /// view can fix (a memtable fault).
+    ///
+    /// Only SSTables whose `[min_token, max_token]` covers the reserved key are
+    /// opened, and a Bloom check (`may_contain_key`) skips the rest, so this is a
+    /// bounded, single-key probe on a table that has ever been truncated.
+    fn table_deletion(
+        &self,
+        guard: &StoreView,
+    ) -> Result<(DeletionTime, Option<CorruptSstableId>)> {
         let key = crate::table_tombstone::table_tombstone_key();
         let mut best = DeletionTime::LIVE;
+        let mut corrupt: Option<CorruptSstableId> = None;
         if let Some(p) = guard.active.get(&key)? {
             best = crate::table_tombstone::newest_deletion(best, p.deletion);
         }
@@ -4309,26 +4324,52 @@ impl<F: FlushTarget> TableStore<F> {
             if token < desc.min_token || token > desc.max_token {
                 continue;
             }
-            let reader = self
-                .open_reader(desc)
-                .map_err(|e| self.unreadable_sstable("table_tombstone", "open", desc, &e))?;
+            // A quarantined generation is never skipped: its tombstone, if any,
+            // cannot be assumed absent. Report it without re-opening the file and
+            // let the caller retry onto a view that no longer holds it, or fail.
+            if self.is_sstable_quarantined(&desc.gen) {
+                corrupt.get_or_insert_with(|| CorruptSstableId::from_descriptor(desc));
+                continue;
+            }
+            let reader = match self.open_reader(desc) {
+                Ok(r) => r,
+                Err(e) => {
+                    self.unreadable_sstable("table_tombstone", "open", desc, &e);
+                    corrupt.get_or_insert_with(|| CorruptSstableId::from_descriptor(desc));
+                    continue;
+                }
+            };
             if !reader.may_contain_key(&key) {
                 continue;
             }
             match reader.get_partition(&key) {
                 Ok(Some(p)) => best = crate::table_tombstone::newest_deletion(best, p.deletion),
                 Ok(None) => {}
-                Err(e) => return Err(self.unreadable_sstable("table_tombstone", "read", desc, &e)),
+                Err(e) => {
+                    self.unreadable_sstable("table_tombstone", "read", desc, &e);
+                    corrupt.get_or_insert_with(|| CorruptSstableId::from_descriptor(desc));
+                }
             }
         }
-        Ok(best)
+        Ok((best, corrupt))
     }
 
     /// The table tombstone as of the store's current view, or
     /// [`DeletionTime::LIVE`]. The store-internal entry point for callers outside
     /// this module (compaction, which must reclaim rows a truncate covers).
+    ///
+    /// Unlike the read paths, a caller here must not reclaim against a tombstone it
+    /// could not fully resolve: dropping rows on a partial answer risks deleting
+    /// live data, so an unconsultable overlapping SSTable stays a hard error.
     pub(crate) fn table_tombstone(&self) -> Result<DeletionTime> {
-        self.table_deletion(&self.view.load())
+        match self.table_deletion(&self.view.load())? {
+            (delete, None) => Ok(delete),
+            (_, Some(c)) => Err(ferrosa_common::Error::corrupt_sstable(
+                c.gen,
+                c.min_token,
+                c.max_token,
+            )),
+        }
     }
 
     /// One attempt of [`read_limited_rows`] against a fixed `view` snapshot.
@@ -4511,7 +4552,11 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let mut merged = merge::merge_partitions(sources);
-        let table_delete = self.table_deletion(guard)?;
+        // Resolving the reserved-key tombstone can meet an SSTable the sources
+        // above never opened; an unconsultable one drives the same fresh-view
+        // retry rather than failing the read on a transient compaction window.
+        let (table_delete, probe_corrupt) = self.table_deletion(guard)?;
+        corrupt = corrupt.or(probe_corrupt);
         merge::apply_table_deletion(&mut merged, table_delete);
         if row_limit > 0 {
             merge::apply_deletions(&mut merged);
@@ -4645,7 +4690,8 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let mut merged = merge::merge_partitions(sources);
-        let table_delete = self.table_deletion(guard)?;
+        let (table_delete, probe_corrupt) = self.table_deletion(guard)?;
+        corrupt = corrupt.or(probe_corrupt);
         merge::apply_table_deletion(&mut merged, table_delete);
         merged.rows.retain(|row| row.clustering == clustering);
         if merged.rows.is_empty() {
@@ -6355,7 +6401,17 @@ impl<F: FlushTarget> TableStore<F> {
         // present).
         // The reserved table-tombstone partition itself holds no rows, but its
         // watermark still suppresses rows table-wide; fold it in before counting.
-        let table_delete = self.table_deletion(&view)?;
+        let (table_delete, probe_corrupt) = self.table_deletion(&view)?;
+        if let Some(c) = probe_corrupt {
+            // This path has no fresh-view retry of its own (a merger error is
+            // already final here), so surface an unconsultable overlapping
+            // SSTable exactly as a source failure: typed, never a partial count.
+            return Err(ferrosa_common::Error::corrupt_sstable(
+                c.gen,
+                c.min_token,
+                c.max_token,
+            ));
+        }
         while let Some(p) = merger.next_merged_partition()? {
             if !matches(&p.key) || crate::table_tombstone::is_table_tombstone_key(&p.key) {
                 continue;
@@ -6451,7 +6507,19 @@ impl<F: FlushTarget> TableStore<F> {
         // overlapping SSTable is surfaced as a stream error, never silently
         // dropped (a missing tombstone would resurrect truncated data).
         let table_delete = match self.table_deletion(&self.view.load()) {
-            Ok(d) => d,
+            Ok((d, None)) => d,
+            Ok((_, Some(c))) => {
+                // No scan has started yet, so there is nothing to retire; surface
+                // the unconsultable overlapping SSTable as the same typed error the
+                // resumable walk raises for an unreadable source.
+                return Box::pin(futures::stream::once(async move {
+                    Err(ferrosa_common::Error::corrupt_sstable(
+                        c.gen,
+                        c.min_token,
+                        c.max_token,
+                    ))
+                }));
+            }
             Err(e) => return Box::pin(futures::stream::once(async move { Err(e) })),
         };
         let scan = RangeScan {
@@ -6711,7 +6779,16 @@ impl<F: FlushTarget> TableStore<F> {
             }
             merged.push(p);
         }
-        let table_delete = self.table_deletion(&guard)?;
+        let (table_delete, probe_corrupt) = self.table_deletion(&guard)?;
+        if let Some(c) = probe_corrupt {
+            // `with_retried_scan` retries this typed error against a fresh view:
+            // the retired input's merged output holds the rows.
+            return Err(ferrosa_common::Error::corrupt_sstable(
+                c.gen,
+                c.min_token,
+                c.max_token,
+            ));
+        }
         for p in &mut merged {
             merge::apply_table_deletion(p, table_delete);
         }
@@ -6796,7 +6873,16 @@ impl<F: FlushTarget> TableStore<F> {
         let in_range = |t: i64| t >= start_token && t < end_token;
         // The table tombstone, resolved once against this view and folded into
         // every merged partition below (a TRUNCATE must hide rows table-wide).
-        let table_delete = self.table_deletion(&guard)?;
+        // An unconsultable overlapping SSTable is a typed, retriable error here:
+        // `with_retried_scan` retries it against a fresh view.
+        let (table_delete, probe_corrupt) = self.table_deletion(&guard)?;
+        if let Some(c) = probe_corrupt {
+            return Err(ferrosa_common::Error::corrupt_sstable(
+                c.gen,
+                c.min_token,
+                c.max_token,
+            ));
+        }
 
         // Token-ordered, peekable source streams. Memtable sources are staged
         // into sorted vecs (already range-filtered, so bounded by matches);
@@ -7899,7 +7985,16 @@ impl<F: FlushTarget> TableStore<F> {
         // need row-level and partition-level deletions applied because
         // the memtable's merge-on-write sets deletion markers but does
         // not suppress the covered cells.
-        let table_delete = self.table_deletion(&guard)?;
+        let (table_delete, probe_corrupt) = self.table_deletion(&guard)?;
+        if let Some(c) = probe_corrupt {
+            // `with_retried_scan` retries this typed error against a fresh view:
+            // the retired input's merged output holds the rows.
+            return Err(ferrosa_common::Error::corrupt_sstable(
+                c.gen,
+                c.min_token,
+                c.max_token,
+            ));
+        }
         for p in &mut merged {
             merge::apply_table_deletion(p, table_delete);
         }
