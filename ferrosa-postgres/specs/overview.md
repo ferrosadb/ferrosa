@@ -194,19 +194,22 @@ query-materialization caveats are in the public
 
 ### Coherence with the consensus write path
 
-`FERROSA_POSTGRES_MAX_TXN_WRITES` bounds what this front end will *admit*, but a
-buffered transaction is not committed here — it is committed by Accord, which
-registers an incoming transaction in its conflict index **under every key** and
-all-or-nothing. Those two limits must therefore agree, or the front end accepts a
-transaction consensus cannot register: the PreAccept is refused by every replica,
-the coordinator collects zero votes, and the client sees only the opaque
-`Accord quorum unavailable`.
+A buffered transaction is not committed here — it is committed by Accord, which
+registers an incoming transaction in its conflict index **under every key**,
+all-or-nothing. Accord's conflict index is now **unbounded** (`ConflictIndex`
+grows to hold any write-set; see `ferrosa-cluster`), so it can no longer refuse a
+write-set this front end admits. The silent disagreement — the front end accepted a
+transaction consensus could not register, the PreAccept was refused by every
+replica, and the client saw only the opaque `Accord quorum unavailable` — is
+therefore closed (forge `t_513f70ed`, FMEA `PG-ACC-01`).
 
-`FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` (see `ferrosa-cluster`) is the consensus-side
-bound. It defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES`, floored at `100000`, so the
-two are coherent out of the box and raising the write cap alone cannot re-open the
-mismatch. A write set that exceeds the resolved capacity is refused **by name**
-before the protocol runs, rather than surfacing as a quorum failure.
+`FERROSA_POSTGRES_MAX_TXN_WRITES` still bounds what this front end will *admit*,
+and that bound is **retained on purpose**: the buffer it bounds is a resident
+`Vec<PgWrite>`, and lifting the cap would leave it unbounded *and resident* — the
+materialization the owner's no-OOM rule forbids. Removing it is BLOCKED until the
+front end spills the write-set to disk as rows arrive (the streaming
+`WriteSetStage` on `fix/pgwire-nonresident-write-path`, `37f76e83`). Until then the
+cap is a fail-loud `53400`, never a silent drop.
 
 1. **Fail loud, never fake.** Every failure maps to a concrete SQLSTATE + one
    `ErrorResponse`; the front-end never returns a fake empty result on error
