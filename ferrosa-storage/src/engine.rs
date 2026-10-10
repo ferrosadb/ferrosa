@@ -9728,6 +9728,37 @@ impl StorageEngine {
         }
     }
 
+    /// Batch point-read of one clustered row each across many partitions, against a
+    /// single store-view snapshot — the batched form of [`Self::read_clustering_row`]
+    /// (see [`TableStore::read_clustering_rows_batch`](crate::store::TableStore::read_clustering_rows_batch)).
+    ///
+    /// `requests` are `(partition key, clustering key)` pairs. The result has one
+    /// entry per request, in order; an absent partition is `None`. The table's
+    /// foreground-read stamp is refreshed once for the batch rather than once per
+    /// request, which is the same heuristic on a coarser granularity.
+    pub fn read_clustering_rows_batch(
+        &self,
+        table_id: &TableId,
+        requests: &[(DecoratedKey, Vec<u8>)],
+    ) -> ferrosa_common::Result<Vec<Option<Partition>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _span = tracing::info_span!(
+            "storage.read_clustering_rows_batch",
+            table = %table_id,
+            requests = requests.len(),
+        )
+        .entered();
+        match self.table_state(table_id) {
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_clustering_rows_batch(requests)
+            }
+            None => Ok(vec![None; requests.len()]),
+        }
+    }
+
     /// Reads partitions from a table in token order with optional bounds and limit.
     pub fn read_range(
         &self,

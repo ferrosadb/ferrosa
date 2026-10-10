@@ -51,6 +51,14 @@ const DEFAULT_PREACCEPT_FAST_PATH_TIMEOUT_MS: u64 = 1_000;
 /// an explicit ceiling rather than a serialization side effect.
 const APPLY_FANOUT_WINDOW: usize = 4;
 
+/// Whether the per-phase commit attribution (`FERROSA_PG_COMMIT_PROFILE`) is on.
+///
+/// Every probe is gated on this so the path is zero-cost when unset — no
+/// `Instant::now()` is taken and no counter is touched.
+fn txn_profile_enabled() -> bool {
+    std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
+}
+
 fn parse_preaccept_fast_path_timeout(value: Option<&str>) -> Result<std::time::Duration, String> {
     let Some(value) = value else {
         return Ok(std::time::Duration::from_millis(
@@ -2414,6 +2422,7 @@ impl AccordCoordinatorDriver {
         // double-apply. The bare `local_applier` fallback is for tests / no-SM
         // setups that persist but have no state machine to advance.
         if self_is_replica {
+            let t_local_apply = txn_profile_enabled().then(std::time::Instant::now);
             let owned_writes: Vec<Vec<u8>> = self
                 .write_set
                 .iter()
@@ -2443,6 +2452,12 @@ impl AccordCoordinatorDriver {
                         AccordDriverError::Network(format!("coordinator local apply failed: {e}"))
                     })?;
                 }
+            }
+            if let Some(started) = t_local_apply {
+                tracing::info!(
+                    local_apply_ms = started.elapsed().as_millis() as u64,
+                    "accord apply_phase: coordinator's own apply (before the remote fan-out)"
+                );
             }
         }
 
@@ -2647,9 +2662,27 @@ impl AccordCoordinatorDriver {
         // `APPLY_FANOUT_WINDOW` of them — while removing the N-fold serialization.
         let mut inflight = futures::stream::FuturesUnordered::new();
         let mut peers = self.replica_ids.iter().filter(|&&id| id != self_id);
+        let profile = txn_profile_enabled();
+        let t_fanout = profile.then(std::time::Instant::now);
+        let mut serialize_ns = 0u64;
+        let mut ack_ms: Vec<u64> = Vec::new();
+        let log_fanout = |serialize_ns: u64, ack_ms: &[u64]| {
+            if let Some(started) = t_fanout {
+                tracing::info!(
+                    txn_id = ?txn_id,
+                    peers = ack_ms.len(),
+                    fanout_ms = started.elapsed().as_millis() as u64,
+                    serialize_ms = serialize_ns as f64 / 1_000_000.0,
+                    max_ack_ms = ack_ms.iter().copied().max().unwrap_or(0),
+                    sum_ack_ms = ack_ms.iter().sum::<u64>(),
+                    "accord apply_fanout attribution"
+                );
+            }
+        };
         loop {
             while inflight.len() < APPLY_FANOUT_WINDOW {
                 let Some(&peer_id) = peers.next() else { break };
+                let t_build = profile.then(std::time::Instant::now);
                 let writes: Vec<WriteSetEntry> = self
                     .write_set
                     .iter()
@@ -2659,19 +2692,26 @@ impl AccordCoordinatorDriver {
                 let payload = ApplyV2Payload { txn_id, writes };
                 let bytes = bincode::serialize(&payload)
                     .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                if let Some(started) = t_build {
+                    serialize_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                }
                 // Free the owned entries before the RPC: only the serialized frame
                 // is resident while the send is in flight, never the entries too.
                 drop(payload);
                 let msg = Message::AccordApplyV2(Bytes::from(bytes));
                 let peers_handle = &self.peers;
+                let pushed = std::time::Instant::now();
                 inflight.push(async move {
                     let result = peers_handle.send(peer_id, msg, Lane::Data).await;
-                    (peer_id, result)
+                    (peer_id, result, pushed)
                 });
             }
-            let Some((peer_id, result)) = inflight.next().await else {
+            let Some((peer_id, result, pushed)) = inflight.next().await else {
                 break;
             };
+            if profile {
+                ack_ms.push(pushed.elapsed().as_millis() as u64);
+            }
             if let Err(error) = &result {
                 tracing::warn!(
                     txn_id = ?txn_id,
@@ -2683,10 +2723,12 @@ impl AccordCoordinatorDriver {
             if is_ack(&result) {
                 quorum.record_node_ack(peer_id);
                 if quorum.all_reached() {
+                    log_fanout(serialize_ns, &ack_ms);
                     return Ok(true);
                 }
             }
         }
+        log_fanout(serialize_ns, &ack_ms);
         Ok(quorum.all_reached())
     }
 
