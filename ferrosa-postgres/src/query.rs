@@ -43,13 +43,12 @@ use ferrosa_sql::{
 use ferrosa_storage::{Mutation, StorageEngine};
 
 use crate::messages::{BackendMessage, FieldDescription};
-use crate::mvcc::{
-    MvccCommitError, MvccManager, MvccSnapshot, PgWrite, RowChange, DEFAULT_MAX_TXN_WRITES,
-};
+use crate::mvcc::{MvccCommitError, MvccManager, MvccSnapshot, PgWrite, RowChange};
 use crate::result_stream::{open_stream, ResultStream};
 use crate::storage_provider::TableCodec;
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 use crate::synthetic_key::next_synthetic_key;
+use crate::txn_write_set::TxnWriteSet;
 
 /// The reserved PostgreSQL schema whose relations are projected from the live
 /// schema, not read from storage (see [`crate::catalog`]).
@@ -883,7 +882,7 @@ pub async fn execute_query(
     sql: &str,
     default_schema: &str,
     jsonb_limits: &ferrosa_jsonb::Limits,
-    txn: Option<&mut Vec<PgWrite>>,
+    txn: Option<&mut TxnWriteSet>,
 ) -> Vec<BackendMessage> {
     let env = ReadEnv {
         engine,
@@ -932,7 +931,7 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
 pub(crate) async fn execute_query_with_mvcc(
     env: ReadEnv<'_>,
     sql: &str,
-    txn: Option<&mut Vec<PgWrite>>,
+    txn: Option<&mut TxnWriteSet>,
 ) -> Vec<BackendMessage> {
     let mut messages: Vec<BackendMessage> = Vec::new();
     let tail = execute_query_streaming(env, sql, txn, &mut messages).await;
@@ -958,7 +957,7 @@ pub(crate) async fn execute_query_with_mvcc(
 pub(crate) async fn execute_query_streaming<O: ReplySink>(
     env: ReadEnv<'_>,
     sql: &str,
-    txn: Option<&mut Vec<PgWrite>>,
+    mut txn: Option<&mut TxnWriteSet>,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
     let stmt = match parse_statement(sql) {
@@ -976,7 +975,20 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
     // Table query: load referenced tables (the R15 guard lives in
     // `load_table` — a missing table is `NoSuchTable`, never an empty scan),
     // then stream the executor's output. Simple query: all text, no params.
-    let pending = txn.as_deref().map(Vec::as_slice);
+    let pending_owned = if let Some(set) = txn.as_mut() {
+        match set.pending_writes() {
+            Ok(writes) => Some(writes),
+            Err(error) => {
+                return Ok(vec![error_response(
+                    "58000",
+                    &format!("transaction write-set could not be read back: {error}"),
+                )])
+            }
+        }
+    } else {
+        None
+    };
+    let pending = pending_owned.as_deref();
     let mut stream = match open_select_stream(env, *select, pending, Vec::new()).await {
         Ok(stream) => stream,
         Err(error) => return Ok(vec![error]),
@@ -1240,7 +1252,7 @@ pub(crate) fn write_error_response(error: &ferrosa_common::Error) -> BackendMess
 async fn execute_statement(
     env: ReadEnv<'_>,
     stmt: Statement,
-    txn: Option<&mut Vec<PgWrite>>,
+    mut txn: Option<&mut TxnWriteSet>,
 ) -> Vec<BackendMessage> {
     let ReadEnv {
         engine,
@@ -1260,7 +1272,23 @@ async fn execute_statement(
         // No-`FROM` expression query: `SELECT 1`, `SELECT version()`,
         // `SELECT (SELECT count(*) FROM t)`, etc.
         Statement::SelectExprs(items) => {
-            let ctx = ScalarReadCtx::new(env, txn.as_deref().map(Vec::as_slice));
+            // Read-your-own-writes: decode the staged write-set so a scalar
+            // subquery inside the open transaction sees its own uncommitted rows.
+            // This is the ONLY place a no-FROM select materializes the set, and
+            // only when there is a set to read.
+            let pending_owned = match txn.as_deref_mut() {
+                Some(set) => match set.pending_writes() {
+                    Ok(writes) => Some(writes),
+                    Err(error) => {
+                        return vec![error_response(
+                            "58000",
+                            &format!("transaction write-set could not be read back: {error}"),
+                        )]
+                    }
+                },
+                None => None,
+            };
+            let ctx = ScalarReadCtx::new(env, pending_owned.as_deref());
             match execute_scalar_select(&items, ctx).await {
                 Ok(result) => render_result(result, &[]),
                 Err(err_msg) => vec![err_msg],
@@ -1455,15 +1483,16 @@ async fn execute_statement(
 /// transaction's write-set, or apply it immediately via the MVCC manager when
 /// there is no open transaction (autocommit).
 ///
-/// FAIL LOUD: when buffering, exceeding the configured write cap returns an error
-/// response (and the server poisons the transaction) rather than growing the
-/// buffer without bound; a buffered write is NEVER applied to storage here —
-/// only the PostgreSQL MVCC manager applies it on COMMIT.
+/// FAIL LOUD: when buffering, a staging I/O failure returns an error response (and
+/// the server poisons the transaction). There is deliberately NO capacity refusal: a
+/// write-set larger than the staging buffer SPILLS, it is never declined for being
+/// large (FMEA PG-12). A buffered write is NEVER applied to storage here — only the
+/// PostgreSQL MVCC manager applies it on COMMIT.
 async fn apply_or_buffer(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: Option<&MvccManager>,
-    txn: Option<&mut Vec<PgWrite>>,
+    txn: Option<&mut TxnWriteSet>,
     mutation: Mutation,
     ok_tag: &str,
 ) -> Vec<BackendMessage> {
@@ -1484,22 +1513,20 @@ async fn apply_or_buffer_silent(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: Option<&MvccManager>,
-    txn: Option<&mut Vec<PgWrite>>,
+    txn: Option<&mut TxnWriteSet>,
     mutation: Mutation,
 ) -> Result<(), Vec<BackendMessage>> {
-    let max_txn_writes = mvcc.map_or(DEFAULT_MAX_TXN_WRITES, MvccManager::max_txn_writes);
     match txn {
         Some(buffer) => {
-            if buffer.len() >= max_txn_writes {
-                return Err(vec![error_response(
-                    "53400",
-                    &format!(
-                        "transaction write-set exceeds the {max_txn_writes}-write limit; \
-                         ROLLBACK required"
-                    ),
-                )]);
-            }
-            buffer.push(PgWrite(mutation));
+            // NO capacity refusal. A write-set larger than the staging buffer
+            // SPILLS to disk; it is never refused for being large, so the old
+            // `FERROSA_POSTGRES_MAX_TXN_WRITES` / `53400` limit is gone (PG-12).
+            buffer.push(PgWrite(mutation)).map_err(|error| {
+                vec![error_response(
+                    "58000",
+                    &format!("transaction write-set staging failed: {error}"),
+                )]
+            })?;
             Ok(())
         }
         None => match mvcc {
@@ -1544,7 +1571,7 @@ pub(crate) struct TruncateContext<'a> {
     pub(crate) schema: &'a Schema,
     pub(crate) default_schema: &'a str,
     pub(crate) mvcc: Option<&'a MvccManager>,
-    pub(crate) txn: Option<&'a mut Vec<PgWrite>>,
+    pub(crate) txn: Option<&'a mut TxnWriteSet>,
 }
 
 /// Execute `TRUNCATE [TABLE] a [, b, ...]`.
@@ -1629,24 +1656,50 @@ pub(crate) async fn execute_truncate(
 /// Apply a PostgreSQL write batch atomically and publish row versions only after
 /// storage confirms the entire batch. This path is independent of Cassandra's
 /// Cassandra Accord transaction protocol.
-pub(crate) fn commit_mutations(
+pub(crate) fn commit_mutations<S: ferrosa_storage::write_set_stage::WriteSetSource>(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: &MvccManager,
     snapshot: &MvccSnapshot,
     read_tables: &std::collections::HashSet<String>,
-    mutations: Vec<Mutation>,
+    source: S,
 ) -> Result<u64, MvccCommitError> {
-    if mutations.is_empty() {
+    if source.is_empty_set() {
         return Ok(mvcc.current_commit_seq());
     }
-    let changes = prepare_row_changes(engine, schema, &mutations)?;
+    let changes = prepare_row_changes_from_source(engine, schema, &source)?;
     mvcc.commit(snapshot, read_tables, || {
-        // The typed error propagates: the front end must be able to ask
-        // `is_backpressure()` to choose between 53000 and 58000.
-        engine.write_atomic_batch(mutations)?;
+        // The durable apply reads the write-set as a STREAM: a staged, spilled
+        // write-set is decoded one mutation at a time, so the apply never
+        // re-materializes the whole set. The source's residency is its own
+        // tunable staging buffer.
+        engine.write_atomic_batch(source)?;
         Ok(changes)
     })
+}
+
+/// Build the MVCC row images for a write-set read from a [`WriteSetSource`].
+///
+/// The row-image build still resolves a whole-table overlay, so the set is
+/// materialized for [`prepare_row_changes`] and DROPPED before the durable apply
+/// runs — the COMMIT's apply pass reads the source as a stream. Bounding THIS
+/// build (and the MVCC history it feeds) needs an on-disk version store and is
+/// the named follow-up for FMEA PG-12/#2.
+pub(crate) fn prepare_row_changes_from_source<
+    S: ferrosa_storage::write_set_stage::WriteSetSource,
+>(
+    engine: &StorageEngine,
+    schema: &Schema,
+    source: &S,
+) -> Result<Vec<RowChange>, MvccCommitError> {
+    let mut mutations: Vec<Mutation> = Vec::with_capacity(source.mutation_count());
+    source
+        .for_each_mutation(&mut |mutation| {
+            mutations.push(mutation.clone());
+            Ok(())
+        })
+        .map_err(MvccCommitError::Storage)?;
+    prepare_row_changes(engine, schema, &mutations)
 }
 
 /// Build MVCC row images before a distributed commit applies the mutations.
@@ -2313,7 +2366,7 @@ pub(crate) struct DmlContext<'a> {
     pub mvcc: Option<&'a MvccManager>,
     pub schema: &'a Schema,
     pub default_schema: &'a str,
-    pub txn: Option<&'a mut Vec<PgWrite>>,
+    pub txn: Option<&'a mut TxnWriteSet>,
     /// Tunable jsonb ingest limits (D14b) for text bound to jsonb columns.
     pub jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
@@ -2515,7 +2568,7 @@ pub(crate) async fn execute_insert(
             timestamp,
         );
         // Write (or buffer into the open transaction) via the shared seam. On any
-        // error — including the write-set cap — `apply_or_buffer` returns an
+        // error — a staging failure included — `apply_or_buffer` returns an
         // `ErrorResponse`; propagate it untouched (the RETURNING rows are never
         // emitted for a failed write). On success it returns `CommandComplete`
         // carrying `tag`, which is the STATEMENT's count (`INSERT 0 N`) rather than
@@ -4748,6 +4801,7 @@ mod tests {
 #[cfg(test)]
 mod txn_buffer_tests {
     use super::*;
+    use crate::mvcc::DEFAULT_MAX_TXN_WRITES;
     use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
     use ferrosa_schema::{
         AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
@@ -5569,7 +5623,7 @@ mod txn_buffer_tests {
         let (_dir, engine, schema) = new_engine_and_schema().await;
 
         // Buffered: must NOT touch storage.
-        let mut buffer: Vec<PgWrite> = Vec::new();
+        let mut buffer = TxnWriteSet::default();
         let msgs = execute_query(
             &engine,
             &schema,
@@ -5583,12 +5637,15 @@ mod txn_buffer_tests {
             matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
             "buffered INSERT still acks INSERT 0 1: {msgs:?}"
         );
+        let buffered = buffer
+            .pending_writes()
+            .expect("read back the staged write-set");
         assert_eq!(
-            buffer.len(),
+            buffered.len(),
             1,
             "the write was buffered as a PostgreSQL MVCC mutation"
         );
-        assert_eq!(buffer[0].0.keyspace, "public");
+        assert_eq!(buffered[0].0.keyspace, "public");
         assert_eq!(
             row_count(&engine, &schema, "a").await,
             0,
@@ -5667,7 +5724,7 @@ mod txn_buffer_tests {
         // Applying the buffered PostgreSQL mutation makes its row visible.
         let (_dir, engine, schema) = new_engine_and_schema().await;
 
-        let mut buffer: Vec<PgWrite> = Vec::new();
+        let mut buffer = TxnWriteSet::default();
         execute_query(
             &engine,
             &schema,
@@ -5684,10 +5741,13 @@ mod txn_buffer_tests {
             "buffered, not yet applied"
         );
 
-        // Apply the buffered PostgreSQL mutation (the MVCC manager does this on COMMIT).
-        engine
-            .write_atomic_batch(vec![buffer[0].0.clone()])
-            .expect("apply");
+        // Apply the buffered write-set the way COMMIT does: consume the staging as
+        // the streaming `WriteSetSource` that `write_atomic_batch` reads (the MVCC
+        // manager does this on COMMIT).
+        let staged = std::mem::take(&mut buffer)
+            .into_staged()
+            .expect("finish the staged write-set");
+        engine.write_atomic_batch(staged).expect("apply");
         assert_eq!(
             row_count(&engine, &schema, "c").await,
             1,
@@ -5744,17 +5804,19 @@ mod txn_buffer_tests {
     }
 
     #[tokio::test]
-    async fn buffer_respects_write_cap() {
-        // Staging past the default write cap fails loud (53400) rather than growing the
-        // buffer without bound; nothing is applied to storage.
+    async fn a_write_set_past_the_old_write_cap_is_staged_not_refused() {
+        // The old `FERROSA_POSTGRES_MAX_TXN_WRITES` / SQLSTATE `53400` refusal is
+        // GONE: a write-set larger than the historical cap is ACCEPTED and staged
+        // (spilled past the buffer), never declined for being large. Nothing is
+        // applied to storage until COMMIT.
         let (_dir, engine, schema) = new_engine_and_schema().await;
-        let mut buffer: Vec<PgWrite> = Vec::with_capacity(DEFAULT_MAX_TXN_WRITES);
-        // Pre-fill to the cap with dummy writes so the next stage trips it.
+        let mut buffer = TxnWriteSet::default();
+        // Pre-fill to the old cap with dummy writes, then stage one more.
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
         let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
         for _ in 0..DEFAULT_MAX_TXN_WRITES {
-            buffer.push(dummy.clone());
+            buffer.push(dummy.clone()).expect("stage a buffered write");
         }
         let msgs = execute_query(
             &engine,
@@ -5765,21 +5827,23 @@ mod txn_buffer_tests {
             Some(&mut buffer),
         )
         .await;
-        match &msgs[..] {
-            [BackendMessage::ErrorResponse { fields }] => {
-                assert_eq!(fields[1], (b'C', "53400".to_string()));
-            }
-            other => panic!("expected a fail-loud cap ErrorResponse, got {other:?}"),
-        }
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "a write past the old cap is accepted, not refused: {msgs:?}"
+        );
         assert_eq!(
             buffer.len(),
-            DEFAULT_MAX_TXN_WRITES,
-            "the over-cap write was NOT buffered"
+            DEFAULT_MAX_TXN_WRITES + 1,
+            "the past-cap write IS staged, never refused for being large"
+        );
+        assert!(
+            buffer.resident_bytes() <= buffer.threshold_bytes(),
+            "residency stays bounded by the staging buffer regardless of the count"
         );
         assert_eq!(
             row_count(&engine, &schema, "over").await,
             0,
-            "an over-cap write is never applied to storage"
+            "a buffered over-cap write is not applied until COMMIT"
         );
 
         engine.shutdown().unwrap();
@@ -5895,13 +5959,19 @@ mod txn_buffer_tests {
     }
 
     #[tokio::test]
-    async fn buffer_respects_configured_write_cap() {
+    async fn a_configured_write_cap_no_longer_refuses_the_next_pg_write() {
+        // A configured `FERROSA_POSTGRES_MAX_TXN_WRITES` is no longer consulted by
+        // the front end: the refusal that used to fire here is gone, and the write
+        // is staged instead. The setting stays a *consensus-side* concern
+        // (`FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY`), never a front-end refusal.
         let (_dir, engine, schema) = new_engine_and_schema().await;
         let mvcc = MvccManager::with_max_txn_writes(2);
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
         let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
-        let mut buffer = vec![dummy.clone(), dummy];
+        let mut buffer = TxnWriteSet::default();
+        buffer.push(dummy.clone()).expect("stage");
+        buffer.push(dummy).expect("stage");
 
         let limits = crate::jsonb_wire::test_limits();
         let env = ReadEnv {
@@ -5919,12 +5989,15 @@ mod txn_buffer_tests {
             Some(&mut buffer),
         )
         .await;
-        assert!(matches!(
-            &msgs[..],
-            [BackendMessage::ErrorResponse { fields }]
-                if fields[1] == (b'C', "53400".to_string())
-        ));
-        assert_eq!(buffer.len(), 2);
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "a configured cap must not refuse the next write: {msgs:?}"
+        );
+        assert_eq!(
+            buffer.len(),
+            3,
+            "the write past the configured cap is staged, never refused"
+        );
         assert_eq!(row_count(&engine, &schema, "over").await, 0);
         engine.shutdown().unwrap();
     }

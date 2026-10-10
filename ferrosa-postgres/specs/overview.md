@@ -181,9 +181,10 @@ string into `numeric` is `22P02`, and any other type mismatch is `42804`.
 
 ## PostgreSQL MVCC resource bounds
 
-At startup, `FERROSA_POSTGRES_MAX_TXN_WRITES` sets the per-transaction buffered
-mutation cap (default 10,000), `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` sets the
-storage-to-executor row channel capacity (64), and
+At startup, `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` sets the resident buffer a
+transaction's write-set may hold before it SPILLS to a staging file (default
+8 MiB — a streaming buffer size, never a cap), `FERROSA_POSTGRES_SCAN_BUFFER_ROWS`
+sets the storage-to-executor row channel capacity (64), and
 `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` expires older active snapshots
 (600,000 ms). `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` controls the
 expiry/pruning sweep cadence (1,000 ms). Invalid values log an error and select
@@ -194,19 +195,20 @@ query-materialization caveats are in the public
 
 ### Coherence with the consensus write path
 
-`FERROSA_POSTGRES_MAX_TXN_WRITES` bounds what this front end will *admit*, but a
-buffered transaction is not committed here — it is committed by Accord, which
+A buffered transaction is not committed here — it is committed by Accord, which
 registers an incoming transaction in its conflict index **under every key** and
-all-or-nothing. Those two limits must therefore agree, or the front end accepts a
+all-or-nothing. Those limits must therefore agree, or the front end accepts a
 transaction consensus cannot register: the PreAccept is refused by every replica,
 the coordinator collects zero votes, and the client sees only the opaque
 `Accord quorum unavailable`.
 
-`FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` (see `ferrosa-cluster`) is the consensus-side
-bound. It defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES`, floored at `100000`, so the
-two are coherent out of the box and raising the write cap alone cannot re-open the
-mismatch. A write set that exceeds the resolved capacity is refused **by name**
-before the protocol runs, rather than surfacing as a quorum failure.
+The front end no longer refuses on its own: `Session.txn_writes` is a spilling
+`TxnWriteSet`, so a write-set past `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` SPILLS
+rather than being declined (FMEA PG-12), and the old
+`FERROSA_POSTGRES_MAX_TXN_WRITES` / SQLSTATE `53400` refusal is gone.
+`FERROSA_POSTGRES_MAX_TXN_WRITES` survives only as the default input to the
+consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` (see `ferrosa-cluster`),
+floored at `100000`, so the two stay coherent out of the box.
 
 1. **Fail loud, never fake.** Every failure maps to a concrete SQLSTATE + one
    `ErrorResponse`; the front-end never returns a fake empty result on error

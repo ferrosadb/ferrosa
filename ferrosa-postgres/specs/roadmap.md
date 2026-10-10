@@ -180,13 +180,16 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Now (highest value)
 
-- **Non-resident front-end write-set (FMEA PG-12).** A `COPY` inside `BEGIN`
-  holds its whole write-set resident in `Session.txn_writes` until COMMIT. The
-  streaming, threshold-bounded stage (`ferrosa_storage::write_set_stage::WriteSetStage`,
-  spill past `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`) is landed and tested but not
-  yet wired in, because the COMMIT phase cannot stay non-resident: `write_atomic_batch`
-  makes three passes over the whole `Vec<Mutation>` under one fsync group. Wire the
-  stage and give the commit path a streaming protocol before claiming the OOM fixed.
+- **(done) Non-resident front-end write-set (FMEA PG-12).** `Session.txn_writes` is
+  now a `TxnWriteSet` over the streaming, threshold-bounded
+  `ferrosa_storage::write_set_stage::WriteSetStage` (spill past
+  `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`), and `COMMIT` drives
+  `write_atomic_batch` through the `WriteSetSource` trait so all three passes read the
+  set as a stream under the one fsync group — the `Vec<Mutation>` is gone. The
+  `FERROSA_POSTGRES_MAX_TXN_WRITES` refusal is removed (a larger write-set spills, never
+  refused). **Remaining, named:** `prepare_row_changes` (MVCC history) and the cluster
+  branch's `prepare_accord_writes` (Accord apply payload) still materialize their `Vec`s;
+  bounding them needs an on-disk version store / a streaming Accord apply.
 - **Replica catch-up and mixed-protocol correctness** (FMEA PG-11). The fault
   schedule checks PostgreSQL transaction histories while one replica is
   paused, then checks final-state convergence on the active quorum. Verify
@@ -261,7 +264,8 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
     the unflushed tail rather than committing part of it. Inside `BEGIN` the rows buffer into the
     transaction's write-set through the SAME `apply_or_buffer` seam INSERT and `TRUNCATE` use:
     they are visible at `COMMIT` and discarded by `ROLLBACK`, with **no `25001` refusal**. The
-    write-set cap (`53400`) — fail-loud, never a silent drop — bounds them. A COPY that fails
+    write-set's own staging buffer bounds residency — a write-set past
+    `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` SPILLS, it is never refused. A COPY that fails
     mid-payload **aborts** the transaction, so a later `COMMIT` rolls back rather than committing a
     partial load: the partial-commit trap the old `25001` refusal stood in front of. This is what
     lets `pgbench -i`, which wraps its `COPY`s in one `BEGIN`/`COMMIT`, load.

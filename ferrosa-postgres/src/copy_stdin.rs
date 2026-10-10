@@ -27,10 +27,12 @@
 //! inside `BEGIN` becomes visible only at `COMMIT` and is discarded by `ROLLBACK`, with no `25001`
 //! refusal. There is no second way to write a row here.
 //!
-//! In autocommit there is no transaction to buffer into, so the rows are staged locally and
-//! flushed in bounded batches ([`FLUSH_EVERY`]). Inside a transaction those rows go to its
-//! write-set instead, and the write-set cap — a fail-loud `53400`, never a silent drop — bounds
-//! them.
+//! In autocommit there is no transaction to buffer into, so the rows are staged locally in a
+//! [`TxnWriteSet`] and flushed in bounded batches ([`FLUSH_EVERY`]). Inside a transaction those
+//! rows go to the session's own write-set instead. Either staging structure is a
+//! threshold-bounded, spilling write-set (`FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`): a bulk load
+//! past the buffer SPILLS rather than growing front-end memory, and there is deliberately NO
+//! capacity refusal — a larger write-set is never declined for being large (FMEA PG-12).
 //!
 //! The payload options are resolved from the parsed `CopyFromStdinStmt`. One of them, `FREEZE`,
 //! has no analogue in an LSM (no heap pages ⇒ no frozen rows) and is accepted-and-recorded by the
@@ -48,7 +50,7 @@ use crate::messages::{BackendMessage, FrontendMessage};
 use crate::mvcc::MvccCommitError;
 use crate::query::{self, ReturningOpts};
 use crate::server::{dml_context, QueryContext};
-use crate::PgWrite;
+use crate::TxnWriteSet;
 
 /// Rows staged before the write set is flushed — the AUTOCOMMIT path only.
 ///
@@ -56,7 +58,8 @@ use crate::PgWrite;
 /// commit them at the end would be a self-inflicted OOM. Flushing periodically bounds the buffer
 /// while keeping the commit count far below one-per-row. Inside a transaction there is nothing to
 /// flush here: the rows go into the session's own write-set, which the open transaction's `COMMIT`
-/// applies and its `ROLLBACK` discards, and whose cap (`53400`) bounds them instead.
+/// applies and its `ROLLBACK` discards. Both staging buffers SPILL past their threshold rather
+/// than grow, so neither mode accumulates the load resident.
 const FLUSH_EVERY: usize = 1000;
 
 /// Everything resolved before the client is told to send.
@@ -122,7 +125,7 @@ where
     let mut failure: Option<BackendMessage> = None;
     // Autocommit staging buffer. Unused inside a transaction: there the rows go into the session's
     // write-set instead (see the module docs), so this stays empty and the flush below is skipped.
-    let mut buffer: Vec<PgWrite> = Vec::new();
+    let mut buffer = TxnWriteSet::default();
 
     loop {
         match codec::read_frontend(frames) {
@@ -266,14 +269,14 @@ async fn stage_rows(
     stmt: &CopyFromStdinStmt,
     columns: &[String],
     in_txn: bool,
-    buffer: &mut Vec<PgWrite>,
+    buffer: &mut TxnWriteSet,
     rows: Vec<CopyRow>,
     inserted: &mut u64,
 ) -> Result<(), BackendMessage> {
     if in_txn {
         // Buffer into the SAME write-set INSERT/TRUNCATE use, so COMMIT applies it and ROLLBACK
         // discards it. `flush_locally` is false: an open transaction must never be committed
-        // mid-statement — the write-set (and its `53400` cap) bounds the rows, not FLUSH_EVERY.
+        // mid-statement — the write-set's own staging buffer bounds residency, not FLUSH_EVERY.
         insert_rows(
             ctx,
             stmt,
@@ -398,7 +401,7 @@ async fn insert_rows(
     ctx: &QueryContext,
     stmt: &CopyFromStdinStmt,
     columns: &[String],
-    mut buffer: Option<&mut Vec<PgWrite>>,
+    mut buffer: Option<&mut TxnWriteSet>,
     rows: Vec<CopyRow>,
     inserted: &mut u64,
     flush_locally: bool,
@@ -473,11 +476,15 @@ async fn insert_rows(
 
 /// Commit the buffered write set, using the same parameters the autocommit path uses so a COPY
 /// cannot commit differently from an INSERT.
-async fn flush(ctx: &QueryContext, buffer: &mut Vec<PgWrite>) -> Result<(), BackendMessage> {
+async fn flush(ctx: &QueryContext, buffer: &mut TxnWriteSet) -> Result<(), BackendMessage> {
     if buffer.is_empty() {
         return Ok(());
     }
-    let mutations = buffer.drain(..).map(|w| w.0).collect::<Vec<_>>();
+    // Consume the staging as the streaming write-set source the commit path reads, so the
+    // autocommit apply never re-materializes the batch.
+    let staged = std::mem::take(buffer)
+        .into_staged()
+        .map_err(|error| query::write_error_response(&error))?;
     let _commit_guard = ctx.mvcc.commit_guard().await;
     match query::commit_mutations(
         &ctx.engine,
@@ -485,7 +492,7 @@ async fn flush(ctx: &QueryContext, buffer: &mut Vec<PgWrite>) -> Result<(), Back
         &ctx.mvcc,
         &ctx.mvcc.snapshot(),
         &std::collections::HashSet::new(),
-        mutations,
+        staged,
     ) {
         Ok(_) => Ok(()),
         // Mirrors the autocommit arms exactly, so a COPY refused for the same reason reports the
@@ -511,8 +518,7 @@ fn bad_payload(message: &str) -> BackendMessage {
 mod tests {
     use super::*;
     use crate::server::txn_atomicity_tests::{
-        make_ctx, make_ctx_synthetic_key, make_ctx_synthetic_key_with_cap, row_count, superuser,
-        synthetic_keys, synthetic_values,
+        make_ctx, make_ctx_synthetic_key, row_count, superuser, synthetic_keys, synthetic_values,
     };
 
     /// Frame a frontend message: one tag byte, a big-endian length that INCLUDES the length word
@@ -601,6 +607,56 @@ mod tests {
     async fn run_copy(ctx: &QueryContext, sql: &str, payload: &[Vec<u8>]) -> (Vec<u8>, String) {
         let mut session = Session::new(superuser());
         run_copy_in(ctx, &mut session, sql, payload).await
+    }
+
+    /// [`run_copy_in`] for a payload LARGER than the duplex pipe's buffer.
+    ///
+    /// `run_copy_in` writes the whole wire into the pipe BEFORE `drive` runs, so it only works for
+    /// a payload that fits the 1 MiB pipe; a write-set big enough to SPILL does not, and the write
+    /// would deadlock waiting for a reader that has not started. Here the client is a SPAWNED task,
+    /// so the payload streams as the server drains it.
+    async fn run_streaming_copy(
+        ctx: &QueryContext,
+        session: &mut Session,
+        sql: &str,
+        payload: &[u8],
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let stmt = parse_copy(sql);
+        let (mut client, mut server) = tokio::io::duplex(1 << 16);
+        let mut wire = copy_data(payload);
+        wire.extend_from_slice(&frame(b'c', &[]));
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(&wire)
+                .await
+                .expect("write the COPY payload");
+            // Drain the server's reply until it closes its end.
+            let mut reply = Vec::new();
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(500),
+                    client.read(&mut buf),
+                )
+                .await
+                {
+                    Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(n)) => reply.extend_from_slice(&buf[..n]),
+                }
+            }
+            reply
+        });
+
+        let mut frames = BytesMut::new();
+        let mut read_buf = vec![0u8; 1 << 16];
+        drive(&mut server, &mut frames, &mut read_buf, ctx, session, &stmt)
+            .await
+            .expect("drive returns");
+        drop(server);
+
+        let reply = writer.await.expect("writer task");
+        String::from_utf8_lossy(&reply).into_owned()
     }
 
     /// Run one simple-query statement (`BEGIN`/`COMMIT`/`ROLLBACK`) through the server's own
@@ -1074,35 +1130,72 @@ mod tests {
         assert_eq!(distinct.len(), 2, "a key per row in autocommit too");
     }
 
-    /// The deployed shape: `pgbench -i` buffers ~1.1M rows into ONE transaction write-set
-    /// (cap raised to 3,000,000) and commits them in one COMMIT. A COPY that buffers without
-    /// error but whose COMMIT cannot build the row images would fail exactly here. RED before
-    /// the fix: `uuid requires 16 bytes`. Kept at 30k rows so it runs fast.
+    /// The deployed shape: `pgbench -i` buffers ~1.1M rows into ONE transaction write-set and
+    /// commits them in one COMMIT. The write-set is now STAGED, not resident: a COPY large enough
+    /// to exceed the staging buffer SPILLS to disk, so front-end residency is bounded by the
+    /// buffer and does NOT track the row count (FMEA PG-12).
+    ///
+    /// This test asserts BOTH halves — BOUNDED RESIDENCY (the set spilled, and its resident bytes
+    /// stay within the staging buffer even though the rows far exceed it) AND COMPLETE DATA
+    /// (every row lands at COMMIT with its own key). The residency half is the exact OPPOSITE of
+    /// the old `txn_writes().len() == N, "all rows buffered"`, which asserted the defect —
+    /// buffering the whole load resident — as if it were the contract.
     #[tokio::test]
-    async fn a_large_transactional_copy_into_a_pkless_table_commits_distinct_rows() {
-        const N: usize = 30_000;
-        let (_dir, ctx) = make_ctx_synthetic_key_with_cap(3_000_000).await;
+    async fn a_large_transactional_copy_stays_bounded_and_commits_distinct_rows() {
+        const N: usize = 12_000;
+        // ~1 KiB per row, so N rows far exceed the default 8 MiB staging buffer (N × 1 KiB ≈ 12 MiB)
+        // and force a spill (the buffer is a tunable; the point is that the staged payload is many
+        // times it). The COPY goes through the spawned-writer helper because that payload is far
+        // larger than the duplex pipe — `run_copy_in` writes the whole payload before it reads and
+        // would deadlock here.
+        const PAD: usize = 1024;
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
         let mut session = Session::new(superuser());
         simple(&ctx, &mut session, "BEGIN").await;
 
-        let payload = (0..N).map(|i| format!("v{i}\n")).collect::<String>();
-        let (_reply, text) = run_copy_in(
+        let payload = (0..N)
+            .map(|i| {
+                let mut value = format!("v{i:08}");
+                value.push_str(&"x".repeat(PAD - value.len()));
+                value.push('\n');
+                value
+            })
+            .collect::<String>();
+        let text = run_streaming_copy(
             &ctx,
             &mut session,
             "COPY sk (v) FROM STDIN",
-            &[copy_data(payload.as_bytes()), frame(b'c', &[])],
+            payload.as_bytes(),
         )
         .await;
         assert!(
             text.contains(&format!("COPY {N}")),
             "reported count: {text:?}"
         );
-        assert_eq!(session.txn_writes().len(), N, "all rows buffered");
+
+        // BOUNDED RESIDENCY: every row is staged, yet the write-set has SPILLED — the payload is
+        // on disk and the resident bytes are within the staging buffer, never the whole load.
+        assert_eq!(
+            session.txn_write_count(),
+            N,
+            "every row must be staged in the transaction write-set"
+        );
+        assert!(
+            session.txn_writes_spilled(),
+            "N rows of ~{PAD} bytes must exceed the staging buffer and SPILL, not stay resident"
+        );
+        assert!(
+            session.txn_writes_resident_bytes() <= session.txn_writes_threshold_bytes(),
+            "resident bytes must stay within the staging buffer ({} <= {})",
+            session.txn_writes_resident_bytes(),
+            session.txn_writes_threshold_bytes()
+        );
 
         simple(&ctx, &mut session, "COMMIT").await;
 
+        // COMPLETE DATA: every staged row must land at COMMIT with its own key.
         let keys = synthetic_keys(&ctx).await;
-        assert_eq!(keys.len(), N, "every buffered row must land at COMMIT");
+        assert_eq!(keys.len(), N, "every staged row must land at COMMIT");
         let distinct: std::collections::HashSet<&Vec<u8>> = keys.iter().collect();
         assert_eq!(distinct.len(), N, "each row needs its OWN key");
     }
