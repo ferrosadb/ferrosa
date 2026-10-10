@@ -667,6 +667,19 @@ build; the codec's own cost is its delta against `none`.
   transaction did not commit and may retry: the PostgreSQL front end maps the
   `abandoned:` reason to SQLSTATE 40001 (serialization failure) and the CQL
   router to a retryable server error.
+  **The abandon is decided before the coordinator writes anything.** The
+  coordinator's own-shard apply is deferred until the remote Apply quorum is
+  secured; before that point NO replica has applied, so the "NOT committed"
+  report is the truth and leaves no row readable (pinned by
+  `abandon_durability::an_abandoned_transaction_leaves_no_row_readable_across_restart`,
+  a point lookup of a known key that must survive a restart as absent). If the
+  Apply quorum *is* secured, the transaction is committed and durably applied on
+  a quorum and is never reported as abandoned: a coordinator whose own replica
+  then fails to converge fails loud with a non-retryable durability error instead
+  (`coordinator local Apply did not reach Applied ... (NOT an abandon)`), because
+  "safe to retry" would invite a double-apply. The residual boundary — a remote
+  that persists a write before its `ApplyOK` is lost — is inherent to Accord's
+  at-least-once apply and is not closed here.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write

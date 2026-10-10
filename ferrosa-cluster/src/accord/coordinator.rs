@@ -540,6 +540,17 @@ pub enum AccordDriverError {
     /// so it no longer blocks later transactions on its keys. The transaction is
     /// NOT committed — the client is told so explicitly and may safely retry.
     ///
+    /// # Atomicity of the abandon
+    ///
+    /// Because the client is told the transaction did not commit and may retry,
+    /// an abandon must leave **no committed row readable on any replica**. That
+    /// holds because the abandon is decided BEFORE the coordinator writes its own
+    /// shard: the coordinator's own-shard apply is deferred until the remote Apply
+    /// quorum is secured, so an abandon means no replica applied. If the Apply
+    /// quorum *is* secured the transaction is committed and durably applied on a
+    /// quorum and is never reported as abandoned — a coordinator whose own replica
+    /// then fails to converge fails loud with [`Self::Network`] instead.
+    ///
     /// This subsumes the former `ApplyQuorumUnavailable`: when the apply quorum
     /// could not be reached within the bound, the transaction is now abandoned
     /// rather than left as a permanently blocking `Committed` entry.
@@ -2554,15 +2565,14 @@ impl AccordCoordinatorDriver {
         // its apply engine is idempotent on `(txn_id, key, t)`, so there is no
         // double-apply. The bare `local_applier` fallback is for tests / no-SM
         // setups that persist but have no state machine to advance.
-        // Coordinator's OWN replica apply, run CONCURRENTLY with the remote fan-out
-        // (joined below), not serially ahead of it.
         //
-        // It used to run synchronously BEFORE the fan-out: the coordinator applied
-        // its own ~1/N of the write-set in full — measured 889 ms on a 100k-row
-        // commit — before the first replica payload was even built, so the Apply
-        // phase paid `local_apply + fanout` instead of `max(local_apply, fanout)`.
-        // The local apply is independent of the remote sends (the SM's apply engine
-        // is idempotent on `(txn_id, key, t)`), so it belongs in the same join.
+        // The coordinator's OWN replica apply is DEFERRED until the remote Apply
+        // quorum is secured (see the ordering note below the fan-out). It must not
+        // write a shard before the transaction's fate is decided: the abandon path
+        // tells the client "NOT committed; safe to retry", and if this shard were
+        // already durable the report would be a lie and a retry could double-apply.
+        // The apply engine is idempotent on `(txn_id, key, t)`, so running it after
+        // the fan-out is safe.
         let local_apply = async {
             if !self_is_replica {
                 return Ok::<(), AccordDriverError>(());
@@ -2710,21 +2720,60 @@ impl AccordCoordinatorDriver {
                 self.apply_fanout_bounded(&participant, is_apply_ok).await
             }
         };
-        // Three-way join: the coordinator's own apply overlaps the remote fan-out and
-        // the local dependency wait, so the Apply phase pays max(local, remote), not
-        // their sum. A local apply failure is surfaced before the remote verdict.
-        let (local_apply_result, local_applied, apply_result) =
-            tokio::join!(local_apply, local_apply_wait, remote_apply);
-        local_apply_result?;
+        // ------------------------------------------------------------------
+        // SECURE THE APPLY QUORUM BEFORE THE COORDINATOR WRITES ITS OWN SHARD.
+        //
+        // `local_apply` above writes the coordinator's OWN ~1/N of the write-set.
+        // It used to be joined with the remote fan-out, so when the fan-out then
+        // failed the coordinator had ALREADY durably applied its shard — and the
+        // abandon path told the client the transaction was "NOT committed; safe to
+        // retry" while that shard stayed committed and readable. A retry could then
+        // double-apply, and every replica could observe rows from a transaction it
+        // was told never happened. That is the one-third-of-rows-after-an-abandon
+        // defect this ordering exists to prevent.
+        //
+        // The apply quorum (which counts the coordinator itself) being met is the
+        // point of no return: before it, NO replica has applied, so an abandon is
+        // truthful and leaves nothing behind; after it, the transaction is committed
+        // and durably applied on a quorum, so it must NOT be reported as abandoned.
+        // ------------------------------------------------------------------
+        let apply_ok = remote_apply.await?;
         if residency_profile {
             tracing::info!(
-                phase = "apply_phase.join_done",
+                phase = "apply_phase.remote_decided",
+                apply_ok,
                 live_mib = ferrosa_common::mem_probe::live_mib(),
                 peak_mib = ferrosa_common::mem_probe::peak_mib(),
                 "accord apply residency"
             );
         }
 
+        if !apply_ok {
+            // No replica has applied: the coordinator has not written yet, and the
+            // apply quorum (self + the remotes) was not met, so nothing durable
+            // exists. Rolling the transaction back is the true outcome, and
+            // finalizing it as a no-write releases any successor parked behind it,
+            // so one slow apply can never poison the key. The client is told it did
+            // not commit and may retry.
+            let timeout = bound;
+            tracing::error!(
+                txn_id = ?txn_id,
+                unmet = ?participant.shards.len(),
+                ?timeout,
+                "accord: Apply quorum not reached within the dependency-wait bound — \
+                 abandoning the transaction (NOT committed; safe to retry)"
+            );
+            self.finalize_no_write().await;
+            return Err(AccordDriverError::TxnAbandoned { timeout });
+        }
+
+        // The Apply quorum is secured. Only NOW does the coordinator persist its own
+        // shard and wait for it to reach `Applied`. Because the write follows the
+        // decision, a failure here can never be reported as the retryable
+        // "abandoned" outcome — the transaction is committed and a quorum already
+        // holds it.
+        let (local_apply_result, local_applied) = tokio::join!(local_apply, local_apply_wait);
+        local_apply_result?;
         if !local_applied {
             let state = if let Some(local_sm) = &self.local_accord_state {
                 crate::accord::handlers::on_state_machine(local_sm, move |sm| {
@@ -2750,50 +2799,26 @@ impl AccordCoordinatorDriver {
             } else {
                 None
             };
-            let timeout = bound;
             tracing::error!(
                 txn_id = ?txn_id,
                 ?state,
                 owned_write_count = self.write_set.iter().filter(|entry| self.replica_owns_key(self_id, &entry.key)).count(),
-                ?timeout,
-                "accord: coordinator local Apply did not reach Applied within the dependency-wait \
-                 bound — abandoning the transaction (NOT committed; safe to retry)"
+                ?bound,
+                "accord: coordinator local Apply did not reach Applied within the \
+                 dependency-wait bound after the Apply quorum was secured"
             );
-            // The LOCAL replica is the one this coordinator must be able to serve
-            // from, and its Apply could not resolve its dependencies inside the
-            // same bound the remote quorum uses. That is the SAME condition as a
-            // failed remote apply quorum, so it must take the same path: roll the
-            // transaction back, release anything parked behind it, and tell the
-            // client it did not commit so it can retry.
-            //
-            // Returning a bare `Network(..)` here — which is what this did before —
-            // bypassed the abandon entirely. The client then received an opaque,
-            // non-retryable failure for a transaction that had never been applied,
-            // which is exactly what stalled the PostgreSQL front end and what the
-            // Jepsen workload could not classify as retryable.
-            self.finalize_no_write().await;
-            return Err(AccordDriverError::TxnAbandoned { timeout });
-        }
-        let apply_ok = apply_result?;
-        if !apply_ok {
-            // The bounded dependency wait expired: abandon the transaction.
-            //
-            // Every replica that parked refused its ApplyOK — it never applied —
-            // so nothing durable exists and rolling the transaction back is the
-            // true outcome. Finalizing it as a no-write additionally releases any
-            // successor parked behind it, so one slow apply can never poison the
-            // key the way an un-finalized Committed entry did. The client is told
-            // it did not commit and may retry.
-            let timeout = bound;
-            tracing::error!(
-                txn_id = ?txn_id,
-                unmet = ?participant.shards.len(),
-                ?timeout,
-                "accord: Apply quorum not reached within the dependency-wait bound — \
-                 abandoning the transaction (NOT committed; safe to retry)"
-            );
-            self.finalize_no_write().await;
-            return Err(AccordDriverError::TxnAbandoned { timeout });
+            // The transaction is COMMITTED (a Commit quorum succeeded) and DURABLY
+            // APPLIED on an Apply quorum, so it must NOT be reported as an abandon:
+            // remotes already hold its rows, and "safe to retry" would invite a
+            // double-apply. This is a local-replica durability/latency fault; the
+            // coordinator's own copy converges via recovery, and its read path
+            // dep-waits on the still-pending entry until it lands. Fail loud with a
+            // non-retryable error rather than lying about the transaction's fate.
+            return Err(AccordDriverError::Network(format!(
+                "coordinator local Apply did not reach Applied within {bound:?} after the \
+                 Apply quorum was secured; the transaction is committed and durably applied \
+                 on a quorum — its local replica will converge (NOT an abandon)"
+            )));
         }
 
         tracing::debug!(
@@ -5702,20 +5727,25 @@ mod tests {
         assert_eq!(local_phase, TxnPhase::Applied);
     }
 
-    /// A local Apply that cannot resolve its dependencies inside the bound must
-    /// ABANDON the transaction — not fail with an opaque network error.
+    /// A local Apply that cannot resolve its dependencies inside the bound, **after
+    /// the remote Apply quorum already succeeded**, must NOT be reported as the
+    /// retryable "abandoned" outcome.
     ///
-    /// This branch returned a bare `AccordDriverError::Network(..)`, which the
-    /// PostgreSQL front end reports as a generic storage fault (58000). A
-    /// transaction that had never been applied was therefore presented to the
-    /// client as "something is broken" instead of "not committed, safe to
-    /// retry" — and the Jepsen strict-serializability workload, which retries
-    /// only on 40001, failed on the 58000 this produced.
+    /// The transaction is committed (its Commit quorum succeeded) and durably
+    /// applied on the remote replicas, so "NOT committed; safe to retry" would be a
+    /// lie and a retry could double-apply. The coordinator's own replica is the one
+    /// that could not converge, which is a local durability/latency fault: it fails
+    /// loud with a non-retryable network error and leaves the committed rows on the
+    /// remotes intact.
+    ///
+    /// The abandon (`TxnAbandoned`, retryable 40001) is reserved for the case where
+    /// NO replica applied, which the ordering guarantees is decided before the
+    /// coordinator writes anything.
     ///
     /// The bound is passed explicitly: `configured_txn_timeout` caches the
     /// environment once per process, so the production bound is out of reach here.
     #[tokio::test]
-    async fn a_local_apply_that_never_resolves_abandons_the_transaction() {
+    async fn a_local_apply_that_never_resolves_after_the_quorum_is_not_an_abandon() {
         let self_id = uuid::Uuid::from_u128(1u128 << 64);
         let remote_id = uuid::Uuid::from_u128(2u128 << 64);
         let (apply_sent, mut apply_received) = tokio::sync::mpsc::unbounded_channel();
@@ -5764,9 +5794,15 @@ mod tests {
             "the local wait must not suppress Apply propagation to the other replicas"
         );
         assert!(
-            matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
-            "a local apply that cannot resolve its dependencies must abandon the transaction \
-             (retryable 40001), not report an opaque failure; got {result:?}"
+            !matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
+            "the remote Apply quorum succeeded, so the transaction is committed and durably \
+             applied on a quorum — the local replica failing to converge must NOT be reported \
+             as the retryable 'abandoned' outcome (a retry could double-apply); got {result:?}"
+        );
+        assert!(
+            matches!(result, Err(AccordDriverError::Network(_))),
+            "the local replica's failure to converge must surface as a non-retryable \
+             durability error, not an abandon; got {result:?}"
         );
     }
 
