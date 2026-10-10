@@ -30,6 +30,7 @@ pub mod pg_types;
 pub mod portal_limits;
 pub mod query;
 pub(crate) mod result_stream;
+mod row_change_codec;
 pub mod scram;
 pub mod server;
 pub mod storage_provider;

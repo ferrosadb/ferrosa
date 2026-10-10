@@ -2828,7 +2828,7 @@ pub(crate) mod txn_atomicity_tests {
         assert_eq!(mutations.len(), 2);
 
         let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
-        let metadata = serde_json::to_vec(&changes).unwrap();
+        let metadata = crate::row_change_codec::encode_partition(&changes).unwrap();
         let txn_id =
             ferrosa_common::accord::TxnId::new(1, ferrosa_common::accord::Timestamp::synthetic(21));
         let metadata_batch = [metadata];
@@ -2962,11 +2962,10 @@ pub(crate) mod txn_atomicity_tests {
                 ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
                     .expect("the streaming path must emit a valid MVCC envelope");
             let metadata = metadata.expect("a data row partition carries row-version metadata");
-            let got: Vec<crate::mvcc::RowChange> = serde_json::from_slice(metadata).unwrap();
+            let got = crate::row_change_codec::decode_partition(metadata).unwrap();
             assert_eq!(
-                serde_json::to_string(&got).unwrap(),
-                serde_json::to_string(expected).unwrap(),
-                "per-partition row-version metadata must be byte-identical to the whole-table path"
+                &got, expected,
+                "per-partition row-version metadata must match the whole-table path"
             );
 
             let mut bytes = vec![0; mutation.serialized_size()];

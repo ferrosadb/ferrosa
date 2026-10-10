@@ -1680,10 +1680,9 @@ mod tests {
                 ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
                     .expect("the batched path must emit a valid MVCC envelope");
             let metadata = metadata.expect("a data row carries row-version metadata");
-            let got: Vec<crate::mvcc::RowChange> = serde_json::from_slice(metadata).unwrap();
+            let got = crate::row_change_codec::decode_partition(metadata).unwrap();
             assert_eq!(
-                serde_json::to_string(&got).unwrap(),
-                serde_json::to_string(expected).unwrap(),
+                &got, expected,
                 "batched before-images must equal the per-row answer for {partition_key:?}"
             );
 

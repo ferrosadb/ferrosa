@@ -47,6 +47,11 @@ serde_json = "1"
 # TLS for SSLRequest: the acceptor is built by ferrosa-net's shared TLS helper
 # (one crypto provider for every listener, t_e1c819ad).
 ferrosa-net = { path = "../ferrosa-net" }
+# The PostgreSQL MVCC row-version metadata (`row_change_codec`) is encoded with
+# the SAME Cap'n Proto schema/codegen ferrosa-net owns (`envelope.capnp` ->
+# `protocol::envelope_capnp`), so no second codegen path exists. `capnp` is the
+# runtime reader/builder for those generated types.
+capnp = "0.25"
 tokio-rustls = "0.26"
 # DDL (T-132a): `CREATE TABLE` runs through the SAME `DdlPath` the CQL router
 # uses (direct / pair / Raft-replicated cluster), so there is one schema-change

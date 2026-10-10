@@ -522,3 +522,82 @@ struct AccordControl {
     readOk @13 :AccordReadOk;
   }
 }
+
+# ---------------------------------------------------------------------------
+# PostgreSQL MVCC row-version metadata (ferrosa-postgres `RowChange`).
+#
+# This is the binary Cap'n Proto replacement for the JSON row-version blob that
+# used to travel inside a PostgreSQL commit's Accord write-set: `RowChange`
+# (the before/after row images plus the SQL key and partition key for one row
+# version) was encoded with `serde_json` and re-decoded with `serde_json` on
+# replica apply. It rides INSIDE the storage mutation's envelope (it is not an
+# envelope payload of its own); the `PgMvccRowChanges` root carries one
+# partition's `Vec<RowChange>`.
+#
+# Append-only: these are NEW types at new ordinals; no existing ordinal is
+# reused and no existing field is renumbered.
+# ---------------------------------------------------------------------------
+
+struct PgMvccTextOrNull {
+  # One `text[]` element, which may be NULL.
+  present @0 :Bool;
+  value @1 :Text;
+}
+
+struct PgMvccNumeric {
+  # `Value::Numeric`: arbitrary-precision `unscaled` as little-endian
+  # two's-complement bytes (`BigInt::to_signed_bytes_le`) with the decimal scale.
+  unscaled @0 :Data;
+  scale @1 :Int32;
+}
+
+struct PgMvccInet {
+  # `Value::Inet`: an IPv4 (4 octets) or IPv6 (16 octets) address.
+  isV6 @0 :Bool;
+  octets @1 :Data;
+}
+
+struct PgMvccValue {
+  # `ferrosa_sql::Value` — one union member per variant, so the decoder keeps
+  # the derived `Eq`/`Hash` value semantics (floats by bit pattern, numeric by
+  # its exact normalized unscaled/scale pair).
+  op :union {
+    nullValue @0 :Void;
+    intValue @1 :Int64;
+    textValue @2 :Text;
+    boolValue @3 :Bool;
+    # `OrderedFloat<f64>` by bit pattern, so NaN and signed zero round-trip.
+    floatValue @4 :UInt64;
+    uuidValue @5 :Data;
+    byteaValue @6 :Data;
+    timestampValue @7 :Int64;
+    dateValue @8 :Int32;
+    timeValue @9 :Int64;
+    inetValue @10 :PgMvccInet;
+    numericValue @11 :PgMvccNumeric;
+    # Validated jsonb canonical cell bytes (`JsonbValue::as_bytes`).
+    jsonbValue @12 :Data;
+    jsonPathValue @13 :Text;
+    textArrayValue @14 :List(PgMvccTextOrNull);
+  }
+}
+
+struct PgMvccRow {
+  # `ferrosa_sql::Row`.
+  values @0 :List(PgMvccValue);
+}
+
+struct PgMvccRowChange {
+  # `ferrosa-postgres` `RowChange`: the row-version metadata for one SQL key.
+  table @0 :Text;
+  key @1 :List(PgMvccValue);
+  partitionKey @2 :Data;
+  # Optional before/after images (`hasBefore()`/`hasAfter()`).
+  before @3 :PgMvccRow;
+  after @4 :PgMvccRow;
+}
+
+struct PgMvccRowChanges {
+  # One partition's `Vec<RowChange>`.
+  changes @0 :List(PgMvccRowChange);
+}

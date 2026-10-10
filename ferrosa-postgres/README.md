@@ -119,7 +119,11 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   table at a time) rather than two `String` clones per mutation; one serialize buffer is
   reused across the whole write-set instead of a fresh zeroed `Vec` per mutation; and the
   mutation's partition-key bytes plus each row-version SQL key and partition value are
-  MOVED out of the consumed mutation and its per-mutation map instead of cloned. The
+  MOVED out of the consumed mutation and its per-mutation map instead of cloned. Each
+  partition's row-version metadata (the before/after row images and the SQL key) is now
+  encoded with **Cap'n Proto** (`row_change_codec`, the `PgMvccRowChanges` family at new
+  ordinals in `ferrosa-net`'s internode envelope), not `serde_json`: binary row images are
+  never run through a text interchange format inside the internal Accord write-set. The
   buffered write set defaults to a 10,000 mutation cap, and each storage scan
   defaults to a 64-row channel; both are startup-configurable. PostgreSQL also
   expires active snapshots past a configurable maximum age so old transactions

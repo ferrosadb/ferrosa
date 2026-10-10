@@ -243,7 +243,7 @@ struct RowKey {
     key: Vec<Value>,
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RowChange {
     pub table: String,
     pub key: Vec<Value>,
@@ -719,7 +719,7 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
 fn decode_row_changes(metadata: &[Vec<u8>]) -> Result<Vec<RowChange>, String> {
     let mut changes = Vec::new();
     for payload in metadata {
-        let mut partition_changes: Vec<RowChange> = serde_json::from_slice(payload)
+        let mut partition_changes = crate::row_change_codec::decode_partition(payload)
             .map_err(|error| format!("decode PostgreSQL MVCC apply metadata: {error}"))?;
         changes.append(&mut partition_changes);
     }
@@ -1086,7 +1086,7 @@ mod tests {
                 after: Some(row("right-after")),
             },
         ];
-        let metadata = serde_json::to_vec(&before).unwrap();
+        let metadata = crate::row_change_codec::encode_partition(&before).unwrap();
         let commit_ts = Timestamp::synthetic(20);
         <MvccManager as ferrosa_storage::accord::PostgresMvccApplyObserver>::prepare_postgres_apply(
             &manager,

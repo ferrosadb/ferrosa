@@ -1984,11 +1984,12 @@ pub(crate) fn prepare_accord_writes(
                         }
                     })
                     .collect();
-                let metadata = serde_json::to_vec(&changes).map_err(|error| {
-                    MvccCommitError::Storage(ferrosa_common::Error::InvalidData(format!(
-                        "serialize PostgreSQL MVCC row versions: {error}"
-                    )))
-                })?;
+                let metadata =
+                    crate::row_change_codec::encode_partition(&changes).map_err(|error| {
+                        MvccCommitError::Storage(ferrosa_common::Error::InvalidData(format!(
+                            "serialize PostgreSQL MVCC row versions: {error}"
+                        )))
+                    })?;
                 metadata_bytes += metadata.len();
                 ferrosa_storage::accord::encode_postgres_mvcc_mutation(&bytes, &metadata).map_err(
                     |error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)),
