@@ -121,7 +121,13 @@ impl Node {
     /// Restart this node's process in place, reusing its data directory.
     fn restart(&mut self, cluster_name: &str, seed: Option<&str>) {
         self.stop();
-        self.child = spawn_child(&self.data_dir, self.ports, &self.host_id, cluster_name, seed);
+        self.child = spawn_child(
+            &self.data_dir,
+            self.ports,
+            &self.host_id,
+            cluster_name,
+            seed,
+        );
     }
 }
 
@@ -414,33 +420,6 @@ fn sabotage_table_dir(table_dir: &Path) -> RestoreDirMode {
 
 // ── the test ──────────────────────────────────────────────────────────────────
 
-/// Debug helper: drive an already-running cluster's PG port. Ignored unless
-/// `DROP_ATTACH_PG` names a port. Not part of the invariant gate.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore]
-async fn debug_attach_manual_cluster() {
-    let Ok(port) = std::env::var("DROP_ATTACH_PG") else {
-        return;
-    };
-    let port: u16 = port.parse().unwrap();
-    let client = pg_connect(port).await;
-    eprintln!(
-        "CREATE: {:?}",
-        client
-            .batch_execute(&format!("CREATE TABLE {TABLE} (id int PRIMARY KEY, v text)"))
-            .await
-            .map_err(|e| describe(&e))
-    );
-    eprintln!(
-        "INSERT: {:?}",
-        client
-            .execute(&format!("INSERT INTO {TABLE} (id, v) VALUES (1, '{OLD_VALUE}')"), &[])
-            .await
-            .map_err(|e| describe(&e))
-    );
-    eprintln!("SELECT: {:?}", read_rows(&client).await);
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects() {
     let cluster_name = format!("drop-proc-{}", std::process::id());
@@ -469,7 +448,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
     };
 
     let mut nodes: Vec<Node> = Vec::new();
-    for i in 0..N_NODES {
+    for (i, ports) in all_ports.iter().enumerate() {
         let dir = tempfile::tempdir().expect("node data dir");
         // A host id must be distinct in BOTH halves, because the node id is
         // derived from it two different ways and the halves are disjoint:
@@ -492,7 +471,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
             "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
              {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
         );
-        let node = spawn_node(dir, all_ports[i], host_id, &cluster_name, Some(&seeds_for(i)));
+        let node = spawn_node(dir, *ports, host_id, &cluster_name, Some(&seeds_for(i)));
         nodes.push(node);
     }
     for node in &nodes {
@@ -522,7 +501,9 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
         let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             match client
-                .batch_execute(&format!("CREATE TABLE {TABLE} (id int PRIMARY KEY, v text)"))
+                .batch_execute(&format!(
+                    "CREATE TABLE {TABLE} (id int PRIMARY KEY, v text)"
+                ))
                 .await
             {
                 Ok(()) => break,
