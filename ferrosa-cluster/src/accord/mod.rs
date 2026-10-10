@@ -7,6 +7,7 @@ pub mod apply;
 pub mod chaos_minority_kill;
 pub mod clock;
 pub mod clock_validation;
+pub mod compression;
 pub mod coordinator;
 pub mod cross_dc_adapter;
 pub mod cross_shard;

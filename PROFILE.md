@@ -355,6 +355,10 @@ rebuilding Ferrosa:
 |---|---|---:|
 | `FERROSA_POSTGRES_MAX_TXN_WRITES` | Mutations buffered by one PostgreSQL transaction before it fails with a resource-limit error | `10000` |
 | `FERROSA_PG_COMMIT_PROFILE` | Per-phase attribution for a PostgreSQL commit (prepare, Accord order/gate, apply fan-out, MVCC observer, prune, WAL) on the coordinator. Unset = zero cost | unset |
+| `FERROSA_ACCORD_COMPRESSION` | Codec for the Accord apply **region** body: `none` (default), `lz4`, `snappy`, `zstd`. Opt-in: compression costs CPU and only pays when the transport term is byte-bound rather than deserialize-bound | `none` |
+| `FERROSA_ACCORD_COMPRESSION_LEVEL` | Codec level where the codec has one (zstd); ignored by the fixed-level codecs | `3` |
+| `FERROSA_ACCORD_COMPRESSION_BLOCK_BYTES` | Block size the region is compressed in — the knob that moves the ratio/CPU/memory trade | `262144` (256 KiB) |
+| `FERROSA_ACCORD_COMPRESSION_MIN_BYTES` | Frames below this size are sent uncompressed (headers + CPU lose to just sending them) | `65536` (64 KiB) |
 | `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` | Keys one Accord transaction may register in the conflict index. Defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES` (floored at `100000`), so the front end cannot admit a transaction consensus is unable to register | derived |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | Rows buffered between a storage scan producer and the synchronous SQL executor | `64` |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | Maximum lifetime of an active PostgreSQL snapshot/transaction; later use fails with SQLSTATE `40001` | `600000` ms |

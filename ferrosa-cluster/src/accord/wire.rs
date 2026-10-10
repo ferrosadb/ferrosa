@@ -802,6 +802,9 @@ mod tests {
                 txn_id: accord,
                 offsets,
                 lengths,
+                compression: 0,
+                uncompressed_len: region.len() as u64,
+                block_bytes: 0,
             })
             .expect("header encodes");
             frame.extend_from_slice(region);
