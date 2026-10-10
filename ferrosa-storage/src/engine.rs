@@ -59,6 +59,7 @@ use crate::timeseries::{
     TimeSeriesTimestampUnit,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
+use crate::write_set_stage::WriteSetSource;
 
 // T-023 crash injection belongs to the poll future that explicitly opts in.
 // Task-local scope follows Tokio task migration and resets on unwind/drop;
@@ -9462,14 +9463,28 @@ impl StorageEngine {
     /// Writes a batch of mutations atomically.
     ///
     /// All mutations are appended to the commit log first, then applied to
-    /// their respective memtables. If the process crashes between commit log
-    /// append and memtable apply, commit log replay will recover all mutations.
+    /// their respective memtables, all under ONE fsync group. If the process
+    /// crashes between commit log append and memtable apply, commit log replay
+    /// will recover all mutations.
     ///
     /// This is the single-node fast path for logged batches: no batchlog
     /// coordination needed because the commit log provides the atomicity
     /// guarantee.
-    pub fn write_atomic_batch(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
-        if mutations.is_empty() {
+    ///
+    /// The set is read from a [`WriteSetSource`] as a STREAM: a resident
+    /// `Vec<Mutation>` for the small autocommit batch, or a spilled
+    /// [`StagedWriteSet`](crate::write_set_stage::StagedWriteSet) whose frames are
+    /// decoded one at a time. Each of the passes below visits ONE mutation at a
+    /// time, so the commit path never needs the whole write-set resident — its
+    /// residency is the source's own tunable buffer, never the write-set size.
+    ///
+    /// # Errors
+    ///
+    /// A rejected preflight (unregistered table, overload admission, an entry
+    /// larger than a fresh commit-log segment) fails the whole set before
+    /// anything is appended. A staging or decode failure fails loud.
+    pub fn write_atomic_batch<S: WriteSetSource>(&self, source: S) -> ferrosa_common::Result<()> {
+        if source.is_empty_set() {
             return Ok(());
         }
 
@@ -9483,7 +9498,7 @@ impl StorageEngine {
             let tables = self.tables.load();
             let max_entry = self.commit_log.max_entry_size();
             let mut checked = HashSet::new();
-            for m in &mutations {
+            source.for_each_mutation(&mut |m| {
                 self.check_write_admission()?;
 
                 // Oversized-entry preflight: an entry larger than a fresh
@@ -9500,7 +9515,7 @@ impl StorageEngine {
 
                 let table_id = TableId::new(&m.keyspace, &m.table);
                 if !checked.insert(table_id.clone()) {
-                    continue;
+                    return Ok(());
                 }
                 let state = tables.get(&table_id).ok_or_else(|| {
                     ferrosa_common::Error::InvalidFormat(format!(
@@ -9508,18 +9523,20 @@ impl StorageEngine {
                     ))
                 })?;
                 self.check_memtable_write_admission(&table_id, state)?;
-            }
+                Ok(())
+            })?;
         }
 
         // Phase 1: Append all mutations to the commit log, tracking positions.
         // Sync health must not refuse an append partway (that would leave a
         // torn prefix); the force_sync below is this batch's durability.
         let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
-        for m in &mutations {
+        source.for_each_mutation(&mut |m| {
             let cl_pos = self.commit_log.append_for_explicit_sync(m)?;
             let table_id = TableId::new(&m.keyspace, &m.table);
             positions.insert(table_id, cl_pos);
-        }
+            Ok(())
+        })?;
 
         // Durability barrier: synchronously fsync the appended batch BEFORE it
         // is made visible in the memtable (Phase 2). Without this, under the
@@ -9535,7 +9552,7 @@ impl StorageEngine {
 
         // Phase 2: Apply to memtables and update commit log positions.
         let tables = self.tables.load();
-        for m in &mutations {
+        source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
             let state = tables.get(&table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -9560,15 +9577,17 @@ impl StorageEngine {
                 }
             }
             self.request_flush_if_needed(state);
-        }
+            Ok(())
+        })?;
         drop(tables);
 
-        // Phase 3: Notify observers.
-        for m in &mutations {
+        // Phase 3: Notify observers, in the same order the log was appended.
+        source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
             self.dispatch_sync_observers(&table_id, m);
             self.dispatch_async_observers(&table_id, m);
-        }
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -9587,7 +9606,7 @@ impl StorageEngine {
         if ops.is_empty() {
             return Ok(());
         }
-        let mutations = ops.into_iter().map(BatchOp::into_mutation).collect();
+        let mutations: Vec<Mutation> = ops.into_iter().map(BatchOp::into_mutation).collect();
         self.write_atomic_batch(mutations)
     }
 
@@ -27150,6 +27169,285 @@ mod tests {
         };
         let result_b = engine.read(&table_b, &key_b).unwrap();
         assert!(result_b.is_some(), "mutation to tbl_b should be visible");
+    }
+
+    // -- Streaming commit-path tests (non-resident write-set) --
+    //
+    // `StorageEngine::write_atomic_batch` reads its write-set from a
+    // `WriteSetSource`, not a resident `Vec<Mutation>`. These tests drive it from
+    // a SPILLED `StagedWriteSet` — the shape a large transaction's commit
+    // consumes — and pin one invariant each.
+
+    /// The schema the streaming commit-path tests write through: one UTF8 column.
+    fn stream_test_schema(table: &str) -> TableSchema {
+        TableSchema {
+            keyspace: "ks".to_string(),
+            table: table.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// A single-row mutation for `table`, partition key `pk`, cell value `value`
+    /// at cell timestamp `ts` (also the partition token, so keys stay distinct).
+    fn stream_mutation(table: &str, pk: &[u8], value: &[u8], ts: i64) -> Mutation {
+        use ferrosa_common::Token;
+        Mutation {
+            mutation_id: [0x5Au8; 16],
+            keyspace: "ks".to_string(),
+            table: table.to_string(),
+            key: DecoratedKey {
+                token: Token(ts),
+                key: PartitionKey::new(pk.to_vec()),
+            },
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        }
+    }
+
+    /// The partition key that [`stream_mutation`] builds for `(pk, ts)`.
+    fn stream_key(pk: &[u8], ts: i64) -> DecoratedKey {
+        use ferrosa_common::Token;
+        DecoratedKey {
+            token: Token(ts),
+            key: PartitionKey::new(pk.to_vec()),
+        }
+    }
+
+    /// Stage `mutations` into a `WriteSetStage` under `root`, spilling past
+    /// `threshold` bytes, then finish. Returns the readable write-set and the
+    /// resident bytes held at the end of staging (0 once anything spilled).
+    fn stage_write_set(
+        mutations: &[Mutation],
+        root: &std::path::Path,
+        threshold: u64,
+    ) -> (crate::write_set_stage::StagedWriteSet, u64) {
+        let mut stage = crate::write_set_stage::WriteSetStage::with_threshold(root, threshold);
+        for mutation in mutations {
+            let mut frame = vec![0u8; mutation.serialized_size()];
+            mutation.serialize_into(&mut frame);
+            stage.append(&frame).expect("stage append");
+        }
+        let resident = stage.resident_bytes();
+        (stage.finish().expect("stage finish"), resident)
+    }
+
+    /// INVARIANT 1 (DATA PRESERVED). Every mutation of a write-set that has
+    /// SPILLED to disk is appended to the commit log and applied to the memtable,
+    /// so every row is readable afterwards. The set is forced past the staging
+    /// threshold, so the commit path reads it back out of the spill — not from a
+    /// resident `Vec<Mutation>` — and must lose nothing crossing the boundary.
+    #[test]
+    fn streamed_commit_lands_every_row_from_a_spilled_write_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table(stream_test_schema("streamed"))
+            .unwrap();
+
+        let n: usize = 200;
+        let mutations: Vec<Mutation> = (0..n)
+            .map(|i| {
+                let ts = i as i64 + 1;
+                stream_mutation(
+                    "streamed",
+                    format!("pk{i}").as_bytes(),
+                    format!("v{i}").as_bytes(),
+                    ts,
+                )
+            })
+            .collect();
+        let (staged, _resident) = stage_write_set(&mutations, &dir.path().join("stage"), 64);
+        assert!(
+            staged.spilled_to_disk(),
+            "the write-set must have SPILLED, or this is not the streaming path"
+        );
+        assert_eq!(staged.len(), n, "every frame is staged");
+
+        engine.write_atomic_batch(staged).expect("streamed commit");
+
+        for i in 0..n {
+            let key = stream_key(format!("pk{i}").as_bytes(), i as i64 + 1);
+            let partition = engine
+                .read(&TableId::new("ks", "streamed"), &key)
+                .expect("read");
+            assert!(
+                partition.is_some(),
+                "row {i} must be readable after a streamed commit across the spill"
+            );
+        }
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT 3 (PREFLIGHT REJECTS FIRST). Pass 1 validates the WHOLE set
+    /// before pass 2 appends anything. Here the offending entry is LAST, so an
+    /// append-then-validate preflight would already have appended the earlier,
+    /// valid entries. The commit log's position must be UNCHANGED — no replayable
+    /// prefix — and nothing may be visible.
+    #[test]
+    fn streamed_preflight_rejects_the_whole_set_before_any_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table(stream_test_schema("present"))
+            .unwrap();
+
+        let mut mutations = vec![
+            stream_mutation("present", b"pk0", b"v0", 1),
+            stream_mutation("present", b"pk1", b"v1", 2),
+            // The offending entry is LAST: everything before it is valid.
+            stream_mutation("absent", b"pk2", b"v2", 3),
+        ];
+        let (staged, _resident) = stage_write_set(&mutations, &dir.path().join("stage"), 4096);
+
+        let before = engine.commit_log.current_position();
+        let error = engine
+            .write_atomic_batch(staged)
+            .expect_err("an unregistered table must reject the whole set");
+        assert!(
+            error.to_string().contains("absent"),
+            "the rejection names the table: {error}"
+        );
+        assert_eq!(
+            before,
+            engine.commit_log.current_position(),
+            "preflight must reject the whole set BEFORE pass 2 appends anything"
+        );
+        assert!(
+            engine
+                .read(&TableId::new("ks", "present"), &stream_key(b"pk0", 1))
+                .unwrap()
+                .is_none(),
+            "a rejected batch must apply nothing"
+        );
+        mutations.clear();
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT 5 (CAPACITY). Residency does not grow with the write-set: a
+    /// small set and a set two orders of magnitude larger are BOTH committed
+    /// completely, and the staged residency never exceeds the tunable buffer.
+    /// This is the opposite of a cap test — the large set SUCCEEDS; a structure
+    /// that cannot hold the data spills, it never refuses.
+    #[test]
+    fn streamed_commit_residency_is_flat_across_write_set_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(stream_test_schema("flat")).unwrap();
+
+        let threshold = 512u64;
+        let payload = vec![b'x'; 32];
+
+        let small: Vec<Mutation> = (0..8)
+            .map(|i| stream_mutation("flat", format!("s{i}").as_bytes(), &payload, i as i64 + 1))
+            .collect();
+        let large: Vec<Mutation> = (0..5_000)
+            .map(|i| {
+                stream_mutation(
+                    "flat",
+                    format!("l{i}").as_bytes(),
+                    &payload,
+                    i as i64 + 1000,
+                )
+            })
+            .collect();
+
+        let (small_staged, small_resident) =
+            stage_write_set(&small, &dir.path().join("stage-small"), threshold);
+        let (large_staged, large_resident) =
+            stage_write_set(&large, &dir.path().join("stage-large"), threshold);
+
+        assert!(
+            small_resident <= threshold,
+            "resident {small_resident} must stay within the {threshold}-byte buffer"
+        );
+        assert!(
+            large_resident <= threshold,
+            "resident {large_resident} must stay within the {threshold}-byte buffer; \
+             residency must not track the write-set size"
+        );
+        assert_eq!(
+            large_staged.len(),
+            5_000,
+            "a write-set far larger than the buffer is ACCEPTED, never refused for size"
+        );
+        assert!(large_staged.spilled_to_disk());
+
+        engine
+            .write_atomic_batch(small_staged)
+            .expect("small commit");
+        engine
+            .write_atomic_batch(large_staged)
+            .expect("a large write-set commits; it is never refused for being large");
+
+        assert!(
+            engine
+                .read(
+                    &TableId::new("ks", "flat"),
+                    &stream_key(b"l4999", 1000 + 4999)
+                )
+                .unwrap()
+                .is_some(),
+            "the LAST row of the large set must land"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT 6 (FAIL LOUD). A staged frame that is not a decodable mutation
+    /// is a clear error, never a silent empty mutation that would drop a row.
+    #[test]
+    fn streamed_commit_fails_loud_on_a_corrupt_staged_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table(stream_test_schema("corrupt"))
+            .unwrap();
+
+        let good = stream_mutation("corrupt", b"pk0", b"v0", 1);
+        let mut frame = vec![0u8; good.serialized_size()];
+        good.serialize_into(&mut frame);
+        let mut stage =
+            crate::write_set_stage::WriteSetStage::with_threshold(dir.path().join("stage"), 8);
+        stage.append(&frame).expect("append good");
+        stage.append(&frame[..8]).expect("append truncated");
+        let staged = stage.finish().expect("finish");
+
+        let before = engine.commit_log.current_position();
+        let error = engine
+            .write_atomic_batch(staged)
+            .expect_err("a corrupt frame must fail loud");
+        assert!(
+            error.to_string().contains("not a decodable mutation frame"),
+            "a clear error, never a silent empty mutation: {error}"
+        );
+        assert_eq!(
+            before,
+            engine.commit_log.current_position(),
+            "a decode failure in preflight must append nothing"
+        );
+        assert!(
+            engine
+                .read(&TableId::new("ks", "corrupt"), &stream_key(b"pk0", 1))
+                .unwrap()
+                .is_none(),
+            "a failed streamed commit must apply nothing"
+        );
+        engine.shutdown().unwrap();
     }
 
     // -- System table registration tests --

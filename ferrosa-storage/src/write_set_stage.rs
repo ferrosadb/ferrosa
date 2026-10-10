@@ -58,6 +58,7 @@ use std::path::PathBuf;
 
 use ferrosa_common::{Error, Result};
 
+use crate::commitlog::mutation::Mutation;
 use crate::engine::TempSortTableReservation;
 
 pub use crate::write_set_spill::WRITE_SET_SPILL_FLOOR_BYTES;
@@ -269,6 +270,67 @@ impl WriteSetStage {
         Ok(())
     }
 
+    /// Visit every payload staged SO FAR, in append order, WITHOUT finishing the
+    /// stage — the write-set survives for the commit.
+    ///
+    /// This is the read-your-own-writes path: a `SELECT` inside an open
+    /// transaction must see the rows the transaction has already staged, even
+    /// once they have spilled. A spilled stage is flushed and read back by
+    /// offset; a fully-resident stage is visited in place. Residency is one
+    /// payload, never the write-set.
+    ///
+    /// # Errors
+    ///
+    /// A flush or read failure is surfaced, never swallowed — a peek that
+    /// silently dropped a staged payload would answer a query with rows missing.
+    pub fn for_each_staged(&mut self, visit: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if self.spill_file.is_none() {
+            // Nothing has spilled: every payload is still in the resident prefix.
+            for blob in &self.resident {
+                visit(blob)?;
+            }
+            return Ok(());
+        }
+
+        // Flush the writer so every appended payload is on disk, then read the
+        // staged region back. The writer borrow is confined to this block so the
+        // offset index below can be borrowed immutably.
+        let path = {
+            let writer = self
+                .spill_file
+                .as_mut()
+                .expect("a spilled stage always holds its writer");
+            writer
+                .flush()
+                .map_err(|e| Error::InvalidFormat(format!("write-set stage: flush: {e}")))?;
+            self.reservation
+                .as_ref()
+                .expect("a spilling stage always owns its reservation")
+                .path()
+                .join("write-set.bin")
+        };
+        let file = File::open(&path).map_err(|e| {
+            Error::InvalidFormat(format!("write-set stage: reopen {}: {e}", path.display()))
+        })?;
+        use std::os::unix::fs::FileExt;
+
+        let mut buf: Vec<u8> = Vec::new();
+        for index in 0..self.offsets.len() {
+            let offset = self.offsets[index];
+            let len = self.lens[index] as usize;
+            buf.clear();
+            buf.resize(len, 0);
+            file.read_exact_at(&mut buf, offset).map_err(|e| {
+                Error::InvalidFormat(format!(
+                    "write-set stage: read staged entry {index} at {offset}+{len} in {}: {e}",
+                    path.display()
+                ))
+            })?;
+            visit(&buf)?;
+        }
+        Ok(())
+    }
+
     /// Flush, memory-map the spilled region, and return the finished view.
     ///
     /// A fully-resident stage (nothing spilled) returns a value with no mapping
@@ -434,6 +496,88 @@ impl StagedWriteSet {
     /// Owned copy of the payload at `index`. FAILS LOUD on an un-staged index.
     pub fn payload(&self, index: usize) -> Result<Vec<u8>> {
         Ok(self.entry(index)?.to_vec())
+    }
+}
+
+/// A write-set the commit path can read **more than once**, in bounded chunks.
+///
+/// [`StorageEngine::write_atomic_batch`](crate::engine::StorageEngine::write_atomic_batch)
+/// makes three passes over a write-set (preflight, commit-log append, memtable
+/// apply) under a single fsync group. Every pass must be able to visit the same
+/// set again, in the same order, without the set being resident as a
+/// `Vec<Mutation>`. This trait is that contract.
+///
+/// Two sources satisfy it:
+///
+/// - a resident `Vec<Mutation>` (the small, common autocommit batch), and
+/// - a spilled [`StagedWriteSet`], each of whose entries is one
+///   [`Mutation::serialize_into`] frame, decoded one at a time as a pass visits
+///   it. Residency is then one decoded mutation, never the whole set.
+///
+/// # Fail loud
+///
+/// A staged source that does not decode (`deserialize_from` error) or an entry
+/// that is not staged ([`StagedWriteSet::entry`] error) propagates as an error.
+/// It is never a silent empty mutation.
+pub trait WriteSetSource {
+    /// Number of mutations in the set. Used only to decide "empty ⇒ no-op";
+    /// never as a capacity bound.
+    fn mutation_count(&self) -> usize;
+
+    /// Whether the set holds no mutations.
+    fn is_empty_set(&self) -> bool {
+        self.mutation_count() == 0
+    }
+
+    /// Visit every mutation in APPEND order, one at a time. The borrow handed to
+    /// `visit` lives only for that call, so the source never materializes the
+    /// whole set.
+    ///
+    /// # Errors
+    ///
+    /// Any error from `visit`, or from reading a staged entry, ends the walk and
+    /// is returned unchanged.
+    fn for_each_mutation(&self, visit: &mut dyn FnMut(&Mutation) -> Result<()>) -> Result<()>;
+}
+
+/// A resident write-set. Bounded by whatever assembled it; this is the small
+/// autocommit batch, not a staged transaction.
+impl WriteSetSource for Vec<Mutation> {
+    fn mutation_count(&self) -> usize {
+        self.len()
+    }
+
+    fn for_each_mutation(&self, visit: &mut dyn FnMut(&Mutation) -> Result<()>) -> Result<()> {
+        for mutation in self {
+            visit(mutation)?;
+        }
+        Ok(())
+    }
+}
+
+/// A staged, threshold-bounded write-set. Each pass re-decodes one frame at a
+/// time out of the resident prefix or the memory-mapped spill, so residency is
+/// one mutation, not the write-set.
+///
+/// Every entry MUST be a [`Mutation`] serialized with `Mutation::serialize_into`;
+/// any other bytes fail loud in `Mutation::deserialize_from`, never decode to an
+/// empty mutation.
+impl WriteSetSource for StagedWriteSet {
+    fn mutation_count(&self) -> usize {
+        self.len()
+    }
+
+    fn for_each_mutation(&self, visit: &mut dyn FnMut(&Mutation) -> Result<()>) -> Result<()> {
+        for index in 0..self.len() {
+            let frame = self.entry(index)?;
+            let mutation = Mutation::deserialize_from(frame).map_err(|e| {
+                Error::InvalidData(format!(
+                    "write-set stage: staged entry {index} is not a decodable mutation frame: {e}"
+                ))
+            })?;
+            visit(&mutation)?;
+        }
+        Ok(())
     }
 }
 
@@ -674,6 +818,56 @@ mod tests {
         );
     }
 
+    /// A non-consuming peek visits every payload staged SO FAR, in append order,
+    /// in BOTH regimes, and leaves the stage usable (the write-set survives for
+    /// the commit). This is the read-your-own-writes path over a spilled set.
+    #[test]
+    fn peeking_a_live_stage_visits_every_payload_without_consuming_it() {
+        // Spilled: the peek must read back out of the staging file.
+        let root = temp_root("peek");
+        let entries: Vec<Vec<u8>> = (0..10u8)
+            .map(|i| format!("payload-{i:02}").into_bytes())
+            .collect();
+        let mut stage = WriteSetStage::with_threshold(&root, 16);
+        for entry in &entries {
+            stage.append(entry).expect("append");
+        }
+        assert!(stage.spilled_to_disk());
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        stage
+            .for_each_staged(&mut |payload| {
+                seen.push(payload.to_vec());
+                Ok(())
+            })
+            .expect("peek");
+        assert_eq!(
+            seen, entries,
+            "a peek must visit every payload in append order"
+        );
+
+        // The peek did not consume the stage: appending more still works, and the
+        // finished view holds everything.
+        stage.append(b"tail").expect("append after peek");
+        let staged = stage.finish().expect("finish");
+        assert_eq!(staged.len(), entries.len() + 1);
+        assert_eq!(staged.entry(entries.len()).expect("tail"), b"tail");
+
+        // Fully resident: the peek visits the resident prefix in place.
+        let mut resident = WriteSetStage::with_threshold(&root, 1 << 20);
+        resident.append(b"a").expect("append");
+        resident.append(b"bb").expect("append");
+        let mut seen_resident: Vec<Vec<u8>> = Vec::new();
+        resident
+            .for_each_staged(&mut |payload| {
+                seen_resident.push(payload.to_vec());
+                Ok(())
+            })
+            .expect("peek");
+        assert_eq!(seen_resident, vec![b"a".to_vec(), b"bb".to_vec()]);
+        let _ = resident.finish().expect("finish");
+    }
+
     /// An invalid threshold setting is refused as a *setting* and the default is
     /// used — it never refuses WORK. Pure, so no env mutation is needed.
     #[test]
@@ -692,5 +886,118 @@ mod tests {
             WRITE_SET_SPILL_FLOOR_BYTES
         );
         assert_eq!(resolve_spill_threshold(Some(" 1048576 ")), 1_048_576);
+    }
+
+    // -- WriteSetSource: the contract the streaming commit path relies on --
+
+    /// One serialized [`Mutation`] frame carrying a single row, so a source test
+    /// can prove byte-for-byte round-trip and append order.
+    fn mutation_frame(keyspace: &str, table: &str, pk: &[u8], value: &[u8], ts: i64) -> Vec<u8> {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+        use ferrosa_common::Token;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+
+        let mutation = Mutation {
+            mutation_id: [0x3Cu8; 16],
+            keyspace: keyspace.to_string(),
+            table: table.to_string(),
+            key: DecoratedKey {
+                token: Token(ts),
+                key: PartitionKey::new(pk.to_vec()),
+            },
+            // The cell timestamp is the token here, so a frame decoded out of
+            // order is detectable: the row's `primary_key_liveness` timestamp
+            // carries the intended position.
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        };
+        let mut frame = vec![0u8; mutation.serialized_size()];
+        mutation.serialize_into(&mut frame);
+        frame
+    }
+
+    /// INVARIANT: ORDERING — a staged source visits every mutation in APPEND
+    /// order, ACROSS the spill boundary. The commit path's pass 2 and pass 3 both
+    /// consume this order, so the append order the log records is the apply order
+    /// the memtable sees.
+    #[test]
+    fn the_source_visits_every_mutation_in_append_order_across_the_boundary() {
+        let root = temp_root("source-order");
+        let frames: Vec<Vec<u8>> = (0..12)
+            .map(|i| mutation_frame("ks", "t", format!("pk{i}").as_bytes(), b"v", i + 1))
+            .collect();
+        // A threshold far below the set forces the resident prefix to spill.
+        let mut stage = WriteSetStage::with_threshold(&root, 64);
+        for frame in &frames {
+            stage.append(frame).expect("append");
+        }
+        let staged = stage.finish().expect("finish");
+        assert!(staged.spilled_to_disk(), "the boundary must be exercised");
+
+        let mut seen: Vec<(String, i64)> = Vec::new();
+        staged
+            .for_each_mutation(&mut |m| {
+                seen.push((
+                    m.key
+                        .key
+                        .as_bytes()
+                        .to_vec()
+                        .into_iter()
+                        .map(char::from)
+                        .collect(),
+                    m.timestamp,
+                ));
+                Ok(())
+            })
+            .expect("walk");
+
+        assert_eq!(
+            seen.len(),
+            frames.len(),
+            "every frame is visited exactly once"
+        );
+        let expected: Vec<(String, i64)> = (0..12).map(|i| (format!("pk{i}"), i + 1)).collect();
+        assert_eq!(
+            seen, expected,
+            "append order must be preserved across the boundary"
+        );
+    }
+
+    /// A resident `Vec<Mutation>` source visits in order too — the small
+    /// autocommit batch stays on the same contract.
+    #[test]
+    fn the_resident_vec_source_visits_in_order() {
+        let mutations: Vec<Mutation> = Vec::new();
+        assert!(mutations.is_empty_set());
+        assert_eq!(mutations.mutation_count(), 0);
+        assert!(Vec::<Mutation>::new()
+            .for_each_mutation(&mut |_| panic!("an empty set visits nothing"))
+            .is_ok());
+    }
+
+    /// INVARIANT: FAIL LOUD — a staged frame that is not a decodable mutation is
+    /// a clear error from the source, never a silent empty mutation.
+    #[test]
+    fn a_non_mutation_frame_fails_loud_from_the_source() {
+        let root = temp_root("source-corrupt");
+        let mut stage = WriteSetStage::with_threshold(&root, 4);
+        stage
+            .append(b"this is definitely not a serialized mutation")
+            .expect("append");
+        let staged = stage.finish().expect("finish");
+
+        let error = staged
+            .for_each_mutation(&mut |_| panic!("a corrupt frame must not be visited"))
+            .expect_err("a corrupt frame must fail loud");
+        assert!(
+            error.to_string().contains("not a decodable mutation frame"),
+            "clear error, never a silent empty mutation: {error}"
+        );
     }
 }
