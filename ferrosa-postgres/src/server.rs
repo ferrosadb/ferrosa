@@ -1017,6 +1017,12 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                         )];
                     };
                     let tables = write_tables.iter().cloned().collect();
+                    // `mutations` has been fully encoded into `accord_writes`; the
+                    // Accord protocol below never reads it again. Without this the
+                    // raw whole-table write-set stays resident for the entire
+                    // PreAccept/Commit/Apply sequence — a second full copy of the
+                    // transaction alongside `accord_writes`.
+                    drop(mutations);
                     match committer
                         .commit_postgres(
                             &ctx.default_schema,

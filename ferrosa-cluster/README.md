@@ -34,6 +34,14 @@ transaction reaches `Applied` and every participating shard reaches Apply
 quorum, so a locally parked dependency does not delay propagation or become an
 early acknowledgement.
 
+The Apply fan-out is **memory-bounded**: `apply_fanout_bounded` keeps one replica's
+`AccordApplyV2` payload resident at a time — build, serialize, drop, send, peer by
+peer — rather than materializing every replica's payload simultaneously. The
+per-shard quorum accounting is unchanged; only the peak memory is. This matters for
+large transactions, where the payloads are the coordinator-only term that tips a
+node: a ~1.1M-row commit measured ~4.5 GB peak on the coordinator against ~2.75 GB
+on each replica before the bound. See FMEA `CL-50`.
+
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and
 > simulated-nemesis). There is **no external/public Jepsen run yet** — the
