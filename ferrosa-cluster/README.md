@@ -223,7 +223,15 @@ build; the codec's own cost is its delta against `none`.
   types, UDFs/UDAs, members, token map, per-node index status, cluster config.
   `DropTable` apply removes the table's index entries from `RaftState` and, via
   `engine.unregister_table`, cascades tombstones over the dropped table's
-  `system_schema.indexes` registrations (t_ae06e925). `DropIndex` apply now
+  `system_schema.indexes` registrations (t_ae06e925). A refused apply — the
+  engine could not remove the table's SSTables — is folded into a
+  `RaftResponse::Error`, and the client-facing cluster route
+  `ddl_path::execute_via_raft` now SURFACES that refusal as an error instead of
+  reporting success; the storage half records the durable sweep intent so the
+  node's schema can never say "dropped" while its directory survives unrecorded
+  (t_c8625592, CL-47; regression
+  `tests/drop_table_replica_agreement.rs::a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects`).
+  `DropIndex` apply now
   also calls `engine.drop_index`, so live memtable/vector index state, sidecar
   read guards, and `IndexStateTracker` entries are removed on the applying node
   immediately. `CreateIndex` apply is now symmetric with it: it calls

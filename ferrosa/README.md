@@ -246,3 +246,27 @@ zero owned ranges. The controller now also resumes the Promote phase on the
 recovered-topology path (it previously skipped promotion on every restart, so a
 mid-join node stayed `Joining` forever). Invariants and boundaries are pinned in
 `ferrosa-cluster/tests/joining_node_health.rs`.
+
+### DROP TABLE replica-atomicity (real-process)
+
+`tests/drop_table_replica_process.rs` is the process-level guard for
+t_c8625592 — a refused `DROP TABLE` must fail loud and never resurrect its rows.
+It spawns **three real `ferrosa` binaries**, forms a real
+cluster (a Raft leader elected, `DdlPath::Cluster` installed on every
+node), and drives the DROP over the **PostgreSQL wire**: the client must receive
+an ERROR (SQLSTATE 58000), no node may serve the seeded rows afterwards, and
+they must stay gone after **restarting the node that applied the drop**.
+
+Two harness traps are load-bearing and easy to re-derive wrongly:
+
+- **Host ids must be distinct in BOTH halves.** Raft's
+  `ferrosa_cluster::raft::uuid_to_node_id` reads `bytes[8..16]` (little-endian)
+  while Accord reads `bytes[0..8]` (big-endian). Host ids that differ only in
+  the leading groups collapse to one Raft node id and no leader is ever elected;
+  host ids that differ only in the trailing group collide on one Accord node id
+  and every write fails `unknown peer`. The test repeats `0x11/0x22/0x33` across
+  all sixteen bytes, as `tests/docker-compose.cluster.yml` does.
+- **Seeding must be a full mesh.** Every node seeds off the other two so the
+  auto-created `public` keyspace is RF=3 (`seeds + 1`). A star topology leaves it
+  RF=1 and an Accord write that resolves to the coordinator's own host fails
+  `Accord quorum unavailable`.

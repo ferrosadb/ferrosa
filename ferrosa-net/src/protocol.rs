@@ -2446,7 +2446,7 @@ where
 /// [`encode_accord_apply_v2_region`] with an optional region compression.
 ///
 /// When `cfg` selects a codec AND the region is at least `cfg.min_bytes`, the region is
-/// compressed in `cfg.block_bytes` blocks (`compress_region`); the header records
+/// compressed in `cfg.block_bytes` blocks (see `compress_region`); the header records
 /// the codec tag, the uncompressed length and the block size so the peer can decompress
 /// and address entries by the SAME `(offset, length)` index. If the compressed region is
 /// not smaller than the raw one, or the region is below `min_bytes`, the frame is sent

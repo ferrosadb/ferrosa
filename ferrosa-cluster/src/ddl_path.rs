@@ -876,6 +876,9 @@ pub async fn wait_for_local_apply(
     }
 }
 
+/// Invariant: a DROP that this node could not apply must fail loud to the
+/// client, never be reported as done.
+///
 /// Propose a DDL operation through Raft consensus.
 ///
 /// On success the state machine has applied the command on all live nodes
@@ -885,11 +888,27 @@ pub async fn wait_for_local_apply(
 /// the leader hint. The [`DdlPath::Cluster`] arm in `execute()` catches this
 /// and transparently forwards the request to the leader instead of propagating
 /// the error to the CQL client.
-pub(crate) async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
+///
+/// On an apply that was committed but refused on the applying node (the state
+/// machine folds a storage failure into `RaftResponse::Error`), this returns an
+/// error: a DROP that did not take effect must not be reported as success.
+#[doc(hidden)]
+pub async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
     let cmd = ddl_op_to_raft_command(op);
 
     match raft.client_write(cmd).await {
         Ok(resp) => {
+            // The applying node folds a refused DROP (its storage could not
+            // remove the table's SSTables) into `RaftResponse::Error`. The
+            // leader applies synchronously inside `client_write`, so that
+            // refusal is carried back here — surface it rather than reporting
+            // success for a DROP that did not take effect (forge t_c8625592,
+            // invariant "all replicas agree").
+            if let crate::raft::RaftResponse::Error(reason) = &resp.data {
+                return Err(ClusterError::Internal(format!(
+                    "DROP/DDL refused on the applying node: {reason}"
+                )));
+            }
             // openraft's `client_write` returns once the LEADER applies, so on
             // the leader read-your-writes already holds. Drive followers'
             // *log replication* forward (condition-based on the matched index)

@@ -2284,6 +2284,7 @@ dependencies = [
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tokio-tungstenite 0.26.2",
  "tokio-util",

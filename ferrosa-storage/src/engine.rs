@@ -4907,6 +4907,37 @@ impl StorageEngine {
 
         let table_id = TableId::new(&schema.keyspace, &schema.table);
         let table_dir = config.data_dir.join("sstables").join(table_id.to_string());
+
+        // A DROP/TRUNCATE that could not remove this table's directory left
+        // orphaned SSTables behind (forge t_c8625592; the live "orphaned SSTables
+        // remained under public.pgbench_accounts"). Registration precedes any
+        // write, so EVERYTHING in the directory here was written before the drop
+        // and belongs to a previous incarnation: remove it rather than load it, or
+        // a same-name CREATE would silently contain a mix of old and new rows. The
+        // sweep is loud on failure — never load a directory known to hold a dropped
+        // table's rows.
+        if crate::table_drops::is_pending_sweep(&config.data_dir, &schema.keyspace, &schema.table)?
+        {
+            if table_dir.exists() {
+                std::fs::remove_dir_all(&table_dir).map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "refusing to register {table_id}: a prior DROP could not remove its \
+                         SSTables and sweeping them now failed ({e}); loading them would \
+                         resurrect the dropped table's rows"
+                    ))
+                })?;
+            }
+            crate::table_drops::clear_pending_sweep(
+                &config.data_dir,
+                &schema.keyspace,
+                &schema.table,
+            )?;
+            tracing::warn!(
+                table = %table_id,
+                "swept orphaned SSTables left by a DROP that could not remove them"
+            );
+        }
+
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
@@ -4990,13 +5021,42 @@ impl StorageEngine {
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        // A same-name re-create after a DROP whose removal failed must never
+        // reach the previous incarnation's still-registered store. When a
+        // pending-sweep intent names this table, retire whatever is registered
+        // instead of taking the "already registered" shortcut below, so
+        // `build_table_state` gets to sweep the orphaned directory before it
+        // loads anything. (forge t_c8625592 — invariant "all replicas agree".)
+        let pending_sweep = crate::table_drops::is_pending_sweep(
+            &self.config.data_dir,
+            &schema.keyspace,
+            &schema.table,
+        )?;
         {
             let tables = self.tables.load();
             if tables.contains_key(&table_id) {
                 drop(tables);
-                self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
-                self.replay_deferred_mutations_for_table(&table_id);
-                return Ok(());
+                if !pending_sweep {
+                    self.merge_index_declarations_for_registered_table(
+                        &table_id,
+                        &indexed_columns,
+                    )?;
+                    self.replay_deferred_mutations_for_table(&table_id);
+                    return Ok(());
+                }
+                // Retire the stale store; the rebuild below installs a clean
+                // one and its directory is swept by `build_table_state`.
+                self.clear_compaction_retry_state(&table_id);
+                if let Some(state) = remove_table(&self.tables, &table_id)? {
+                    state.store.retire();
+                }
+                self.remove_time_series_consolidator(&table_id);
+                self.index_tracker
+                    .remove_table_indexes(table_id.keyspace(), table_id.table());
+                tracing::warn!(
+                    table = %table_id,
+                    "re-registration swept a live store whose DROP could not remove its SSTables"
+                );
             }
         }
         let time_series_handle = self.build_time_series_consolidator(&table_id, &schema)?;
@@ -5174,6 +5234,30 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // A DROP that is about to happen must be recorded durably BEFORE any
+        // step that can refuse or abort it. The in-memory schema is dropped
+        // first on every DDL route (cluster `apply_command`, `apply_direct`,
+        // the pair coordinator), so unless the durable half is written here too
+        // the node is left reporting the table dropped while its directory —
+        // and therefore its rows — survives on disk. Recording the intent first
+        // means a refusal can never leave the two disagreeing: the next
+        // `build_table_state` for this name sweeps the directory instead of
+        // loading it. `unregister_table_quiesced` clears the intent on a
+        // removal that succeeds, so a legitimately re-created table is
+        // untouched. (forge t_c8625592 — invariant "all replicas agree".)
+        if self.tables.load().contains_key(table_id) {
+            crate::table_drops::record_drop(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+                crate::table_drops::now_millis()?,
+            )?;
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
+        }
         let pause = self
             .compaction_executor
             .pause_table(table_id, ferrosa_common::CancelReason::TableDropped);
@@ -5256,24 +5340,47 @@ impl StorageEngine {
         }
 
         // Delete local SSTable directory so DROP+CREATE starts empty.
+        //
+        // A failed removal must not report success: the dropped rows would stay
+        // readable and a same-name CREATE would silently reload them (forge
+        // t_c8625592; live: the census grew 1.0M -> 1.15M -> 1.25M across reloads).
+        // The pending-sweep intent is recorded durably BEFORE the removal, so a
+        // removal that fails leaves it in place and the next `build_table_state`
+        // sweeps the directory instead of loading it; a removal that succeeds
+        // clears it.
         let table_dir = self
             .config
             .data_dir
             .join("sstables")
             .join(table_id.to_string());
         if table_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&table_dir) {
-                tracing::warn!(
-                    table = %table_id,
-                    path = %table_dir.display(),
-                    %e,
-                    "failed to delete SSTable directory on DROP TABLE"
-                );
-            } else {
-                tracing::info!(
-                    table = %table_id,
-                    "deleted local SSTable directory on DROP TABLE"
-                );
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
+            match std::fs::remove_dir_all(&table_dir) {
+                Ok(()) => {
+                    crate::table_drops::clear_pending_sweep(
+                        &self.config.data_dir,
+                        table_id.keyspace(),
+                        table_id.table(),
+                    )?;
+                    tracing::info!(
+                        table = %table_id,
+                        "deleted local SSTable directory on DROP TABLE"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        table = %table_id,
+                        path = %table_dir.display(),
+                        %e,
+                        "DROP TABLE: could not delete the SSTable directory — refusing to \
+                         report success; a same-name CREATE will sweep it"
+                    );
+                    return Err(ferrosa_common::Error::Io(e));
+                }
             }
         }
 
@@ -10717,22 +10824,36 @@ impl StorageEngine {
         // Clear in-memory state (memtable + SSTable references).
         state.store.truncate()?;
 
-        // Delete local SSTable files so data doesn't reappear on restart.
+        // Delete local SSTable files so data doesn't reappear on restart. As for
+        // DROP, a failure must not be swallowed: record the sweep intent first, and
+        // fail loud if the removal does not complete (forge t_c8625592).
         let table_dir = self
             .config
             .data_dir
             .join("sstables")
             .join(table_id.to_string());
         if table_dir.exists() {
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
             if let Err(e) = std::fs::remove_dir_all(&table_dir) {
-                tracing::warn!(
+                tracing::error!(
                     table = %table_id,
                     %e,
-                    "TRUNCATE: failed to delete local SSTable directory"
+                    "TRUNCATE: could not delete the SSTable directory — refusing to report \
+                     success; a later registration will sweep it"
                 );
+                return Err(ferrosa_common::Error::Io(e));
             }
+            crate::table_drops::clear_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
             // Re-create empty directory so future flushes have a target.
-            let _ = std::fs::create_dir_all(&table_dir);
+            std::fs::create_dir_all(&table_dir)?;
         }
 
         Ok(())
@@ -18210,6 +18331,297 @@ mod tests {
             result.is_none(),
             "data must be gone after DROP+CREATE — got {:?}",
             result
+        );
+    }
+
+    /// DROP TABLE must not leave its rows readable after a same-name CREATE,
+    /// even when the physical SSTable deletion could not complete.
+    ///
+    /// An aborted bulk load can leave an undeletable entry inside the table's
+    /// SSTable directory (the live incident: "orphaned SSTables remained under
+    /// `public.pgbench_accounts`"). `unregister_table_quiesced` logs the
+    /// `remove_dir_all` failure and returns `Ok(())`, so the DROP reports
+    /// success while every row stays on disk; the next `register_table` for the
+    /// same name scans that directory and reloads them. The dropped table's rows
+    /// are then readable, and a same-name CREATE silently returns a mix of old
+    /// and new data (the census that grew 1.0M -> 1.15M -> 1.25M across reloads).
+    ///
+    /// RED against the current code. The guard is the DROP contract: either the
+    /// drop fails loud, or no read path returns a dropped row.
+    #[cfg(unix)]
+    #[test]
+    fn a_drop_that_cannot_remove_its_sstables_leaves_no_readable_rows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        // The bulk load: rows flushed to real SSTables on disk.
+        for i in 0..5 {
+            let key = make_key(&format!("old{i}"));
+            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        assert_eq!(
+            engine.count_range(&tid, None, None).unwrap(),
+            5,
+            "precondition: five rows are on disk before the DROP"
+        );
+
+        // The aborted load left the table directory undeletable. Make it
+        // unreadable too, so `remove_dir_all` cannot even enumerate it — the
+        // order-independent form of "the deletion did not complete".
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(table_dir.exists(), "the table directory must exist on disk");
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        // DROP TABLE.
+        let drop = engine.unregister_table(&tid);
+
+        // The transient condition clears (the process that held the directory
+        // released it; an operator runs a cleanup). The SSTable files were never
+        // removed, so they are readable again — this is the live state.
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        // CREATE the same name and load a DIFFERENT row count.
+        engine.register_table(test_schema()).unwrap();
+        for i in 0..3 {
+            let key = make_key(&format!("new{i}"));
+            engine
+                .write(&tid, &key, make_row(b"fresh", 100), 100)
+                .unwrap();
+        }
+
+        // The table must contain ONLY the newly written rows. Assert the exact
+        // count, not a lower bound: a stale count must not be able to match.
+        let visible = engine.count_range(&tid, None, None).unwrap();
+        assert_eq!(
+            visible,
+            3,
+            "DROP+CREATE must contain ONLY the new rows; the dropped table's rows \
+             came back (drop returned {:?})",
+            drop.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+
+        // And the survivors must not be reachable by a full scan either.
+        let scanned: usize = engine
+            .read_range_limited_rows(&tid, None, None, 1000, 0)
+            .unwrap()
+            .iter()
+            .map(|p| p.rows.len())
+            .sum();
+        assert_eq!(scanned, 3, "a full scan must not return dropped rows");
+        assert!(
+            !table_dir.join("orphaned-generation").exists(),
+            "the orphaned entry must be gone"
+        );
+    }
+
+    /// Restores a table directory's mode when dropped, so a test that made it
+    /// unreadable still leaves a cleanable tempdir.
+    #[cfg(unix)]
+    struct RestoreDirMode(std::path::PathBuf);
+    #[cfg(unix)]
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(&self.0) {
+                let mut p = md.permissions();
+                p.set_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, p);
+            }
+        }
+    }
+
+    /// Make the table's SSTable directory unreadable so `remove_dir_all` cannot
+    /// enumerate it (the order-independent form of "the removal did not complete").
+    /// Returns a guard that restores the mode.
+    #[cfg(unix)]
+    fn make_undeletable(table_dir: &std::path::Path) -> RestoreDirMode {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(table_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(table_dir, perms).unwrap();
+        RestoreDirMode(table_dir.to_path_buf())
+    }
+
+    /// Every `-Data.db` component under `dir` (flat or `<gen>/` layout).
+    fn data_files_under(dir: &std::path::Path) -> usize {
+        fn walk(d: &std::path::Path, n: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, n);
+                } else if p
+                    .file_name()
+                    .map(|f| f.to_string_lossy().ends_with("-Data.db"))
+                    .unwrap_or(false)
+                {
+                    *n += 1;
+                }
+            }
+        }
+        let mut n = 0;
+        walk(dir, &mut n);
+        n
+    }
+
+    /// INV-1 / INV-2 (NO RESURRECTION, NAME REUSE IS CLEAN): after a DROP that
+    /// could not remove its SSTables, a same-name CREATE contains ONLY the new
+    /// rows, and they stay the only rows after a full restart — the sweep is
+    /// durable, not merely in-memory.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_name_recreate_after_an_unremovable_drop_holds_only_new_rows_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..7 {
+                let key = make_key(&format!("old{i}"));
+                engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert_eq!(engine.count_range(&tid, None, None).unwrap(), 7);
+
+            let table_dir = dir.path().join("sstables").join(tid.to_string());
+            let guard = make_undeletable(&table_dir);
+            let drop_result = engine.unregister_table(&tid);
+            assert!(
+                drop_result.is_err(),
+                "INV-6: an unremovable drop must not succeed"
+            );
+            drop(guard);
+
+            // The re-created table loads a DIFFERENT row count.
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..4 {
+                let key = make_key(&format!("new{i}"));
+                engine
+                    .write(&tid, &key, make_row(b"fresh", 100), 100)
+                    .unwrap();
+            }
+            assert_eq!(
+                engine.count_range(&tid, None, None).unwrap(),
+                4,
+                "INV-2: the re-created table must hold exactly the new rows"
+            );
+            // Flush the new rows so they are on disk and must survive the restart
+            // below (an unflushed memtable is not a durability claim).
+            engine.flush(&tid).unwrap();
+        }
+
+        // A full restart must not bring the dropped rows back (INV-1).
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+        assert_eq!(
+            engine.count_range(&tid, None, None).unwrap(),
+            4,
+            "INV-1: after a restart the dropped rows must still be gone"
+        );
+        let scanned: usize = engine
+            .read_range_limited_rows(&tid, None, None, 1000, 0)
+            .unwrap()
+            .iter()
+            .map(|p| p.rows.len())
+            .sum();
+        assert_eq!(
+            scanned, 4,
+            "INV-1: a full scan must return only the new rows"
+        );
+    }
+
+    /// INV-4 (SPACE RECLAIMED): the orphaned SSTables are physically removed, not
+    /// merely hidden by a count. After the re-create, no component of the dropped
+    /// incarnation is left on disk.
+    #[cfg(unix)]
+    #[test]
+    fn the_orphaned_sstables_are_physically_reclaimed_on_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+        for i in 0..5 {
+            let key = make_key(&format!("old{i}"));
+            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(
+            data_files_under(&table_dir) > 0,
+            "precondition: the bulk load wrote real SSTables"
+        );
+
+        let guard = make_undeletable(&table_dir);
+        engine.unregister_table(&tid).unwrap_err();
+        drop(guard);
+        engine.register_table(test_schema()).unwrap();
+
+        assert_eq!(
+            data_files_under(&table_dir),
+            0,
+            "INV-4: the orphaned SSTables must be deleted, not hidden"
+        );
+    }
+
+    /// INV-3 (TRUNCATE IS ABSOLUTE): a TRUNCATE leaves zero rows readable even when
+    /// the SSTable files could not be removed, and they do not return after a
+    /// restart; the failed disk removal is loud.
+    #[cfg(unix)]
+    #[test]
+    fn truncate_leaves_zero_rows_even_when_its_sstables_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..5 {
+                let key = make_key(&format!("old{i}"));
+                engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert_eq!(engine.count_range(&tid, None, None).unwrap(), 5);
+
+            let table_dir = dir.path().join("sstables").join(tid.to_string());
+            let guard = make_undeletable(&table_dir);
+            let truncate = engine.truncate(&tid);
+            assert!(
+                truncate.is_err(),
+                "INV-6: a TRUNCATE that cannot reclaim its files must fail loud"
+            );
+            drop(guard);
+
+            assert_eq!(
+                engine.count_range(&tid, None, None).unwrap(),
+                0,
+                "INV-3: TRUNCATE must leave zero rows readable regardless"
+            );
+        }
+
+        // Restart: the rows must not come back (INV-3, durable).
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        assert_eq!(
+            engine.count_range(&table_id(), None, None).unwrap(),
+            0,
+            "INV-3: a truncated table must read empty after a restart"
         );
     }
 
