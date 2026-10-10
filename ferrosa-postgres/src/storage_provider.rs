@@ -678,6 +678,17 @@ pub(crate) fn apply_pending_writes(
 /// already hold). A streaming caller can then attach the correct before-image to
 /// each partition's row-version metadata without a second storage read — the
 /// commit path used to read every row twice for exactly this reason.
+/// Env-gated attribution counters for the commit path's per-row storage read.
+/// Temporary measurement scaffolding (see `FERROSA_PG_COMMIT_PROFILE`).
+pub(crate) static READ_IMAGE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static READ_IMAGE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn commit_profile_enabled() -> bool {
+    std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
+}
+
 #[derive(Default)]
 pub(crate) struct ApplyOutputs<'a> {
     /// Per-key partition bytes, when the caller needs them for the commit payload.
@@ -744,8 +755,14 @@ where
             let base = if let Some(snapshot_row) = overlay.get(&key) {
                 snapshot_row.clone()
             } else {
+                let started = commit_profile_enabled().then(std::time::Instant::now);
                 let image = read_row_image(engine, codec, mutation, &mutation_row.clustering)?
                     .map(|(_, row)| row);
+                if let Some(started) = started {
+                    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    READ_IMAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    READ_IMAGE_NS.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+                }
                 if let Some(before) = before_images.as_deref_mut() {
                     before.insert(key.clone(), image.clone());
                 }

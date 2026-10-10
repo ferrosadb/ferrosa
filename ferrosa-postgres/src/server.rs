@@ -938,6 +938,11 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         })
         .collect();
     let _commit_guard = ctx.mvcc.commit_guard().await;
+    // Per-phase attribution for the COMMIT (see `MvccProfile`). Zero-valued and
+    // unused unless `FERROSA_PG_COMMIT_PROFILE` is set.
+    let commit_started = std::time::Instant::now();
+    let mut prepare_nanos: u64 = 0;
+    let mut accord_nanos: u64 = 0;
     let outcome = if let Some(committer) = ctx.accord.committer() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
             Err(error)
@@ -949,6 +954,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             // is consumed here; the raw whole-table write-set is therefore gone by
             // the time Accord runs, instead of staying resident alongside
             // `accord_writes` for the whole PreAccept/Commit/Apply sequence.
+            let prepare_started = std::time::Instant::now();
             let accord_writes =
                 match query::prepare_accord_writes(&ctx.engine, &ctx.schema, mutations) {
                     Ok(writes) => writes,
@@ -960,6 +966,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                         )];
                     }
                 };
+            prepare_nanos = u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
                 session.end_txn();
                 return vec![query::error_response(
@@ -968,7 +975,8 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 )];
             };
             let tables = write_tables.iter().cloned().collect();
-            match committer
+            let accord_started = std::time::Instant::now();
+            let accord_result = match committer
                 .commit_postgres(&ctx.default_schema, accord_writes, tables, cluster_snapshot)
                 .await
             {
@@ -990,7 +998,9 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 Err(error) => Err(MvccCommitError::Storage(
                     ferrosa_common::Error::InvalidData(error.reason),
                 )),
-            }
+            };
+            accord_nanos = u64::try_from(accord_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            accord_result
         }
     } else {
         query::commit_mutations(
@@ -1003,6 +1013,40 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         )
     };
     session.end_txn();
+    if std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some() {
+        // Attribution line for a large transaction's commit: how the wall time
+        // splits between building the Accord write-set (row decode + encode),
+        // driving Accord (registration + apply fan-out), and the rest; and how
+        // much resident MVCC history the transaction left behind.
+        let stats = ctx.mvcc.history_stats();
+        let total_ms = commit_started.elapsed().as_secs_f64() * 1_000.0;
+        tracing::info!(
+            total_ms,
+            prepare_ms = prepare_nanos as f64 / 1_000_000.0,
+            accord_ms = accord_nanos as f64 / 1_000_000.0,
+            decoded_rows = ctx.mvcc.profile_decoded(),
+            versions_inserted = ctx.mvcc.profile_versions_inserted(),
+            history_keys = stats.total_keys(),
+            history_versions = stats.total_versions(),
+            history_kib = stats.total_bytes() / 1024,
+            dist_keys = stats.distributed_keys,
+            dist_versions = stats.distributed_versions,
+            dist_kib = stats.distributed_bytes / 1024,
+            applied_accord = stats.applied_accord_txns,
+            "pg commit phase attribution"
+        );
+        for (label, calls, nanos) in ctx.mvcc.profile_report() {
+            if calls > 0 {
+                tracing::info!(
+                    phase = label,
+                    calls,
+                    total_ms = nanos as f64 / 1_000_000.0,
+                    per_call_us = nanos as f64 / 1_000.0 / calls as f64,
+                    "pg commit phase attribution: mvcc"
+                );
+            }
+        }
+    }
     match outcome {
         Ok(_) => vec![BackendMessage::CommandComplete {
             tag: "COMMIT".to_string(),

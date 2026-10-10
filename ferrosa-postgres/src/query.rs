@@ -1801,11 +1801,20 @@ pub(crate) fn prepare_accord_writes(
         std::collections::HashMap<Vec<SqlValue>, Option<Row>>,
     > = std::collections::HashMap::new();
     let mut writes: Vec<TransactionWrite> = Vec::with_capacity(mutations.len());
+    // Temporary attribution scaffolding (see `FERROSA_PG_COMMIT_PROFILE`).
+    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+    let mut serialize_ns = 0u64;
+    let mut pending_ns = 0u64;
+    let mut metadata_bytes = 0usize;
 
     for mutation in mutations {
         let table: TableKey = (mutation.keyspace.clone(), mutation.table.clone());
         let mut bytes = vec![0; mutation.serialized_size()];
+        let serialize_started = profile.then(std::time::Instant::now);
         mutation.serialize_into(&mut bytes);
+        if let Some(started) = serialize_started {
+            serialize_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        }
         let partition_key = mutation.key.key.as_bytes().to_vec();
 
         // A table tombstone (`TRUNCATE`) marker carries no row image; the cluster
@@ -1833,6 +1842,7 @@ pub(crate) fn prepare_accord_writes(
             std::collections::HashMap::new();
         let mut partition_keys: std::collections::HashMap<Vec<SqlValue>, Vec<u8>> =
             std::collections::HashMap::new();
+        let pending_started = profile.then(std::time::Instant::now);
         crate::storage_provider::apply_pending_writes_with_partition_keys(
             engine,
             codec,
@@ -1846,6 +1856,9 @@ pub(crate) fn prepare_accord_writes(
             },
         )
         .map_err(|error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)))?;
+        if let Some(started) = pending_started {
+            pending_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        }
 
         // Encode this partition's row-version metadata now, while only its own
         // images are resident, and never keep the `RowChange` list.
@@ -1867,6 +1880,7 @@ pub(crate) fn prepare_accord_writes(
                     "serialize PostgreSQL MVCC row versions: {error}"
                 )))
             })?;
+            metadata_bytes += metadata.len();
             ferrosa_storage::accord::encode_postgres_mvcc_mutation(&bytes, &metadata).map_err(
                 |error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)),
             )?
@@ -1877,6 +1891,19 @@ pub(crate) fn prepare_accord_writes(
             key: partition_key,
             mutation: mutation_bytes,
         });
+    }
+    if profile {
+        use std::sync::atomic::Ordering;
+        tracing::info!(
+            mutations = writes.len(),
+            pending_ms = pending_ns as f64 / 1_000_000.0,
+            serialize_ms = serialize_ns as f64 / 1_000_000.0,
+            metadata_kib = metadata_bytes / 1024,
+            read_image_calls = crate::storage_provider::READ_IMAGE_CALLS.load(Ordering::Relaxed),
+            read_image_ms =
+                crate::storage_provider::READ_IMAGE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
+            "prepare_accord_writes attribution"
+        );
     }
     Ok(writes)
 }

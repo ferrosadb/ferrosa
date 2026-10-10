@@ -322,6 +322,8 @@ async fn drive_accord(
 
     // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
     //    commit a write to a guessed/empty replica set).
+    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+    let t_resolve = profile.then(std::time::Instant::now);
     let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
     let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
     for w in &writes {
@@ -343,10 +345,13 @@ async fn drive_accord(
         per_key.insert(w.key.clone(), replicas);
     }
     let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
+    let resolve_ns = t_resolve.map(|t| t.elapsed().as_nanos() as u64);
 
     // 2. Build the write-set + the per-key participant resolver for the driver.
+    let t_write_set = profile.then(std::time::Instant::now);
     let write_set: Vec<(Vec<u8>, Vec<u8>)> =
         writes.into_iter().map(|w| (w.key, w.mutation)).collect();
+    let write_set_len_hint = write_set.len();
     let per_key = Arc::new(per_key);
     let pk = per_key.clone();
     let participant_resolver =
@@ -381,14 +386,27 @@ async fn drive_accord(
         driver = driver.with_local_accord_state(state);
     }
 
-    match driver.run_transaction().await {
+    let write_set_ns = t_write_set.map(|t| t.elapsed().as_nanos() as u64);
+    let write_set_len = write_set_len_hint;
+    let t_run = profile.then(std::time::Instant::now);
+    let result = match driver.run_transaction().await {
         Ok((timestamp, _)) => Ok(timestamp),
         // A general transaction is unconditional (Always mode), so a condition
         // abort should not arise — map it cleanly if it ever does.
         // Quorum/network/codec failures: the commit did not reach a decision —
         // surface as Err so the front-end never acks an uncommitted transaction.
         Err(e) => Err(e),
+    };
+    if let (Some(t_run), Some(resolve_ns), Some(write_set_ns)) = (t_run, resolve_ns, write_set_ns) {
+        tracing::info!(
+            keys = write_set_len,
+            resolve_ms = resolve_ns as f64 / 1_000_000.0,
+            write_set_ms = write_set_ns as f64 / 1_000_000.0,
+            driver_ms = t_run.elapsed().as_millis() as u64,
+            "drive_accord attribution"
+        );
     }
+    result
 }
 
 #[cfg(test)]
