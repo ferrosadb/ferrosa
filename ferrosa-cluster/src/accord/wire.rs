@@ -549,4 +549,97 @@ mod tests {
         assert_bincode_roundtrip(&ApplyOkPayload { txn_id, from: 4 });
         assert_bincode_roundtrip(&CommitOkPayload { txn_id, from: 5 });
     }
+
+    /// The capnp Accord frame must decode to EXACTLY what the bincode frame
+    /// decoded to. This is the migration-equivalence gate for the bulk data path:
+    /// the empty, single-entry and multi-entry write-sets all survive both encoders
+    /// as the same value.
+    #[test]
+    fn capnp_accord_apply_v2_decodes_to_exactly_what_the_bincode_frame_decoded_to() {
+        use ferrosa_net::protocol::{
+            decode_accord_envelope, encode_accord_envelope, AccordControlMessage, AccordTxnId,
+            AccordWriteSetEntry,
+        };
+
+        fn to_accord_txn(id: TxnId) -> AccordTxnId {
+            AccordTxnId {
+                epoch: id.0.epoch,
+                time: id.0.time,
+                seq: id.0.seq,
+                node: id.0.node,
+            }
+        }
+
+        fn to_capnp(payload: &ApplyV2Payload) -> AccordControlMessage {
+            AccordControlMessage::ApplyV2 {
+                txn_id: to_accord_txn(payload.txn_id),
+                writes: payload
+                    .writes
+                    .iter()
+                    .map(|w| AccordWriteSetEntry {
+                        key: w.key.clone(),
+                        mutation: w.mutation.clone(),
+                    })
+                    .collect(),
+            }
+        }
+
+        fn from_capnp(msg: &AccordControlMessage) -> ApplyV2Payload {
+            match msg {
+                AccordControlMessage::ApplyV2 { txn_id, writes } => ApplyV2Payload {
+                    txn_id: TxnId(Timestamp {
+                        epoch: txn_id.epoch,
+                        time: txn_id.time,
+                        seq: txn_id.seq,
+                        node: txn_id.node,
+                    }),
+                    writes: writes
+                        .iter()
+                        .map(|w| WriteSetEntry {
+                            key: w.key.clone(),
+                            mutation: w.mutation.clone(),
+                        })
+                        .collect(),
+                },
+                other => panic!("expected an ApplyV2 payload, got {other:?}"),
+            }
+        }
+
+        let txn_id = txn(21, 4_242, 3, 22);
+        let cases: [Vec<WriteSetEntry>; 3] = [
+            vec![],
+            vec![WriteSetEntry {
+                key: b"only-key".to_vec(),
+                mutation: b"only-mutation".to_vec(),
+            }],
+            vec![
+                WriteSetEntry {
+                    key: b"key-alpha".to_vec(),
+                    mutation: b"mutation-for-alpha".to_vec(),
+                },
+                WriteSetEntry {
+                    key: b"key-beta\0with-nul".to_vec(),
+                    mutation: vec![0x7Fu8; 4096],
+                },
+            ],
+        ];
+
+        for writes in cases {
+            let payload = ApplyV2Payload { txn_id, writes };
+            // The bincode frame the live path ships today.
+            let bincode_bytes = bincode::serialize(&payload).expect("bincode encodes");
+            let bincode_decoded: ApplyV2Payload =
+                bincode::deserialize(&bincode_bytes).expect("bincode decodes");
+            // The capnp frame the migrated path will ship.
+            let capnp_frame =
+                encode_accord_envelope(&to_capnp(&payload)).expect("capnp frame encodes");
+            let capnp_decoded = from_capnp(&decode_accord_envelope(&capnp_frame).expect("decodes"));
+            assert_eq!(
+                capnp_decoded, bincode_decoded,
+                "the capnp Accord frame must decode to exactly what the bincode frame decoded to"
+            );
+            // And both agree with the original payload.
+            assert_eq!(capnp_decoded, payload);
+        }
+    }
 }

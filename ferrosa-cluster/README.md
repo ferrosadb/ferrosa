@@ -69,6 +69,30 @@ sharing a frame across scopes would put a key on a peer that does not own it. Th
 `FERROSA_PG_COMMIT_PROFILE` fan-out line reports `frame_bytes` (the largest frame on
 the wire, which is what the Data-lane wait bound is spent on) and `shared_frame`.
 
+**Where the Apply phase's time actually goes (measured, N=1 100 000, 3-node, the
+`pgbench -i` shape).** The dependency-wait bound is 10 s; the commit is ABANDONED
+(`unmet=3 timeout=10s`). The `FERROSA_PG_COMMIT_PROFILE` split of the 25.4 s apply
+phase, with the peer-side `accord apply_writeset attribution` lines:
+
+| Component | Before mmap (N=1.1M) | After mmap (see below) |
+|---|---|---|
+| (a) coordinator frame build + bincode serialize | **15.2 s** (`serialize_ms=15229`) | reduced — see residual |
+| (b) transport + peer-side frame deserialize | **~9.4 s** (`max_ack_ms=17442` minus peer apply) | unchanged (still bincode) |
+| (c) peer's own local apply (decode+`apply_batch`) | **~8.0 s** (node1 7.4 s, node2 8.0 s, node3 7.6 s) | unchanged |
+| per-peer payload bytes | **195 MB** (`frame_bytes=204541573`), `shared_frame=false` | unchanged |
+
+So the peer's own local apply (~8.0 s) is BELOW the 10 s bound — it does NOT alone
+make acceptance unreachable — but the peer ROUND TRIP (`(max_ack_ms)=17.4 s`) is
+`transport + peer-deserialize + apply`, and that exceeds the bound on its own. **A
+frame that carries the write-set INLINE — capnp or bincode — still copies every one
+of the ~1.1M entries into the message on the coordinator and out of it on the peer,
+so capnp structs alone are NOT sufficient: acceptance needs the region-REFERENCE
+wire** (an offset+length into a shared/mapped buffer rather than inline bytes). The
+`ferrosa-storage` write-set spill is now MMAPPED (`entry(i)` is a slice of the
+mapping), which removes the ~1.1M per-entry seek+read+mutex that was the bulk of (a)
+and is the enabling step for that wire — but nothing sends a region reference yet.
+The 10 s bound was NOT raised.
+
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and
 > simulated-nemesis). There is **no external/public Jepsen run yet** — the

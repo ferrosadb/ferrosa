@@ -160,7 +160,7 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
 |------|-------------------|
 | Framing | `InternodeCodec`, `Frame`, `FrameHeader`, `Lane`, `MsgType`, `TraceContext`, `WireFrameFormat`, `HEADER_SIZE` |
 | Messages | `Message`, `accord_messages::AccordMessageType` |
-| Cap'n Proto envelope | `CapnpEnvelope`, `encode_message_envelope`, `decode_message_envelope`, `negotiate_capnp_capabilities` |
+| Cap'n Proto envelope | `CapnpEnvelope`, `encode_message_envelope`, `decode_message_envelope`, `negotiate_capnp_capabilities`; Accord family: `AccordControlMessage`, `encode_accord_envelope`, `decode_accord_envelope` |
 | Handshake | `initiate_handshake`, `accept_handshake`, `compute_auth_token`, `verify_auth_token`, `HandshakePeer` |
 | Pool / lanes | `PriorityPool`, `LaneHandle`, `LaneOutcome`, `LaneStatusReport`, `spawn_lane_actor` |
 | RPC | `RpcServer`, `RpcClient`, `HandlerRegistry`, `RpcHandler`, `PeerId`, `InboundPeerCallback`, `RpcErrorReply`, `RemoteFailureKind`, `NetError::RemoteHandlerFailed` |

@@ -15,6 +15,24 @@
 //! — plus a small offset table, never the payloads. The payloads move to disk; the
 //! keys do not.
 //!
+//! # The staged region is MMAPPED
+//!
+//! The staging file is memory-mapped read-only once written. Reading an entry is a
+//! slice of that mapping ([`WriteSetSpill::entry`]) — no `seek`, no `read_exact`, no
+//! per-read lock, no syscall at all. The pre-mmap path paid one `lseek` + one `read`
+//! (and a `Mutex` acquisition) PER ENTRY: at N = 1 100 000 the coordinator's Apply
+//! fan-out resolved every write-set entry through that path, i.e. ~1.1M syscalls
+//! serialized behind one mutex, which the `FERROSA_PG_COMMIT_PROFILE` fan-out line
+//! priced as the bulk of `serialize_ms`. A slice of the mapping removes that cost
+//! entirely, and lets the mapped region be handed to the wire instead of being read
+//! into an intermediate buffer per peer.
+//!
+//! [`WriteSetSpill::entry`] is the genuinely zero-copy accessor: it borrows the
+//! mapping. [`WriteSetSpill::mutation`] is the owned twin the Apply wire types still
+//! need today (`WriteSetEntry::mutation` is a `Vec<u8>`), so the per-entry copy into
+//! the serialized frame remains — see the crate README for exactly what is and is
+//! not zero-copy after mmapping.
+//!
 //! # Reusing the spill machinery
 //!
 //! Cleanup rides on [`TempSortTableReservation`] (the same guard the ORDER BY and
@@ -30,9 +48,8 @@
 //! the filesystem at all.
 
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use ferrosa_common::{Error, Result};
 
@@ -47,12 +64,20 @@ use crate::engine::TempSortTableReservation;
 /// resident payload set.
 pub const WRITE_SET_SPILL_FLOOR_BYTES: u64 = 8 * 1024 * 1024;
 
-/// A transaction's write-set payloads staged in a local temp file.
+/// A transaction's write-set payloads staged in a local temp file and mapped.
 ///
 /// Addressable by index — the position of the entry in the transaction's write-set —
 /// so the Apply phase can read each payload back exactly where Accord needs it
 /// (per-peer fan-out, the coordinator's own apply) without the whole set resident.
 pub struct WriteSetSpill {
+    /// The staged payload region, memory-mapped read-only.
+    ///
+    /// Declared FIRST so it is unmapped before `_reservation` removes the staging
+    /// directory: on a platform where removing a file that is still mapped fails, the
+    /// map is already gone by the time the directory is unlinked. `None` only when the
+    /// staging file is zero bytes, which `mmap` refuses; every entry is then empty by
+    /// construction.
+    map: Option<memmap2::Mmap>,
     /// Owns the staging directory; dropping the spill removes it.
     _reservation: TempSortTableReservation,
     path: PathBuf,
@@ -60,8 +85,6 @@ pub struct WriteSetSpill {
     offsets: Vec<u64>,
     /// Payload length in bytes, by write-set index.
     lens: Vec<u32>,
-    /// Reopened lazily for reads (the writer is closed once staging completes).
-    file: Mutex<File>,
     /// Total payload bytes staged (observability + tests).
     bytes: u64,
 }
@@ -82,12 +105,13 @@ impl WriteSetSpill {
     }
 
     /// Stage `blobs` under `reservation`'s directory, draining each entry as it is
-    /// written so the in-memory copy is freed as we go.
+    /// written so the in-memory copy is freed as we go, then memory-map the region.
     ///
-    /// On success every `blobs[i]` is left EMPTY: the bytes now live on disk and are
-    /// read back through [`Self::mutation`]. A write error leaves the reservation
-    /// intact (the caller's `blobs` are then partially drained, which is why a staging
-    /// failure is only ever surfaced as a failed commit, never retried in place).
+    /// On success every `blobs[i]` is left EMPTY: the bytes now live on disk, mapped
+    /// read-only, and are read back through [`Self::entry`]. A write error leaves the
+    /// reservation intact (the caller's `blobs` are then partially drained, which is
+    /// why a staging failure is only ever surfaced as a failed commit, never retried
+    /// in place).
     pub fn stage(reservation: TempSortTableReservation, blobs: &mut [Vec<u8>]) -> Result<Self> {
         let path = reservation.path().join("write-set.bin");
         let mut offsets: Vec<u64> = Vec::with_capacity(blobs.len());
@@ -122,12 +146,28 @@ impl WriteSetSpill {
         let file = File::open(&path).map_err(|e| {
             Error::InvalidFormat(format!("write-set spill: reopen {}: {e}", path.display()))
         })?;
+        let map = if bytes == 0 {
+            // `mmap` refuses a zero-length mapping; with no payload bytes every
+            // entry is empty, which `entry` returns without touching the map.
+            None
+        } else {
+            // SAFETY: the staging file is private to this spill — it lives in a
+            // fresh directory created by `reserve_write_set_stage`, the writer is
+            // closed above, and no writable handle to it survives. Nothing can
+            // mutate the bytes under the mapping.
+            Some(unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+                Error::InvalidFormat(format!("write-set spill: mmap {}: {e}", path.display()))
+            })?)
+        };
+        // The file handle is not needed once the region is mapped; the mapping owns
+        // the pages.
+        drop(file);
         Ok(Self {
+            map,
             _reservation: reservation,
             path,
             offsets,
             lens,
-            file: Mutex::new(file),
             bytes,
         })
     }
@@ -154,11 +194,13 @@ impl WriteSetSpill {
             + self.lens.capacity() * std::mem::size_of::<u32>()) as u64
     }
 
-    /// Read back the payload staged for write-set entry `index`.
+    /// Borrow the payload staged for write-set entry `index` — a slice of the
+    /// staging region's memory map, not a fresh allocation and not a syscall.
     ///
-    /// FAILS LOUD on an index that was never staged: a missing payload must never
-    /// become an empty mutation that the applier silently drops.
-    pub fn mutation(&self, index: usize) -> Result<Vec<u8>> {
+    /// FAILS LOUD on an index that was never staged, and on a staged range that
+    /// would escape the mapping (a corrupt offset table must never read past the
+    /// mapped region).
+    pub fn entry(&self, index: usize) -> Result<&[u8]> {
         let (&offset, &len) = self
             .offsets
             .get(index)
@@ -169,25 +211,40 @@ impl WriteSetSpill {
                     self.offsets.len()
                 ))
             })?;
-        let mut buf = vec![0u8; len as usize];
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| Error::InvalidData("write-set spill: read lock poisoned".to_string()))?;
-        file.seek(SeekFrom::Start(offset)).map_err(|e| {
+        let start = usize::try_from(offset).map_err(|_| {
             Error::InvalidData(format!(
-                "write-set spill: seek {}: {e}",
-                self.path.display()
+                "write-set spill: staged offset {offset} does not fit in usize"
             ))
         })?;
-        file.read_exact(&mut buf).map_err(|e| {
+        let end = start.checked_add(len as usize).ok_or_else(|| {
             Error::InvalidData(format!(
-                "write-set spill: read {} bytes at {offset} from {}: {e}",
-                buf.len(),
-                self.path.display()
+                "write-set spill: staged range {start}..(start+{len}) overflows usize"
             ))
         })?;
-        Ok(buf)
+        match &self.map {
+            Some(map) => map.get(start..end).ok_or_else(|| {
+                Error::InvalidData(format!(
+                    "write-set spill: staged range {start}..{end} escapes the {} byte mapping of {}",
+                    map.len(),
+                    self.path.display()
+                ))
+            }),
+            // A zero-byte staging file: no mapping, and every entry is empty.
+            None if len == 0 => Ok(&[]),
+            None => Err(Error::InvalidData(format!(
+                "write-set spill: entry {index} of {} claims {len} bytes but nothing was staged",
+                self.path.display()
+            ))),
+        }
+    }
+
+    /// Read back the payload staged for write-set entry `index` as an owned copy.
+    ///
+    /// FAILS LOUD on an index that was never staged: a missing payload must never
+    /// become an empty mutation that the applier silently drops. This is the owned
+    /// twin of [`Self::entry`]; callers that can borrow should use `entry`.
+    pub fn mutation(&self, index: usize) -> Result<Vec<u8>> {
+        Ok(self.entry(index)?.to_vec())
     }
 }
 
@@ -244,6 +301,70 @@ mod tests {
         assert!(
             spill.resident_index_bytes() < 128,
             "only the offset/length index stays resident"
+        );
+    }
+
+    /// The mapped accessor and the owned accessor must agree byte for byte with what
+    /// was staged, across every shape the write-set ever has: a small payload, an
+    /// EMPTY payload (a key with no mutation), a payload with embedded NUL bytes, and
+    /// a multi-KiB payload that crosses a page boundary.
+    #[test]
+    fn mmap_entry_reads_identical_bytes_to_the_owned_mutation_path() {
+        let originals: Vec<Vec<u8>> = vec![
+            b"first".to_vec(),
+            Vec::new(),
+            b"a\x00longer\x00third payload".to_vec(),
+            vec![0xABu8; 5000],
+        ];
+        let mut blobs = originals.clone();
+        let spill = stage(&mut blobs);
+        for (index, expected) in originals.iter().enumerate() {
+            assert_eq!(
+                spill.entry(index).unwrap(),
+                expected.as_slice(),
+                "the mapped entry {index} must be byte-identical to what was staged"
+            );
+            assert_eq!(
+                spill.mutation(index).unwrap(),
+                *expected,
+                "the owned read must agree with the mapped one for entry {index}"
+            );
+        }
+        // The un-staged index fails loud on the mapped accessor too.
+        let error = spill
+            .entry(originals.len())
+            .expect_err("index past the end was never staged");
+        assert!(
+            error.to_string().contains("out of range"),
+            "a mapped out-of-range read must fail loud: {error}"
+        );
+    }
+
+    /// The genuinely zero-copy property: reading an entry returns a STABLE slice of
+    /// the mapping — the same address every time, because the bytes were never read
+    /// into a per-call buffer. The negative control is the owned accessor, whose
+    /// address is free to differ between calls precisely because it allocates.
+    #[test]
+    fn mmap_entry_is_a_stable_slice_of_the_mapping() {
+        let mut blobs = vec![vec![7u8; 4096], vec![9u8; 4096]];
+        let spill = stage(&mut blobs);
+
+        let first = spill.entry(0).unwrap();
+        let second = spill.entry(0).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            first.as_ptr(),
+            second.as_ptr(),
+            "an entry must be a slice of the mapping, not a fresh allocation per read"
+        );
+
+        // Negative control: the owned twin copies, so it must NOT alias the mapping.
+        let owned = spill.mutation(0).unwrap();
+        assert_eq!(owned, vec![7u8; 4096]);
+        assert_ne!(
+            owned.as_ptr(),
+            first.as_ptr(),
+            "the owned read must be a copy, never the mapping's own storage"
         );
     }
 

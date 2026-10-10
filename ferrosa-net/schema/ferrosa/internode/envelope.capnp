@@ -39,6 +39,8 @@ struct Envelope {
     legacy @27 :LegacyPayload;
     bootstrap @28 :BootstrapControl;
     stream @29 :StreamControl;
+    # Accord consensus family (ADR-019). Append-only: new ordinal only.
+    accord @30 :AccordControl;
   }
 }
 
@@ -350,4 +352,173 @@ enum RecoveryAction {
   replayRaft @2;
   runBootstrap @3;
   fullBootstrapRequired @4;
+}
+
+# ---------------------------------------------------------------------------
+# Accord consensus family (ADR-019). Append-only: these are NEW types; new
+# ordinals only. The struct field shapes mirror `ferrosa-cluster`'s
+# `accord::wire` bincode payloads 1:1, so a capnp-encoded Accord frame decodes
+# to exactly what the bincode frame decoded to.
+#
+# The Apply family (`applyV2` and its single-key degenerate `apply`) is the
+# BULK DATA PATH — a transactional COPY's whole write-set rides in one
+# `AccordApplyV2`. The rest carry Accord's identity/dependency bookkeeping.
+# ---------------------------------------------------------------------------
+
+struct AccordTxnId {
+  # ferrosa_common::accord::Timestamp — Accord's total-order execution stamp.
+  epoch @0 :UInt64;
+  time @1 :UInt64;
+  seq @2 :UInt32;
+  node @3 :UInt64;
+}
+
+struct AccordWriteSetEntry {
+  # One write in a multi-key transaction's write-set (wire.rs `WriteSetEntry`).
+  key @0 :Data;
+  mutation @1 :Data;
+}
+
+struct AccordApplyV2 {
+  # wire.rs `ApplyV2Payload`: the multi-key Apply request. The whole write-set
+  # travels here, which is the heaviest object on the data path.
+  txnId @0 :AccordTxnId;
+  writes @1 :List(AccordWriteSetEntry);
+}
+
+struct AccordApply {
+  # wire.rs `ApplyPayload`: the single-key Apply (degenerate one-entry case).
+  txnId @0 :AccordTxnId;
+  resultData @1 :Data;
+}
+
+struct AccordApplyOk {
+  # wire.rs `ApplyOkPayload`.
+  txnId @0 :AccordTxnId;
+  from @1 :UInt64;
+}
+
+struct AccordPreAccept {
+  # wire.rs `PreAcceptPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  key @2 :Data;
+  ballot @3 :UInt64;
+  epoch @4 :UInt64;
+}
+
+struct AccordPreAcceptV2 {
+  # wire.rs `PreAcceptV2Payload`. `snapshotTs` is optional (has_*).
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  keys @2 :List(Data);
+  ballot @3 :UInt64;
+  epoch @4 :UInt64;
+  snapshotTs @5 :AccordTxnId;
+}
+
+struct AccordPreAcceptOk {
+  # wire.rs `PreAcceptOkPayload`.
+  from @0 :UInt64;
+  t @1 :AccordTxnId;
+  deps @2 :List(AccordTxnId);
+  snapshotStale @3 :Bool;
+}
+
+struct AccordAccept {
+  # wire.rs `AcceptPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  t @2 :AccordTxnId;
+  deps @3 :List(AccordTxnId);
+  ballot @4 :UInt64;
+}
+
+struct AccordAcceptOk {
+  # wire.rs `AcceptOkPayload` (the current shape; a pre-dependency coordinator
+  # sent a body with `deps` absent, which decodes here as an empty list).
+  txnId @0 :AccordTxnId;
+  deps @1 :List(AccordTxnId);
+}
+
+struct AccordCommit {
+  # wire.rs `CommitPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  t @2 :AccordTxnId;
+  deps @3 :List(AccordTxnId);
+}
+
+struct AccordCommitOk {
+  # wire.rs `CommitOkPayload`.
+  txnId @0 :AccordTxnId;
+  from @1 :UInt64;
+}
+
+struct AccordRecover {
+  # wire.rs `RecoverPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  ballot @2 :UInt64;
+}
+
+struct AccordRead {
+  # wire.rs `ReadVotePayload` — the linearizable read-vote request.
+  txnId @0 :AccordTxnId;
+  t @1 :AccordTxnId;
+  key @2 :Data;
+  predicate @3 :AccordReadPredicate;
+}
+
+struct AccordReadPredicate {
+  # wire.rs `ReadPredicate`.
+  op :union {
+    notExists @0 :Void;
+    readRow @1 :AccordReadRow;
+    snapshotBarrier @2 :Void;
+    always @3 :Void;
+    readClusteringRow @4 :AccordReadClusteringRow;
+  }
+}
+
+struct AccordReadRow {
+  keyspace @0 :Text;
+  table @1 :Text;
+}
+
+struct AccordReadClusteringRow {
+  keyspace @0 :Text;
+  table @1 :Text;
+  clustering @2 :Data;
+}
+
+struct AccordReadOk {
+  # wire.rs `ReadVoteOkPayload` — the read-vote response.
+  txnId @0 :AccordTxnId;
+  from @1 :UInt64;
+  conditionHolds @2 :Bool;
+  currentRow @3 :Data;
+}
+
+struct AccordControl {
+  op :union {
+    # Apply family — the bulk data path.
+    applyV2 @0 :AccordApplyV2;
+    apply @1 :AccordApply;
+    applyOk @2 :AccordApplyOk;
+    # Consensus control / bookkeeping.
+    preAccept @3 :AccordPreAccept;
+    preAcceptV2 @4 :AccordPreAcceptV2;
+    preAcceptOk @5 :AccordPreAcceptOk;
+    accept @6 :AccordAccept;
+    acceptOk @7 :AccordAcceptOk;
+    commit @8 :AccordCommit;
+    commitOk @9 :AccordCommitOk;
+    recover @10 :AccordRecover;
+    # `AccordRecoverOK` carries no payload (wire.rs defines no RecoverOk struct).
+    recoverOk @11 :Void;
+    # Linearizable read-vote.
+    read @12 :AccordRead;
+    readOk @13 :AccordReadOk;
+  }
 }

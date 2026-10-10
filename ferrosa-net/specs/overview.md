@@ -34,7 +34,7 @@ that is wrong — see `Cargo.toml` and `src/task_pool.rs`.)
 |--------|----------------|
 | `codec` | Frame model: `FrameHeader` (44-byte), `Frame`, `Lane`, `MsgType`, `TraceContext`, `InternodeCodec` (tokio-util `Encoder`/`Decoder`), `WireFrameFormat` |
 | `message` | `Message` enum + hand-rolled length-prefixed encode/decode for all `MsgType`s |
-| `protocol` | Generated Cap'n Proto envelope (v2) + adapter types, capability/feature negotiation, `encode/decode_message_envelope` |
+| `protocol` | Generated Cap'n Proto envelope (v2) + adapter types, capability/feature negotiation, `encode/decode_message_envelope`; the Accord consensus family (`AccordControlMessage`: applyV2/apply/preAccept/accept/commit/recover/read + replies) via `encode/decode_accord_envelope` |
 | `accord_messages` | `AccordMessageType` discriminants (Accord payloads carried as opaque `Bytes`) |
 | `handshake` | PSK-HMAC handshake (`initiate_handshake` / `accept_handshake`), `compute/verify_auth_token`, `HandshakePeer`; capability bits exchanged both ways (`CAP_RESULT_CURSOR_PAGE`, `CAP_PAIR_DISSOLVE`, `LOCAL_CAPABILITIES`) so a new message type is only sent to a peer that knows it |
 | `pool` | `PriorityPool`: 3 lanes per peer, connect/send/fire/shutdown, reconnect-host selection |
