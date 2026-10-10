@@ -36,7 +36,7 @@ use ferrosa_storage::accord::sync_writer::{SyncWriteResult, SyncWriter};
 use tokio::sync::Notify;
 
 use crate::accord::apply::{
-    ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier, StorageReader,
+    DepWaitApplier, MutationView, NoopStorageApplier, StorageApplier, StorageReader,
 };
 use crate::accord::finalized::{DecidedBy, FinalizedTxns};
 
@@ -906,7 +906,26 @@ impl AccordStateMachine {
     /// is advanced to `Applied` and fsyncs its protocol-log marker exactly once
     /// (N markers per txn would corrupt the log).
     pub fn handle_apply_writeset(&mut self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> SmResponse {
-        let no_write = writes.iter().all(Vec::is_empty);
+        // Owned payloads: borrow a view over them and share the ONE apply body with
+        // the borrowed entry point below, so the two shapes cannot drift.
+        let borrowed: Vec<&[u8]> = writes.iter().map(|write| write.as_slice()).collect();
+        self.handle_apply_writeset_borrowed(txn_id, &borrowed)
+    }
+
+    /// Apply a **multi-key** transaction from BORROWED payloads.
+    ///
+    /// The borrowed twin of [`Self::handle_apply_writeset`], and the path the
+    /// coordinator's OWN local apply takes when its write-set is STAGED: the payloads
+    /// are slices of the spill's memory map, so no owned `Vec<u8>` is materialized per
+    /// entry. Behaviour is identical — every key is routed through the dep-ordered
+    /// apply engine as one unit (parked together, applied atomically), writes 2..N are
+    /// never dropped, and an empty payload is still the no-write finalize.
+    pub fn handle_apply_writeset_borrowed(
+        &mut self,
+        txn_id: TxnId,
+        writes: &[&[u8]],
+    ) -> SmResponse {
+        let no_write = writes.iter().all(|write| write.is_empty());
         // Read the agreed timestamp + deps from committed state BEFORE mutating,
         // so each mutation we hand to storage carries the real `(t, deps)`.
         let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
@@ -961,7 +980,11 @@ impl AccordStateMachine {
 
         // Drop no-write entries (empty payloads): a key the replica owns but for
         // which this txn writes no row.
-        let writes: Vec<Vec<u8>> = writes.into_iter().filter(|d| !d.is_empty()).collect();
+        let writes: Vec<&[u8]> = writes
+            .iter()
+            .copied()
+            .filter(|data| !data.is_empty())
+            .collect();
 
         // No-write finalize: nothing to persist and no dependency ordering to
         // respect. Advance to Applied, then advance any waiters it unblocks.
@@ -978,15 +1001,18 @@ impl AccordStateMachine {
         // Real write-set: route through the dep-ordered apply engine. It persists
         // every key atomically (idempotent on `(txn_id, key, t)`) once every
         // dependency has applied on this replica; otherwise it parks the set.
-        let mutations: Vec<ApplyMutation> = writes
-            .into_iter()
-            .map(|data| ApplyMutation {
+        let views: Vec<MutationView<'_>> = writes
+            .iter()
+            .map(|data| MutationView {
                 data,
                 t,
-                deps: deps.clone(),
+                deps: &deps,
             })
             .collect();
-        let applied = match self.apply_engine.try_apply_writeset(txn_id, mutations) {
+        let applied = match self
+            .apply_engine
+            .try_apply_writeset_borrowed(txn_id, &views)
+        {
             Ok(applied) => applied,
             Err(e) => {
                 // Storage apply failed: do NOT advance to Applied — fail loud,

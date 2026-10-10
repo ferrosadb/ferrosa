@@ -199,9 +199,16 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   `Arc<WriteSetSpill>` is `'static`, so the blocking closure can own it and borrow
   the mapping inside
   (`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`).
-  **Follow-up:** thread the coordinator's own `Arc<WriteSetSpill>` + indices
-  straight into the apply engine so its local-apply transient copy is removed too;
-  today that copy is freed when the park stages the write-set.
+  **Landed:** the coordinator's own local apply now takes the same borrow. For a
+  STAGED write-set `apply_phase_within` hands the `Arc<WriteSetSpill>` into the
+  `'static` `on_state_machine` closure and borrows the mapping INSIDE it, applying
+  through `AccordStateMachine::handle_apply_writeset_borrowed` →
+  `DepWaitApplier::try_apply_writeset_borrowed` → `StorageApplier::apply_writeset_borrowed`
+  (`MutationView`), so no owned `Vec<u8>` is materialized per entry. A RESIDENT
+  (small) write-set keeps the legacy owned path, and only the park path — where the
+  bytes must outlive the call — materializes them.
+  (`staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy`, whose
+  negative control drives the owned path through the same probe.)
 - **Cluster-wide `fts_match` scatter-gather (BUG-F-007 / t_0d08aa43).** `fts_match`
   carries no partition key, so its hits span every token range, but the served
   path consulted only the coordinator's local FTI — returning 0/1

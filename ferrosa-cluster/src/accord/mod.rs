@@ -54,7 +54,7 @@ pub(crate) mod wire;
 
 pub use apply::{
     ApplyError, ApplyMutation, DepWaitApplier, EngineStorageApplier, EngineStorageReader,
-    NoopStorageApplier, RowReadError, StorageApplier, StorageReader,
+    MutationView, NoopStorageApplier, RowReadError, StorageApplier, StorageReader,
 };
 pub use clock::{ClockError, ClockValidator};
 pub use clock_validation::{
