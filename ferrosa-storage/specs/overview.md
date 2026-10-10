@@ -61,7 +61,7 @@ without changing the process environment. Digest verification is unconditional.
 | `index/` | Index state tracker (registered/pending/current completeness; compaction swaps retire inputs, failed/stalled backfills healed by `StorageEngine::heal_secondary_index_backfills`, ST-85), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR); `restore/intent.rs` carries the restore-on-boot intent (`FERROSA_RESTORE_*`) and the apply-once marker that keeps a reboot-surviving env var from re-restoring on every start |
 | `quarantine`, `self_heal/` | Malformed-row quarantine sidecar; deterministic self-heal control loop + corrupt-SSTable detector |
-| `accord/` | Per-shard conflict index + protocol log for Accord transactions |
+| `accord/` | Per-shard conflict index + protocol log for Accord transactions. The protocol log's framing reader bounds a record by the FILE length, not a fixed size ceiling: a valid record of any size is recovered, never mistaken for a torn tail |
 | `timeseries/` | Ring aggregation, late-data, WASM aggregates, materialization |
 | `data_store` | `DataStore` trait + `LocalDataStore` |
 | `spill_budget` | Process RAM-budget detection (cgroup v2/v1 → `/proc/meminfo` → floor, injectable + cached) and the ORDER BY spill threshold (50% default; `FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`) |

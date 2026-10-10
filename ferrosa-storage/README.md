@@ -1312,6 +1312,54 @@ equivalent. Recognized names:
 Cassandra client is read/written here uncompressed rather than failing with
 `UnsupportedCompression`. Any other unrecognized name is still rejected loudly.
 
+## Bound policy — no hard data caps
+
+**Rule.** A bound that limits the SIZE OF DATA the engine accepts or returns,
+where exceeding it either REFUSES (errors) or SILENTLY truncates / skips /
+drops, is illegitimate. The only allowed bounds are (a) **streaming buffers**,
+whose size is an externalized tunable and which SPILL to disk rather than
+refuse, and (b) concurrency / retries / backoff / timeouts / clock skew / log
+rotation / connection counts / channel capacity that applies backpressure / a
+fixed chunk size in the middle of a stream — none of which can affect data
+completeness.
+
+The reference shape is the set-aside and write-set paths: a bounded resident
+buffer whose overflow is written durably to disk and re-ingested automatically
+(`replay_set_aside.rs`, `write_set_stage.rs`) — never refused, never truncated.
+
+### Census
+
+| Bound | Where | Exceeding it | Verdict |
+|---|---|---|---|
+| `MAX_ENTRY_SIZE` (1 MiB) + `OversizedEntryError` | `accord/oversized_entry.rs` | refused a serialized protocol entry | **REMOVED** — a dead refusal cap: `check_entry_size` had no call site outside its own file. The module and its A7.10 tests are deleted |
+| `MAX_RECORD_LEN` (64 MiB) | `accord/framed_log.rs` | treated a longer record as a torn tail and dropped it | **REMOVED** — redundant with the file-length check `pos + len > bytes.len()`, which bounds allocation before it happens; red test `a_record_larger_than_the_old_reading_guard_is_recovered_not_dropped` |
+| `MAX_FRAME_BYTES` (256 MiB) | `replay_set_aside.rs` | refused a longer frame as an "implausible frame length" | **REMOVED** — redundant with the remaining-bytes check, which bounds the read by the file; red test `a_frame_larger_than_the_old_guard_is_bounded_by_the_file_not_refused` |
+| `MAX_DURABLE_CDC_PAGE_BYTES` single-event refusal | `commitlog/cdc.rs` | a single event over the byte budget returned `EventTooLarge`, permanently undeliverable | **FIXED** — the byte budget now bounds only how many events a page batches (backpressure); one oversized event is delivered alone in its own page. Red test `durable_cdc_page_delivers_an_event_larger_than_byte_budget` |
+| `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (10000), `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` | `engine.rs` | overflow is written to the set-aside file and re-ingested, not refused | **LEGITIMATE** — bounded resident buffer whose overflow SPILLS to disk; the ERROR is a log line, not a returned error |
+| `MAX_DURABLE_CDC_PAGE_MUTATIONS` (128) | `commitlog/cdc.rs` | the page ends; the caller re-requests | **LEGITIMATE** — streaming page backpressure |
+| `MAX_COMPACTION_CANDIDATES`, `MAX_COMBINE_ROUNDS` | `store.rs` | a batch takes fewer inputs / a round ends; the rest round | **LEGITIMATE** — work bounds |
+| `MAX_CAS_RETRIES`, `MAX_CAS_ATTEMPTS`, `MAX_ATTEMPTS`, `MAX_BACKOFF` | `manifest.rs`, `lockfree.rs`, `upload/download.rs` | retry, then fail loud | **LEGITIMATE** — retries / backoff |
+| upload in-flight / rate / idle-pool bounds | `upload/*` | requests queue | **LEGITIMATE** — concurrency / throttle |
+| `runtime_tuning.rs` bound set | `runtime_tuning.rs` | an out-of-range value logs and uses the default | **LEGITIMATE** — parallelism / queue / backpressure / chunk / memory-budget knobs |
+| `FERROSA_EVICTION_AUDIT_MAX_BYTES` | `eviction_audit.rs` | the oldest rotated segment is deleted | **LEGITIMATE** — log rotation on a diagnostics trail |
+
+### Illegitimate caps NOT yet removed
+
+These refuse or truncate DATA but each needs a streaming / spill replacement:
+removing the bound alone would allow unbounded materialization and blow memory,
+so they are deferred rather than removed unsafely. They are tracked here and in
+[Roadmap](specs/roadmap.md).
+
+| Bound | Where | Exceeding it | Needed replacement |
+|---|---|---|---|
+| `RANGE_READ_MATERIALIZATION_CAP` (10000) | `store.rs` | a range read is REFUSED | re-point the materializing path at the existing streaming twin `range_iter` |
+| `INDEX_RESULT_CAP` (10000) | `store.rs` | an index query is REFUSED | stream / spill index postings instead of materializing them |
+| `MAX_INDEXES_TO_RELOAD` / `_READ`, `MAX_TYPES_TO_READ`, `MAX_FUNCTIONS_TO_READ` (10000) | `engine.rs` | `system_schema` rows are silently skipped | the paginated `system_schema` scan (roadmap t_1ec2e3fc) |
+| `DEFAULT_MAX_BYTES` | `schema_snapshot.rs` | a schema-snapshot persist/load is REFUSED | externalize the bound and stream the registry document |
+| `MAX_RECORD_BYTES` | `eviction_audit.rs` | one audit record is REFUSED (that pass is lost) | drop the per-record cap; the ring already bounds the total |
+| RRD ring memory budget | `timeseries/aggregator.rs` | a rollup ring is SKIPPED when the budget is exhausted | spill rollups to disk instead of skipping the ring |
+| u32 staging bounds | `write_set_spill.rs`, `external_sort.rs` | a payload above 4 GiB is REFUSED | a `u64` length prefix in the spill format |
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
