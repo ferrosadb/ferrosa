@@ -1656,7 +1656,7 @@ mod tests {
         }
 
         // Batched path (4096-row prefetch windows).
-        let writes = crate::query::prepare_accord_writes(&engine, &schema, mutations.clone())
+        let writes = crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations)
             .expect("the batched path must build row versions");
         assert_eq!(
             writes.len(),
@@ -1760,7 +1760,7 @@ mod tests {
             "the request set must vary in serialized size, else it proves nothing"
         );
 
-        let writes = crate::query::prepare_accord_writes(&engine, &schema, mutations)
+        let writes = crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations)
             .expect("the batched path builds row versions");
         assert_eq!(writes.len(), widths.len());
 

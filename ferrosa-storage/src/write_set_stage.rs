@@ -538,6 +538,21 @@ pub trait WriteSetSource {
     /// Any error from `visit`, or from reading a staged entry, ends the walk and
     /// is returned unchanged.
     fn for_each_mutation(&self, visit: &mut dyn FnMut(&Mutation) -> Result<()>) -> Result<()>;
+
+    /// Visit every mutation in APPEND order, one at a time, handing the **owned**
+    /// mutation to `visit`.
+    ///
+    /// A consumer that must buffer a bounded window of mutations — the Accord
+    /// write-set builder batch-reads before-images for a chunk of them — needs to
+    /// own each mutation for the lifetime of that window. This is that contract.
+    ///
+    /// The DEFAULT clones the borrowed mutation, which is honest for a resident
+    /// `Vec<Mutation>` (the small autocommit batch). A [`StagedWriteSet`] overrides
+    /// it to MOVE the mutation it just decoded, so streaming a staged write-set
+    /// never copies a payload.
+    fn for_each_owned_mutation(&self, visit: &mut dyn FnMut(Mutation) -> Result<()>) -> Result<()> {
+        self.for_each_mutation(&mut |mutation| visit(mutation.clone()))
+    }
 }
 
 /// A resident write-set. Bounded by whatever assembled it; this is the small
@@ -576,6 +591,21 @@ impl WriteSetSource for StagedWriteSet {
                 ))
             })?;
             visit(&mutation)?;
+        }
+        Ok(())
+    }
+
+    /// The decode already produced an OWNED mutation, so hand it on by MOVE: a
+    /// consumer that buffers a bounded prefetch window pays no per-payload copy.
+    fn for_each_owned_mutation(&self, visit: &mut dyn FnMut(Mutation) -> Result<()>) -> Result<()> {
+        for index in 0..self.len() {
+            let frame = self.entry(index)?;
+            let mutation = Mutation::deserialize_from(frame).map_err(|e| {
+                Error::InvalidData(format!(
+                    "write-set stage: staged entry {index} is not a decodable mutation frame: {e}"
+                ))
+            })?;
+            visit(mutation)?;
         }
         Ok(())
     }

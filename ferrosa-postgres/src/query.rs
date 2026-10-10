@@ -1869,26 +1869,68 @@ impl TableKeyCache {
 /// one key twice, where this streams each intermediate row image rather than only
 /// the final one (a duplicate-key write-set is last-write-wins at the MVCC apply
 /// anyway; see `record_applied_accord_commit`).
-pub(crate) fn prepare_accord_writes(
+///
+/// The source is a [`ferrosa_storage::write_set_stage::WriteSetSource`] — a resident
+/// `Vec<Mutation>` (the small autocommit batch) or a spilled `StagedWriteSet`
+/// (a large transactional `COPY`) — and is read one mutation at a time, so the
+/// write-set is NEVER materialized into a second resident `Vec<Mutation>`. This
+/// buffers at most [`AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK`] mutations
+/// at once; the build's residency is one prefetch chunk, not the whole write-set.
+/// At `pgbench -i --scale 10` the whole-set clone was the `mutations_cloned` phase:
+/// a resident `Vec<Mutation>` holding a deep clone of every staged frame (~690 MB
+/// at 1.1M rows).
+pub(crate) fn prepare_accord_writes_streaming<S>(
     engine: &StorageEngine,
     schema: &Schema,
-    mutations: Vec<Mutation>,
-) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError> {
-    use ferrosa_storage::accord::TransactionWrite;
+    source: &S,
+) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError>
+where
+    S: ferrosa_storage::write_set_stage::WriteSetSource + ?Sized,
+{
+    let mut builder = AccordWriteSetBuilder::new(engine, schema);
+    let mut pending: Vec<Mutation> =
+        Vec::with_capacity(AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK);
+    source
+        .for_each_owned_mutation(&mut |mutation| {
+            pending.push(mutation);
+            if pending.len() >= AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK {
+                builder.process_chunk(&mut pending)?;
+            }
+            Ok(())
+        })
+        .map_err(MvccCommitError::Storage)?;
+    if !pending.is_empty() {
+        builder
+            .process_chunk(&mut pending)
+            .map_err(MvccCommitError::Storage)?;
+    }
+    builder.finish()
+}
 
-    let mut codecs: std::collections::HashMap<TableKey, TableCodec> =
-        std::collections::HashMap::new();
-    let mut overlays: std::collections::HashMap<
-        TableKey,
-        std::collections::HashMap<Vec<SqlValue>, Option<Row>>,
-    > = std::collections::HashMap::new();
-    let mut writes: Vec<TransactionWrite> = Vec::with_capacity(mutations.len());
-    // Temporary attribution scaffolding (see `FERROSA_PG_COMMIT_PROFILE`).
-    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
-    let mut serialize_ns = 0u64;
-    let mut pending_ns = 0u64;
-    let mut metadata_bytes = 0usize;
+/// The mutable state of one streaming Accord write-set build, factored out so the
+/// per-chunk work is a method over it rather than a free function with a dozen
+/// parameters. See [`prepare_accord_writes_streaming`].
+struct AccordWriteSetBuilder<'a> {
+    engine: &'a StorageEngine,
+    schema: &'a Schema,
+    codecs: std::collections::HashMap<TableKey, TableCodec>,
+    overlays:
+        std::collections::HashMap<TableKey, std::collections::HashMap<Vec<SqlValue>, Option<Row>>>,
+    writes: Vec<ferrosa_storage::accord::TransactionWrite>,
+    /// ONE serialization buffer for the whole write-set, reused per mutation
+    /// instead of a fresh `vec![0; n]` allocation each time. A mutation is consumed
+    /// by the iteration that serializes it, so nothing needs the buffer to outlive
+    /// that iteration.
+    bytes: Vec<u8>,
+    table_keys: TableKeyCache,
+    /// Temporary attribution scaffolding (see `FERROSA_PG_COMMIT_PROFILE`).
+    profile: bool,
+    serialize_ns: u64,
+    pending_ns: u64,
+    metadata_bytes: usize,
+}
 
+impl<'a> AccordWriteSetBuilder<'a> {
     /// How many mutations' pre-transaction before-images are resolved in ONE
     /// batched storage read.
     ///
@@ -1898,16 +1940,29 @@ pub(crate) fn prepare_accord_writes(
     /// O(write-set), so the streaming shape (and its commit peak) is preserved.
     const BEFORE_IMAGE_PREFETCH_CHUNK: usize = 4096;
 
-    // ONE serialization buffer for the whole write-set, reused per mutation
-    // instead of a fresh `vec![0; n]` allocation each time (see `serialize_into`
-    // below). `mutations` is CONSUMED by this function, so nothing needs the
-    // per-mutation buffer to outlive its iteration.
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut table_keys = TableKeyCache { current: None };
-    let mut pending: Vec<Mutation> = mutations;
-    while !pending.is_empty() {
-        let take = BEFORE_IMAGE_PREFETCH_CHUNK.min(pending.len());
-        let chunk: Vec<Mutation> = pending.drain(..take).collect();
+    fn new(engine: &'a StorageEngine, schema: &'a Schema) -> Self {
+        Self {
+            engine,
+            schema,
+            codecs: std::collections::HashMap::new(),
+            overlays: std::collections::HashMap::new(),
+            writes: Vec::new(),
+            bytes: Vec::new(),
+            table_keys: TableKeyCache { current: None },
+            profile: std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some(),
+            serialize_ns: 0,
+            pending_ns: 0,
+            metadata_bytes: 0,
+        }
+    }
+
+    /// Encode every mutation buffered in `pending` as one `TransactionWrite`,
+    /// draining `pending` and dropping each mutation as it is consumed.
+    fn process_chunk(&mut self, pending: &mut Vec<Mutation>) -> ferrosa_common::Result<()> {
+        use ferrosa_storage::accord::TransactionWrite;
+        let engine = self.engine;
+        let schema = self.schema;
+        let mut chunk: std::collections::VecDeque<Mutation> = pending.drain(..).collect();
 
         // Prebuild each distinct table's codec once, then batch-read this chunk's
         // before-images for it against a single store view.
@@ -1916,7 +1971,7 @@ pub(crate) fn prepare_accord_writes(
             if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
                 continue;
             }
-            let table = table_keys.key_for(&mutation.keyspace, &mutation.table);
+            let table = self.table_keys.key_for(&mutation.keyspace, &mutation.table);
             if !chunk_tables.contains(&table) {
                 chunk_tables.push(table);
             }
@@ -1926,15 +1981,14 @@ pub(crate) fn prepare_accord_writes(
             std::collections::HashMap<Vec<SqlValue>, Option<Row>>,
         > = std::collections::HashMap::new();
         for table in &chunk_tables {
-            let codec = match codecs.entry(table.clone()) {
+            let codec = match self.codecs.entry(table.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(TableCodec::build(&table.0, &table.1, schema).map_err(
-                        |error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)),
-                    )?)
-                }
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    TableCodec::build(&table.0, &table.1, schema)
+                        .map_err(ferrosa_common::Error::InvalidData)?,
+                ),
             };
-            let overlay = overlays.entry(table.clone()).or_default();
+            let overlay = self.overlays.entry(table.clone()).or_default();
             let cache = crate::storage_provider::prefetch_before_images(
                 engine,
                 codec,
@@ -1943,54 +1997,54 @@ pub(crate) fn prepare_accord_writes(
                 overlay,
                 chunk.iter(),
             )
-            .map_err(|error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)))?;
+            .map_err(ferrosa_common::Error::InvalidData)?;
             if !cache.is_empty() {
                 before_caches.insert(table.clone(), cache);
             }
         }
 
-        for mutation in chunk {
-            let table = table_keys.key_for(&mutation.keyspace, &mutation.table);
+        while let Some(mutation) = chunk.pop_front() {
+            let table = self.table_keys.key_for(&mutation.keyspace, &mutation.table);
             // Reuse the ONE buffer: `clear` + `resize` to this mutation's exact
             // `serialized_size` writes exactly what a fresh zeroed buffer would, so a
             // previous (larger) mutation's tail can never leak into this frame.
-            bytes.clear();
-            bytes.resize(mutation.serialized_size(), 0);
-            let serialize_started = profile.then(std::time::Instant::now);
-            mutation.serialize_into(&mut bytes);
+            self.bytes.clear();
+            self.bytes.resize(mutation.serialized_size(), 0);
+            let serialize_started = self.profile.then(std::time::Instant::now);
+            mutation.serialize_into(&mut self.bytes);
             if let Some(started) = serialize_started {
-                serialize_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.serialize_ns +=
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             }
 
             // A table tombstone (`TRUNCATE`) marker carries no row image; the cluster
             // committer routes it to every serving node at CL=ALL from its own bytes.
             if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
-                writes.push(TransactionWrite {
+                self.writes.push(TransactionWrite {
                     keyspace: mutation.keyspace,
                     // MOVED out of the consumed mutation, never copied.
                     key: mutation.key.key.into_bytes(),
                     // The shared buffer lives on, so a tombstone takes a copy. A
                     // tombstone is ONE entry per TRUNCATE, not one per row.
-                    mutation: bytes.clone(),
+                    mutation: self.bytes.clone(),
                 });
                 continue;
             }
 
-            let codec = match codecs.entry(table.clone()) {
+            let codec = match self.codecs.entry(table.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(TableCodec::build(&table.0, &table.1, schema).map_err(
-                        |error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)),
-                    )?)
-                }
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(
+                    TableCodec::build(&table.0, &table.1, schema)
+                        .map_err(ferrosa_common::Error::InvalidData)?,
+                ),
             };
-            let overlay = overlays.entry(table.clone()).or_default();
+            let overlay = self.overlays.entry(table.clone()).or_default();
             // Scoped to this one mutation; dropped at the end of the iteration.
             let mut before_images: std::collections::HashMap<Vec<SqlValue>, Option<Row>> =
                 std::collections::HashMap::new();
             let mut partition_keys: std::collections::HashMap<Vec<SqlValue>, Vec<u8>> =
                 std::collections::HashMap::new();
-            let pending_started = profile.then(std::time::Instant::now);
+            let pending_started = self.profile.then(std::time::Instant::now);
             crate::storage_provider::apply_pending_writes_with_partition_keys(
                 engine,
                 codec,
@@ -2004,9 +2058,9 @@ pub(crate) fn prepare_accord_writes(
                     before_cache: before_caches.get(&table),
                 },
             )
-            .map_err(|error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)))?;
+            .map_err(ferrosa_common::Error::InvalidData)?;
             if let Some(started) = pending_started {
-                pending_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                self.pending_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             }
 
             // Encode this partition's row-version metadata now, while only its own
@@ -2018,7 +2072,7 @@ pub(crate) fn prepare_accord_writes(
             let mutation_bytes = if partition_keys.is_empty() {
                 // The shared serialize buffer is reused, so this rare no-row path takes
                 // a copy (a bulk `COPY` always carries rows, so it is not the hot path).
-                bytes.clone()
+                self.bytes.clone()
             } else {
                 // Each partition's SQL key and partition bytes are MOVED out of
                 // `partition_keys` (dropped at the end of this iteration) rather than
@@ -2039,37 +2093,42 @@ pub(crate) fn prepare_accord_writes(
                     .collect();
                 let metadata =
                     crate::row_change_codec::encode_partition(&changes).map_err(|error| {
-                        MvccCommitError::Storage(ferrosa_common::Error::InvalidData(format!(
+                        ferrosa_common::Error::InvalidData(format!(
                             "serialize PostgreSQL MVCC row versions: {error}"
-                        )))
+                        ))
                     })?;
-                metadata_bytes += metadata.len();
-                ferrosa_storage::accord::encode_postgres_mvcc_mutation(&bytes, &metadata).map_err(
-                    |error| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(error)),
-                )?
+                self.metadata_bytes += metadata.len();
+                ferrosa_storage::accord::encode_postgres_mvcc_mutation(&self.bytes, &metadata)
+                    .map_err(ferrosa_common::Error::InvalidData)?
             };
 
-            writes.push(TransactionWrite {
+            self.writes.push(TransactionWrite {
                 keyspace: mutation.keyspace,
                 key: partition_key,
                 mutation: mutation_bytes,
             });
         }
+        Ok(())
     }
-    if profile {
-        use std::sync::atomic::Ordering;
-        tracing::info!(
-            mutations = writes.len(),
-            pending_ms = pending_ns as f64 / 1_000_000.0,
-            serialize_ms = serialize_ns as f64 / 1_000_000.0,
-            metadata_kib = metadata_bytes / 1024,
-            read_image_calls = crate::storage_provider::READ_IMAGE_CALLS.load(Ordering::Relaxed),
-            read_image_ms =
-                crate::storage_provider::READ_IMAGE_NS.load(Ordering::Relaxed) as f64 / 1_000_000.0,
-            "prepare_accord_writes attribution"
-        );
+
+    fn finish(self) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError> {
+        if self.profile {
+            use std::sync::atomic::Ordering;
+            tracing::info!(
+                mutations = self.writes.len(),
+                pending_ms = self.pending_ns as f64 / 1_000_000.0,
+                serialize_ms = self.serialize_ns as f64 / 1_000_000.0,
+                metadata_kib = self.metadata_bytes / 1024,
+                read_image_calls =
+                    crate::storage_provider::READ_IMAGE_CALLS.load(Ordering::Relaxed),
+                read_image_ms = crate::storage_provider::READ_IMAGE_NS.load(Ordering::Relaxed)
+                    as f64
+                    / 1_000_000.0,
+                "prepare_accord_writes attribution"
+            );
+        }
+        Ok(self.writes)
     }
-    Ok(writes)
 }
 
 /// Resolve a DML scalar to a concrete [`SqlValue`], substituting bound
