@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
@@ -27,6 +28,81 @@ const MAX_TXN_WRITES_ENV: &str = "FERROSA_POSTGRES_MAX_TXN_WRITES";
 const SCAN_BUFFER_ROWS_ENV: &str = "FERROSA_POSTGRES_SCAN_BUFFER_ROWS";
 const MAX_SNAPSHOT_AGE_MS_ENV: &str = "FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS";
 const SNAPSHOT_REAPER_INTERVAL_MS_ENV: &str = "FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS";
+/// Enables per-`COMMIT` phase timing and resident-history accounting. Off by
+/// default: the counters are relaxed atomics, but a disabled run must not pay
+/// even that on the hot path.
+const COMMIT_PROFILE_ENV: &str = "FERROSA_PG_COMMIT_PROFILE";
+
+/// Per-phase wall-clock and resident-history accounting for the PostgreSQL MVCC
+/// apply seam. These answer, with evidence rather than a guess, how a large
+/// transaction's commit cost and resident memory split between the four
+/// candidates: the version-history insert itself, distributed (Accord)
+/// registration, the apply fan-out, and row decode/encode.
+#[derive(Default)]
+pub(crate) struct MvccProfile {
+    enabled: AtomicBool,
+    /// `prepare_postgres_apply` — decode metadata + insert history.
+    prepare_calls: AtomicU64,
+    prepare_ns: AtomicU64,
+    prepare_decoded: AtomicU64,
+    /// `record_applied_accord_commit` — decode metadata + insert history.
+    apply_calls: AtomicU64,
+    apply_ns: AtomicU64,
+    apply_decoded: AtomicU64,
+    /// Time spent inside `prune_versions`.
+    prune_calls: AtomicU64,
+    prune_ns: AtomicU64,
+    /// Versions inserted into either history map (keyed insert of a cloned Row).
+    versions_inserted: AtomicU64,
+}
+
+impl MvccProfile {
+    fn from_env() -> Self {
+        let profile = Self::default();
+        profile
+            .enabled
+            .store(env::var_os(COMMIT_PROFILE_ENV).is_some(), Ordering::Relaxed);
+        profile
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    fn add(counter: &AtomicU64, nanos: u64) {
+        counter.fetch_add(nanos, Ordering::Relaxed);
+    }
+}
+
+/// Resident byte accounting for the two MVCC history maps, plus the entry
+/// counts needed to read the numbers as a per-key cost. The byte figure is a
+/// deterministic ESTIMATE of the payload + per-node overhead (not an allocator
+/// probe): it is meant to compare before/after and to separate MVCC history
+/// residency from the rest of the process, not to be byte-exact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct MvccHistoryStats {
+    pub local_keys: usize,
+    pub local_versions: usize,
+    pub local_bytes: usize,
+    pub distributed_keys: usize,
+    pub distributed_versions: usize,
+    pub distributed_bytes: usize,
+    pub applied_accord_txns: usize,
+}
+
+impl MvccHistoryStats {
+    pub(crate) fn total_keys(&self) -> usize {
+        self.local_keys + self.distributed_keys
+    }
+
+    pub(crate) fn total_versions(&self) -> usize {
+        self.local_versions + self.distributed_versions
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        self.local_bytes + self.distributed_bytes
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MvccConfig {
@@ -200,6 +276,7 @@ pub struct MvccManager {
     state: Arc<Mutex<State>>,
     commit_gate: Arc<tokio::sync::Mutex<()>>,
     config: MvccConfig,
+    profile: Arc<MvccProfile>,
 }
 
 impl Default for MvccManager {
@@ -250,7 +327,53 @@ impl MvccManager {
             state: Arc::new(Mutex::new(State::default())),
             commit_gate: Arc::new(tokio::sync::Mutex::new(())),
             config,
+            profile: Arc::new(MvccProfile::from_env()),
         }
+    }
+
+    /// Resident-history accounting: entry counts and an estimated byte cost for
+    /// both version maps. Used to attribute the resident term of a large commit
+    /// and to prove the size bound holds.
+    pub(crate) fn history_stats(&self) -> MvccHistoryStats {
+        let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        history_stats(&state)
+    }
+
+    /// Cumulative per-phase timings since process start, as `(label, calls,
+    /// nanos)` triples. Empty unless [`COMMIT_PROFILE_ENV`] was set.
+    pub(crate) fn profile_report(&self) -> Vec<(&'static str, u64, u64)> {
+        let profile = &self.profile;
+        vec![
+            (
+                "mvcc.prepare_postgres_apply",
+                profile.prepare_calls.load(Ordering::Relaxed),
+                profile.prepare_ns.load(Ordering::Relaxed),
+            ),
+            (
+                "mvcc.on_postgres_apply",
+                profile.apply_calls.load(Ordering::Relaxed),
+                profile.apply_ns.load(Ordering::Relaxed),
+            ),
+            (
+                "mvcc.prune_versions",
+                profile.prune_calls.load(Ordering::Relaxed),
+                profile.prune_ns.load(Ordering::Relaxed),
+            ),
+        ]
+    }
+
+    /// Number of decoded `RowChange`s seen by the apply observer (the row
+    /// decode/encode volume the commit pays for).
+    pub(crate) fn profile_decoded(&self) -> u64 {
+        self.profile
+            .prepare_decoded
+            .load(Ordering::Relaxed)
+            .saturating_add(self.profile.apply_decoded.load(Ordering::Relaxed))
+    }
+
+    /// Number of row versions inserted into either history map.
+    pub(crate) fn profile_versions_inserted(&self) -> u64 {
+        self.profile.versions_inserted.load(Ordering::Relaxed)
     }
 
     pub(crate) fn max_txn_writes(&self) -> usize {
@@ -441,9 +564,28 @@ impl MvccManager {
             versions.insert(commit_seq, change.after.clone());
             state.table_epochs.insert(change.table.clone(), commit_seq);
         }
+        if self.profile.is_enabled() {
+            MvccProfile::add(
+                &self.profile.versions_inserted,
+                u64::try_from(changes.len()).unwrap_or(u64::MAX),
+            );
+        }
         state.commit_seq = commit_seq;
-        prune_versions(&mut state);
+        self.timed_prune_versions(&mut state);
         Ok(commit_seq)
+    }
+
+    /// Run [`prune_versions`] under the phase timer when profiling is on.
+    fn timed_prune_versions(&self, state: &mut State) {
+        if !self.profile.is_enabled() {
+            prune_versions(state);
+            return;
+        }
+        let started = Instant::now();
+        prune_versions(state);
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        MvccProfile::add(&self.profile.prune_calls, 1);
+        MvccProfile::add(&self.profile.prune_ns, elapsed);
     }
 
     fn record_applied_accord_commit(
@@ -457,6 +599,7 @@ impl MvccManager {
             return state.commit_seq;
         }
         let commit_seq = state.commit_seq.saturating_add(1);
+        let changes_len = changes.len();
         for change in changes {
             let key = RowKey {
                 table: change.table.clone(),
@@ -478,8 +621,14 @@ impl MvccManager {
             versions.entry(timestamp).or_insert(change.after);
             state.table_epochs.insert(change.table, commit_seq);
         }
+        if self.profile.is_enabled() {
+            MvccProfile::add(
+                &self.profile.versions_inserted,
+                u64::try_from(changes_len).unwrap_or(u64::MAX),
+            );
+        }
         state.commit_seq = commit_seq;
-        prune_versions(&mut state);
+        self.timed_prune_versions(&mut state);
         commit_seq
     }
 
@@ -511,7 +660,9 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
         timestamp: Timestamp,
         metadata: &[Vec<u8>],
     ) -> Result<(), String> {
+        let started = self.profile.is_enabled().then(Instant::now);
         let mut changes = decode_row_changes(metadata)?;
+        let decoded = changes.len();
         let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
         let baseline = Timestamp {
             epoch: 0,
@@ -530,6 +681,15 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
             }
             versions.entry(timestamp).or_insert(change.after);
         }
+        if let Some(started) = started {
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            MvccProfile::add(&self.profile.prepare_calls, 1);
+            MvccProfile::add(&self.profile.prepare_ns, elapsed);
+            MvccProfile::add(
+                &self.profile.prepare_decoded,
+                u64::try_from(decoded).unwrap_or(u64::MAX),
+            );
+        }
         Ok(())
     }
 
@@ -539,8 +699,19 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
         timestamp: Timestamp,
         metadata: &[Vec<u8>],
     ) -> Result<(), String> {
+        let started = self.profile.is_enabled().then(Instant::now);
         let changes = decode_row_changes(metadata)?;
+        let decoded = changes.len();
         self.record_applied_accord_commit(txn_id, timestamp, changes);
+        if let Some(started) = started {
+            let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            MvccProfile::add(&self.profile.apply_calls, 1);
+            MvccProfile::add(&self.profile.apply_ns, elapsed);
+            MvccProfile::add(
+                &self.profile.apply_decoded,
+                u64::try_from(decoded).unwrap_or(u64::MAX),
+            );
+        }
         Ok(())
     }
 }
@@ -572,6 +743,73 @@ fn validate_snapshot(
         return Err(MvccCommitError::SerializationFailure);
     }
     Ok(())
+}
+
+/// Estimated resident bytes of a `Value`'s heap payload (the inline slot is
+/// counted separately). Underestimates nothing that matters for a comparison
+/// and deliberately does NOT allocate: it is a walk, not a serialization.
+fn value_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null
+        | Value::Int(_)
+        | Value::Bool(_)
+        | Value::Float(_)
+        | Value::Uuid(_)
+        | Value::Timestamp(_)
+        | Value::Date(_)
+        | Value::Time(_)
+        | Value::Inet(_) => 0,
+        Value::Bytea(bytes) => bytes.len(),
+        Value::Text(text) | Value::JsonPath(text) => text.len(),
+        Value::Numeric { unscaled, .. } => unscaled.to_signed_bytes_le().len(),
+        Value::Jsonb(doc) => doc.as_bytes().len(),
+        Value::TextArray(items) => items
+            .iter()
+            .map(|item| item.as_ref().map_or(0, String::len))
+            .sum(),
+    }
+}
+
+fn values_bytes(values: &[Value]) -> usize {
+    std::mem::size_of_val(values) + values.iter().map(value_heap_bytes).sum::<usize>()
+}
+
+fn row_bytes(row: &Row) -> usize {
+    values_bytes(&row.0)
+}
+
+fn row_key_bytes(key: &RowKey) -> usize {
+    std::mem::size_of::<RowKey>() + key.table.capacity() + values_bytes(&key.key)
+}
+
+/// Resident history accounting. See [`MvccHistoryStats`] for the contract: a
+/// deterministic estimate used to compare configurations, not an allocator
+/// probe.
+fn history_stats(state: &State) -> MvccHistoryStats {
+    let mut stats = MvccHistoryStats {
+        applied_accord_txns: state.applied_accord_txns.len(),
+        ..Default::default()
+    };
+    let version_slot = std::mem::size_of::<Option<Row>>();
+    for (key, versions) in &state.versions {
+        stats.local_keys += 1;
+        stats.local_versions += versions.len();
+        stats.local_bytes +=
+            row_key_bytes(key) + versions.len() * (std::mem::size_of::<u64>() + version_slot);
+        for row in versions.values().flatten() {
+            stats.local_bytes += row_bytes(row);
+        }
+    }
+    for (key, versions) in &state.distributed_versions {
+        stats.distributed_keys += 1;
+        stats.distributed_versions += versions.len();
+        stats.distributed_bytes +=
+            row_key_bytes(key) + versions.len() * (std::mem::size_of::<Timestamp>() + version_slot);
+        for row in versions.values().flatten() {
+            stats.distributed_bytes += row_bytes(row);
+        }
+    }
+    stats
 }
 
 fn prune_versions(state: &mut State) {

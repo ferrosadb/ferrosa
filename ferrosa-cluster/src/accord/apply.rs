@@ -538,6 +538,8 @@ impl StorageApplier for EngineStorageApplier {
         // BEFORE appending any commit-log record — so either all surviving keys
         // land durably or none do (all-or-nothing; no partial / torn apply).
         let mut ops: Vec<BatchOp> = Vec::new();
+        let profile_apply = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+        let decode_started = profile_apply.then(std::time::Instant::now);
         // The (txn,key,t) triples this call will newly persist — recorded only
         // AFTER the batch is durable, so a failed apply leaves them re-appliable.
         let mut newly_applied: Vec<(TxnId, Vec<u8>, u64)> = Vec::new();
@@ -636,10 +638,23 @@ impl StorageApplier for EngineStorageApplier {
         // Atomic commit of all surviving partitions. On any preflight/append
         // failure NONE of the ops are applied; propagated as `ApplyError`
         // (never fake success).
+        let decode_ms = decode_started.map(|t| t.elapsed().as_millis() as u64);
+        let apply_started = profile_apply.then(std::time::Instant::now);
         self.engine.apply_batch(ops).map_err(|e| ApplyError {
             txn_id,
             reason: format!("storage apply_batch failed for writeset: {e}"),
         })?;
+        if let Some(started) = apply_started {
+            let metadata_kib: usize =
+                postgres_mvcc_metadata.iter().map(Vec::len).sum::<usize>() / 1024;
+            tracing::info!(
+                mutations = mutations.len(),
+                decode_ms = decode_ms.unwrap_or(0),
+                apply_batch_ms = started.elapsed().as_millis() as u64,
+                metadata_kib,
+                "accord apply_writeset attribution"
+            );
+        }
 
         if !postgres_mvcc_metadata.is_empty() {
             for observer in self.postgres_mvcc_observers.read().iter() {

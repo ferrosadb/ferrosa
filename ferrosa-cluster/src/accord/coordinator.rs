@@ -40,6 +40,17 @@ use ferrosa_net::peer::PeerManager;
 const PREACCEPT_FAST_PATH_TIMEOUT_ENV: &str = "FERROSA_ACCORD_PREACCEPT_FAST_PATH_TIMEOUT_MS";
 const DEFAULT_PREACCEPT_FAST_PATH_TIMEOUT_MS: u64 = 1_000;
 
+/// How many per-replica Apply frames the coordinator may have in flight at once.
+///
+/// The Apply fan-out used to await each replica's ApplyOK before building the
+/// next replica's frame, so a 3-node cluster paid the SUM of the replicas' apply
+/// latencies instead of the MAX. The window lets every replica's apply overlap
+/// (a real cluster has a handful of replicas) while still bounding how many
+/// serialized frames — each up to the replica's share of the write-set — are
+/// resident at once. Bounds memory the same way the one-at-a-time loop did, with
+/// an explicit ceiling rather than a serialization side effect.
+const APPLY_FANOUT_WINDOW: usize = 4;
+
 fn parse_preaccept_fast_path_timeout(value: Option<&str>) -> Result<std::time::Duration, String> {
     let Some(value) = value else {
         return Ok(std::time::Duration::from_millis(
@@ -1336,6 +1347,9 @@ impl AccordCoordinatorDriver {
                 capacity,
             });
         }
+        let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+        let write_set_len = self.write_set.len();
+        let t_order = profile.then(std::time::Instant::now);
         let (commit_t, commit_deps) = match self.order_and_gate().await {
             Ok(ordered) => ordered,
             Err(e) => {
@@ -1359,7 +1373,18 @@ impl AccordCoordinatorDriver {
                 return Err(e);
             }
         };
-        self.apply_phase(commit_t, commit_deps).await
+        let order_ns = t_order.map(|t| t.elapsed().as_nanos() as u64);
+        let t_apply = profile.then(std::time::Instant::now);
+        let apply_result = self.apply_phase(commit_t, commit_deps).await;
+        if let (Some(t_apply), Some(order_ns)) = (t_apply, order_ns) {
+            tracing::info!(
+                keys = write_set_len,
+                order_ms = order_ns as f64 / 1_000_000.0,
+                apply_ms = t_apply.elapsed().as_millis() as u64,
+                "run_transaction attribution"
+            );
+        }
+        apply_result
     }
 
     /// Phases 1-4 of [`Self::run_transaction`]: order the transaction
@@ -2598,6 +2623,7 @@ impl AccordCoordinatorDriver {
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
     ) -> Result<bool, AccordDriverError> {
         use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
+        use futures::StreamExt;
         let txn_id = self.coordinator.txn_id;
         let self_id = self.self_id;
         let mut quorum = participant.quorum();
@@ -2607,21 +2633,45 @@ impl AccordCoordinatorDriver {
         if quorum.all_reached() {
             return Ok(true);
         }
-        for &peer_id in self.replica_ids.iter().filter(|&&id| id != self_id) {
-            let writes: Vec<WriteSetEntry> = self
-                .write_set
-                .iter()
-                .filter(|e| self.replica_owns_key(peer_id, &e.key))
-                .cloned()
-                .collect();
-            let payload = ApplyV2Payload { txn_id, writes };
-            let bytes = bincode::serialize(&payload)
-                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
-            // Free the owned entries before the RPC: only the serialized frame is
-            // resident while the send is in flight, never the entries too.
-            drop(payload);
-            let msg = Message::AccordApplyV2(Bytes::from(bytes));
-            let result = self.peers.send(peer_id, msg, Lane::Data).await;
+        // Send to every replica CONCURRENTLY, up to a small in-flight window.
+        //
+        // This loop used to `send(..).await` one peer at a time: peer 2's payload
+        // was not even BUILT until peer 1 had finished applying and replied. With
+        // a 3-node RF=1 cluster each replica owns ~1/N of the write-set, so a
+        // 1.1M-row commit serialized N replica applies and paid the sum instead of
+        // the max — the Apply phase (≈57% of COMMIT) was latency-bound on the
+        // replica count, not on any single replica's work (each replica's own
+        // `apply_batch` is a small fraction of its apply latency). The window keeps
+        // resident bytes bounded the same way the old code did — only the
+        // serialized frame of an in-flight send is held, and at most
+        // `APPLY_FANOUT_WINDOW` of them — while removing the N-fold serialization.
+        let mut inflight = futures::stream::FuturesUnordered::new();
+        let mut peers = self.replica_ids.iter().filter(|&&id| id != self_id);
+        loop {
+            while inflight.len() < APPLY_FANOUT_WINDOW {
+                let Some(&peer_id) = peers.next() else { break };
+                let writes: Vec<WriteSetEntry> = self
+                    .write_set
+                    .iter()
+                    .filter(|e| self.replica_owns_key(peer_id, &e.key))
+                    .cloned()
+                    .collect();
+                let payload = ApplyV2Payload { txn_id, writes };
+                let bytes = bincode::serialize(&payload)
+                    .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+                // Free the owned entries before the RPC: only the serialized frame
+                // is resident while the send is in flight, never the entries too.
+                drop(payload);
+                let msg = Message::AccordApplyV2(Bytes::from(bytes));
+                let peers_handle = &self.peers;
+                inflight.push(async move {
+                    let result = peers_handle.send(peer_id, msg, Lane::Data).await;
+                    (peer_id, result)
+                });
+            }
+            let Some((peer_id, result)) = inflight.next().await else {
+                break;
+            };
             if let Err(error) = &result {
                 tracing::warn!(
                     txn_id = ?txn_id,
@@ -4233,7 +4283,7 @@ mod tests {
     /// the bound DIRECTLY, by observing how many sends overlap, rather than only
     /// that a small-N commit eventually succeeds (an outcome test cannot see it).
     #[tokio::test]
-    async fn apply_fanout_never_holds_more_than_one_replica_payload_at_once() {
+    async fn apply_fanout_overlaps_replicas_within_a_bounded_window() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Mutex;
 
@@ -4293,10 +4343,19 @@ mod tests {
             .expect("bounded fan-out runs");
 
         assert!(ok, "every replica acked; the per-shard quorum is reached");
-        assert_eq!(
-            probe.max_in_flight.load(Ordering::SeqCst),
-            1,
-            "at most one replica's apply payload may be in flight (resident) at a time"
+        let peak = probe.max_in_flight.load(Ordering::SeqCst);
+        // Assert BOTH axes. Pinning only one is exactly how this regressed: the
+        // memory bound was asserted while the fan-out silently became sequential,
+        // which measured 57% of a large commit paying the SUM of replica apply
+        // latencies instead of the MAX.
+        assert!(
+            peak > 1,
+            "replica payloads must OVERLAP; a sequential fan-out pays the sum of \
+             replica apply latencies, not the max"
+        );
+        assert!(
+            peak <= APPLY_FANOUT_WINDOW,
+            "the bounded window must still cap how many replica payloads are resident at once"
         );
         assert!(
             probe.sent.lock().expect("probe mutex").len() >= 2,
