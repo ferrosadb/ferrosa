@@ -251,6 +251,23 @@ fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+/// Every node's log tail, labelled — the evidence a failing harness must show.
+fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            let log = std::fs::read_to_string(n.log_path()).unwrap_or_default();
+            format!(
+                "\n===== node {i} host {} (web {}) log tail =====\n{}",
+                n.host_id,
+                n.ports.web,
+                tail(&log, lines)
+            )
+        })
+        .collect()
+}
+
 /// The node reporting `ferrosa_raft_is_leader 1` on the unauthenticated
 /// `/metrics` endpoint — the Raft leader that a DDL `client_write` will apply on.
 fn find_leader(nodes: &[Node]) -> Option<usize> {
@@ -269,6 +286,48 @@ fn ddl_path_is_cluster(node: &Node) -> bool {
     http_get(node.ports.web, "/api/cluster/status", Some(ADMIN_BASIC))
         .map(|body| json_str(&body, "ddl_path").as_deref() == Some("cluster"))
         .unwrap_or(false)
+}
+
+/// Wait until a Raft leader has been elected AND **every** node reports the
+/// replicated `DdlPath::Cluster`; return the leader's index.
+///
+/// Both conditions are polled per node on a generous budget (formation is not a
+/// timed production limit — a flat 60 s that is too short only ever costs a
+/// round). On timeout it dumps **every** node's log tail: a harness that fails
+/// without showing why is worth nothing.
+async fn wait_cluster_ddl_ready(nodes: &[Node], budget: Duration) -> usize {
+    let deadline = Instant::now() + budget;
+    loop {
+        let ddl: Vec<bool> = nodes.iter().map(ddl_path_is_cluster).collect();
+        let leader = find_leader(nodes);
+        if let Some(leader) = leader {
+            if ddl.iter().all(|ready| *ready) {
+                return leader;
+            }
+        }
+        if Instant::now() >= deadline {
+            let logs: String = nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let log = std::fs::read_to_string(n.log_path()).unwrap_or_default();
+                    format!(
+                        "\n===== node {i} host {} (web {}) ddl_path={} log tail =====\n{}",
+                        n.host_id,
+                        n.ports.web,
+                        ddl[i],
+                        tail(&log, 80)
+                    )
+                })
+                .collect();
+            panic!(
+                "cluster did not elect a Raft leader and install the replicated DDL path on \
+                 every node within {budget:?} (leader={leader:?}, ddl_path_per_node={ddl:?}):\
+                 {logs}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 // ── PostgreSQL wire ───────────────────────────────────────────────────────────
@@ -412,11 +471,27 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
     let mut nodes: Vec<Node> = Vec::new();
     for i in 0..N_NODES {
         let dir = tempfile::tempdir().expect("node data dir");
-        // Accord derives a node's numeric id from the FIRST eight bytes of its
-        // host UUID, so the distinguishing group must lead: three host ids that
-        // differ only in a trailing group collide on one Accord node id and every
-        // write fails "unknown peer" against a self-send.
-        let host_id = format!("0000000{i}-0000-0000-0000-000000000000");
+        // A host id must be distinct in BOTH halves, because the node id is
+        // derived from it two different ways and the halves are disjoint:
+        //
+        //  * Raft's `uuid_to_node_id` reads `bytes[8..16]` (the LAST two groups,
+        //    little-endian) — three host ids that differ only in the FIRST groups
+        //    collapse to one Raft node id, the voters cannot form a group, and no
+        //    leader is ever elected ("never installed the replicated DDL path /
+        //    elected a leader").
+        //  * Accord derives its numeric node id from `bytes[0..8]` (the FIRST
+        //    groups, big-endian) — host ids differing only in the LAST group
+        //    collide onto one Accord node id and every write fails "unknown peer"
+        //    against a self-send (trap 2 below).
+        //
+        // `0x11, 0x22, 0x33` repeated across all sixteen bytes matches the host
+        // ids `tests/docker-compose.cluster.yml` ships and is distinct in both
+        // halves. A single distinguishing group — either end — is not enough.
+        let d = 0x11u8 * (i as u8 + 1);
+        let host_id = format!(
+            "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
+             {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
+        );
         let node = spawn_node(dir, all_ports[i], host_id, &cluster_name, Some(&seeds_for(i)));
         nodes.push(node);
     }
@@ -435,28 +510,16 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
         );
     }
 
-    // The DDL must route through the Raft-replicated path; give the cluster time
-    // to install `DdlPath::Cluster` and elect a leader.
-    {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if ddl_path_is_cluster(&nodes[0]) && find_leader(&nodes).is_some() {
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "cluster never installed the replicated DDL path / elected a leader within 60s"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    }
-    let leader = find_leader(&nodes).expect("a leader is present once the cluster formed");
+    // The DDL must route through the Raft-replicated path: wait (generously, and
+    // per node) until a Raft leader exists and every node has installed
+    // `DdlPath::Cluster`. On timeout the helper dumps every node's log.
+    let leader = wait_cluster_ddl_ready(&nodes, Duration::from_secs(240)).await;
 
     // Create the table through the SAME replicated DDL path CQL uses, via PG.
     // Retry while the default `public` keyspace is being created at boot.
     let client = pg_connect(nodes[leader].ports.pg).await;
     {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             match client
                 .batch_execute(&format!("CREATE TABLE {TABLE} (id int PRIMARY KEY, v text)"))
@@ -466,8 +529,9 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
                 Err(e) => {
                     assert!(
                         Instant::now() < deadline,
-                        "CREATE TABLE {TABLE} never succeeded: {}",
-                        describe(&e)
+                        "CREATE TABLE {TABLE} never succeeded: {}{}",
+                        describe(&e),
+                        dump_all_logs(&nodes, 40)
                     );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
@@ -480,7 +544,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
     // full Accord membership: right after bootstrap the peer set can still be
     // incomplete, so a write is briefly refused with "Accord quorum unavailable".
     for id in 1..=3 {
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             match client
                 .execute(
@@ -493,12 +557,9 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
                 Err(e) => {
                     assert!(
                         Instant::now() < deadline,
-                        "INSERT row {id} never succeeded: {}\n--- leader log tail ---\n{}",
+                        "INSERT row {id} never succeeded: {}{}",
                         describe(&e),
-                        tail(
-                            &std::fs::read_to_string(nodes[leader].log_path()).unwrap_or_default(),
-                            40
-                        )
+                        dump_all_logs(&nodes, 40)
                     );
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
