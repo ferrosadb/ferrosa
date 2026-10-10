@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 doc: fmea
-last_updated: 2026-10-09 (ST-81)
+last_updated: 2026-10-10 (ST-92)
 ---
 
 # ferrosa-storage — FMEA / Known Issues
@@ -160,6 +160,12 @@ runtime. Permit acquisition also selects on cancellation and shutdown.
 T-025 operator requests preserve existing cancellation reasons, count each task
 once under the registry lock, and keep future admission open. Scoped tests cover
 unselected tasks, repeated requests and empty registries.
+
+## ST-92 DROP / TRUNCATE that cannot remove its SSTables
+
+| ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
+|---|---|---|---|---|---|---|---|
+| ST-92 (t_c8625592) | **A `DROP TABLE` / `TRUNCATE` whose SSTable-directory removal fails is reported as success, and a same-name CREATE reloads the survivors** — `unregister_table_quiesced` and `truncate_local` called `std::fs::remove_dir_all` and, on failure, only logged a WARN and returned `Ok(())`; `register_table` -> `build_table_state` then rescanned the directory (`load_existing_sstables_and_sidecars_reporting`) and loaded the dropped rows. On a cluster, a follower whose `unregister_table` is refused (an in-flight compaction leaves `pause_table().is_drained()` false) keeps its rows while the leader reports the DROP as applied. | Dropped-table rows stay readable; DROP+CREATE yields a table silently mixing old and new data. Live: orphaned SSTables under `public.pgbench_accounts` survived DROP+CREATE and TRUNCATE; census 1.0M -> 1.15M -> 1.25M across reloads; `SELECT ... WHERE aid > 100000` returned 230,879 rows on a table that should have held <= 100,000. | 10 | 4 | 4 | 160 -> 20 | **Fixed (t_c8625592):** a durable, name-keyed **pending-sweep intent** (`table_drops::PENDING_SWEEPS_FILE`) is recorded BEFORE the removal and cleared only after it succeeds; a failed removal now returns `Err` (fail loud), and a later `build_table_state` sweeps the directory before loading — registration precedes any write, so its whole contents are a previous incarnation's rows and are deleted, not hidden. Tests: `a_drop_that_cannot_remove_its_sstables_leaves_no_readable_rows` (red first: left 8, right 3), `a_same_name_recreate_after_an_unremovable_drop_holds_only_new_rows_across_a_restart`, `the_orphaned_sstables_are_physically_reclaimed_on_recreate`, `truncate_leaves_zero_rows_even_when_its_sstables_cannot_be_removed`. **Residual:** a follower whose Raft `DropTable` apply is refused keeps the table registered in-process (rows readable) until its next restart/re-registration, where the sweep clears it; the Raft state drops the table in-memory before the storage call, so a refused apply can still let a same-name CREATE reach a still-registered store. A cluster-level test that the refused apply is surfaced to the client is outstanding — see `ferrosa-cluster`'s DropTable apply and ST-2 there. |
 
 ## ST-54 collection-cell ordinal in the memtable merge normalizer
 

@@ -570,7 +570,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   Because `unregister_table` also deletes the table's SSTable directory, cluster
   snapshot install must only reach it for explicit drops, not for table-map
   absence alone; the Raft state machine now enforces that guard before calling
-  this storage cleanup primitive. Re-registering an already
+  this storage cleanup primitive.
+  That removal is now part of the drop contract rather than best-effort
+  (t_c8625592, ST-92): `unregister_table` and `truncate` record a durable,
+  name-keyed **pending sweep** in `<data_dir>/pending-table-sweeps.json` BEFORE
+  the removal and clear it only after the removal succeeds. A removal that fails
+  returns an error (the drop is not reported as done) and leaves the sweep
+  recorded, so the next `build_table_state` for that name — registration precedes
+  any write, so its whole directory is a previous incarnation's rows — deletes the
+  orphans before loading them instead of resurrecting a dropped table's rows.
+  Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after local-schema
   boot preload. The registry-owned `schema.json` is a discriminated, bounded,
