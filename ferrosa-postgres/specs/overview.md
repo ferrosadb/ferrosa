@@ -204,11 +204,12 @@ the coordinator collects zero votes, and the client sees only the opaque
 
 The front end no longer refuses on its own: `Session.txn_writes` is a spilling
 `TxnWriteSet`, so a write-set past `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` SPILLS
-rather than being declined (FMEA PG-12), and the old
-`FERROSA_POSTGRES_MAX_TXN_WRITES` / SQLSTATE `53400` refusal is gone.
-`FERROSA_POSTGRES_MAX_TXN_WRITES` survives only as the default input to the
-consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` (see `ferrosa-cluster`),
-floored at `100000`, so the two stay coherent out of the box.
+rather than being declined (FMEA PG-12). The old
+`FERROSA_POSTGRES_MAX_TXN_WRITES` / SQLSTATE `53400` refusal and the knob that
+carried it are both GONE; the consensus conflict index is likewise unbounded
+(grown, not refused — see `ferrosa-cluster` CL-49), so the two no longer
+disagree. The consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` setting was
+removed with the index's fixed capacity.
 
 1. **Fail loud, never fake.** Every failure maps to a concrete SQLSTATE + one
    `ErrorResponse`; the front-end never returns a fake empty result on error

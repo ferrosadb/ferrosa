@@ -1082,11 +1082,6 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         let total_ms = commit_started.elapsed().as_secs_f64() * 1_000.0;
         tracing::info!(
             total_ms,
-            // The configured front-end write cap. It is NO LONGER a refusal — a
-            // write-set past it spills instead (FMEA PG-12) — but reporting it
-            // keeps the front-end's configured admission ceiling visible next to
-            // the commit's stats.
-            front_end_write_cap = ctx.mvcc.max_txn_writes(),
             prepare_ms = prepare_nanos as f64 / 1_000_000.0,
             accord_ms = accord_nanos as f64 / 1_000_000.0,
             decoded_rows = ctx.mvcc.profile_decoded(),

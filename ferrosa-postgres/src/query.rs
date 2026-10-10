@@ -1510,19 +1510,15 @@ async fn apply_or_buffer(
 /// so a caller that writes several mutations for ONE statement (TRUNCATE of a
 /// table list) can emit a single tag.
 ///
-/// # The write-set buffer stays BOUNDED on purpose (the cap is RETAINED)
+/// # The write-set buffer SPILLS (there is no cap)
 ///
-/// The open-transaction buffer is a resident `Vec<PgWrite>`, so `max_txn_writes`
-/// (the `53400` refusal below) is the only thing bounding the front end's
-/// resident memory for a transactional bulk load. The owner's rule forbids a
-/// refusal CAP only in favour of a buffer that SPILLS; an unbounded *resident*
-/// `Vec` is the materialization the rule calls an OOM bug, not a buffer. Lifting
-/// this cap is therefore BLOCKED until the front end writes its buffer to disk as
-/// rows arrive — the streaming, threshold-bounded `WriteSetStage` landed on
-/// `fix/pgwire-nonresident-write-path` (`.wt-accord-stream`) commit `37f76e83`,
-/// which stages the write-set instead of holding it, and is being wired into this
-/// crate. Do not remove the cap before that path replaces the `Vec`. See FMEA
-/// `PG-ACC-01` and forge `t_513f70ed`.
+/// The open-transaction buffer is a [`TxnWriteSet`], a threshold-bounded staging
+/// that spills PAST its resident buffer (default 8 MiB,
+/// `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`) to a private staging file. Resident
+/// memory is therefore the staging buffer, never the load, and there is NO
+/// per-transaction write-count refusal: the old `FERROSA_POSTGRES_MAX_TXN_WRITES`
+/// / SQLSTATE `53400` cap is gone (FMEA PG-12, PG-ACC-01). A write larger than
+/// the buffer SPILLS; it is never declined for being large.
 async fn apply_or_buffer_silent(
     engine: &StorageEngine,
     schema: &Schema,
@@ -4874,7 +4870,6 @@ mod tests {
 #[cfg(test)]
 mod txn_buffer_tests {
     use super::*;
-    use crate::mvcc::DEFAULT_MAX_TXN_WRITES;
     use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
     use ferrosa_schema::{
         AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
@@ -5884,11 +5879,14 @@ mod txn_buffer_tests {
         // applied to storage until COMMIT.
         let (_dir, engine, schema) = new_engine_and_schema().await;
         let mut buffer = TxnWriteSet::default();
-        // Pre-fill to the old cap with dummy writes, then stage one more.
+        // Pre-fill to the HISTORICAL cap with dummy writes, then stage one more.
+        // The historical default is inlined here so this test still means "far
+        // past the old write-count cap" now that the cap's constant is gone.
+        const OLD_PG_WRITE_CAP: usize = 10_000;
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
         let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
-        for _ in 0..DEFAULT_MAX_TXN_WRITES {
+        for _ in 0..OLD_PG_WRITE_CAP {
             buffer.push(dummy.clone()).expect("stage a buffered write");
         }
         let msgs = execute_query(
@@ -5906,7 +5904,7 @@ mod txn_buffer_tests {
         );
         assert_eq!(
             buffer.len(),
-            DEFAULT_MAX_TXN_WRITES + 1,
+            OLD_PG_WRITE_CAP + 1,
             "the past-cap write IS staged, never refused for being large"
         );
         assert!(
@@ -6032,13 +6030,14 @@ mod txn_buffer_tests {
     }
 
     #[tokio::test]
-    async fn a_configured_write_cap_no_longer_refuses_the_next_pg_write() {
-        // A configured `FERROSA_POSTGRES_MAX_TXN_WRITES` is no longer consulted by
-        // the front end: the refusal that used to fire here is gone, and the write
-        // is staged instead. The setting stays a *consensus-side* concern
-        // sizing default. Never a front-end refusal: the write is staged instead.
+    async fn a_retired_write_cap_setting_is_not_consulted_by_the_front_end() {
+        // The retired `FERROSA_POSTGRES_MAX_TXN_WRITES` setting is not consulted
+        // anywhere in this crate any more: the front end stages its write-set
+        // (spilling past the buffer) and never refuses for size. The knob's
+        // constant and its config field are gone; a front end built with the
+        // default MVCC config still stages a write-set that dwarfs the old cap.
         let (_dir, engine, schema) = new_engine_and_schema().await;
-        let mvcc = MvccManager::with_max_txn_writes(2);
+        let mvcc = MvccManager::default();
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
         let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
