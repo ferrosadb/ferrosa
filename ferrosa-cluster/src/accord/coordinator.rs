@@ -2906,7 +2906,12 @@ impl AccordCoordinatorDriver {
         let mut ack_ms: Vec<u64> = Vec::new();
         let log_fanout = |serialize_ns: u64, ack_ms: &[u64], frame_bytes: usize, shared: bool| {
             if let Some(started) = t_fanout {
-                tracing::info!(
+                // debug!, not info!: this fires once per transaction (behind
+                // `FERROSA_PG_COMMIT_PROFILE`) and carries a `txn_id`. The
+                // `consensus_logging_is_bounded` guard forbids a per-transaction
+                // log at INFO because such lines saturated the disk the CQL
+                // runtime needs and stopped consensus answering read votes.
+                tracing::debug!(
                     txn_id = ?txn_id,
                     peers = ack_ms.len(),
                     fanout_ms = started.elapsed().as_millis() as u64,
