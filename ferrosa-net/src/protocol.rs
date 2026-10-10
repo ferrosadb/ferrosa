@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::codec::{MsgType, WireFrameFormat};
 use crate::message::Message;
 use crate::protocol::envelope_capnp::{
+    accord_control, accord_read_predicate, accord_txn_id, accord_write_set_entry,
     bootstrap_control, bootstrap_stream_plan, cluster_control, envelope, error_frame,
     legacy_payload, node_identity, recovery_control, stream_chunk, stream_chunk_metadata,
     stream_control, stream_end, stream_start, ErrorCode, MessageFamily,
@@ -277,6 +278,139 @@ pub struct LegacyPayload {
     pub body: Vec<u8>,
 }
 
+/// Accord's total-order execution stamp (`ferrosa_common::accord::Timestamp`),
+/// mirrored here so the wire contract does not depend on the cluster crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct AccordTxnId {
+    pub epoch: u64,
+    pub time: u64,
+    pub seq: u32,
+    pub node: u64,
+}
+
+/// One write in a multi-key Accord transaction's write-set: the partition key
+/// (Accord conflict ordering + replica routing) paired with the encoded
+/// commit-log mutation to apply for that key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccordWriteSetEntry {
+    pub key: Vec<u8>,
+    pub mutation: Vec<u8>,
+}
+
+/// The read a linearizable read-vote performs, mirroring
+/// `ferrosa-cluster`'s `ReadPredicate` wire tags exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AccordReadPredicate {
+    /// `INSERT IF NOT EXISTS` existence semantics; also the fail-closed default.
+    #[default]
+    NotExists,
+    /// Generic `IF`: read the whole partition's row at `t`.
+    ReadRow { keyspace: String, table: String },
+    /// PostgreSQL snapshot-barrier read-vote.
+    SnapshotBarrier,
+    /// Unconditional commit: no `IF`, always applies after commit.
+    Always,
+    /// A conditional statement on one row (partition + clustering).
+    ReadClusteringRow {
+        keyspace: String,
+        table: String,
+        clustering: Vec<u8>,
+    },
+}
+
+/// The Accord consensus family payloads, mirroring the bincode shapes in
+/// `ferrosa-cluster`'s `accord::wire` module 1:1.
+///
+/// These are the wire contract for [`MessageFamily::Accord`] frames once a peer
+/// has negotiated [`CapnpPayload::Accord`] support; until then Accord messages
+/// ride [`LegacyPayload`]. The [`Self::ApplyV2`] variant is the bulk data path —
+/// a transactional `COPY` rides its whole write-set in one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccordControlMessage {
+    /// Multi-key Apply request (`wire.rs` `ApplyV2Payload`).
+    ApplyV2 {
+        txn_id: AccordTxnId,
+        writes: Vec<AccordWriteSetEntry>,
+    },
+    /// Single-key Apply request (`wire.rs` `ApplyPayload`), the degenerate one-key case.
+    Apply {
+        txn_id: AccordTxnId,
+        result_data: Vec<u8>,
+    },
+    /// Apply acknowledgement (`wire.rs` `ApplyOkPayload`).
+    ApplyOk { txn_id: AccordTxnId, from: u64 },
+    /// Single-key PreAccept probe (`wire.rs` `PreAcceptPayload`).
+    PreAccept {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        key: Vec<u8>,
+        ballot: u64,
+        epoch: u64,
+    },
+    /// Multi-key PreAccept probe carrying every conflict key (`wire.rs` `PreAcceptV2Payload`).
+    PreAcceptV2 {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        keys: Vec<Vec<u8>>,
+        ballot: u64,
+        epoch: u64,
+        snapshot_ts: Option<AccordTxnId>,
+    },
+    /// PreAccept reply (`wire.rs` `PreAcceptOkPayload`).
+    PreAcceptOk {
+        from: u64,
+        t: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+        snapshot_stale: bool,
+    },
+    /// Accept request, slow path (`wire.rs` `AcceptPayload`).
+    Accept {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        t: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+        ballot: u64,
+    },
+    /// Accept reply (`wire.rs` `AcceptOkPayload` — a pre-dependency coordinator's
+    /// shorter body decodes here as an empty `deps`).
+    AcceptOk {
+        txn_id: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+    },
+    /// Commit broadcast (`wire.rs` `CommitPayload`).
+    Commit {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        t: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+    },
+    /// Commit acknowledgement (`wire.rs` `CommitOkPayload`).
+    CommitOk { txn_id: AccordTxnId, from: u64 },
+    /// Recovery probe (`wire.rs` `RecoverPayload`).
+    Recover {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        ballot: u64,
+    },
+    /// Recovery acknowledgement — carries no payload (the bincode path ships an
+    /// empty body for `AccordRecoverOK`).
+    RecoverOk,
+    /// Linearizable read-vote request (`wire.rs` `ReadVotePayload`).
+    Read {
+        txn_id: AccordTxnId,
+        t: AccordTxnId,
+        key: Vec<u8>,
+        predicate: AccordReadPredicate,
+    },
+    /// Read-vote response (`wire.rs` `ReadVoteOkPayload`).
+    ReadOk {
+        txn_id: AccordTxnId,
+        from: u64,
+        condition_holds: bool,
+        current_row: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapnpTransportMode {
     LegacyOnly,
@@ -303,6 +437,7 @@ pub enum CapnpPayload {
     Recovery(RecoveryControlMessage),
     Bootstrap(BootstrapControlMessage),
     Stream(StreamControlMessage),
+    Accord(AccordControlMessage),
     Error(CapnpErrorFrame),
     Legacy(LegacyPayload),
 }
@@ -425,6 +560,11 @@ pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeE
                 root.set_message_family(MessageFamily::Stream);
                 write_stream(stream, root.init_payload().init_stream())?;
             }
+            CapnpPayload::Accord(accord) => {
+                root.set_message_family(MessageFamily::Accord);
+                root.set_message_kind(accord_message_kind(accord));
+                write_accord(accord, root.init_payload().init_accord())?;
+            }
             CapnpPayload::Error(error) => {
                 root.set_message_family(error.failed_family);
                 root.set_message_kind(error.failed_kind);
@@ -480,6 +620,9 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeError> 
         }
         envelope::payload::Stream(stream) => {
             CapnpPayload::Stream(read_stream(stream.map_err(CapnpDecodeError::from)?)?)
+        }
+        envelope::payload::Accord(accord) => {
+            CapnpPayload::Accord(read_accord(accord.map_err(CapnpDecodeError::from)?)?)
         }
         envelope::payload::Error(error) => {
             CapnpPayload::Error(read_error(error.map_err(CapnpDecodeError::from)?)?)
@@ -678,15 +821,53 @@ fn validate_envelope(envelope: &CapnpEnvelope) -> Result<(), CapnpDecodeError> {
         CapnpPayload::Cluster(_) | CapnpPayload::Recovery(_) | CapnpPayload::Bootstrap(_) => {
             validate_node("sender", &envelope.sender)?;
         }
-        CapnpPayload::Stream(_) | CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => {}
+        CapnpPayload::Stream(_)
+        | CapnpPayload::Accord(_)
+        | CapnpPayload::Error(_)
+        | CapnpPayload::Legacy(_) => {}
     }
     match &envelope.payload {
         CapnpPayload::Cluster(msg) => validate_cluster(msg),
         CapnpPayload::Recovery(msg) => validate_recovery(msg),
         CapnpPayload::Bootstrap(msg) => validate_bootstrap(msg),
         CapnpPayload::Stream(msg) => validate_stream(msg),
+        CapnpPayload::Accord(msg) => validate_accord(msg),
         CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => Ok(()),
     }
+}
+
+/// Validate an Accord payload's shape.
+///
+/// An Accord body carries no sender identity of its own, so — like Stream — it
+/// needs no node check. The one field that must not be silently empty is a
+/// read-vote's target table: a row read with an empty keyspace/table is a
+/// routing bug that would make F+1 agreement meaningless, so it fails loud here
+/// rather than reading the wrong (or no) partition.
+fn validate_accord(msg: &AccordControlMessage) -> Result<(), CapnpDecodeError> {
+    if let AccordControlMessage::Read { predicate, .. } = msg {
+        match predicate {
+            AccordReadPredicate::ReadRow { keyspace, table } => {
+                if keyspace.is_empty() || table.is_empty() {
+                    return Err(CapnpDecodeError::InvalidRequiredField(
+                        "accord read row keyspace/table".to_string(),
+                    ));
+                }
+            }
+            AccordReadPredicate::ReadClusteringRow {
+                keyspace, table, ..
+            } => {
+                if keyspace.is_empty() || table.is_empty() {
+                    return Err(CapnpDecodeError::InvalidRequiredField(
+                        "accord read clustering row keyspace/table".to_string(),
+                    ));
+                }
+            }
+            AccordReadPredicate::NotExists
+            | AccordReadPredicate::SnapshotBarrier
+            | AccordReadPredicate::Always => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_cluster(msg: &ClusterControlMessage) -> Result<(), CapnpDecodeError> {
@@ -1476,6 +1657,447 @@ fn read_legacy(reader: legacy_payload::Reader<'_>) -> Result<LegacyPayload, Capn
         msg_type: reader.get_msg_type(),
         body: reader.get_body()?.to_vec(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Accord family adapters (ADR-019).
+//
+// These mirror `ferrosa-cluster`'s `accord::wire` bincode payloads 1:1 so that a
+// capnp-encoded Accord frame decodes to EXACTLY what the bincode frame decoded
+// to. The Apply family is the bulk data path; the rest carry Accord's
+// identity/dependency bookkeeping.
+// ---------------------------------------------------------------------------
+
+/// The bincode `MsgType` discriminant an Accord payload rides under, so a capnp
+/// Accord frame's `messageKind` matches what the bincode frame carried.
+fn accord_message_kind(msg: &AccordControlMessage) -> u16 {
+    let msg_type = match msg {
+        AccordControlMessage::ApplyV2 { .. } => MsgType::AccordApplyV2,
+        AccordControlMessage::Apply { .. } => MsgType::AccordApply,
+        AccordControlMessage::ApplyOk { .. } => MsgType::AccordApplyOK,
+        AccordControlMessage::PreAccept { .. } => MsgType::AccordPreAccept,
+        AccordControlMessage::PreAcceptV2 { .. } => MsgType::AccordPreAcceptV2,
+        AccordControlMessage::PreAcceptOk { .. } => MsgType::AccordPreAcceptOK,
+        AccordControlMessage::Accept { .. } => MsgType::AccordAccept,
+        AccordControlMessage::AcceptOk { .. } => MsgType::AccordAcceptOK,
+        AccordControlMessage::Commit { .. } => MsgType::AccordCommit,
+        // There is no `AccordCommitOK` wire code: the commit ack reuses the
+        // request's discriminant, exactly as it does on the bincode path.
+        AccordControlMessage::CommitOk { .. } => MsgType::AccordCommit,
+        AccordControlMessage::Recover { .. } => MsgType::AccordRecover,
+        AccordControlMessage::RecoverOk => MsgType::AccordRecoverOK,
+        AccordControlMessage::Read { .. } => MsgType::AccordRead,
+        AccordControlMessage::ReadOk { .. } => MsgType::AccordReadOK,
+    };
+    msg_type as u16
+}
+
+fn write_accord_txn_id(txn_id: AccordTxnId, mut builder: accord_txn_id::Builder<'_>) {
+    builder.set_epoch(txn_id.epoch);
+    builder.set_time(txn_id.time);
+    builder.set_seq(txn_id.seq);
+    builder.set_node(txn_id.node);
+}
+
+fn read_accord_txn_id(reader: accord_txn_id::Reader<'_>) -> AccordTxnId {
+    AccordTxnId {
+        epoch: reader.get_epoch(),
+        time: reader.get_time(),
+        seq: reader.get_seq(),
+        node: reader.get_node(),
+    }
+}
+
+fn read_accord_txn_ids(
+    reader: capnp::struct_list::Reader<'_, accord_txn_id::Owned>,
+) -> Result<Vec<AccordTxnId>, CapnpDecodeError> {
+    (0..reader.len())
+        .map(|idx| Ok(read_accord_txn_id(reader.get(idx))))
+        .collect()
+}
+
+fn write_accord_txn_ids(
+    deps: &[AccordTxnId],
+    builder: capnp::struct_list::Builder<'_, accord_txn_id::Owned>,
+) {
+    let mut builder = builder;
+    for (idx, dep) in deps.iter().enumerate() {
+        write_accord_txn_id(*dep, builder.reborrow().get(idx as u32));
+    }
+}
+
+fn write_accord_writes(
+    writes: &[AccordWriteSetEntry],
+    builder: capnp::struct_list::Builder<'_, accord_write_set_entry::Owned>,
+) {
+    let mut builder = builder;
+    for (idx, write) in writes.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_key(&write.key);
+        entry.set_mutation(&write.mutation);
+    }
+}
+
+fn read_accord_writes(
+    reader: capnp::struct_list::Reader<'_, accord_write_set_entry::Owned>,
+) -> Result<Vec<AccordWriteSetEntry>, CapnpDecodeError> {
+    (0..reader.len())
+        .map(|idx| {
+            let entry = reader.get(idx);
+            Ok(AccordWriteSetEntry {
+                key: entry.get_key()?.to_vec(),
+                mutation: entry.get_mutation()?.to_vec(),
+            })
+        })
+        .collect()
+}
+
+fn write_accord_read_predicate(
+    predicate: &AccordReadPredicate,
+    builder: accord_read_predicate::Builder<'_>,
+) {
+    let mut op = builder.init_op();
+    match predicate {
+        AccordReadPredicate::NotExists => op.set_not_exists(()),
+        AccordReadPredicate::ReadRow { keyspace, table } => {
+            let mut row = op.init_read_row();
+            row.set_keyspace(keyspace);
+            row.set_table(table);
+        }
+        AccordReadPredicate::SnapshotBarrier => op.set_snapshot_barrier(()),
+        AccordReadPredicate::Always => op.set_always(()),
+        AccordReadPredicate::ReadClusteringRow {
+            keyspace,
+            table,
+            clustering,
+        } => {
+            let mut row = op.init_read_clustering_row();
+            row.set_keyspace(keyspace);
+            row.set_table(table);
+            row.set_clustering(clustering);
+        }
+    }
+}
+
+fn read_accord_read_predicate(
+    reader: accord_read_predicate::Reader<'_>,
+) -> Result<AccordReadPredicate, CapnpDecodeError> {
+    use accord_read_predicate::op;
+    Ok(match reader.get_op().which().map_err(not_in_schema)? {
+        op::NotExists(()) => AccordReadPredicate::NotExists,
+        op::ReadRow(row) => {
+            let row = row?;
+            AccordReadPredicate::ReadRow {
+                keyspace: row.get_keyspace()?.to_string()?,
+                table: row.get_table()?.to_string()?,
+            }
+        }
+        op::SnapshotBarrier(()) => AccordReadPredicate::SnapshotBarrier,
+        op::Always(()) => AccordReadPredicate::Always,
+        op::ReadClusteringRow(row) => {
+            let row = row?;
+            AccordReadPredicate::ReadClusteringRow {
+                keyspace: row.get_keyspace()?.to_string()?,
+                table: row.get_table()?.to_string()?,
+                clustering: row.get_clustering()?.to_vec(),
+            }
+        }
+    })
+}
+
+fn write_accord(
+    msg: &AccordControlMessage,
+    builder: accord_control::Builder<'_>,
+) -> Result<(), CapnpDecodeError> {
+    match msg {
+        AccordControlMessage::ApplyV2 { txn_id, writes } => {
+            let mut out = builder.init_op().init_apply_v2();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_writes(writes, out.init_writes(writes.len() as u32));
+        }
+        AccordControlMessage::Apply {
+            txn_id,
+            result_data,
+        } => {
+            let mut out = builder.init_op().init_apply();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_result_data(result_data);
+        }
+        AccordControlMessage::ApplyOk { txn_id, from } => {
+            let mut out = builder.init_op().init_apply_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_from(*from);
+        }
+        AccordControlMessage::PreAccept {
+            txn_id,
+            t0,
+            key,
+            ballot,
+            epoch,
+        } => {
+            let mut out = builder.init_op().init_pre_accept();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            out.set_key(key);
+            out.set_ballot(*ballot);
+            out.set_epoch(*epoch);
+        }
+        AccordControlMessage::PreAcceptV2 {
+            txn_id,
+            t0,
+            keys,
+            ballot,
+            epoch,
+            snapshot_ts,
+        } => {
+            let mut out = builder.init_op().init_pre_accept_v2();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            {
+                let mut list = out.reborrow().init_keys(keys.len() as u32);
+                for (idx, key) in keys.iter().enumerate() {
+                    list.set(idx as u32, key);
+                }
+            }
+            out.set_ballot(*ballot);
+            out.set_epoch(*epoch);
+            if let Some(snapshot_ts) = snapshot_ts {
+                write_accord_txn_id(*snapshot_ts, out.init_snapshot_ts());
+            }
+        }
+        AccordControlMessage::PreAcceptOk {
+            from,
+            t,
+            deps,
+            snapshot_stale,
+        } => {
+            let mut out = builder.init_op().init_pre_accept_ok();
+            out.set_from(*from);
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            write_accord_txn_ids(deps, out.reborrow().init_deps(deps.len() as u32));
+            out.set_snapshot_stale(*snapshot_stale);
+        }
+        AccordControlMessage::Accept {
+            txn_id,
+            t0,
+            t,
+            deps,
+            ballot,
+        } => {
+            let mut out = builder.init_op().init_accept();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            write_accord_txn_ids(deps, out.reborrow().init_deps(deps.len() as u32));
+            out.set_ballot(*ballot);
+        }
+        AccordControlMessage::AcceptOk { txn_id, deps } => {
+            let mut out = builder.init_op().init_accept_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_ids(deps, out.init_deps(deps.len() as u32));
+        }
+        AccordControlMessage::Commit {
+            txn_id,
+            t0,
+            t,
+            deps,
+        } => {
+            let mut out = builder.init_op().init_commit();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            write_accord_txn_ids(deps, out.init_deps(deps.len() as u32));
+        }
+        AccordControlMessage::CommitOk { txn_id, from } => {
+            let mut out = builder.init_op().init_commit_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_from(*from);
+        }
+        AccordControlMessage::Recover { txn_id, t0, ballot } => {
+            let mut out = builder.init_op().init_recover();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            out.set_ballot(*ballot);
+        }
+        AccordControlMessage::RecoverOk => {
+            builder.init_op().set_recover_ok(());
+        }
+        AccordControlMessage::Read {
+            txn_id,
+            t,
+            key,
+            predicate,
+        } => {
+            let mut out = builder.init_op().init_read();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            out.set_key(key);
+            write_accord_read_predicate(predicate, out.init_predicate());
+        }
+        AccordControlMessage::ReadOk {
+            txn_id,
+            from,
+            condition_holds,
+            current_row,
+        } => {
+            let mut out = builder.init_op().init_read_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_from(*from);
+            out.set_condition_holds(*condition_holds);
+            out.set_current_row(current_row);
+        }
+    }
+    Ok(())
+}
+
+fn read_accord(
+    reader: accord_control::Reader<'_>,
+) -> Result<AccordControlMessage, CapnpDecodeError> {
+    use accord_control::op;
+    Ok(match reader.get_op().which().map_err(not_in_schema)? {
+        op::ApplyV2(apply) => {
+            let apply = apply?;
+            AccordControlMessage::ApplyV2 {
+                txn_id: read_accord_txn_id(apply.get_txn_id()?),
+                writes: read_accord_writes(apply.get_writes()?)?,
+            }
+        }
+        op::Apply(apply) => {
+            let apply = apply?;
+            AccordControlMessage::Apply {
+                txn_id: read_accord_txn_id(apply.get_txn_id()?),
+                result_data: apply.get_result_data()?.to_vec(),
+            }
+        }
+        op::ApplyOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::ApplyOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                from: ok.get_from(),
+            }
+        }
+        op::PreAccept(v) => {
+            let v = v?;
+            AccordControlMessage::PreAccept {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                key: v.get_key()?.to_vec(),
+                ballot: v.get_ballot(),
+                epoch: v.get_epoch(),
+            }
+        }
+        op::PreAcceptV2(v) => {
+            let v = v?;
+            let keys = v.get_keys()?;
+            let keys = (0..keys.len())
+                .map(|idx| keys.get(idx).map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>, _>>()?;
+            AccordControlMessage::PreAcceptV2 {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                keys,
+                ballot: v.get_ballot(),
+                epoch: v.get_epoch(),
+                snapshot_ts: if v.has_snapshot_ts() {
+                    Some(read_accord_txn_id(v.get_snapshot_ts()?))
+                } else {
+                    None
+                },
+            }
+        }
+        op::PreAcceptOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::PreAcceptOk {
+                from: ok.get_from(),
+                t: read_accord_txn_id(ok.get_t()?),
+                deps: read_accord_txn_ids(ok.get_deps()?)?,
+                snapshot_stale: ok.get_snapshot_stale(),
+            }
+        }
+        op::Accept(v) => {
+            let v = v?;
+            AccordControlMessage::Accept {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                t: read_accord_txn_id(v.get_t()?),
+                deps: read_accord_txn_ids(v.get_deps()?)?,
+                ballot: v.get_ballot(),
+            }
+        }
+        op::AcceptOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::AcceptOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                deps: read_accord_txn_ids(ok.get_deps()?)?,
+            }
+        }
+        op::Commit(v) => {
+            let v = v?;
+            AccordControlMessage::Commit {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                t: read_accord_txn_id(v.get_t()?),
+                deps: read_accord_txn_ids(v.get_deps()?)?,
+            }
+        }
+        op::CommitOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::CommitOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                from: ok.get_from(),
+            }
+        }
+        op::Recover(v) => {
+            let v = v?;
+            AccordControlMessage::Recover {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                ballot: v.get_ballot(),
+            }
+        }
+        op::RecoverOk(()) => AccordControlMessage::RecoverOk,
+        op::Read(v) => {
+            let v = v?;
+            AccordControlMessage::Read {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t: read_accord_txn_id(v.get_t()?),
+                key: v.get_key()?.to_vec(),
+                predicate: read_accord_read_predicate(v.get_predicate()?)?,
+            }
+        }
+        op::ReadOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::ReadOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                from: ok.get_from(),
+                condition_holds: ok.get_condition_holds(),
+                current_row: ok.get_current_row()?.to_vec(),
+            }
+        }
+    })
+}
+
+/// Encode one Accord payload into a standalone capnp envelope.
+///
+/// The transport-version and feature fields are stamped exactly as the generic
+/// [`encode_envelope`] path stamps them, so a frame produced here is the frame a
+/// peer that negotiated [`CapnpPayload::Accord`] receives.
+pub fn encode_accord_envelope(payload: &AccordControlMessage) -> Result<Vec<u8>, CapnpDecodeError> {
+    encode_envelope(&base_envelope(
+        Uuid::nil(),
+        0,
+        CapnpPayload::Accord(payload.clone()),
+    ))
+}
+
+/// Decode a frame produced by [`encode_accord_envelope`] back to its Accord payload.
+pub fn decode_accord_envelope(bytes: &[u8]) -> Result<AccordControlMessage, CapnpDecodeError> {
+    match decode_envelope(bytes)?.payload {
+        CapnpPayload::Accord(payload) => Ok(payload),
+        other => Err(CapnpDecodeError::UnknownPayload(format!(
+            "expected an Accord payload, found {other:?}"
+        ))),
+    }
 }
 
 fn read_required_uuid(field: &str, data: &[u8]) -> Result<Uuid, CapnpDecodeError> {

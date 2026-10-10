@@ -897,8 +897,17 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   dir) and gates on an absolute floor (`WRITE_SET_SPILL_FLOOR_BYTES = 8 MiB`), not
   the `spill_budget` ORDER BY threshold — that is a fraction of the *process*
   budget, the wrong scale for one transaction's write-set. Below the floor the
-  write-set stays wholly resident. `stage` drains each payload as it writes;
-  `mutation(i)` fails loud on an un-staged index, never returning an empty mutation.
+  write-set stays wholly resident. `stage` drains each payload as it writes; an
+  un-staged index fails loud, never returning an empty mutation.
+  **The staged region is MMAPPED** (`memmap2`): once written, the staging file is
+  mapped read-only, so `entry(i)` returns a borrowed **slice of the mapping** — no
+  `lseek`, no `read_exact`, no per-read lock, no syscall. The pre-mmap path paid one
+  seek + one `read` + one mutex acquisition **per write-set entry**; at N = 1.1M the
+  coordinator's Apply fan-out resolved every entry through it, ~1.1M syscalls
+  serialized behind one mutex (measured as the bulk of `serialize_ms` on the
+  `FERROSA_PG_COMMIT_PROFILE` fan-out line). `mutation(i)` is the owned twin
+  (`entry(i)?.to_vec()`), kept for the Apply wire types, which still hold
+  `Vec<u8>` — so the per-entry copy INTO the serialized frame remains.
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per
