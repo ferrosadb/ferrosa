@@ -1745,6 +1745,7 @@ where
 pub(crate) mod txn_atomicity_tests {
     use super::*;
     use crate::extended::Session;
+    use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
     use ferrosa_schema::{
         AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
         EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
@@ -1929,6 +1930,144 @@ pub(crate) mod txn_atomicity_tests {
         engine.register_table(kv_storage_schema()).unwrap();
         let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_kv()));
         (dir, ctx)
+    }
+
+    /// `make_ctx` for a table whose partition key is the synthetic `_sys_ck_` column —
+    /// the shape `ddl::plan_create_table` produces for a `CREATE TABLE` with no
+    /// `PRIMARY KEY`. `public.sk(_sys_ck_ uuid, v text)`, keyed on `_sys_ck_`. The key
+    /// column is invisible to the client, so every INSERT/COPY row must have one minted.
+    pub(crate) async fn make_ctx_synthetic_key() -> (tempfile::TempDir, QueryContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine
+            .register_table(synthetic_key_storage_schema())
+            .unwrap();
+        let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_synthetic_key()));
+        (dir, ctx)
+    }
+
+    /// `make_ctx_synthetic_key` with the transaction write-set cap raised, so a COPY large
+    /// enough to matter buffers without hitting the fail-loud `53400` cap first (the deployed
+    /// cluster runs `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000` for `pgbench -i`'s ~1.1M-row load).
+    pub(crate) async fn make_ctx_synthetic_key_with_cap(
+        max_txn_writes: usize,
+    ) -> (tempfile::TempDir, QueryContext) {
+        let (dir, mut ctx) = make_ctx_synthetic_key().await;
+        ctx.mvcc = Arc::new(crate::mvcc::MvccManager::with_max_txn_writes(
+            max_txn_writes,
+        ));
+        (dir, ctx)
+    }
+
+    fn synthetic_key_storage_schema() -> ferrosa_common::schema::TableSchema {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        TableSchema {
+            keyspace: "public".to_string(),
+            table: "sk".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// `public.sk`, whose partition key is the synthetic `_sys_ck_` column of type `uuid`
+    /// — the shape `plan_create_table` produces for a PK-less table.
+    fn schema_with_synthetic_key() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        let mut cols = IndexMap::new();
+        cols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "sk".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: cols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table sk");
+        schema
+    }
+
+    /// Every DISTINCT synthetic key visible through `SELECT _sys_ck_ FROM sk`, as its
+    /// 16 raw bytes. The synthetic key is invisible to `SELECT *`; naming it returns it.
+    pub(crate) async fn synthetic_keys(ctx: &QueryContext) -> Vec<Vec<u8>> {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            "SELECT _sys_ck_ FROM sk",
+            &ctx.default_schema,
+            &ctx.jsonb_limits,
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "SELECT _sys_ck_ failed: {msgs:?}"
+        );
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns[0].clone().unwrap_or_default()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `v` values visible through `SELECT v FROM sk`, in read order.
+    pub(crate) async fn synthetic_values(ctx: &QueryContext) -> Vec<String> {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            "SELECT v FROM sk",
+            &ctx.default_schema,
+            &ctx.jsonb_limits,
+            None,
+        )
+        .await;
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    String::from_utf8_lossy(columns[0].as_deref().unwrap_or_default()).into_owned(),
+                ),
+                _ => None,
+            })
+            .collect()
     }
 
     /// `make_ctx` with hard write admission enabled, so a client can fill the
@@ -2152,6 +2291,115 @@ pub(crate) mod txn_atomicity_tests {
             row_count(&ctx, "k1").await,
             0,
             "COMMIT must apply the buffered truncate"
+        );
+    }
+
+    /// A PK-less table keys on the invisible synthetic `_sys_ck_` uuid. `TRUNCATE`
+    /// buffers a table-level tombstone under a RESERVED partition key — a
+    /// partition-tombstone MARKER, not a row — and building a transaction's row
+    /// images must skip it. Before the fix, COMMIT decoded the marker's magic bytes
+    /// as `_sys_ck_` (a uuid) and failed loud (`build transaction row image failed:
+    /// uuid requires 16 bytes`), losing the whole transaction. This is the exact
+    /// shape `pgbench -i` hits: it runs `TRUNCATE` INSIDE the load transaction, so
+    /// the deployed load died at COMMIT even though every row had landed. The `kv`
+    /// test above could not see this because a `text` key accepts any bytes.
+    #[tokio::test]
+    async fn truncate_inside_a_transaction_commits_on_a_pkless_table() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('a')").await;
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('b')").await;
+        assert_eq!(synthetic_values(&ctx).await.len(), 2);
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "TRUNCATE is accepted inside a transaction: {messages:?}"
+        );
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "COMMIT must build row images for the transaction's ROWS, never for the \
+             reserved table-tombstone key: {messages:?}"
+        );
+        assert_eq!(command_tag(&messages).as_deref(), Some("COMMIT"));
+        assert!(
+            synthetic_values(&ctx).await.is_empty(),
+            "the buffered truncate must apply on COMMIT"
+        );
+    }
+
+    /// The same reserved tombstone key reaches the open transaction's READ overlay:
+    /// a SELECT in the transaction that buffered the TRUNCATE must not decode it as a
+    /// data row either. Before the fix this failed loud (`transaction overlay failed:
+    /// uuid requires 16 bytes`).
+    #[tokio::test]
+    async fn reading_inside_a_transaction_after_a_truncate_does_not_decode_the_tombstone() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('a')").await;
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        let messages = execute_simple(&ctx, &mut session, "SELECT v FROM sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "the transaction overlay must skip the reserved tombstone key: {messages:?}"
+        );
+        execute_simple(&ctx, &mut session, "COMMIT").await;
+    }
+
+    /// An autocommit `TRUNCATE` on a PK-less table is an implicit transaction and
+    /// takes the same row-image path; it must commit too. Before the fix it failed
+    /// with `write failed: invalid data: build transaction row image failed: uuid
+    /// requires 16 bytes`.
+    #[tokio::test]
+    async fn autocommit_truncate_on_a_pkless_table_commits() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('a')").await;
+
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "an autocommit TRUNCATE on a PK-less table must commit: {messages:?}"
+        );
+        assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
+        assert!(
+            synthetic_values(&ctx).await.is_empty(),
+            "the truncate applied"
+        );
+    }
+
+    /// A `TRUNCATE` inside a transaction must also commit when a table tombstone
+    /// already exists in storage (from an earlier commit): the BEFORE-image read the
+    /// commit performs must skip the reserved marker key too, not only the after-image
+    /// build. Otherwise a second truncate of the same PK-less table fails loud
+    /// (`read before image failed: uuid requires 16 bytes`).
+    #[tokio::test]
+    async fn truncate_inside_a_transaction_commits_when_a_tombstone_already_exists() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        // Autocommit: the marker lands in storage.
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "first truncate: {messages:?}"
+        );
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "a second truncate of the same PK-less table must commit: {messages:?}"
         );
     }
 

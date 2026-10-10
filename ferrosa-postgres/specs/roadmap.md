@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-10-09
+last_updated: 2026-10-10
 ---
 
 # ferrosa-postgres — Roadmap
@@ -12,6 +12,25 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 `feature_not_supported` paths and documented lossy fallbacks instead.
 
 ## Done (recent)
+
+- **The transactional `TRUNCATE` row-image decode fix (FMEA PG-TRUNCATE-03).** Building a
+  transaction's MVCC row images — and the transaction's read overlay — used to decode EVERY
+  buffered mutation's key as its column type, including the `TRUNCATE` table-tombstone
+  marker, whose reserved partition key is marker magic bytes, not a value of any key column.
+  A PK-less table (synthetic `_sys_ck_` uuid) or an `int`-keyed one failed loud: `pgbench -i`
+  lost its whole `--scale 10` load at `COMMIT` (`build transaction row image failed: uuid
+  requires 16 bytes`) *after* all ~1.1M rows had landed; reading the table back inside the
+  transaction failed too (`transaction overlay failed: …`), and autocommit failed the same
+  way (`write failed: …`). A `text`-keyed table silently accepted the magic as a bogus key,
+  which is why the earlier text-keyed `TRUNCATE` tests were green. **Fix:** skip a
+  table-tombstone mutation when row images are built
+  (`storage_provider::apply_pending_writes_with_partition_keys`, the choke point the commit
+  build and the read overlay share) — the marker is not a data row, and the commit path still
+  applies it (and, on a cluster, replicates it to every serving node). Tests:
+  `truncate_inside_a_transaction_commits_on_a_pkless_table`,
+  `reading_inside_a_transaction_after_a_truncate_does_not_decode_the_tombstone`,
+  `autocommit_truncate_on_a_pkless_table_commits`,
+  `truncate_inside_a_transaction_commits_when_a_tombstone_already_exists`.
 
 - **`::` casts, and `pg_catalog.*` as a queryable relation** (`catalog::resolve_regclass`,
   `query::resolve_casts`, `load_catalog_with_mvcc`). `$1::pg_catalog.regclass` resolves the relation

@@ -510,7 +510,10 @@ fn bad_payload(message: &str) -> BackendMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::txn_atomicity_tests::{make_ctx, row_count, superuser};
+    use crate::server::txn_atomicity_tests::{
+        make_ctx, make_ctx_synthetic_key, make_ctx_synthetic_key_with_cap, row_count, superuser,
+        synthetic_keys, synthetic_values,
+    };
 
     /// Frame a frontend message: one tag byte, a big-endian length that INCLUDES the length word
     /// itself, then the body. There is no frontend encoder in the codec (the server only ever
@@ -944,6 +947,187 @@ mod tests {
             row_count(&ctx, "good").await,
             0,
             "a failed COPY must never commit a partial load"
+        );
+    }
+
+    /// The transactional COPY into a PK-LESS table: the table declared no `PRIMARY KEY`, so
+    /// it keys on the invisible synthetic `_sys_ck_` column and every buffered row needs its
+    /// own minted v1 TimeUUID. RED before the fix — COMMIT built the row image and rejected
+    /// the key as `uuid requires 16 bytes`. The rows must now LAND at COMMIT.
+    #[tokio::test]
+    async fn copy_inside_a_transaction_into_a_pkless_table_commits_its_rows() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let (_reply, text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY sk (v) FROM STDIN",
+            &[copy_data(b"a\nb\nc\n"), frame(b'c', &[])],
+        )
+        .await;
+        assert!(
+            text.contains("COPY 3"),
+            "the buffered COPY reports its count: {text:?}"
+        );
+        assert_eq!(
+            session.txn_writes().len(),
+            3,
+            "all three rows sit in the transaction write-set"
+        );
+
+        simple(&ctx, &mut session, "COMMIT").await;
+
+        let mut values = synthetic_values(&ctx).await;
+        values.sort();
+        assert_eq!(
+            values,
+            vec!["a", "b", "c"],
+            "every buffered row must land at COMMIT: {text:?}"
+        );
+    }
+
+    /// The property a "rows landed" count alone would MISS: each buffered row must carry its
+    /// OWN synthetic key. A key minted once and reused for every row of the batch collapses
+    /// N rows into one — the write-set applies cleanly and reports success while silently
+    /// losing rows, which is exactly the row-loss bug keying on a non-unique column had.
+    #[tokio::test]
+    async fn copy_inside_a_transaction_gives_each_buffered_row_its_own_key() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let (_reply, _text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY sk (v) FROM STDIN",
+            &[copy_data(b"a\nb\nc\nd\ne\n"), frame(b'c', &[])],
+        )
+        .await;
+        simple(&ctx, &mut session, "COMMIT").await;
+
+        let keys = synthetic_keys(&ctx).await;
+        assert_eq!(keys.len(), 5, "count rows == count keys");
+        let distinct: std::collections::HashSet<&Vec<u8>> = keys.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            5,
+            "each buffered row must have a DISTINCT synthetic key; {keys:?}"
+        );
+    }
+
+    /// The distinct keys must also stay TIME-ORDERED: the synthetic key is the storage key,
+    /// and a batch whose keys sort backwards scatters rows that were written in order. This
+    /// is the same monotonicity the mint guarantees, asserted across a whole buffered COPY.
+    #[tokio::test]
+    async fn copy_buffered_synthetic_keys_stay_time_ordered() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let payload = (0..50).map(|i| format!("v{i}\n")).collect::<String>();
+        let (_reply, _text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY sk (v) FROM STDIN",
+            &[copy_data(payload.as_bytes()), frame(b'c', &[])],
+        )
+        .await;
+        simple(&ctx, &mut session, "COMMIT").await;
+
+        let mut keys = synthetic_keys(&ctx).await;
+        assert_eq!(keys.len(), 50, "all 50 rows must land");
+        // The keys as handed out are already ordered; reading them back sorted must not
+        // change the SET (they are all distinct and monotone), so a strictly increasing
+        // sort is the assertion.
+        let sorted = {
+            let mut k = keys.clone();
+            k.sort();
+            k
+        };
+        keys.sort();
+        assert_eq!(sorted, keys, "the 50 distinct keys must sort as themselves");
+        for pair in sorted.windows(2) {
+            assert!(pair[0] < pair[1], "keys must be strictly increasing");
+        }
+    }
+
+    /// No regression: an AUTOCOMMIT COPY (no open transaction) into the same PK-less table
+    /// still mints a key per row and applies each immediately.
+    #[tokio::test]
+    async fn autocommit_copy_into_a_pkless_table_still_works() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let (_reply, text) = run_copy(
+            &ctx,
+            "COPY sk (v) FROM STDIN",
+            &[copy_data(b"x\ny\n"), frame(b'c', &[])],
+        )
+        .await;
+
+        assert!(text.contains("COPY 2"), "the reported count: {text:?}");
+        let mut values = synthetic_values(&ctx).await;
+        values.sort();
+        assert_eq!(values, vec!["x", "y"], "autocommit rows land: {text:?}");
+        let keys = synthetic_keys(&ctx).await;
+        let distinct: std::collections::HashSet<&Vec<u8>> = keys.iter().collect();
+        assert_eq!(distinct.len(), 2, "a key per row in autocommit too");
+    }
+
+    /// The deployed shape: `pgbench -i` buffers ~1.1M rows into ONE transaction write-set
+    /// (cap raised to 3,000,000) and commits them in one COMMIT. A COPY that buffers without
+    /// error but whose COMMIT cannot build the row images would fail exactly here. RED before
+    /// the fix: `uuid requires 16 bytes`. Kept at 30k rows so it runs fast.
+    #[tokio::test]
+    async fn a_large_transactional_copy_into_a_pkless_table_commits_distinct_rows() {
+        const N: usize = 30_000;
+        let (_dir, ctx) = make_ctx_synthetic_key_with_cap(3_000_000).await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let payload = (0..N).map(|i| format!("v{i}\n")).collect::<String>();
+        let (_reply, text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY sk (v) FROM STDIN",
+            &[copy_data(payload.as_bytes()), frame(b'c', &[])],
+        )
+        .await;
+        assert!(
+            text.contains(&format!("COPY {N}")),
+            "reported count: {text:?}"
+        );
+        assert_eq!(session.txn_writes().len(), N, "all rows buffered");
+
+        simple(&ctx, &mut session, "COMMIT").await;
+
+        let keys = synthetic_keys(&ctx).await;
+        assert_eq!(keys.len(), N, "every buffered row must land at COMMIT");
+        let distinct: std::collections::HashSet<&Vec<u8>> = keys.iter().collect();
+        assert_eq!(distinct.len(), N, "each row needs its OWN key");
+    }
+
+    /// Preserved invariant: a transactional COPY into a PK-less table that `ROLLBACK`s leaves
+    /// no rows — the buffered keys are discarded with the write-set.
+    #[tokio::test]
+    async fn copy_into_a_pkless_table_inside_a_rolled_back_transaction_leaves_no_rows() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let (_reply, text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY sk (v) FROM STDIN",
+            &[copy_data(b"a\nb\n"), frame(b'c', &[])],
+        )
+        .await;
+        assert!(text.contains("COPY 2"), "the COPY succeeds: {text:?}");
+
+        simple(&ctx, &mut session, "ROLLBACK").await;
+        assert!(
+            synthetic_values(&ctx).await.is_empty(),
+            "ROLLBACK must discard every buffered row"
         );
     }
 }

@@ -223,7 +223,14 @@ query-materialization caveats are in the public
    (`WritePath::write_all_serving_nodes`) and **every** target must acknowledge;
    a node that does not ack fails the commit **loudly** — no quorum degrade and no
    hint fallback. The reserved marker is exempt from purge, so nothing can be
-   resurrected; it lives until the table is dropped.
+   resurrected; it lives until the table is dropped. The marker is also **skipped
+   when a transaction's MVCC row images are built** — the commit row-image build
+   and the transaction read overlay share
+   `apply_pending_writes_with_partition_keys` — because its reserved key is marker
+   magic bytes, not a value of any key column, so decoding it as a data row would
+   fail loud for a PK-less (synthetic `_sys_ck_` uuid) or `int`-keyed table. That was
+   the `COMMIT` failure that killed `pgbench -i`'s transactional load after every
+   row had landed. See FMEA `PG-TRUNCATE-03`.
 
 ## Position in the dependency graph
 

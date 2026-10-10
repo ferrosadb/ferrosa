@@ -184,6 +184,23 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   - **Transactional.** Inside a `BEGIN` it BUFFERS into the write-set, applies
     atomically on `COMMIT`, and is discarded by `ROLLBACK` — the old `25001`
     refusal is gone; autocommit applies it at once.
+  - **The reserved marker key is skipped when the transaction's row images are
+    built.** The tombstone is buffered as a `Mutation` under a reserved partition
+    key (`ferrosa_storage::table_tombstone::table_tombstone_key`), whose bytes are the
+    marker magic — not a value of any key column. `query::prepare_row_changes` builds
+    MVCC row images for the transaction's DML rows, and
+    `storage_provider::apply_pending_writes_with_partition_keys` (which the read
+    overlay also uses) decodes each mutation's key as its column type; both now
+    **skip** a table-tombstone mutation, which carries no row image. Without the skip
+    a PK-less table (synthetic `_sys_ck_` uuid) or an `int`-keyed table failed loud —
+    `build transaction row image failed: uuid requires 16 bytes` at `COMMIT`,
+    `transaction overlay failed: …` reading it back inside the transaction, and the
+    same wrapped as `write failed: …` at autocommit — while a `text` key silently
+    accepted the magic bytes as a bogus key (which is why only a text-keyed test could
+    pass before). `pgbench -i` runs `TRUNCATE` inside its load transaction, so this is
+    the failure that killed a load whose rows had all landed. The marker is still
+    applied by the commit path — and, on a cluster, routed to every serving node
+    (below).
   - **Logically immediate; physical reclamation is lazy.** Reads return no rows for
     the table *the moment the tombstone commits*, because the marker suppresses
     every row older than its `marked_for_delete_at` on every read path table-wide —
