@@ -103,7 +103,7 @@ where
                 // Once a failure is pending the payload is discarded, not decoded: the client is
                 // still sending and these bytes have nowhere to go.
                 if failure.is_none() {
-                    match decoder.push(&data) {
+                    match decoder.push(data) {
                         Ok(rows) => {
                             if let Err(err) = insert_rows(
                                 ctx,
@@ -306,6 +306,17 @@ async fn insert_rows(
     rows: Vec<CopyRow>,
     inserted: &mut u64,
 ) -> Result<(), BackendMessage> {
+    // Built ONCE and reused. An `InsertStmt` owns its column list, so constructing one per row
+    // would clone the table name and the entire column list once for every row of the payload —
+    // a million times for a million-row COPY. Only the values differ between rows, so the row
+    // vector is reused in place.
+    let mut ins = InsertStmt {
+        table: stmt.table.clone(),
+        columns: columns.to_vec(),
+        rows: vec![Vec::new()],
+        returning: None,
+    };
+
     for row in rows {
         if row.len() != columns.len() {
             return Err(bad_payload(&format!(
@@ -314,7 +325,7 @@ async fn insert_rows(
                 columns.len()
             )));
         }
-        let values: Vec<ScalarValue> = row
+        ins.rows[0] = row
             .into_iter()
             .map(|field| {
                 ScalarValue::Literal(match field {
@@ -322,17 +333,19 @@ async fn insert_rows(
                     // A payload field is TEXT whatever the column's type: the format has no types,
                     // and it is `resolve_dml_value` that decides what the text means for the column
                     // it lands in. Coercing here would be a second, divergent notion of the types.
-                    Some(bytes) => Value::Text(String::from_utf8_lossy(&bytes).into_owned()),
+                    //
+                    // `from_utf8` MOVES the field's own allocation into the String instead of
+                    // copying it (`from_utf8_lossy(..).into_owned()` always allocated a second
+                    // buffer). A COPY payload is valid UTF-8 in the overwhelming majority of
+                    // cases, so this is a move; invalid UTF-8 still degrades to a lossy String
+                    // exactly as before, so no input changes meaning.
+                    Some(bytes) => Value::Text(match String::from_utf8(bytes) {
+                        Ok(text) => text,
+                        Err(not_utf8) => String::from_utf8_lossy(not_utf8.as_bytes()).into_owned(),
+                    }),
                 })
             })
             .collect();
-
-        let ins = InsertStmt {
-            table: stmt.table.clone(),
-            columns: columns.to_vec(),
-            rows: vec![values],
-            returning: None,
-        };
         let msgs = query::execute_insert(
             dml_context(ctx, Some(buffer)),
             &ins,

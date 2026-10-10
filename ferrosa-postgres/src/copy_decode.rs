@@ -120,11 +120,22 @@ impl CopyDecoder {
 
     /// Feed one `CopyData` payload and return the rows it completed.
     ///
+    /// Takes the payload BY VALUE. The frame arrives from the codec as an owned `Vec<u8>`, so the
+    /// bytes can be moved into the buffer rather than copied into it — and when nothing was left
+    /// over from the previous frame (the common case) the chunk simply BECOMES the buffer, with no
+    /// copy at all. A COPY payload is row data; copying it once per frame is exactly the kind of
+    /// avoidable allocation this crate's OOM audit exists to catch.
+    ///
     /// # Errors
     ///
     /// A malformed payload — see [`CopyDecodeError`].
-    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<CopyRow>, CopyDecodeError> {
-        self.pending.extend_from_slice(chunk);
+    pub fn push(&mut self, chunk: Vec<u8>) -> Result<Vec<CopyRow>, CopyDecodeError> {
+        if self.pending.is_empty() {
+            self.pending = chunk;
+        } else {
+            // Moves the bytes out of `chunk`; no clone of the payload.
+            self.pending.extend(chunk);
+        }
         let complete = match self.opts.format {
             CopyFormat::Text => complete_rows(&mut self.pending, b'\n'),
             // csv rows end at a newline that is not inside a quoted field, so the split has to
@@ -345,8 +356,21 @@ fn decode_csv_row(raw: &[u8], delimiter: u8) -> Result<CopyRow, CopyDecodeError>
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test-side shim for [`CopyDecoder::push`], which takes the frame payload BY VALUE so the
+    /// bytes can be MOVED into the buffer rather than copied. Tests hold byte-string literals,
+    /// slices and arrays, so they hand over a fresh `Vec` here; `AsRef<[u8]>` accepts all of them.
+    trait PushBytes {
+        fn push_owned(&mut self, bytes: impl AsRef<[u8]>) -> Result<Vec<CopyRow>, CopyDecodeError>;
+    }
+    impl PushBytes for CopyDecoder {
+        fn push_owned(&mut self, bytes: impl AsRef<[u8]>) -> Result<Vec<CopyRow>, CopyDecodeError> {
+            self.push(bytes.as_ref().to_vec())
+        }
+    }
 
     fn text() -> CopyDecoder {
         CopyDecoder::new(CopyOptions::text())
@@ -356,7 +380,7 @@ mod tests {
     #[test]
     fn text_rows_split_on_delimiter_and_newline() {
         let mut d = text();
-        let rows = d.push(b"1\thello\n2\tworld\n").unwrap();
+        let rows = d.push_owned(b"1\thello\n2\tworld\n").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0], vec![Some(b"1".to_vec()), Some(b"hello".to_vec())]);
         assert_eq!(rows[1], vec![Some(b"2".to_vec()), Some(b"world".to_vec())]);
@@ -369,12 +393,12 @@ mod tests {
     #[test]
     fn a_row_split_across_chunks_decodes_identically() {
         let payload = b"1\thello\n2\tworld\n3\t!\n";
-        let whole = text().push(payload).unwrap();
+        let whole = text().push_owned(payload).unwrap();
 
         let mut by_byte = Vec::new();
         let mut d = text();
         for b in payload {
-            by_byte.extend(d.push(&[*b]).unwrap());
+            by_byte.extend(d.push_owned([*b]).unwrap());
         }
         assert!(d.finish().unwrap().is_empty());
         assert_eq!(
@@ -385,9 +409,9 @@ mod tests {
         // And split at a deliberately awkward place: mid-field and mid-newline.
         let mut parts = Vec::new();
         let mut d = text();
-        parts.extend(d.push(&payload[..3]).unwrap()); // mid-"hello"
-        parts.extend(d.push(&payload[3..9]).unwrap()); // ends on the newline
-        parts.extend(d.push(&payload[9..]).unwrap());
+        parts.extend(d.push_owned(&payload[..3]).unwrap()); // mid-"hello"
+        parts.extend(d.push_owned(&payload[3..9]).unwrap()); // ends on the newline
+        parts.extend(d.push_owned(&payload[9..]).unwrap());
         assert_eq!(parts, whole);
     }
 
@@ -395,7 +419,7 @@ mod tests {
     /// data must arrive as `\\N` and must not be confused with it.
     #[test]
     fn text_null_is_unescaped_backslash_n_only() {
-        let rows = text().push(b"\\N\tx\n\\\\N\ty\n").unwrap();
+        let rows = text().push_owned(b"\\N\tx\n\\\\N\ty\n").unwrap();
         assert_eq!(rows[0][0], None, "`\\N` is NULL");
         assert_eq!(
             rows[1][0],
@@ -407,7 +431,7 @@ mod tests {
     /// The C escapes PostgreSQL defines, and a literal backslash.
     #[test]
     fn text_escapes_decode() {
-        let rows = text().push(b"a\\tb\\nc\\\\d\n").unwrap();
+        let rows = text().push_owned(b"a\\tb\\nc\\\\d\n").unwrap();
         assert_eq!(rows[0][0], Some(b"a\tb\nc\\d".to_vec()));
     }
 
@@ -417,19 +441,19 @@ mod tests {
     fn malformed_text_escapes_are_refused() {
         // A row whose last field ends mid-escape, and one with an escape that does not exist.
         assert_eq!(
-            text().push(b"bad\\\n").unwrap_err(),
+            text().push_owned(b"bad\\\n").unwrap_err(),
             CopyDecodeError::TruncatedEscape
         );
         assert_eq!(
-            text().push(b"bad\\q\n").unwrap_err(),
+            text().push_owned(b"bad\\q\n").unwrap_err(),
             CopyDecodeError::UnknownEscape('q')
         );
         // An incomplete trailing escape is NOT an error yet: the next chunk may supply the `n`
         // that makes it the newline escape. So it is held, exactly as an incomplete row is.
         let mut held = text();
-        assert_eq!(held.push(b"bad\\").unwrap().len(), 0);
+        assert_eq!(held.push_owned(b"bad\\").unwrap().len(), 0);
         assert_eq!(
-            held.push(b"n\n").unwrap().len(),
+            held.push_owned(b"n\n").unwrap().len(),
             1,
             "...and it does, so this was the escape rather than a malformed field"
         );
@@ -440,9 +464,9 @@ mod tests {
     fn a_trailing_partial_row_is_refused_at_finish() {
         // "ok\n" completes; the rest never terminates.
         let mut d = text();
-        assert_eq!(d.push(b"ok\n1\tpartial").unwrap().len(), 1);
+        assert_eq!(d.push_owned(b"ok\n1\tpartial").unwrap().len(), 1);
         assert_eq!(
-            d.push(b"").unwrap().len(),
+            d.push_owned(b"").unwrap().len(),
             0,
             "an incomplete tail is held, not rowed"
         );
@@ -456,7 +480,7 @@ mod tests {
     /// An empty delimiter-separated field is the empty string, not NULL: only `\N` is NULL.
     #[test]
     fn an_empty_text_field_is_the_empty_string() {
-        let rows = text().push(b"\t\n").unwrap();
+        let rows = text().push_owned(b"\t\n").unwrap();
         assert_eq!(rows[0], vec![Some(Vec::new()), Some(Vec::new())]);
     }
 
@@ -468,7 +492,7 @@ mod tests {
     #[test]
     fn csv_quoted_fields_may_contain_the_delimiter_and_newlines() {
         let mut d = csv();
-        let rows = d.push(b"1,\"a,b\"\n2,\"line\nbreak\"\n").unwrap();
+        let rows = d.push_owned(b"1,\"a,b\"\n2,\"line\nbreak\"\n").unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0][1], Some(b"a,b".to_vec()));
         assert_eq!(
@@ -482,7 +506,7 @@ mod tests {
     /// A doubled quote is a literal quote, and does not close the field.
     #[test]
     fn csv_doubled_quote_is_a_literal_quote() {
-        let rows = csv().push(b"1,\"say \"\"hi\"\"\"\n").unwrap();
+        let rows = csv().push_owned(b"1,\"say \"\"hi\"\"\"\n").unwrap();
         assert_eq!(rows[0][1], Some(b"say \"hi\"".to_vec()));
     }
 
@@ -490,7 +514,7 @@ mod tests {
     /// different values and must not collapse.
     #[test]
     fn csv_distinguishes_null_from_an_empty_string() {
-        let rows = csv().push(b"1,,\"\"\n").unwrap();
+        let rows = csv().push_owned(b"1,,\"\"\n").unwrap();
         assert_eq!(rows[0][0], Some(b"1".to_vec()));
         assert_eq!(rows[0][1], None, "unquoted empty is NULL");
         assert_eq!(
@@ -505,7 +529,7 @@ mod tests {
     fn csv_unterminated_quote_is_refused() {
         // A newline inside quotes is not a row boundary, so nothing is rowed yet...
         let mut d = csv();
-        assert_eq!(d.push(b"1,\"never closed\n").unwrap().len(), 0);
+        assert_eq!(d.push_owned(b"1,\"never closed\n").unwrap().len(), 0);
         // ...and the payload ending inside the field is the error. It cannot be detected earlier:
         // until the payload ends, every byte could still belong to the field.
         assert_eq!(
@@ -519,7 +543,7 @@ mod tests {
     #[test]
     fn csv_text_after_a_closing_quote_is_refused() {
         assert_eq!(
-            csv().push(b"1,\"a\"b\n").unwrap_err(),
+            csv().push_owned(b"1,\"a\"b\n").unwrap_err(),
             CopyDecodeError::TextAfterClosingQuote
         );
     }
@@ -530,7 +554,7 @@ mod tests {
         let mut opts = CopyOptions::csv();
         opts.header = true;
         let mut d = CopyDecoder::new(opts);
-        let rows = d.push(b"id,name\n1,a\n2,b\n").unwrap();
+        let rows = d.push_owned(b"id,name\n1,a\n2,b\n").unwrap();
         assert_eq!(rows.len(), 2, "the header is not a row");
         assert_eq!(rows[0][0], Some(b"1".to_vec()));
         assert_eq!(rows[1][0], Some(b"2".to_vec()));
@@ -539,7 +563,7 @@ mod tests {
     /// A CRLF client must not get a stray carriage return on its last field.
     #[test]
     fn crlf_terminators_do_not_leak_a_carriage_return() {
-        let rows = text().push(b"1\thello\r\n").unwrap();
+        let rows = text().push_owned(b"1\thello\r\n").unwrap();
         assert_eq!(rows[0][1], Some(b"hello".to_vec()));
     }
 }

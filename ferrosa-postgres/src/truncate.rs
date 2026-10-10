@@ -21,7 +21,7 @@
 //!
 //! - No executor (`None`) means the front-end has no replicated write path
 //!   (unit-test contexts): the statement is refused with `0A000` rather than
-//!   reported as done — see [`execute_truncate`].
+//!   reported as done — see `execute_truncate`.
 //! - `TRUNCATE` inside an explicit transaction block is refused with `25001`.
 //!   ferrosa applies the truncate immediately through [`WritePath`]; it is not
 //!   buffered with the PostgreSQL MVCC write-set and would NOT roll back, so

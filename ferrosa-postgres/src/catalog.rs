@@ -199,7 +199,7 @@ pub fn pg_namespace(schema: &Schema) -> InMemoryTable {
 /// table, `'i'` index).
 ///
 /// A table with a primary key gets an `'i'` row for the index that backs it,
-/// named [`primary_key_index_name`] (`<table>_pkey`) — the row a client joins to
+/// named `primary_key_index_name` (`<table>_pkey`) — the row a client joins to
 /// through `pg_index.indexrelid` to name the key. A table whose only key is the
 /// synthesized `_sys_ck_` gets none: there is no primary-key index to point at.
 pub fn pg_class(schema: &Schema) -> InMemoryTable {
@@ -335,7 +335,7 @@ pub fn pg_type(schema: &Schema) -> Result<InMemoryTable, PgTypeError> {
 ///
 /// Only a table's **primary-key** index is projected — the one psql's describe
 /// joins on (`indisprimary`) and the only one this front end builds
-/// ([`primary_key_index_name`]). The key comes from [`crate::pg_key::of`], which
+/// (`primary_key_index_name`). The key comes from [`crate::pg_key::of`], which
 /// returns the **declared** key and nothing for a table whose only key is the
 /// synthesized `_sys_ck_`; such a table therefore gets no row, and a client cannot
 /// be shown a primary key the user never declared.
