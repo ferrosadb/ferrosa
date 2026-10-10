@@ -520,19 +520,6 @@ impl AccordCoordinator {
 pub enum AccordDriverError {
     /// Too few replicas responded to reach a quorum.
     QuorumUnavailable,
-    /// The transaction's write-set has more keys than a node's Accord
-    /// conflict-index capacity can hold. A PreAccept registers the transaction
-    /// under EVERY key and is all-or-nothing, so a write-set larger than the
-    /// index is refused by *every* replica and is indistinguishable from a
-    /// cluster fault unless named here. Raised before the protocol registers
-    /// anything, so no finalize is owed.
-    WriteSetExceedsCapacity {
-        /// Number of keys in this transaction's write-set.
-        keys: usize,
-        /// The node's configured conflict-index capacity (see
-        /// [`crate::accord::state_machine::configured_conflict_index_capacity`]).
-        capacity: usize,
-    },
     /// Network I/O error communicating with a replica.
     Network(String),
     /// Serialization/deserialization failure.
@@ -566,13 +553,6 @@ impl std::fmt::Display for AccordDriverError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::QuorumUnavailable => write!(f, "Accord quorum unavailable"),
-            Self::WriteSetExceedsCapacity { keys, capacity } => write!(
-                f,
-                "transaction write-set of {keys} keys exceeds the Accord conflict-index capacity of \
-                 {capacity}; raise FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY (or lower \
-                 FERROSA_POSTGRES_MAX_TXN_WRITES) so the consensus layer can register every \
-                 write-set the SQL layer accepts"
-            ),
             Self::Network(e) => write!(f, "Accord network error: {e}"),
             Self::Codec(e) => write!(f, "Accord codec error: {e}"),
             Self::ConditionNotMet { .. } => write!(f, "Accord LWT condition not met"),
@@ -616,16 +596,6 @@ pub struct AccordCoordinatorDriver {
     coordinator: AccordCoordinator,
     /// Maximum wait for a possible final fast-path PreAccept vote.
     preaccept_fast_path_timeout: std::time::Duration,
-    /// The node's Accord conflict-index capacity (see
-    /// [`crate::accord::state_machine::configured_conflict_index_capacity`]).
-    ///
-    /// A PreAccept registers the transaction under every key it writes and is
-    /// all-or-nothing, so a write-set larger than this can never reach a quorum —
-    /// every replica refuses it. Bounding the driver here turns that opaque
-    /// "Accord quorum unavailable" into a named, actionable error before the
-    /// protocol runs. Overridable via
-    /// [`Self::with_conflict_index_capacity`] so the guard is testable.
-    conflict_index_capacity: usize,
     /// Network seam: `PeerManager` in production, a mock in tests.
     peers: Arc<dyn AccordTransport>,
     /// IDs of the replicas for this transaction's token range.
@@ -991,8 +961,6 @@ impl AccordCoordinatorDriver {
         Self {
             coordinator,
             preaccept_fast_path_timeout: configured_preaccept_fast_path_timeout(),
-            conflict_index_capacity:
-                crate::accord::state_machine::configured_conflict_index_capacity(),
             peers,
             replica_ids,
             snapshot_ts: None,
@@ -1032,18 +1000,6 @@ impl AccordCoordinatorDriver {
     /// after the coordinator has already collected a valid slow quorum.
     pub fn with_preaccept_fast_path_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.preaccept_fast_path_timeout = timeout;
-        self
-    }
-
-    /// Override the node's Accord conflict-index capacity for this driver.
-    ///
-    /// Production takes it from
-    /// [`configured_conflict_index_capacity`](crate::accord::state_machine::configured_conflict_index_capacity);
-    /// this exists so the oversized-write-set guard is testable without touching
-    /// the process environment (which `set_var` makes racy under parallel tests).
-    #[must_use]
-    pub fn with_conflict_index_capacity(mut self, capacity: usize) -> Self {
-        self.conflict_index_capacity = capacity;
         self
     }
 
@@ -1473,28 +1429,6 @@ impl AccordCoordinatorDriver {
     pub async fn run_transaction(
         &mut self,
     ) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
-        // A write-set larger than a node's conflict index can never be decided:
-        // the PreAccept registration is all-or-nothing, so every replica refuses
-        // it and the caller sees an opaque "Accord quorum unavailable". Name it
-        // here, before the protocol registers anything (so no finalize is owed),
-        // rather than let a 1.1M-row transactional COPY fail as a mystery. See
-        // `state_machine::resolve_conflict_index_capacity` for the coherence rule
-        // (conflict-index capacity must cover every write-set the front end
-        // admits) that this enforces on the coordinator side.
-        let capacity = self.conflict_index_capacity;
-        if self.write_set.len() > capacity {
-            tracing::error!(
-                txn_id = ?self.coordinator.txn_id,
-                keys = self.write_set.len(),
-                capacity,
-                "accord: refusing a transaction whose write-set exceeds the node's conflict-index \
-                 capacity; no replica could register it (see FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY)"
-            );
-            return Err(AccordDriverError::WriteSetExceedsCapacity {
-                keys: self.write_set.len(),
-                capacity,
-            });
-        }
         let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
         let write_set_len = self.write_set.len();
         let t_order = profile.then(std::time::Instant::now);
@@ -5444,20 +5378,15 @@ mod tests {
         )
     }
 
-    /// A write-set larger than the node's conflict-index capacity can never be
-    /// decided: a PreAccept registers the transaction under EVERY key and is
-    /// all-or-nothing, so every replica refuses it and the coordinator would
-    /// report the opaque "Accord quorum unavailable" that a ~1.1M-row
-    /// transactional COPY produced live on 2026-10-10 (`key_count=1000112
-    /// e=conflict index at capacity`, votes=0 on a healthy cluster).
-    ///
-    /// The driver must instead NAME the limit, and do it before the protocol runs
-    /// so nothing is registered anywhere and no no-write finalize is owed.
+    /// INVERSE of the retired `an_oversized_write_set_is_refused_by_name_*` test.
+    /// There is no longer any capacity guard: the coordinator must NOT refuse a
+    /// write-set for its size before the protocol runs — the consensus layer GROWS
+    /// to hold it. (The retired test asserted the defect: that a 2-key write-set
+    /// was rejected locally when the node was "configured for one".)
     #[tokio::test]
-    async fn an_oversized_write_set_is_refused_by_name_before_the_protocol_runs() {
-        // Every replica refuses every RPC: with the guard absent this is a plain
-        // quorum failure, so the returned variant discriminates the two paths.
-        let transport = flaky(&[(2, usize::MAX), (3, usize::MAX)]);
+    async fn a_large_write_set_is_not_refused_before_the_protocol_runs() {
+        // Every peer acks: a size guard would fire before a single RPC is sent.
+        let transport = flaky(&[]);
         let clock = HybridLogicalClock::new(1, 0);
         let write_set = vec![
             (b"k1".to_vec(), b"m1".to_vec()),
@@ -5474,37 +5403,17 @@ mod tests {
             false,
             &clock,
             write_set,
-        )
-        .with_conflict_index_capacity(1);
+        );
 
-        let result = driver.run_transaction().await;
+        // Bounded: the point is that the protocol STARTS, not that the mock's
+        // canned ack lets it finish. A size guard would return before any RPC.
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_secs(5), driver.run_transaction()).await;
 
-        match result {
-            Err(error @ AccordDriverError::WriteSetExceedsCapacity { keys, capacity }) => {
-                assert_eq!(keys, 2, "the write-set has two keys");
-                assert_eq!(capacity, 1, "the node was configured for one");
-                let rendered = error.to_string();
-                assert!(
-                    rendered.contains("conflict-index capacity"),
-                    "the error must name the limit: {rendered}"
-                );
-                assert!(
-                    rendered.contains("FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY"),
-                    "the error must name the knob that fixes it: {rendered}"
-                );
-                assert!(
-                    !rendered.starts_with("abandoned:"),
-                    "an oversized write-set is a fault, not a retryable abandon: {rendered}"
-                );
-            }
-            other => panic!("an oversized write-set must be refused by name, not as {other:?}"),
-        }
-
-        // The guard fires before the protocol runs: no registration exists on any
-        // replica, so no no-write finalize is owed.
         assert!(
-            transport.sends.lock().unwrap().is_empty(),
-            "the guard must refuse before any RPC is sent"
+            !transport.sends.lock().unwrap().is_empty(),
+            "no capacity guard may refuse the write-set before the protocol runs — \
+             the PreAccept must be fanned out"
         );
     }
 

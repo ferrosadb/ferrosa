@@ -311,8 +311,7 @@ values log an error and the process uses the complete defaults:
 
 | Environment variable | Default | Bound |
 |---|---:|---|
-| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | Buffered mutations per transaction |
-| `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` | derived | Keys one Accord txn may register; defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES`, floor `100000` |
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | Resident mutations buffered per transaction; fails loud `53400` past it. A stopgap on a resident buffer — **retained** until the front end streams the write-set to disk (FMEA `PG-ACC-01`) |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |

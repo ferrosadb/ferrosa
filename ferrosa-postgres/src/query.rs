@@ -1480,6 +1480,20 @@ async fn apply_or_buffer(
 /// success and the error response(s) to send on failure — no `CommandComplete`,
 /// so a caller that writes several mutations for ONE statement (TRUNCATE of a
 /// table list) can emit a single tag.
+///
+/// # The write-set buffer stays BOUNDED on purpose (the cap is RETAINED)
+///
+/// The open-transaction buffer is a resident `Vec<PgWrite>`, so `max_txn_writes`
+/// (the `53400` refusal below) is the only thing bounding the front end's
+/// resident memory for a transactional bulk load. The owner's rule forbids a
+/// refusal CAP only in favour of a buffer that SPILLS; an unbounded *resident*
+/// `Vec` is the materialization the rule calls an OOM bug, not a buffer. Lifting
+/// this cap is therefore BLOCKED until the front end writes its buffer to disk as
+/// rows arrive — the streaming, threshold-bounded `WriteSetStage` landed on
+/// `fix/pgwire-nonresident-write-path` (`.wt-accord-stream`) commit `37f76e83`,
+/// which stages the write-set instead of holding it, and is being wired into this
+/// crate. Do not remove the cap before that path replaces the `Vec`. See FMEA
+/// `PG-ACC-01` and forge `t_513f70ed`.
 async fn apply_or_buffer_silent(
     engine: &StorageEngine,
     schema: &Schema,

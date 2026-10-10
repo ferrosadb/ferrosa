@@ -549,23 +549,23 @@ build; the codec's own cost is its delta against `none`.
   after PreAccept and return that effective set in AcceptOK; the coordinator
   unions the accepted quorum's dependencies before Commit. This prevents a
   delayed Accept from dropping a conflict discovered during the first round.
-  **The conflict index is a hard floor on the largest decidable transaction.**
+  **The conflict index is UNBOUNDED — it grows to hold any write-set.**
   A PreAccept registers the transaction under EVERY key in its write-set and is
-  all-or-nothing: if any `ConflictIndex::register` fails (capacity) the replica
-  rolls back the partial registration and answers with no vote. The capacity
-  therefore caps the size of any single transaction the cluster can decide, so
-  it MUST cover every write-set the front end admits. It resolves, cached
-  process-wide, from `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY`, else from the
-  PostgreSQL front end's own `FERROSA_POSTGRES_MAX_TXN_WRITES`, floored at the
-  historical 100 000 (`state_machine::resolve_conflict_index_capacity`). Before
-  this the capacity was a fixed 100 000 that no setting could raise: a
-  ~1,000,112-key transactional `COPY` (`pgbench -i`, admitted because
-  `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000`) was refused by all three replicas —
-  `key_count=1000112 e=conflict index at capacity`, zero votes — and surfaced as
-  an opaque "Accord quorum unavailable" on a healthy cluster (CL-49). The driver
-  also refuses an oversized write-set **by name**
-  (`AccordDriverError::WriteSetExceedsCapacity`), before the protocol registers
-  anything, instead of letting it fail as a mystery quorum error.
+  all-or-nothing, so a bound here was a hard floor on the largest decidable
+  transaction. `ConflictIndex::register`/`register_range` are now infallible:
+  there is no capacity, `ConflictIndexFull`/`capacity()` and the
+  `AccordDriverError::WriteSetExceedsCapacity` refusal are gone, and the
+  constructor argument (`DEFAULT_CONFLICT_INDEX_RESERVE`) is a pre-allocation
+  hint, never a bound. Before this the index was a fixed 100 000 that no setting
+  could raise — a ~1,000,112-key transactional `COPY` (`pgbench -i`, admitted
+  because `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000`) was refused by all three
+  replicas (`key_count=1000112 e=conflict index at capacity`, zero votes) and
+  surfaced as an opaque "Accord quorum unavailable" on a healthy cluster (CL-49).
+  The index grows (rather than spilling) because it holds only *in-flight*
+  registrations — every entry is removed by `gc_applied`/`remove` once the
+  transaction applies — so it is a working set, not a store. It therefore has no
+  disk tier: a single transaction with hundreds of millions of keys would still
+  grow it resident.
   The read-vote phase is the LWT `IF`-condition gate: every conditional
   statement, `INSERT IF NOT EXISTS` included, sends `ReadClusteringRow`, the
   replicas read only that table's row at `t` (`StorageReader::

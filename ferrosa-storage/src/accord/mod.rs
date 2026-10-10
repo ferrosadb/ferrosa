@@ -28,7 +28,9 @@ pub mod sync_writer;
 pub mod transaction_committer;
 pub mod write_gate;
 
-pub use conflict_index::{ConflictIndex, ConflictIndexFull, InFlightWrite, TokenRange, TxnStatus};
+pub use conflict_index::{
+    ConflictIndex, InFlightWrite, TokenRange, TxnStatus, DEFAULT_CONFLICT_INDEX_RESERVE,
+};
 pub use crash_recovery::{
     resolve_orphan_intent, CrashRecoveryReplay, OrphanResolution, ReplayedConflictEntry,
     ReplayedPhase, ReplayedTxnState,

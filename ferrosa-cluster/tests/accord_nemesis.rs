@@ -676,10 +676,6 @@ enum BatchAtomicityResult {
     CodecError,
     /// Snapshot rejected before any statement was applied.
     SnapshotStale,
-    /// The write-set exceeded the node's Accord conflict-index capacity — a
-    /// configuration fault (the front end admits a larger write-set than the
-    /// consensus layer can register), never a nemesis-induced failure.
-    WriteSetExceedsCapacity,
 }
 
 impl BatchAtomicityResult {
@@ -692,15 +688,13 @@ impl BatchAtomicityResult {
             Err(AccordDriverError::Network(_)) => Self::NetworkError,
             Err(AccordDriverError::Codec(_)) => Self::CodecError,
             Err(AccordDriverError::SnapshotStale) => Self::SnapshotStale,
-            Err(AccordDriverError::WriteSetExceedsCapacity { .. }) => Self::WriteSetExceedsCapacity,
         }
     }
 
     /// Whether this result is valid under nemesis (no partial visibility).
     fn is_atomically_valid(&self) -> bool {
-        // Codec errors indicate a bug, not a nemesis-induced failure; an
-        // oversized write-set is a configuration fault, likewise not nemesis.
-        !matches!(self, Self::CodecError | Self::WriteSetExceedsCapacity)
+        // Codec errors indicate a bug, not a nemesis-induced failure.
+        !matches!(self, Self::CodecError)
     }
 }
 

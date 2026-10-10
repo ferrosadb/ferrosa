@@ -114,8 +114,7 @@ mod tests {
     fn conflict_index_1000_keys() -> ConflictIndex {
         let mut idx = ConflictIndex::new(100_000);
         for i in 0..1000u64 {
-            idx.register(format!("k:{i}").as_bytes(), in_flight(i))
-                .unwrap();
+            idx.register(format!("k:{i}").as_bytes(), in_flight(i));
         }
         idx
     }
@@ -126,8 +125,7 @@ mod tests {
         for key_idx in 0..100u64 {
             for txn_idx in 0..100u64 {
                 let t = key_idx * 1000 + txn_idx;
-                idx.register(format!("perf:k:{key_idx}").as_bytes(), in_flight(t))
-                    .unwrap();
+                idx.register(format!("perf:k:{key_idx}").as_bytes(), in_flight(t));
             }
         }
         idx
@@ -355,7 +353,7 @@ mod tests {
         // Correctness: a lookup returns the right deps.
         let mut idx = ConflictIndex::new(100_000);
         for txn_idx in 0..100u64 {
-            idx.register(b"perf:k:0", in_flight(txn_idx)).unwrap();
+            idx.register(b"perf:k:0", in_flight(txn_idx));
         }
         let key0_deps = idx.deps_before_t0(b"perf:k:0", &ts(50));
         // key 0 has txns at t=0..99. deps_before_t0(t0=50) returns entries
