@@ -1819,6 +1819,25 @@ impl ModeController {
                             );
                         }
 
+                        // Reclaim parked write-sets whose dependency never arrived.
+                        // The graph bounds its own bookkeeping; this bounds the parked
+                        // PAYLOADS. Reported at ERROR — a fact, never a silent drop.
+                        let reclaimed =
+                            crate::accord::handlers::on_state_machine(&accord_state, move |sm| {
+                                sm.reclaim_stale_parked_applies_default()
+                            })
+                            .await;
+                        if let Some(reclaimed) = reclaimed {
+                            if !reclaimed.is_empty() {
+                                tracing::error!(
+                                    count = reclaimed.len(),
+                                    "maintenance: reclaimed unresolvable parked Accord write-sets \
+                                     (dependency never arrived; NOT applied — the coordinator \
+                                     abandons the txn and the client retries)"
+                                );
+                            }
+                        }
+
                         // Log table-level memory stats.
                         let table_count = storage.table_count();
                         tracing::info!(

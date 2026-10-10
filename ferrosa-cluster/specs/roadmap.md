@@ -135,8 +135,11 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   fail-loud `MultiKeyNotYetExecutable` guard is **removed**; multi-key
   transactions now execute end-to-end in-process:
   - `DepWaitApplier::try_apply_writeset` parks a transaction's WHOLE write-set
-    (`pending: HashMap<TxnId, Vec<ApplyMutation>>`) and applies every key on
-    resolve — no write 2..N is dropped while parked.
+    (`pending: HashMap<TxnId, ParkedApply>`) and applies every key on
+    resolve — no write 2..N is dropped while parked. A park whose payloads reach
+    the staging floor is held as `ParkedWriteSet::Staged` (`Arc<WriteSetSpill>` +
+    indices) so its residency is bounded, and an unresolvable park is reclaimed by
+    time with an ERROR (see the parked-residency entry below).
   - `StorageApplier::apply_writeset` commits all of a txn's partitions through ONE
     atomic `apply_batch` (all-or-nothing: a failure on any key persists none —
     chosen over the spec's per-key loop to guarantee no torn multi-key apply).
@@ -179,6 +182,33 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   committing a lost write. `NoopStorageApplier` now records payloads so this is
   regression-tested. (The previously-open follow-up — route `handle_apply` itself
   through `DepWaitApplier` — is now done; see the dep-ordered apply entry above.)
+- **Parked write-sets are spillable and unresolvable parks are reclaimed (Now).**
+  `DepWaitApplier::pending` used to hold the FULL owned write-set per parked
+  transaction with no cap, prune, spill or TTL, so a park whose dependency never
+  arrives (an abandoned dep, a lost apply, a dead coordinator) retained its whole
+  write-set in RAM forever — while the dep-wait graph pruned its own bookkeeping.
+  Now a parked write-set whose payloads reach the staging floor is `Staged`
+  (`Arc<WriteSetSpill>` + per-entry indices), bounded by the buffer not the payload
+  (`parked_write_sets_spill_so_residency_is_bounded_not_proportional_to_payload`,
+  negative control `control_resident_parks_grow_with_the_payload_when_staging_is_disabled`),
+  and an unresolvable park is reclaimed by time
+  (`FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS`, default 60 s, reported at ERROR with
+  its unresolved dependency set — no cap, no refusal, no dropped write)
+  (`an_unresolvable_park_is_reclaimed_and_surfaced_never_retained_forever`). This
+  also supersedes 30a776eb's "owned bytes are structurally required" claim: an
+  `Arc<WriteSetSpill>` is `'static`, so the blocking closure can own it and borrow
+  the mapping inside
+  (`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`).
+  **Landed:** the coordinator's own local apply now takes the same borrow. For a
+  STAGED write-set `apply_phase_within` hands the `Arc<WriteSetSpill>` into the
+  `'static` `on_state_machine` closure and borrows the mapping INSIDE it, applying
+  through `AccordStateMachine::handle_apply_writeset_borrowed` →
+  `DepWaitApplier::try_apply_writeset_borrowed` → `StorageApplier::apply_writeset_borrowed`
+  (`MutationView`), so no owned `Vec<u8>` is materialized per entry. A RESIDENT
+  (small) write-set keeps the legacy owned path, and only the park path — where the
+  bytes must outlive the call — materializes them.
+  (`staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy`, whose
+  negative control drives the owned path through the same probe.)
 - **Cluster-wide `fts_match` scatter-gather (BUG-F-007 / t_0d08aa43).** `fts_match`
   carries no partition key, so its hits span every token range, but the served
   path consulted only the coordinator's local FTI — returning 0/1

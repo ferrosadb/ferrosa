@@ -180,6 +180,13 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Now (highest value)
 
+- **Non-resident front-end write-set (FMEA PG-12).** A `COPY` inside `BEGIN`
+  holds its whole write-set resident in `Session.txn_writes` until COMMIT. The
+  streaming, threshold-bounded stage (`ferrosa_storage::write_set_stage::WriteSetStage`,
+  spill past `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`) is landed and tested but not
+  yet wired in, because the COMMIT phase cannot stay non-resident: `write_atomic_batch`
+  makes three passes over the whole `Vec<Mutation>` under one fsync group. Wire the
+  stage and give the commit path a streaming protocol before claiming the OOM fixed.
 - **Replica catch-up and mixed-protocol correctness** (FMEA PG-11). The fault
   schedule checks PostgreSQL transaction histories while one replica is
   paused, then checks final-state convergence on the active quorum. Verify

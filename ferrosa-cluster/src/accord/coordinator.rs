@@ -1111,10 +1111,31 @@ impl AccordCoordinatorDriver {
         self
     }
 
-    /// The encoded mutation payload for write-set entry `index`.
+    /// The encoded mutation payload for write-set entry `index`, as an **owned** copy.
     ///
     /// Reads the staged bytes when the write-set is spilled, else clones the resident
-    /// entry — so every Apply caller is written once and works on both paths.
+    /// entry. This is the owned accessor, kept for the two paths that still need owned
+    /// bytes: a RESIDENT write-set (small; the bytes are already in RAM) and the
+    /// no-state-machine applier fallback, which persists but cannot borrow. The
+    /// production local apply of a STAGED write-set does NOT use it — see below.
+    ///
+    /// # Why the local apply can borrow — a superseded claim
+    ///
+    /// A previous revision recorded the owned read-back as *structurally required*,
+    /// because `crate::accord::handlers::on_state_machine` demands
+    /// `F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static`. That claim was wrong
+    /// (commit 30a776eb, superseded here). The `'static` bound constrains the closure's
+    /// **captures**, not the payload representation, and an `Arc<WriteSetSpill>` IS
+    /// `'static`: a closure can OWN the `Arc` and borrow the mapping INSIDE its body.
+    /// That is compile-verified by `apply.rs`'s
+    /// `an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`, against
+    /// the very bound `on_state_machine` imposes.
+    ///
+    /// So `apply_phase_within` hands the `Arc<WriteSetSpill>` into the closure and
+    /// borrows the mapping inside, applying through
+    /// `AccordStateMachine::handle_apply_writeset_borrowed` — the same borrow the
+    /// per-peer fan-out already takes via [`Self::borrowed_write_set_entries`]. No owned
+    /// `Vec<u8>` is materialized per entry on that path.
     fn entry_mutation(&self, index: usize) -> Result<Vec<u8>, AccordDriverError> {
         match &self.write_blobs {
             Some(blobs) => blobs
@@ -2509,31 +2530,73 @@ impl AccordCoordinatorDriver {
                 return Ok::<(), AccordDriverError>(());
             }
             let t_local_apply = txn_profile_enabled().then(std::time::Instant::now);
-            // Resolve the owned payloads through `entry_mutation`, so a write-set
-            // staged in local temp storage is read back here as well as in the
-            // per-peer fan-out. `mutation` is EMPTY for a staged entry, so it must
-            // be filtered on the RESOLVED bytes, never on the stored field.
-            let owned: Vec<(usize, Vec<u8>)> = self
+            // The write-set entries THIS replica owns, in write-set order. A staged
+            // entry's stored `mutation` is EMPTY, so the payload is always resolved
+            // through the staging file, never read from the stored field.
+            let owned_indices: Vec<usize> = self
                 .write_set
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| self.replica_owns_key(self_id, &e.key))
-                .map(|(index, _)| self.entry_mutation(index).map(|bytes| (index, bytes)))
-                .collect::<Result<Vec<_>, _>>()?;
+                .map(|(index, _)| index)
+                .collect();
             if let Some(local_sm) = &self.local_accord_state {
-                let owned_writes: Vec<Vec<u8>> =
-                    owned.into_iter().map(|(_, bytes)| bytes).collect();
-                crate::accord::handlers::on_state_machine(local_sm, move |sm| {
-                    sm.handle_apply_writeset(txn_id, owned_writes)
-                })
-                .await;
-            } else if !owned.is_empty() {
+                match &self.write_blobs {
+                    // STAGED write-set: hand the `Arc<WriteSetSpill>` INTO the `'static`
+                    // closure and borrow its memory map INSIDE the body. The Arc IS
+                    // `'static`, so the bound `on_state_machine` imposes is satisfied by
+                    // owning the Arc, not the bytes — no owned `Vec<u8>` per entry. A
+                    // read-back that cannot be resolved fails loud below (it must never
+                    // become an empty write that applies nothing).
+                    Some(blobs) => {
+                        let blobs = std::sync::Arc::clone(blobs);
+                        crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                            let mut writes: Vec<&[u8]> = Vec::with_capacity(owned_indices.len());
+                            for &index in &owned_indices {
+                                match blobs.entry(index) {
+                                    Ok(bytes) => writes.push(bytes),
+                                    Err(err) => {
+                                        tracing::error!(
+                                            error = %err,
+                                            index,
+                                            "accord apply: staged write-set read-back failed on the \
+                                             coordinator's own apply — not applying (fail loud)"
+                                        );
+                                        return crate::accord::state_machine::SmResponse::None;
+                                    }
+                                }
+                            }
+                            sm.handle_apply_writeset_borrowed(txn_id, &writes)
+                        })
+                        .await;
+                    }
+                    // RESIDENT write-set (below the staging floor): the legacy owned
+                    // path. The bytes are already in RAM, so a disk round-trip would
+                    // cost more than it saves.
+                    None => {
+                        let owned_writes: Vec<Vec<u8>> = owned_indices
+                            .iter()
+                            .map(|&index| self.entry_mutation(index))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        crate::accord::handlers::on_state_machine(local_sm, move |sm| {
+                            sm.handle_apply_writeset(txn_id, owned_writes)
+                        })
+                        .await;
+                    }
+                }
+            } else if !owned_indices.is_empty() {
                 if let Some(applier) = &self.local_applier {
+                    // No state machine to advance (tests / no-SM setups): the bare
+                    // applier persists the write-set but cannot borrow it, so the
+                    // payloads are resolved here.
                     let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
-                    let owned: Vec<crate::accord::apply::ApplyMutation> = owned
+                    let owned: Vec<crate::accord::apply::ApplyMutation> = owned_indices
+                        .iter()
+                        .map(|&index| self.entry_mutation(index))
+                        .collect::<Result<Vec<_>, _>>()?
                         .into_iter()
-                        .filter(|(_, data)| !data.is_empty())
-                        .map(|(_, data)| crate::accord::apply::ApplyMutation {
+                        .filter(|data| !data.is_empty())
+                        .map(|data| crate::accord::apply::ApplyMutation {
                             data,
                             t: commit_t,
                             deps: deps.clone(),
@@ -2777,7 +2840,12 @@ impl AccordCoordinatorDriver {
         let mut ack_ms: Vec<u64> = Vec::new();
         let log_fanout = |serialize_ns: u64, ack_ms: &[u64], frame_bytes: usize, shared: bool| {
             if let Some(started) = t_fanout {
-                tracing::info!(
+                // debug!, not info!: this fires once per transaction (behind
+                // `FERROSA_PG_COMMIT_PROFILE`) and carries a `txn_id`. The
+                // `consensus_logging_is_bounded` guard forbids a per-transaction
+                // log at INFO because such lines saturated the disk the CQL
+                // runtime needs and stopped consensus answering read votes.
+                tracing::debug!(
                     txn_id = ?txn_id,
                     peers = ack_ms.len(),
                     fanout_ms = started.elapsed().as_millis() as u64,
@@ -7276,5 +7344,204 @@ mod tests {
         .expect("quorum must not wait for unanswered minority replicas");
 
         assert!(reached, "both shards have enough responsive replicas");
+    }
+
+    /// END-TO-END: the coordinator's OWN local apply BORROWS a staged write-set.
+    ///
+    /// The applier-seam guard
+    /// (`apply::tests::staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy`)
+    /// proves `DepWaitApplier` forwards the spill mapping rather than a copy; THIS test
+    /// proves the WIRING ABOVE it — `apply_phase_within`'s self-apply — does the
+    /// borrowing. A staged write-set is driven through the REAL coordinator driver
+    /// (`run_transaction`), and the applier records the ADDRESS of every payload it is
+    /// handed. The addresses must be `WriteSetSpill::entry`'s, entry for entry.
+    ///
+    /// Pointer identity is the only honest observable: the owned path produces
+    /// byte-identical VALUES, so no value assertion can tell the two apart (which is
+    /// exactly why this is not a value check). The NEGATIVE CONTROL is a second driver
+    /// with the SAME keys and the SAME payload bytes but a RESIDENT write-set (no spill
+    /// wired): the coordinator then takes the OWNED read-back branch (`entry_mutation`),
+    /// so the addresses it hands the applier are heap copies, NOT the mapping. Without
+    /// that control the assertion could pass vacuously.
+    ///
+    /// NOTE: both coordinator branches funnel into
+    /// `StorageApplier::apply_writeset_borrowed` — `AccordStateMachine::handle_apply_writeset`
+    /// merely borrows the owned `Vec`s and forwards to the borrowed entry point — so the
+    /// branch that ran is observable ONLY through the addresses, never through which
+    /// applier method was called.
+    #[tokio::test]
+    async fn coordinator_local_apply_borrows_the_staged_write_set_not_a_copy() {
+        use crate::accord::apply::{ApplyError, ApplyMutation, MutationView, StorageApplier};
+        use crate::accord::handlers::AccordState;
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+        use std::sync::Mutex;
+
+        /// Records the ADDRESS of every payload slice the applier is handed.
+        struct AddressProbe {
+            seen: Mutex<Vec<usize>>,
+        }
+        impl AddressProbe {
+            fn new() -> Self {
+                Self {
+                    seen: Mutex::new(Vec::new()),
+                }
+            }
+            fn addresses(&self) -> Vec<usize> {
+                self.seen.lock().expect("probe mutex").clone()
+            }
+        }
+        impl StorageApplier for AddressProbe {
+            fn apply(&self, _txn_id: TxnId, _mutation: ApplyMutation) -> Result<(), ApplyError> {
+                unreachable!("write-sets go through the batch entry points")
+            }
+            fn apply_writeset(
+                &self,
+                _txn_id: TxnId,
+                mutations: Vec<ApplyMutation>,
+            ) -> Result<(), ApplyError> {
+                let mut seen = self.seen.lock().expect("probe mutex");
+                for mutation in &mutations {
+                    seen.push(mutation.data.as_ptr() as usize);
+                }
+                Ok(())
+            }
+            fn apply_writeset_borrowed(
+                &self,
+                _txn_id: TxnId,
+                mutations: &[MutationView<'_>],
+            ) -> Result<(), ApplyError> {
+                let mut seen = self.seen.lock().expect("probe mutex");
+                for mutation in mutations {
+                    seen.push(mutation.data.as_ptr() as usize);
+                }
+                Ok(())
+            }
+        }
+
+        /// No reachable peers: for a sole-replica coordinator the self-send is never made
+        /// (a node is not in its own peer map), so this is never called.
+        struct NoPeers;
+        #[async_trait::async_trait]
+        impl AccordTransport for NoPeers {
+            async fn send(
+                &self,
+                _host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                Err(ferrosa_net::error::NetError::Timeout("no peers".into()))
+            }
+        }
+
+        // The payload bytes are the SAME in both arms, so the only difference the probe
+        // can see is WHERE they live — the mapping (staged) vs a heap copy (resident).
+        let payloads = vec![vec![0xA1u8; 512], vec![0xB2u8; 512]];
+
+        // ---- ARM 1: STAGED write-set -> the coordinator's own apply must BORROW ----
+        let mut blobs = payloads.clone();
+        let reservation =
+            ferrosa_storage::write_set_spill::reserve_write_set_stage().expect("stage dir");
+        let spill = ferrosa_storage::write_set_spill::WriteSetSpill::stage(reservation, &mut blobs)
+            .expect("stage payloads");
+        assert!(
+            blobs.iter().all(|b| b.is_empty()),
+            "staging must drain the resident copies"
+        );
+        let staged: Vec<usize> = (0..2)
+            .map(|index| spill.entry(index).expect("staged entry").as_ptr() as usize)
+            .collect();
+
+        let host = uuid::Uuid::from_u128(0xB0);
+        let node_id = u64::from_be_bytes(host.as_bytes()[..8].try_into().expect("uuid 16 bytes"));
+        let clock = HybridLogicalClock::new(node_id, 0);
+        let probe = Arc::new(AddressProbe::new());
+        let local_state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                node_id,
+                Arc::new(MockSyncWriter::new()),
+                probe.clone(),
+            )));
+        // Stored mutations are EMPTY — the exact shape `drive_accord` builds once it has
+        // staged the payloads and handed the driver `with_spilled_write_set`.
+        let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+            node_id,
+            vec![host],
+            Arc::new(NoPeers),
+            false,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), Vec::new()),
+                (b"key-2".to_vec(), Vec::new()),
+            ],
+        )
+        .with_local_accord_state(local_state)
+        .with_spilled_write_set(Arc::new(spill))
+        .with_read_predicate(crate::accord::wire::ReadPredicate::Always);
+
+        driver
+            .run_transaction()
+            .await
+            .expect("staged sole-replica commit must succeed");
+
+        assert_eq!(
+            probe.addresses(),
+            staged,
+            "the coordinator's OWN local apply must hand the applier the spill's own \
+             mapping, entry for entry — not an owned copy"
+        );
+
+        // ---- ARM 2 (NEGATIVE CONTROL): RESIDENT write-set -> owned read-back ----
+        let control_host = uuid::Uuid::from_u128(0xB1);
+        let control_node = u64::from_be_bytes(
+            control_host.as_bytes()[..8]
+                .try_into()
+                .expect("uuid 16 bytes"),
+        );
+        let control_clock = HybridLogicalClock::new(control_node, 0);
+        let control_probe = Arc::new(AddressProbe::new());
+        let control_state: AccordState =
+            Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
+                control_node,
+                Arc::new(MockSyncWriter::new()),
+                control_probe.clone(),
+            )));
+        // SAME keys, SAME bytes, but NO spill wired -> the coordinator's resident branch
+        // reads each entry back into an owned `Vec<u8>` (`entry_mutation`) before applying.
+        let mut control_driver = AccordCoordinatorDriver::new_multi_with_transport(
+            control_node,
+            vec![control_host],
+            Arc::new(NoPeers),
+            false,
+            &control_clock,
+            vec![
+                (b"key-1".to_vec(), payloads[0].clone()),
+                (b"key-2".to_vec(), payloads[1].clone()),
+            ],
+        )
+        .with_local_accord_state(control_state)
+        .with_read_predicate(crate::accord::wire::ReadPredicate::Always);
+
+        control_driver
+            .run_transaction()
+            .await
+            .expect("resident sole-replica commit must succeed");
+
+        let control_seen = control_probe.addresses();
+        assert_eq!(
+            control_seen.len(),
+            2,
+            "control: the resident path still applies every entry (it is correct, merely a \
+             copy)"
+        );
+        assert_eq!(
+            control_seen
+                .iter()
+                .filter(|addr| staged.contains(addr))
+                .count(),
+            0,
+            "control: the OWNED read-back must hand over COPIES, never the staged mapping — \
+             this is what makes the identity assertion above non-vacuous"
+        );
     }
 }

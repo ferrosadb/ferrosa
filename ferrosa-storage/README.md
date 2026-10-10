@@ -925,6 +925,27 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   `FERROSA_PG_COMMIT_PROFILE` fan-out line). `mutation(i)` is the owned twin
   (`entry(i)?.to_vec()`), kept for the Apply wire types, which still hold
   `Vec<u8>` — so the per-entry copy INTO the serialized frame remains.
+- **Streaming write-set staging** (`write_set_stage.rs`) — `WriteSetStage` closes the
+  gap `WriteSetSpill` leaves open: staging *after the fact* cannot bound a buffer that
+  has already grown. The front end that BUILDS a write-set (a `COPY` inside `BEGIN`)
+  pushes one row at a time; `WriteSetStage::append(payload)` is driven as those rows
+  arrive, keeping a bounded resident prefix and spilling the rest to a private temp
+  file. Below the threshold nothing touches the disk, so a small transaction pays
+  nothing. `finish()` flushes and mmaps the spilled region; `StagedWriteSet::entry(i)`
+  returns a borrowed slice — the resident prefix for entries before the first spill,
+  a slice of the mapping after it — in APPEND order (the order the commit path needs).
+  An index that was never staged fails loud, never a silent empty read. The resident
+  limit is a streaming **BUFFER SIZE**, externalized as
+  `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` (default `WRITE_SET_SPILL_FLOOR_BYTES`,
+  8 MiB), the same knob `WriteSetSpill::should_stage` now reads — never a cap: a
+  write-set larger than the threshold SPILLS, it is not refused. Cleanup reuses
+  `TempSortTableReservation`. Tests: `write_set_stage::tests::{every_entry_round_trips_across_the_spill_boundary_and_the_last_entry,
+  empty_payloads_round_trip_as_empty_not_missing,
+  entries_are_readable_in_append_order_across_the_boundary,
+  residency_is_flat_across_widely_separated_entry_counts,
+  an_un_staged_index_fails_loud_in_both_regimes, a_small_write_set_stays_fully_resident,
+  dropping_the_staged_view_removes_the_staging_directory,
+  an_invalid_threshold_setting_falls_back_to_the_default}`.
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per

@@ -162,10 +162,16 @@ lock-free atomic — changing them needs a restart, not a rebuild.
 |---|---|---:|
 | `FERROSA_ACCORD_TXN_TIMEOUT_SECS` | Apply bound: how long a transaction may wait for its dependencies before it is abandoned (rolled back, client told to retry) | `10` s |
 | `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` | Barrier bound: how long the snapshot-barrier read-vote and inbound `ReadVote` wait before abstaining | `5` s |
+| `FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS` | Parked-apply reclamation: how long the dep-wait apply engine may retain a **parked** write-set whose dependency has not arrived before it releases it. This is a TIME bound on residency, never a hard cap on how much may be parked: the park is reclaimed only once its dependency has had far longer than the protocol allows it to arrive. Reclamation is fail-loud (logged at ERROR with the unresolved dependency set; the coordinator abandons the transaction and the client retries), never a silent drop. Keep it **above** the apply bound above | `60` s |
 
 A non-numeric, zero, or negative value logs one warning and uses the default.
 Zero is refused rather than clamped: it would fail every transaction the instant
 it parked.
+
+The parked-apply reclamation bound must stay **strictly above**
+`FERROSA_ACCORD_TXN_TIMEOUT_SECS` and the barrier bound: a park is reclaimed only
+after its dependency has had far longer to arrive than the coordinator will wait,
+so an about-to-resolve park is never released out from under its transaction.
 
 ### SSTable write, compression, and reader buffers
 
@@ -354,6 +360,7 @@ rebuilding Ferrosa:
 | Environment variable | What it bounds | Default |
 |---|---|---:|
 | `FERROSA_POSTGRES_MAX_TXN_WRITES` | Resident mutations buffered by one PostgreSQL transaction before it fails loud with `53400`. A stopgap bound on a resident `Vec`, **retained** until the front end streams its buffer to disk (see `ferrosa-postgres` README, FMEA `PG-ACC-01`) | `10000` |
+| `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | Resident buffer size, in bytes, a transaction's write-set payloads may hold before they spill to a local temp file (both the streaming `WriteSetStage` and the coordinator's `WriteSetSpill::should_stage` read it). A streaming BUFFER SIZE, not a cap: a write-set larger than it SPILLS, it is never refused. Absolute bytes on purpose — a fraction of RAM is the wrong scale on a dataset larger than RAM | `8388608` (8 MiB) |
 | `FERROSA_PG_COMMIT_PROFILE` | Per-phase attribution for a PostgreSQL commit (prepare, Accord order/gate, apply fan-out, MVCC observer, prune, WAL) on the coordinator. Unset = zero cost | unset |
 | `FERROSA_ACCORD_COMPRESSION` | Codec for the Accord apply **region** body: `none` (default), `lz4`, `snappy`, `zstd`. Opt-in: compression costs CPU and only pays when the transport term is byte-bound rather than deserialize-bound | `none` |
 | `FERROSA_ACCORD_COMPRESSION_LEVEL` | Codec level where the codec has one (zstd); ignored by the fixed-level codecs | `3` |
