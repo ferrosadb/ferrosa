@@ -186,9 +186,10 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`), and `COMMIT` drives
   `write_atomic_batch` through the `WriteSetSource` trait so all three passes read the
   set as a stream under the one fsync group — the `Vec<Mutation>` is gone. The
-  `FERROSA_POSTGRES_MAX_TXN_WRITES` refusal is removed (a larger write-set spills, never
-  refused). **Remaining, named:** `prepare_row_changes` (MVCC history) and the cluster
-  branch's `prepare_accord_writes` (Accord apply payload) still materialize their `Vec`s;
+  `FERROSA_POSTGRES_MAX_TXN_WRITES` refusal AND its knob (constant, config field,
+  accessor) are removed — a larger write-set spills, never refused. **Remaining,
+  named:** `prepare_row_changes` (MVCC history) and the cluster branch's
+  `prepare_accord_writes` (Accord apply payload) still materialize their `Vec`s;
   bounding them needs an on-disk version store / a streaming Accord apply.
 - **Replica catch-up and mixed-protocol correctness** (FMEA PG-11). The fault
   schedule checks PostgreSQL transaction histories while one replica is

@@ -315,11 +315,60 @@ values log an error and the process uses the complete defaults:
 | Environment variable | Default | Bound |
 |---|---:|---|
 | `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | `8388608` | Resident buffer a transaction's write-set may hold before it SPILLS (a streaming buffer size, never a cap) |
-| `FERROSA_POSTGRES_MAX_TXN_WRITES` | `10000` | No longer a front-end refusal; is retained only as a consensus/MVCC-side sizing default; the conflict index it once sized is now unbounded |
-| `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` | derived | Keys one Accord txn may register; defaults to `FERROSA_POSTGRES_MAX_TXN_WRITES`, floor `100000` |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
+| `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS_PER_CONNECTION` | `64` | Concurrent SUSPENDED portals one connection may hold — a concurrency bound, not a data cap (see the census) |
+| `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS` | `2048` | Concurrent suspended portals per node — a concurrency bound, not a data cap (see the census) |
+| `FERROSA_POSTGRES_SUSPENDED_PORTAL_IDLE_TIMEOUT_MS` | `600000` | Idle timeout after which a suspended portal is closed (`57014`) |
+
+`FERROSA_POSTGRES_MAX_TXN_WRITES` is **GONE**: it bounded nothing (the write-set
+spills) and its constant, config field and accessor were removed. Neither it nor
+the consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` is read anywhere any
+more — the conflict index grows rather than refusing (see `ferrosa-cluster` CL-49).
+
+### Cap census (no-hard-bounds rule)
+
+Every remaining bound in this crate, with a verdict. The rule: a bound on the SIZE
+of DATA the engine accepts or returns that REFUSES or TRUNCATES is forbidden; the
+replacement is a spilling, streaming path whose resident buffer is a tunable that
+never refuses. Bounds that cannot affect data completeness (concurrency,
+backpressure, timeouts) are kept.
+
+| Bound | Kind | Refuse / drop / block? | Verdict | Evidence |
+|---|---|---|---|---|
+| `FERROSA_POSTGRES_MAX_TXN_WRITES` (const, `MvccConfig` field, `max_txn_writes()`, `with_max_txn_writes()`) | write-count cap | Bounded nothing: the write-set SPILLS; only a `tracing` field read it | **REMOVED** (vestige) | `mvcc.rs`; `server.rs` log field; `mvcc::tests::a_retired_write_cap_setting_cannot_reset_the_other_mvcc_settings` (RED first: a bad value for the dead knob reset the live `scan_buffer_rows` to its default) |
+| `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | streaming buffer size | Neither — SPILLS past the buffer | **LEGITIMATE** (a buffer, tunable) | `ferrosa-storage::write_set_stage`; `txn_write_set.rs` |
+| `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | scan buffer size | Blocks (backpressure) | **LEGITIMATE** | `storage_provider.rs`; bounded channel |
+| `portal_limits::{per_connection: 64, per_node: 2048}` | concurrent suspended portals | REFUSES the (limit+1)th NEW suspension with `53000`; NEVER evicts a live portal | **LEGITIMATE** (concurrency bound + retryable backpressure) | `portal_limits.rs::admit`; `tests/pg_suspended_portal_limits.rs` — the refused portal holds nothing, and a resume of an already-suspended portal is not re-admitted |
+| `suspended_portal_idle_timeout` | timeout | Closes an idle portal (`57014`) | **LEGITIMATE** (timeout) | `portal_limits.rs`; `extended.rs::expire_idle` |
+| `RESULT_BATCH_ROWS` (16) + `RESULT_CHANNEL_BATCHES` (2) | fixed chunk + channel capacity | Blocks (channel backpressure) | **LEGITIMATE** (chunk size / backpressure) | `result_stream.rs` |
+| `codec::MAX_MESSAGE_LEN` (256 MiB) | wire FRAME bound (incoming) | REFUSES an over-long frame LOUDLY (`MessageTooLarge`) — never truncates | **LEGITIMATE** (fixed frame chunk / untrusted-length pre-alloc guard) | `codec.rs` `read_startup`/`read_frontend`; `tests/pg_codec_proptest.rs`; see the honest limitation below |
+| `jsonb_wire::TEXT_OUTPUT_BUDGET` (1 GiB) | print amplification bound | REFUSES (`54000`), never truncates | **LEGITIMATE** (pathological-amplification guard; a stored cell is capped far below by the write limits) | `jsonb_wire.rs` |
+| `row_change_codec::TRAVERSAL_LIMIT_WORDS` (64 MiB) | decode traversal guard | Fails loud on over-limit | **LEGITIMATE** (untrusted-payload decode guard) | `row_change_codec.rs` |
+
+Adjacent crates, adjudicated the same way (not changed here — see the notes):
+
+| Bound | Kind | Refuse / drop / block? | Verdict | Evidence |
+|---|---|---|---|---|
+| `ferrosa-net::max_frame_body_size` (256 MiB) | internode wire FRAME bound | REFUSES (`FrameTooLarge`), never truncates | **LEGITIMATE** (fixed frame chunk / untrusted-length pre-alloc guard) | `ferrosa-net/src/codec.rs` |
+| `FERROSA_CQL_TRANSACTION_MAX_OPEN` (10 000) | open-transaction count | REFUSES a `BEGIN` at capacity with a retryable `Overloaded`; in-flight txns untouched | **LEGITIMATE** (concurrency count + backpressure; no write-set is dropped) | `ferrosa-cql/src/txn_registry.rs::begin` |
+| `FERROSA_CQL_TRANSACTION_MAX_STATEMENTS` (10 000) | staged statements in one txn | REFUSES **and POISONS** the txn | **ILLEGITIMATE — removal REFUSED, evidence** | `ferrosa-cql/src/session.rs::stage`/`stage_read` refuse+poison; the buffer is a resident `Vec<TransactionWrite>` with NO spill path and `TransactionCommitter::commit_with_reads` consumes the whole `Vec`, so removing the cap unbounds BOTH the staging and the commit peak (OOM). Blocked on a spilling CQL write-set + a streaming committer. |
+| `FERROSA_CQL_MAX_BATCH_STATEMENTS` (500) | statements in one BATCH | REFUSES the whole batch (`CqlError::Invalid`) | **ILLEGITIMATE — removal REFUSED, evidence** | `ferrosa-cql/src/router.rs::route_batch` refuses `> max`; `route_logged_batch` builds a resident `Vec<Mutation>` sized by the statement count and calls `write_batch(Vec<..>)`, so removing the cap lets ONE request build an unbounded resident `Vec`. Blocked on a streaming atomic batch apply. |
+
+Two deliberate remaining materializations (named, NOT claimed fixed): the MVCC
+history `Vec<RowChange>` in `prepare_row_changes`, and the cluster branch's
+`prepare_accord_writes` Accord-apply payload. Bounding either needs an on-disk
+version store / a streaming Accord apply. See `specs/roadmap.md` and
+`ferrosa-storage` FMEA ST-WS-02.
+
+**Honest limitation on `MAX_MESSAGE_LEN` (kept, not removed).** It bounds the
+`i32` length field of ONE inbound frame, before any allocation, and fails loud. A
+single `Bind` parameter or `COPY` frame larger than 256 MiB is refused; a bulk
+`COPY` is unaffected because drivers chunk `d` frames well under the bound. It is
+kept because removing it converts a loud, recoverable protocol error into an
+unbounded allocation from an attacker- or peer-controlled length (the OOM the rule
+exists to prevent) — a wire frame cannot "spill".
 
 The scan buffer is a storage-side backpressure bound. The result side is
 bounded too: rows reach the client in batches of `RESULT_BATCH_ROWS` (16) through

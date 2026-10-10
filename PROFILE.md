@@ -359,7 +359,6 @@ rebuilding Ferrosa:
 
 | Environment variable | What it bounds | Default |
 |---|---|---:|
-| `FERROSA_POSTGRES_MAX_TXN_WRITES` | No longer a front-end refusal: a write-set past any in-memory buffer SPILLS instead (`FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`). Retained only as the consensus/MVCC-side sizing default | `10000` |
 | `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | Resident buffer size, in bytes, a transaction's write-set payloads may hold before they spill to a local temp file (both the streaming `WriteSetStage` and the coordinator's `WriteSetSpill::should_stage` read it). A streaming BUFFER SIZE, not a cap: a write-set larger than it SPILLS, it is never refused. Absolute bytes on purpose — a fraction of RAM is the wrong scale on a dataset larger than RAM | `8388608` (8 MiB) |
 | `FERROSA_PG_COMMIT_PROFILE` | Per-phase attribution for a PostgreSQL commit (prepare, Accord order/gate, apply fan-out, MVCC observer, prune, WAL) on the coordinator. Unset = zero cost | unset |
 | `FERROSA_ACCORD_COMPRESSION` | Codec for the Accord apply **region** body: `none` (default), `lz4`, `snappy`, `zstd`. Opt-in: compression costs CPU and only pays when the transport term is byte-bound rather than deserialize-bound | `none` |
@@ -369,6 +368,11 @@ rebuilding Ferrosa:
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | Rows buffered between a storage scan producer and the synchronous SQL executor | `64` |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | Maximum lifetime of an active PostgreSQL snapshot/transaction; later use fails with SQLSTATE `40001` | `600000` ms |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | Background cadence for expiring old snapshots and pruning history they retain | `1000` ms |
+
+`FERROSA_POSTGRES_MAX_TXN_WRITES` is **gone** (with its constant, config field and
+accessor): the front end's write-set SPILLS, so the write-count knob bounded
+nothing and was removed. See the cap census in
+[`ferrosa-postgres/README.md`](ferrosa-postgres/README.md).
 
 Every value must be a positive integer. If any PostgreSQL override is invalid,
 Ferrosa logs an error and uses the complete default set without stopping

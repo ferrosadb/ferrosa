@@ -3,10 +3,12 @@
 //! CQL transactions are coordinated by Accord. This manager is deliberately
 //! separate: it versions PostgreSQL row images and tracks the oldest live
 //! PostgreSQL snapshot.
-//! Runtime bounds cover transaction write sets, scan buffering, and snapshot
-//! retention; malformed environment settings log and use defaults.
-//! Last revised: 2026-09-26
-//! Last changed: Added startup-configurable scan buffer capacity and snapshot expiry.
+//! Runtime bounds cover scan buffering and snapshot retention; malformed
+//! environment settings log and use defaults. There is deliberately NO bound on
+//! a transaction's write count: the front end's write-set SPILLS to disk (see
+//! `txn_write_set`), so the retired `FERROSA_POSTGRES_MAX_TXN_WRITES` knob is gone.
+//! Last revised: 2026-10-10
+//! Last changed: Removed the vestigial `FERROSA_POSTGRES_MAX_TXN_WRITES` knob.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -20,11 +22,9 @@ use ferrosa_common::accord::{Timestamp, TxnId};
 use ferrosa_sql::{Row, Value};
 use ferrosa_storage::commitlog::Mutation;
 
-pub(crate) const DEFAULT_MAX_TXN_WRITES: usize = 10_000;
 pub(crate) const DEFAULT_SCAN_BUFFER_ROWS: usize = 64;
 const DEFAULT_MAX_SNAPSHOT_AGE: Duration = Duration::from_secs(600);
 const DEFAULT_SNAPSHOT_REAPER_INTERVAL: Duration = Duration::from_secs(1);
-const MAX_TXN_WRITES_ENV: &str = "FERROSA_POSTGRES_MAX_TXN_WRITES";
 const SCAN_BUFFER_ROWS_ENV: &str = "FERROSA_POSTGRES_SCAN_BUFFER_ROWS";
 const MAX_SNAPSHOT_AGE_MS_ENV: &str = "FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS";
 const SNAPSHOT_REAPER_INTERVAL_MS_ENV: &str = "FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS";
@@ -106,7 +106,6 @@ impl MvccHistoryStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MvccConfig {
-    max_txn_writes: usize,
     scan_buffer_rows: usize,
     max_snapshot_age: Duration,
     snapshot_reaper_interval: Duration,
@@ -126,7 +125,6 @@ impl Error for MvccConfigError {}
 impl Default for MvccConfig {
     fn default() -> Self {
         Self {
-            max_txn_writes: DEFAULT_MAX_TXN_WRITES,
             scan_buffer_rows: DEFAULT_SCAN_BUFFER_ROWS,
             max_snapshot_age: DEFAULT_MAX_SNAPSHOT_AGE,
             snapshot_reaper_interval: DEFAULT_SNAPSHOT_REAPER_INTERVAL,
@@ -136,14 +134,11 @@ impl Default for MvccConfig {
 
 impl MvccConfig {
     fn from_overrides(
-        max_txn_writes: Option<&str>,
         scan_buffer_rows: Option<&str>,
         max_snapshot_age_ms: Option<&str>,
         snapshot_reaper_interval_ms: Option<&str>,
     ) -> Result<Self, MvccConfigError> {
         let defaults = Self::default();
-        let max_txn_writes =
-            parse_positive_usize(MAX_TXN_WRITES_ENV, max_txn_writes, defaults.max_txn_writes)?;
         let scan_buffer_rows = parse_positive_usize(
             SCAN_BUFFER_ROWS_ENV,
             scan_buffer_rows,
@@ -160,7 +155,6 @@ impl MvccConfig {
             defaults.snapshot_reaper_interval,
         )?;
         Ok(Self {
-            max_txn_writes,
             scan_buffer_rows,
             max_snapshot_age,
             snapshot_reaper_interval,
@@ -177,12 +171,10 @@ impl MvccConfig {
         }
 
         let overrides = (|| {
-            let max_txn_writes = read(MAX_TXN_WRITES_ENV)?;
             let scan_buffer_rows = read(SCAN_BUFFER_ROWS_ENV)?;
             let max_snapshot_age_ms = read(MAX_SNAPSHOT_AGE_MS_ENV)?;
             let snapshot_reaper_interval_ms = read(SNAPSHOT_REAPER_INTERVAL_MS_ENV)?;
             Self::from_overrides(
-                max_txn_writes.as_deref(),
                 scan_buffer_rows.as_deref(),
                 max_snapshot_age_ms.as_deref(),
                 snapshot_reaper_interval_ms.as_deref(),
@@ -376,20 +368,8 @@ impl MvccManager {
         self.profile.versions_inserted.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn max_txn_writes(&self) -> usize {
-        self.config.max_txn_writes
-    }
-
     pub(crate) fn scan_buffer_rows(&self) -> usize {
         self.config.scan_buffer_rows
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_max_txn_writes(max_txn_writes: usize) -> Self {
-        Self::with_config(MvccConfig {
-            max_txn_writes,
-            ..MvccConfig::default()
-        })
     }
 
     pub(crate) fn spawn_snapshot_reaper(manager: Arc<Self>) -> tokio::task::JoinHandle<()> {
@@ -1019,19 +999,15 @@ mod tests {
     }
 
     #[test]
-    fn mvcc_config_defaults_write_cap_and_snapshot_max_age() {
-        let config = MvccConfig::from_overrides(None, None, None, None).unwrap();
-        assert_eq!(config.max_txn_writes, DEFAULT_MAX_TXN_WRITES);
+    fn mvcc_config_defaults_scan_buffer_and_snapshot_max_age() {
+        let config = MvccConfig::from_overrides(None, None, None).unwrap();
         assert_eq!(config.scan_buffer_rows, DEFAULT_SCAN_BUFFER_ROWS);
         assert_eq!(config.max_snapshot_age, Duration::from_secs(600));
     }
 
     #[test]
-    fn mvcc_config_accepts_write_cap_and_snapshot_max_age_overrides() {
-        let config =
-            MvccConfig::from_overrides(Some("25"), Some("128"), Some("30000"), Some("250"))
-                .unwrap();
-        assert_eq!(config.max_txn_writes, 25);
+    fn mvcc_config_accepts_scan_buffer_and_snapshot_max_age_overrides() {
+        let config = MvccConfig::from_overrides(Some("128"), Some("30000"), Some("250")).unwrap();
         assert_eq!(config.scan_buffer_rows, 128);
         assert_eq!(config.max_snapshot_age, Duration::from_secs(30));
         assert_eq!(config.snapshot_reaper_interval, Duration::from_millis(250));
@@ -1040,17 +1016,64 @@ mod tests {
 
     #[test]
     fn mvcc_config_rejects_zero_and_malformed_overrides() {
-        assert!(MvccConfig::from_overrides(Some("0"), None, None, None).is_err());
-        assert!(MvccConfig::from_overrides(None, Some("0"), None, None).is_err());
-        assert!(MvccConfig::from_overrides(None, None, Some("0"), None).is_err());
-        assert!(MvccConfig::from_overrides(None, None, None, Some("0")).is_err());
-        assert!(MvccConfig::from_overrides(Some("x"), None, None, None).is_err());
-        assert!(MvccConfig::from_overrides(None, None, Some("x"), None).is_err());
+        assert!(MvccConfig::from_overrides(Some("0"), None, None).is_err());
+        assert!(MvccConfig::from_overrides(None, Some("0"), None).is_err());
+        assert!(MvccConfig::from_overrides(None, None, Some("0")).is_err());
+        assert!(MvccConfig::from_overrides(Some("x"), None, None).is_err());
+        assert!(MvccConfig::from_overrides(None, Some("x"), None).is_err());
+    }
+
+    /// RED-first (caps-gone-postgres): the retired `FERROSA_POSTGRES_MAX_TXN_WRITES`
+    /// knob bounds NOTHING any more — the front end's write-set spills — but
+    /// `from_env` still PARSES it, and a zero or malformed value makes the WHOLE
+    /// MVCC config fall back to its defaults. A typo in a dead knob therefore
+    /// silently resets the live `scan_buffer_rows` setting. Removing the knob
+    /// removes that coupling.
+    ///
+    /// Crosses the real config-resolution path the server runs at startup
+    /// (`ferrosa::main` calls `MvccManager::from_env()` -> `MvccConfig::from_env()`),
+    /// not a unit shim: the assertion is on the resolution `from_env` performs.
+    #[test]
+    fn a_retired_write_cap_setting_cannot_reset_the_other_mvcc_settings() {
+        static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        const VARS: [&str; 4] = [
+            "FERROSA_POSTGRES_MAX_TXN_WRITES",
+            "FERROSA_POSTGRES_SCAN_BUFFER_ROWS",
+            "FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS",
+            "FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS",
+        ];
+        let saved: Vec<(String, Option<String>)> = VARS
+            .iter()
+            .map(|name| ((*name).to_string(), env::var(name).ok()))
+            .collect();
+
+        // A retired, value-less knob set to a bad value, beside a LIVE live knob.
+        env::set_var("FERROSA_POSTGRES_MAX_TXN_WRITES", "0");
+        env::set_var("FERROSA_POSTGRES_SCAN_BUFFER_ROWS", "128");
+
+        let config = MvccConfig::from_env();
+
+        for (name, value) in saved {
+            match value {
+                Some(value) => env::set_var(&name, value),
+                None => env::remove_var(&name),
+            }
+        }
+
+        assert_eq!(
+            config.scan_buffer_rows, 128,
+            "a bad value for the RETIRED write-count knob must not reset the live \
+             scan-buffer setting to its default"
+        );
     }
 
     #[test]
     fn expiring_an_old_snapshot_releases_history_and_rejects_commit() {
-        let config = MvccConfig::from_overrides(None, None, Some("5"), None).unwrap();
+        let config = MvccConfig::from_overrides(None, Some("5"), None).unwrap();
         let manager = MvccManager::with_config(config);
         let setup = manager.snapshot();
         manager
