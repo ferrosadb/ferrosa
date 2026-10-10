@@ -1,38 +1,32 @@
 //! Multi-row INSERT / multi-key Accord commit over a REAL 3-node cluster.
 //!
-//! # Why this file exists
+//! # What this file pins now
 //!
-//! The live row-drop (a statement reporting `INSERT 0 N` while persisting fewer
-//! than N rows) is *not* reproducible in-process at the SQL/MVCC layers — those
-//! are proven correct. The lead the work item left was the **live multi-node
-//! apply path below `ferrosa-postgres`**: `COPY FROM STDIN` writes one row per
-//! `execute_insert` and works; a multi-row `INSERT` builds ONE statement whose N
-//! writes travel as ONE multi-key Accord transaction. This file is the clustered
-//! experiment that exercises exactly that path.
+//! `execute_insert` used to refuse a multi-row INSERT with SQLSTATE `0A000` — a
+//! fail-loud holding position standing in for an unimplemented feature, because
+//! applying the rows one at a time could leave a partial write behind while the
+//! statement still announced a count. The refusal is GONE: `execute_insert` now
+//! builds and validates EVERY row of the statement BEFORE it applies any of them and
+//! writes them as ONE atomic batch (see `ferrosa-postgres/src/query.rs`,
+//! `execute_insert` + `apply_batch_or_buffer`).
 //!
-//! # What it found (2026-10-09): NO reproduction, and that is the result
+//! The first test drives a real 2-row `INSERT` over the real PG wire on a real
+//! 3-node cluster and asserts the VALUES of BOTH rows (the first AND the last) on
+//! EVERY replica — this is the flip the work item described. It is deliberately NOT
+//! a `count` assertion: the live defect reported `INSERT 0 2` while persisting one
+//! row, which any count check would have passed.
 //!
-//! Two tests drive the real protocol on a real cluster — 3 independent
+//! # The multi-key apply path, characterized
+//!
+//! Two further tests drive the real protocol on a real cluster — 3 independent
 //! `AccordStateMachine` nodes, 3 independent `StorageEngine`s, one real PG wire
 //! listener per node, and the real `AccordTransactionCommitter`:
 //!
 //! * RF=3 (every key on every node, the `SimpleStrategy`/RF=3 shape) and
 //! * RF=1 one-shard-per-key (the multi-shard shape of a real ring),
 //!
-//! and in **both** every key of a multi-key commit lands on every replica that
-//! owns it. The below-SQL multi-node apply path is therefore NOT the dropper in
-//! this shape. See `specs/todo/postgres-frontend/in-process/feat-pgbench-compat-surface.md`
-//! for the full non-reproduction report and the remaining (transport-level)
-//! hypothesis.
-//!
-//! # The first test pins the holding position
-//!
-//! `execute_insert` refuses N>1 rows with SQLSTATE `0A000` rather than announce a
-//! count it did not write. The first test keeps that fail-loud guard honest at
-//! the cluster boundary: a multi-row INSERT over the wire must be refused and
-//! must write NOTHING. When the loss is eventually reproduced and fixed, this
-//! test flips to assert `INSERT 0 2` and both rows readable — exactly the
-//! red-green handover the work item describes.
+//! and in **both** every key of a multi-key commit lands on every replica that owns
+//! it. The below-SQL multi-node apply path is therefore not the dropper in this shape.
 //!
 //! Peer transport is in-process (routing to each node's real `AccordHandler`), so
 //! the protocol, state machines, storage engines, PG front-end and committer are
@@ -464,39 +458,66 @@ fn stored_name(engine: &StorageEngine, id: i32) -> Option<String> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// The holding position, pinned at the cluster boundary: a multi-row INSERT over
-/// the wire is REFUSED with `0A000` and writes NOTHING. The guard exists precisely
-/// so this statement can never announce a count it did not persist; this test is
-/// its negative control, and it is the test to flip to `INSERT 0 2` once the live
-/// loss is reproduced and fixed.
+/// The fixed behavior, pinned at the cluster boundary: a multi-row INSERT over the
+/// wire is ACCEPTED, reports `INSERT 0 2`, and persists BOTH rows with their OWN
+/// values on EVERY replica.
+///
+/// This test was the fail-loud refusal's negative control. Now it is the positive
+/// control for the fix — the flip the work item described. It asserts the VALUES of
+/// the FIRST and the LAST row on every node, never the count alone: a write that
+/// announced `INSERT 0 2` while persisting only row 1 is exactly the live defect this
+/// replaced.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multi_row_insert_is_refused_fail_loud_on_a_real_cluster() {
+async fn multi_row_insert_persists_every_row_on_a_real_cluster() {
     let cluster = cluster(Placement::AllNodes).await;
     let client = connect(cluster.ports[0]).await;
 
-    let error = client
+    let inserted = client
         .execute(
             "INSERT INTO users (id, name) VALUES (201, 'm-one'), (202, 'm-two')",
             &[],
         )
         .await
-        .expect_err("multi-row INSERT must fail loud until the loss is understood");
-    let code = error.code().map(|c| c.code());
+        .expect("multi-row INSERT now executes on a real cluster");
     assert_eq!(
-        code,
-        Some("0A000"),
-        "multi-row INSERT must be feature_not_supported (fail loud), got: {error}"
+        inserted, 2,
+        "the reported count must be the count that landed"
     );
 
-    // Fail loud, not fail-partial: neither row may appear in storage anywhere.
-    for (i, node) in cluster.nodes.iter().enumerate() {
-        for id in [201, 202] {
-            assert_eq!(
-                stored_name(&node.engine, id),
-                None,
-                "node {i} must not persist row id={id} of a refused INSERT"
-            );
+    // Accord apply is asynchronous: the coordinator returns at apply QUORUM and the
+    // remaining replica(s) apply in the background. Give every replica a bounded
+    // window to converge, then assert.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let all = cluster.nodes.iter().all(|node| {
+            stored_name(&node.engine, 201).is_some() && stored_name(&node.engine, 202).is_some()
+        });
+        if all || std::time::Instant::now() >= deadline {
+            break;
         }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let mut report = Vec::new();
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        report.push(format!(
+            "node {i}: 201={:?} 202={:?}",
+            stored_name(&node.engine, 201),
+            stored_name(&node.engine, 202)
+        ));
+    }
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        assert_eq!(
+            stored_name(&node.engine, 201).as_deref(),
+            Some("m-one"),
+            "node {i} is missing or has the wrong value for row id=201; replicas: {report:?}"
+        );
+        assert_eq!(
+            stored_name(&node.engine, 202).as_deref(),
+            Some("m-two"),
+            "node {i} is missing or has the wrong value for the LAST row id=202; \
+             replicas: {report:?}"
+        );
     }
 }
 

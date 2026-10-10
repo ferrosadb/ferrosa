@@ -673,7 +673,7 @@ mod tests {
     }
 
     /// Every row of the payload is written, and the count the client is told is the count that
-    /// landed. This is the assertion the multi-row INSERT could not make.
+    /// landed.
     #[tokio::test]
     async fn copy_from_stdin_writes_every_row_and_reports_the_count() {
         let (_dir, ctx) = make_ctx().await;
