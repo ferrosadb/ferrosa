@@ -31,7 +31,9 @@ use ferrosa_common::accord::{
     AcceptedBallot, BallotNumber, HybridLogicalClock, PromisedBallot, Timestamp, TxnId, TxnPhase,
     TxnState,
 };
-use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
+use ferrosa_storage::accord::conflict_index::{
+    ConflictIndex, InFlightWrite, TxnStatus, DEFAULT_CONFLICT_INDEX_RESERVE,
+};
 use ferrosa_storage::accord::sync_writer::{SyncWriteResult, SyncWriter};
 use tokio::sync::Notify;
 
@@ -187,32 +189,7 @@ impl AccordStateMachine {
         Self {
             node_id,
             txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(configured_conflict_index_capacity()),
-            sync_writer,
-            dep_waiters: HashMap::new(),
-            committed_txns: HashSet::new(),
-            last_notified: Vec::new(),
-            apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
-            reader: None,
-            applied_notify: Arc::new(Notify::new()),
-            clock: None,
-            finalized: FinalizedTxns::default(),
-            refusing_by_floor: false,
-        }
-    }
-
-    /// Create with a custom conflict index capacity.
-    ///
-    /// Uses a [`NoopStorageApplier`] (see [`Self::new`]).
-    pub fn with_capacity(
-        node_id: u64,
-        sync_writer: Arc<dyn SyncWriter>,
-        conflict_index_capacity: usize,
-    ) -> Self {
-        Self {
-            node_id,
-            txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(conflict_index_capacity),
+            conflict_index: ConflictIndex::new(DEFAULT_CONFLICT_INDEX_RESERVE),
             sync_writer,
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
@@ -239,7 +216,7 @@ impl AccordStateMachine {
         Self {
             node_id,
             txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(configured_conflict_index_capacity()),
+            conflict_index: ConflictIndex::new(DEFAULT_CONFLICT_INDEX_RESERVE),
             sync_writer,
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
@@ -269,7 +246,7 @@ impl AccordStateMachine {
         Self {
             node_id,
             txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(configured_conflict_index_capacity()),
+            conflict_index: ConflictIndex::new(DEFAULT_CONFLICT_INDEX_RESERVE),
             sync_writer,
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
@@ -616,9 +593,12 @@ impl AccordStateMachine {
         self.witness_timestamp(t);
 
         // Register the txn under EVERY key it writes, so a later conflicting
-        // txn on any of them sees it as a dependency. A partial registration is
-        // unsafe: it could acknowledge a transaction without indexing all of its
-        // conflicts. Roll back and abstain if capacity is exhausted.
+        // txn on any of them sees it as a dependency. Registration is
+        // all-or-nothing and cannot fail: the index GROWS to hold the whole
+        // write-set (there is no capacity that could drop a key — a partial
+        // registration would acknowledge a transaction without indexing all of
+        // its conflicts, and one key over an old cap silently destroyed the
+        // entire transaction live at pgbench -i scale).
         let newly_created = !self.txn_states.contains_key(&txn_id);
         for key in keys {
             let entry = InFlightWrite {
@@ -631,19 +611,7 @@ impl AccordStateMachine {
                 accord_ts: Some(t),
                 status: TxnStatus::PreAccepted,
             };
-            if let Err(e) = self.conflict_index.register(key, entry) {
-                self.conflict_index.remove(&txn_id);
-                if newly_created {
-                    self.txn_states.remove(&txn_id);
-                }
-                tracing::error!(
-                    txn_id = ?txn_id,
-                    key_count = keys.len(),
-                    %e,
-                    "accord: refusing PreAccept because conflict index registration was incomplete"
-                );
-                return SmResponse::None;
-            }
+            self.conflict_index.register(key, entry);
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can
@@ -1203,13 +1171,6 @@ impl AccordStateMachine {
     pub fn committed_count(&self) -> usize {
         self.committed_txns.len()
     }
-
-    /// The configured conflict-index capacity — the largest write-set this node
-    /// can register at PreAccept, and therefore the largest single transaction it
-    /// can decide. See [`resolve_conflict_index_capacity`].
-    pub fn conflict_index_capacity(&self) -> usize {
-        self.conflict_index.capacity()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1260,33 +1221,8 @@ pub const DEFAULT_TXN_TIMEOUT: std::time::Duration =
 /// Default **barrier** abstain bound — the historical dependency-wait value.
 pub const DEFAULT_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Environment variable bounding the Accord **conflict-index capacity**: the
-/// maximum number of `(partition-key, in-flight transaction)` registrations a
-/// node will hold at once.
-///
-/// A PreAccept registers its transaction under EVERY key in the write-set, so a
-/// node can only decide a transaction whose write-set fits. This capacity is
-/// therefore a **hard floor on the largest decidable transaction** — see
-/// [`resolve_conflict_index_capacity`] for why it must track the front end's own
-/// write-set bound.
-pub const CONFLICT_INDEX_CAPACITY_ENV: &str = "FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY";
-
-/// The PostgreSQL front end's per-transaction write-set bound (see
-/// `ferrosa-postgres`'s `FERROSA_POSTGRES_MAX_TXN_WRITES`). Read here so the two
-/// limits stay in lockstep (see [`resolve_conflict_index_capacity`]).
-pub const POSTGRES_MAX_TXN_WRITES_ENV: &str = "FERROSA_POSTGRES_MAX_TXN_WRITES";
-
-/// Historical default conflict-index capacity.
-///
-/// The floor for every resolved capacity: an unset or tiny setting never
-/// shrinks the index below the value the tree has always used.
-pub const DEFAULT_CONFLICT_INDEX_CAPACITY: usize = 100_000;
-
 /// Sentinel meaning "not yet resolved".
 const TIMEOUT_UNRESOLVED: u64 = u64::MAX;
-
-/// Sentinel meaning "not yet resolved" for the conflict-index capacity.
-const CAPACITY_UNRESOLVED: usize = 0;
 
 /// The resolved apply bound, cached as nanoseconds.
 ///
@@ -1380,79 +1316,6 @@ pub fn configured_barrier_timeout() -> std::time::Duration {
         BARRIER_TIMEOUT_ENV,
         resolve_barrier_timeout,
     )
-}
-
-/// Parse a positive `usize`, reporting (never silently accepting) anything else.
-/// Pure: the testable half of the capacity resolvers.
-fn parse_capacity(raw: Option<&str>) -> Option<usize> {
-    raw.and_then(|value| match value.trim().parse::<usize>() {
-        Ok(n) if n > 0 => Some(n),
-        _ => {
-            tracing::warn!(
-                value = %value,
-                "accord: ignoring invalid conflict-index capacity (expected a positive integer)"
-            );
-            None
-        }
-    })
-}
-
-/// Resolve the Accord **conflict-index capacity**.
-///
-/// A PreAccept registers its transaction under EVERY key in its write-set and
-/// is all-or-nothing: if any registration fails the replica refuses the whole
-/// transaction. The capacity is therefore a hard cap on the largest decidable
-/// transaction, and it MUST be at least as large as the write-set the front end
-/// will admit. When it is not, a transaction the SQL layer accepted is refused
-/// by *every* replica, so the coordinator collects no votes and reports an
-/// opaque "Accord quorum unavailable" — the failure observed live on
-/// 2026-10-10, when a transactional `COPY` of ~1,000,112 rows (admitted because
-/// `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000`) hit the fixed 100 000-entry index
-/// and was refused by all three nodes with `key_count=1000112 e=conflict index
-/// at capacity`.
-///
-/// `override_raw` ([`CONFLICT_INDEX_CAPACITY_ENV`]) takes precedence so an
-/// operator can size the index independently; otherwise the front end's own
-/// [`POSTGRES_MAX_TXN_WRITES_ENV`] is read, so the consensus layer can index
-/// every write-set the SQL layer accepts. The result is floored at
-/// [`DEFAULT_CONFLICT_INDEX_CAPACITY`] so neither an unset nor a tiny setting
-/// shrinks the index below its historical bound.
-///
-/// Pure and total, so it is testable without touching the process environment.
-pub fn resolve_conflict_index_capacity(
-    override_raw: Option<&str>,
-    postgres_max_txn_writes_raw: Option<&str>,
-) -> usize {
-    let from_override = parse_capacity(override_raw);
-    let from_front_end = || parse_capacity(postgres_max_txn_writes_raw);
-    from_override
-        .or_else(from_front_end)
-        .unwrap_or(DEFAULT_CONFLICT_INDEX_CAPACITY)
-        .max(DEFAULT_CONFLICT_INDEX_CAPACITY)
-}
-
-/// The resolved conflict-index capacity, cached process-wide (same rationale as
-/// [`configured_txn_timeout`]: an operator setting is process-wide by nature, so
-/// one atomic is the whole store; first writer wins).
-#[inline]
-pub fn configured_conflict_index_capacity() -> usize {
-    static CAPACITY: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(CAPACITY_UNRESOLVED);
-    let cached = CAPACITY.load(std::sync::atomic::Ordering::Relaxed);
-    if cached != CAPACITY_UNRESOLVED {
-        return cached;
-    }
-    let resolved = resolve_conflict_index_capacity(
-        std::env::var(CONFLICT_INDEX_CAPACITY_ENV).ok().as_deref(),
-        std::env::var(POSTGRES_MAX_TXN_WRITES_ENV).ok().as_deref(),
-    );
-    let _ = CAPACITY.compare_exchange(
-        CAPACITY_UNRESOLVED,
-        resolved,
-        std::sync::atomic::Ordering::Relaxed,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    resolved
 }
 
 /// `node_id` is the Accord node identifier, `sync_writer` the protocol-log
@@ -1584,43 +1447,6 @@ mod tests {
         let barrier = configured_barrier_timeout();
         assert_eq!(barrier, configured_barrier_timeout());
         assert!(barrier > std::time::Duration::ZERO);
-    }
-
-    /// The conflict-index capacity must be at least the largest write-set the
-    /// front end admits, or the consensus layer refuses a transaction the SQL
-    /// layer accepted — the opaque "Accord quorum unavailable" of 2026-10-10.
-    #[test]
-    fn conflict_index_capacity_tracks_the_front_end_write_cap() {
-        // Neither set: the historical floor.
-        assert_eq!(
-            resolve_conflict_index_capacity(None, None),
-            DEFAULT_CONFLICT_INDEX_CAPACITY
-        );
-        // The front end admits 3M writes (the deployed pgbench -i load's bound);
-        // the index must be able to register them.
-        assert_eq!(
-            resolve_conflict_index_capacity(None, Some("3000000")),
-            3_000_000
-        );
-        // An explicit override wins.
-        assert_eq!(
-            resolve_conflict_index_capacity(Some("2000000"), Some("3000000")),
-            2_000_000
-        );
-        // A tiny override is floored, never shrinking the index below the
-        // historical bound.
-        assert_eq!(
-            resolve_conflict_index_capacity(Some("5"), None),
-            DEFAULT_CONFLICT_INDEX_CAPACITY
-        );
-        // Malformed / zero values are ignored (and never disable the bound).
-        for bad in ["", "   ", "abc", "0", "-1", "1.5"] {
-            assert_eq!(
-                resolve_conflict_index_capacity(Some(bad), None),
-                DEFAULT_CONFLICT_INDEX_CAPACITY,
-                "{bad:?} must fall back to the historical floor"
-            );
-        }
     }
 
     /// `dep_detail` must separate a dependency this replica never registered
@@ -1772,16 +1598,6 @@ mod tests {
     fn make_sm(node_id: u64) -> (AccordStateMachine, Arc<MockSyncWriter>) {
         let writer = Arc::new(MockSyncWriter::new());
         let sm = AccordStateMachine::new(node_id, writer.clone());
-        (sm, writer)
-    }
-
-    #[allow(dead_code)]
-    fn make_sm_with_capacity(
-        node_id: u64,
-        cap: usize,
-    ) -> (AccordStateMachine, Arc<MockSyncWriter>) {
-        let writer = Arc::new(MockSyncWriter::new());
-        let sm = AccordStateMachine::with_capacity(node_id, writer.clone(), cap);
         (sm, writer)
     }
 
@@ -2730,7 +2546,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept a new txn on the same key with t0=1000 (> 500).
         let new_txn = txn(1, 1000);
@@ -2761,7 +2577,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // Register txn with t0=1200.
         let txn_1200 = txn(3, 1200);
@@ -2771,7 +2587,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept with t0=1000. deps_before_t0 should include 800 but not 1200.
         let new_txn = txn(1, 1000);
@@ -2815,17 +2631,28 @@ mod tests {
         }
     }
 
+    /// The INVERSE of the old `sm_preaccept_capacity_failure_*` test: a multi-key
+    /// write-set registers under EVERY key and votes — there is no capacity at
+    /// which one key is dropped. (The retired test asserted the defect: that a
+    /// 2-key write-set was refused and rolled back when the cap was 1.)
     #[test]
-    fn sm_preaccept_capacity_failure_abstains_and_rolls_back_partial_registration() {
-        let (mut sm, _writer) = make_sm_with_capacity(1, 1);
+    fn sm_preaccept_registers_every_key_of_a_multi_key_write_set() {
+        let (mut sm, _writer) = make_sm(1);
         let keys: &[&[u8]] = &[b"key_one", b"key_two"];
         let txn_id = txn(2, 500);
 
         let response = sm.handle_preaccept_multi(txn_id, ts(500), keys, BallotNumber(0), 0);
 
-        assert!(matches!(response, SmResponse::None));
-        assert!(sm.conflict_index().is_empty());
-        assert!(sm.get_state(&txn_id).is_none());
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "both keys must register and the txn vote; got {response:?}"
+        );
+        assert_eq!(
+            sm.conflict_index().len(),
+            2,
+            "every key of the write-set must be registered, none dropped"
+        );
+        assert!(sm.get_state(&txn_id).is_some());
     }
 
     /// `n` distinct keys, so a write-set can be built at the failing scale.
@@ -2838,65 +2665,56 @@ mod tests {
     /// transaction). At the historical fixed 100 000-entry capacity every replica
     /// refused the PreAccept — `key_count=1000112 e=conflict index at capacity` —
     /// so the coordinator collected ZERO votes and reported "Accord quorum
-    /// unavailable" on a fully healthy cluster. The capacity, not the protocol,
-    /// was the blocker: the same write-set registers whole once the index can
-    /// hold it (the control below shows the refusal at the old cap).
+    /// unavailable" on a fully healthy cluster. The write-set itself is legal and
+    /// the index must GROW to hold it: this test is the INVERSE of the defect — it
+    /// asserts the write-set is ACCEPTED, not that it is refused.
     ///
     /// Deliberately at the failing scale. A small-N test cannot see the capacity
     /// boundary, which is how this class of defect shipped green twice.
     #[test]
-    fn a_million_key_preaccept_depends_only_on_the_conflict_index_capacity() {
-        // The capacity the deployed front end's write cap (3M) requires.
-        let coherent = resolve_conflict_index_capacity(None, Some("3000000"));
+    fn a_million_key_preaccept_registers_whole_and_votes() {
         let keys = distinct_keys(1_000_112);
         let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
 
-        // Control: at the historical cap the write-set is refused outright, and
-        // the partial registration is rolled back (nothing lingers as a phantom
-        // conflict). This is the live failure, reproduced in-process at scale.
-        let (mut small, _w1) = make_sm_with_capacity(1, DEFAULT_CONFLICT_INDEX_CAPACITY);
-        let refused =
-            small.handle_preaccept_multi(txn(1, 1000), ts(1000), &refs, BallotNumber(0), 0);
-        assert!(
-            matches!(refused, SmResponse::None),
-            "at the historical {DEFAULT_CONFLICT_INDEX_CAPACITY}-entry cap the 1,000,112-key \
-             write-set must be refused (the 2026-10-10 failure); got {refused:?}"
-        );
-        assert!(
-            small.conflict_index().is_empty(),
-            "a refused PreAccept must roll back its partial registration"
-        );
-
-        // With a capacity that covers the write-set the SAME PreAccept registers it
-        // whole and votes — so the round can reach a quorum.
-        let (mut big, _w2) = make_sm_with_capacity(1, coherent);
-        let accepted =
-            big.handle_preaccept_multi(txn(1, 1000), ts(1000), &refs, BallotNumber(0), 0);
+        let (mut sm, _w) = make_sm(1);
+        let accepted = sm.handle_preaccept_multi(txn(1, 1000), ts(1000), &refs, BallotNumber(0), 0);
         assert!(
             matches!(accepted, SmResponse::PreAcceptOK { .. }),
-            "a write-set the front end admits must register whole and vote; got {accepted:?}"
+            "a 1,000,112-key write-set the front end admits must register whole and vote; \
+             got {accepted:?}"
         );
         assert_eq!(
-            big.conflict_index().len(),
+            sm.conflict_index().len(),
             keys.len(),
-            "every key of the write-set must be registered"
+            "every key of the write-set must be registered — no cap may truncate it"
+        );
+        // A key beyond the old 100 000 boundary must still resolve to the txn.
+        assert_eq!(
+            sm.conflict_index()
+                .max_conflicting_timestamp(&keys[999_999]),
+            Some(ts(1000)),
+            "a key past the old capacity boundary must still be indexed"
         );
     }
 
-    /// The production constructors take their capacity from the same resolver, so
-    /// the fix is wired, not merely available. Without this a future constructor
-    /// could silently reintroduce the fixed 100 000-entry cap.
+    /// Every production constructor must build a conflict index that admits a
+    /// write-set of ANY size — there is no capacity to configure, so no future
+    /// constructor can silently reintroduce the fixed 100 000-entry cap. This
+    /// exercises the constructor through a real multi-key PreAccept well past the
+    /// old cap.
     #[test]
-    fn production_constructors_use_the_resolved_conflict_index_capacity() {
+    fn production_constructors_admit_a_write_set_past_the_old_cap() {
         let writer = Arc::new(MockSyncWriter::new());
-        let sm = AccordStateMachine::new(1, writer);
-        assert_eq!(
-            sm.conflict_index_capacity(),
-            configured_conflict_index_capacity(),
-            "the state machine's capacity must come from the resolver the front end's \
-             write cap feeds"
+        let mut sm = AccordStateMachine::new(1, writer);
+        let keys = distinct_keys(120_000);
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let response = sm.handle_preaccept_multi(txn(1, 1000), ts(1000), &refs, BallotNumber(0), 0);
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "a production-built state machine must admit a write-set past the old cap; \
+             got {response:?}"
         );
-        assert!(sm.conflict_index_capacity() >= DEFAULT_CONFLICT_INDEX_CAPACITY);
+        assert_eq!(sm.conflict_index().len(), keys.len());
     }
 
     /// Multi-key PreAccept returns the UNION of dependencies across all of the
@@ -2910,7 +2728,7 @@ mod tests {
         // A pre-existing conflicting txn on each key, both with t0 < 1000.
         let on_k1 = txn(2, 400);
         let on_k2 = txn(3, 600);
-        let _ = sm.conflict_index_mut().register(
+        sm.conflict_index_mut().register(
             k1,
             InFlightWrite {
                 txn_id: on_k1,
@@ -2919,7 +2737,7 @@ mod tests {
                 status: TxnStatus::PreAccepted,
             },
         );
-        let _ = sm.conflict_index_mut().register(
+        sm.conflict_index_mut().register(
             k2,
             InFlightWrite {
                 txn_id: on_k2,
@@ -2957,7 +2775,7 @@ mod tests {
 
         // A conflict on k2 (not k1) with t0=1500 >= our t0=1000.
         let hot = txn(2, 1500);
-        let _ = sm.conflict_index_mut().register(
+        sm.conflict_index_mut().register(
             k2,
             InFlightWrite {
                 txn_id: hot,
@@ -3409,7 +3227,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept new txn with t0=1000 (lower than existing t0=1500).
         let new_txn = txn(1, 1000);
@@ -3520,7 +3338,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept with epoch=1 (mismatch from epoch=0 on existing txns).
         // The epoch mismatch means the coordinator's proposed t0 may be

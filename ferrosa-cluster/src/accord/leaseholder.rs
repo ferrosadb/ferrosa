@@ -331,7 +331,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        conflict_index.register(key, entry).unwrap();
+        conflict_index.register(key, entry);
 
         // Now check should fail with LocalConflict.
         let result = mgr.check_local_conflicts(&conflict_index, key);

@@ -144,7 +144,7 @@ mod tests {
                     accord_ts: None,
                     status: TxnStatus::PreAccepted,
                 };
-                conflict_index.register(key, write).unwrap();
+                conflict_index.register(key, write);
             }
 
             // Warm-up.

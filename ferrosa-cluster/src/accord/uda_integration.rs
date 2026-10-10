@@ -304,8 +304,7 @@ mod tests {
             start: 100,
             end: 200,
         };
-        idx.register_range(range, ts(1000), TxnId(ts(1000)))
-            .unwrap();
+        idx.register_range(range, ts(1000), TxnId(ts(1000)));
 
         // A point write at token 150 is within the range.
         // The range query should be detected as a conflict.
@@ -329,7 +328,7 @@ mod tests {
         // Register a range [0, 500].
         let range = TokenRange { start: 0, end: 500 };
         let range_txn = TxnId(ts(1000));
-        idx.register_range(range, ts(1000), range_txn).unwrap();
+        idx.register_range(range, ts(1000), range_txn);
 
         // A point write at key "abc" (simulated as token 250) should conflict.
         // We check via range overlap: point write is [250, 250].
@@ -355,8 +354,7 @@ mod tests {
             start: 100,
             end: 200,
         };
-        idx.register_range(range, ts(1000), TxnId(ts(1000)))
-            .unwrap();
+        idx.register_range(range, ts(1000), TxnId(ts(1000)));
 
         // Point write at token 300 is outside the range.
         let outside_range = TokenRange {
@@ -392,10 +390,8 @@ mod tests {
             start: 500,
             end: 600,
         };
-        idx.register_range(range1, ts(1000), TxnId(ts(1000)))
-            .unwrap();
-        idx.register_range(range2, ts(2000), TxnId(ts(2000)))
-            .unwrap();
+        idx.register_range(range1, ts(1000), TxnId(ts(1000)));
+        idx.register_range(range2, ts(2000), TxnId(ts(2000)));
 
         // Full scan: [0, i64::MAX] covers everything.
         let full_scan = TokenRange {
