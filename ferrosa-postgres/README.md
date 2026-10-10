@@ -134,8 +134,11 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   mode excludes the resumed node from convergence checks; see the Jepsen crate
   guide for the exact boundary.
 - **DML execution** — INSERT/UPDATE/DELETE build storage rows through the shared
-  `ferrosa-row-bridge` encoder. **Autocommit** uses the PostgreSQL MVCC commit
-  path; **inside a transaction** the write is buffered until commit (see above).
+  `ferrosa-row-bridge` encoder. An `INSERT` accepts **one or more rows**
+  (`INSERT ... VALUES (...), (...)`) and applies them as ONE atomic statement: every
+  row is built and validated before any is written, so a failure on a later row writes
+  nothing. **Autocommit** uses the PostgreSQL MVCC commit path; **inside a transaction**
+  the write is buffered until commit (see above).
   UPDATE/DELETE are Cassandra-style blind
   upserts/tombstones keyed by a full-primary-key equality `WHERE` (reported as
   `UPDATE 1` / `DELETE 1`).
@@ -507,9 +510,12 @@ are also accepted inside a transaction block — neither is rolled back.
 **Write (`INSERT`/`UPDATE`/`DELETE`):** parse → resolve each value to a
 `CqlValue` by the column's CQL type (`value_to_cql`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder CQL uses) →
-build a `Mutation` → `apply_or_buffer`: **autocommit** → apply and publish MVCC
-row versions; **in a transaction** → buffer a PostgreSQL-owned `PgWrite`, later
-atomically applied by the PostgreSQL MVCC commit path. With a cluster committer,
+build a `Mutation`. An `INSERT` of N rows builds and validates EVERY row first, then
+applies the whole set as ONE atomic batch via `apply_batch_or_buffer`: **autocommit** →
+apply and publish MVCC row versions (one `write_atomic_batch` / one MVCC commit);
+**in a transaction** → buffer the rows as PostgreSQL-owned `PgWrite`s, later
+atomically applied by the PostgreSQL MVCC commit path. A failure on any row leaves
+nothing behind (all rows or none). With a cluster committer,
 the PG-owned mutation batch and snapshot are submitted through Accord after
 local MVCC validation. Accord validates the cluster snapshot against the
 PostgreSQL commit marker and atomically applies the batch. The marker is

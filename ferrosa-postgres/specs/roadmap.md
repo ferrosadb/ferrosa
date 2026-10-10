@@ -206,16 +206,12 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   `INSERT … RETURNING` is wired.
 - **`ON CONFLICT` (upsert)** — today a parse error; the common ORM upsert idiom.
 - **`= ANY($N)` / IN-list parameter expansion** — Ecto `where: x in ^ids`.
-- **Multi-row `INSERT ... VALUES`** — *parsed but refused at execution* (`0A000`).
-  The parser accepts nested row values and the SQL layer executes them correctly
-  in-process (autocommit and buffered), but on the live cluster the same statement
-  reports `INSERT 0 3` and persists only row 1, reproduced twice on a fresh table.
-  Root cause is open and is **below** `ferrosa-postgres` — four in-process multi-row
-  tests across the SQL/MVCC/server layers are green with the defect present, so a
-  single-process test cannot reproduce it. The guard stays until it can be reproduced
-  with real clustered processes; a silent row-drop announced as a successful count is
-  worse than an error. Do not add an in-process "regression test" for this — it would
-  pass and prove nothing.
+- **Multi-row `INSERT ... VALUES`** — **DONE.** `INSERT` of one or more rows executes
+  every row; `execute_insert` builds and validates the whole statement first and applies
+  it as ONE atomic batch (`apply_batch_or_buffer`), so it is all rows or none. Asserted by
+  value, per row, at the SQL, transaction, and real-3-node-cluster layers (see FMEA
+  `PG-MULTIROW-01` and `tests/pg_multirow_cluster_rowdrop.rs`). The real internode
+  transport is still not exercised by the clustered harness.
 - **Richer `UPDATE`/`DELETE` `WHERE`** (range/non-key predicates), which today are
   restricted to single-row, full-PK equality.
 - **`CREATE TABLE` without a `PRIMARY KEY`** — today refused (`MissingPrimaryKey` ->

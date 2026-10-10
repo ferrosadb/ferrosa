@@ -1573,6 +1573,89 @@ async fn apply_or_buffer_silent(
     }
 }
 
+/// Apply a STATEMENT's whole set of mutations: buffer every one into the open
+/// transaction's write-set, or apply them as ONE atomic batch (autocommit).
+///
+/// This is the batch sibling of [`apply_or_buffer`], used by `INSERT` because a
+/// multi-row `INSERT` is ONE statement: its rows must land together. Buffering keeps
+/// the write-set transactional (COMMIT applies it atomically, ROLLBACK discards it);
+/// autocommit applies the whole set in a single MVCC commit / `write_atomic_batch`, so
+/// the statement is atomic even with no explicit transaction around it.
+///
+/// FAIL LOUD: a staging I/O failure while buffering returns an error response (and
+/// the server poisons the transaction), and `CommandComplete` is emitted only on
+/// success — never a count for a set that was not all written.
+async fn apply_batch_or_buffer(
+    engine: &StorageEngine,
+    schema: &Schema,
+    mvcc: Option<&MvccManager>,
+    txn: Option<&mut TxnWriteSet>,
+    mutations: Vec<Mutation>,
+    ok_tag: &str,
+) -> Vec<BackendMessage> {
+    match apply_batch_or_buffer_silent(engine, schema, mvcc, txn, mutations).await {
+        Ok(()) => vec![BackendMessage::CommandComplete {
+            tag: ok_tag.to_string(),
+        }],
+        Err(messages) => messages,
+    }
+}
+
+/// The write half of [`apply_batch_or_buffer`]: buffer the statement's mutations into
+/// the open transaction, or apply them as one atomic batch. See
+/// [`apply_or_buffer_silent`] for the write-set-buffer rationale that applies here too.
+async fn apply_batch_or_buffer_silent(
+    engine: &StorageEngine,
+    schema: &Schema,
+    mvcc: Option<&MvccManager>,
+    txn: Option<&mut TxnWriteSet>,
+    mutations: Vec<Mutation>,
+) -> Result<(), Vec<BackendMessage>> {
+    match txn {
+        Some(buffer) => {
+            // NO capacity refusal: the write-set spills past its buffer, it is never
+            // declined for being large (FMEA PG-12).
+            for mutation in mutations {
+                buffer.push(PgWrite(mutation)).map_err(|error| {
+                    vec![error_response(
+                        "58000",
+                        &format!("transaction write-set staging failed: {error}"),
+                    )]
+                })?;
+            }
+            Ok(())
+        }
+        None => match mvcc {
+            Some(mvcc) => {
+                let _commit_guard = mvcc.commit_guard().await;
+                match commit_mutations(
+                    engine,
+                    schema,
+                    mvcc,
+                    &mvcc.snapshot(),
+                    &std::collections::HashSet::new(),
+                    mutations,
+                ) {
+                    Ok(_) => Ok(()),
+                    Err(MvccCommitError::SerializationFailure) => Err(vec![error_response(
+                        "40001",
+                        "could not serialize PostgreSQL transaction",
+                    )]),
+                    Err(MvccCommitError::Storage(error)) => Err(vec![write_error_response(&error)]),
+                    Err(error) => Err(vec![error_response(
+                        "58000",
+                        &format!("write failed: {error:?}"),
+                    )]),
+                }
+            }
+            None => match engine.write_atomic_batch(mutations) {
+                Ok(()) => Ok(()),
+                Err(e) => Err(vec![write_error_response(&e)]),
+            },
+        },
+    }
+}
+
 /// What a `TRUNCATE` runs against: the same storage engine, schema registry and
 /// transaction write-set an `INSERT`/`UPDATE`/`DELETE` runs against. TRUNCATE is a
 /// write now, so it shares the write seam and inherits its transactionality.
@@ -2450,20 +2533,32 @@ impl ReturningOpts<'_> {
     }
 }
 
-/// Execute a single-row `INSERT`: materialize the row from the table schema and
-/// write it through the engine. Returns `CommandComplete "INSERT 0 1"` (Postgres
-/// reports oid 0 + a 1-row count). The row encoder is the shared
-/// `ferrosa-row-bridge` one — the SAME bytes the engine + CQL reads decode.
+/// Execute an `INSERT` of ONE OR MORE rows: materialize every row from the table
+/// schema and write them through the engine as a SINGLE atomic batch. Returns
+/// `CommandComplete "INSERT 0 N"` (Postgres reports oid 0 + the N-row count). The row
+/// encoder is the shared `ferrosa-row-bridge` one — the SAME bytes the engine + CQL
+/// reads decode.
 ///
 /// `params` supplies bound `$N` values (the extended-query path); the simple
 /// path passes `&[]`. `returning_opts` controls RETURNING rendering (see
-/// [`ReturningOpts`]). `txn = Some(buffer)` BUFFERS the write as a
-/// PostgreSQL `PgWrite` (committed atomically on COMMIT); `None` is autocommit.
+/// [`ReturningOpts`]). `txn = Some(buffer)` BUFFERS the rows as PostgreSQL `PgWrite`s
+/// (committed atomically on COMMIT); `None` is autocommit.
+///
+/// # Statement atomicity: every row is built before ANY row is applied
+///
+/// A multi-row `INSERT` is ONE statement, so it is ALL rows or NONE. Every row is
+/// therefore built and VALIDATED first — value resolution, foreign-key checks, key
+/// ordering, RETURNING projection — and only then applied, as one MVCC commit / one
+/// `write_atomic_batch` / one buffered write-set. Applying a row at a time would
+/// commit row 1 before row 2 is even resolved, so a failure on a later row would
+/// leave the earlier rows behind and silently violate atomicity (and, on a cluster,
+/// scatter one statement across N transactions instead of one). See
+/// [`apply_batch_or_buffer`].
 ///
 /// `RETURNING` echoes the values just written (built in-memory from the supplied
-/// column values — storage is NOT read back): exactly what Ecto needs to recover
-/// a generated/echoed key after an insert. A buffered write still returns its
-/// RETURNING rows now; the write commits at COMMIT.
+/// column values — storage is NOT read back), one DataRow per inserted row: exactly
+/// what Ecto needs to recover a generated/echoed key after an insert. A buffered write
+/// still returns its RETURNING rows now; the write commits at COMMIT.
 pub(crate) async fn execute_insert(
     context: DmlContext<'_>,
     ins: &InsertStmt,
@@ -2486,10 +2581,6 @@ pub(crate) async fn execute_insert(
         result_formats,
     } = returning_opts;
 
-    // Re-borrowed per row below: each row is its own mutation, buffered into the
-    // open transaction when there is one.
-    let mut txn = txn;
-
     let ks = ins.table.schema.as_deref().unwrap_or(default_schema);
     let snap = schema.snapshot();
     let meta = match snap.tables.get(&(ks.to_string(), ins.table.table.clone())) {
@@ -2502,32 +2593,12 @@ pub(crate) async fn execute_insert(
         }
     };
 
-    // Multi-row INSERT is PARSED but must not be EXECUTED yet.
-    //
-    // The SQL layer is proven correct: this loop writes all three rows in-process,
-    // via autocommit AND via the buffered write-set, and the mvcc/server multi-row
-    // tests pass. On the live cluster the SAME statement reports `INSERT 0 3` and
-    // writes only row 1, reproduced twice on a fresh table — so the loss is in the
-    // distributed apply path, below this layer, not here.
-    //
-    // Until that is found, fail loud. A silent row-drop announced as `INSERT 0 3` is
-    // strictly worse than an error. See the work item for the disproof of the two
-    // hypotheses already ruled out (accumulator reuse; the buffered write-set).
-    if ins.rows.len() != 1 {
-        return vec![error_response(
-            "0A000",
-            &format!(
-                "multi-row INSERT is parsed but not yet executed ({} rows); \
-                 executing it drops rows below the SQL layer",
-                ins.rows.len()
-            ),
-        )];
-    }
-
     // The statement's own tag: one INSERT of N rows, not N INSERTs of one.
-    let tag = format!("INSERT 0 {}", ins.rows.len());
     let mut combined_returning: Option<QueryResult> = None;
-    let mut last_write: Vec<BackendMessage> = Vec::new();
+    // Every row's mutation, built and VALIDATED BEFORE any is applied — statement
+    // atomicity (see the function doc).
+    let mut mutations: Vec<Mutation> = Vec::with_capacity(ins.rows.len());
+
     for row_index in 0..ins.rows.len() {
         // Resolve THIS row's named columns (per CQL type), substituting bound params;
         // collect regular/static cells by storage index, the CQL values by name for key
@@ -2629,38 +2700,35 @@ pub(crate) async fn execute_insert(
             Err(e) => return vec![error_response("22000", &e.to_string())],
         };
         let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
-        let mutation = Mutation::new(
+        mutations.push(Mutation::new(
             ks.to_string(),
             ins.table.table.clone(),
-            key.clone(),
+            key,
             vec![row],
             timestamp,
-        );
-        // Write (or buffer into the open transaction) via the shared seam. On any
-        // error — a staging failure included — `apply_or_buffer` returns an
-        // `ErrorResponse`; propagate it untouched (the RETURNING rows are never
-        // emitted for a failed write). On success it returns `CommandComplete`
-        // carrying `tag`, which is the STATEMENT's count (`INSERT 0 N`) rather than
-        // this row's, so N rows produce one announcement of N. When RETURNING is
-        // present the DataRows are accumulated across rows and rendered once, from
-        // the in-memory values resolved above (no storage read-back). A buffered
-        // write still returns its RETURNING rows now and commits at COMMIT.
-        last_write =
-            apply_or_buffer(engine, schema, mvcc, txn.as_deref_mut(), mutation, &tag).await;
-        // A failed row kills the whole statement. Report it untouched rather than
-        // announcing a count for rows that were not all written.
-        if last_write
-            .iter()
-            .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
-        {
-            return last_write;
-        }
+        ));
+
         if let Some(result) = returning {
             match &mut combined_returning {
                 Some(acc) => acc.rows.extend(result.rows),
                 None => combined_returning = Some(result),
             }
         }
+    }
+
+    // ONE atomic apply for the WHOLE statement: one MVCC commit, one
+    // `write_atomic_batch`, or one buffered write-set. Building every mutation above
+    // before applying any is what makes a multi-row INSERT all-or-nothing — a failure
+    // on a later row returns having applied nothing, never leaving earlier rows
+    // committed. `tag` is the STATEMENT's count (`INSERT 0 N`), so N rows produce one
+    // announcement of N (and a failed statement announces no count at all).
+    let tag = format!("INSERT 0 {}", ins.rows.len());
+    let last_write = apply_batch_or_buffer(engine, schema, mvcc, txn, mutations, &tag).await;
+    if last_write
+        .iter()
+        .any(|m| matches!(m, BackendMessage::ErrorResponse { .. }))
+    {
+        return last_write;
     }
 
     // ONE result for the whole statement: a single RowDescription, one DataRow per
@@ -5105,6 +5173,95 @@ mod txn_buffer_tests {
             .count()
     }
 
+    /// Read a `kv` row's ACTUAL CELL VALUES back through the SAME `execute_query`
+    /// SELECT path the front-end serves: `(k, v)` for the row whose key is `key`.
+    ///
+    /// Returns the decoded cells of EVERY row the scan produced (a `None` cell is a
+    /// SQL NULL, distinct from a row that is absent — an absent row yields an EMPTY
+    /// vec). This is deliberately NOT a `count(*)`: a multi-row INSERT that reports a
+    /// count while writing only its first row passes a count check, so the assertion
+    /// has to be on the values.
+    async fn read_kv(
+        engine: &Arc<StorageEngine>,
+        schema: &Schema,
+        key: &str,
+    ) -> Vec<(Option<String>, Option<String>)> {
+        let msgs = execute_query(
+            engine,
+            schema,
+            &format!("SELECT k, v FROM kv WHERE k = '{key}'"),
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT for {key} failed: {msgs:?}"
+        );
+        let decode = |cell: Option<&Option<Vec<u8>>>| {
+            cell.and_then(|c| c.as_ref())
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => {
+                    Some((decode(columns.first()), decode(columns.get(1))))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The single `CommandComplete` tag out of a statement's messages, failing loud if
+    /// the statement errored or produced more than one.
+    fn command_tag(msgs: &[BackendMessage]) -> String {
+        match msgs {
+            [BackendMessage::CommandComplete { tag }] => tag.clone(),
+            other => panic!("expected exactly one CommandComplete, got: {other:?}"),
+        }
+    }
+
+    /// Every `(k, n)` cell of the `num` table, read back through `execute_query`.
+    /// Used to prove a failed multi-row INSERT wrote NOTHING (`n` is decoded to text).
+    async fn read_num(
+        engine: &Arc<StorageEngine>,
+        schema: &Schema,
+    ) -> Vec<(Option<String>, Option<String>)> {
+        let msgs = execute_query(
+            engine,
+            schema,
+            "SELECT k, n FROM num",
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT of num failed: {msgs:?}"
+        );
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some((
+                    columns
+                        .first()
+                        .and_then(|c| c.as_ref())
+                        .map(|b| String::from_utf8_lossy(b).into_owned()),
+                    columns
+                        .get(1)
+                        .and_then(|c| c.as_ref())
+                        .map(|b| String::from_utf8_lossy(b).into_owned()),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
     async fn new_engine_and_schema() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
@@ -5743,46 +5900,193 @@ mod txn_buffer_tests {
         engine.shutdown().unwrap();
     }
 
-    /// Multi-row INSERT is PARSED but refused at execution — pinned deliberately.
+    /// INVARIANT: every row of a multi-row INSERT is written exactly once and read
+    /// back with its OWN values.
     ///
-    /// It is refused, not unimplemented: this loop writes all three rows correctly
-    /// in-process, both autocommit (below) and buffered
-    /// (`a_buffered_multi_row_insert_applies_every_row`), and the mvcc/server
-    /// multi-row tests pass. On the live cluster the same statement reports
-    /// `INSERT 0 3` and writes only row 1, reproduced twice on a fresh table — so the
-    /// loss is below this layer. Until that is found, failing loud beats dropping rows.
-    ///
-    /// To re-enable: drop the guard, then assert one CommandComplete tagged
-    /// "INSERT 0 3", three rows landed, and each carrying its own value.
+    /// This is the MINIMUM from the live failure -- a 2-row `INSERT ... VALUES (...),
+    /// (...)` -- and it asserts the VALUES of BOTH rows, not the count. The row count
+    /// is precisely the property the defect PRESERVES: a write that acked `INSERT 0 2`
+    /// while landing only row 1 passes any `count(*) == 2` check, so the count is not
+    /// the proof. The LAST row is asserted explicitly -- an off-by-one that drops the
+    /// final row is the classic shape here.
     #[tokio::test]
-    async fn multi_row_insert_writes_every_row_and_reports_the_count() {
+    async fn a_two_row_insert_writes_both_rows_with_their_own_values() {
         let (_dir, engine, schema) = new_engine_and_schema().await;
 
         let msgs = execute_query(
             &engine,
             &schema,
-            "INSERT INTO kv (k, v) VALUES ('m1', 'one'), ('m2', 'two'), ('m3', 'three')",
+            "INSERT INTO kv (k, v) VALUES ('a', 'alpha'), ('b', 'beta')",
             "public",
             &crate::jsonb_wire::test_limits(),
             None,
         )
         .await;
 
-        // The guard refuses it. Pinned deliberately: until the live row-drop is
-        // understood, refusing beats dropping rows. To re-enable, drop the guard and
-        // assert instead one CommandComplete tagged "INSERT 0 3", three rows landed,
-        // and each carrying its own value.
-        assert!(
-            matches!(&msgs[..], [BackendMessage::ErrorResponse { .. }]),
-            "multi-row INSERT must fail loud, never ack a count it did not write: {msgs:?}"
+        assert_eq!(
+            command_tag(&msgs),
+            "INSERT 0 2",
+            "one statement, one count: {msgs:?}"
         );
-        for key in ["m1", "m2", "m3"] {
+        // The FIRST row's own values.
+        assert_eq!(
+            read_kv(&engine, &schema, "a").await,
+            vec![(Some("a".to_string()), Some("alpha".to_string()))],
+            "the first row must carry its own values"
+        );
+        // The LAST row's own values -- the row an off-by-one drops.
+        assert_eq!(
+            read_kv(&engine, &schema, "b").await,
+            vec![(Some("b".to_string()), Some("beta".to_string()))],
+            "the last row must carry its own values"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT: every row written exactly once, and NO row carries another row's
+    /// values.
+    ///
+    /// A larger N than the 2-row minimum, with DISTINCT values, so a bug that let row
+    /// 2 carry row 1's cells (the first attempt's accumulator defect) -- or that
+    /// dropped any interior row -- is caught per row. The last row is pinned
+    /// explicitly: a short loop that drops the final row is the classic shape here.
+    #[tokio::test]
+    async fn a_larger_multi_row_insert_gives_every_row_its_own_values() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        let rows: Vec<(String, String)> =
+            (0..8).map(|i| (format!("k{i}"), format!("v{i}"))).collect();
+        let values = rows
+            .iter()
+            .map(|(k, v)| format!("('{k}', '{v}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO kv (k, v) VALUES {values}");
+
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            &sql,
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert_eq!(command_tag(&msgs), "INSERT 0 8", "one statement, one count");
+
+        for (k, v) in &rows {
             assert_eq!(
-                row_count(&engine, &schema, key).await,
-                0,
-                "a refused statement must write nothing (row {key})"
+                read_kv(&engine, &schema, k).await,
+                vec![(Some(k.clone()), Some(v.clone()))],
+                "row {k} must carry its OWN value {v}, not a neighbour's"
             );
         }
+
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT: duplicate keys WITHIN one statement resolve LAST-WRITE-WINS, and one
+    /// key writes one row.
+    ///
+    /// Two VALUES tuples naming the same partition key are two writes to one row; the
+    /// row that survives is the LAST tuple's, and there is exactly one row for the key.
+    /// A bug that keyed the whole statement off row 0 -- or that left the FIRST value
+    /// in place -- would surface here as the wrong surviving value.
+    #[tokio::test]
+    async fn duplicate_keys_in_one_multi_row_insert_are_last_write_wins() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('dup', 'first'), ('dup', 'second')",
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert_eq!(command_tag(&msgs), "INSERT 0 2", "one statement, one count");
+
+        assert_eq!(
+            read_kv(&engine, &schema, "dup").await,
+            vec![(Some("dup".to_string()), Some("second".to_string()))],
+            "one key is one row, and the LAST write wins"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT: a NULL cell round-trips as NULL, not as an empty string and not as a
+    /// missing row.
+    ///
+    /// The multi-row VALUES list mixes a NULL with a non-NULL in ONE statement, so the
+    /// NULL-bearing row still has to land -- with NULL -- alongside its neighbour. A
+    /// defect that dropped any row carrying a NULL, or widened NULL to `''`, is caught
+    /// by distinguishing the two in the read-back.
+    #[tokio::test]
+    async fn a_multi_row_insert_stores_null_distinctly_from_a_value() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO kv (k, v) VALUES ('n1', NULL), ('n2', 'x')",
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert_eq!(command_tag(&msgs), "INSERT 0 2", "one statement, one count");
+
+        assert_eq!(
+            read_kv(&engine, &schema, "n1").await,
+            vec![(Some("n1".to_string()), None)],
+            "the NULL-bearing row lands, with NULL (not '', not absent)"
+        );
+        assert_eq!(
+            read_kv(&engine, &schema, "n2").await,
+            vec![(Some("n2".to_string()), Some("x".to_string()))],
+            "its non-NULL neighbour is unaffected"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT: STATEMENT ATOMICITY -- a multi-row INSERT is ALL rows or NONE.
+    ///
+    /// A statement that fails on a LATER row must leave NO row behind. Applying the
+    /// statement's rows to storage one at a time as they are built commits row 1
+    /// before row 2 is even resolved, so a failure on row 2 leaves row 1 committed and
+    /// silently violates statement atomicity. PostgreSQL writes none of them.
+    ///
+    /// Row 2 is made to fail at value resolution (`'xyz'` is not a decimal); the table
+    /// is `num(k text PK, n decimal)`. The assertion is that NEITHER row is readable --
+    /// the values, not the count.
+    #[tokio::test]
+    async fn a_multi_row_insert_that_fails_on_a_later_row_writes_nothing() {
+        let (_dir, engine, schema) = new_engine_with_decimal().await;
+
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "INSERT INTO num (k, n) VALUES ('good', 1), ('bad', 'xyz')",
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::ErrorResponse { .. }]),
+            "a malformed row must fail the whole statement: {msgs:?}"
+        );
+
+        // Neither the failing row NOR the one before it may survive.
+        let survivors = read_num(&engine, &schema).await;
+        assert!(
+            survivors.is_empty(),
+            "statement atomicity: a failed multi-row INSERT writes NOTHING, got {survivors:?}"
+        );
 
         engine.shutdown().unwrap();
     }
@@ -5825,20 +6129,19 @@ mod txn_buffer_tests {
         engine.shutdown().unwrap();
     }
 
-    /// The LIVE failure, reproduced in-process: a multi-row INSERT buffered into an
-    /// open transaction — how the server reaches it (`Some(txn_writes_mut())`) — then
-    /// applied the way COMMIT applies the write-set.
+    /// A multi-mutation write-set buffered into an open transaction — how the server
+    /// reaches a multi-row INSERT (`Some(txn_writes_mut())`) — is applied COMPLETELY
+    /// when COMMIT applies it.
     ///
-    /// The autocommit test stays green with the row-dropping bug present, because it
-    /// never touches the buffer. That gap is how the live server came to report
-    /// `INSERT 0 3` and write one row while every in-process test passed.
+    /// The mutations are built directly here (not through `execute_query`) because
+    /// this exercises the WRITE-SET machinery, the layer below the statement builder:
+    /// given N valid mutations, does the transactional apply land all N? `execute_query`
+    /// covers the statement path (see `a_multi_row_insert_in_a_committed_transaction_writes_every_row`
+    /// in `server.rs`).
     #[tokio::test]
     async fn a_buffered_multi_row_insert_applies_every_row() {
         let (_dir, engine, schema) = new_engine_and_schema().await;
 
-        // Build the three row mutations directly rather than through execute_query:
-        // the multi-row guard above would refuse the statement, and what this test
-        // exercises is the write-set machinery, not the parser.
         let mut mutations: Vec<Mutation> = Vec::new();
         for (k, v) in [("b1", "one"), ("b2", "two"), ("b3", "three")] {
             let key =

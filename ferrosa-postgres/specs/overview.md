@@ -6,7 +6,8 @@ executive_summary: >
   The PostgreSQL v3 wire-protocol front-end for ferrosa. Implements the
   frontend/backend protocol (startup, SCRAM-SHA-256, simple + extended query),
   and lowers SQL onto the bespoke ferrosa-sql relational engine over live
-  ferrosa storage. SELECT (incl. one JOIN) and single-row INSERT/UPDATE/DELETE
+  ferrosa storage. SELECT (incl. one JOIN) and INSERT (one or more rows,
+  `VALUES (…),(…)` applied atomically) / UPDATE / DELETE
   are supported; it shares the storage row codec with CQL via ferrosa-row-bridge
   (D10) and is differential-tested against real PostgreSQL 16. Explicit
   PostgreSQL SERIALIZABLE transactions use MVCC snapshots with read-your-writes
@@ -111,8 +112,12 @@ timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
 `CqlValue` driven by the target column's `CqlType` (`value_to_cql`, fail-loud on
 type mismatch `42804` / out-of-range `22003`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder the engine
-and CQL decode) → `Mutation` → `engine.write_atomic_batch` → `CommandComplete
-"INSERT 0 1"` / `"UPDATE 1"` / `"DELETE 1"`.
+and CQL decode) → `Mutation`. An `INSERT` of N rows builds and validates EVERY
+row first, then applies the whole set as ONE atomic batch (`apply_batch_or_buffer`):
+**autocommit** → `engine.write_atomic_batch` (or one MVCC commit), **in a
+transaction** → buffer the rows into the write-set for one commit at `COMMIT`.
+The statement announces its count only when every row landed → `CommandComplete
+"INSERT 0 N"` / `"UPDATE 1"` / `"DELETE 1"`.
 
 See [data-flow.md](data-flow.md) for the sequence diagrams.
 

@@ -2167,6 +2167,115 @@ pub(crate) mod txn_atomicity_tests {
             .count()
     }
 
+    /// The `(k, v)` CELL VALUES of every `kv` row with key `key`, read back through the
+    /// `execute_query` SELECT path. Asserts VALUES, not the count (a count passes a
+    /// write that landed only its first row).
+    async fn read_kv_values(
+        ctx: &QueryContext,
+        key: &str,
+    ) -> Vec<(Option<String>, Option<String>)> {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            &format!("SELECT k, v FROM kv WHERE k = '{key}'"),
+            &ctx.default_schema,
+            &ctx.jsonb_limits,
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT for {key} failed: {msgs:?}"
+        );
+        let decode = |cell: Option<&Option<Vec<u8>>>| {
+            cell.and_then(|c| c.as_ref())
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => {
+                    Some((decode(columns.first()), decode(columns.get(1))))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// INVARIANT (transactionality): a multi-row INSERT buffered inside an explicit
+    /// transaction commits EVERY row, each with its own values — ONE statement, ONE
+    /// commit.
+    ///
+    /// This is how the server reaches a multi-row INSERT (`Some(txn_writes_mut())`),
+    /// buffered as a write-set and applied atomically at COMMIT. The rows must be
+    /// invisible until COMMIT, then ALL readable with their own values.
+    #[tokio::test]
+    async fn a_multi_row_insert_in_a_committed_transaction_writes_every_row() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('t1', 'one'), ('t2', 'two'), ('t3', 'three')",
+        )
+        .await;
+        assert_eq!(
+            command_tag(&m).as_deref(),
+            Some("INSERT 0 3"),
+            "a buffered multi-row INSERT acks the STATEMENT count: {m:?}"
+        );
+        for key in ["t1", "t2", "t3"] {
+            assert!(
+                read_kv_values(&ctx, key).await.is_empty(),
+                "row {key} must NOT be in storage before COMMIT"
+            );
+        }
+
+        let m = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(command_tag(&m).as_deref(), Some("COMMIT"), "{m:?}");
+        for (key, val) in [("t1", "one"), ("t2", "two"), ("t3", "three")] {
+            assert_eq!(
+                read_kv_values(&ctx, key).await,
+                vec![(Some(key.to_string()), Some(val.to_string()))],
+                "row {key} must carry its own value {val} after COMMIT"
+            );
+        }
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT (transactionality + atomicity): a multi-row INSERT inside a transaction
+    /// that ROLLS BACK leaves NO row behind — the WHOLE statement is discarded, not one
+    /// row of it.
+    #[tokio::test]
+    async fn a_multi_row_insert_in_a_rolled_back_transaction_writes_nothing() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('r1', 'one'), ('r2', 'two')",
+        )
+        .await;
+        assert_eq!(command_tag(&m).as_deref(), Some("INSERT 0 2"), "{m:?}");
+
+        let m = execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        assert_eq!(command_tag(&m).as_deref(), Some("ROLLBACK"), "{m:?}");
+        for key in ["r1", "r2"] {
+            assert!(
+                read_kv_values(&ctx, key).await.is_empty(),
+                "ROLLBACK must discard the whole statement — row {key} must be gone"
+            );
+        }
+
+        ctx.engine.shutdown().unwrap();
+    }
+
     /// The SQLSTATE of the sole `ErrorResponse` in a reply, if any.
     fn error_sqlstate(messages: &[BackendMessage]) -> Option<String> {
         messages.iter().find_map(|m| match m {

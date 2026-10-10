@@ -16,8 +16,9 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 - **DML/DQL:** `SELECT` (single `JOIN`, `WHERE`, `GROUP BY`, `ORDER BY`,
   `LIMIT`, aggregates), no-`FROM` scalar selects (incl. `||` concatenation and a
-  scalar subquery `( SELECT ... )` as an operand), and **single-row** `INSERT` /
-  `UPDATE` / `DELETE` (key-equality `WHERE`, Cassandra-style blind
+  scalar subquery `( SELECT ... )` as an operand), `INSERT` of **one or more rows**
+  (`INSERT ... VALUES (...), (...)`, applied as one atomic statement), and
+  single-row `UPDATE` / `DELETE` (key-equality `WHERE`, Cassandra-style blind
   upsert/tombstone). A `numeric`/`decimal` target takes an integer literal, a
   decimal literal, and a TEXT value (untyped string literal / COPY FROM STDIN
   cell); a non-numeric string is refused `22P02`, any other mismatch `42804`.
@@ -35,17 +36,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 ## Not yet supported (fail-loud gaps)
 
 - `UPDATE`/`DELETE … RETURNING` → `0A000` (only `INSERT … RETURNING` is wired).
-- `ON CONFLICT` (upsert) → parse error; multi-row `INSERT … VALUES (…),(…)` is
-  parsed but REFUSED `0A000` at execution. It is refused, not unimplemented: a
-  live 3-node cluster reported `INSERT 0 2` while persisting one row, so the
-  statement fails loud rather than announce a count it did not write. A real
-  clustered repro attempt (3 Accord nodes + real storage + real PG wire, the
-  exact statement) did **not** reproduce the loss — see
-  `tests/pg_multirow_cluster_rowdrop.rs` and the work item
-  `specs/todo/postgres-frontend/in-process/feat-pgbench-compat-surface.md`.
-  Still to build: the same test over a REAL internode transport (the one
-  component the harness elides), with `is_apply_ok`'s empty-body `AccordApplyOK`
-  acceptance the first thing to audit.
+- `ON CONFLICT` (upsert) → parse error.
 - `= ANY($N)` / IN-list parameter expansion.
 - `UPDATE`/`DELETE` with a non-key or range `WHERE` (only full-PK equality).
 - **Full PostgreSQL strict-serializability scope is not yet verified** — the
@@ -78,6 +69,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 | PG-3 | **`INSERT … RETURNING` only; `UPDATE`/`DELETE … RETURNING` + `ON CONFLICT` unsupported** | `UPDATE`/`DELETE … RETURNING` and upsert ORM patterns fail | 5 | 5 | 2 | 50 | `INSERT … RETURNING` done (in-memory row, no read-back). `UPDATE`/`DELETE … RETURNING` fail loud `0A000`; `ON CONFLICT` fails at parse. Never a wrong row. Roadmap Next. |
 | PG-4 | **(mitigated) CQL `Duration`/collections have no SQL value representation** | A scan cannot represent a non-NULL duration/list/map column | 6 | 4 | 2 | 48 | `cql_to_value` returns an error and scan failure is propagated as a query error; no fabricated NULL. Widen `Value` to add support (roadmap Later). |
 | PG-5 | **Row-codec divergence from CQL/engine** — a write encodes differently than the canonical codec | Postgres-written rows read back wrong/invisible over CQL or the engine (silent corruption) | 10 | 1 | 4 | 40 | **Structural (D10):** INSERT/UPDATE/DELETE use `ferrosa-row-bridge` `build_row`/`build_delete_row`/`build_decorated_key` — the SAME code CQL uses. Reinforced by the differential oracle (PG vs real PG) + the M1 live tests. |
+| PG-MULTIROW-01 | **A multi-row `INSERT` applied row-by-row (partial write if a later row fails).** `execute_insert` used to write each row to storage as it was built, so a failure on row *k* left rows `1..k-1` committed while the statement errored — and on a cluster it scattered ONE statement across N transactions. | A statement announces a count it did not fully persist, or half-applies — silent partial write. | 9 | 4 | 3 | 108 → 12 | **Fixed.** `execute_insert` builds and validates EVERY row of the statement first (value resolution, FK checks, key ordering, RETURNING projection), then applies the whole set in ONE atomic apply (`apply_batch_or_buffer`): one MVCC commit / one `write_atomic_batch` / one buffered write-set. The count is announced only when every row landed. Tests: `a_two_row_insert_writes_both_rows_with_their_own_values`, `a_larger_multi_row_insert_gives_every_row_its_own_values`, `duplicate_keys_in_one_multi_row_insert_are_last_write_wins`, `a_multi_row_insert_stores_null_distinctly_from_a_value`, `a_multi_row_insert_that_fails_on_a_later_row_writes_nothing`, `a_multi_row_insert_in_a_committed_transaction_writes_every_row`, `a_multi_row_insert_in_a_rolled_back_transaction_writes_nothing`, and the clustered `pg_multirow_cluster_rowdrop::multi_row_insert_persists_every_row_on_a_real_cluster`. Each asserts the VALUES of every row, never the count alone — a count check passes a write that landed only its first row. Residual: the real internode transport is not in the clustered harness; `is_apply_ok`'s empty-body `AccordApplyOK` acceptance in `coordinator.rs` stays unaudited. |
 | PG-6 | **Missing table served as empty relation** | A typo'd table silently returns zero rows instead of erroring | 8 | 1 | 3 | 24 | **R15 guard:** `load_table` checks schema metadata first → `NoSuchTable` (`42P01`), distinct from an existing empty table. Covered by `load_table_missing_table_is_no_such_table`. |
 | PG-7 | **Binary `numeric` unsupported** — a client requests binary parameters or results | The query could misdecode numeric values or emit invalid wire bytes | 5 | 2 | 2 | 20 | Checked Bind decoding and `encode_value` return explicit unsupported-format errors rather than guessing text. Implement binary numeric (roadmap Next). |
 | PG-8 | **No query cancel** — `BackendKeyData` is `(0,0)` | `CancelRequest` closes the connection but cannot target a running query | 4 | 3 | 2 | 24 | TLS is implemented (t_e1c819ad: `SSLRequest` → `S` + rustls, `[postgres] require_tls` refuses plaintext with `28000`, pipelined-bytes-after-`SSLRequest` refused). A real cancel key is roadmap. Threat-model note: `UnknownRole` is a user-enumeration oracle (run dummy verifier — follow-up). |
@@ -122,11 +114,10 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
   Accord, including cross-node snapshot and predicate-conflict cases).
 - `tests/pg_multirow_cluster_rowdrop.rs` — a REAL 3-node cluster (3 independent
   `AccordStateMachine`s + 3 `StorageEngine`s + 3 PG wire listeners) driven by the
-  real `AccordTransactionCommitter`. Pins the multi-row `INSERT` fail-loud guard
-  at the cluster boundary, and characterizes that a multi-key commit persists
-  every key on every owner in both the RF=3 and RF=1-one-shard-per-key topologies.
-  It documents the row-drop **non-reproduction**: this is the test to flip to
-  `INSERT 0 2` once the live loss is reproduced behind the real transport.
+  real `AccordTransactionCommitter`. Asserts that a multi-row `INSERT` over the
+  wire persists **every** row, with its own values, on every replica (it is not a
+  count assertion), and characterizes that a multi-key commit persists every key on
+  every owner in both the RF=3 and RF=1-one-shard-per-key topologies.
 - `server::txn_atomicity_tests` — local PostgreSQL MVCC snapshots, read-your-
   writes, serializable conflicts, phantoms, rollback, and extended protocol.
 - in-crate unit tests for codecs, SQLSTATE mapping, SCRAM vectors, the R15
