@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::cmp::Ordering;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef, Term,
+    AggArg, CastTarget, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef,
+    Term,
 };
 use crate::catalog::Catalog;
 use crate::exec::{
@@ -96,6 +97,13 @@ pub enum ExecError {
     /// purpose: a lost run would silently shorten the result, so the query
     /// fails rather than returning rows it cannot vouch for.
     Spill(SpillError),
+    /// A comparison term carries a `::` cast the pure engine cannot resolve. A
+    /// cast target's meaning (a relation name to a `pg_class.oid`) lives in the
+    /// PostgreSQL front end, which rewrites every cast before planning; reaching
+    /// this means a caller drove `execute`/`execute_streaming` directly with a
+    /// cast that never passed through the front end. Refuse loudly rather than
+    /// compare an unresolved cast.
+    UnresolvedCast(CastTarget),
 }
 
 impl fmt::Display for ExecError {
@@ -124,17 +132,26 @@ impl fmt::Display for ExecError {
                 write!(f, "there is no parameter ${n}")
             }
             ExecError::Spill(e) => write!(f, "{e}"),
+            ExecError::UnresolvedCast(ty) => write!(
+                f,
+                "a `::{}` cast was not resolved before planning (the PostgreSQL front end \
+                 resolves casts; this statement did not pass through it)",
+                ty.name()
+            ),
         }
     }
 }
 
 /// Resolve a comparison [`Term`] to a concrete [`Value`]: a literal yields
 /// itself; a `$N` parameter looks up `params[N-1]`, failing loud with
-/// [`ExecError::MissingParameter`] when the index is out of range.
+/// [`ExecError::MissingParameter`] when the index is out of range. A cast has no
+/// value here — its target's meaning lives in the PostgreSQL front end, which
+/// rewrites casts away before planning — so reaching it is [`ExecError::UnresolvedCast`].
 fn resolve_term<'a>(term: &'a Term, params: &'a [Value]) -> Result<&'a Value, ExecError> {
     match term {
         Term::Literal(v) => Ok(v),
         Term::Param(n) => params.get(n - 1).ok_or(ExecError::MissingParameter(*n)),
+        Term::Cast { ty, .. } => Err(ExecError::UnresolvedCast(*ty)),
     }
 }
 
@@ -581,9 +598,23 @@ fn infer_in_expr(
 ) -> Result<(), ExecError> {
     match expr {
         Expr::Compare { left, value, .. } => {
-            if let Term::Param(n) = value {
-                let ty = operand_type(left, scope, combined_schema)?;
-                record(n - 1, ty);
+            match value {
+                Term::Param(n) => {
+                    let ty = operand_type(left, scope, combined_schema)?;
+                    record(n - 1, ty);
+                }
+                // `$N::regclass` — the parameter is a relation NAME (text) on the
+                // wire; that is regclass's input type. A cast over anything else
+                // (a literal) carries no parameter to record.
+                Term::Cast {
+                    value,
+                    ty: CastTarget::Regclass,
+                } => {
+                    if let Term::Param(n) = &**value {
+                        record(*n - 1, ColumnType::Text);
+                    }
+                }
+                Term::Literal(_) => {}
             }
             Ok(())
         }

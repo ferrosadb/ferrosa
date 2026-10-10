@@ -3,9 +3,9 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand, OrderItem,
-    Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef,
-    Term, UnsupportedClause, UpdateStmt,
+    AggArg, CastTarget, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand,
+    OrderItem, Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement,
+    TableRef, Term, UnsupportedClause, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -39,6 +39,14 @@ pub enum ParseError {
     /// is supported only in a no-`FROM` expression select; any other use is
     /// refused by name rather than mis-parsed.
     UnsupportedSelectExpr(&'static str),
+    /// A `::type_name` cast to a target ferrosa does not implement, naming the
+    /// type exactly as written (schema-qualified when so). A cast that were
+    /// accepted and ignored would let a client's query return a wrong answer
+    /// while looking like it worked, so an unknown target fails loud.
+    UnsupportedCast(String),
+    /// A `CAST(x AS t)` call, which ferrosa does not implement. Refused by name
+    /// rather than mis-parsed as a column named `CAST`. (Use the `::` form.)
+    UnsupportedCastExpr,
     /// `CREATE TABLE` declares more than one primary key.
     MultiplePrimaryKeys,
     /// `CREATE TABLE` declares no primary key.
@@ -77,6 +85,12 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnsupportedSelectExpr(form) => {
                 write!(f, "{form} is not supported in a select list")
+            }
+            ParseError::UnsupportedCast(t) => {
+                write!(f, "cast to type `{t}` is not supported")
+            }
+            ParseError::UnsupportedCastExpr => {
+                write!(f, "CAST(x AS t) is not supported; use the `::` form")
             }
             ParseError::MultiplePrimaryKeys => write!(f, "multiple primary keys defined"),
             ParseError::MissingPrimaryKey => write!(f, "table has no PRIMARY KEY"),
@@ -206,6 +220,8 @@ enum Tok {
     RParen,
     /// The `||` string-concatenation operator (one token, not two pipes).
     Concat,
+    /// The `::` cast operator (one token, not two colons).
+    Cast,
     Eq,
     Ne,
     Lt,
@@ -265,6 +281,13 @@ fn lex_mode(sql: &str, lenient: bool) -> Result<Vec<Tok>, ParseError> {
                 // falls through to the `other` arm below and stays a loud
                 // `bad token: |` — never silently accepted.
                 toks.push(Tok::Concat);
+                i += 2;
+            }
+            ':' if chars.get(i + 1) == Some(&':') => {
+                // `::`: the cast operator, one token. A lone `:` falls through to
+                // the `other` arm below and stays a loud `bad token: :` — never
+                // silently accepted.
+                toks.push(Tok::Cast);
                 i += 2;
             }
             '=' => {
@@ -665,12 +688,14 @@ impl Parser {
     }
 
     /// The operand of a `||` (or a lone select item): a `$N` param, a scalar
-    /// subquery `( SELECT ... )`, a zero-arg function call, or a literal.
+    /// subquery `( SELECT ... )`, a zero-arg function call, or a literal —
+    /// optionally followed by a postfix `::type_name` cast.
     fn parse_scalar_primary(&mut self) -> Result<ScalarValue, ParseError> {
-        if let Some(Tok::Param(n)) = self.peek() {
+        self.reject_cast_call()?;
+        let mut value = if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
-            Ok(ScalarValue::Param(n))
+            ScalarValue::Param(n)
         } else if matches!(self.peek(), Some(Tok::LParen))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::Select))
         {
@@ -683,7 +708,7 @@ impl Parser {
             self.next(); // `(`
             let inner = self.parse_select_stmt()?;
             self.expect(&Tok::RParen, ")")?;
-            Ok(ScalarValue::Subquery(Box::new(inner)))
+            ScalarValue::Subquery(Box::new(inner))
         } else if matches!(self.peek(), Some(Tok::Ident(_)))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
         {
@@ -692,10 +717,21 @@ impl Parser {
             };
             self.expect(&Tok::LParen, "(")?;
             self.expect(&Tok::RParen, ")")?;
-            Ok(ScalarValue::Func(w.to_ascii_uppercase()))
+            ScalarValue::Func(w.to_ascii_uppercase())
         } else {
-            Ok(ScalarValue::Literal(self.parse_value()?))
+            ScalarValue::Literal(self.parse_value()?)
+        };
+        // `::type_name` — a POSTFIX cast, binding tighter than `||`
+        // (`'a' || 'b'::regclass` is `'a' || ('b'::regclass)`).
+        while matches!(self.peek(), Some(Tok::Cast)) {
+            self.next();
+            let ty = self.parse_cast_target()?;
+            value = ScalarValue::Cast {
+                value: Box::new(value),
+                ty,
+            };
         }
+        Ok(value)
     }
 
     /// An optional output alias: `AS name` or a bare `name`.
@@ -1047,6 +1083,7 @@ impl Parser {
     }
 
     fn parse_select_item_primary(&mut self) -> Result<SelectItem, ParseError> {
+        self.reject_cast_call()?;
         if let Some(Tok::Ident(word)) = self.peek() {
             if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
                 let raw = word.clone();
@@ -1242,20 +1279,66 @@ impl Parser {
     }
 
     /// The right-hand side of a comparison: a `$N` parameter placeholder
-    /// ([`Term::Param`]) or a literal value ([`Term::Literal`]).
+    /// ([`Term::Param`]) or a literal value ([`Term::Literal`]), optionally
+    /// followed by a postfix `::type_name` cast ([`Term::Cast`]).
     fn parse_term(&mut self) -> Result<Term, ParseError> {
-        if let Some(Tok::Param(n)) = self.peek() {
+        self.reject_cast_call()?;
+        let mut term = if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
-            return Ok(Term::Param(n));
+            Term::Param(n)
+        } else {
+            Term::Literal(self.parse_value()?)
+        };
+        // `::type_name` is a POSTFIX operator: it casts the term just parsed, so it
+        // binds tighter than the comparison operator it sits beside (`oid =
+        // $1::regclass` is `oid = ($1::regclass)`). A chain nests left-associatively.
+        while matches!(self.peek(), Some(Tok::Cast)) {
+            self.next();
+            let ty = self.parse_cast_target()?;
+            term = Term::Cast {
+                value: Box::new(term),
+                ty,
+            };
         }
-        Ok(Term::Literal(self.parse_value()?))
+        Ok(term)
+    }
+
+    /// Parse a `::type_name` cast target. The name may be schema-qualified
+    /// (`pg_catalog.regclass`) or bare (`regclass`). Only targets ferrosa
+    /// implements are accepted; anything else is refused **by name** — a cast
+    /// that were parsed and then ignored would return a wrong answer while
+    /// looking like it worked.
+    fn parse_cast_target(&mut self) -> Result<CastTarget, ParseError> {
+        let first = self.ident()?;
+        let written = if matches!(self.peek(), Some(Tok::Dot)) {
+            self.next();
+            format!("{first}.{}", self.ident()?)
+        } else {
+            first
+        };
+        match written.to_ascii_lowercase().as_str() {
+            "regclass" | "pg_catalog.regclass" => Ok(CastTarget::Regclass),
+            _ => Err(ParseError::UnsupportedCast(written)),
+        }
+    }
+
+    /// Fail loud on a `CAST(x AS t)` call. ferrosa implements the `::` form only,
+    /// and refusing it by name beats mis-parsing `CAST` as a column named `CAST`.
+    fn reject_cast_call(&mut self) -> Result<(), ParseError> {
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CAST"))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+        {
+            return Err(ParseError::UnsupportedCastExpr);
+        }
+        Ok(())
     }
 
     /// An operand in a comparison: an aggregate `FUNC(...)` if an identifier
     /// whose uppercase name is a known aggregate is immediately followed by `(`,
     /// otherwise a plain column reference. (Mirrors `parse_select_item`.)
     fn parse_operand(&mut self) -> Result<Operand, ParseError> {
+        self.reject_cast_call()?;
         if let Some(Tok::Ident(word)) = self.peek() {
             if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
                 let raw = word.clone();
@@ -3249,6 +3332,114 @@ mod tests {
                 other => panic!("`{sql}` must be refused by name, got {other:?}"),
             }
         }
+    }
+
+    // ---- `::` cast (`expr::type_name`) — pgbench's `$1::pg_catalog.regclass` ----
+
+    #[test]
+    fn the_pgbench_object_existence_query_parses_a_regclass_cast() {
+        // RED before the `::` token existed: the lexer had no token for `:`, so the
+        // query died with `bad token: :` before the parser ever ran. This is the
+        // exact statement pgbench -i issues to check whether a table already exists.
+        let stmt =
+            parse("SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass")
+                .expect("the pgbench object-existence query must parse");
+        assert_eq!(stmt.from.schema.as_deref(), Some("pg_catalog"));
+        assert_eq!(stmt.from.table, "pg_class");
+        let filter = stmt.filter.expect("WHERE");
+        let (_, op, value) = as_compare(&filter);
+        assert_eq!(op, CmpOp::Eq);
+        assert_eq!(
+            *compare_column(&filter),
+            ColumnRef {
+                qualifier: None,
+                name: "oid".into()
+            }
+        );
+        // The cast is on the RHS term — `oid = ($1::regclass)` — so `::` binds
+        // tighter than the comparison operator, which is the specification.
+        assert_eq!(
+            *value,
+            Term::Cast {
+                value: Box::new(Term::Param(1)),
+                ty: CastTarget::Regclass,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_regclass_cast_is_the_same_target_as_the_schema_qualified_spelling() {
+        let bare = parse("SELECT relkind FROM t WHERE oid = $1::regclass").expect("must parse");
+        let qualified =
+            parse("SELECT relkind FROM t WHERE oid = $1::pg_catalog.regclass").expect("must parse");
+        assert_eq!(bare.filter, qualified.filter);
+    }
+
+    #[test]
+    fn a_cast_binds_tighter_than_string_concatenation() {
+        // `'a' || 'b'::regclass` is `'a' || ('b'::regclass)`: the postfix `::`
+        // applies to the primary on its left, not to the whole concatenation.
+        let items = scalar_items("SELECT 'a' || 'b'::regclass");
+        let ScalarValue::Concat { left, right } = &items[0].value else {
+            panic!("expected a top-level concat, got {:?}", items[0].value);
+        };
+        assert_eq!(**left, ScalarValue::Literal(Value::Text("a".into())));
+        assert_eq!(
+            **right,
+            ScalarValue::Cast {
+                value: Box::new(ScalarValue::Literal(Value::Text("b".into()))),
+                ty: CastTarget::Regclass,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cast_to_a_type_ferrosa_does_not_implement_is_refused_by_name() {
+        // Never silently accepted and ignored: a cast target the engine cannot
+        // honour is refused by name — the type exactly as it was written, with its
+        // schema qualifier when one was given.
+        for (sql, ty) in [
+            ("SELECT relkind FROM t WHERE oid = $1::text", "text"),
+            ("SELECT relkind FROM t WHERE oid = $1::int4", "int4"),
+            (
+                "SELECT relkind FROM t WHERE oid = $1::pg_catalog.regtype",
+                "pg_catalog.regtype",
+            ),
+            ("SELECT relkind FROM t WHERE oid = $1::nowhere", "nowhere"),
+        ] {
+            match parse(sql) {
+                Err(ParseError::UnsupportedCast(name)) => assert_eq!(name, ty, "{sql}"),
+                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cast_function_syntax_is_refused_by_name_not_misparsed() {
+        // `CAST(x AS t)` is not implemented, so it is refused BY NAME rather than
+        // mis-parsed as a column named `CAST`. A bare `cast` column is still fine.
+        for sql in [
+            "SELECT CAST(k AS text) FROM t",
+            "SELECT relkind FROM t WHERE oid = CAST($1 AS regclass)",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedCastExpr) => {}
+                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+            }
+        }
+        assert!(parse("SELECT cast FROM t").is_ok());
+    }
+
+    #[test]
+    fn a_lone_colon_is_still_a_bad_token() {
+        // Negative control: `::` becomes one token, but a single `:` is still a
+        // character the lexer has no token for and must keep failing loudly.
+        let error = parse_statement("SELECT 'a' : 'b'").expect_err("a lone `:` must be refused");
+        assert_eq!(
+            error.to_string(),
+            "bad token: :",
+            "a lone colon must still be `bad token: :`, not silently accepted"
+        );
     }
 
     // ---- scalar subqueries `( SELECT ... )` in the SELECT list ----

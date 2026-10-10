@@ -455,6 +455,93 @@ pub fn catalog_tables(schema: &Schema) -> Result<Vec<(String, InMemoryTable)>, P
     ])
 }
 
+/// Resolve a relation name — as PostgreSQL's `regclass` input — to the OID this
+/// front end projects for it in `pg_catalog.pg_class`.
+///
+/// `name` may be unqualified (`t`) or schema-qualified (`ks.t`). An unqualified
+/// name resolves in `default_schema`, the **same** rule the query path uses for a
+/// `FROM` relation (`table_ref.schema.as_deref().unwrap_or(default_schema)`), so
+/// the two agree by construction rather than by a second, divergent rule.
+/// Double-quoted parts are taken literally (and may contain a `.`); an unquoted
+/// part is folded to lower case, as PostgreSQL folds an unquoted identifier.
+///
+/// A base relation resolves to [`relation_oid`]. A table's primary-key index
+/// (`<table>_pkey`) is a relation too — it has its own `pg_class` row with
+/// `relkind = 'i'` — so it resolves to [`index_oid`]. Returns `None` when nothing
+/// by that name exists; the caller turns that into a `42P01` (undefined_table),
+/// never a zero OID that would silently match nothing.
+pub(crate) fn resolve_regclass(schema: &Schema, default_schema: &str, name: &str) -> Option<u32> {
+    let (keyspace, table) = match parse_relation_name(name)?.as_slice() {
+        [table] => (default_schema.to_string(), table.clone()),
+        [ks, table] => (ks.clone(), table.clone()),
+        _ => return None,
+    };
+    let snapshot = schema.snapshot();
+    if snapshot
+        .tables
+        .contains_key(&(keyspace.clone(), table.clone()))
+    {
+        return Some(relation_oid(&keyspace, &table));
+    }
+    let is_index = snapshot.tables.iter().any(|((ks, tbl), meta)| {
+        *ks == keyspace
+            && table == primary_key_index_name(tbl)
+            && !crate::pg_key::of(meta).is_empty()
+    });
+    is_index.then(|| index_oid(&keyspace, &table))
+}
+
+/// Split a `regclass` name into its parts: `ks.tbl`, `"ks"."tbl"`, or `tbl`.
+///
+/// An unquoted part is trimmed and lowercased; a quoted part is literal, with
+/// `""` an escaped quote. `None` for an empty part or trailing junk, so a
+/// malformed name is unreachable rather than silently truncated.
+fn parse_relation_name(name: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut chars = name.chars().peekable();
+    loop {
+        let mut part = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next(); // opening quote
+            let mut closed = false;
+            while let Some(c) = chars.next() {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        part.push('"');
+                    } else {
+                        closed = true;
+                        break;
+                    }
+                } else {
+                    part.push(c);
+                }
+            }
+            if !closed {
+                return None;
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == '.' {
+                    break;
+                }
+                part.push(c);
+                chars.next();
+            }
+            part = part.trim().to_ascii_lowercase();
+        }
+        if part.is_empty() {
+            return None;
+        }
+        parts.push(part);
+        match chars.next() {
+            None => return Some(parts),
+            Some('.') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
 /// Shared schema fixtures for catalog and `pg_types` tests.
 #[cfg(test)]
 pub(crate) mod test_support {

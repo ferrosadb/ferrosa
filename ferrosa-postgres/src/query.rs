@@ -36,9 +36,9 @@ use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    parse_statement, Column, ColumnType, DeleteStmt, ExecError, InsertStmt, MapCatalog,
-    QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, Statement, UpdateStmt,
-    Value as SqlValue,
+    parse_statement, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr, InsertStmt,
+    MapCatalog, QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, Statement, Term,
+    UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -49,6 +49,10 @@ use crate::mvcc::{
 use crate::result_stream::{open_stream, ResultStream};
 use crate::storage_provider::{load_table_with_overlay, LoadError, ScanFailure, SCAN_BUFFER_ROWS};
 use crate::synthetic_key::next_synthetic_key;
+
+/// The reserved PostgreSQL schema whose relations are projected from the live
+/// schema, not read from storage (see [`crate::catalog`]).
+const PG_CATALOG: &str = "pg_catalog";
 
 /// Build an `ErrorResponse` with the standard severity/code/message trio
 /// (`S=ERROR`, `C=<sqlstate>`, `M=<message>`).
@@ -799,6 +803,11 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         // with a short result the client could not distinguish from a complete
         // one (forge t_50d99192).
         ExecError::Spill(_) => ("58030", err.to_string()),
+        // A `::` cast the front end failed to resolve before planning. The front
+        // end resolves every cast, so this is a caller that drove the engine
+        // directly with an unresolved cast; refused as an unsupported feature
+        // rather than compared as if the cast did nothing.
+        ExecError::UnresolvedCast(_) => ("0A000", err.to_string()),
     };
     error_response(sqlstate, &message)
 }
@@ -899,7 +908,9 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         | ParseError::MissingPrimaryKey
         | ParseError::UnsupportedAlter(_)
         | ParseError::UnsupportedStorageParameter(_)
-        | ParseError::UnsupportedSelectExpr(_) => "0A000",
+        | ParseError::UnsupportedSelectExpr(_)
+        | ParseError::UnsupportedCast(_)
+        | ParseError::UnsupportedCastExpr => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",
@@ -992,10 +1003,15 @@ pub(crate) struct ReadEnv<'a> {
 /// be pumped. The single entry point for both simple and extended `SELECT`s.
 pub(crate) async fn open_select_stream(
     env: ReadEnv<'_>,
-    select: ferrosa_sql::SelectStmt,
+    mut select: ferrosa_sql::SelectStmt,
     pending_writes: Option<&[PgWrite]>,
     params: Vec<SqlValue>,
 ) -> Result<ResultStream, BackendMessage> {
+    // Resolve every `::` cast to a concrete value BEFORE planning: the `::type`
+    // semantics (a relation name to its `pg_class.oid`) live here, in the
+    // PostgreSQL front end, not in the pure engine. A cast that cannot be resolved
+    // is an error here, never a value silently left to the executor.
+    resolve_casts(&mut select, &params, env.schema, env.default_schema)?;
     let (catalog, failure) = load_catalog_with_mvcc(
         env.engine,
         env.schema,
@@ -1014,6 +1030,138 @@ pub(crate) async fn open_select_stream(
         params,
     )
     .await
+}
+
+/// Resolve every `::` cast in a table select's `WHERE`/`HAVING` to its concrete
+/// value, before the executor plans the statement.
+///
+/// `ferrosa-sql` parses a cast and carries its target, but owns no catalog-OID
+/// scheme (that is PostgreSQL-specific). The **semantics** of each target live
+/// here: `text::regclass` resolves the relation name to the `pg_class.oid` of the
+/// relation it names, so `oid = $1::regclass` compares exactly as PostgreSQL
+/// does. The term is REWRITTEN to a literal OID, so the pure engine compares
+/// like-with-like and a cast can never be silently ignored.
+///
+/// # Errors
+///
+/// `42P01` (undefined_table) when the name resolves to no relation — never a
+/// zero OID, which would silently match nothing; `42846` (cannot_coerce) when the
+/// operand is not a relation name; `08P01` when a cast's `$N` has no bound value.
+fn resolve_casts(
+    select: &mut SelectStmt,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<(), BackendMessage> {
+    if let Some(filter) = select.filter.as_mut() {
+        resolve_casts_in_expr(filter, params, schema, default_schema)?;
+    }
+    if let Some(having) = select.having.as_mut() {
+        resolve_casts_in_expr(having, params, schema, default_schema)?;
+    }
+    Ok(())
+}
+
+fn resolve_casts_in_expr(
+    expr: &mut Expr,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<(), BackendMessage> {
+    match expr {
+        Expr::Compare { value, .. } if term_has_cast(value) => {
+            // `Term::Literal` cannot carry a cast, so the term is a cast tree.
+            let resolved = eval_cast_term(value, params, schema, default_schema)?;
+            *value = Term::Literal(resolved);
+            Ok(())
+        }
+        Expr::Compare { .. } => Ok(()),
+        Expr::Not(inner) => resolve_casts_in_expr(inner, params, schema, default_schema),
+        Expr::And(left, right) | Expr::Or(left, right) => {
+            resolve_casts_in_expr(left, params, schema, default_schema)?;
+            resolve_casts_in_expr(right, params, schema, default_schema)
+        }
+    }
+}
+
+/// Whether this term carries a `::` cast anywhere (so it must be resolved).
+fn term_has_cast(term: &Term) -> bool {
+    match term {
+        Term::Cast { .. } => true,
+        Term::Literal(_) | Term::Param(_) => false,
+    }
+}
+
+/// Evaluate a comparison term that carries a cast to its concrete value,
+/// substituting bound `$N` values and applying each cast in turn.
+fn eval_cast_term(
+    term: &Term,
+    params: &[SqlValue],
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    match term {
+        Term::Literal(v) => Ok(v.clone()),
+        Term::Param(n) => params.get(n.wrapping_sub(1)).cloned().ok_or_else(|| {
+            error_response(
+                "08P01",
+                &format!("bind parameter ${n} has no value (out of range)"),
+            )
+        }),
+        Term::Cast { value, ty } => {
+            let inner = eval_cast_term(value, params, schema, default_schema)?;
+            apply_cast(&inner, *ty, schema, default_schema)
+        }
+    }
+}
+
+/// Apply a parsed cast to an already-evaluated value — the ONE place a cast
+/// target's meaning is decided.
+fn apply_cast(
+    value: &SqlValue,
+    ty: CastTarget,
+    schema: &Schema,
+    default_schema: &str,
+) -> Result<SqlValue, BackendMessage> {
+    match ty {
+        CastTarget::Regclass => match value {
+            // PostgreSQL: NULL cast to any type is NULL. `oid = NULL` is UNKNOWN,
+            // so the row is filtered out — never a zero OID that would match.
+            SqlValue::Null => Ok(SqlValue::Null),
+            SqlValue::Text(name) => {
+                let oid = crate::catalog::resolve_regclass(schema, default_schema, name)
+                    .ok_or_else(|| {
+                        error_response("42P01", &format!("relation \"{name}\" does not exist"))
+                    })?;
+                Ok(SqlValue::Int(i64::from(oid)))
+            }
+            other => Err(error_response(
+                "42846",
+                &format!("cannot cast type {} to regclass", value_type_name(other)),
+            )),
+        },
+    }
+}
+
+/// The Postgres type name of a value, for a `cannot cast` message.
+fn value_type_name(value: &SqlValue) -> &'static str {
+    match value {
+        SqlValue::Int(_) => "integer",
+        SqlValue::Float(_) => "double precision",
+        SqlValue::Numeric { .. } => "numeric",
+        SqlValue::Bool(_) => "boolean",
+        SqlValue::Text(_) => "text",
+        SqlValue::Null => "unknown",
+        SqlValue::Uuid(_) => "uuid",
+        SqlValue::Bytea(_) => "bytea",
+        SqlValue::Timestamp(_) => "timestamp",
+        SqlValue::Date(_) => "date",
+        SqlValue::Time(_) => "time",
+        SqlValue::Inet(_) => "inet",
+        SqlValue::Jsonb(_) => "jsonb",
+        SqlValue::JsonPath(_) => "jsonpath",
+        SqlValue::TextArray(_) => "text[]",
+    }
 }
 
 /// Where a reply's messages go as they are produced. The server's sink writes
@@ -1619,6 +1767,13 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
             let right = substitute_param(right, params)?;
             concat_text(&left, &right)
         }
+        // The DML/`VALUES` grammar never builds a cast (`parse_scalar_value` has no
+        // `::`), so this arm is unreachable today; it refuses loudly rather than
+        // guessing if a future grammar reaches it.
+        ScalarValue::Cast { ty, .. } => Err(error_response(
+            "0A000",
+            &format!("a `::{}` cast is not supported in a DML value", ty.name()),
+        )),
         // The DML/`VALUES` grammar never builds a scalar subquery, so this arm is
         // unreachable today; it refuses loudly rather than guessing if a future
         // grammar reaches it (there is no read environment on this synchronous,
@@ -2841,6 +2996,19 @@ async fn eval_scalar_value(
             let (right, _) = Box::pin(eval_scalar_value(right, ctx)).await?;
             Ok((concat_text(&left, &right)?, ColumnType::Text))
         }
+        ScalarValue::Cast { value, ty } => {
+            let (inner, _) = Box::pin(eval_scalar_value(value, ctx)).await?;
+            let Some(env) = ctx.read else {
+                return Err(error_response(
+                    "0A000",
+                    "a `::` cast in an expression requires a storage context",
+                ));
+            };
+            // Same semantics as the WHERE path: the cast's meaning is the front
+            // end's, and an unresolvable `regclass` name is an error, not NULL.
+            let out = apply_cast(&inner, *ty, env.schema, env.default_schema)?;
+            Ok((out, ColumnType::Int))
+        }
         ScalarValue::Subquery(stmt) => eval_scalar_subquery(stmt, ctx).await,
     }
 }
@@ -3031,9 +3199,40 @@ pub(crate) async fn load_catalog_with_mvcc(
     // One slot per query: every provider records into it, and the query layer
     // takes it once after `execute` returns.
     let failure = ScanFailure::default();
-    let referenced = std::iter::once(&stmt.from).chain(stmt.join.as_ref().map(|j| &j.table));
+    let referenced: Vec<&ferrosa_sql::ast::TableRef> = std::iter::once(&stmt.from)
+        .chain(stmt.join.as_ref().map(|j| &j.table))
+        .collect();
+    // `pg_catalog.<relation>` is not stored: it is a projection built from the live
+    // schema. Build the six catalog tables once when a referenced relation asks for
+    // one, and serve each from that projection — an unresolvable column type is a
+    // PgTypeError, reported rather than advertising an unresolvable type to a client.
+    let catalog_tables = if referenced
+        .iter()
+        .any(|t| t.schema.as_deref().unwrap_or(default_schema) == PG_CATALOG)
+    {
+        Some(
+            crate::catalog::catalog_tables(schema)
+                .map_err(|e| error_response("42704", &e.to_string()))?,
+        )
+    } else {
+        None
+    };
     for table_ref in referenced {
         let keyspace = table_ref.schema.as_deref().unwrap_or(default_schema);
+        if keyspace == PG_CATALOG {
+            let Some(table) = catalog_tables
+                .as_ref()
+                .and_then(|tables| tables.iter().find(|(name, _)| name == &table_ref.table))
+                .map(|(_, table)| table)
+            else {
+                return Err(error_response(
+                    "42P01",
+                    &format!("relation \"{keyspace}.{}\" does not exist", table_ref.table),
+                ));
+            };
+            catalog = catalog.with_table(keyspace, &table_ref.table, Arc::new(table.clone()));
+            continue;
+        }
         let table_name = format!("{keyspace}.{}", table_ref.table);
         let mut overlay = match (mvcc, snapshot) {
             (Some(mvcc), Some(snapshot)) => mvcc.table_overlay(snapshot, &table_name),

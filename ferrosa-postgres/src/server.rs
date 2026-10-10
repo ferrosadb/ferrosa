@@ -3154,6 +3154,153 @@ pub(crate) mod txn_atomicity_tests {
         ctx.engine.shutdown().unwrap();
     }
 
+    // ---- `::` cast: pgbench's object-existence check (`$1::pg_catalog.regclass`) ----
+
+    /// pgbench -i's object-existence check, the exact statement and the exact
+    /// protocol (Parse → Bind → Execute) the server runs:
+    ///
+    /// ```text
+    /// SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass
+    /// ```
+    ///
+    /// with `$1` bound to a real relation name. Before `::` existed the lexer
+    /// refused the `:` with `bad token: :`. The cast must now resolve the name to
+    /// the relation's real `pg_class.oid` — the SAME OID `pg_class` projects — so the
+    /// `oid =` comparison matches and the query returns that relation's actual
+    /// `relkind` ('r' for an ordinary table), not merely "no error".
+    #[tokio::test]
+    async fn the_pgbench_object_existence_check_returns_the_real_relkind() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        assert!(matches!(
+            session.on_parse(
+                "exists".to_string(),
+                "SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass",
+                vec![],
+            ),
+            BackendMessage::ParseComplete
+        ));
+        assert!(matches!(
+            session.on_bind(
+                "p".to_string(),
+                "exists".to_string(),
+                &[],
+                &[Some(b"kv".to_vec())],
+                vec![],
+                &crate::jsonb_wire::test_limits(),
+            ),
+            BackendMessage::BindComplete
+        ));
+
+        let messages = execute_portal(&ctx, &mut session, "p").await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "the object-existence check must not error: {messages:?}"
+        );
+        assert_eq!(
+            read_first_text_column(&messages).as_deref(),
+            Some("r"),
+            "the cast resolved `kv` to its real oid, so pg_class returned its relkind"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// Negative control for the case above: an unresolvable relation name is an
+    /// ERROR (PostgreSQL `42P01`), never an empty result that a client would read
+    /// as "the object does not exist".
+    #[tokio::test]
+    async fn the_pgbench_object_existence_check_errors_on_an_unknown_relation() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        session.on_parse(
+            "exists".to_string(),
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass",
+            vec![],
+        );
+        session.on_bind(
+            "p".to_string(),
+            "exists".to_string(),
+            &[],
+            &[Some(b"no_such_relation".to_vec())],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+
+        let messages = execute_portal(&ctx, &mut session, "p").await;
+        assert!(
+            is_error(&messages, "42P01"),
+            "an unresolvable relation name must be undefined_table: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { .. })),
+            "and must not be an empty result that looks like success: {messages:?}"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// The `pg_catalog.pg_class` projection is served to the query path (the cast
+    /// test above depends on it): a plain simple query reads a relation's relkind
+    /// with no cast involved.
+    #[tokio::test]
+    async fn pg_catalog_pg_class_is_queryable_and_reports_relkind() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(
+            &ctx,
+            &mut session,
+            "SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'kv'",
+        )
+        .await;
+        assert_eq!(read_first_text_column(&messages).as_deref(), Some("r"));
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// A select-list `::regclass` resolves the same way the WHERE one does:
+    /// `'kv'::regclass` yields the relation's `pg_class.oid` (as an integer).
+    #[tokio::test]
+    async fn a_scalar_regclass_cast_yields_the_relations_oid() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(&ctx, &mut session, "SELECT 'kv'::regclass").await;
+        let expected = crate::catalog::resolve_regclass(&ctx.schema, "public", "kv")
+            .expect("kv resolves to its oid")
+            .to_string();
+        assert_eq!(
+            read_first_text_column(&messages).as_deref(),
+            Some(expected.as_str()),
+            "the scalar cast must resolve to the real oid, not be dropped"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// A cast to a type ferrosa does not implement is refused BY NAME at parse
+    /// time (never accepted and ignored): the type as written is in the message.
+    #[tokio::test]
+    async fn a_cast_to_an_unsupported_type_is_refused_by_name() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let response = session.on_parse(
+            "bad".to_string(),
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::text",
+            vec![],
+        );
+        match response {
+            BackendMessage::ErrorResponse { fields } => {
+                assert_eq!(fields[1], (b'C', "0A000".to_string()));
+                assert!(
+                    fields[2].1.contains('`') && fields[2].1.contains("text"),
+                    "the refusal names the type: {fields:?}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+        ctx.engine.shutdown().unwrap();
+    }
+
     fn read_first_text_column(messages: &[BackendMessage]) -> Option<String> {
         messages.iter().find_map(|message| match message {
             BackendMessage::DataRow { columns } => columns

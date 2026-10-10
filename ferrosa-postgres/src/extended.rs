@@ -429,7 +429,10 @@ impl Session {
             }
             Err(e) => {
                 self.error_pending = true;
-                return error_response("42601", &e.to_string());
+                // Same SQLSTATE as the simple-query path: a refused clause, key or
+                // CAST type is `0A000` (feature_not_supported), not the generic
+                // `42601` — a client must not read an unsupported feature as a typo.
+                return error_response(crate::query::parse_error_sqlstate(&e), &e.to_string());
             }
         };
         self.statements.insert(

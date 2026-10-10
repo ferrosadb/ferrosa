@@ -33,7 +33,8 @@ in-memory table in tests and by Ferrosa storage in production.
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
 - No-`FROM` scalar selects: `SELECT 1`, `SELECT version()` (zero-arg func),
   `SELECT $1`, `SELECT TRUE`, `||` string concatenation over those scalars
-  (`SELECT 'a' || 'b'`, `SELECT 'a' || $1 || current_database()`), and a **scalar
+  (`SELECT 'a' || 'b'`, `SELECT 'a' || $1 || current_database()`), a postfix
+  `::type_name` cast (`SELECT 'kv'::regclass`), and a **scalar
   subquery** `( SELECT ... )` as an operand
   (`SELECT (SELECT count(*) FROM t) || '|'`). `||` is left-associative, evaluates
   to `text`, and propagates NULL (NULL on either side ⇒ NULL, which is *not* the
@@ -98,7 +99,21 @@ in-memory table in tests and by Ferrosa storage in production.
 - Transaction / session statements **parsed** (not executed here): `BEGIN`/`START`,
   `COMMIT`/`END`, `ROLLBACK`/`ABORT`, `SET`, `RESET`.
 - WHERE/HAVING boolean expressions: `AND` / `OR` / `NOT` with parentheses and
-  the six comparison operators `= != <> < <= > >=`. RHS is a literal or `$N`.
+  the six comparison operators `= != <> < <= > >=`. RHS is a literal, a `$N`, or
+  either followed by a postfix `::type_name` cast (`oid = $1::regclass`).
+- **`::` cast (`expr::type_name`).** A POSTFIX cast, so it binds tighter than the
+  operator beside it: `oid = $1::regclass` is `oid = ($1::regclass)`, and
+  `'a' || 'b'::regclass` is `'a' || ('b'::regclass)`. The name may be bare
+  (`::regclass`) or schema-qualified (`::pg_catalog.regclass`). The parser records
+  the target (`CastTarget`); its **semantics** are the front end's (see
+  `ferrosa-postgres`): `::regclass` resolves a relation name to the `pg_class.oid`
+  of the relation it names, so `oid = $1::regclass` compares like PostgreSQL and an
+  unresolvable name is an error, never a zero OID. Only `regclass` is implemented;
+  **any other target is refused by name** (`ParseError::UnsupportedCast`, `0A000`)
+  rather than accepted and ignored, and the `CAST(x AS t)` spelling is likewise
+  refused by name (`ParseError::UnsupportedCastExpr`) — never mis-parsed as a column
+  named `CAST`. A lone `:` is still a loud `bad token: :`: the `::` arm consumes both
+  colons, a single one falls through to the catch-all.
 - Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`.
 - Literals: int, float, string (with `''` escape), `TRUE`/`FALSE`/`NULL`, `$N`
   params, and typed literals `TIMESTAMP/DATE/TIME/INET/NUMERIC(=DECIMAL) '...'`.
@@ -184,7 +199,7 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 | Area | Items |
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
-| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
+| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `CastTarget`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
 | Plan | `execute_streaming`, `RowSink`, `open_cursor`, `RowCursor`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |

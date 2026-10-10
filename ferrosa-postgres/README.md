@@ -139,6 +139,15 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   (with a matching `<table>_pkey` index row in `pg_class`), so psql's describe-table
   shows a declared `PRIMARY KEY`; a table whose only key is the synthesized
   `_sys_ck_` reports no key.
+- **`::` casts to a catalog type, resolved before planning** (`catalog::resolve_regclass`,
+  `query::resolve_casts`). `$1::pg_catalog.regclass` — what pgbench sends to test whether its
+  tables exist — takes the relation NAME as text on the wire and resolves it to the same
+  deterministic OID the `pg_catalog` projection reports, so `WHERE oid = $1::pg_catalog.regclass`
+  compares like Postgres. An unresolvable name is `42P01`, never an empty result; a non-text
+  operand is `42846`; every other cast target — and the `CAST(x AS t)` spelling — is refused BY
+  NAME (`0A000`) rather than accepted and ignored. `::` binds tighter than `||`, so
+  `'a' || 'b'::regclass` is `'a' || ('b'::regclass)`. A query's `FROM pg_catalog.*` is served
+  from `catalog_tables`, which is what makes that query run at all.
 - **Enforced `FOREIGN KEY`s, backed by real secondary indexes** (`pg_fk`, `ddl::execute_add_foreign_key`).
   `ALTER TABLE ... ADD [CONSTRAINT <name>] FOREIGN KEY (<col>) REFERENCES <parent> [(<pcol>)]`
   records the constraint on the child table (as `pg.foreign_key.<name>` in `TableMetadata::extensions`,

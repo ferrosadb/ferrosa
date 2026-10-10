@@ -13,6 +13,27 @@ toward the Postgres queries real clients send.
 
 ## Now (highest value)
 
+- **(done) `::` cast (`expr::type_name`), sufficient for pgbench's object-existence
+  query.** `SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass`
+  is what `pgbench -i` runs to check whether a table exists; before this the lexer
+  had no token for `:` and the query died with `bad token: :`. The lexer now yields
+  ONE `Tok::Cast` for `::` (a lone `:` stays a loud `bad token: :`, mirroring the
+  `||`/`|` precedent). It is a POSTFIX operator — `oid = $1::regclass` is
+  `oid = ($1::regclass)`, and `'a' || 'b'::regclass` is `'a' || ('b'::regclass)` —
+  so it binds tighter than both the comparison operators and `||`; that precedence
+  is pinned by `the_pgbench_object_existence_query_parses_a_regclass_cast` and
+  `a_cast_binds_tighter_than_string_concatenation`. The name may be bare or
+  schema-qualified (`pg_catalog.regclass`), and the target is recorded as
+  `Term::Cast` / `ScalarValue::Cast` (`CastTarget`). The parser only *records* the
+  cast: its **semantics are the front end's** (`ferrosa-postgres::query::resolve_casts`
+  and `catalog::resolve_regclass`), because the `pg_class.oid` scheme is
+  PostgreSQL-specific and this crate owns no catalog. Only `regclass` is implemented.
+  **Refused by name, never accepted-and-ignored**: any other target is
+  `ParseError::UnsupportedCast(<type as written>)` (`0A000`), and the `CAST(x AS t)`
+  spelling is `ParseError::UnsupportedCastExpr` (`0A000`) rather than mis-parsed as a
+  column named `CAST` (a bare `cast` column is still allowed). A cast that reaches the
+  pure engine unrewritten is `ExecError::UnresolvedCast` (`0A000`), not a no-op.
+
 - **(done) Scalar subqueries `( SELECT ... )` in the no-`FROM` select list.** An
   LParen followed by `SELECT` in `parse_scalar_primary` begins a scalar subquery
   operand (`ScalarValue::Subquery`), closed by the matching RParen; the inner

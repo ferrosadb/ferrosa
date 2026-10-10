@@ -13,6 +13,14 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **`::` casts, and `pg_catalog.*` as a queryable relation** (`catalog::resolve_regclass`,
+  `query::resolve_casts`, `load_catalog_with_mvcc`). `$1::pg_catalog.regclass` resolves the relation
+  name to its catalog OID, so pgbench's object-existence check
+  (`SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass`) now runs — it was
+  dying as `bad token: :` because the lexer had no `::` token at all. Unsupported cast targets and
+  `CAST(x AS t)` are refused by name; `ParseError`→SQLSTATE mapping now runs on the extended-protocol
+  parse path too, so those refusals carry `0A000` instead of a blanket `42601`.
+
 - **Enforced `FOREIGN KEY`s, backed by real secondary indexes** (`pg_fk.rs`,
   `ddl::execute_add_foreign_key`, `query::execute_{insert,update,delete}`). `ALTER TABLE …
   ADD [CONSTRAINT <name>] FOREIGN KEY (<col>) REFERENCES <parent> [(<pcol>)]` — with the

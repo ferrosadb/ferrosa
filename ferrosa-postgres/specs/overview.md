@@ -54,6 +54,12 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: bounded async-to-sync streaming provider; `cql_to_value`; R15 guard |
 | `catalog` (`src/catalog.rs`) | ~956 | `pg_catalog` projection (`pg_namespace`/`pg_class`/`pg_attribute`/`pg_type`/`pg_index`/`pg_constraint`) with deterministic OIDs. Ordinary columns take attnums 1..n; a reserved `_sys_` column takes a NEGATIVE attnum, as Postgres numbers its own system columns, so it cannot shift every other column's ordinal. `pg_index`/`pg_constraint` carry a table's *primary key* (a `<table>_pkey` index row in `pg_class` too); a table whose only key is the synthesized `_sys_ck_` gets none |
 | `server` (`src/server.rs`) | ~540 | tokio TCP front-end: `serve`, `QueryContext`, `handle_connection`, the post-auth query loop (wakes to expire idle suspended portals) |
+
+**`::` casts.** A cast target is resolved BEFORE planning (`query::resolve_casts`):
+`<name>::pg_catalog.regclass` becomes the relation's catalog OID via `catalog::resolve_regclass`, matching
+what the `pg_catalog` projection reports. Unsupported targets, and `CAST(x AS t)`, are refused by name.
+`load_catalog_with_mvcc` serves a query's `FROM pg_catalog.*` from `catalog_tables`.
+
 | `result_stream` (`src/result_stream.rs`) | ~600 | Pull-driven result delivery: an owned `RowCursor` fetched 16 rows at a time on a blocking thread; a waiting query holds no thread |
 | `portal_limits` (`src/portal_limits.rs`) | ~380 | `PortalLimits`/`SuspendedPortals`: per-connection and per-node caps on suspended portals (`53000`), idle timeout (`57014`), metrics |
 | `synthetic_key` (`src/synthetic_key.rs`) | ~147 | Mints the per-row v1 TimeUUID value for the synthetic `_sys_ck_` key column of a PK-less table: random per-process node field, monotonic time field, process-local clock sequence |

@@ -426,6 +426,15 @@ pub enum ScalarValue {
     /// Produced only by the select-list scalar grammar's `parse_scalar_primary`;
     /// the DML/`VALUES` and `FROM`-relation grammars never build one.
     Subquery(Box<SelectStmt>),
+    /// `value::ty` — a cast in a select-list scalar.
+    ///
+    /// A **postfix** cast, so it binds tighter than `||`: `'a' || 'b'::regclass`
+    /// is `'a' || ('b'::regclass)`, never `('a' || 'b')::regclass`. The target's
+    /// meaning is owned by the front end, exactly as for [`crate::ast::Term::Cast`].
+    Cast {
+        value: Box<ScalarValue>,
+        ty: CastTarget,
+    },
 }
 
 impl ScalarValue {
@@ -442,6 +451,7 @@ impl ScalarValue {
             ScalarValue::Concat { left, right } => {
                 left.references_param() || right.references_param()
             }
+            ScalarValue::Cast { value, .. } => value.references_param(),
             ScalarValue::Subquery(stmt) => stmt.references_param(),
             ScalarValue::Literal(_) | ScalarValue::Func(_) => false,
         }
@@ -465,7 +475,18 @@ impl Expr {
                 left.references_param() || right.references_param()
             }
             Expr::Not(inner) => inner.references_param(),
-            Expr::Compare { value, .. } => matches!(value, Term::Param(_)),
+            Expr::Compare { value, .. } => value.references_param(),
+        }
+    }
+}
+
+impl Term {
+    /// Whether this comparison term carries a `$N` parameter, at any cast depth.
+    pub fn references_param(&self) -> bool {
+        match self {
+            Term::Param(_) => true,
+            Term::Cast { value, .. } => value.references_param(),
+            Term::Literal(_) => false,
         }
     }
 }
@@ -495,6 +516,42 @@ pub enum Term {
     Literal(Value),
     /// A `$N` placeholder, carrying the 1-based parameter index `N`.
     Param(usize),
+    /// `value::ty` — the term's value cast to `ty`.
+    ///
+    /// A **postfix** cast, so it binds tighter than the comparison operator it
+    /// sits beside: `oid = $1::regclass` is `oid = ($1::regclass)`, never
+    /// `(oid = $1)::regclass`. The cast's *meaning* is the target's semantic,
+    /// owned by the front end (see [`CastTarget`]); the parser only records it,
+    /// and a target it cannot name is refused at parse time rather than dropped.
+    Cast {
+        value: Box<Term>,
+        ty: CastTarget,
+    },
+}
+
+/// A cast target (`::type_name`) — the set of casts ferrosa implements.
+///
+/// A cast must MEAN something: each target has a real semantic, given by the
+/// front end. Anything outside this set is refused **by name** at parse time
+/// ([`crate::parser::ParseError::UnsupportedCast`]) — never accepted and
+/// silently ignored, which would let a client's query return a wrong answer
+/// while looking like it worked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CastTarget {
+    /// `::regclass` / `::pg_catalog.regclass`. Resolves a relation name (text) to
+    /// the `pg_class.oid` of the relation it names, so `oid = $1::regclass`
+    /// compares exactly as PostgreSQL's does. An unresolvable name is an error,
+    /// never a zero OID or NULL.
+    Regclass,
+}
+
+impl CastTarget {
+    /// The target as a user would write it (canonical spelling), for messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            CastTarget::Regclass => "regclass",
+        }
+    }
 }
 
 /// A boolean WHERE/HAVING expression: comparisons combined with AND/OR/NOT.
