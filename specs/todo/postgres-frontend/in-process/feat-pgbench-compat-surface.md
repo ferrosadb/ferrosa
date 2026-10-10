@@ -107,8 +107,95 @@ the partition/clustering key, the regular cells, and the RETURNING row, collecti
 `Mutation` per row; any row's failure returns before anything is applied. The whole set is
 then written once via `apply_batch_or_buffer(..., txn, mutations, &tag)`. The result is ONE
 `RowDescription`, one `DataRow` per inserted row, and a single `CommandComplete
-"INSERT 0 N"` — never N concatenated result sets. A buffered write-set still commits or
+`"INSERT 0 N"` — never N concatenated result sets. A buffered write-set still commits or
 rolls back as a unit.
+
+### PK-less CREATE TABLE: use a synthetic incrementing-id column at position 0
+
+`CREATE TABLE` with no PRIMARY KEY is refused (`MissingPrimaryKey` -> 0A000), and that is
+what stops `pgbench -i` — it dies at
+`pgbench_accounts (aid, bid, abalance, filler char(84))`.
+
+**A shadow key on the user's first column is WRONG** and was implemented, then reverted
+(`e347f3eb` -> `b91a232a`). It assumes the first column is unique; where it is not, rows
+collide and the write is lost. Do not reintroduce it.
+
+Instead the table gets a **synthetic column at position 0 carrying a globally unique
+incrementing id**, and the partition key is that column. Every row is then unique by
+construction, with no assumption about the user's data.
+
+Two constraints drive the design:
+
+1. **The column must be invisible to PostgreSQL clients.** pgbench's
+   `COPY pgbench_accounts FROM STDIN` sends exactly the four declared columns; a visible
+   fifth column makes COPY and `INSERT ... VALUES` (no column list) fail. It must also be
+   excluded from `SELECT *`.
+2. **The id must be globally unique, not a per-node counter.** Three nodes each counting
+   from zero would collide on the shared key exactly as a non-unique first column would —
+   the same bug, relabelled. Use a time-ordered v1 timeuuid (ordered *and* unique) or, if
+   v1 is unavailable, `uuid::Uuid::new_v4()` (already a dependency; unique, unordered),
+   or the Accord HLC in `ferrosa-common/src/accord.rs` (carries a node id).
+
+**Cheapest correct route — avoid a 151-site refactor.** Adding `hidden: bool` to
+`ColumnMetadata` (`ferrosa-schema/src/metadata/column.rs`) touches **151** construction
+sites across the workspace and the type derives no `Default`. Prefer instead:
+keep the synthetic column in `columns` (so storage indexes and row encoding work
+unchanged) and carry its hidden-ness **in the Postgres front end by a reserved name**
+(e.g. `ferrosa_row_id`), rejecting that name in user DDL. Then `SELECT *`, COPY and
+INSERT arity all filter it in one place, and no schema-metadata change is needed.
+Only if CQL clients must also not see it does the metadata field become necessary.
+
+Still to build: the column synthesis, server-side per-row assignment on INSERT and COPY,
+the wire exclusions, and `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all today — a
+new statement type; where it names a column other than the synthetic key it becomes a
+secondary index, where it names nothing new it is a no-op).
+
+### Seeing the system columns: PG's own model beats a bespoke options table
+
+Decision: the synthetic key is `_sys_ck_`, a v1 TimeUUID, and its `node` field is a
+**random 48-bit value chosen once per process** (RFC 4122 permits exactly this — it is
+what v1 does with MAC addresses). No cluster plumbing, ~2^-48 collision odds. Plumbing the
+real node id from `main.rs:3252` or the engine's `node_id` stays available as an upgrade;
+`v1_timeuuid(time, clock_seq, node)` takes `node` as a parameter precisely so that swap
+touches one call site.
+
+The open question was how a user finds a column that `SELECT *` hides. Two facts settle
+most of it, both already true in this tree:
+
+1. **`pg_attribute` already lists every column, including a hidden one.**
+   `catalog.rs::pg_attribute` projects one row per column per table with `attname`,
+   `atttypid` and `attnum`. So `SELECT * FROM pg_catalog.pg_attribute` is *already* the
+   discovery path — no new machinery needed for "users can see the system columns".
+2. **Postgres has a native name for exactly this.** Its own system columns (`ctid`, `xmin`,
+   `xmax`, `cmin`, `cmax`) are hidden from `SELECT *`, are listed in `pg_attribute` with a
+   **negative `attnum`**, and *are* selectable when named explicitly
+   (`SELECT ctid FROM t` works). ferrosa currently gives every column a 1-based positive
+   `attnum` (`catalog.rs::attribute_row`).
+
+**Recommendation: model `_sys_ck_` as a system column the way Postgres models `ctid`.**
+Hidden from `SELECT *`; listed in `pg_attribute` with a negative `attnum`; selectable by
+name. That gives discoverability and explicit access with *no new concept* — every
+Postgres user already knows how `ctid` behaves, which is the least-surprise outcome by
+construction.
+
+**DECIDED (owner): the `pg_attribute` route. No options table.** The system column is
+invisible to `SELECT *`, listed in `pg_attribute` with a negative `attnum`, and selectable
+by name. `SELECT *` stays clean. Documentation is part of the definition of done: the
+behaviour is written up in `ferrosa-common/README.md` ("Reserved `_sys_` columns") and
+`ferrosa-common/specs/overview.md`, and tracked in `ferrosa-postgres/specs/roadmap.md`
+"Next" — which is also where `pg_attribute`'s negative-`attnum` convention for system
+columns is recorded for the front-end. Keep those in sync when the wiring lands.
+
+**Rejected: the options table.** A
+`_sys_*` relation the user `UPDATE`s to toggle visibility would let `SELECT *` include the
+system columns. Costs: a writable system relation (the existing virtual tables —
+`ferrosa-postgres/src/catalog.rs` projections, `ferrosa-cql/src/virtual_tables/` including
+`rrd_runtime_settings.rs` — are all **read-only projections**), plus somewhere to persist
+the setting, plus a session/global scope rule. Worth it only if the toggle is genuinely
+wanted; the `pg_attribute` + explicit-select path covers "let users see them" for free.
+
+Not yet decided, and needed before building: whether `SELECT *` should ever include
+`_sys_ck_`, and if the options table is wanted at all — the two are the same question.
 
 ## Also staged on #544 (not pgwire surface, but required to get through the gate)
 
