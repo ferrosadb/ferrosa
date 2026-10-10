@@ -547,7 +547,12 @@ impl<St: AsyncWrite + Unpin> ReplySink for SocketSink<'_, St> {
 /// A `SELECT`'s rows are written to `out` as they are produced; the returned
 /// messages are the tail still to send (its `CommandComplete`, or the
 /// `ErrorResponse` that ended it).
-async fn execute_simple_to<O: ReplySink>(
+///
+/// `pub(crate)` so the `COPY ... FROM STDIN` tests can drive `BEGIN`/`COMMIT`
+/// through the SAME transaction path a connection uses, rather than
+/// re-implementing it: a COPY's transactionality is only proven by committing
+/// and rolling back through this seam.
+pub(crate) async fn execute_simple_to<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     sql: &str,

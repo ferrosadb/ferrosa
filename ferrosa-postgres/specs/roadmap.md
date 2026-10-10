@@ -219,19 +219,26 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   from `query_loop`, where the frame buffer and the stream are in scope; a leading-`COPY` byte
   compare guards the intercept so ordinary statements are not parsed twice.
 
-  Three properties are the whole point, and each has a test:
+  Four properties are the whole point, and each has a test:
 
   - **Nothing is acknowledged that cannot run.** The table, the column list and the payload options
     are resolved *before* `CopyInResponse`, so a COPY that is going to fail never has the client
-    stream a payload at it (`42P01` / `42P16` / `42703` / `25001` inside a transaction).
+    stream a payload at it (`42P01` / `42P16` / `42703`; `25P02` in an aborted transaction block).
   - **A failure keeps draining.** Once the payload starts the client is sending regardless, so a
     failure is remembered, the remaining frames are consumed and discarded, and the error is sent
     when the client finishes. Returning early would leave those bytes for the statement parser to
     read as SQL.
   - **No second write path.** Rows go through `query::execute_insert`, so COPY gets the same type
-    coercion and the same synthetic `_sys_ck_` minting as an INSERT, and the write set is flushed
-    with the very parameters the autocommit path uses. A failed COPY drops the unflushed tail
-    rather than committing part of it.
+    coercion and the same synthetic `_sys_ck_` minting as an INSERT.
+  - **Transactional, like any DML.** In autocommit the staged write set is flushed with the very
+    parameters the autocommit INSERT path uses (bounded by `FLUSH_EVERY`), and a failed COPY drops
+    the unflushed tail rather than committing part of it. Inside `BEGIN` the rows buffer into the
+    transaction's write-set through the SAME `apply_or_buffer` seam INSERT and `TRUNCATE` use:
+    they are visible at `COMMIT` and discarded by `ROLLBACK`, with **no `25001` refusal**. The
+    write-set cap (`53400`) — fail-loud, never a silent drop — bounds them. A COPY that fails
+    mid-payload **aborts** the transaction, so a later `COMMIT` rolls back rather than committing a
+    partial load: the partial-commit trap the old `25001` refusal stood in front of. This is what
+    lets `pgbench -i`, which wraps its `COPY`s in one `BEGIN`/`COMMIT`, load.
 
   A row whose field count does not match the column list is refused (`22P04`) rather than padded.
   The option list is parsed by `ferrosa-sql`: `FREEZE [ON|OFF]` — a heap-page concept an LSM has no

@@ -6,7 +6,7 @@
 //! lives beside the connection loop, which owns the frame buffer and the stream, rather than in
 //! the executor.
 //!
-//! Two rules shape the code below.
+//! Three rules shape the code below.
 //!
 //! **Nothing is acknowledged that cannot run.** `CopyInResponse` is the cue for the client to
 //! start sending, so the table, the column list and the payload options are all resolved *first*.
@@ -19,10 +19,18 @@
 //! interpreted as SQL. So a failure is remembered, the remaining payload is consumed and
 //! discarded, and the error is sent once the client has finished.
 //!
-//! Rows are inserted through the ordinary DML path (`query::execute_insert`) rather than a
-//! parallel one, so COPY gets the same type coercion, the same synthetic `_sys_ck_` key minting,
-//! and — because the write set is flushed with the very parameters the autocommit path uses —
-//! the same commit. There is no second way to write a row here.
+//! **Rows take the ordinary DML seam, so a COPY is transactional exactly as an INSERT is.** Each
+//! row goes through `query::execute_insert` — the same path (`apply_or_buffer`) an INSERT uses —
+//! rather than a parallel one, so COPY gets the same type coercion, the same synthetic `_sys_ck_`
+//! key minting, and the same write seam. That seam buffers the write into the open transaction's
+//! write-set when there is one, and applies it immediately (autocommit) otherwise. So a COPY
+//! inside `BEGIN` becomes visible only at `COMMIT` and is discarded by `ROLLBACK`, with no `25001`
+//! refusal. There is no second way to write a row here.
+//!
+//! In autocommit there is no transaction to buffer into, so the rows are staged locally and
+//! flushed in bounded batches ([`FLUSH_EVERY`]). Inside a transaction those rows go to its
+//! write-set instead, and the write-set cap — a fail-loud `53400`, never a silent drop — bounds
+//! them.
 //!
 //! The payload options are resolved from the parsed `CopyFromStdinStmt`. One of them, `FREEZE`,
 //! has no analogue in an LSM (no heap pages ⇒ no frozen rows) and is accepted-and-recorded by the
@@ -42,12 +50,13 @@ use crate::query::{self, ReturningOpts};
 use crate::server::{dml_context, QueryContext};
 use crate::PgWrite;
 
-/// Rows buffered before the write set is flushed.
+/// Rows staged before the write set is flushed — the AUTOCOMMIT path only.
 ///
 /// A COPY is one statement with one result, but holding a million rows of mutations in memory to
 /// commit them at the end would be a self-inflicted OOM. Flushing periodically bounds the buffer
-/// while keeping the commit count far below one-per-row. (The session's own write-set limit does
-/// not apply: this is not a client transaction, and COPY is atomic per flush, not per statement.)
+/// while keeping the commit count far below one-per-row. Inside a transaction there is nothing to
+/// flush here: the rows go into the session's own write-set, which the open transaction's `COMMIT`
+/// applies and its `ROLLBACK` discards, and whose cap (`53400`) bounds them instead.
 const FLUSH_EVERY: usize = 1000;
 
 /// Everything resolved before the client is told to send.
@@ -78,6 +87,13 @@ where
 {
     let mut out = BytesMut::new();
 
+    // Snapshot the transaction mode ONCE. No other statement can run while the payload streams,
+    // so the session cannot change mode mid-exchange — and every row of this COPY must land in
+    // the same place: the session's write-set when a block is open, the local staging buffer in
+    // autocommit. (A COPY arriving in an ABORTED block is refused by `plan_copy` before the ack,
+    // so `in_txn` here only distinguishes "open block" from "autocommit".)
+    let in_txn = session.in_txn();
+
     // Plan first: a refusal here is sent without ever acknowledging the COPY.
     let plan = match plan_copy(ctx, session, stmt) {
         Ok(plan) => plan,
@@ -99,6 +115,8 @@ where
     let mut decoder = CopyDecoder::new(plan.options.clone());
     let mut inserted: u64 = 0;
     let mut failure: Option<BackendMessage> = None;
+    // Autocommit staging buffer. Unused inside a transaction: there the rows go into the session's
+    // write-set instead (see the module docs), so this stays empty and the flush below is skipped.
     let mut buffer: Vec<PgWrite> = Vec::new();
 
     loop {
@@ -109,10 +127,12 @@ where
                 if failure.is_none() {
                     match decoder.push(data) {
                         Ok(rows) => {
-                            if let Err(err) = insert_rows(
+                            if let Err(err) = stage_rows(
                                 ctx,
+                                session,
                                 stmt,
                                 &plan.columns,
+                                in_txn,
                                 &mut buffer,
                                 rows,
                                 &mut inserted,
@@ -132,10 +152,12 @@ where
                 if failure.is_none() {
                     match decoder.finish() {
                         Ok(rows) => {
-                            if let Err(err) = insert_rows(
+                            if let Err(err) = stage_rows(
                                 ctx,
+                                session,
                                 stmt,
                                 &plan.columns,
+                                in_txn,
                                 &mut buffer,
                                 rows,
                                 &mut inserted,
@@ -187,23 +209,79 @@ where
     }
 
     match failure {
-        // The buffered rows are deliberately NOT committed on failure: the write set is dropped,
-        // so a COPY that failed part-way leaves nothing behind from the unflushed tail. Rows from
-        // an earlier flush are already committed and cannot be rolled back — which is why an
-        // unflushed tail is the common case (FLUSH_EVERY rows) and a failure is reported, never
-        // swallowed.
-        Some(err) => err.encode(&mut out),
-        None => match flush(ctx, &mut buffer).await {
-            Ok(()) => BackendMessage::CommandComplete {
-                tag: format!("COPY {inserted}"),
+        Some(err) => {
+            // Fail loud, never silent. Inside a transaction an error ABORTS the block (PG
+            // `25P02`), so poison it: a later COMMIT then rolls back rather than applying the
+            // rows that DID buffer before the failure. A COPY that died part-way must never be
+            // committed as if the load were whole — that partial load is exactly the silent data
+            // loss the old `25001` refusal existed to prevent. In autocommit there is no block to
+            // poison: the unflushed staging tail is simply dropped here, and rows from an earlier
+            // flush are already applied (bounded by FLUSH_EVERY) and cannot be rolled back.
+            if in_txn {
+                session.mark_txn_failed();
             }
-            .encode(&mut out),
-            Err(err) => err.encode(&mut out),
-        },
+            err.encode(&mut out);
+        }
+        None => {
+            if in_txn {
+                // The rows are in the transaction's write-set: COMMIT applies them atomically,
+                // ROLLBACK discards them. Announcing `COPY n` now is what PostgreSQL does inside a
+                // block too — visibility, not the count, waits for COMMIT.
+                BackendMessage::CommandComplete {
+                    tag: format!("COPY {inserted}"),
+                }
+                .encode(&mut out);
+            } else {
+                // Autocommit: apply the staged write-set through the same commit path an INSERT
+                // uses, so a COPY cannot commit differently.
+                match flush(ctx, &mut buffer).await {
+                    Ok(()) => BackendMessage::CommandComplete {
+                        tag: format!("COPY {inserted}"),
+                    }
+                    .encode(&mut out),
+                    Err(err) => err.encode(&mut out),
+                }
+            }
+        }
     }
     BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
     stream.write_all(&out).await?;
     Ok(())
+}
+
+/// Route a batch of decoded rows to the write seam a COPY must use: the open transaction's
+/// write-set when `in_txn`, else the local autocommit staging buffer.
+///
+/// This is the ONE place the transaction-vs-autocommit decision is made for COPY rows, so the two
+/// modes cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+async fn stage_rows(
+    ctx: &QueryContext,
+    session: &mut Session,
+    stmt: &CopyFromStdinStmt,
+    columns: &[String],
+    in_txn: bool,
+    buffer: &mut Vec<PgWrite>,
+    rows: Vec<CopyRow>,
+    inserted: &mut u64,
+) -> Result<(), BackendMessage> {
+    if in_txn {
+        // Buffer into the SAME write-set INSERT/TRUNCATE use, so COMMIT applies it and ROLLBACK
+        // discards it. `flush_locally` is false: an open transaction must never be committed
+        // mid-statement — the write-set (and its `53400` cap) bounds the rows, not FLUSH_EVERY.
+        insert_rows(
+            ctx,
+            stmt,
+            columns,
+            Some(session.txn_writes_mut()),
+            rows,
+            inserted,
+            false,
+        )
+        .await
+    } else {
+        insert_rows(ctx, stmt, columns, Some(buffer), rows, inserted, true).await
+    }
 }
 
 /// Resolve the table, the columns and the payload options — everything that could refuse the
@@ -213,12 +291,14 @@ fn plan_copy(
     session: &Session,
     stmt: &CopyFromStdinStmt,
 ) -> Result<CopyPlan, BackendMessage> {
-    if session.in_txn() {
-        // Nothing is inserted on a COPY inside an explicit transaction, so allowing it would
-        // silently drop the payload.
+    // A COPY is a command like any other: inside an ABORTED transaction block PostgreSQL refuses
+    // every statement but COMMIT/ROLLBACK (`25P02`). Refused here, before the client is cued to
+    // send, so a payload is never streamed at a statement that cannot accept it. (An OPEN block is
+    // fine — the rows buffer into its write-set; see the module docs.)
+    if session.in_failed_txn() {
         return Err(query::error_response(
-            "25001",
-            "COPY FROM STDIN cannot run inside a transaction block",
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
         ));
     }
 
@@ -298,7 +378,14 @@ fn plan_copy(
     })
 }
 
-/// Insert every decoded row, buffering the writes and flushing every [`FLUSH_EVERY`].
+/// Insert every decoded row through the shared DML seam, staging them in `buffer`.
+///
+/// `buffer` is `Some` either way: the session's transaction write-set when a block is open, or the
+/// caller's autocommit staging buffer otherwise — the seam decides what "buffer" means from the
+/// `Some` alone, so both modes take the identical path. `flush_locally` is true only in
+/// autocommit, where the staged writes are applied every [`FLUSH_EVERY`] rows; inside a transaction
+/// there is nothing to flush (the write-set's own cap bounds the rows), and flushing would commit
+/// a still-open transaction.
 ///
 /// A row whose field count does not match the column count is refused: silently padding or
 /// truncating it would store a row the client never sent.
@@ -306,9 +393,10 @@ async fn insert_rows(
     ctx: &QueryContext,
     stmt: &CopyFromStdinStmt,
     columns: &[String],
-    buffer: &mut Vec<PgWrite>,
+    mut buffer: Option<&mut Vec<PgWrite>>,
     rows: Vec<CopyRow>,
     inserted: &mut u64,
+    flush_locally: bool,
 ) -> Result<(), BackendMessage> {
     // Built ONCE and reused. An `InsertStmt` owns its column list, so constructing one per row
     // would clone the table name and the entire column list once for every row of the payload —
@@ -351,7 +439,7 @@ async fn insert_rows(
             })
             .collect();
         let msgs = query::execute_insert(
-            dml_context(ctx, Some(buffer)),
+            dml_context(ctx, buffer.as_deref_mut()),
             &ins,
             &[],
             ReturningOpts {
@@ -367,8 +455,12 @@ async fn insert_rows(
             return Err(err);
         }
         *inserted += 1;
-        if buffer.len() >= FLUSH_EVERY {
-            flush(ctx, buffer).await?;
+        if flush_locally {
+            if let Some(staged) = buffer.as_deref_mut() {
+                if staged.len() >= FLUSH_EVERY {
+                    flush(ctx, staged).await?;
+                }
+            }
         }
     }
     Ok(())
@@ -443,13 +535,23 @@ mod tests {
         }
     }
 
-    /// Run one whole exchange and return everything the server wrote back.
+    /// Run one whole exchange against an EXISTING session and return everything the server wrote
+    /// back.
     ///
     /// The payload holds only `CopyData`/`CopyDone`/`CopyFail` frames. `drive` is entered *after*
     /// the connection loop has consumed the `Query` frame that opened the COPY, so a Query frame
     /// here would (correctly) be read as a stray message arriving mid-COPY. Nothing depends on
     /// task scheduling: the payload is written before `drive` runs.
-    async fn run_copy(ctx: &QueryContext, sql: &str, payload: &[Vec<u8>]) -> (Vec<u8>, String) {
+    ///
+    /// Taking the session as a parameter is what lets a test put it in a transaction first: the
+    /// rows then have to land in the session's write-set, which is only observable through the
+    /// same `Session` the `COMMIT`/`ROLLBACK` drives.
+    async fn run_copy_in(
+        ctx: &QueryContext,
+        session: &mut Session,
+        sql: &str,
+        payload: &[Vec<u8>],
+    ) -> (Vec<u8>, String) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let stmt = parse_copy(sql);
 
@@ -461,19 +563,11 @@ mod tests {
         }
         client.write_all(&wire).await.unwrap();
 
-        let mut session = crate::extended::Session::new(superuser());
         let mut frames = BytesMut::new();
         let mut read_buf = vec![0u8; 1 << 16];
-        drive(
-            &mut server,
-            &mut frames,
-            &mut read_buf,
-            ctx,
-            &mut session,
-            &stmt,
-        )
-        .await
-        .expect("drive returns");
+        drive(&mut server, &mut frames, &mut read_buf, ctx, session, &stmt)
+            .await
+            .expect("drive returns");
 
         // Close our end of the pipe so the read below can reach EOF instead of blocking forever.
         // `drive` has already returned, so everything the server will ever write is buffered.
@@ -493,6 +587,25 @@ mod tests {
             }
         }
         (reply.clone(), String::from_utf8_lossy(&reply).into_owned())
+    }
+
+    /// [`run_copy_in`] against a fresh, autocommit session — the common case.
+    async fn run_copy(ctx: &QueryContext, sql: &str, payload: &[Vec<u8>]) -> (Vec<u8>, String) {
+        let mut session = Session::new(superuser());
+        run_copy_in(ctx, &mut session, sql, payload).await
+    }
+
+    /// Run one simple-query statement (`BEGIN`/`COMMIT`/`ROLLBACK`) through the server's own
+    /// transaction path, collecting its whole reply. This is how the COPIES below become
+    /// transactional: they are wrapped by the SAME `BEGIN`/`COMMIT`/`ROLLBACK` handling a real
+    /// connection uses, never a hand-rolled stand-in.
+    async fn simple(ctx: &QueryContext, session: &mut Session, sql: &str) -> Vec<BackendMessage> {
+        let mut out: Vec<BackendMessage> = Vec::new();
+        let tail = crate::server::execute_simple_to(ctx, session, sql, &mut out)
+            .await
+            .expect("an in-memory sink cannot fail");
+        out.extend(tail);
+        out
     }
 
     /// Every row of the payload is written, and the count the client is told is the count that
@@ -636,5 +749,135 @@ mod tests {
         for key in ["x", "y"] {
             assert_eq!(row_count(&ctx, key).await, 1, "row {key} must be persisted");
         }
+    }
+
+    /// RED-then-GREEN: a COPY inside an open transaction is ACCEPTED (the old `25001` refusal is
+    /// gone), its rows are BUFFERED in the transaction's write-set rather than applied, and they
+    /// become VISIBLE only on `COMMIT`.
+    ///
+    /// The values are read back, not merely the absence of an error: "no error" would also be
+    /// true of a COPY that acknowledged and dropped the payload — the exact silent-data-loss
+    /// bug the refusal used to stand in front of.
+    #[tokio::test]
+    async fn copy_inside_a_transaction_buffers_and_applies_on_commit() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let (_reply, text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY kv (k) FROM STDIN",
+            &[copy_data(b"a\nb\nc\n"), frame(b'c', &[])],
+        )
+        .await;
+
+        assert!(
+            text.starts_with('G'),
+            "the COPY is acknowledged first: {text:?}"
+        );
+        assert!(
+            !text.contains("25001"),
+            "a COPY inside a transaction must no longer be refused: {text:?}"
+        );
+        assert!(
+            text.contains("COPY 3"),
+            "the statement still reports its own row count: {text:?}"
+        );
+        assert_eq!(
+            session.txn_writes().len(),
+            3,
+            "the three rows must sit in the transaction write-set, unbuffered nothing"
+        );
+        for key in ["a", "b", "c"] {
+            assert_eq!(
+                row_count(&ctx, key).await,
+                0,
+                "row {key} must NOT be visible before COMMIT (buffered, not applied)"
+            );
+        }
+
+        simple(&ctx, &mut session, "COMMIT").await;
+        for key in ["a", "b", "c"] {
+            assert_eq!(
+                row_count(&ctx, key).await,
+                1,
+                "row {key} must be visible after COMMIT"
+            );
+        }
+    }
+
+    /// The ACID half, and the reason the whole change is safe: a COPY inside a transaction that
+    /// `ROLLBACK`s leaves NO rows. Without this, "accepted" would only mean the refusal moved, and
+    /// the old silent-data-loss bug would return in a new costume — a COPY that reports `COPY n`
+    /// and commits rows the client asked to discard.
+    #[tokio::test]
+    async fn copy_inside_a_rolled_back_transaction_leaves_no_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        let (_reply, text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY kv (k) FROM STDIN",
+            &[copy_data(b"a\nb\n"), frame(b'c', &[])],
+        )
+        .await;
+        assert!(
+            text.contains("COPY 2"),
+            "the COPY itself succeeds: {text:?}"
+        );
+        assert_eq!(
+            session.txn_writes().len(),
+            2,
+            "the rows are buffered in the transaction write-set"
+        );
+
+        simple(&ctx, &mut session, "ROLLBACK").await;
+        assert!(
+            session.txn_writes().is_empty(),
+            "ROLLBACK must clear the buffered COPY rows"
+        );
+        for key in ["a", "b"] {
+            assert_eq!(
+                row_count(&ctx, key).await,
+                0,
+                "row {key} must be discarded by ROLLBACK"
+            );
+        }
+    }
+
+    /// Fail loud, not silent: a COPY that dies mid-payload inside a transaction must ABORT that
+    /// transaction, so the rows that did buffer are not later committed as if the load were whole.
+    /// A poisoned transaction's `COMMIT` is a `ROLLBACK`, and the partially-loaded rows must be
+    /// absent — the specific trap this change had to avoid.
+    #[tokio::test]
+    async fn a_failed_copy_inside_a_transaction_must_not_commit_a_partial_load() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        simple(&ctx, &mut session, "BEGIN").await;
+
+        // A good row, then a malformed one — the good row is buffered before the failure.
+        let (_reply, text) = run_copy_in(
+            &ctx,
+            &mut session,
+            "COPY kv (k) FROM STDIN",
+            &[
+                copy_data(b"good\nbad\textra\n"),
+                copy_data(b"more\n"),
+                frame(b'c', &[]),
+            ],
+        )
+        .await;
+        assert!(text.contains("22P04"), "the bad row is reported: {text:?}");
+
+        // COMMIT on the aborted transaction must NOT apply the buffered "good" row.
+        simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            row_count(&ctx, "good").await,
+            0,
+            "a failed COPY must never commit a partial load"
+        );
     }
 }

@@ -221,6 +221,26 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   - Refusals: `42P01` for a missing table (checked BEFORE any write, so a refused
     statement changes nothing). `TRUNCATE … CASCADE` / `RESTART IDENTITY` are
     refused at parse time.
+- **`COPY … FROM STDIN` — a transactional bulk load** (`copy_stdin`) — the one statement
+  answered over several frames: the table, the column list and the payload options are
+  resolved *before* `CopyInResponse`, then the payload is consumed as
+  `CopyData`/`CopyDone` (or aborted by the client with `CopyFail`). Every row goes through
+  the SAME `query::execute_insert` seam a DML `INSERT` uses — same coercion, same synthetic
+  `_sys_ck_` minting — so there is **no second write path**.
+  - **Transactional.** Inside a `BEGIN` the rows BUFFER into the transaction's write-set
+    (the seam `INSERT` and `TRUNCATE` share), become visible at `COMMIT` and are discarded
+    by `ROLLBACK` — the old `25001` refusal is gone. Autocommit instead stages the rows and
+    applies them in bounded `FLUSH_EVERY` batches. Either way the write-set cap (`53400`)
+    is fail-loud, never a silent drop, and a COPY that fails mid-payload **aborts** the
+    transaction rather than committing a partial load. `pgbench -i`, which wraps its
+    `COPY`s in one `BEGIN`/`COMMIT`, therefore loads.
+  - **Refusals before the payload.** A missing table (`42P01`), a reserved or unknown column
+    (`42P16`/`42703`) and an aborted transaction block (`25P02`) are all refused before
+    `CopyInResponse`, so a client never streams a payload at a statement that cannot take
+    it. A failure *after* the payload starts still drains every remaining frame to the
+    terminator — client data is never reinterpreted as SQL. `FREEZE [ON|OFF]` is
+    accepted-and-recorded (an LSM has no frozen rows, and it is what `pgbench -i` sends);
+    other options, a bad option value, and `COPY … TO` are refused **by name** (`0A000`).
 - **`VACUUM` (flush + compact) / `ANALYZE` (accepted no-op)** — `VACUUM [FULL]
   [ANALYZE|ANALYSE]` answers `CommandComplete "VACUUM"` and `ANALYZE|ANALYSE`
   answers `"ANALYZE"`, so routine maintenance (e.g. `pgbench -i`) succeeds.
