@@ -87,6 +87,10 @@ parked behind an unresolved dependency without acknowledging a local write early
 A remote Apply counts toward the quorum only when its `AccordApplyOK` payload
 carries THIS transaction's `txn_id`; an empty or unparseable body is not an ack
 (a bare ApplyOK proves nothing about which transaction the peer applied).
+A remote Commit likewise counts toward the commit quorum only when its
+`AccordCommit` reply carries THIS transaction's `txn_id` (`CommitOkPayload`);
+an empty or unparseable body is not an ack (a bare Commit reply proves nothing
+about which transaction the peer committed).
 An explicit no-write Apply resolves an absent local dependency and cascades any
 parked dependent writes. A missing target with real mutation bytes still fails
 without an Apply acknowledgement.
@@ -117,7 +121,7 @@ sequenceDiagram
         R-->>CO: AcceptOk (or NACK on higher ballot)
     end
 
-    CO->>R: Commit final t, deps (fire-and-forget)
+    CO->>R: Commit final t, deps (fire-and-forget; reply echoes txn_id as CommitOkPayload)
 
     Note over CO,R: Apply phase
     CO->>R: Apply t, deps, mutation bytes

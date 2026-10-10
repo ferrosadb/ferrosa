@@ -305,6 +305,26 @@ pub(crate) struct ApplyOkPayload {
     pub(crate) from: u64,
 }
 
+// ---------------------------------------------------------------------------
+// Gap 5: Commit-phase acknowledgement (coordinator → replica → coordinator)
+// ---------------------------------------------------------------------------
+
+/// CommitOK response from a replica.
+///
+/// Commit is fire-and-forget in Accord, but the coordinator's per-shard quorum
+/// still counts one ack per replica and the request-response transport needs a
+/// reply. The reply must therefore PROVE it processed THIS transaction: it
+/// echoes the inbound [`CommitPayload::txn_id`], exactly as [`ApplyOkPayload`]
+/// does for Apply. Without it a coordinator could count a peer's reply toward
+/// the commit quorum for whatever transaction it happened to be awaiting
+/// (CL-48's sibling). An empty or unparseable body is NOT an ack.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct CommitOkPayload {
+    pub(crate) txn_id: TxnId,
+    /// The replica that sent this acknowledgement.
+    pub(crate) from: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +481,6 @@ mod tests {
             current_row: b"existing-row-bytes".to_vec(),
         });
         assert_bincode_roundtrip(&ApplyOkPayload { txn_id, from: 4 });
+        assert_bincode_roundtrip(&CommitOkPayload { txn_id, from: 5 });
     }
 }

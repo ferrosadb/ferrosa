@@ -1298,7 +1298,7 @@ impl AccordCoordinatorDriver {
     /// Returns the committed `(t, deps)` once the transaction may apply.
     async fn order_and_gate(&mut self) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::{
-            AcceptOkPayload, AcceptPayload, CommitPayload, LegacyAcceptOkPayload,
+            AcceptOkPayload, AcceptPayload, CommitOkPayload, CommitPayload, LegacyAcceptOkPayload,
             PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload,
             ReadVotePayload,
         };
@@ -1924,8 +1924,15 @@ impl AccordCoordinatorDriver {
         // sets when a multi-shard resolver is wired, else collapses to one shard
         // (the behavior-preserving single-key / single-replica-set default).
         let participant = self.participant_set();
+        let commit_txn = txn_id;
+        let is_commit_ok = move |r: &ferrosa_net::error::Result<Message>| {
+            matches!(r, Ok(Message::AccordCommit(b))
+                if bincode::deserialize::<CommitOkPayload>(b)
+                    .map(|ok| ok.txn_id == commit_txn)
+                    .unwrap_or(false))
+        };
         if !self
-            .quorum_broadcast(commit_msg, &participant, |r| r.is_ok())
+            .quorum_broadcast(commit_msg, &participant, is_commit_ok)
             .await
         {
             return Err(AccordDriverError::QuorumUnavailable);
@@ -4275,7 +4282,9 @@ mod tests {
                         bincode::serialize(&response).unwrap(),
                     )))
                 }
-                Message::AccordCommit(_) => Ok(Message::AccordCommit(Bytes::new())),
+                commit @ Message::AccordCommit(_) => {
+                    Ok(structured_commit_ack(commit, node_id_of(host_id)))
+                }
                 Message::AccordRead(bytes) if host_id == self.sole_reader => {
                     let request: ReadVotePayload = bincode::deserialize(&bytes).unwrap();
                     let response = ReadVoteOkPayload {
@@ -4610,6 +4619,176 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Regression: a Commit ack must PROVE it processed THIS transaction.
+    //
+    // The Commit quorum predicate was `|r| r.is_ok()`, so it accepted ANY `Ok`
+    // reply — no variant check, no transaction check. The replica's commit reply
+    // was an EMPTY `AccordCommit(Bytes::new())`, so a peer that answered proved
+    // nothing about WHICH transaction (if any) it committed, yet counted toward
+    // the quorum for whatever txn the coordinator awaited. `handlers::on_message`
+    // already had `payload.txn_id` in hand, so echoing it costs nothing. The fix
+    // mirrors the Apply ack exactly: a structured `CommitOkPayload { txn_id, from }`
+    // that the coordinator deserialises and verifies.
+    // -----------------------------------------------------------------------
+
+    /// How a replica answers an `AccordCommit` under test.
+    #[derive(Clone, Copy)]
+    enum CommitAck {
+        /// Pre-fix wire: a bare `AccordCommit` carrying no body.
+        Empty,
+        /// A structured ack for a DIFFERENT transaction than the one awaited.
+        MismatchedTxn,
+        /// A structured ack echoing the awaited transaction's id.
+        MatchingTxn,
+    }
+
+    /// A replica that agrees on the PreAccept (so the coordinator takes the fast
+    /// path straight to Commit) and on the Read, acks every Apply structurally,
+    /// and answers every Commit per `mode`.
+    struct CommitAckTransport {
+        mode: CommitAck,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for CommitAckTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            use crate::accord::wire::{
+                CommitOkPayload, CommitPayload, PreAcceptOkPayload, PreAcceptPayload,
+                ReadVoteOkPayload, ReadVotePayload,
+            };
+            match msg {
+                Message::AccordPreAccept(bytes) => {
+                    let request: PreAcceptPayload = bincode::deserialize(&bytes).unwrap();
+                    let response = PreAcceptOkPayload {
+                        from: node_id_of(host_id),
+                        t: request.t0,
+                        deps: Vec::new(),
+                        snapshot_stale: false,
+                    };
+                    Ok(Message::AccordPreAcceptOK(Bytes::from(
+                        bincode::serialize(&response).unwrap(),
+                    )))
+                }
+                Message::AccordRead(bytes) => {
+                    let request: ReadVotePayload = bincode::deserialize(&bytes).unwrap();
+                    let response = ReadVoteOkPayload {
+                        txn_id: request.txn_id,
+                        from: node_id_of(host_id),
+                        condition_holds: true,
+                        current_row: Vec::new(),
+                    };
+                    Ok(Message::AccordReadOK(Bytes::from(
+                        bincode::serialize(&response).unwrap(),
+                    )))
+                }
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                Message::AccordCommit(bytes) => {
+                    let request: CommitPayload = bincode::deserialize(&bytes).unwrap();
+                    let txn_id = match self.mode {
+                        CommitAck::Empty => return Ok(Message::AccordCommit(Bytes::new())),
+                        CommitAck::MismatchedTxn => TxnId(Timestamp {
+                            node: request.txn_id.0.node.wrapping_add(1),
+                            ..request.txn_id.0
+                        }),
+                        CommitAck::MatchingTxn => request.txn_id,
+                    };
+                    let ack = CommitOkPayload {
+                        txn_id,
+                        from: node_id_of(host_id),
+                    };
+                    Ok(Message::AccordCommit(Bytes::from(
+                        bincode::serialize(&ack).unwrap(),
+                    )))
+                }
+                other => panic!("unexpected commit-phase test message: {other:?}"),
+            }
+        }
+    }
+
+    /// An RF=3 driver whose coordinator is itself a replica (1 implicit self ack
+    /// of the 2 required) and whose two remotes answer Commit per `mode`.
+    fn commit_ack_driver(mode: CommitAck) -> AccordCoordinatorDriver {
+        use crate::accord::state_machine::AccordStateMachine;
+        use ferrosa_storage::accord::sync_writer::MockSyncWriter;
+
+        let self_host = uuid::Uuid::from_u128((0xC0DE_u128 << 64) | 0xC0DE);
+        let remote1 = uuid::Uuid::from_u128((0x1111_u128 << 64) | 0x1111);
+        let remote2 = uuid::Uuid::from_u128((0x2222_u128 << 64) | 0x2222);
+        let self_node = node_id_of(self_host);
+
+        let local_state: crate::accord::handlers::AccordState = Arc::new(parking_lot::Mutex::new(
+            AccordStateMachine::new(self_node, Arc::new(MockSyncWriter::new())),
+        ));
+        let transport = Arc::new(CommitAckTransport { mode });
+        let clock = HybridLogicalClock::new(self_node, 0);
+        AccordCoordinatorDriver::new_multi_with_transport(
+            self_node,
+            vec![self_host, remote1, remote2],
+            transport,
+            false,
+            &clock,
+            vec![(b"k".to_vec(), b"m".to_vec())],
+        )
+        .with_local_accord_state(local_state)
+        .with_local_applier(Arc::new(crate::accord::apply::NoopStorageApplier::new()))
+    }
+
+    /// An empty-body `AccordCommit` must NOT reach the commit quorum: it carries
+    /// no `txn_id`, so it cannot prove the sender processed THIS transaction. Fails
+    /// while the predicate is `|r| r.is_ok()` (the bare acks then count) and passes
+    /// once the predicate verifies the payload's `txn_id`.
+    #[tokio::test]
+    async fn commit_quorum_rejects_empty_body_commit_ack() {
+        let mut driver = commit_ack_driver(CommitAck::Empty);
+
+        let result = driver.run_transaction().await;
+
+        assert!(
+            matches!(result, Err(AccordDriverError::QuorumUnavailable)),
+            "an empty-body Commit ack proves nothing about this txn and must not satisfy the \
+             commit quorum (RF=3, coordinator is a replica → 1 implicit self ack of the 2 \
+             required); got {result:?}"
+        );
+    }
+
+    /// A structured ack whose `txn_id` is a DIFFERENT transaction than the one
+    /// awaited must not count toward the commit quorum either.
+    #[tokio::test]
+    async fn commit_quorum_rejects_mismatched_txn_commit_ack() {
+        let mut driver = commit_ack_driver(CommitAck::MismatchedTxn);
+
+        let result = driver.run_transaction().await;
+
+        assert!(
+            matches!(result, Err(AccordDriverError::QuorumUnavailable)),
+            "a Commit ack for a different txn_id does not prove THIS txn committed; got {result:?}"
+        );
+    }
+
+    /// Positive control: a structured ack echoing THIS transaction's id DOES reach
+    /// the commit quorum (the coordinator's implicit self ack + one matching remote
+    /// = 2 of 3).
+    #[tokio::test]
+    async fn commit_quorum_accepts_structured_matching_commit_ack() {
+        let mut driver = commit_ack_driver(CommitAck::MatchingTxn);
+
+        let result = driver.run_transaction().await;
+
+        assert!(
+            result.is_ok(),
+            "a structured Commit ack carrying the awaited txn_id must satisfy the commit quorum; \
+             got {result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn one_true_existence_vote_plus_two_failures_does_not_apply_rf3() {
         let replicas = vec![
@@ -4729,6 +4908,25 @@ mod tests {
         Message::AccordApplyOK(Bytes::from(bincode::serialize(&ack).unwrap()))
     }
 
+    /// Decode the `txn_id` from an inbound `AccordCommit` request and serialise
+    /// the structured `AccordCommit` a production replica replies with. Every
+    /// test double that answers a Commit MUST use this: an empty-body reply
+    /// carries no `txn_id` and is NOT counted toward the commit quorum (it cannot
+    /// prove which transaction, if any, the peer committed).
+    fn structured_commit_ack(msg: Message, from: u64) -> Message {
+        use crate::accord::wire::{CommitOkPayload, CommitPayload};
+        let txn_id = match msg {
+            Message::AccordCommit(b) => {
+                bincode::deserialize::<CommitPayload>(&b)
+                    .expect("Commit payload decodes")
+                    .txn_id
+            }
+            other => panic!("expected a Commit request, got {other:?}"),
+        };
+        let ack = CommitOkPayload { txn_id, from };
+        Message::AccordCommit(Bytes::from(bincode::serialize(&ack).unwrap()))
+    }
+
     #[async_trait::async_trait]
     impl AccordTransport for SlowPathSelfVoteTransport {
         async fn send(
@@ -4806,7 +5004,10 @@ mod tests {
                 apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
                     Ok(structured_apply_ack(apply, node_id_of(host_id)))
                 }
-                // Commit / anything else: ack so only Accept is stressed.
+                // Anything else: ack so only Accept is stressed.
+                commit @ Message::AccordCommit(_) => {
+                    Ok(structured_commit_ack(commit, node_id_of(host_id)))
+                }
                 _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
@@ -5166,6 +5367,9 @@ mod tests {
                 apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
                     Ok(structured_apply_ack(apply, node_id_of(host_id)))
                 }
+                commit @ Message::AccordCommit(_) => {
+                    Ok(structured_commit_ack(commit, node_id_of(host_id)))
+                }
                 _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
@@ -5266,6 +5470,9 @@ mod tests {
                         .lock()
                         .push(("apply", host_id, std::time::Instant::now()));
                     Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                commit @ Message::AccordCommit(_) => {
+                    Ok(structured_commit_ack(commit, node_id_of(host_id)))
                 }
                 _ => Ok(Message::AccordCommit(Bytes::new())),
             }
@@ -5442,7 +5649,10 @@ mod tests {
                 apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
                     Ok(structured_apply_ack(apply, node_id_of(host_id)))
                 }
-                // Commit / anything else: ack.
+                // Anything else: ack.
+                commit @ Message::AccordCommit(_) => {
+                    Ok(structured_commit_ack(commit, node_id_of(host_id)))
+                }
                 _ => Ok(Message::AccordCommit(Bytes::new())),
             }
         }
@@ -5544,6 +5754,9 @@ mod tests {
                 }
                 apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
                     Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                }
+                commit @ Message::AccordCommit(_) => {
+                    Ok(structured_commit_ack(commit, node_id_of(host_id)))
                 }
                 _ => Ok(Message::AccordCommit(Bytes::new())),
             }
@@ -5683,6 +5896,7 @@ mod tests {
                 Message::AccordApply(_) | Message::AccordApplyV2(_) => {
                     structured_apply_ack(msg.clone(), node_id_of(host_id))
                 }
+                Message::AccordCommit(_) => structured_commit_ack(msg.clone(), node_id_of(host_id)),
                 _ => Message::AccordCommit(Bytes::new()),
             };
             self.sent.lock().insert(host_id, msg);

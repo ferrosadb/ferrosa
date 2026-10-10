@@ -18,9 +18,9 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 
 use super::state_machine::{AccordStateMachine, SmResponse};
 use super::wire::{
-    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, ApplyV2Payload, CommitPayload,
-    PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
-    RecoverPayload,
+    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, ApplyV2Payload, CommitOkPayload,
+    CommitPayload, PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload,
+    ReadVotePayload, RecoverPayload,
 };
 
 /// Shared mutable access to the Accord state machine.
@@ -453,13 +453,23 @@ impl RpcHandler for AccordHandler {
                 let payload: CommitPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordCommit: deserialize failed: {e}"))
                     .ok()?;
+                let txn_id = payload.txn_id;
                 on_state_machine(&self.state, move |sm| {
                     sm.handle_commit(payload.txn_id, payload.t0, payload.t, payload.deps)
                 })
                 .await?;
-                // Commit is fire-and-forget in Accord but we need a response
-                // for the request-response transport.
-                Some(Message::AccordCommit(Bytes::new()))
+                // Commit is fire-and-forget in Accord, but the request-response
+                // transport needs a reply, and the coordinator's commit quorum
+                // verifies it proves THIS transaction was committed. Echo the
+                // inbound `txn_id` in a structured `CommitOkPayload`, exactly as
+                // the Apply ack does — a bare reply proves nothing about which
+                // transaction, if any, this replica committed.
+                let ok = CommitOkPayload {
+                    txn_id,
+                    from: self.local_node_id,
+                };
+                let bytes = bincode::serialize(&ok).ok()?;
+                Some(Message::AccordCommit(Bytes::from(bytes)))
             }
 
             Message::AccordApply(b) => {
