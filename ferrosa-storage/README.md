@@ -579,6 +579,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   recorded, so the next `build_table_state` for that name — registration precedes
   any write, so its whole directory is a previous incarnation's rows — deletes the
   orphans before loading them instead of resurrecting a dropped table's rows.
+  The intent is recorded BEFORE the step that can refuse the drop (the
+  `is_drained()` compaction check), so *any* refusal — not only a failed
+  `remove_dir_all` — is durably recorded and retried; and `register_table_inner`
+  honours a live intent by retiring a still-registered store rather than taking
+  its "already registered" shortcut, so a same-name re-create can never reach a
+  previous incarnation's store. Together these keep the in-memory schema (dropped
+  first on every DDL route) and the durable directory from disagreeing
+  (t_c8625592, invariant "all replicas agree").
   Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after local-schema

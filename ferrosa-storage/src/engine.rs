@@ -5021,13 +5021,39 @@ impl StorageEngine {
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        // A same-name re-create after a DROP whose removal failed must never
+        // reach the previous incarnation's still-registered store. When a
+        // pending-sweep intent names this table, retire whatever is registered
+        // instead of taking the "already registered" shortcut below, so
+        // `build_table_state` gets to sweep the orphaned directory before it
+        // loads anything. (forge t_c8625592 — invariant "all replicas agree".)
+        let pending_sweep = crate::table_drops::is_pending_sweep(
+            &self.config.data_dir,
+            &schema.keyspace,
+            &schema.table,
+        )?;
         {
             let tables = self.tables.load();
             if tables.contains_key(&table_id) {
                 drop(tables);
-                self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
-                self.replay_deferred_mutations_for_table(&table_id);
-                return Ok(());
+                if !pending_sweep {
+                    self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
+                    self.replay_deferred_mutations_for_table(&table_id);
+                    return Ok(());
+                }
+                // Retire the stale store; the rebuild below installs a clean
+                // one and its directory is swept by `build_table_state`.
+                self.clear_compaction_retry_state(&table_id);
+                if let Some(state) = remove_table(&self.tables, &table_id)? {
+                    state.store.retire();
+                }
+                self.remove_time_series_consolidator(&table_id);
+                self.index_tracker
+                    .remove_table_indexes(table_id.keyspace(), table_id.table());
+                tracing::warn!(
+                    table = %table_id,
+                    "re-registration swept a live store whose DROP could not remove its SSTables"
+                );
             }
         }
         let time_series_handle = self.build_time_series_consolidator(&table_id, &schema)?;
@@ -5205,6 +5231,30 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // A DROP that is about to happen must be recorded durably BEFORE any
+        // step that can refuse or abort it. The in-memory schema is dropped
+        // first on every DDL route (cluster `apply_command`, `apply_direct`,
+        // the pair coordinator), so unless the durable half is written here too
+        // the node is left reporting the table dropped while its directory —
+        // and therefore its rows — survives on disk. Recording the intent first
+        // means a refusal can never leave the two disagreeing: the next
+        // `build_table_state` for this name sweeps the directory instead of
+        // loading it. `unregister_table_quiesced` clears the intent on a
+        // removal that succeeds, so a legitimately re-created table is
+        // untouched. (forge t_c8625592 — invariant "all replicas agree".)
+        if self.tables.load().contains_key(table_id) {
+            crate::table_drops::record_drop(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+                crate::table_drops::now_millis()?,
+            )?;
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
+        }
         let pause = self
             .compaction_executor
             .pause_table(table_id, ferrosa_common::CancelReason::TableDropped);

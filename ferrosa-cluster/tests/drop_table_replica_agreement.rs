@@ -220,7 +220,8 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
              but the cluster route reported success (returned {drop:?})"
         );
 
-        // (b) The refused node must not serve the dropped rows afterwards.
+        // (b) The refused node must not serve the dropped rows afterwards, even
+        // though its removal did not complete.
         {
             let nodes = cluster.nodes();
             let leader = nodes
@@ -228,17 +229,37 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
                 .find(|n| n.node_id == leader_id)
                 .expect("leader node present");
             let engine = leader.engine.as_ref().expect("engine-backed leader");
-            let served = engine.count_range(&tid, None, None);
-            assert!(
-                served.is_err(),
-                "the refused node still serves the dropped table's rows: {served:?}"
+            assert_eq!(
+                engine.count_range(&tid, None, None).expect("count"),
+                0,
+                "the refused node still serves the dropped table's rows"
             );
         }
     }
 
-    // And a same-name re-create must hold only the new rows, never the dropped
-    // incarnation's survivors.
-    std::fs::remove_dir_all(&table_dir).ok();
+    // The removal never completed: the dropped incarnation's SSTable directory
+    // is still physically on disk. It must nevertheless never be served again —
+    // not now, and not through a same-name re-create.
+    assert!(
+        table_dir.exists(),
+        "precondition: the refused removal must have left the directory on disk"
+    );
+    {
+        let nodes = cluster.nodes();
+        let leader = nodes
+            .iter()
+            .find(|n| n.node_id == leader_id)
+            .expect("leader node present");
+        let engine = leader.engine.as_ref().expect("engine-backed leader");
+        assert_eq!(
+            engine.count_range(&tid, None, None).expect("count"),
+            0,
+            "rows physically present on disk must not be served after the refused DROP"
+        );
+    }
+
+    // A same-name re-create must sweep the orphaned directory and hold only the
+    // new rows, never the dropped incarnation's survivors.
     propose_on_node(&cluster, leader_id, RaftOp::CreateTable(Box::new(table())))
         .await
         .expect("same-name CreateTable applies");

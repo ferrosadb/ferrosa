@@ -898,6 +898,17 @@ pub async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64
 
     match raft.client_write(cmd).await {
         Ok(resp) => {
+            // The applying node folds a refused DROP (its storage could not
+            // remove the table's SSTables) into `RaftResponse::Error`. The
+            // leader applies synchronously inside `client_write`, so that
+            // refusal is carried back here — surface it rather than reporting
+            // success for a DROP that did not take effect (forge t_c8625592,
+            // invariant "all replicas agree").
+            if let crate::raft::RaftResponse::Error(reason) = &resp.data {
+                return Err(ClusterError::Internal(format!(
+                    "DROP/DDL refused on the applying node: {reason}"
+                )));
+            }
             // openraft's `client_write` returns once the LEADER applies, so on
             // the leader read-your-writes already holds. Drive followers'
             // *log replication* forward (condition-based on the matched index)
