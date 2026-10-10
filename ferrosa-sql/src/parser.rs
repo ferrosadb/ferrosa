@@ -32,6 +32,12 @@ pub enum ParseError {
     DuplicateColumn(String),
     /// An `ALTER TABLE` form outside the supported subset, described by the caller.
     UnsupportedAlter(String),
+    /// A `COPY ... FROM STDIN` form or option outside the supported subset, described by the
+    /// caller with the option/form named. COPY refusals are reported as COPY — never as an
+    /// `ALTER TABLE` form, which is what [`ParseError::UnsupportedAlter`] means — so the two
+    /// variants stay honest about what was refused. See `parser_ddl::parse_copy` /
+    /// `parse_copy_options`.
+    UnsupportedCopy(String),
     /// A `CREATE TABLE ... WITH (key = value)` storage parameter outside the
     /// accepted set, named. See `parser_ddl::ACCEPTED_STORAGE_PARAMETERS`.
     UnsupportedStorageParameter(String),
@@ -79,6 +85,9 @@ impl fmt::Display for ParseError {
             ParseError::DuplicateColumn(c) => write!(f, "column `{c}` is declared twice"),
             ParseError::UnsupportedAlter(form) => {
                 write!(f, "ALTER TABLE form is not supported: {form}")
+            }
+            ParseError::UnsupportedCopy(detail) => {
+                write!(f, "COPY is not supported: {detail}")
             }
             ParseError::UnsupportedStorageParameter(name) => {
                 write!(f, "table storage parameter `{name}` is not supported")
@@ -2386,8 +2395,9 @@ mod tests {
         );
     }
 
-    /// `COPY ... TO` and an unknown option are refused by name. A client that asked for csv and
-    /// silently got text would store garbage, so the option is not ignored.
+    /// `COPY ... TO` and an unknown option are refused by name, as COPY refusals. A client that
+    /// asked for csv and silently got text would store garbage, so the option is not ignored; and
+    /// a COPY refusal is never reported as an ALTER TABLE form.
     #[test]
     fn unsupported_copy_forms_are_refused_by_name() {
         for sql in [
@@ -2398,15 +2408,85 @@ mod tests {
             "COPY t FROM STDIN WITH CSV",
         ] {
             match parse_statement(sql) {
-                Err(ParseError::UnsupportedAlter(form)) => {
+                Err(ParseError::UnsupportedCopy(form)) => {
                     assert!(
                         !form.is_empty(),
                         "{sql}: the refusal must say what is unsupported"
+                    );
+                    assert!(
+                        !form.contains("ALTER TABLE"),
+                        "{sql}: a COPY refusal must not name an ALTER TABLE form"
                     );
                 }
                 other => panic!("{sql} must be refused by name, got {other:?}"),
             }
         }
+    }
+
+    /// pgbench (`pgbench -i`) sends `copy pgbench_accounts from stdin with (freeze on)` for
+    /// every ordinary table on PostgreSQL v14+. ferrosa has no frozen-row concept (an LSM has no
+    /// heap pages), so the option is accepted-and-recorded as a no-op — but it IS accepted, and
+    /// the value is kept on the statement rather than silently swallowed.
+    #[test]
+    fn copy_freeze_option_is_accepted_and_recorded() {
+        let copy = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::CopyFromStdin(c)) => *c,
+            other => panic!("FREEZE must be accepted, got {other:?}"),
+        };
+
+        // The exact statement pgbench emits. `freeze on` is recorded, not applied.
+        let on = copy("copy pgbench_accounts from stdin with (freeze on)");
+        assert_eq!(on.table.table, "pgbench_accounts");
+        assert_eq!(
+            on.freeze,
+            Some(true),
+            "`freeze on` must be RECORDED on the statement, not silently dropped"
+        );
+        // `FREEZE` alongside the applied options: the rest still take effect.
+        let mixed = copy("COPY t FROM STDIN WITH (FORMAT csv, HEADER, freeze off)");
+        assert_eq!(mixed.freeze, Some(false), "`freeze off` is recorded too");
+        assert_eq!(mixed.format, crate::ast::CopyFormatKind::Csv);
+        assert!(mixed.header);
+        // Absent ⇒ recorded as absent, so the field distinguishes "not asked" from "asked off".
+        assert_eq!(copy("COPY t FROM STDIN").freeze, None);
+    }
+
+    /// The negative control for `FREEZE`: the accepted set is not widened. Any other COPY option
+    /// is refused BY NAME, and the refusal is reported as a COPY option — never as an ALTER TABLE
+    /// form (which is what `ParseError::UnsupportedAlter` means and still says).
+    #[test]
+    fn unknown_copy_option_is_refused_by_name_and_not_as_an_alter_table_form() {
+        let err = parse_statement("COPY t FROM STDIN (NOSUCHOPT)").expect_err("must be refused");
+        assert!(
+            matches!(err, ParseError::UnsupportedCopy(_)),
+            "an unknown COPY option must be a COPY refusal, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("NOSUCHOPT"),
+            "the refusal must name the option: {message}"
+        );
+        assert!(
+            message.contains("COPY option"),
+            "the client must be told it was a COPY option: {message}"
+        );
+        assert!(
+            !message.contains("ALTER TABLE"),
+            "a COPY option must never be reported as an ALTER TABLE form: {message}"
+        );
+
+        // A bad option VALUE is likewise a COPY-option refusal, named.
+        let bad_value = parse_statement("COPY t FROM STDIN (FORMAT binary)")
+            .expect_err("must be refused")
+            .to_string();
+        assert!(
+            bad_value.contains("FORMAT") && bad_value.to_ascii_lowercase().contains("binary"),
+            "the FORMAT value refusal names both: {bad_value}"
+        );
+        assert!(
+            !bad_value.contains("ALTER TABLE"),
+            "not an ALTER TABLE form: {bad_value}"
+        );
     }
 
     /// `ADD COLUMN` and `DROP COLUMN` map straight onto the schema layer's `TableUpdates`, so

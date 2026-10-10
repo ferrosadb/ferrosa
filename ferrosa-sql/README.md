@@ -49,6 +49,17 @@ in-memory table in tests and by Ferrosa storage in production.
   list (a `FROM` relation's projection, `WHERE`, `VALUES`) is not parsed.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
   `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
+- **`COPY t [(cols)] FROM STDIN [[WITH] (<options>)]`** → `Statement::CopyFromStdin` (the
+  payload arrives later as `CopyData` frames, so `ferrosa-postgres` drives it). Options are the
+  parenthesised form: `FORMAT (text|csv)`, `DELIMITER '<c>'`, `NULL '<s>'` and `HEADER` are
+  applied; `FREEZE [ON|OFF]` is **accepted and recorded but not applied**
+  (`CopyFromStdinStmt::freeze`) — PostgreSQL freezes the loaded rows into heap pages and ferrosa
+  is an LSM with no heap pages and therefore no frozen-row concept, so the option has no
+  analogue and is accepted for client compatibility only. `pgbench -i` writes
+  `with (freeze on)` for every ordinary table on PostgreSQL v14+, so this is the option that lets
+  it load. Every other option name, a bad option *value*, and `COPY ... TO` are refused **by
+  name** as a COPY refusal (`ParseError::UnsupportedCopy`, whose message names the option) —
+  never reported as an ALTER TABLE form, which is what `ParseError::UnsupportedAlter` means.
 - PG DDL (T-130, D10), **parsed only** (no execution or schema creation yet; the
   Postgres front end answers `0A000`): `CREATE TABLE [IF NOT EXISTS] [public.]t
   (col type [NOT NULL | PRIMARY KEY], ..., [CONSTRAINT n] PRIMARY KEY (a, b))`

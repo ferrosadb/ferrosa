@@ -1,9 +1,11 @@
-//! Module: `CREATE TABLE` parsing for the Ecto-migration DDL subset (D10, T-130).
+//! Module: DDL/DML-adjacent parsing — `CREATE TABLE` for the Ecto-migration subset
+//! (D10, T-130) and `COPY ... FROM STDIN` with its option list.
 //! Correctness: Correct when every statement `ecto_sql` emits for `create table`
 //! parses to the expected AST, and every out-of-scope clause fails with a typed
 //! `ParseError::UnsupportedClause` naming that clause (never silently dropped).
-//! Last revised: 2026-09-28
-//! Last changed: New module; parse layer only, no execution or schema creation.
+//! Last revised: 2026-10-09
+//! Last changed: `COPY ... FROM STDIN` options — `FREEZE [ON|OFF]` accepted-and-recorded
+//! (no LSM analogue), every other option refused by name as `ParseError::UnsupportedCopy`.
 //!
 //! This is a child module of `parser` so it shares the private lexer/`Parser`.
 //! Every loop here iterates over the token vector once; there is no recursion.
@@ -36,6 +38,22 @@ const MAPPED_SCHEMA: &str = "public";
 /// name is refused (`ParseError::UnsupportedStorageParameter`), so a client that
 /// asked for real behaviour (e.g. `WITH (oids=false)`) learns immediately.
 const ACCEPTED_STORAGE_PARAMETERS: &[&str] = &["fillfactor", "autovacuum_enabled"];
+
+/// The `COPY ... FROM STDIN` options ferrosa **records but does not apply**.
+///
+/// - `FREEZE [ON | OFF]` — tells PostgreSQL to mark the rows this `COPY` loads as frozen
+///   (all-visible, needing no vacuum). That is a heap-page concept and ferrosa is an
+///   LSM/SSTable store: it has no heap pages and therefore no frozen-row concept, so there is
+///   nothing to set. The option is accepted because it can never change what a query returns,
+///   and the parsed value is kept on the statement (`CopyFromStdinStmt::freeze`) so the
+///   acceptance is visible rather than a silent swallow. `pgbench -i` sends
+///   `with (freeze on)` for every ordinary table on PostgreSQL v14+, so refusing it keeps
+///   `pgbench -i` broken.
+///
+/// Every other COPY option name is refused by name (`ParseError::UnsupportedCopy`, whose
+/// message names the option), so a client that asked for real behaviour learns immediately
+/// rather than getting a COPY that does not do what it asked for.
+pub(super) const RECORDED_COPY_OPTIONS: &[&str] = &["FREEZE"];
 
 impl Parser {
     /// `CREATE TABLE [IF NOT EXISTS] name ( elem [, elem]* )`. The leading
@@ -325,8 +343,14 @@ impl Parser {
     ///
     /// Only the `FROM STDIN` direction is parsed: `COPY ... TO` writes a payload the client reads,
     /// which is a different exchange and is refused by name. Options are the modern parenthesised
-    /// form; an unrecognised option is refused rather than ignored, because a client that asked for
-    /// csv and silently got text would store garbage.
+    /// form; an unrecognised option is refused by name (`ParseError::UnsupportedCopy`, whose
+    /// message names the option) rather than ignored, because a client that asked for csv and
+    /// silently got text would store garbage. The one option with no analogue here — `FREEZE`,
+    /// a heap-page concept an LSM cannot honour — is accepted and recorded instead
+    /// (see [`RECORDED_COPY_OPTIONS`] and `CopyFromStdinStmt::freeze`).
+    ///
+    /// A COPY refusal is a COPY refusal: it is reported as `UnsupportedCopy`, never as the
+    /// `ALTER TABLE` form that [`ParseError::UnsupportedAlter`] means.
     pub(super) fn parse_copy(&mut self) -> Result<Statement, ParseError> {
         self.expect_ident_kw("COPY")?;
         let table = self.parse_qualified_table()?;
@@ -341,8 +365,8 @@ impl Parser {
         // `COPY ... TO` writes a payload the client reads — the opposite exchange — and is refused
         // by name rather than reported as a stray token.
         if self.peek_is_kw("TO") {
-            return Err(ParseError::UnsupportedAlter(
-                "COPY ... TO is not supported; only COPY ... FROM STDIN".into(),
+            return Err(ParseError::UnsupportedCopy(
+                "only COPY ... FROM STDIN is supported, not COPY ... TO".into(),
             ));
         }
         // `FROM` is a KEYWORD token here, not an identifier, so it is matched directly.
@@ -354,7 +378,7 @@ impl Parser {
         }
         self.next(); // FROM
         if !self.peek_is_kw("STDIN") {
-            return Err(ParseError::UnsupportedAlter(
+            return Err(ParseError::UnsupportedCopy(
                 "only COPY ... FROM STDIN is supported".into(),
             ));
         }
@@ -367,6 +391,7 @@ impl Parser {
             delimiter: None,
             null: None,
             header: false,
+            freeze: None,
         };
         // `WITH` is optional, as is the parenthesised list entirely.
         if self.peek_is_kw("WITH") {
@@ -375,7 +400,7 @@ impl Parser {
         if matches!(self.peek(), Some(Tok::LParen)) {
             self.parse_copy_options(&mut stmt)?;
         } else if self.peek().is_some() {
-            return Err(ParseError::UnsupportedAlter(
+            return Err(ParseError::UnsupportedCopy(
                 "only the parenthesised COPY option list is supported".into(),
             ));
         }
@@ -383,6 +408,11 @@ impl Parser {
     }
 
     /// `(key [value] [, ...])`, applied to `stmt`.
+    ///
+    /// Each option is named in the match below: `FORMAT`/`DELIMITER`/`NULL`/`HEADER` are applied,
+    /// and `FREEZE` (see [`RECORDED_COPY_OPTIONS`]) is recorded as a no-op. Anything else is
+    /// refused by name (`ParseError::UnsupportedCopy`) — the set is never widened to "accept
+    /// anything", so an option ferrosa cannot honour fails loudly.
     fn parse_copy_options(&mut self, stmt: &mut CopyFromStdinStmt) -> Result<(), ParseError> {
         self.expect(&Tok::LParen, "(")?;
         loop {
@@ -394,8 +424,8 @@ impl Parser {
                         "TEXT" => CopyFormatKind::Text,
                         "CSV" => CopyFormatKind::Csv,
                         other => {
-                            return Err(ParseError::UnsupportedAlter(format!(
-                                "COPY format `{other}` is not supported"
+                            return Err(ParseError::UnsupportedCopy(format!(
+                                "COPY option `FORMAT` value `{other}` is not supported"
                             )))
                         }
                     };
@@ -403,8 +433,23 @@ impl Parser {
                 "DELIMITER" => stmt.delimiter = Some(self.copy_option_char()?),
                 "NULL" => stmt.null = Some(self.copy_option_string()?),
                 "HEADER" => stmt.header = true,
+                // Accept-and-record (never apply): a heap-page concept this LSM cannot honour.
+                // `pgbench -i` writes `with (freeze on)`; see `RECORDED_COPY_OPTIONS`.
+                "FREEZE" => {
+                    let value = self.copy_option_word()?;
+                    stmt.freeze = Some(match value.as_str() {
+                        "ON" => true,
+                        "OFF" => false,
+                        other => {
+                            return Err(ParseError::UnsupportedCopy(format!(
+                                "COPY option `FREEZE` value `{other}` is not supported"
+                            )))
+                        }
+                    });
+                    debug_assert!(RECORDED_COPY_OPTIONS.contains(&"FREEZE"));
+                }
                 other => {
-                    return Err(ParseError::UnsupportedAlter(format!(
+                    return Err(ParseError::UnsupportedCopy(format!(
                         "COPY option `{other}` is not supported"
                     )))
                 }
@@ -433,9 +478,24 @@ impl Parser {
         let mut chars = text.chars();
         match (chars.next(), chars.next()) {
             (Some(c), None) => Ok(c),
-            _ => Err(ParseError::UnsupportedAlter(format!(
-                "DELIMITER must be a single character, got {text:?}"
+            _ => Err(ParseError::UnsupportedCopy(format!(
+                "COPY option `DELIMITER` must be a single character, got {text:?}"
             ))),
+        }
+    }
+
+    /// A bare-word COPY option value (`FREEZE ON` / `FREEZE OFF`), upper-cased for matching.
+    ///
+    /// `ON` is a keyword token (`JOIN ... ON`), so `ident()` alone would reject `freeze on`;
+    /// `OFF` is an ordinary identifier.
+    fn copy_option_word(&mut self) -> Result<String, ParseError> {
+        match self.next() {
+            Some(Tok::Ident(s) | Tok::QuotedIdent(s)) => Ok(s.to_ascii_uppercase()),
+            Some(Tok::On) => Ok("ON".to_string()),
+            other => Err(ParseError::Unexpected {
+                expected: "an option value",
+                found: format!("{other:?}"),
+            }),
         }
     }
 

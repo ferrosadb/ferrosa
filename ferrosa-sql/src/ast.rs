@@ -142,6 +142,14 @@ pub struct CopyFromStdinStmt {
     pub null: Option<String>,
     /// `HEADER` — csv only.
     pub header: bool,
+    /// `FREEZE [ON | OFF]`. PostgreSQL freezes the loaded rows into the table's heap pages;
+    /// ferrosa is an LSM/SSTable store with no heap pages and therefore no frozen-row concept,
+    /// so there is nothing to apply. The option is **accepted and recorded, not applied** —
+    /// `Some(true)` for `freeze on`, `Some(false)` for `freeze off`, `None` when absent — so the
+    /// acceptance is visible and testable rather than a silent swallow. This is what lets
+    /// `pgbench -i` (which writes `with (freeze on)` on PostgreSQL v14+) load its tables; see
+    /// `parser_ddl::ACCEPTED_COPY_OPTIONS`.
+    pub freeze: Option<bool>,
 }
 
 /// The `FORMAT` of a `COPY` payload.

@@ -234,6 +234,11 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
     rather than committing part of it.
 
   A row whose field count does not match the column list is refused (`22P04`) rather than padded.
+  The option list is parsed by `ferrosa-sql`: `FREEZE [ON|OFF]` — a heap-page concept an LSM has no
+  frozen rows for — is accepted-and-recorded there (never applied), which is what lets `pgbench
+  -i` (PostgreSQL v14+ writes `with (freeze on)`) load; every other option, a bad option value and
+  `COPY ... TO` are refused **by name** as COPY refusals (`ParseError::UnsupportedCopy`, `0A000`) —
+  never reported as an `ALTER TABLE` form.
   Minting is done on this path too: every payload row goes through `execute_insert`, so a COPY
   mints `_sys_ck_` for a PK-less table exactly as an INSERT does. The projection that *reads*
   `pg_key` also exists now (`pg_index`/`pg_constraint` plus the `<table>_pkey` index row in

@@ -67,6 +67,14 @@ toward the Postgres queries real clients send.
   compaction; `ANALYZE` is an accepted no-op).
   `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused by name.
 
+- **(done) `COPY ... FROM STDIN` options, incl. pgbench's `FREEZE`.** The parenthesised option
+  list parses (`FORMAT`/`DELIMITER`/`NULL`/`HEADER` applied). `FREEZE [ON|OFF]` — a heap-page
+  concept an LSM cannot honour — is accepted-and-**recorded** (`CopyFromStdinStmt::freeze`), not
+  applied, which is what lets `pgbench -i` (PostgreSQL v14+ writes `with (freeze on)`) load its
+  tables. Every other option, a bad option *value*, and `COPY ... TO` are refused **by name** as
+  COPY refusals (`ParseError::UnsupportedCopy`) — no longer funnelled through `UnsupportedAlter`,
+  whose "ALTER TABLE form" wording now only ever describes an `ALTER TABLE`.
+
 - **(done) `FOREIGN KEY` / column `REFERENCES` grammar.** `[CONSTRAINT <name>]
   FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]` (table level) and a column-level
   `REFERENCES` parse into `ForeignKeyConstraint`, recorded on

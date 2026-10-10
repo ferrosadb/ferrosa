@@ -907,6 +907,7 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         ParseError::UnsupportedClause(_)
         | ParseError::MissingPrimaryKey
         | ParseError::UnsupportedAlter(_)
+        | ParseError::UnsupportedCopy(_)
         | ParseError::UnsupportedStorageParameter(_)
         | ParseError::UnsupportedSelectExpr(_)
         | ParseError::UnsupportedCast(_)

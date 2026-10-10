@@ -23,6 +23,10 @@
 //! parallel one, so COPY gets the same type coercion, the same synthetic `_sys_ck_` key minting,
 //! and — because the write set is flushed with the very parameters the autocommit path uses —
 //! the same commit. There is no second way to write a row here.
+//!
+//! The payload options are resolved from the parsed `CopyFromStdinStmt`. One of them, `FREEZE`,
+//! has no analogue in an LSM (no heap pages ⇒ no frozen rows) and is accepted-and-recorded by the
+//! parser, never applied; it has no effect on this path and is not consulted here.
 
 use bytes::BytesMut;
 use ferrosa_common::timeuuid::is_reserved_column_name;
@@ -608,5 +612,29 @@ mod tests {
         assert_eq!(reply.first().copied(), Some(b'E'));
         assert!(text.contains("42P16"), "reserved name: {text:?}");
         assert!(!text.contains('G'), "not acknowledged: {text:?}");
+    }
+
+    /// pgbench's exact form on PostgreSQL v14+: `(freeze on)`. An LSM has no heap pages and so no
+    /// frozen-row concept — the option is accepted-and-recorded, not applied (see
+    /// `ferrosa_sql::CopyFromStdinStmt::freeze`) — but the COPY it wraps must still load the rows.
+    /// This asserts the rows land, not merely that no error was returned.
+    #[tokio::test]
+    async fn copy_freeze_on_loads_the_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let (_reply, text) = run_copy(
+            &ctx,
+            "copy kv (k) from stdin with (freeze on)",
+            &[copy_data(b"x\ny\n"), frame(b'c', &[])],
+        )
+        .await;
+
+        assert!(
+            text.starts_with('G'),
+            "the COPY is acknowledged first: {text:?}"
+        );
+        assert!(text.contains("COPY 2"), "the reported count: {text:?}");
+        for key in ["x", "y"] {
+            assert_eq!(row_count(&ctx, key).await, 1, "row {key} must be persisted");
+        }
     }
 }
