@@ -684,7 +684,6 @@ pub(crate) static READ_IMAGE_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static READ_IMAGE_NS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
-
 fn commit_profile_enabled() -> bool {
     std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
 }
@@ -697,6 +696,16 @@ pub(crate) struct ApplyOutputs<'a> {
     /// caller can attach it to that partition's row-version metadata instead of
     /// reading the row a second time.
     pub before_images: Option<&'a mut std::collections::HashMap<Vec<Value>, Option<Row>>>,
+    /// Batch-prefetched storage before-images, keyed by SQL key, produced by
+    /// [`prefetch_before_images`] against ONE store-view snapshot.
+    ///
+    /// When an entry is present it is used instead of a per-row [`read_row_image`]
+    /// call: the value is the SAME pre-transaction storage image the per-row read
+    /// would return, so an absent entry means "not prefetched — read it now" while a
+    /// present `Some(None)` means "read, and there is no live row". That distinction
+    /// is what lets a batched prefetch stand in for the per-row read without changing
+    /// which keys see a before-image.
+    pub before_cache: Option<&'a std::collections::HashMap<Vec<Value>, Option<Row>>>,
 }
 
 pub(crate) fn apply_pending_writes_with_partition_keys<'a, I>(
@@ -713,6 +722,7 @@ where
 {
     let mut partition_keys = outputs.partition_keys;
     let mut before_images = outputs.before_images;
+    let before_cache = outputs.before_cache;
     for mutation in writes {
         if mutation.keyspace != keyspace || mutation.table != table {
             continue;
@@ -754,6 +764,15 @@ where
 
             let base = if let Some(snapshot_row) = overlay.get(&key) {
                 snapshot_row.clone()
+            } else if let Some(cached) = before_cache.and_then(|cache| cache.get(&key)) {
+                // Prefetched batch before-image: byte-for-byte what the per-row
+                // read below would return, but resolved once per key across a whole
+                // window of mutations against one store view (see
+                // `prefetch_before_images`).
+                if let Some(before) = before_images.as_deref_mut() {
+                    before.insert(key.clone(), cached.clone());
+                }
+                cached.clone()
             } else {
                 let started = commit_profile_enabled().then(std::time::Instant::now);
                 let image = read_row_image(engine, codec, mutation, &mutation_row.clustering)?
@@ -808,29 +827,37 @@ pub(crate) fn read_row_image(
     mutation: &ferrosa_storage::Mutation,
     clustering: &[u8],
 ) -> Result<Option<(Vec<Value>, Row)>, String> {
-    let Some(partition) = engine
-        .read_clustering_row(
-            &TableId::new(&mutation.keyspace, &mutation.table),
-            &mutation.key,
-            clustering,
-        )
-        .map_err(|error| error.to_string())?
-    else {
+    let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+    let looked_up = engine
+        .read_clustering_row(&table_id, &mutation.key, clustering)
+        .map_err(|error| error.to_string())?;
+    let Some(partition) = looked_up else {
         return Ok(None);
     };
+    partition_row_image(codec, &mutation.keyspace, &mutation.table, &partition)
+}
+
+/// Decode one storage [`Partition`](ferrosa_sstable::types::Partition) into a SQL
+/// primary-key tuple and the row image the MVCC history stores.
+///
+/// Shared by the per-row [`read_row_image`] and the batched
+/// [`prefetch_before_images`] so both produce byte-identical before-images — the
+/// batch path is a different read SHAPE, never a different answer.
+fn partition_row_image(
+    codec: &TableCodec,
+    keyspace: &str,
+    table: &str,
+    partition: &ferrosa_sstable::types::Partition,
+) -> Result<Option<(Vec<Value>, Row)>, String> {
     let rows = ferrosa_row_bridge::partition_to_rows_with_clustering(
-        &partition,
+        partition,
         &codec.names,
         &codec.types,
         &codec.pk,
         &codec.ck,
         &codec.storage_to_table,
     )
-    .map_err(|error| {
-        error
-            .in_table(format!("{}.{}", mutation.keyspace, mutation.table))
-            .to_string()
-    })?;
+    .map_err(|error| error.in_table(format!("{keyspace}.{table}")).to_string())?;
     let Some((_, cells)) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -848,6 +875,82 @@ pub(crate) fn read_row_image(
         .map(|index| values[*index].clone())
         .collect();
     Ok(Some((key, Row::new(values))))
+}
+
+/// Batch-prefetch the storage before-images a chunk of mutations will need, in ONE
+/// store-view snapshot, so the per-mutation overlay merge does not issue a point read
+/// per row.
+///
+/// The commit's before-image read is one point read of the PRE-transaction row for
+/// every key the transaction writes (the row-version metadata needs it). Issued one
+/// row at a time that pays the storage view/schema/tombstone fixed cost once per row;
+/// this resolves the whole chunk against one view and returns a `SQL key -> Option<Row>`
+/// map the caller hands back through [`ApplyOutputs::before_cache`].
+///
+/// Keys already present in `overlay` are skipped: the merge uses the overlay's
+/// accumulated row as its base and never reads storage for them. A key the overlay
+/// gains LATER — an earlier mutation in the same chunk wrote it — is read here anyway,
+/// which is harmless: the merge simply does not consult it.
+pub(crate) fn prefetch_before_images<'a, I>(
+    engine: &StorageEngine,
+    codec: &TableCodec,
+    keyspace: &str,
+    table: &str,
+    overlay: &std::collections::HashMap<Vec<Value>, Option<Row>>,
+    writes: I,
+) -> Result<std::collections::HashMap<Vec<Value>, Option<Row>>, String>
+where
+    I: IntoIterator<Item = &'a ferrosa_storage::Mutation>,
+{
+    let mut requests: Vec<(ferrosa_common::DecoratedKey, Vec<u8>)> = Vec::new();
+    let mut keys: Vec<Vec<Value>> = Vec::new();
+    for mutation in writes {
+        if mutation.keyspace != keyspace || mutation.table != table {
+            continue;
+        }
+        if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
+            continue;
+        }
+        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, codec.pk.len());
+        for mutation_row in &mutation.rows {
+            let ck_parts =
+                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, codec.ck.len());
+            let mut key = Vec::with_capacity(codec.pk.len() + codec.ck.len());
+            for (index, part) in codec.pk.iter().zip(pk_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
+                    .map_err(|error| error.to_string())?;
+                key.push(cql_to_value(&cql)?);
+            }
+            for (index, part) in codec.ck.iter().zip(ck_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
+                    .map_err(|error| error.to_string())?;
+                key.push(cql_to_value(&cql)?);
+            }
+            if overlay.contains_key(&key) {
+                continue;
+            }
+            requests.push((mutation.key.clone(), mutation_row.clustering.clone()));
+            keys.push(key);
+        }
+    }
+    let mut cache = std::collections::HashMap::with_capacity(requests.len());
+    if requests.is_empty() {
+        return Ok(cache);
+    }
+    let table_id = TableId::new(keyspace, table);
+    let images = engine
+        .read_clustering_rows_batch(&table_id, &requests)
+        .map_err(|error| error.to_string())?;
+    for (key, partition) in keys.into_iter().zip(images) {
+        let image = match partition {
+            Some(partition) => {
+                partition_row_image(codec, keyspace, table, &partition)?.map(|(_, row)| row)
+            }
+            None => None,
+        };
+        cache.insert(key, image);
+    }
+    Ok(cache)
 }
 
 #[cfg(test)]
