@@ -11,6 +11,17 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **Region-REFERENCE Apply wire (CL-52).** `MsgType::AccordApplyV2Region` (0x7E),
+  gated on `CAP_ACCORD_APPLY_REGION` (1<<4): the Apply frame is now a capnp HEADER
+  (`txnId` + a parallel `offsets`/`lengths` index) followed by ONE contiguous REGION
+  of the peer's mutation payload bytes. The coordinator writes the spill's borrowed
+  mmap slices (`WriteSetSpill::entry`) straight into the region — no per-entry capnp
+  struct, no key on the wire — and the peer's `decode_accord_apply_v2_region` reads
+  entries BY OFFSET from a borrowed view, with no owned per-entry wire structure. A
+  peer that did not advertise the bit still receives the inline capnp (or bincode)
+  frame. `frame_bytes` shrinks (test: `region_apply_frame_is_smaller_than_the_inline_capnp_frame`).
+  Still to measure on the same 4 GB nodes at N=1e6: `frame_bytes`, `serialize_ms`,
+  `fanout_ms`, `max_ack_ms`, peer apply and per-node RSS.
 - **Interim jsonb gate on leaving standalone (T-300, D24).** Transitions out of
   standalone and non-standalone startup are refused while jsonb columns exist.
   Follow-ups: show the refusal on `/readyz` (`jsonb_gate_refusing()` is the
@@ -223,6 +234,19 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   cross-DC partition scenarios now (cheap), pending the full Jepsen run.
 
 ## Next
+
+- **Compress the Apply region (owner directive; measure first).** The handshake
+  already negotiates a codec (`supportedCompression`/`chosenCompression`,
+  `FLAG_COMPRESSED`) and `lz4_flex`/`snap` are already dependencies, but **no codec is
+  applied to any frame body** — negotiate-then-ignore. The region-REFERENCE body is the
+  one place to apply it: compress the CONTIGUOUS REGION in blocked form (never
+  per-entry), the peer decompresses into its own buffer and addresses entries by
+  `(offset, length)`. Capability-gated and version-skew safe like the region bit. Do
+  NOT apply it blindly: the peer round trip is `transport + deserialize + apply`, so if
+  the transport term is CPU/deserialize-bound, compression makes it slower. Measure the
+  transport byte-vs-CPU split, then compare `frame_bytes`/`max_ack_ms`/peer apply
+  compressed vs uncompressed, and leave it off by default if `max_ack_ms` does not move.
+  Note in any commit that `pgbench`'s repeated filler columns flatter any ratio.
 
 - **A replica's failed fulltext search must not answer "no matches".**
   `FulltextSearchHandler` (and `IndexReadInPartitionHandler`) log a storage

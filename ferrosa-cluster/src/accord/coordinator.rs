@@ -2865,18 +2865,25 @@ impl AccordCoordinatorDriver {
         // fan-out falls back to the bincode `AccordApplyV2` frame rather than sending one
         // peer a type byte it would reject and drop the connection on. This is the
         // `CAP_ACCORD_CAPNP` version-skew contract: an un-upgraded peer always receives a
-        // frame it can decode.
-        let mut capnp = false;
+        // frame it can decode. The region-REFERENCE form is preferred when EVERY dialed
+        // peer advertises `CAP_ACCORD_APPLY_REGION`: it carries the same header plus ONE
+        // bulk region instead of a capnp struct per entry.
+        let mut capnp = true;
+        let mut region = true;
         let mut any_remote = false;
         for &peer in self.replica_ids.iter().filter(|&&id| id != self_id) {
             any_remote = true;
             if !self.peers.supports_accord_capnp(peer).await {
                 capnp = false;
+                region = false;
                 break;
             }
-            capnp = true;
+            if !self.peers.supports_accord_apply_region(peer).await {
+                region = false;
+            }
         }
         let capnp = capnp && any_remote;
+        let region = region && any_remote;
         // The capnp body's total-order stamp, mirrored from the driver's transaction id.
         let accord_txn_id = ferrosa_net::protocol::AccordTxnId {
             epoch: txn_id.0.epoch,
@@ -2884,12 +2891,22 @@ impl AccordCoordinatorDriver {
             seq: txn_id.0.seq,
             node: txn_id.0.node,
         };
-        // Build one wire frame for a set of BORROWED entries. Cap'n Proto writes each
-        // entry's bytes straight into the arena, so the write-set is copied exactly once;
+        // Build one wire frame for a set of BORROWED entries. The region form (when every
+        // peer advertises `CAP_ACCORD_APPLY_REGION`) writes the mutation bytes into ONE
+        // contiguous region right after a small index header — no per-entry capnp struct,
+        // and the partition keys are not carried (the frame is already scoped). The
+        // capnp-inline form writes each entry's bytes straight into the arena (one copy);
         // the legacy bincode twin (a peer that did not advertise the capability) keeps the
         // exact bytes that path always shipped.
         let encode_frame = |entries: &[(&[u8], &[u8])]| -> Result<Bytes, AccordDriverError> {
-            if capnp {
+            if region {
+                ferrosa_net::protocol::encode_accord_apply_v2_region(
+                    accord_txn_id,
+                    entries.iter().map(|(_, mutation)| *mutation),
+                )
+                .map(Bytes::from)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))
+            } else if capnp {
                 ferrosa_net::protocol::encode_accord_apply_v2(
                     accord_txn_id,
                     entries.iter().copied(),
@@ -2961,7 +2978,9 @@ impl AccordCoordinatorDriver {
                     }
                 };
                 frame_bytes = frame_bytes.max(bytes.len());
-                let msg = if capnp {
+                let msg = if region {
+                    Message::AccordApplyV2Region(bytes)
+                } else if capnp {
                     Message::AccordApplyV2Capnp(bytes)
                 } else {
                     Message::AccordApplyV2(bytes)
@@ -4894,10 +4913,12 @@ mod tests {
         enum Enc {
             Legacy,
             Capnp,
+            Region,
         }
 
         struct CapProbe {
             capnp: bool,
+            region: bool,
             frames: Mutex<Vec<(uuid::Uuid, Enc, Bytes)>>,
         }
         #[async_trait::async_trait]
@@ -4919,6 +4940,11 @@ mod tests {
                         .lock()
                         .expect("probe mutex")
                         .push((host, Enc::Capnp, bytes.clone())),
+                    Message::AccordApplyV2Region(bytes) => self
+                        .frames
+                        .lock()
+                        .expect("probe mutex")
+                        .push((host, Enc::Region, bytes.clone())),
                     _ => {}
                 }
                 Ok(Message::AccordApplyOK(Bytes::new()))
@@ -4926,6 +4952,10 @@ mod tests {
 
             async fn supports_accord_capnp(&self, _host: uuid::Uuid) -> bool {
                 self.capnp
+            }
+
+            async fn supports_accord_apply_region(&self, _host: uuid::Uuid) -> bool {
+                self.region
             }
         }
 
@@ -4938,12 +4968,24 @@ mod tests {
             (b"key-2".to_vec(), vec![0x22u8; 64]),
         ];
 
-        for (label, capnp, expected) in [
-            ("skewed peer (no capability)", false, Enc::Legacy),
-            ("upgraded peer (CAP_ACCORD_CAPNP)", true, Enc::Capnp),
+        for (label, capnp, region, expected) in [
+            ("skewed peer (no capability)", false, false, Enc::Legacy),
+            (
+                "capnp-only peer (CAP_ACCORD_CAPNP)",
+                true,
+                false,
+                Enc::Capnp,
+            ),
+            (
+                "region peer (CAP_ACCORD_APPLY_REGION)",
+                true,
+                true,
+                Enc::Region,
+            ),
         ] {
             let probe = Arc::new(CapProbe {
                 capnp,
+                region,
                 frames: Mutex::new(Vec::new()),
             });
             let driver = AccordCoordinatorDriver::new_multi_with_transport(
@@ -4992,11 +5034,25 @@ mod tests {
                             other => panic!("expected an ApplyV2 payload, got {other:?}"),
                         }
                     }
+                    Enc::Region => {
+                        use ferrosa_net::protocol::decode_accord_apply_v2_region;
+                        let view =
+                            decode_accord_apply_v2_region(bytes).expect("region frame decodes");
+                        view.mutations()
+                            .map(|entry| crate::accord::wire::WriteSetEntry {
+                                // The region form does not carry keys (scoped already).
+                                key: Vec::new(),
+                                mutation: entry.expect("entry in bounds").to_vec(),
+                            })
+                            .collect()
+                    }
                 };
                 // No resolver: every replica owns every key, so a uniform write-set
                 // fans out EVERY key — no peer is sent a key it does not own.
                 assert_eq!(writes.len(), 2, "{label}: the full write-set is delivered");
-                assert_eq!(writes[0].key, b"key-1");
+                if *enc != Enc::Region {
+                    assert_eq!(writes[0].key, b"key-1");
+                }
                 assert_eq!(writes[1].mutation, vec![0x22u8; 64]);
                 pointers.push(bytes.as_ptr() as usize);
             }
@@ -5114,6 +5170,108 @@ mod tests {
         assert_ne!(
             shard_a_ptr, shard_b_ptr,
             "two different scoped write-sets must not be served by one shared frame"
+        );
+    }
+
+    /// SHARD SCOPE ON THE REGION WIRE: when every peer advertises
+    /// `CAP_ACCORD_APPLY_REGION`, a per-key resolver that spreads keys over two
+    /// DISJOINT replica sets must still deliver each peer ONLY the keys it owns —
+    /// the region carries no key at all, so the scope lives entirely in the
+    /// coordinator's selection. A peer must NEVER receive an entry outside its shard
+    /// scope (a data-placement violation the replica cannot detect — it trusts the
+    /// coordinator).
+    #[tokio::test]
+    async fn region_fanout_never_sends_a_peer_an_entry_outside_its_shard_scope() {
+        use std::sync::Mutex;
+
+        struct RegionProbe {
+            frames: Mutex<Vec<(uuid::Uuid, Bytes)>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for RegionProbe {
+            async fn send(
+                &self,
+                host: uuid::Uuid,
+                msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                if let Message::AccordApplyV2Region(bytes) = &msg {
+                    self.frames
+                        .lock()
+                        .expect("probe mutex")
+                        .push((host, bytes.clone()));
+                }
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+
+            async fn supports_accord_capnp(&self, _host: uuid::Uuid) -> bool {
+                true
+            }
+
+            async fn supports_accord_apply_region(&self, _host: uuid::Uuid) -> bool {
+                true
+            }
+        }
+
+        let n = six_nodes();
+        let probe = Arc::new(RegionProbe {
+            frames: Mutex::new(Vec::new()),
+        });
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            n.clone(),
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), b"mutation-for-ka".to_vec()),
+                (b"kb".to_vec(), b"mutation-for-kb".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(per_key_resolver(n.clone()));
+        let participant = driver.participant_set();
+
+        let ok = driver
+            .apply_fanout_bounded(&participant, |r| r.is_ok())
+            .await
+            .expect("bounded fan-out runs");
+        assert!(ok, "every shard acked");
+
+        let frames = probe.frames.lock().expect("probe mutex");
+        assert!(
+            frames.len() >= 4,
+            "both shards must reach quorum over the region wire, got {}",
+            frames.len()
+        );
+        let mut saw_shard_a = false;
+        let mut saw_shard_b = false;
+        for (host, frame) in frames.iter() {
+            use ferrosa_net::protocol::decode_accord_apply_v2_region;
+            let view = decode_accord_apply_v2_region(frame).expect("each scoped region decodes");
+            assert_eq!(
+                view.len(),
+                1,
+                "a peer's region carries only its OWN shard's single mutation"
+            );
+            let mutation = view.entry(0).expect("entry in bounds");
+            if n[0..3].contains(host) {
+                assert_eq!(
+                    mutation, b"mutation-for-ka",
+                    "a shard-A peer must never receive shard B's payload"
+                );
+                saw_shard_a = true;
+            } else {
+                assert_eq!(
+                    mutation, b"mutation-for-kb",
+                    "a shard-B peer must never receive shard A's payload"
+                );
+                saw_shard_b = true;
+            }
+        }
+        assert!(
+            saw_shard_a && saw_shard_b,
+            "both shards must be represented among the region frames sent"
         );
     }
 

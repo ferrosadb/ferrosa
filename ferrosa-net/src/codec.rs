@@ -204,6 +204,13 @@ pub enum MsgType {
     /// [`crate::handshake::CAP_ACCORD_CAPNP`]: a peer without the bit would read the
     /// unknown type byte as a protocol error and drop the connection.
     AccordApplyV2Capnp = 0x7D,
+    /// Multi-key Accord Apply whose body is a Cap'n Proto `accord.applyV2Region`
+    /// header followed by ONE contiguous REGION holding the write-set payload
+    /// bytes by reference (offset+length), rather than inline. Sent ONLY to a peer
+    /// that advertised [`crate::handshake::CAP_ACCORD_APPLY_REGION`]: a peer without
+    /// the bit would read the unknown type byte as a protocol error and drop the
+    /// connection.
+    AccordApplyV2Region = 0x7E,
     // Bootstrap coordination
     BootstrapComplete = 0x80,
     BootstrapCompleteAck = 0x81,
@@ -345,6 +352,7 @@ impl TryFrom<u8> for MsgType {
             0x7B => Ok(Self::AccordPreAcceptV2),
             0x7C => Ok(Self::AccordApplyV2),
             0x7D => Ok(Self::AccordApplyV2Capnp),
+            0x7E => Ok(Self::AccordApplyV2Region),
             0x80 => Ok(Self::BootstrapComplete),
             0x81 => Ok(Self::BootstrapCompleteAck),
             0x82 => Ok(Self::ClusterMembershipForward),

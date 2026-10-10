@@ -386,6 +386,18 @@ struct AccordApplyV2 {
   writes @1 :List(AccordWriteSetEntry);
 }
 
+struct AccordApplyV2Region {
+  # The region-REFERENCE multi-key Apply: the write-set payload bytes travel as ONE
+  # contiguous REGION appended AFTER this capnp message (see ferrosa-cluster README,
+  # "The region-REFERENCE Apply wire"). This header carries only the index.
+  txnId @0 :AccordTxnId;
+  # Number of entries; `offsets`/`lengths` are parallel lists of this length.
+  entryCount @1 :UInt32;
+  # Byte offset of entry i within the appended region, and its byte length.
+  offsets @2 :List(UInt64);
+  lengths @3 :List(UInt32);
+}
+
 struct AccordApply {
   # wire.rs `ApplyPayload`: the single-key Apply (degenerate one-entry case).
   txnId @0 :AccordTxnId;
@@ -520,6 +532,8 @@ struct AccordControl {
     # Linearizable read-vote.
     read @12 :AccordRead;
     readOk @13 :AccordReadOk;
+    # Region-REFERENCE Apply (the region is appended after this capnp message).
+    applyV2Region @14 :AccordApplyV2Region;
   }
 }
 
