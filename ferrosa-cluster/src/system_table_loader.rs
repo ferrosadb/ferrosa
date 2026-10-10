@@ -113,13 +113,11 @@ impl SystemTableLoader {
                 .get(&ROLES_COL_SALTED_HASH)
                 .and_then(|cell| cell.value.as_deref())
                 .map(|bytes| {
-                    std::str::from_utf8(bytes)
-                        .map(str::to_owned)
-                        .map_err(|e| {
-                            FerrosaError::InvalidData(format!(
-                                "role {name} has invalid salted_hash utf8: {e}"
-                            ))
-                        })
+                    std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
+                        FerrosaError::InvalidData(format!(
+                            "role {name} has invalid salted_hash utf8: {e}"
+                        ))
+                    })
                 })
                 .transpose()?;
             let scram = cells
