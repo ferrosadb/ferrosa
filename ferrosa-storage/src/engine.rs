@@ -18213,6 +18213,96 @@ mod tests {
         );
     }
 
+    /// DROP TABLE must not leave its rows readable after a same-name CREATE,
+    /// even when the physical SSTable deletion could not complete.
+    ///
+    /// An aborted bulk load can leave an undeletable entry inside the table's
+    /// SSTable directory (the live incident: "orphaned SSTables remained under
+    /// `public.pgbench_accounts`"). `unregister_table_quiesced` logs the
+    /// `remove_dir_all` failure and returns `Ok(())`, so the DROP reports
+    /// success while every row stays on disk; the next `register_table` for the
+    /// same name scans that directory and reloads them. The dropped table's rows
+    /// are then readable, and a same-name CREATE silently returns a mix of old
+    /// and new data (the census that grew 1.0M -> 1.15M -> 1.25M across reloads).
+    ///
+    /// RED against the current code. The guard is the DROP contract: either the
+    /// drop fails loud, or no read path returns a dropped row.
+    #[cfg(unix)]
+    #[test]
+    fn a_drop_that_cannot_remove_its_sstables_leaves_no_readable_rows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        // The bulk load: rows flushed to real SSTables on disk.
+        for i in 0..5 {
+            let key = make_key(&format!("old{i}"));
+            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        assert_eq!(
+            engine.count_range(&tid, None, None).unwrap(),
+            5,
+            "precondition: five rows are on disk before the DROP"
+        );
+
+        // The aborted load left the table directory undeletable. Make it
+        // unreadable too, so `remove_dir_all` cannot even enumerate it — the
+        // order-independent form of "the deletion did not complete".
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(table_dir.exists(), "the table directory must exist on disk");
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        // DROP TABLE.
+        let drop = engine.unregister_table(&tid);
+
+        // The transient condition clears (the process that held the directory
+        // released it; an operator runs a cleanup). The SSTable files were never
+        // removed, so they are readable again — this is the live state.
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        // CREATE the same name and load a DIFFERENT row count.
+        engine.register_table(test_schema()).unwrap();
+        for i in 0..3 {
+            let key = make_key(&format!("new{i}"));
+            engine
+                .write(&tid, &key, make_row(b"fresh", 100), 100)
+                .unwrap();
+        }
+
+        // The table must contain ONLY the newly written rows. Assert the exact
+        // count, not a lower bound: a stale count must not be able to match.
+        let visible = engine.count_range(&tid, None, None).unwrap();
+        assert_eq!(
+            visible,
+            3,
+            "DROP+CREATE must contain ONLY the new rows; the dropped table's rows \
+             came back (drop returned {:?})",
+            drop.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+
+        // And the survivors must not be reachable by a full scan either.
+        let scanned: usize = engine
+            .read_range_limited_rows(&tid, None, None, 1000, 0)
+            .unwrap()
+            .iter()
+            .map(|p| p.rows.len())
+            .sum();
+        assert_eq!(scanned, 3, "a full scan must not return dropped rows");
+        assert!(
+            !table_dir.join("orphaned-generation").exists(),
+            "the orphaned entry must be gone"
+        );
+    }
+
     /// Reproduce bug-data-loss-after-drop-table: DROP TABLE on one table
     /// must NOT affect data in other tables in the same keyspace.
     #[test]
