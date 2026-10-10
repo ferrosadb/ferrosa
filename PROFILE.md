@@ -373,6 +373,52 @@ with result size; increasing this buffer only changes the storage-side producer
 window. A portal suspended by `Execute` with `max_rows` keeps one blocking
 executor thread until it resumes or is closed.
 
+#### Accord apply-region compression: measured
+
+`FERROSA_ACCORD_COMPRESSION` is opt-in and default-`none`; this is the first
+measurement of it. Every row is a 3-node **loopback** cluster receiving ONE
+transactional `COPY` of **exactly N = 100,000 rows** and its COMMIT. N is verified
+per row from the logs: the follower applies total 100,000 mutations
+(31,798 + 35,180 + 33,022 across the three nodes). `serialize_ms` is the
+coordinator's frame build (region copy + capnp header + codec), so the codec's own
+cost is its delta against `none`. `frame_bytes` is the largest per-peer wire frame.
+
+| setting | frame_bytes | ratio | serialize_ms | codec ms | fanout_ms | max_ack_ms | RSS n1/n2/n3 (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `none` (default) | 21,671,344 | 1.00x | 82.1 | — | 1086 | 1043 | 608 / 376 / 368 |
+| `lz4` | 3,774,361 | 5.74x | 576.8 | +494.7 | 1582 | 1285 | 568 / 380 / 371 |
+| `lz4` blk 64 KiB | 3,805,439 | 5.69x | 583.4 | +501.2 | 1615 | 1318 | 573 / 386 / 363 |
+| `lz4` blk 1 MiB | 3,767,994 | 5.75x | 554.2 | +472.1 | 1563 | 1279 | 520 / 378 / 371 |
+| `snappy` | 4,234,224 | 5.12x | 217.7 | +135.5 | 1208 | 1097 | 527 / 387 / 370 |
+| `zstd` | 2,055,220 | 10.54x | 198.7 | +116.6 | 1154 | 1053 | 536 / 373 / 367 |
+| `zstd` blk 64 KiB | 2,008,826 | 10.79x | 196.7 | +114.6 | 1158 | 1059 | 554 / 383 / 368 |
+| `zstd` blk 1 MiB | 2,117,670 | 10.23x | 212.8 | +130.6 | 1167 | 1059 | 537 / 377 / 367 |
+
+What the numbers say:
+
+* **`zstd` wins on both axes** — the lowest build cost (+115–131 ms) *and* the best
+  ratio (10.2–10.8x). `lz4` is the worst here on both: 5.7x for the most expensive
+  build of all (+472–501 ms). `snappy` matches `lz4`'s ratio (5.1x) for a sixth of
+  its CPU.
+* **Block size barely moves the result.** `zstd` is 10.2–10.8x from 64 KiB to 1 MiB
+  and `lz4` is 5.7x at every block; the 256 KiB default is fine. The smallest block
+  was marginally best for `zstd` (10.79x) with no measured CPU penalty.
+* **RSS is flat across codecs** (peaks within ~40 MB of `none`): compression does not
+  materially change coordinator or peer memory — the compressed frame is transient.
+* **On this loopback cluster, compression LOSES on latency.** `fanout_ms` rises from
+  1086 ms (`none`) to 1154–1615 ms, because every node is on one host: the transport
+  term is ~free, so the only effect of a codec is added CPU on the critical path.
+  The byte saving can only pay for itself when the transport is byte-bound, i.e.
+  across a real network — which this measurement does NOT exercise.
+
+> **Two honesty caveats.**
+> (1) The ratio is a **benchmark artifact, not a general claim**: the pgbench/pgcopy
+> `accounts` filler column is one repeated character, near-ideal input for any LZ
+> codec. Expect far less than 5–11x on real payloads.
+> (2) This is a **3-node loopback** run. It characterises the codec's CPU / ratio /
+> memory cost, NOT its benefit on the wire. Do not read it as "enable compression
+> for throughput".
+
 The maximum snapshot age bounds how long an abandoned or long-running
 transaction can retain old row versions. Once expired, its next query or commit
 fails with `40001`; the reaper removes its active lease and allows history

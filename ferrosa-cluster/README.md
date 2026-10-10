@@ -159,6 +159,42 @@ Apply frame with one ack. Folding the Apply region into it would replace one App
 RPC with a session (and a per-chunk ack round-trip) for no gain, so the region rides
 the existing single-frame Accord message path.
 
+#### Region compression: measured (loopback, N = 100,000)
+
+The compression tunable (`FERROSA_ACCORD_COMPRESSION`, see
+[../PROFILE.md](../PROFILE.md)) is opt-in and default-`none`; this is its first
+measurement. Each row is a 3-node **loopback** cluster receiving ONE transactional
+`COPY` of **exactly N = 100,000 rows** and its COMMIT — N is verified from the logs
+(the follower applies total 100,000 mutations: 31,798 + 35,180 + 33,022). The CAPs
+are advertised by all three nodes (identical build), confirmed behaviourally by
+`frame_bytes` falling when a codec is set. `serialize_ms` is the coordinator's frame
+build; the codec's own cost is its delta against `none`.
+
+| setting | frame_bytes | ratio | serialize_ms | codec ms | fanout_ms | max_ack_ms | RSS n1/n2/n3 (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `none` (default) | 21,671,344 | 1.00x | 82.1 | — | 1086 | 1043 | 608 / 376 / 368 |
+| `lz4` | 3,774,361 | 5.74x | 576.8 | +494.7 | 1582 | 1285 | 568 / 380 / 371 |
+| `lz4` blk 64 KiB | 3,805,439 | 5.69x | 583.4 | +501.2 | 1615 | 1318 | 573 / 386 / 363 |
+| `lz4` blk 1 MiB | 3,767,994 | 5.75x | 554.2 | +472.1 | 1563 | 1279 | 520 / 378 / 371 |
+| `snappy` | 4,234,224 | 5.12x | 217.7 | +135.5 | 1208 | 1097 | 527 / 387 / 370 |
+| `zstd` | 2,055,220 | 10.54x | 198.7 | +116.6 | 1154 | 1053 | 536 / 373 / 367 |
+| `zstd` blk 64 KiB | 2,008,826 | 10.79x | 196.7 | +114.6 | 1158 | 1059 | 554 / 383 / 368 |
+| `zstd` blk 1 MiB | 2,117,670 | 10.23x | 212.8 | +130.6 | 1167 | 1059 | 537 / 377 / 367 |
+
+* `zstd` is the best on both axes (cheapest build, best ratio); `lz4` is the worst
+  on both (5.7x for +472–501 ms); `snappy` buys `lz4`'s ratio for ~1/4 the CPU.
+* Block size barely matters: `zstd` is 10.2–10.8x over 64 KiB…1 MiB, `lz4` 5.7x at
+  every block. The 256 KiB default is fine.
+* RSS is flat across codecs (±~40 MB): the compressed frame is transient and does
+  not change peer memory.
+* On a **loopback** cluster compression LOSES on latency — `fanout_ms` rises from
+  1086 ms to 1154–1615 ms — because the transport term is ~free and the codec is
+  pure added CPU. The byte saving only pays when the transport is byte-bound.
+
+> **The ratio is a benchmark artifact.** The pgbench `accounts` filler is one
+> repeated character, near-ideal for LZ; do not quote 5–11x as a general claim. And
+> this is a loopback run: it measures the codec's cost, not its wire benefit.
+
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and
 > simulated-nemesis). There is **no external/public Jepsen run yet** — the
