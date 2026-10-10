@@ -249,6 +249,17 @@ impl ClusterCoordinator {
             .replica_host_ids_for_strategy(token, strategy)
     }
 
+    /// Number of distinct nodes in the current ring snapshot.
+    ///
+    /// The ring's topology size — how many distinct voter/learner nodes the
+    /// coordinator's current ring holds. (A table tombstone no longer keys its
+    /// scope off this: `TRUNCATE` is replicated to *every* serving node at
+    /// `ConsistencyLevel::All` via `WritePath::write_all_serving_nodes`, so it no
+    /// longer depends on the ring's node count matching a replication factor.)
+    pub fn node_count(&self) -> usize {
+        self.ring.load().node_count()
+    }
+
     /// Attach a Raft state snapshot for index-aware replica selection.
     pub fn with_raft_state(mut self, state: Arc<ArcSwap<RaftState>>) -> Self {
         self.raft_state = Some(state);

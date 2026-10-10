@@ -16,20 +16,26 @@ pub(crate) mod authz;
 pub mod catalog;
 pub mod codec;
 pub mod connection;
+pub mod copy_decode;
+mod copy_stdin;
 pub mod ddl;
 pub mod extended;
 pub mod handshake;
 pub mod jsonb_wire;
 pub mod messages;
 mod mvcc;
+pub mod pg_fk;
+pub mod pg_key;
 pub mod pg_types;
 pub mod portal_limits;
 pub mod query;
 pub(crate) mod result_stream;
+mod row_change_codec;
 pub mod scram;
 pub mod server;
 pub mod storage_provider;
 pub mod store;
+mod txn_write_set;
 
 mod accord_access;
 
@@ -47,5 +53,7 @@ pub use mvcc::{MvccManager, PgWrite};
 pub use portal_limits::{PortalLimits, SuspendedPortals};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
 pub use server::{PgTls, QueryContext};
+pub use txn_write_set::TxnWriteSet;
 
 pub use accord_access::AccordAccess;
+mod synthetic_key;

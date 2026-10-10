@@ -22,6 +22,41 @@ pub trait AccordTransport: Send + Sync {
         msg: Message,
         lane: Lane,
     ) -> ferrosa_net::error::Result<Message>;
+
+    /// Whether `host_id` advertised [`ferrosa_net::handshake::CAP_ACCORD_CAPNP`],
+    /// i.e. decodes the Cap'n Proto `AccordApplyV2Capnp` body.
+    ///
+    /// Defaults to `false`: a transport that cannot positively confirm the peer's
+    /// capability must fall back to the bincode `AccordApplyV2` frame. Sending the
+    /// Cap'n Proto type to a peer that does not know the type byte drops the whole
+    /// internode connection — a rolled-back (version-skewed) peer must still be sent
+    /// a frame it can decode.
+    async fn supports_accord_capnp(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
+
+    /// Whether `host_id` advertised
+    /// [`ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION`], i.e. decodes the
+    /// region-REFERENCE `AccordApplyV2Region` body.
+    ///
+    /// Defaults to `false`: a transport that cannot positively confirm the peer's
+    /// capability must fall back to the inline `AccordApplyV2Capnp` (or bincode
+    /// `AccordApplyV2`) frame. Sending the region type to a peer that does not know
+    /// the type byte drops the whole internode connection.
+    async fn supports_accord_apply_region(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
+
+    /// Whether `host_id` advertised
+    /// [`ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED`], i.e. decodes a
+    /// COMPRESSED region body.
+    ///
+    /// Gated SEPARATELY from the region bit so that enabling
+    /// `FERROSA_ACCORD_COMPRESSION` can never send a compressed body to a peer that
+    /// understands only the uncompressed region form. Defaults to `false`.
+    async fn supports_accord_apply_region_compressed(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -34,5 +69,23 @@ impl AccordTransport for PeerManager {
     ) -> ferrosa_net::error::Result<Message> {
         // Forward to the inherent method (this trait impl only adds the dyn seam).
         PeerManager::send(self, host_id, msg, lane).await
+    }
+
+    async fn supports_accord_capnp(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_CAPNP != 0)
+    }
+
+    async fn supports_accord_apply_region(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION != 0)
+    }
+
+    async fn supports_accord_apply_region_compressed(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id).await.is_some_and(|caps| {
+            caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED != 0
+        })
     }
 }

@@ -128,10 +128,50 @@ protocol, so the combined multi-key replica set cannot bypass snapshot freshness
 | `FERROSA_ACCORD_PREACCEPT_FAST_PATH_TIMEOUT_MS` | Maximum wait for a possible final fast-path PreAccept response before using an already-collected slow quorum | `1000` ms |
 
 The default leaves time for Accept and local dependency application within the
-existing 5-second read dependency wait while allowing ordinary sub-second
-replica responses to retain the one-round fast path. Increase it when healthy
-replica response latency regularly exceeds one second; decrease it only when
-the extra Accept round is preferable to waiting for the final fast-path vote.
+barrier abstain bound (`FERROSA_ACCORD_BARRIER_TIMEOUT_SECS`, 5 s by default)
+while allowing ordinary sub-second replica responses to retain the one-round fast
+path. Increase it when healthy replica response latency regularly exceeds one
+second; decrease it only when the extra Accept round is preferable to waiting for
+the final fast-path vote.
+
+### Accord dependency-wait bounds
+
+Two bounds govern how long an Accord transaction waits on the replicas that
+ordered before it. They are separate settings on purpose, because the two waits
+have opposite costs, and both are per-process values read once and cached in a
+lock-free atomic — changing them needs a restart, not a rebuild.
+
+- **Apply bound.** How long the coordinator waits for its ordered dependencies to
+  reach `Applied` before it abandons the transaction. Abandoning rolls the
+  transaction back (it is never applied), releases any successor parked behind
+  it, and tells the client the transaction was not committed and may be retried
+  (PostgreSQL SQLSTATE `40001`; CQL a retryable server error). Raise this for a
+  slow mutator: a client updating many rows in one transaction legitimately needs
+  a longer window than a benchmark burst. It is single-sourced from the epoch
+  drain period's `DEFAULT_TXN_TIMEOUT` (10 s) because the drain is sized as
+  `SkewMax + DEFAULT_TXN_TIMEOUT` — raising this without raising the drain would
+  let a drain cut off a transaction still inside its bound.
+- **Barrier abstain bound.** How long the PostgreSQL snapshot-barrier read-vote,
+  and every inbound `ReadVote`, waits for its conflicting transactions to reach
+  `Applied` before it abstains. Deliberately tighter than the apply bound:
+  raising it only makes a *failing* transaction slower. An abstain is fail-loud
+  and the client retries, so there is nothing to wait longer for. Keep it at or
+  below the apply bound.
+
+| Environment variable | What it bounds | Default |
+|---|---|---:|
+| `FERROSA_ACCORD_TXN_TIMEOUT_SECS` | Apply bound: how long a transaction may wait for its dependencies before it is abandoned (rolled back, client told to retry) | `10` s |
+| `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` | Barrier bound: how long the snapshot-barrier read-vote and inbound `ReadVote` wait before abstaining | `5` s |
+| `FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS` | Parked-apply reclamation: how long the dep-wait apply engine may retain a **parked** write-set whose dependency has not arrived before it releases it. This is a TIME bound on residency, never a hard cap on how much may be parked: the park is reclaimed only once its dependency has had far longer than the protocol allows it to arrive. Reclamation is fail-loud (logged at ERROR with the unresolved dependency set; the coordinator abandons the transaction and the client retries), never a silent drop. Keep it **above** the apply bound above | `60` s |
+
+A non-numeric, zero, or negative value logs one warning and uses the default.
+Zero is refused rather than clamped: it would fail every transaction the instant
+it parked.
+
+The parked-apply reclamation bound must stay **strictly above**
+`FERROSA_ACCORD_TXN_TIMEOUT_SECS` and the barrier bound: a park is reclaimed only
+after its dependency has had far longer to arrive than the coordinator will wait,
+so an about-to-resolve park is never released out from under its transaction.
 
 ### SSTable write, compression, and reader buffers
 
@@ -319,10 +359,20 @@ rebuilding Ferrosa:
 
 | Environment variable | What it bounds | Default |
 |---|---|---:|
-| `FERROSA_POSTGRES_MAX_TXN_WRITES` | Mutations buffered by one PostgreSQL transaction before it fails with a resource-limit error | `10000` |
+| `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | Resident buffer size, in bytes, a transaction's write-set payloads may hold before they spill to a local temp file (both the streaming `WriteSetStage` and the coordinator's `WriteSetSpill::should_stage` read it). A streaming BUFFER SIZE, not a cap: a write-set larger than it SPILLS, it is never refused. Absolute bytes on purpose — a fraction of RAM is the wrong scale on a dataset larger than RAM | `8388608` (8 MiB) |
+| `FERROSA_PG_COMMIT_PROFILE` | Per-phase attribution for a PostgreSQL commit (prepare, Accord order/gate, apply fan-out, MVCC observer, prune, WAL) on the coordinator. Unset = zero cost | unset |
+| `FERROSA_ACCORD_COMPRESSION` | Codec for the Accord apply **region** body: `none` (default), `lz4`, `snappy`, `zstd`. Opt-in: compression costs CPU and only pays when the transport term is byte-bound rather than deserialize-bound | `none` |
+| `FERROSA_ACCORD_COMPRESSION_LEVEL` | Codec level where the codec has one (zstd); ignored by the fixed-level codecs | `3` |
+| `FERROSA_ACCORD_COMPRESSION_BLOCK_BYTES` | Block size the region is compressed in — the knob that moves the ratio/CPU/memory trade | `262144` (256 KiB) |
+| `FERROSA_ACCORD_COMPRESSION_MIN_BYTES` | Frames below this size are sent uncompressed (headers + CPU lose to just sending them) | `65536` (64 KiB) |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | Rows buffered between a storage scan producer and the synchronous SQL executor | `64` |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | Maximum lifetime of an active PostgreSQL snapshot/transaction; later use fails with SQLSTATE `40001` | `600000` ms |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | Background cadence for expiring old snapshots and pruning history they retain | `1000` ms |
+
+`FERROSA_POSTGRES_MAX_TXN_WRITES` is **gone** (with its constant, config field and
+accessor): the front end's write-set SPILLS, so the write-count knob bounded
+nothing and was removed. See the cap census in
+[`ferrosa-postgres/README.md`](ferrosa-postgres/README.md).
 
 Every value must be a positive integer. If any PostgreSQL override is invalid,
 Ferrosa logs an error and uses the complete default set without stopping
@@ -332,6 +382,86 @@ in small fixed batches with socket backpressure, so response memory does not gro
 with result size; increasing this buffer only changes the storage-side producer
 window. A portal suspended by `Execute` with `max_rows` keeps one blocking
 executor thread until it resumes or is closed.
+
+#### Accord apply-region compression: measured
+
+`FERROSA_ACCORD_COMPRESSION` is opt-in and default-`none`; this is the first
+measurement of it. Every row is a 3-node **loopback** cluster receiving ONE
+transactional `COPY` of **exactly N = 100,000 rows** and its COMMIT. N is verified
+per row from the logs: the follower applies total 100,000 mutations
+(31,798 + 35,180 + 33,022 across the three nodes). `serialize_ms` is the
+coordinator's frame build (region copy + capnp header + codec), so the codec's own
+cost is its delta against `none`. `frame_bytes` is the largest per-peer wire frame.
+
+| setting | frame_bytes | ratio | serialize_ms | codec ms | fanout_ms | max_ack_ms | RSS n1/n2/n3 (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `none` (default) | 21,671,344 | 1.00x | 82.1 | — | 1086 | 1043 | 608 / 376 / 368 |
+| `lz4` | 3,774,361 | 5.74x | 576.8 | +494.7 | 1582 | 1285 | 568 / 380 / 371 |
+| `lz4` blk 64 KiB | 3,805,439 | 5.69x | 583.4 | +501.2 | 1615 | 1318 | 573 / 386 / 363 |
+| `lz4` blk 1 MiB | 3,767,994 | 5.75x | 554.2 | +472.1 | 1563 | 1279 | 520 / 378 / 371 |
+| `snappy` | 4,234,224 | 5.12x | 217.7 | +135.5 | 1208 | 1097 | 527 / 387 / 370 |
+| `zstd` | 2,055,220 | 10.54x | 198.7 | +116.6 | 1154 | 1053 | 536 / 373 / 367 |
+| `zstd` blk 64 KiB | 2,008,826 | 10.79x | 196.7 | +114.6 | 1158 | 1059 | 554 / 383 / 368 |
+| `zstd` blk 1 MiB | 2,117,670 | 10.23x | 212.8 | +130.6 | 1167 | 1059 | 537 / 377 / 367 |
+
+What the numbers say:
+
+* **`zstd` wins on both axes** — the lowest build cost (+115–131 ms) *and* the best
+  ratio (10.2–10.8x). `lz4` is the worst here on both: 5.7x for the most expensive
+  build of all (+472–501 ms). `snappy` matches `lz4`'s ratio (5.1x) for a sixth of
+  its CPU.
+* **Block size barely moves the result.** `zstd` is 10.2–10.8x from 64 KiB to 1 MiB
+  and `lz4` is 5.7x at every block; the 256 KiB default is fine. The smallest block
+  was marginally best for `zstd` (10.79x) with no measured CPU penalty.
+* **RSS is flat across codecs** (peaks within ~40 MB of `none`): compression does not
+  materially change coordinator or peer memory — the compressed frame is transient.
+* **On this loopback cluster, compression LOSES on latency.** `fanout_ms` rises from
+  1086 ms (`none`) to 1154–1615 ms, because every node is on one host: the transport
+  term is ~free, so the only effect of a codec is added CPU on the critical path.
+  The byte saving can only pay for itself when the transport is byte-bound, i.e.
+  across a real network — which this measurement does NOT exercise.
+
+> **Two honesty caveats.**
+> (1) The ratio is a **benchmark artifact, not a general claim**: the pgbench/pgcopy
+> `accounts` filler column is one repeated character, near-ideal input for any LZ
+> codec. Expect far less than 5–11x on real payloads.
+> (2) This is a **3-node loopback** run. It characterises the codec's CPU / ratio /
+> memory cost, NOT its benefit on the wire. Do not read it as "enable compression
+> for throughput".
+#### Residency attribution (`alloc-probe`)
+
+`FERROSA_PG_COMMIT_PROFILE=1` also emits `phase=... live_mib=...` residency lines
+at each COMMIT phase boundary, but only in a binary built with the `alloc-probe`
+feature:
+
+```bash
+cargo build -p ferrosa --features alloc-probe     # diagnostic build
+FERROSA_PG_COMMIT_PROFILE=1 ./target/debug/ferrosa
+```
+
+`alloc-probe` installs a counting global allocator (`ferrosa::counting_alloc`)
+that feeds `ferrosa_common::mem_probe` with live-heap bytes, so a line reads the
+exact resident heap at that boundary (`pg commit residency`,
+`accord apply residency`, `accord drive residency`). A production build does not
+enable the feature: it uses jemalloc directly, pays no allocation-path cost, and
+the lines are absent (not zero-valued). Comparing live_MiB with the same
+instant's process RSS splits a COMMIT peak into the heap it holds and the
+non-heap around it (the spill file's mapped pages, allocator metadata, page
+cache).
+
+What the probe found on a 1.1 M-row transactional `COPY` (see
+`ferrosa-cluster/specs/fmea.md` CL-53/CL-54 and `ferrosa-postgres/specs/fmea.md`
+PG-ACC-03): the dominant APPLY term is the DECODED APPLY path — ~2.4 KB per
+decoded op, a ratio stable across an 11x range — NOT the MVCC version store,
+which the same log reports at ~157 MB (`history_kib`/`dist_kib` 160766 each).
+`EngineStorageApplier::apply_writeset` now consumes its input write-set as it
+decodes instead of pinning every payload next to the decoded `Vec<BatchOp>`
+(the guard is `ferrosa-cluster/tests/accord_apply_decode_residency.rs`): live-heap
+peak at N=1 100 000 fell 3650.7 -> 3452.3 MiB and RSS peak 5235 -> 4687 MB. The
+peak is still NOT flat across N — the front-end `mutations` clone, the
+per-key/participant maps, the version history, and the two per-peer Apply frames
+are all still O(N) resident.
+
 
 The maximum snapshot age bounds how long an abandoned or long-running
 transaction can retain old row versions. Once expired, its next query or commit

@@ -19,7 +19,6 @@ pub mod conflict_index;
 pub mod crash_recovery;
 pub mod entries;
 pub mod framed_log;
-pub mod oversized_entry;
 pub mod postgres_mvcc;
 pub mod protocol_log;
 pub mod read_2i;
@@ -28,7 +27,9 @@ pub mod sync_writer;
 pub mod transaction_committer;
 pub mod write_gate;
 
-pub use conflict_index::{ConflictIndex, ConflictIndexFull, InFlightWrite, TokenRange, TxnStatus};
+pub use conflict_index::{
+    ConflictIndex, InFlightWrite, TokenRange, TxnStatus, DEFAULT_CONFLICT_INDEX_RESERVE,
+};
 pub use crash_recovery::{
     resolve_orphan_intent, CrashRecoveryReplay, OrphanResolution, ReplayedConflictEntry,
     ReplayedPhase, ReplayedTxnState,

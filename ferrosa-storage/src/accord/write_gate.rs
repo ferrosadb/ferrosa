@@ -112,7 +112,7 @@ mod tests {
         let key = b"partition-K";
 
         // Register an in-flight Accord transaction on key K.
-        idx.register(key, write_entry(10)).unwrap();
+        idx.register(key, write_entry(10));
 
         // The write gate must route through Accord.
         let decision = check_write_gate(&idx, key);
@@ -152,7 +152,7 @@ mod tests {
         let key_l = b"partition-L";
 
         // Register an in-flight Accord transaction on key K only.
-        idx.register(key_k, write_entry(10)).unwrap();
+        idx.register(key_k, write_entry(10));
 
         // Key K is gated.
         assert_eq!(
@@ -179,7 +179,7 @@ mod tests {
         let key = b"partition-K";
 
         // Register an in-flight Accord transaction on key K.
-        idx.register(key, write_entry(10)).unwrap();
+        idx.register(key, write_entry(10));
         assert_eq!(
             check_write_gate(&idx, key),
             WriteGateDecision::RouteThroughAccord,

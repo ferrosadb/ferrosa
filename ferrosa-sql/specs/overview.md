@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 status: implemented
-last_updated: 2026-09-15
+last_updated: 2026-10-09
 executive_summary: >
   The bespoke relational query engine (lexer + recursive-descent parser, binder/
   planner, Volcano-style physical operators) behind Ferrosa's Postgres front-end.
@@ -37,7 +37,7 @@ inner equi-join — and widens outward.
 | `exec` (`src/exec.rs`) | ~900 | Physical operators: streaming `seq_scan`, `filter`, `project`; **blocking, spilling** `hash_join`, `sort`, `hash_aggregate`, `dedup`; `limit_offset`, `Predicate`, `CmpOp`, `AggFunc` |
 | `spill` (`src/spill.rs`) | ~700 | Spill backing for the blocking operators: `SpillCtx`/`SpillReserver` (per-node temp location), `SpillSort` over `ferrosa_storage::ExternalSorter`, `ReplayBuffer` (the join's replayable inner group), `canonical_cmp` (type-aware total order for grouping/DISTINCT), orphan sweep |
 | `parser` (`src/parser.rs`) | ~1752 | Hand-written lexer + recursive-descent parser; `parse`, `parse_statement`, `ParseError`, typed-literal parsing |
-| `parser_ddl` (`src/parser_ddl.rs`, child of `parser`) | ~330 | `CREATE TABLE` (Ecto subset, D10): PG type map, PRIMARY KEY merge/validation, typed refusal of out-of-scope clauses. Parse only |
+| `parser_ddl` (`src/parser_ddl.rs`, child of `parser`) | ~430 | `CREATE TABLE` (Ecto subset, D10): PG type map, PRIMARY KEY merge/validation, optional `WITH (key = value, ...)` storage parameters recorded on the AST, typed refusal of out-of-scope clauses; also the `COPY ... FROM STDIN` option list (incl. the recorded-no-op `FREEZE`). Parse only |
 | `plan` (`src/plan.rs`) | ~1598 | Binder + planner: `execute`, `describe`, `infer_param_types`; scope resolution, Kleene WHERE/HAVING eval, `ExecError` |
 | `ast` (`src/ast.rs`) | ~207 | Logical AST: `Statement`, `SelectStmt`, DML statements, `Expr`, `Operand`, `Projection`, `OrderItem` |
 | `catalog` (`src/catalog.rs`) | ~81 | `Catalog` trait + `MapCatalog`; name → provider resolution (fail-loud on miss) |

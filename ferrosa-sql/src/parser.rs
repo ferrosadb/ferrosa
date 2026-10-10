@@ -3,9 +3,9 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand, OrderItem,
-    Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement, TableRef,
-    Term, UnsupportedClause, UpdateStmt,
+    AggArg, CastTarget, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand,
+    OrderItem, Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement,
+    TableRef, Term, UnsupportedClause, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -30,6 +30,29 @@ pub enum ParseError {
     UnknownType(String),
     /// `CREATE TABLE` declares the same column twice.
     DuplicateColumn(String),
+    /// An `ALTER TABLE` form outside the supported subset, described by the caller.
+    UnsupportedAlter(String),
+    /// A `COPY ... FROM STDIN` form or option outside the supported subset, described by the
+    /// caller with the option/form named. COPY refusals are reported as COPY — never as an
+    /// `ALTER TABLE` form, which is what [`ParseError::UnsupportedAlter`] means — so the two
+    /// variants stay honest about what was refused. See `parser_ddl::parse_copy` /
+    /// `parse_copy_options`.
+    UnsupportedCopy(String),
+    /// A `CREATE TABLE ... WITH (key = value)` storage parameter outside the
+    /// accepted set, named. See `parser_ddl::ACCEPTED_STORAGE_PARAMETERS`.
+    UnsupportedStorageParameter(String),
+    /// A select-list expression form outside the supported subset, named. `||`
+    /// is supported only in a no-`FROM` expression select; any other use is
+    /// refused by name rather than mis-parsed.
+    UnsupportedSelectExpr(&'static str),
+    /// A `::type_name` cast to a target ferrosa does not implement, naming the
+    /// type exactly as written (schema-qualified when so). A cast that were
+    /// accepted and ignored would let a client's query return a wrong answer
+    /// while looking like it worked, so an unknown target fails loud.
+    UnsupportedCast(String),
+    /// A `CAST(x AS t)` call, which ferrosa does not implement. Refused by name
+    /// rather than mis-parsed as a column named `CAST`. (Use the `::` form.)
+    UnsupportedCastExpr,
     /// `CREATE TABLE` declares more than one primary key.
     MultiplePrimaryKeys,
     /// `CREATE TABLE` declares no primary key.
@@ -60,6 +83,24 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnknownType(t) => write!(f, "unknown column type `{t}`"),
             ParseError::DuplicateColumn(c) => write!(f, "column `{c}` is declared twice"),
+            ParseError::UnsupportedAlter(form) => {
+                write!(f, "ALTER TABLE form is not supported: {form}")
+            }
+            ParseError::UnsupportedCopy(detail) => {
+                write!(f, "COPY is not supported: {detail}")
+            }
+            ParseError::UnsupportedStorageParameter(name) => {
+                write!(f, "table storage parameter `{name}` is not supported")
+            }
+            ParseError::UnsupportedSelectExpr(form) => {
+                write!(f, "{form} is not supported in a select list")
+            }
+            ParseError::UnsupportedCast(t) => {
+                write!(f, "cast to type `{t}` is not supported")
+            }
+            ParseError::UnsupportedCastExpr => {
+                write!(f, "CAST(x AS t) is not supported; use the `::` form")
+            }
             ParseError::MultiplePrimaryKeys => write!(f, "multiple primary keys defined"),
             ParseError::MissingPrimaryKey => write!(f, "table has no PRIMARY KEY"),
             ParseError::UnknownPrimaryKeyColumn(c) => {
@@ -79,82 +120,9 @@ pub fn parse(sql: &str) -> Result<SelectStmt, ParseError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
     let toks = lex(trimmed)?;
     let mut p = Parser::new(toks);
-
-    p.expect(&Tok::Select, "SELECT")?;
-    let distinct = if matches!(p.peek(), Some(Tok::Distinct)) {
-        p.next();
-        true
-    } else {
-        false
-    };
-    let projection = p.parse_projection()?;
-    p.expect(&Tok::From, "FROM")?;
-    let from = p.parse_table_ref()?;
-    let join = if matches!(p.peek(), Some(Tok::Join | Tok::Inner)) {
-        Some(p.parse_join()?)
-    } else {
-        None
-    };
-    let filter = if matches!(p.peek(), Some(Tok::Where)) {
-        p.next();
-        Some(p.parse_expr()?)
-    } else {
-        None
-    };
-    let group_by = if matches!(p.peek(), Some(Tok::Group)) {
-        p.next();
-        p.expect(&Tok::By, "BY")?;
-        p.parse_column_list()?
-    } else {
-        Vec::new()
-    };
-    let having = if matches!(p.peek(), Some(Tok::Having)) {
-        p.next();
-        Some(p.parse_expr()?)
-    } else {
-        None
-    };
-    let order_by = if matches!(p.peek(), Some(Tok::Order)) {
-        p.next();
-        p.expect(&Tok::By, "BY")?;
-        p.parse_order_by()?
-    } else {
-        Vec::new()
-    };
-    // LIMIT and OFFSET in either order, both optional.
-    let mut limit = None;
-    let mut offset = None;
-    loop {
-        match p.peek() {
-            Some(Tok::Limit) if limit.is_none() => {
-                p.next();
-                limit = Some(p.parse_u64()?);
-            }
-            Some(Tok::Offset) if offset.is_none() => {
-                p.next();
-                offset = Some(p.parse_u64()?);
-            }
-            _ => break,
-        }
-    }
-    if let Some(t) = p.peek() {
-        return Err(ParseError::Unexpected {
-            expected: "end of statement",
-            found: format!("{t:?}"),
-        });
-    }
-    Ok(SelectStmt {
-        distinct,
-        projection,
-        from,
-        join,
-        filter,
-        group_by,
-        having,
-        order_by,
-        limit,
-        offset,
-    })
+    let stmt = p.parse_select_stmt()?;
+    p.expect_end()?;
+    Ok(stmt)
 }
 
 /// Parse a top-level statement off the Postgres wire: a table `SELECT`, a
@@ -171,6 +139,19 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
         Some(Tok::Select) => {
             if p.is_expr_select() {
                 let items = p.parse_scalar_select()?;
+                // `SELECT 'a' || 'b' FROM t`: the expression select list parsed,
+                // but a `FROM` means the user meant a table query — and `||` over
+                // a relation is not evaluable (see `parse_select_item`). Name it
+                // instead of reporting a bare "expected end of statement".
+                if matches!(p.peek(), Some(Tok::From))
+                    && items
+                        .iter()
+                        .any(|item| matches!(item.value, ScalarValue::Concat { .. }))
+                {
+                    return Err(ParseError::UnsupportedSelectExpr(
+                        "`||` concatenation over a FROM relation",
+                    ));
+                }
                 p.expect_end()?;
                 Ok(Statement::SelectExprs(items))
             } else {
@@ -190,6 +171,12 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
             "CREATE" => p.parse_create(),
+            "COPY" => p.parse_copy(),
+            "ALTER" => p.parse_alter_table(),
+            "DROP" => p.parse_drop(),
+            "TRUNCATE" => p.parse_truncate(),
+            "VACUUM" => p.parse_vacuum(),
+            "ANALYZE" | "ANALYSE" => p.parse_analyze(),
             other => Err(ParseError::Unexpected {
                 expected: "a statement",
                 found: other.to_string(),
@@ -240,6 +227,10 @@ enum Tok {
     Dot,
     LParen,
     RParen,
+    /// The `||` string-concatenation operator (one token, not two pipes).
+    Concat,
+    /// The `::` cast operator (one token, not two colons).
+    Cast,
     Eq,
     Ne,
     Lt,
@@ -293,6 +284,20 @@ fn lex_mode(sql: &str, lenient: bool) -> Result<Vec<Tok>, ParseError> {
             ')' => {
                 toks.push(Tok::RParen);
                 i += 1;
+            }
+            '|' if chars.get(i + 1) == Some(&'|') => {
+                // `||`: the string-concatenation operator, one token. A lone `|`
+                // falls through to the `other` arm below and stays a loud
+                // `bad token: |` — never silently accepted.
+                toks.push(Tok::Concat);
+                i += 2;
+            }
+            ':' if chars.get(i + 1) == Some(&':') => {
+                // `::`: the cast operator, one token. A lone `:` falls through to
+                // the `other` arm below and stays a loud `bad token: :` — never
+                // silently accepted.
+                toks.push(Tok::Cast);
+                i += 2;
             }
             '=' => {
                 toks.push(Tok::Eq);
@@ -548,6 +553,83 @@ impl Parser {
         }
     }
 
+    /// Parse a full table `SELECT` (`SELECT ... FROM ...`) starting at the
+    /// `SELECT` token, stopping after its last clause. Does NOT require the
+    /// statement to end there: a scalar subquery's inner select is followed by
+    /// the `)` that closes it and possibly a `||`. The public [`parse`] adds the
+    /// end-of-statement check for a top-level statement.
+    fn parse_select_stmt(&mut self) -> Result<SelectStmt, ParseError> {
+        self.expect(&Tok::Select, "SELECT")?;
+        let distinct = if matches!(self.peek(), Some(Tok::Distinct)) {
+            self.next();
+            true
+        } else {
+            false
+        };
+        let projection = self.parse_projection()?;
+        self.expect(&Tok::From, "FROM")?;
+        let from = self.parse_table_ref()?;
+        let join = if matches!(self.peek(), Some(Tok::Join | Tok::Inner)) {
+            Some(self.parse_join()?)
+        } else {
+            None
+        };
+        let filter = if matches!(self.peek(), Some(Tok::Where)) {
+            self.next();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let group_by = if matches!(self.peek(), Some(Tok::Group)) {
+            self.next();
+            self.expect(&Tok::By, "BY")?;
+            self.parse_column_list()?
+        } else {
+            Vec::new()
+        };
+        let having = if matches!(self.peek(), Some(Tok::Having)) {
+            self.next();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        let order_by = if matches!(self.peek(), Some(Tok::Order)) {
+            self.next();
+            self.expect(&Tok::By, "BY")?;
+            self.parse_order_by()?
+        } else {
+            Vec::new()
+        };
+        // LIMIT and OFFSET in either order, both optional.
+        let mut limit = None;
+        let mut offset = None;
+        loop {
+            match self.peek() {
+                Some(Tok::Limit) if limit.is_none() => {
+                    self.next();
+                    limit = Some(self.parse_u64()?);
+                }
+                Some(Tok::Offset) if offset.is_none() => {
+                    self.next();
+                    offset = Some(self.parse_u64()?);
+                }
+                _ => break,
+            }
+        }
+        Ok(SelectStmt {
+            distinct,
+            projection,
+            from,
+            join,
+            filter,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+        })
+    }
+
     fn parse_projection(&mut self) -> Result<Projection, ParseError> {
         // A single bare `*` is `SELECT *`.
         if matches!(self.peek(), Some(Tok::Star))
@@ -570,6 +652,11 @@ impl Parser {
     fn is_expr_select(&self) -> bool {
         match self.toks.get(self.pos + 1) {
             Some(Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Param(_)) => true,
+            // A leading `( SELECT ...` begins a scalar subquery operand, so this
+            // is an expression select. An LParen not followed by SELECT stays a
+            // table select (whose projection then refuses the LParen loudly);
+            // no table select's projection can start with `(`, so this is safe.
+            Some(Tok::LParen) => matches!(self.toks.get(self.pos + 2), Some(Tok::Select)),
             Some(Tok::Ident(w)) => {
                 let up = w.to_ascii_uppercase();
                 matches!(up.as_str(), "TRUE" | "FALSE" | "NULL")
@@ -593,12 +680,44 @@ impl Parser {
     }
 
     /// One scalar select item: a `$N` param, a zero-arg function call, or a
-    /// literal — with an optional `AS`/bare alias.
+    /// literal — optionally concatenated with `||` — with an optional `AS`/bare
+    /// alias. `a || b || c` nests left-associatively: `(a || b) || c`.
     fn parse_scalar_item(&mut self) -> Result<ScalarItem, ParseError> {
-        let value = if let Some(Tok::Param(n)) = self.peek() {
+        let mut value = self.parse_scalar_primary()?;
+        while matches!(self.peek(), Some(Tok::Concat)) {
+            self.next(); // `||`
+            let right = self.parse_scalar_primary()?;
+            value = ScalarValue::Concat {
+                left: Box::new(value),
+                right: Box::new(right),
+            };
+        }
+        let alias = self.parse_optional_alias()?;
+        Ok(ScalarItem { value, alias })
+    }
+
+    /// The operand of a `||` (or a lone select item): a `$N` param, a scalar
+    /// subquery `( SELECT ... )`, a zero-arg function call, or a literal —
+    /// optionally followed by a postfix `::type_name` cast.
+    fn parse_scalar_primary(&mut self) -> Result<ScalarValue, ParseError> {
+        self.reject_cast_call()?;
+        let mut value = if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
             ScalarValue::Param(n)
+        } else if matches!(self.peek(), Some(Tok::LParen))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Select))
+        {
+            // `( SELECT ... )` — a scalar subquery operand. Consume the `(`, read
+            // the inner table select (`parse_select_stmt` stops at its last
+            // clause), then require the matching `)`. An LParen NOT followed by
+            // SELECT falls through to the literal path below and stays as refused
+            // as it was: an ordinary parenthesised scalar (`(1)`) is still
+            // unsupported, never silently accepted.
+            self.next(); // `(`
+            let inner = self.parse_select_stmt()?;
+            self.expect(&Tok::RParen, ")")?;
+            ScalarValue::Subquery(Box::new(inner))
         } else if matches!(self.peek(), Some(Tok::Ident(_)))
             && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
         {
@@ -611,8 +730,17 @@ impl Parser {
         } else {
             ScalarValue::Literal(self.parse_value()?)
         };
-        let alias = self.parse_optional_alias()?;
-        Ok(ScalarItem { value, alias })
+        // `::type_name` — a POSTFIX cast, binding tighter than `||`
+        // (`'a' || 'b'::regclass` is `'a' || ('b'::regclass)`).
+        while matches!(self.peek(), Some(Tok::Cast)) {
+            self.next();
+            let ty = self.parse_cast_target()?;
+            value = ScalarValue::Cast {
+                value: Box::new(value),
+                ty,
+            };
+        }
+        Ok(value)
     }
 
     /// An optional output alias: `AS name` or a bare `name`.
@@ -730,20 +858,51 @@ impl Parser {
         Ok(Statement::Begin { isolation })
     }
 
-    /// A scalar value in a `VALUES` list: a `$N` parameter or a literal.
+    /// A scalar value in a `VALUES` list: a `$N` parameter, a literal, or a
+    /// zero-arg value function (`now()`). A bare keyword with no parentheses
+    /// (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`, `CURRENT_USER`, …)
+    /// is also a function value — pg_dump emits these unparenthesized.
     fn parse_scalar_value(&mut self) -> Result<ScalarValue, ParseError> {
         if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
-            Ok(ScalarValue::Param(n))
-        } else {
-            Ok(ScalarValue::Literal(self.parse_value()?))
+            return Ok(ScalarValue::Param(n));
         }
+        // `ident (...)` → a zero-arg function value. `now()` is the one pgbench
+        // uses for pgbench_history.mtime.
+        if let Some(Tok::Ident(w)) = self.peek() {
+            if matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+                && matches!(self.toks.get(self.pos + 2), Some(Tok::RParen))
+            {
+                let name = w.to_ascii_uppercase();
+                self.next(); // ident
+                self.next(); // (
+                self.next(); // )
+                return Ok(ScalarValue::Func(name));
+            }
+        }
+        // A bare value keyword: a literal, or a paren-less function like
+        // CURRENT_TIMESTAMP. Anything else falls through to `parse_value`,
+        // which fails loud on an unknown identifier.
+        if let Some(Tok::Ident(w)) = self.peek() {
+            let upper = w.to_ascii_uppercase();
+            match upper.as_str() {
+                "TRUE" | "FALSE" | "NULL" => {}
+                _ if bare_value_function(&upper) => {
+                    self.next();
+                    return Ok(ScalarValue::Func(upper));
+                }
+                _ => {}
+            }
+        }
+        Ok(ScalarValue::Literal(self.parse_value()?))
     }
 
-    /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...)`. Assumes
-    /// `self.pos` is at the `INSERT` ident. Single-row; values are literals or
-    /// `$N` parameters, one per named column.
+    /// `INSERT INTO [schema.]table (col, ...) VALUES (val, ...) [, (val, ...)]*`.
+    /// Assumes `self.pos` is at the `INSERT` ident. Multi-row (one entry per
+    /// parenthesised tuple) — pgbench and pg_dump both batch rows this way.
+    /// Values are literals, `$N` parameters, or zero-arg value functions, one
+    /// per named column in every row.
     fn parse_insert(&mut self) -> Result<Statement, ParseError> {
         self.next(); // INSERT
         self.expect_ident_kw("INTO")?;
@@ -758,13 +917,11 @@ impl Parser {
         self.expect(&Tok::RParen, ")")?;
 
         self.expect_ident_kw("VALUES")?;
-        self.expect(&Tok::LParen, "(")?;
-        let mut values = vec![self.parse_scalar_value()?];
+        let mut rows = vec![self.parse_values_row(&columns)?];
         while matches!(self.peek(), Some(Tok::Comma)) {
             self.next();
-            values.push(self.parse_scalar_value()?);
+            rows.push(self.parse_values_row(&columns)?);
         }
-        self.expect(&Tok::RParen, ")")?;
 
         // ON CONFLICT is recognized to fail loud (out of scope), never silently
         // ignored — a client that relies on upsert semantics must learn it.
@@ -772,18 +929,31 @@ impl Parser {
         let returning = self.parse_returning()?;
         self.expect_end()?;
 
-        if columns.len() != values.len() {
+        Ok(Statement::Insert(Box::new(InsertStmt {
+            table,
+            columns,
+            rows,
+            returning,
+        })))
+    }
+
+    /// One `(val, ...)` tuple of an INSERT `VALUES` list. Every row must supply
+    /// exactly one value per named column; a short or long row fails loud.
+    fn parse_values_row(&mut self, columns: &[String]) -> Result<Vec<ScalarValue>, ParseError> {
+        self.expect(&Tok::LParen, "(")?;
+        let mut values = vec![self.parse_scalar_value()?];
+        while matches!(self.peek(), Some(Tok::Comma)) {
+            self.next();
+            values.push(self.parse_scalar_value()?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        if values.len() != columns.len() {
             return Err(ParseError::Unexpected {
                 expected: "matching column and value counts",
                 found: format!("{} columns, {} values", columns.len(), values.len()),
             });
         }
-        Ok(Statement::Insert(Box::new(InsertStmt {
-            table,
-            columns,
-            values,
-            returning,
-        })))
+        Ok(values)
     }
 
     /// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`.
@@ -906,7 +1076,23 @@ impl Parser {
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
     /// whose uppercase name is a known aggregate is immediately followed by
     /// `(`, otherwise a plain column reference.
+    ///
+    /// Concatenation is refused **by name** here: evaluating `col || 'x'` over a
+    /// `FROM` relation would need a select-list expression the planner does not
+    /// have (its projection is column indices, not computed cells), so a `||`
+    /// that follows an item is a named refusal rather than a token mismatch.
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
+        let item = self.parse_select_item_primary()?;
+        if matches!(self.peek(), Some(Tok::Concat)) {
+            return Err(ParseError::UnsupportedSelectExpr(
+                "`||` concatenation over a FROM relation",
+            ));
+        }
+        Ok(item)
+    }
+
+    fn parse_select_item_primary(&mut self) -> Result<SelectItem, ParseError> {
+        self.reject_cast_call()?;
         if let Some(Tok::Ident(word)) = self.peek() {
             if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
                 let raw = word.clone();
@@ -1102,20 +1288,66 @@ impl Parser {
     }
 
     /// The right-hand side of a comparison: a `$N` parameter placeholder
-    /// ([`Term::Param`]) or a literal value ([`Term::Literal`]).
+    /// ([`Term::Param`]) or a literal value ([`Term::Literal`]), optionally
+    /// followed by a postfix `::type_name` cast ([`Term::Cast`]).
     fn parse_term(&mut self) -> Result<Term, ParseError> {
-        if let Some(Tok::Param(n)) = self.peek() {
+        self.reject_cast_call()?;
+        let mut term = if let Some(Tok::Param(n)) = self.peek() {
             let n = *n;
             self.next();
-            return Ok(Term::Param(n));
+            Term::Param(n)
+        } else {
+            Term::Literal(self.parse_value()?)
+        };
+        // `::type_name` is a POSTFIX operator: it casts the term just parsed, so it
+        // binds tighter than the comparison operator it sits beside (`oid =
+        // $1::regclass` is `oid = ($1::regclass)`). A chain nests left-associatively.
+        while matches!(self.peek(), Some(Tok::Cast)) {
+            self.next();
+            let ty = self.parse_cast_target()?;
+            term = Term::Cast {
+                value: Box::new(term),
+                ty,
+            };
         }
-        Ok(Term::Literal(self.parse_value()?))
+        Ok(term)
+    }
+
+    /// Parse a `::type_name` cast target. The name may be schema-qualified
+    /// (`pg_catalog.regclass`) or bare (`regclass`). Only targets ferrosa
+    /// implements are accepted; anything else is refused **by name** — a cast
+    /// that were parsed and then ignored would return a wrong answer while
+    /// looking like it worked.
+    fn parse_cast_target(&mut self) -> Result<CastTarget, ParseError> {
+        let first = self.ident()?;
+        let written = if matches!(self.peek(), Some(Tok::Dot)) {
+            self.next();
+            format!("{first}.{}", self.ident()?)
+        } else {
+            first
+        };
+        match written.to_ascii_lowercase().as_str() {
+            "regclass" | "pg_catalog.regclass" => Ok(CastTarget::Regclass),
+            _ => Err(ParseError::UnsupportedCast(written)),
+        }
+    }
+
+    /// Fail loud on a `CAST(x AS t)` call. ferrosa implements the `::` form only,
+    /// and refusing it by name beats mis-parsing `CAST` as a column named `CAST`.
+    fn reject_cast_call(&mut self) -> Result<(), ParseError> {
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CAST"))
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen))
+        {
+            return Err(ParseError::UnsupportedCastExpr);
+        }
+        Ok(())
     }
 
     /// An operand in a comparison: an aggregate `FUNC(...)` if an identifier
     /// whose uppercase name is a known aggregate is immediately followed by `(`,
     /// otherwise a plain column reference. (Mirrors `parse_select_item`.)
     fn parse_operand(&mut self) -> Result<Operand, ParseError> {
+        self.reject_cast_call()?;
         if let Some(Tok::Ident(word)) = self.peek() {
             if is_aggregate_name(word) && matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
                 let raw = word.clone();
@@ -1192,6 +1424,14 @@ impl Parser {
             None => Err(ParseError::UnexpectedEnd),
         }
     }
+}
+
+/// A keyword that names a zero-argument value function which PostgreSQL accepts
+/// **without** parentheses (`CURRENT_TIMESTAMP`, `CURRENT_DATE`, `CURRENT_TIME`).
+/// pg_dump and pgbench emit these bare. `now()` is spelled with parentheses and
+/// is handled separately; both map to the same function name here.
+fn bare_value_function(upper: &str) -> bool {
+    matches!(upper, "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME")
 }
 
 /// The kind of typed literal a leading keyword introduces (`TIMESTAMP '...'` etc).
@@ -1876,11 +2116,11 @@ mod tests {
                 assert_eq!(ins.table.table, "t");
                 assert_eq!(ins.columns, vec!["id".to_string(), "v".to_string()]);
                 assert_eq!(
-                    ins.values,
-                    vec![
+                    ins.rows,
+                    vec![vec![
                         ScalarValue::Literal(Value::Int(1)),
                         ScalarValue::Literal(Value::Text("x".into())),
-                    ]
+                    ]]
                 );
             }
             other => panic!("expected Insert, got {other:?}"),
@@ -1895,8 +2135,8 @@ mod tests {
                 assert_eq!(ins.table.schema, None);
                 assert_eq!(ins.table.table, "t");
                 assert_eq!(
-                    ins.values,
-                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
+                    ins.rows,
+                    vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]
                 );
             }
             other => panic!("expected Insert, got {other:?}"),
@@ -1979,8 +2219,8 @@ mod tests {
         match stmt {
             Statement::Insert(ins) => {
                 assert_eq!(
-                    ins.values,
-                    vec![ScalarValue::Param(1), ScalarValue::Param(2)]
+                    ins.rows,
+                    vec![vec![ScalarValue::Param(1), ScalarValue::Param(2)]]
                 );
                 assert_eq!(
                     ins.returning,
@@ -2070,6 +2310,241 @@ mod tests {
     }
 
     // ---- T-130: PG CREATE TABLE subset -------------------------------------
+
+    /// PostgreSQL allows a table with no PRIMARY KEY. The parser reports that as an
+    /// empty key rather than refusing the statement: supplying a synthetic key is the
+    /// Postgres front-end's job, and refusing here is what stops `pgbench -i`.
+    #[test]
+    fn create_table_without_a_primary_key_reports_none_declared() {
+        let stmt = create("CREATE TABLE pgbench_accounts (aid int, bid int, filler char(84))");
+        assert!(
+            stmt.primary_key.is_empty(),
+            "none declared must be reported as none, not silently invented: {:?}",
+            stmt.primary_key
+        );
+        assert_eq!(stmt.columns.len(), 3, "the user's own columns, untouched");
+        assert!(
+            stmt.columns.iter().all(|c| !c.primary_key),
+            "no column is marked as a key when none was declared"
+        );
+    }
+
+    /// `ALTER TABLE ... ADD PRIMARY KEY (...)`: the one ALTER form ferrosa accepts, and the
+    /// step `pgbench -i` runs right after creating its tables without a key.
+    #[test]
+    fn alter_table_add_primary_key_parses() {
+        let apk = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => match a.operation {
+                crate::ast::AlterOperation::AddPrimaryKey(cols) => (a.table, cols),
+                other => panic!("expected AddPrimaryKey for `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        };
+
+        let (table, columns) = apk("ALTER TABLE t ADD PRIMARY KEY (a)");
+        assert_eq!(table.table, "t");
+        assert_eq!(table.schema, None);
+        assert_eq!(columns, vec!["a".to_string()]);
+
+        // Schema-qualified, a constraint name, multiple key columns, and ONLY: all accepted,
+        // because all are things a client actually writes.
+        let (table, columns) = apk("ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)");
+        assert_eq!(table.schema.as_deref(), Some("public"));
+        assert_eq!(table.table, "t");
+        assert_eq!(columns, vec!["a".to_string(), "b".to_string()]);
+
+        let (_, columns) = apk("ALTER TABLE ONLY t ADD PRIMARY KEY (a)");
+        assert_eq!(columns, vec!["a".to_string()]);
+    }
+
+    /// `COPY <t> [(cols)] FROM STDIN [(options)]`. The payload is not part of the statement: it
+    /// arrives afterwards as `CopyData` frames, which is why the connection loop drives it.
+    #[test]
+    fn copy_from_stdin_parses() {
+        let copy = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::CopyFromStdin(c)) => *c,
+            other => panic!("expected CopyFromStdin for `{sql}`, got {other:?}"),
+        };
+
+        // The bare form pgbench emits: every column, text format.
+        let bare = copy("COPY pgbench_accounts FROM STDIN");
+        assert_eq!(bare.table.table, "pgbench_accounts");
+        assert_eq!(bare.columns, None, "no list means every column, in order");
+        assert_eq!(bare.format, crate::ast::CopyFormatKind::Text);
+        assert_eq!(
+            bare.delimiter, None,
+            "defaulted per format, not baked in here"
+        );
+        assert!(!bare.header);
+
+        // A column list, schema qualification, and the parenthesised options.
+        let full = copy(
+            "COPY public.t (a, b) FROM STDIN WITH (FORMAT csv, HEADER, DELIMITER ';', NULL '')",
+        );
+        assert_eq!(full.table.schema.as_deref(), Some("public"));
+        assert_eq!(full.columns, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(full.format, crate::ast::CopyFormatKind::Csv);
+        assert_eq!(full.delimiter, Some(';'));
+        assert_eq!(full.null.as_deref(), Some(""));
+        assert!(full.header);
+
+        // `WITH` and the option list are both optional.
+        assert_eq!(
+            copy("COPY t FROM STDIN (FORMAT csv)").format,
+            crate::ast::CopyFormatKind::Csv
+        );
+    }
+
+    /// `COPY ... TO` and an unknown option are refused by name, as COPY refusals. A client that
+    /// asked for csv and silently got text would store garbage, so the option is not ignored; and
+    /// a COPY refusal is never reported as an ALTER TABLE form.
+    #[test]
+    fn unsupported_copy_forms_are_refused_by_name() {
+        for sql in [
+            "COPY t TO STDOUT",
+            "COPY t FROM STDIN (FORMAT binary)",
+            "COPY t FROM STDIN (NOSUCHOPT)",
+            "COPY t FROM STDIN (DELIMITER 'too long')",
+            "COPY t FROM STDIN WITH CSV",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedCopy(form)) => {
+                    assert!(
+                        !form.is_empty(),
+                        "{sql}: the refusal must say what is unsupported"
+                    );
+                    assert!(
+                        !form.contains("ALTER TABLE"),
+                        "{sql}: a COPY refusal must not name an ALTER TABLE form"
+                    );
+                }
+                other => panic!("{sql} must be refused by name, got {other:?}"),
+            }
+        }
+    }
+
+    /// pgbench (`pgbench -i`) sends `copy pgbench_accounts from stdin with (freeze on)` for
+    /// every ordinary table on PostgreSQL v14+. ferrosa has no frozen-row concept (an LSM has no
+    /// heap pages), so the option is accepted-and-recorded as a no-op — but it IS accepted, and
+    /// the value is kept on the statement rather than silently swallowed.
+    #[test]
+    fn copy_freeze_option_is_accepted_and_recorded() {
+        let copy = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::CopyFromStdin(c)) => *c,
+            other => panic!("FREEZE must be accepted, got {other:?}"),
+        };
+
+        // The exact statement pgbench emits. `freeze on` is recorded, not applied.
+        let on = copy("copy pgbench_accounts from stdin with (freeze on)");
+        assert_eq!(on.table.table, "pgbench_accounts");
+        assert_eq!(
+            on.freeze,
+            Some(true),
+            "`freeze on` must be RECORDED on the statement, not silently dropped"
+        );
+        // `FREEZE` alongside the applied options: the rest still take effect.
+        let mixed = copy("COPY t FROM STDIN WITH (FORMAT csv, HEADER, freeze off)");
+        assert_eq!(mixed.freeze, Some(false), "`freeze off` is recorded too");
+        assert_eq!(mixed.format, crate::ast::CopyFormatKind::Csv);
+        assert!(mixed.header);
+        // Absent ⇒ recorded as absent, so the field distinguishes "not asked" from "asked off".
+        assert_eq!(copy("COPY t FROM STDIN").freeze, None);
+    }
+
+    /// The negative control for `FREEZE`: the accepted set is not widened. Any other COPY option
+    /// is refused BY NAME, and the refusal is reported as a COPY option — never as an ALTER TABLE
+    /// form (which is what `ParseError::UnsupportedAlter` means and still says).
+    #[test]
+    fn unknown_copy_option_is_refused_by_name_and_not_as_an_alter_table_form() {
+        let err = parse_statement("COPY t FROM STDIN (NOSUCHOPT)").expect_err("must be refused");
+        assert!(
+            matches!(err, ParseError::UnsupportedCopy(_)),
+            "an unknown COPY option must be a COPY refusal, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("NOSUCHOPT"),
+            "the refusal must name the option: {message}"
+        );
+        assert!(
+            message.contains("COPY option"),
+            "the client must be told it was a COPY option: {message}"
+        );
+        assert!(
+            !message.contains("ALTER TABLE"),
+            "a COPY option must never be reported as an ALTER TABLE form: {message}"
+        );
+
+        // A bad option VALUE is likewise a COPY-option refusal, named.
+        let bad_value = parse_statement("COPY t FROM STDIN (FORMAT binary)")
+            .expect_err("must be refused")
+            .to_string();
+        assert!(
+            bad_value.contains("FORMAT") && bad_value.to_ascii_lowercase().contains("binary"),
+            "the FORMAT value refusal names both: {bad_value}"
+        );
+        assert!(
+            !bad_value.contains("ALTER TABLE"),
+            "not an ALTER TABLE form: {bad_value}"
+        );
+    }
+
+    /// `ADD COLUMN` and `DROP COLUMN` map straight onto the schema layer's `TableUpdates`, so
+    /// they are implemented rather than refused. `COLUMN` is optional, as in Postgres.
+    #[test]
+    fn alter_table_add_and_drop_column_parse() {
+        let add = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => match a.operation {
+                crate::ast::AlterOperation::AddColumn(def) => def,
+                other => panic!("expected AddColumn for `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        };
+        assert_eq!(add("ALTER TABLE t ADD COLUMN c int").name, "c");
+        assert_eq!(add("ALTER TABLE t ADD c int").name, "c");
+        assert!(add("ALTER TABLE t ADD COLUMN c int NOT NULL").not_null);
+
+        let drop = |sql: &str| match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => match a.operation {
+                crate::ast::AlterOperation::DropColumn(name) => name,
+                other => panic!("expected DropColumn for `{sql}`, got {other:?}"),
+            },
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        };
+        assert_eq!(drop("ALTER TABLE t DROP COLUMN c"), "c");
+        assert_eq!(drop("ALTER TABLE t DROP c"), "c");
+    }
+
+    /// Adding a PRIMARY KEY as a column constraint would be a second way to say
+    /// `ADD PRIMARY KEY`, with its own idea of order and the storage key. Refused, not guessed.
+    #[test]
+    fn add_column_with_an_inline_primary_key_is_refused() {
+        match parse_statement("ALTER TABLE t ADD COLUMN c int PRIMARY KEY") {
+            Err(ParseError::UnsupportedAlter(form)) => assert!(form.contains("ADD PRIMARY KEY")),
+            other => panic!("must be refused by name, got {other:?}"),
+        }
+    }
+
+    /// Every other `ALTER TABLE` is refused BY NAME. Parsing one loosely would let a client
+    /// believe a change took effect that never ran.
+    #[test]
+    fn other_alter_forms_are_refused_by_name() {
+        for sql in [
+            "ALTER TABLE t RENAME TO u",
+            "ALTER TABLE t ALTER COLUMN c TYPE bigint",
+            "ALTER INDEX i RENAME TO j",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedAlter(form)) => {
+                    assert!(
+                        !form.is_empty(),
+                        "{sql}: the refusal must say what is unsupported"
+                    );
+                }
+                other => panic!("{sql} must be refused as an unsupported ALTER, got {other:?}"),
+            }
+        }
+    }
 
     fn create(sql: &str) -> crate::ast::CreateTableStmt {
         match parse_statement(sql) {
@@ -2177,12 +2652,9 @@ mod tests {
     #[test]
     fn pg_ddl_out_of_scope_clause_named_in_error() {
         // Each clause fails with a typed error whose message names it (D10);
-        // the per-clause tests below pin the exact variant.
+        // the per-clause tests below pin the exact variant. `FOREIGN KEY` is no
+        // longer in this list — it parses and is enforced (see the foreign-key tests).
         let cases = [
-            (
-                "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p (id))",
-                "FOREIGN KEY",
-            ),
             (
                 "CREATE TABLE t (id int PRIMARY KEY, n int, CHECK (n > 0))",
                 "CHECK",
@@ -2204,22 +2676,189 @@ mod tests {
         }
     }
 
+    /// Parse an `ALTER TABLE` statement, asserting it is one.
+    fn alter(sql: &str) -> crate::ast::AlterTableStmt {
+        match parse_statement(sql) {
+            Ok(Statement::AlterTable(a)) => *a,
+            other => panic!("expected AlterTable for `{sql}`, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn foreign_key_table_constraint_is_refused_by_name() {
+    fn foreign_key_table_constraint_is_parsed() {
+        let c = create(
+            "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p)",
+        );
+        assert_eq!(c.foreign_keys.len(), 1, "one FK clause");
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.name, None, "an unnamed table constraint");
+        assert_eq!(fk.columns, vec!["o".to_string()]);
+        assert_eq!(fk.parent.table, "p");
         assert_eq!(
-            refused(
-                "CREATE TABLE t (id int, o int, PRIMARY KEY (id), FOREIGN KEY (o) REFERENCES p (id))"
-            ),
-            UnsupportedClause::ForeignKey
+            fk.parent_columns, None,
+            "no referenced column list: it defaults to the parent's primary key"
         );
     }
 
     #[test]
-    fn foreign_key_column_references_is_refused_by_name() {
-        assert_eq!(
-            refused("CREATE TABLE t (id int PRIMARY KEY, o int REFERENCES p (id))"),
-            UnsupportedClause::ForeignKey
+    fn foreign_key_named_table_constraint_keeps_its_name_and_parent_columns() {
+        let c = create(
+            "CREATE TABLE t (id int, o int, PRIMARY KEY (id), \
+             CONSTRAINT t_o_fkey FOREIGN KEY (o) REFERENCES p (id))",
         );
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.name.as_deref(), Some("t_o_fkey"));
+        assert_eq!(fk.parent_columns, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn foreign_key_column_references_is_parsed() {
+        let c = create("CREATE TABLE t (id int PRIMARY KEY, o int REFERENCES p (id))");
+        assert_eq!(c.foreign_keys.len(), 1);
+        let fk = &c.foreign_keys[0];
+        assert_eq!(fk.name, None, "a column REFERENCES is auto-named");
+        assert_eq!(fk.columns, vec!["o".to_string()]);
+        assert_eq!(fk.parent.table, "p");
+        assert_eq!(fk.parent_columns, Some(vec!["id".to_string()]));
+    }
+
+    #[test]
+    fn add_constraint_foreign_key_parses_with_and_without_a_referenced_column() {
+        use crate::ast::AlterOperation;
+        for (sql, expect_parent_cols) in [
+            (
+                "ALTER TABLE h ADD CONSTRAINT h_bid_fkey FOREIGN KEY (bid) REFERENCES b",
+                None,
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT h_bid_fkey FOREIGN KEY (bid) REFERENCES b (bid)",
+                Some(vec!["bid".to_string()]),
+            ),
+        ] {
+            let a = alter(sql);
+            let AlterOperation::AddForeignKey(fk) = a.operation else {
+                panic!("expected AddForeignKey for `{sql}`");
+            };
+            assert_eq!(fk.name.as_deref(), Some("h_bid_fkey"));
+            assert_eq!(fk.columns, vec!["bid".to_string()]);
+            assert_eq!(fk.parent.table, "b");
+            assert_eq!(fk.parent_columns, expect_parent_cols);
+        }
+        // Without `CONSTRAINT <name>`, PostgreSQL auto-names it.
+        let a = alter("ALTER TABLE h ADD FOREIGN KEY (bid) REFERENCES b");
+        let AlterOperation::AddForeignKey(fk) = a.operation else {
+            panic!("expected AddForeignKey");
+        };
+        assert_eq!(fk.name, None);
+    }
+
+    /// The exact five `FOREIGN KEY` statements `pgbench -i --foreign-keys` emits. Each omits the
+    /// referenced-column list, so the referenced column defaults to the parent's primary key. The
+    /// parser must accept every one — this is the grammar half of the acceptance; `ferrosa-postgres`
+    /// proves they APPLY and are enforced.
+    #[test]
+    fn the_five_pgbench_foreign_keys_parse() {
+        use crate::ast::AlterOperation;
+        for (sql, child, parent) in [
+            (
+                "alter table pgbench_tellers  add constraint pgbench_tellers_bid_fkey  foreign key (bid) references pgbench_branches",
+                "pgbench_tellers",
+                "pgbench_branches",
+            ),
+            (
+                "alter table pgbench_accounts add constraint pgbench_accounts_bid_fkey foreign key (bid) references pgbench_branches",
+                "pgbench_accounts",
+                "pgbench_branches",
+            ),
+            (
+                "alter table pgbench_history  add constraint pgbench_history_bid_fkey  foreign key (bid) references pgbench_branches",
+                "pgbench_history",
+                "pgbench_branches",
+            ),
+            (
+                "alter table pgbench_history  add constraint pgbench_history_tid_fkey  foreign key (tid) references pgbench_tellers",
+                "pgbench_history",
+                "pgbench_tellers",
+            ),
+            (
+                "alter table pgbench_history  add constraint pgbench_history_aid_fkey  foreign key (aid) references pgbench_accounts",
+                "pgbench_history",
+                "pgbench_accounts",
+            ),
+        ] {
+            let a = alter(sql);
+            assert_eq!(a.table.table, child, "{sql}");
+            let AlterOperation::AddForeignKey(fk) = a.operation else {
+                panic!("expected AddForeignKey for `{sql}`");
+            };
+            assert_eq!(fk.parent.table, parent, "{sql}");
+            assert_eq!(
+                fk.parent_columns, None,
+                "{sql}: no referenced-column list -> the parent's primary key"
+            );
+        }
+    }
+
+    #[test]
+    fn add_primary_key_is_unchanged_by_the_foreign_key_grammar() {
+        use crate::ast::AlterOperation;
+        let a = alter("ALTER TABLE t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b)");
+        assert_eq!(
+            a.operation,
+            AlterOperation::AddPrimaryKey(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_action_and_restrict_are_accepted_and_cascade_is_refused_by_name() {
+        // Accepted: the default NO ACTION and its immediate equivalent RESTRICT.
+        for sql in [
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE NO ACTION",
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON UPDATE NO ACTION",
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE RESTRICT",
+            "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE NO ACTION \
+             ON UPDATE RESTRICT NOT DEFERRABLE",
+        ] {
+            alter(sql);
+        }
+        // Refused by name: a client that asked to cascade must never get a NO ACTION
+        // constraint silently in its place.
+        for (sql, named) in [
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE CASCADE",
+                "ON DELETE CASCADE",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON DELETE SET NULL",
+                "ON DELETE SET NULL",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b ON UPDATE SET DEFAULT",
+                "ON UPDATE SET DEFAULT",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b DEFERRABLE",
+                "DEFERRABLE",
+            ),
+            (
+                "ALTER TABLE h ADD CONSTRAINT fk FOREIGN KEY (bid) REFERENCES b NOT VALID",
+                "NOT VALID",
+            ),
+            (
+                "CREATE TABLE t (o int REFERENCES p MATCH FULL)",
+                "MATCH",
+            ),
+        ] {
+            let err = parse_statement(sql).expect_err(sql);
+            assert!(
+                matches!(err, ParseError::UnsupportedAlter(_)),
+                "{sql}: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(named),
+                "the refusal must name the action: {sql}: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2283,8 +2922,7 @@ mod tests {
 
     #[test]
     fn create_table_structural_errors_are_typed() {
-        let cases: [(&str, ParseError); 7] = [
-            ("CREATE TABLE t (a int)", ParseError::MissingPrimaryKey),
+        let cases: [(&str, ParseError); 6] = [
             (
                 "CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)",
                 ParseError::MultiplePrimaryKeys,
@@ -2315,6 +2953,136 @@ mod tests {
         }
     }
 
+    /// PostgreSQL's fixed-length `char[(n)]` / `character[(n)]` and
+    /// `character varying[(n)]` must parse. pgbench's own schema uses
+    /// `filler char(84)`, so without this `pgbench -i` cannot create its tables.
+    ///
+    /// ferrosa stores `char(n)` as `varchar(n)` — UTF-8 text, NO blank padding.
+    /// That is a deliberate, documented deviation: the type is accepted and stored
+    /// faithfully as text, but `bpchar` padding semantics are not implemented.
+    #[test]
+    fn create_table_accepts_char_and_character_varying() {
+        for sql in [
+            "CREATE TABLE t (k int PRIMARY KEY, filler char(84))",
+            "CREATE TABLE t (k int PRIMARY KEY, filler char)",
+            "CREATE TABLE t (k int PRIMARY KEY, filler character(10))",
+            "CREATE TABLE t (k int PRIMARY KEY, filler character varying(10))",
+            "CREATE TABLE t (k int PRIMARY KEY, filler character varying)",
+        ] {
+            let got = parse_statement(sql);
+            assert!(got.is_ok(), "{sql} must parse: {got:?}");
+        }
+    }
+
+    // ---- CREATE TABLE ... WITH (storage parameters) — pgbench -i ----
+
+    /// pgbench -i emits `... with (fillfactor=100)` on several of its tables. Before
+    /// this clause parsed, `pgbench -i` stopped dead at:
+    /// `ERROR: expected end of statement, found Ident("with")`. The statement below is
+    /// verbatim from that run.
+    #[test]
+    fn create_table_with_fillfactor_parses_pgbench_statement() {
+        let c = create(
+            "create table pgbench_tellers(tid int not null,bid int,tbalance int,filler char(84)) with (fillfactor=100)",
+        );
+        assert_eq!(c.name.table, "pgbench_tellers");
+        assert_eq!(
+            c.storage_parameters,
+            vec![("fillfactor".to_string(), "100".to_string())]
+        );
+        // Nothing else about CREATE TABLE changed: four columns, tid NOT NULL, no key.
+        assert_eq!(c.columns.len(), 4);
+        assert!(c.columns[0].not_null);
+        assert!(c.primary_key.is_empty());
+    }
+
+    /// A multi-option list parses every option, in declaration order.
+    #[test]
+    fn create_table_with_multiple_options_keeps_order() {
+        let c = create(
+            "CREATE TABLE t (k int PRIMARY KEY) WITH (fillfactor=100, autovacuum_enabled=false)",
+        );
+        assert_eq!(
+            c.storage_parameters,
+            vec![
+                ("fillfactor".to_string(), "100".to_string()),
+                ("autovacuum_enabled".to_string(), "false".to_string()),
+            ]
+        );
+    }
+
+    /// The clause is optional and accepts every spacing a client writes: `WITH(...)`
+    /// with no space, spaces around `=`, mixed case, a quoted-string value, and no
+    /// clause at all.
+    #[test]
+    fn create_table_with_clause_spacing_and_value_forms() {
+        // The clause absent leaves the parameter list empty.
+        assert!(create("CREATE TABLE t (k int PRIMARY KEY)")
+            .storage_parameters
+            .is_empty());
+
+        let cases = [
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) WITH (fillfactor=100)",
+                "100",
+            ),
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) WITH(fillfactor=100)",
+                "100",
+            ),
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) with ( fillfactor = 100 )",
+                "100",
+            ),
+            (
+                "CREATE TABLE t (k int PRIMARY KEY) WITH (fillfactor='70')",
+                "70",
+            ),
+        ];
+        for (sql, want) in cases {
+            let c = create(sql);
+            assert_eq!(
+                c.storage_parameters,
+                vec![("fillfactor".to_string(), want.to_string())],
+                "{sql}"
+            );
+        }
+    }
+
+    /// A table created with the clause is identical in every other respect to one
+    /// created without it — only `storage_parameters` differs.
+    #[test]
+    fn create_table_with_clause_is_otherwise_identical() {
+        let with = create("CREATE TABLE t (k int PRIMARY KEY, v text) WITH (fillfactor=100)");
+        let without = create("CREATE TABLE t (k int PRIMARY KEY, v text)");
+        let mut with_cleared = with.clone();
+        with_cleared.storage_parameters.clear();
+        assert_eq!(with_cleared, without);
+    }
+
+    /// An option outside the accepted set is refused by NAME — never parsed and
+    /// dropped, which would let a client believe it configured something.
+    #[test]
+    fn create_table_refuses_unknown_storage_parameter_by_name() {
+        for option in ["toast_tuple_target", "oids", "user_catalog_table", "wibble"] {
+            let sql = format!("CREATE TABLE t (k int PRIMARY KEY) WITH ({option}=1)");
+            let err = parse_statement(&sql).expect_err(&sql);
+            assert!(
+                matches!(&err, ParseError::UnsupportedStorageParameter(name) if name == option),
+                "{sql}: expected a named refusal, got {err:?}"
+            );
+            assert!(err.to_string().contains(option), "{err}");
+        }
+    }
+
+    /// The clause must be parenthesised; a bare `WITH fillfactor=100` is refused,
+    /// not silently accepted as if the option were applied.
+    #[test]
+    fn create_table_bare_with_without_parentheses_is_refused() {
+        let sql = "CREATE TABLE t (k int PRIMARY KEY) WITH fillfactor=100";
+        assert!(parse_statement(sql).is_err(), "{sql} must not parse");
+    }
+
     #[test]
     fn create_table_malformed_input_fails_loud() {
         let bad = [
@@ -2338,5 +3106,533 @@ mod tests {
         let c = create(r#"CREATE TABLE "Users" ("Id" int, "primary" text, PRIMARY KEY ("Id"))"#);
         assert_eq!(c.name.table, "Users");
         assert_eq!(c.columns[1].name, "primary");
+    }
+
+    // ---- DROP TABLE (pgbench -i / client reset) ----
+
+    fn drop_tables(sql: &str) -> (bool, Vec<String>) {
+        match parse_statement(sql) {
+            Ok(Statement::DropTable(d)) => (
+                d.if_exists,
+                d.tables.iter().map(|t| t.table.clone()).collect(),
+            ),
+            other => panic!("expected DROP TABLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_drop_table_if_exists_single() {
+        let (if_exists, tables) = drop_tables("DROP TABLE IF EXISTS fprobe");
+        assert!(if_exists);
+        assert_eq!(tables, ["fprobe"]);
+    }
+
+    #[test]
+    fn parses_drop_table_lists_every_named_table() {
+        // pgbench -i emits exactly this: drop all four tables in one statement.
+        let (if_exists, tables) = drop_tables(
+            "DROP TABLE IF EXISTS pgbench_accounts, pgbench_branches, \
+             pgbench_history, pgbench_tellers",
+        );
+        assert!(if_exists);
+        assert_eq!(
+            tables,
+            [
+                "pgbench_accounts",
+                "pgbench_branches",
+                "pgbench_history",
+                "pgbench_tellers"
+            ]
+        );
+    }
+
+    #[test]
+    fn drop_table_without_if_exists_is_accepted_and_reports_it() {
+        let (if_exists, tables) = drop_tables("drop table t");
+        assert!(!if_exists, "IF EXISTS must not be assumed");
+        assert_eq!(tables, ["t"]);
+    }
+
+    #[test]
+    fn drop_table_preserves_schema_qualifier_when_present() {
+        match parse_statement("DROP TABLE IF EXISTS public.t") {
+            Ok(Statement::DropTable(d)) => {
+                assert_eq!(d.tables[0].schema.as_deref(), Some("public"));
+                assert_eq!(d.tables[0].table, "t");
+            }
+            other => panic!("expected DROP TABLE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drop_table_with_no_table_is_a_parse_error() {
+        for sql in [
+            "DROP TABLE",
+            "DROP TABLE IF EXISTS",
+            "DROP TABLE IF EXISTS a,",
+        ] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "must reject `{sql}` rather than silently dropping nothing"
+            );
+        }
+    }
+
+    // ---- TRUNCATE / VACUUM / ANALYZE (pgbench reset + routine maintenance) ----
+
+    /// The table names a `TRUNCATE` names, in order.
+    fn truncate_tables(sql: &str) -> Vec<String> {
+        match parse_statement(sql) {
+            Ok(Statement::Truncate(t)) => t.tables.iter().map(|t| t.table.clone()).collect(),
+            other => panic!("expected TRUNCATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_truncate_with_and_without_the_table_keyword() {
+        assert_eq!(
+            truncate_tables("TRUNCATE pgbench_accounts"),
+            ["pgbench_accounts"]
+        );
+        assert_eq!(truncate_tables("TRUNCATE TABLE t"), ["t"]);
+    }
+
+    #[test]
+    fn parses_truncate_of_several_tables_and_keeps_the_schema_qualifier() {
+        assert_eq!(truncate_tables("TRUNCATE TABLE public.a, b"), ["a", "b"]);
+        match parse_statement("TRUNCATE public.t") {
+            Ok(Statement::Truncate(t)) => {
+                assert_eq!(t.tables[0].schema.as_deref(), Some("public"));
+                assert_eq!(t.tables[0].table, "t");
+            }
+            other => panic!("expected TRUNCATE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_with_no_table_is_a_parse_error() {
+        for sql in ["TRUNCATE", "TRUNCATE TABLE", "TRUNCATE a,"] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "must reject `{sql}` rather than silently truncating nothing"
+            );
+        }
+    }
+
+    /// `TRUNCATE ... CASCADE` / `... RESTART IDENTITY` carry no meaning here
+    /// (no foreign keys, no sequences), so a stray token is refused, not ignored.
+    #[test]
+    fn truncate_cascade_and_restart_identity_are_refused_by_name() {
+        for sql in [
+            "TRUNCATE t CASCADE",
+            "TRUNCATE t RESTART IDENTITY",
+            "TRUNCATE t CONTINUE IDENTITY",
+            "TRUNCATE t RESTRICT",
+        ] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "`{sql}` would silently ignore a modifier ferrosa cannot honour"
+            );
+        }
+    }
+
+    /// The `(full, analyze, table)` an accepted `VACUUM` parsed to.
+    fn vacuum_parts(sql: &str) -> (bool, bool, Option<String>) {
+        match parse_statement(sql) {
+            Ok(Statement::Vacuum(v)) => (v.full, v.analyze, v.table.map(|t| t.table)),
+            other => panic!("expected VACUUM, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_vacuum_full_and_analyze_in_any_order() {
+        assert_eq!(vacuum_parts("VACUUM"), (false, false, None));
+        assert_eq!(vacuum_parts("VACUUM FULL"), (true, false, None));
+        assert_eq!(vacuum_parts("VACUUM ANALYZE"), (false, true, None));
+        assert_eq!(vacuum_parts("VACUUM FULL ANALYZE"), (true, true, None));
+        assert_eq!(vacuum_parts("VACUUM ANALYZE FULL"), (true, true, None));
+        assert_eq!(vacuum_parts("VACUUM ANALYSE"), (false, true, None));
+        assert_eq!(
+            vacuum_parts("VACUUM ANALYZE pgbench_accounts"),
+            (false, true, Some("pgbench_accounts".into()))
+        );
+    }
+
+    #[test]
+    fn parses_standalone_analyze() {
+        assert_eq!(
+            parse_statement("ANALYZE").unwrap(),
+            Statement::Analyze(crate::ast::AnalyzeStmt { table: None })
+        );
+        match parse_statement("ANALYSE t") {
+            Ok(Statement::Analyze(a)) => {
+                assert_eq!(a.table.as_ref().map(|t| t.table.as_str()), Some("t"));
+            }
+            other => panic!("expected ANALYZE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vacuum_parenthesised_option_list_is_refused() {
+        // `VACUUM (VERBOSE) t` is out of the parsed subset: the `(` would be read
+        // as a table name and the following ident is then a stray token.
+        assert!(parse_statement("VACUUM (VERBOSE) t").is_err());
+    }
+
+    // ---- multi-row INSERT + value functions (pg_dump / pgbench history) ----
+
+    fn insert_rows(sql: &str) -> Vec<Vec<ScalarValue>> {
+        match parse_statement(sql) {
+            Ok(Statement::Insert(i)) => i.rows,
+            other => panic!("expected INSERT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn single_row_insert_is_one_row() {
+        let rows = insert_rows("INSERT INTO t (a, b) VALUES (1, 'x')");
+        assert_eq!(
+            rows,
+            vec![vec![
+                ScalarValue::Literal(Value::Int(1)),
+                ScalarValue::Literal(Value::Text("x".into()))
+            ]]
+        );
+    }
+
+    #[test]
+    fn multi_row_insert_yields_every_row() {
+        // pgbench's history load batches many rows in one statement.
+        let rows = insert_rows("INSERT INTO t (a, b) VALUES (1, 2), (3, 4), (5, 6)");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows[2],
+            vec![
+                ScalarValue::Literal(Value::Int(5)),
+                ScalarValue::Literal(Value::Int(6))
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_accept_now_function() {
+        // pgbench_history.mtime is populated with now().
+        let rows = insert_rows("INSERT INTO h (t, m) VALUES (1, now())");
+        assert_eq!(
+            rows[0],
+            vec![
+                ScalarValue::Literal(Value::Int(1)),
+                ScalarValue::Func("NOW".into())
+            ]
+        );
+    }
+
+    #[test]
+    fn insert_values_accept_bare_current_timestamp() {
+        // pg_dump writes CURRENT_TIMESTAMP with no parentheses.
+        let rows = insert_rows("INSERT INTO h (m) VALUES (CURRENT_TIMESTAMP)");
+        assert_eq!(rows[0], vec![ScalarValue::Func("CURRENT_TIMESTAMP".into())]);
+    }
+
+    #[test]
+    fn multi_row_insert_with_mismatched_arity_fails_loud() {
+        // Every row must supply one value per named column; a short row is an error.
+        assert!(parse_statement("INSERT INTO t (a, b) VALUES (1, 2), (3)").is_err());
+    }
+
+    // ---- `||` string concatenation in the SELECT list (pgbench init / census) ----
+
+    fn scalar_items(sql: &str) -> Vec<ScalarItem> {
+        match parse_statement(sql) {
+            Ok(Statement::SelectExprs(items)) => items,
+            other => panic!("expected an expression select, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_double_pipe_concatenation_parses_in_an_expression_select() {
+        // RED before the token existed: the lexer had no token for `|`, so this
+        // died with `bad token: |` before the parser ever ran.
+        let items = scalar_items("SELECT 'a' || 'b' AS greeting");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].alias.as_deref(), Some("greeting"));
+        assert_eq!(
+            items[0].value,
+            ScalarValue::Concat {
+                left: Box::new(ScalarValue::Literal(Value::Text("a".into()))),
+                right: Box::new(ScalarValue::Literal(Value::Text("b".into()))),
+            }
+        );
+    }
+
+    #[test]
+    fn concatenation_nests_left_associatively_and_mixes_operands() {
+        // `a || b || c` is `(a || b) || c`; operands may be literals, `$N` params
+        // and zero-arg function calls. No `FROM`, so no ambiguous alias.
+        let items = scalar_items("SELECT 'a' || $1 || current_database()");
+        let ScalarValue::Concat { left, right } = &items[0].value else {
+            panic!("expected a top-level concat, got {:?}", items[0].value);
+        };
+        assert_eq!(
+            **left,
+            ScalarValue::Concat {
+                left: Box::new(ScalarValue::Literal(Value::Text("a".into()))),
+                right: Box::new(ScalarValue::Param(1)),
+            }
+        );
+        assert_eq!(**right, ScalarValue::Func("CURRENT_DATABASE".into()));
+    }
+
+    #[test]
+    fn a_lone_pipe_is_still_a_bad_token() {
+        // Negative control: `||` becomes one token, but a single `|` is still a
+        // character the lexer has no token for and must keep failing loudly.
+        let error = parse_statement("SELECT 'a' | 'b'").expect_err("a lone `|` must be refused");
+        assert_eq!(
+            error.to_string(),
+            "bad token: |",
+            "a lone pipe must still be `bad token: |`, not silently accepted"
+        );
+    }
+
+    #[test]
+    fn concatenation_over_a_from_relation_is_refused_by_name() {
+        // `||` over a `FROM` relation needs a computed select-list expression the
+        // planner does not have. Both spellings must be refused by NAME (0A000),
+        // never mis-parsed as a column list or reported as a token mismatch.
+        for sql in [
+            "SELECT name || '!' FROM t",
+            "SELECT 'a' || 'b' FROM t",
+            "SELECT count(*) || 'x' FROM t",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedSelectExpr(form)) => {
+                    assert_eq!(form, "`||` concatenation over a FROM relation");
+                }
+                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+            }
+        }
+    }
+
+    // ---- `::` cast (`expr::type_name`) — pgbench's `$1::pg_catalog.regclass` ----
+
+    #[test]
+    fn the_pgbench_object_existence_query_parses_a_regclass_cast() {
+        // RED before the `::` token existed: the lexer had no token for `:`, so the
+        // query died with `bad token: :` before the parser ever ran. This is the
+        // exact statement pgbench -i issues to check whether a table already exists.
+        let stmt =
+            parse("SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass")
+                .expect("the pgbench object-existence query must parse");
+        assert_eq!(stmt.from.schema.as_deref(), Some("pg_catalog"));
+        assert_eq!(stmt.from.table, "pg_class");
+        let filter = stmt.filter.expect("WHERE");
+        let (_, op, value) = as_compare(&filter);
+        assert_eq!(op, CmpOp::Eq);
+        assert_eq!(
+            *compare_column(&filter),
+            ColumnRef {
+                qualifier: None,
+                name: "oid".into()
+            }
+        );
+        // The cast is on the RHS term — `oid = ($1::regclass)` — so `::` binds
+        // tighter than the comparison operator, which is the specification.
+        assert_eq!(
+            *value,
+            Term::Cast {
+                value: Box::new(Term::Param(1)),
+                ty: CastTarget::Regclass,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bare_regclass_cast_is_the_same_target_as_the_schema_qualified_spelling() {
+        let bare = parse("SELECT relkind FROM t WHERE oid = $1::regclass").expect("must parse");
+        let qualified =
+            parse("SELECT relkind FROM t WHERE oid = $1::pg_catalog.regclass").expect("must parse");
+        assert_eq!(bare.filter, qualified.filter);
+    }
+
+    #[test]
+    fn a_cast_binds_tighter_than_string_concatenation() {
+        // `'a' || 'b'::regclass` is `'a' || ('b'::regclass)`: the postfix `::`
+        // applies to the primary on its left, not to the whole concatenation.
+        let items = scalar_items("SELECT 'a' || 'b'::regclass");
+        let ScalarValue::Concat { left, right } = &items[0].value else {
+            panic!("expected a top-level concat, got {:?}", items[0].value);
+        };
+        assert_eq!(**left, ScalarValue::Literal(Value::Text("a".into())));
+        assert_eq!(
+            **right,
+            ScalarValue::Cast {
+                value: Box::new(ScalarValue::Literal(Value::Text("b".into()))),
+                ty: CastTarget::Regclass,
+            }
+        );
+    }
+
+    #[test]
+    fn a_cast_to_a_type_ferrosa_does_not_implement_is_refused_by_name() {
+        // Never silently accepted and ignored: a cast target the engine cannot
+        // honour is refused by name — the type exactly as it was written, with its
+        // schema qualifier when one was given.
+        for (sql, ty) in [
+            ("SELECT relkind FROM t WHERE oid = $1::text", "text"),
+            ("SELECT relkind FROM t WHERE oid = $1::int4", "int4"),
+            (
+                "SELECT relkind FROM t WHERE oid = $1::pg_catalog.regtype",
+                "pg_catalog.regtype",
+            ),
+            ("SELECT relkind FROM t WHERE oid = $1::nowhere", "nowhere"),
+        ] {
+            match parse(sql) {
+                Err(ParseError::UnsupportedCast(name)) => assert_eq!(name, ty, "{sql}"),
+                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn cast_function_syntax_is_refused_by_name_not_misparsed() {
+        // `CAST(x AS t)` is not implemented, so it is refused BY NAME rather than
+        // mis-parsed as a column named `CAST`. A bare `cast` column is still fine.
+        for sql in [
+            "SELECT CAST(k AS text) FROM t",
+            "SELECT relkind FROM t WHERE oid = CAST($1 AS regclass)",
+        ] {
+            match parse_statement(sql) {
+                Err(ParseError::UnsupportedCastExpr) => {}
+                other => panic!("`{sql}` must be refused by name, got {other:?}"),
+            }
+        }
+        assert!(parse("SELECT cast FROM t").is_ok());
+    }
+
+    #[test]
+    fn a_lone_colon_is_still_a_bad_token() {
+        // Negative control: `::` becomes one token, but a single `:` is still a
+        // character the lexer has no token for and must keep failing loudly.
+        let error = parse_statement("SELECT 'a' : 'b'").expect_err("a lone `:` must be refused");
+        assert_eq!(
+            error.to_string(),
+            "bad token: :",
+            "a lone colon must still be `bad token: :`, not silently accepted"
+        );
+    }
+
+    // ---- scalar subqueries `( SELECT ... )` in the SELECT list ----
+
+    /// Flatten a left-associative `||` tree into its operands, left to right.
+    fn concat_operands(value: &ScalarValue) -> Vec<&ScalarValue> {
+        match value {
+            ScalarValue::Concat { left, right } => {
+                let mut parts = concat_operands(left);
+                parts.push(right);
+                parts
+            }
+            other => vec![other],
+        }
+    }
+
+    /// The `count(*)`-over-`table` a scalar subquery must be, or a panic naming
+    /// what was found instead.
+    fn count_star_table(value: &ScalarValue) -> &str {
+        let ScalarValue::Subquery(stmt) = value else {
+            panic!("expected a scalar subquery, got {value:?}");
+        };
+        assert!(
+            matches!(
+                &stmt.projection,
+                Projection::Items(items)
+                    if items.len() == 1
+                        && matches!(
+                            &items[0],
+                            SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star }
+                        )
+            ),
+            "expected `count(*)`, got {:?}",
+            stmt.projection
+        );
+        assert!(stmt.filter.is_none(), "the probe subquery has no WHERE");
+        stmt.from.table.as_str()
+    }
+
+    #[test]
+    fn a_scalar_subquery_parses_as_a_concatenation_operand_in_order() {
+        // RED before the change: a leading `(` made this a table select, which
+        // died `expected identifier, found `LParen``. Afterwards the three
+        // subqueries parse as `||` operands, left to right, each `count(*)` over
+        // its own relation — the pgbench census line.
+        let items = scalar_items(
+            "select (select count(*) from pgbench_accounts)||'|'||\
+             (select count(*) from pgbench_tellers)||'|'||\
+             (select count(*) from pgbench_branches)",
+        );
+        assert_eq!(items.len(), 1);
+        let parts = concat_operands(&items[0].value);
+        assert_eq!(parts.len(), 5, "three subqueries and two `|` literals");
+        assert_eq!(
+            [0, 2, 4]
+                .iter()
+                .map(|&i| count_star_table(parts[i]))
+                .collect::<Vec<_>>(),
+            ["pgbench_accounts", "pgbench_tellers", "pgbench_branches"],
+            "the subqueries keep their written order"
+        );
+        for i in [1, 3] {
+            assert_eq!(
+                *parts[i],
+                ScalarValue::Literal(Value::Text("|".into())),
+                "the separators are the `|` literals, in order"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_subquery_may_be_the_whole_select_item() {
+        let items = scalar_items("SELECT (SELECT count(*) FROM t) AS n");
+        assert_eq!(items[0].alias.as_deref(), Some("n"));
+        assert_eq!(count_star_table(&items[0].value), "t");
+    }
+
+    #[test]
+    fn a_parenthesised_scalar_that_is_not_a_select_is_still_refused() {
+        // Negative control: only `( SELECT ... )` becomes a subquery. An ordinary
+        // parenthesised scalar was unsupported before and stays so — this must
+        // never be silently accepted as something else.
+        for sql in ["SELECT (1)", "SELECT ('a')", "SELECT (version())"] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "`{sql}` must still be refused: parenthesised scalars are not a subquery"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_scalar_subquery_is_refused() {
+        // Negative control: a subquery that is not a well-formed `( SELECT ... )`
+        // fails loud — an unclosed paren, an extra paren, and an inner query with
+        // no `FROM` (the probe's shape needs a relation to count over).
+        for sql in [
+            "SELECT (SELECT count(*) FROM t",
+            "SELECT (SELECT count(*) FROM t))",
+            "SELECT (SELECT 1)",
+            "SELECT (SELECT count(*) FROM t) || ",
+        ] {
+            assert!(
+                parse_statement(sql).is_err(),
+                "`{sql}` is malformed and must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_scalar_subquery_outside_the_select_list_is_refused() {
+        // The new grammar reaches only the select-list scalar primary. A subquery
+        // in WHERE stays unsupported (the WHERE grammar takes a column/aggregate
+        // operand or a literal/`$N` term), and is refused loudly, not ignored.
+        assert!(parse_statement("SELECT a FROM t WHERE k = (SELECT 1)").is_err());
     }
 }

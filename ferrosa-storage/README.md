@@ -259,10 +259,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   resurrect older data. `CompactionTask::purge` carries the policy, computed by
   `StorageEngine::purge_policy_for` at submission; a schema with no `gc_grace_seconds`
   means no purge. Kill switch: `FERROSA_COMPACTION_PURGE_TOMBSTONES=0`. A pathless
-  collection tombstone is kept while element cells it shadows remain. If every
-  partition purges away, one is written unpurged (an empty output cannot be swapped
-  in) and counted. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
-  `..._purge_held_back_total`, `..._purge_policy_errors_total`.
+  collection tombstone is kept while element cells it shadows remain. **The
+  reserved table-tombstone key is EXEMPT from purge** (see
+ [Table tombstones](#table-tombstones-whole-table-truncate)): its marker is
+ retained until the table itself is dropped, so a stale replica's pre-truncate
+ copy can never be resurrected. If every
+ partition purges away, one is written unpurged (an empty output cannot be swapped
+ in) and counted. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
+ `..._purge_held_back_total`, `..._purge_policy_errors_total`.
   **Flush fix:** a partition holding only a partition-level delete (no rows, no static
   row) is now flushed; it used to be dropped as empty, losing the delete.
   Existing backlogs drain without waiting for another flush: every maintenance
@@ -359,7 +363,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   both legacy flat SSTable components and restored generation directories.
   Periodic sync publishes a generation only when all four required components
   (`Data.db`, `Partitions.db`, `Rows.db`, and `Filter.db`) are present; component
-  presence is the invariant, so a valid zero-byte `Rows.db` is uploaded.
+  presence is the invariant, so a valid zero-byte `Rows.db` is uploaded. `Rows.db`
+  is a MANDATORY BTI component (row index, listed in TOC.txt), so an absent one is
+  corruption, not an optional gap — the generation is withheld and never uploaded,
+  never worked around (ST-91).
   **Wired into the flush path.**
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
@@ -563,7 +570,24 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   Because `unregister_table` also deletes the table's SSTable directory, cluster
   snapshot install must only reach it for explicit drops, not for table-map
   absence alone; the Raft state machine now enforces that guard before calling
-  this storage cleanup primitive. Re-registering an already
+  this storage cleanup primitive.
+  That removal is now part of the drop contract rather than best-effort
+  (t_c8625592, ST-92): `unregister_table` and `truncate` record a durable,
+  name-keyed **pending sweep** in `<data_dir>/pending-table-sweeps.json` BEFORE
+  the removal and clear it only after the removal succeeds. A removal that fails
+  returns an error (the drop is not reported as done) and leaves the sweep
+  recorded, so the next `build_table_state` for that name — registration precedes
+  any write, so its whole directory is a previous incarnation's rows — deletes the
+  orphans before loading them instead of resurrecting a dropped table's rows.
+  The intent is recorded BEFORE the step that can refuse the drop (the
+  `is_drained()` compaction check), so *any* refusal — not only a failed
+  `remove_dir_all` — is durably recorded and retried; and `register_table_inner`
+  honours a live intent by retiring a still-registered store rather than taking
+  its "already registered" shortcut, so a same-name re-create can never reach a
+  previous incarnation's store. Together these keep the in-memory schema (dropped
+  first on every DDL route) and the durable directory from disagreeing
+  (t_c8625592, invariant "all replicas agree").
+  Re-registering an already
   loaded table with index declarations merges any missing declarations into the
   existing store, keeping disk-loaded sidecars readable after local-schema
   boot preload. The registry-owned `schema.json` is a discriminated, bounded,
@@ -881,6 +905,47 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   run file so a CQL result cursor can be parked between pages holding only a
   merge head, not up to a spill threshold of rows. With an empty `RowOrder` the
   sorter is a spill-backed FIFO (stable runs, run-index tie-break).
+- **Write-set payload staging** (`write_set_spill.rs`) — `WriteSetSpill` stages a
+  large transaction's encoded mutation payloads in a local temp file and hands the
+  bytes back by write-set index on demand, so the COMMIT coordinator's resident
+  write-set is the KEYS (Accord's conflict ordering and per-shard participant set
+  need them) plus a small offset/length index, never the payload bulk. Reuses the
+  `TempSortTableReservation` cleanup guard (dropping the spill removes its staging
+  dir) and gates on an absolute floor (`WRITE_SET_SPILL_FLOOR_BYTES = 8 MiB`), not
+  the `spill_budget` ORDER BY threshold — that is a fraction of the *process*
+  budget, the wrong scale for one transaction's write-set. Below the floor the
+  write-set stays wholly resident. `stage` drains each payload as it writes; an
+  un-staged index fails loud, never returning an empty mutation.
+  **The staged region is MMAPPED** (`memmap2`): once written, the staging file is
+  mapped read-only, so `entry(i)` returns a borrowed **slice of the mapping** — no
+  `lseek`, no `read_exact`, no per-read lock, no syscall. The pre-mmap path paid one
+  seek + one `read` + one mutex acquisition **per write-set entry**; at N = 1.1M the
+  coordinator's Apply fan-out resolved every entry through it, ~1.1M syscalls
+  serialized behind one mutex (measured as the bulk of `serialize_ms` on the
+  `FERROSA_PG_COMMIT_PROFILE` fan-out line). `mutation(i)` is the owned twin
+  (`entry(i)?.to_vec()`), kept for the Apply wire types, which still hold
+  `Vec<u8>` — so the per-entry copy INTO the serialized frame remains.
+- **Streaming write-set staging** (`write_set_stage.rs`) — `WriteSetStage` closes the
+  gap `WriteSetSpill` leaves open: staging *after the fact* cannot bound a buffer that
+  has already grown. The front end that BUILDS a write-set (a `COPY` inside `BEGIN`)
+  pushes one row at a time; `WriteSetStage::append(payload)` is driven as those rows
+  arrive, keeping a bounded resident prefix and spilling the rest to a private temp
+  file. Below the threshold nothing touches the disk, so a small transaction pays
+  nothing. `finish()` flushes and mmaps the spilled region; `StagedWriteSet::entry(i)`
+  returns a borrowed slice — the resident prefix for entries before the first spill,
+  a slice of the mapping after it — in APPEND order (the order the commit path needs).
+  An index that was never staged fails loud, never a silent empty read. The resident
+  limit is a streaming **BUFFER SIZE**, externalized as
+  `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` (default `WRITE_SET_SPILL_FLOOR_BYTES`,
+  8 MiB), the same knob `WriteSetSpill::should_stage` now reads — never a cap: a
+  write-set larger than the threshold SPILLS, it is not refused. Cleanup reuses
+  `TempSortTableReservation`. Tests: `write_set_stage::tests::{every_entry_round_trips_across_the_spill_boundary_and_the_last_entry,
+  empty_payloads_round_trip_as_empty_not_missing,
+  entries_are_readable_in_append_order_across_the_boundary,
+  residency_is_flat_across_widely_separated_entry_counts,
+  an_un_staged_index_fails_loud_in_both_regimes, a_small_write_set_stays_fully_resident,
+  dropping_the_staged_view_removes_the_staging_directory,
+  an_invalid_threshold_setting_falls_back_to_the_default}`.
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per
@@ -916,6 +981,61 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   boundary returns the same way and is re-admitted by the supervisor; no
   producer waits on its thread for anything.
 
+## Table tombstones — whole-table TRUNCATE
+
+A **table tombstone** (`src/table_tombstone.rs`) is a whole-table deletion
+watermark stored as an **ordinary row in the table's own LSM**: one reserved
+partition (`table_tombstone_key()`, magic `\x00ferrosa/table-tombstone/v1`) whose
+`deletion` is the truncate's `DeletionTime`, written through the same write seam
+as any DML. Nothing about the write path knows it means "whole table" — it is the
+exact partition-tombstone shape `DELETE FROM t WHERE pk = ?` produces, lifted by
+the memtable into `Partition::deletion`. The only new thing is **scope**: the
+per-partition predicate is applied *table-wide*.
+
+- **Read scope.** Every read path folds the reserved partition's watermark into
+  the partition it is reading, via `merge::apply_table_deletion` — the SAME
+  predicate and timestamp ordering as a per-partition tombstone, at table scope.
+  A row written at or after `marked_for_delete_at` survives (a later `INSERT`
+  keeps its data); an older row is suppressed immediately.
+- **The probe is a read, not a hard check.** Resolving the watermark opens the
+  SSTables whose token range covers the reserved key. An overlapping generation
+  that cannot be consulted takes the **same fresh-view retry** as the read's own
+  sources — never an immediate error — and only retry exhaustion quarantines it
+  and fails the read loud. So the transient compaction window (the input was
+  retired and its merged output holds the rows) cannot fail a read that is
+  otherwise answerable; `engine::tests::read_compaction_race_stress` pins it.
+  Compaction's own caller (`TableStore::table_tombstone`) keeps the hard error,
+  because it must not reclaim rows on a partial answer.
+- **Reclamation.** `merge::reclaim_covers_table` drops the covered rows and static
+  cells at the next compaction (dropping them is what reclaims the bytes).
+  Reclamation is therefore **lazy** — it happens at compaction, not at the write.
+- **Logically immediate, physically lazy — deliberately.** A committed table
+  tombstone makes reads return no rows at once, but reclaims bytes only later.
+  `VACUUM` (flush + submit compaction) is what forces reclamation promptly, and
+  `TRUNCATE` followed by `VACUUM` is strictly equivalent in effect to an immediate
+  truncate. That split is deliberate for client compatibility; making reclamation
+  synchronous at `TRUNCATE` would be a purposeful, separate change.
+- **Lifetime rule (no resurrection).** The reserved marker may only be dropped
+  once *every replica* has purged every row it covers. ferrosa does not yet track a
+  per-replica purge watermark, so the marker is **never purged by compaction**: it
+  is exempted in `compaction::purge` and retained until the table itself is
+  dropped. Retaining it is the conservative side of the rule — dropping it while a
+  stale replica still held older rows would be the silent resurrection this exists
+  to prevent. `a_stale_older_copy_cannot_resurrect_a_truncated_row` pins it.
+- **Cluster replication: the whole ring, at `CL=ALL`.** The tombstone is a *single*
+  reserved partition key, so the ordinary write path would route it only to that
+  key's RF replica set — a proper subset of the ring whenever `RF < node count`.
+  The nodes outside it would never learn of the truncate and would keep serving the
+  truncated rows. So the marker is replicated to **every node serving the table** at
+  `ConsistencyLevel::All`; `CL=ALL` alone is not enough (it only filters the replica
+  slice it is handed, i.e. that one key's RF set), so the target set is the **whole
+  ring** and **every** target must acknowledge — the write **fails loud** if any
+  does not. See `ferrosa-cluster`'s `WritePath::write_all_serving_nodes` and the
+  `ferrosa-postgres` README.
+- **Reserved-key collision.** The magic is long and namespaced (`\x00ferrosa/…`);
+  a user partition key encoding to exactly those bytes would be shadowed. The
+  accident is astronomically unlikely and documented rather than silently assumed.
+
 ## Legacy nanosecond timestamps (t_cf637b6e)
 
 Timestamps a pre-fix build stamped in nanoseconds are normalised to
@@ -945,14 +1065,14 @@ replayed commit log or in-process writes.
 
 | Area | Items |
 |------|-------|
-| Engine | `StorageEngine`, `StorageEngineConfig`, `new`/`open`, `register_table[_with_indexes]`, `add_index[_with_predicate]`, `add_clustering_index` (clustering-column indexes, t_430c4188), `shutdown` |
+| Engine | `StorageEngine`, `StorageEngineConfig`, `new`/`open`, `register_table[_with_indexes]`, `add_index[_with_predicate]`, `add_btree_index` (declare an ordered BTree index over one column — the declaration half of `read_by_index_exists`), `add_clustering_index` (clustering-column indexes, t_430c4188), `shutdown` |
 | Write | `write`, `batch_write`, `write_atomic_batch`, `apply_batch`, `begin_batch`/`BatchTxn`/`BatchOp`, `replay_mutations` |
-| Read | `read`, `read_range`, `read_token_range[_bounded]`, `range_iter[_projected|_fragmented]`, `count_range`, streaming `read_by_index_each`/`read_by_index_stream` (global lookups visit postings incrementally), `read_by_index_in_partition` (keyed consult restricted to one partition and fail-loud bounded), `ann_search`, `fulltext_search`, `walk_token_range[_for_digest]` |
+| Read | `read`, `read_range`, `read_token_range[_bounded]`, `range_iter[_projected|_fragmented]`, `count_range`, streaming `read_by_index_each`/`read_by_index_stream` (global lookups visit postings incrementally), `read_by_index_exists` (whether ANY row carries an index posting for a key — stops at the first match, one lookup, never O(result); fails loud on an undeclared/not-current index), `read_by_index_in_partition` (keyed consult restricted to one partition and fail-loud bounded), `ann_search`, `fulltext_search`, `walk_token_range[_for_digest]` |
 | Maintenance | `flush`, `flush_if_needed`, `flush_all`, `poll_compactions`, `truncate`, `sync_sstables_to_s3` |
 | Snapshot/PITR | `create_snapshot_with_store`, `open_from_snapshot_with_store`, `open_from_snapshot` (builds the object store from `config.object_store`; the restore-on-boot entry point), `list/delete_snapshot_with_store` |
 | Restore intent | `restore::RestoreIntent` (`from_env`, `from_vars`, `point_in_time_micros`, `already_applied`, `mark_applied`), `restore::parse_rfc3339_micros`, `ENV_RESTORE_SNAPSHOT` / `ENV_RESTORE_POINT_IN_TIME` / `ENV_RESTORE_FORCE` |
 | Abstraction | `DataStore` / `LocalDataStore` (the `Arc<dyn DataStore>` boundary) |
-| Spill/sort | `ExternalSorter`, `RowOrder`, `SortedRows`, `spill_budget::process_spill_threshold_bytes`, `reserve_order_by_temp_sort_table`/`TempSortTableReservation` |
+| Spill/sort | `ExternalSorter`, `RowOrder`, `SortedRows`, `spill_budget::process_spill_threshold_bytes`, `reserve_order_by_temp_sort_table`/`TempSortTableReservation`, `WriteSetSpill`/`reserve_write_set_stage` (write-set payload staging) |
 | Config types | `CommitLogConfig`, `SyncStrategyConfig`, `CompactionConfig`, `ObjectStoreConfig`, `Mutation`, `TableId` |
 
 ## Dependencies
@@ -1191,6 +1311,54 @@ equivalent. Recognized names:
 {...}` writes to turn compression off, so a table created uncompressed by a real
 Cassandra client is read/written here uncompressed rather than failing with
 `UnsupportedCompression`. Any other unrecognized name is still rejected loudly.
+
+## Bound policy — no hard data caps
+
+**Rule.** A bound that limits the SIZE OF DATA the engine accepts or returns,
+where exceeding it either REFUSES (errors) or SILENTLY truncates / skips /
+drops, is illegitimate. The only allowed bounds are (a) **streaming buffers**,
+whose size is an externalized tunable and which SPILL to disk rather than
+refuse, and (b) concurrency / retries / backoff / timeouts / clock skew / log
+rotation / connection counts / channel capacity that applies backpressure / a
+fixed chunk size in the middle of a stream — none of which can affect data
+completeness.
+
+The reference shape is the set-aside and write-set paths: a bounded resident
+buffer whose overflow is written durably to disk and re-ingested automatically
+(`replay_set_aside.rs`, `write_set_stage.rs`) — never refused, never truncated.
+
+### Census
+
+| Bound | Where | Exceeding it | Verdict |
+|---|---|---|---|
+| `MAX_ENTRY_SIZE` (1 MiB) + `OversizedEntryError` | `accord/oversized_entry.rs` | refused a serialized protocol entry | **REMOVED** — a dead refusal cap: `check_entry_size` had no call site outside its own file. The module and its A7.10 tests are deleted |
+| `MAX_RECORD_LEN` (64 MiB) | `accord/framed_log.rs` | treated a longer record as a torn tail and dropped it | **REMOVED** — redundant with the file-length check `pos + len > bytes.len()`, which bounds allocation before it happens; red test `a_record_larger_than_the_old_reading_guard_is_recovered_not_dropped` |
+| `MAX_FRAME_BYTES` (256 MiB) | `replay_set_aside.rs` | refused a longer frame as an "implausible frame length" | **REMOVED** — redundant with the remaining-bytes check, which bounds the read by the file; red test `a_frame_larger_than_the_old_guard_is_bounded_by_the_file_not_refused` |
+| `MAX_DURABLE_CDC_PAGE_BYTES` single-event refusal | `commitlog/cdc.rs` | a single event over the byte budget returned `EventTooLarge`, permanently undeliverable | **FIXED** — the byte budget now bounds only how many events a page batches (backpressure); one oversized event is delivered alone in its own page. Red test `durable_cdc_page_delivers_an_event_larger_than_byte_budget` |
+| `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (10000), `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` | `engine.rs` | overflow is written to the set-aside file and re-ingested, not refused | **LEGITIMATE** — bounded resident buffer whose overflow SPILLS to disk; the ERROR is a log line, not a returned error |
+| `MAX_DURABLE_CDC_PAGE_MUTATIONS` (128) | `commitlog/cdc.rs` | the page ends; the caller re-requests | **LEGITIMATE** — streaming page backpressure |
+| `MAX_COMPACTION_CANDIDATES`, `MAX_COMBINE_ROUNDS` | `store.rs` | a batch takes fewer inputs / a round ends; the rest round | **LEGITIMATE** — work bounds |
+| `MAX_CAS_RETRIES`, `MAX_CAS_ATTEMPTS`, `MAX_ATTEMPTS`, `MAX_BACKOFF` | `manifest.rs`, `lockfree.rs`, `upload/download.rs` | retry, then fail loud | **LEGITIMATE** — retries / backoff |
+| upload in-flight / rate / idle-pool bounds | `upload/*` | requests queue | **LEGITIMATE** — concurrency / throttle |
+| `runtime_tuning.rs` bound set | `runtime_tuning.rs` | an out-of-range value logs and uses the default | **LEGITIMATE** — parallelism / queue / backpressure / chunk / memory-budget knobs |
+| `FERROSA_EVICTION_AUDIT_MAX_BYTES` | `eviction_audit.rs` | the oldest rotated segment is deleted | **LEGITIMATE** — log rotation on a diagnostics trail |
+
+### Illegitimate caps NOT yet removed
+
+These refuse or truncate DATA but each needs a streaming / spill replacement:
+removing the bound alone would allow unbounded materialization and blow memory,
+so they are deferred rather than removed unsafely. They are tracked here and in
+[Roadmap](specs/roadmap.md).
+
+| Bound | Where | Exceeding it | Needed replacement |
+|---|---|---|---|
+| `RANGE_READ_MATERIALIZATION_CAP` (10000) | `store.rs` | a range read is REFUSED | re-point the materializing path at the existing streaming twin `range_iter` |
+| `INDEX_RESULT_CAP` (10000) | `store.rs` | an index query is REFUSED | stream / spill index postings instead of materializing them |
+| `MAX_INDEXES_TO_RELOAD` / `_READ`, `MAX_TYPES_TO_READ`, `MAX_FUNCTIONS_TO_READ` (10000) | `engine.rs` | `system_schema` rows are silently skipped | the paginated `system_schema` scan (roadmap t_1ec2e3fc) |
+| `DEFAULT_MAX_BYTES` | `schema_snapshot.rs` | a schema-snapshot persist/load is REFUSED | externalize the bound and stream the registry document |
+| `MAX_RECORD_BYTES` | `eviction_audit.rs` | one audit record is REFUSED (that pass is lost) | drop the per-record cap; the ring already bounds the total |
+| RRD ring memory budget | `timeseries/aggregator.rs` | a rollup ring is SKIPPED when the budget is exhausted | spill rollups to disk instead of skipping the ring |
+| u32 staging bounds | `write_set_spill.rs`, `external_sort.rs` | a payload above 4 GiB is REFUSED | a `u64` length prefix in the spill format |
 
 ## Specs
 

@@ -3796,8 +3796,10 @@ async fn finish_lwt_via_accord(
         Err(AccordDriverError::QuorumUnavailable) => Err(CqlError::ServerError(
             "Accord quorum unavailable for LWT transaction".into(),
         )),
-        Err(AccordDriverError::ApplyQuorumUnavailable) => Err(CqlError::ServerError(
-            "Accord apply quorum unavailable — LWT transaction may not be durable".into(),
+        Err(AccordDriverError::TxnAbandoned { .. }) => Err(CqlError::ServerError(
+            "Accord transaction abandoned after the dependency-wait bound — rolled back and NOT \
+             applied; safe to retry"
+                .into(),
         )),
         Err(AccordDriverError::Network(msg)) => Err(CqlError::ServerError(format!(
             "Accord network error: {msg}"

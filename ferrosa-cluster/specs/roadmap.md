@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-08-24
+last_updated: 2026-10-10
 ---
 
 # ferrosa-cluster — Roadmap
@@ -11,6 +11,28 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
 
 ## Recently addressed
 
+- **No hard bounds on streamed data (CL-56/57/58).** Three data-path caps that
+  either refused or silently truncated data are gone: the row-stream receiver's
+  `DEFAULT_STREAM_MAX_MUTATIONS`/`DEFAULT_STREAM_MAX_BYTES` refusal (now a tunable
+  resident buffer, `FERROSA_STREAM_RESIDENT_BUFFER_BYTES`, that SPILLS to the staging
+  file); the `system_table_loader` `read_range(.., 10_000)` silent tail-drop (now a
+  streaming `walk_token_range`); and the bootstrap row-fallback `BOUNDED_ROW_FALLBACK_LIMIT`
+  silent tail-drop (now `TableStreamPlan::StreamRows` + a streaming walk). Each removal
+  landed red-first. Remaining resource bounds (Accord fan-out window, repair chunk sizes,
+  hint byte budget, peer-count maps, rejoin backoff, net lane capacities) are kept and
+  documented in the crate README's cap census.
+
+- **Region-REFERENCE Apply wire (CL-52).** `MsgType::AccordApplyV2Region` (0x7E),
+  gated on `CAP_ACCORD_APPLY_REGION` (1<<4): the Apply frame is now a capnp HEADER
+  (`txnId` + a parallel `offsets`/`lengths` index) followed by ONE contiguous REGION
+  of the peer's mutation payload bytes. The coordinator writes the spill's borrowed
+  mmap slices (`WriteSetSpill::entry`) straight into the region — no per-entry capnp
+  struct, no key on the wire — and the peer's `decode_accord_apply_v2_region` reads
+  entries BY OFFSET from a borrowed view, with no owned per-entry wire structure. A
+  peer that did not advertise the bit still receives the inline capnp (or bincode)
+  frame. `frame_bytes` shrinks (test: `region_apply_frame_is_smaller_than_the_inline_capnp_frame`).
+  Still to measure on the same 4 GB nodes at N=1e6: `frame_bytes`, `serialize_ms`,
+  `fanout_ms`, `max_ack_ms`, peer apply and per-node RSS.
 - **Interim jsonb gate on leaving standalone (T-300, D24).** Transitions out of
   standalone and non-standalone startup are refused while jsonb columns exist.
   Follow-ups: show the refusal on `/readyz` (`jsonb_gate_refusing()` is the
@@ -124,8 +146,11 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   fail-loud `MultiKeyNotYetExecutable` guard is **removed**; multi-key
   transactions now execute end-to-end in-process:
   - `DepWaitApplier::try_apply_writeset` parks a transaction's WHOLE write-set
-    (`pending: HashMap<TxnId, Vec<ApplyMutation>>`) and applies every key on
-    resolve — no write 2..N is dropped while parked.
+    (`pending: HashMap<TxnId, ParkedApply>`) and applies every key on
+    resolve — no write 2..N is dropped while parked. A park whose payloads reach
+    the staging floor is held as `ParkedWriteSet::Staged` (`Arc<WriteSetSpill>` +
+    indices) so its residency is bounded, and an unresolvable park is reclaimed by
+    time with an ERROR (see the parked-residency entry below).
   - `StorageApplier::apply_writeset` commits all of a txn's partitions through ONE
     atomic `apply_batch` (all-or-nothing: a failure on any key persists none —
     chosen over the spec's per-key loop to guarantee no torn multi-key apply).
@@ -168,6 +193,33 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   committing a lost write. `NoopStorageApplier` now records payloads so this is
   regression-tested. (The previously-open follow-up — route `handle_apply` itself
   through `DepWaitApplier` — is now done; see the dep-ordered apply entry above.)
+- **Parked write-sets are spillable and unresolvable parks are reclaimed (Now).**
+  `DepWaitApplier::pending` used to hold the FULL owned write-set per parked
+  transaction with no cap, prune, spill or TTL, so a park whose dependency never
+  arrives (an abandoned dep, a lost apply, a dead coordinator) retained its whole
+  write-set in RAM forever — while the dep-wait graph pruned its own bookkeeping.
+  Now a parked write-set whose payloads reach the staging floor is `Staged`
+  (`Arc<WriteSetSpill>` + per-entry indices), bounded by the buffer not the payload
+  (`parked_write_sets_spill_so_residency_is_bounded_not_proportional_to_payload`,
+  negative control `control_resident_parks_grow_with_the_payload_when_staging_is_disabled`),
+  and an unresolvable park is reclaimed by time
+  (`FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS`, default 60 s, reported at ERROR with
+  its unresolved dependency set — no cap, no refusal, no dropped write)
+  (`an_unresolvable_park_is_reclaimed_and_surfaced_never_retained_forever`). This
+  also supersedes 30a776eb's "owned bytes are structurally required" claim: an
+  `Arc<WriteSetSpill>` is `'static`, so the blocking closure can own it and borrow
+  the mapping inside
+  (`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`).
+  **Landed:** the coordinator's own local apply now takes the same borrow. For a
+  STAGED write-set `apply_phase_within` hands the `Arc<WriteSetSpill>` into the
+  `'static` `on_state_machine` closure and borrows the mapping INSIDE it, applying
+  through `AccordStateMachine::handle_apply_writeset_borrowed` →
+  `DepWaitApplier::try_apply_writeset_borrowed` → `StorageApplier::apply_writeset_borrowed`
+  (`MutationView`), so no owned `Vec<u8>` is materialized per entry. A RESIDENT
+  (small) write-set keeps the legacy owned path, and only the park path — where the
+  bytes must outlive the call — materializes them.
+  (`staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy`, whose
+  negative control drives the owned path through the same probe.)
 - **Cluster-wide `fts_match` scatter-gather (BUG-F-007 / t_0d08aa43).** `fts_match`
   carries no partition key, so its hits span every token range, but the served
   path consulted only the coordinator's local FTI — returning 0/1
@@ -223,6 +275,19 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   cross-DC partition scenarios now (cheap), pending the full Jepsen run.
 
 ## Next
+
+- **Compress the Apply region (owner directive; measure first).** The handshake
+  already negotiates a codec (`supportedCompression`/`chosenCompression`,
+  `FLAG_COMPRESSED`) and `lz4_flex`/`snap` are already dependencies, but **no codec is
+  applied to any frame body** — negotiate-then-ignore. The region-REFERENCE body is the
+  one place to apply it: compress the CONTIGUOUS REGION in blocked form (never
+  per-entry), the peer decompresses into its own buffer and addresses entries by
+  `(offset, length)`. Capability-gated and version-skew safe like the region bit. Do
+  NOT apply it blindly: the peer round trip is `transport + deserialize + apply`, so if
+  the transport term is CPU/deserialize-bound, compression makes it slower. Measure the
+  transport byte-vs-CPU split, then compare `frame_bytes`/`max_ack_ms`/peer apply
+  compressed vs uncompressed, and leave it off by default if `max_ack_ms` does not move.
+  Note in any commit that `pgbench`'s repeated filler columns flatter any ratio.
 
 - **A replica's failed fulltext search must not answer "no matches".**
   `FulltextSearchHandler` (and `IndexReadInPartitionHandler`) log a storage

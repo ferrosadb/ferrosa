@@ -1,12 +1,13 @@
 ---
 crate: ferrosa-postgres
 status: developer-preview
-last_updated: 2026-09-27
+last_updated: 2026-10-09
 executive_summary: >
   The PostgreSQL v3 wire-protocol front-end for ferrosa. Implements the
   frontend/backend protocol (startup, SCRAM-SHA-256, simple + extended query),
   and lowers SQL onto the bespoke ferrosa-sql relational engine over live
-  ferrosa storage. SELECT (incl. one JOIN) and single-row INSERT/UPDATE/DELETE
+  ferrosa storage. SELECT (incl. one JOIN) and INSERT (one or more rows,
+  `VALUES (…),(…)` applied atomically) / UPDATE / DELETE
   are supported; it shares the storage row codec with CQL via ferrosa-row-bridge
   (D10) and is differential-tested against real PostgreSQL 16. Explicit
   PostgreSQL SERIALIZABLE transactions use MVCC snapshots with read-your-writes
@@ -50,12 +51,21 @@ Postgres drivers speak to ferrosa. Its boundary is deliberately narrow:
 | `connection` (`src/connection.rs`) | ~520 | Sans-IO `Connection`: startup/`SSLRequest` (`TlsPolicy`)/SASL → `Ready`; `take_inbuf` for pipelined first query |
 | `authz` (`src/authz.rs`) | ~180 | Statement → required `(Permission, Resource)`; `authorize` via `Schema::check_permission`, `42501` on denial |
 | `extended` (`src/extended.rs`) | ~453 | Per-connection `Session`: Parse/Bind/Close/Sync, prepared statements + portals, txn `I`/`T`/`E` |
-| `query` (`src/query.rs`) | ~1927 | `execute_query`, DML (INSERT/UPDATE/DELETE), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
+| `query` (`src/query.rs`) | ~2000 | `execute_query`, DML (INSERT/UPDATE/DELETE), `execute_truncate` (table-tombstone `TRUNCATE`), value codecs (text+binary), SQLSTATE mapping, `load_catalog` |
 | `storage_provider` (`src/storage_provider.rs`) | ~758 | `load_table`: bounded async-to-sync streaming provider; `cql_to_value`; R15 guard |
-| `catalog` (`src/catalog.rs`) | ~537 | `pg_catalog` projection (`pg_namespace`/`pg_class`/`pg_attribute`/`pg_type`) with deterministic OIDs |
+| `catalog` (`src/catalog.rs`) | ~956 | `pg_catalog` projection (`pg_namespace`/`pg_class`/`pg_attribute`/`pg_type`/`pg_index`/`pg_constraint`) with deterministic OIDs. Ordinary columns take attnums 1..n; a reserved `_sys_` column takes a NEGATIVE attnum, as Postgres numbers its own system columns, so it cannot shift every other column's ordinal. `pg_index`/`pg_constraint` carry a table's *primary key* (a `<table>_pkey` index row in `pg_class` too); a table whose only key is the synthesized `_sys_ck_` gets none |
 | `server` (`src/server.rs`) | ~540 | tokio TCP front-end: `serve`, `QueryContext`, `handle_connection`, the post-auth query loop (wakes to expire idle suspended portals) |
+
+**`::` casts.** A cast target is resolved BEFORE planning (`query::resolve_casts`):
+`<name>::pg_catalog.regclass` becomes the relation's catalog OID via `catalog::resolve_regclass`, matching
+what the `pg_catalog` projection reports. Unsupported targets, and `CAST(x AS t)`, are refused by name.
+`load_catalog_with_mvcc` serves a query's `FROM pg_catalog.*` from `catalog_tables`.
+
 | `result_stream` (`src/result_stream.rs`) | ~600 | Pull-driven result delivery: an owned `RowCursor` fetched 16 rows at a time on a blocking thread; a waiting query holds no thread |
 | `portal_limits` (`src/portal_limits.rs`) | ~380 | `PortalLimits`/`SuspendedPortals`: per-connection and per-node caps on suspended portals (`53000`), idle timeout (`57014`), metrics |
+| `synthetic_key` (`src/synthetic_key.rs`) | ~147 | Mints the per-row v1 TimeUUID value for the synthetic `_sys_ck_` key column of a PK-less table: random per-process node field, monotonic time field, process-local clock sequence |
+| `pg_key` (`src/pg_key.rs`) | ~168 | The **declared** PostgreSQL primary key (`pg.primary_key` extension), which is not the storage key: a PK-less table reports none, and `ALTER TABLE ADD PRIMARY KEY` gives one the storage key does not have |
+| `ddl` (`src/ddl.rs`) | ~823 | PG DDL execution (`CREATE`/`DROP`/`ALTER TABLE`) through the same `ferrosa_cluster::ddl_path::DdlPath` CQL DDL uses |
 | `lib` (`src/lib.rs`) | ~37 | Module wiring + public re-exports |
 
 ## Connection lifecycle
@@ -102,8 +112,12 @@ timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
 `CqlValue` driven by the target column's `CqlType` (`value_to_cql`, fail-loud on
 type mismatch `42804` / out-of-range `22003`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder the engine
-and CQL decode) → `Mutation` → `engine.write_atomic_batch` → `CommandComplete
-"INSERT 0 1"` / `"UPDATE 1"` / `"DELETE 1"`.
+and CQL decode) → `Mutation`. An `INSERT` of N rows builds and validates EVERY
+row first, then applies the whole set as ONE atomic batch (`apply_batch_or_buffer`):
+**autocommit** → `engine.write_atomic_batch` (or one MVCC commit), **in a
+transaction** → buffer the rows into the write-set for one commit at `COMMIT`.
+The statement announces its count only when every row landed → `CommandComplete
+"INSERT 0 N"` / `"UPDATE 1"` / `"DELETE 1"`.
 
 See [data-flow.md](data-flow.md) for the sequence diagrams.
 
@@ -129,6 +143,22 @@ cluster mode). `QueryContext.ddl` carries the executor into `ReadEnv`. Parse
 errors map to typed SQLSTATEs (`query::parse_error_sqlstate`). See FMEA
 `PG-T132a-*`.
 
+**TRUNCATE / VACUUM / ANALYZE.** `Statement::Truncate` executes in
+`query::execute_truncate`. Each named table is truncated by writing ONE
+**table-level tombstone** — a reserved-partition `Mutation`
+(`ferrosa_storage::table_tombstone::table_tombstone_row`) — through the SAME
+`apply_or_buffer` seam every DML write uses, so it is a **normal replicated
+write**; the front-end never truncates locally (never a node-local
+`StorageEngine::truncate`, which would empty one replica and leave the others
+holding the old data). `Statement::Truncate` is in the "data statement" set, so in
+autocommit it is wrapped in the implicit transaction and, in cluster mode, commits
+through the cluster (`AccordTransactionCommitter`) like any other write;
+standalone it applies locally. `Statement::Vacuum` flushes the
+named table's memtables and submits compaction (`force_compact_all`, all tables)
+before answering `CommandComplete "VACUUM"` — asynchronous, and reclamation depends
+on the purge policy, so the tag does not mean "space reclaimed". `Statement::Analyze`
+is answered `"ANALYZE"` and collects no statistics.
+
 `query` renders/parses each `ferrosa_sql::Value` to/from its exact Postgres text
 form and (for most) the binary form, with OIDs/sizes advertised in
 `RowDescription`: `Int→int4(23)`, `Text→text(25)`, `Bool→bool(16)`,
@@ -144,13 +174,22 @@ OID 0 (unspecified) is taken as UTF-8 text; nothing becomes NULL on error.
 The storage value bridge (`cql_to_value`) maps supported CQL scalars onto this
 model and reports a scan error for values without a representation.
 
+DML literals bind through `query::value_to_cql`, coercing each value to its target
+column's CQL type. A `numeric` column accepts an integer literal (widened at scale
+0) and a decimal literal (recovered from its shortest round-trip text, `1.5` →
+unscaled 15 / scale 1), plus a value arriving as TEXT — an untyped string literal or
+a COPY FROM STDIN payload cell — via the same `parse_numeric_text` the numeric
+text-parameter path uses. The accepted set is widened, not loosened: a non-numeric
+string into `numeric` is `22P02`, and any other type mismatch is `42804`.
+
 ## Key invariants
 
 ## PostgreSQL MVCC resource bounds
 
-At startup, `FERROSA_POSTGRES_MAX_TXN_WRITES` sets the per-transaction buffered
-mutation cap (default 10,000), `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` sets the
-storage-to-executor row channel capacity (64), and
+At startup, `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` sets the resident buffer a
+transaction's write-set may hold before it SPILLS to a staging file (default
+8 MiB — a streaming buffer size, never a cap), `FERROSA_POSTGRES_SCAN_BUFFER_ROWS`
+sets the storage-to-executor row channel capacity (64), and
 `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` expires older active snapshots
 (600,000 ms). `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` controls the
 expiry/pruning sweep cadence (1,000 ms). Invalid values log an error and select
@@ -158,6 +197,24 @@ the complete default set without stopping startup. Expired transactions fail
 on subsequent snapshot validation with SQLSTATE `40001`. Tuning guidance and
 query-materialization caveats are in the public
 [`PROFILE.md`](../../PROFILE.md).
+
+### Coherence with the consensus write path
+
+A buffered transaction is not committed here — it is committed by Accord, which
+registers an incoming transaction in its conflict index **under every key** and
+all-or-nothing. Those limits must therefore agree, or the front end accepts a
+transaction consensus cannot register: the PreAccept is refused by every replica,
+the coordinator collects zero votes, and the client sees only the opaque
+`Accord quorum unavailable`.
+
+The front end no longer refuses on its own: `Session.txn_writes` is a spilling
+`TxnWriteSet`, so a write-set past `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` SPILLS
+rather than being declined (FMEA PG-12). The old
+`FERROSA_POSTGRES_MAX_TXN_WRITES` / SQLSTATE `53400` refusal and the knob that
+carried it are both GONE; the consensus conflict index is likewise unbounded
+(grown, not refused — see `ferrosa-cluster` CL-49), so the two no longer
+disagree. The consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` setting was
+removed with the index's fixed capacity.
 
 1. **Fail loud, never fake.** Every failure maps to a concrete SQLSTATE + one
    `ErrorResponse`; the front-end never returns a fake empty result on error
@@ -173,6 +230,31 @@ query-materialization caveats are in the public
    to the sync executor through a bounded channel and blocking iterator, and the
    executor's rows return to the async side through another. Neither the scan
    nor the result is ever gathered.
+6. **`TRUNCATE` is a replicated table tombstone, and its scope is the whole
+   ring.** `TRUNCATE` writes ONE reserved-partition table tombstone through the
+   ordinary `apply_or_buffer` write seam, so it is transactional (buffers in a
+   `BEGIN`, applies on `COMMIT`, discarded by `ROLLBACK`) and replicated as a
+   write. It is *logically immediate* (reads return no rows the moment it commits,
+   table-wide, via `apply_table_deletion`) but *physically lazy* (bytes go at the
+   next compaction); `TRUNCATE` then `VACUUM` is strictly equivalent in effect to
+   an immediate truncate, and that split is deliberate for client compatibility.
+   In cluster mode the tombstone's commit is replicated to **every node serving
+   the table at `ConsistencyLevel::All`**: `CL=ALL` alone is not sufficient,
+   because the ordinary write path would route the marker by its reserved key's
+   token to that key's **RF replica set** — a proper subset of the ring when
+   `RF < node count` — leaving the nodes outside it serving the truncated rows. So
+   the marker is *also* fanned out to the **whole ring**
+   (`WritePath::write_all_serving_nodes`) and **every** target must acknowledge;
+   a node that does not ack fails the commit **loudly** — no quorum degrade and no
+   hint fallback. The reserved marker is exempt from purge, so nothing can be
+   resurrected; it lives until the table is dropped. The marker is also **skipped
+   when a transaction's MVCC row images are built** — the commit row-image build
+   and the transaction read overlay share
+   `apply_pending_writes_with_partition_keys` — because its reserved key is marker
+   magic bytes, not a value of any key column, so decoding it as a data row would
+   fail loud for a PK-less (synthetic `_sys_ck_` uuid) or `int`-keyed table. That was
+   the `COMMIT` failure that killed `pgbench -i`'s transactional load after every
+   row had landed. See FMEA `PG-TRUNCATE-03`.
 
 ## Position in the dependency graph
 

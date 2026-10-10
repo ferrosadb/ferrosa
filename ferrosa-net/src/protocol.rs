@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::codec::{MsgType, WireFrameFormat};
 use crate::message::Message;
 use crate::protocol::envelope_capnp::{
+    accord_control, accord_read_predicate, accord_txn_id, accord_write_set_entry,
     bootstrap_control, bootstrap_stream_plan, cluster_control, envelope, error_frame,
     legacy_payload, node_identity, recovery_control, stream_chunk, stream_chunk_metadata,
     stream_control, stream_end, stream_start, ErrorCode, MessageFamily,
@@ -277,6 +278,158 @@ pub struct LegacyPayload {
     pub body: Vec<u8>,
 }
 
+/// Accord's total-order execution stamp (`ferrosa_common::accord::Timestamp`),
+/// mirrored here so the wire contract does not depend on the cluster crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+pub struct AccordTxnId {
+    pub epoch: u64,
+    pub time: u64,
+    pub seq: u32,
+    pub node: u64,
+}
+
+/// One write in a multi-key Accord transaction's write-set: the partition key
+/// (Accord conflict ordering + replica routing) paired with the encoded
+/// commit-log mutation to apply for that key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccordWriteSetEntry {
+    pub key: Vec<u8>,
+    pub mutation: Vec<u8>,
+}
+
+/// The read a linearizable read-vote performs, mirroring
+/// `ferrosa-cluster`'s `ReadPredicate` wire tags exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum AccordReadPredicate {
+    /// `INSERT IF NOT EXISTS` existence semantics; also the fail-closed default.
+    #[default]
+    NotExists,
+    /// Generic `IF`: read the whole partition's row at `t`.
+    ReadRow { keyspace: String, table: String },
+    /// PostgreSQL snapshot-barrier read-vote.
+    SnapshotBarrier,
+    /// Unconditional commit: no `IF`, always applies after commit.
+    Always,
+    /// A conditional statement on one row (partition + clustering).
+    ReadClusteringRow {
+        keyspace: String,
+        table: String,
+        clustering: Vec<u8>,
+    },
+}
+
+/// The Accord consensus family payloads, mirroring the bincode shapes in
+/// `ferrosa-cluster`'s `accord::wire` module 1:1.
+///
+/// These are the wire contract for [`MessageFamily::Accord`] frames once a peer
+/// has negotiated [`CapnpPayload::Accord`] support; until then Accord messages
+/// ride [`LegacyPayload`]. The [`Self::ApplyV2`] variant is the bulk data path —
+/// a transactional `COPY` rides its whole write-set in one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccordControlMessage {
+    /// Multi-key Apply request (`wire.rs` `ApplyV2Payload`).
+    ApplyV2 {
+        txn_id: AccordTxnId,
+        writes: Vec<AccordWriteSetEntry>,
+    },
+    /// The region-REFERENCE multi-key Apply header. The write-set payload bytes do
+    /// NOT travel here: they follow this message as one contiguous REGION, addressed
+    /// by `offsets[i]`/`lengths[i]` relative to the region's start. The generic
+    /// envelope round-trip carries the index only; the region is spliced on / sliced
+    /// off by [`encode_accord_apply_v2_region`] and
+    /// [`decode_accord_apply_v2_region`].
+    ApplyV2Region {
+        txn_id: AccordTxnId,
+        /// Byte offset of entry `i` within the appended region.
+        offsets: Vec<u64>,
+        /// Byte length of entry `i`.
+        lengths: Vec<u32>,
+        /// Region codec tag (see [`RegionCodec::tag`]); 0 = uncompressed.
+        compression: u8,
+        /// Uncompressed region length.
+        uncompressed_len: u64,
+        /// Block size the region was compressed in (0 = one block).
+        block_bytes: u32,
+    },
+    /// Single-key Apply request (`wire.rs` `ApplyPayload`), the degenerate one-key case.
+    Apply {
+        txn_id: AccordTxnId,
+        result_data: Vec<u8>,
+    },
+    /// Apply acknowledgement (`wire.rs` `ApplyOkPayload`).
+    ApplyOk { txn_id: AccordTxnId, from: u64 },
+    /// Single-key PreAccept probe (`wire.rs` `PreAcceptPayload`).
+    PreAccept {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        key: Vec<u8>,
+        ballot: u64,
+        epoch: u64,
+    },
+    /// Multi-key PreAccept probe carrying every conflict key (`wire.rs` `PreAcceptV2Payload`).
+    PreAcceptV2 {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        keys: Vec<Vec<u8>>,
+        ballot: u64,
+        epoch: u64,
+        snapshot_ts: Option<AccordTxnId>,
+    },
+    /// PreAccept reply (`wire.rs` `PreAcceptOkPayload`).
+    PreAcceptOk {
+        from: u64,
+        t: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+        snapshot_stale: bool,
+    },
+    /// Accept request, slow path (`wire.rs` `AcceptPayload`).
+    Accept {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        t: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+        ballot: u64,
+    },
+    /// Accept reply (`wire.rs` `AcceptOkPayload` — a pre-dependency coordinator's
+    /// shorter body decodes here as an empty `deps`).
+    AcceptOk {
+        txn_id: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+    },
+    /// Commit broadcast (`wire.rs` `CommitPayload`).
+    Commit {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        t: AccordTxnId,
+        deps: Vec<AccordTxnId>,
+    },
+    /// Commit acknowledgement (`wire.rs` `CommitOkPayload`).
+    CommitOk { txn_id: AccordTxnId, from: u64 },
+    /// Recovery probe (`wire.rs` `RecoverPayload`).
+    Recover {
+        txn_id: AccordTxnId,
+        t0: AccordTxnId,
+        ballot: u64,
+    },
+    /// Recovery acknowledgement — carries no payload (the bincode path ships an
+    /// empty body for `AccordRecoverOK`).
+    RecoverOk,
+    /// Linearizable read-vote request (`wire.rs` `ReadVotePayload`).
+    Read {
+        txn_id: AccordTxnId,
+        t: AccordTxnId,
+        key: Vec<u8>,
+        predicate: AccordReadPredicate,
+    },
+    /// Read-vote response (`wire.rs` `ReadVoteOkPayload`).
+    ReadOk {
+        txn_id: AccordTxnId,
+        from: u64,
+        condition_holds: bool,
+        current_row: Vec<u8>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapnpTransportMode {
     LegacyOnly,
@@ -303,6 +456,7 @@ pub enum CapnpPayload {
     Recovery(RecoveryControlMessage),
     Bootstrap(BootstrapControlMessage),
     Stream(StreamControlMessage),
+    Accord(AccordControlMessage),
     Error(CapnpErrorFrame),
     Legacy(LegacyPayload),
 }
@@ -378,35 +532,46 @@ impl From<std::str::Utf8Error> for CapnpDecodeError {
     }
 }
 
+/// Stamp the common envelope header fields (everything except the payload
+/// union) from `envelope` onto a freshly-initialized root builder.
+///
+/// Shared by the generic [`encode_envelope`] path and the direct-from-borrow
+/// Accord Apply encoder [`encode_accord_apply_v2`], so both stamp transport
+/// version, feature bits and trace fields identically and a peer sees one
+/// envelope shape.
+fn stamp_envelope_header(root: &mut envelope::Builder<'_>, envelope: &CapnpEnvelope) {
+    root.set_magic(MAGIC);
+    root.set_transport_version(envelope.transport_version);
+    root.set_min_supported_transport_version(envelope.min_supported_transport_version);
+    root.set_schema_version(envelope.schema_version);
+    root.set_flags(0);
+    root.set_required_features(envelope.required_features);
+    root.set_optional_features(envelope.optional_features);
+    fill_node(root.reborrow().init_sender(), &envelope.sender);
+    if let Some(recipient) = &envelope.recipient {
+        fill_node(root.reborrow().init_recipient(), recipient);
+    }
+    root.set_cluster_id(envelope.cluster_id.as_bytes());
+    root.set_epoch(envelope.epoch);
+    root.set_correlation_id(envelope.correlation_id.as_bytes());
+    if let Some(causation_id) = envelope.causation_id {
+        root.set_causation_id(causation_id.as_bytes());
+    }
+    root.set_stream_id(envelope.stream_id);
+    root.set_sequence(envelope.sequence);
+    root.set_deadline_unix_nanos(envelope.deadline_unix_nanos.unwrap_or(0));
+    root.set_trace_id(&envelope.trace_id);
+    root.set_span_id(&envelope.span_id);
+    root.set_trace_flags(envelope.trace_flags);
+}
+
 pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeError> {
     validate_envelope(envelope)?;
 
     let mut message = message::Builder::new_default();
     {
         let mut root = message.init_root::<envelope::Builder>();
-        root.set_magic(MAGIC);
-        root.set_transport_version(envelope.transport_version);
-        root.set_min_supported_transport_version(envelope.min_supported_transport_version);
-        root.set_schema_version(envelope.schema_version);
-        root.set_flags(0);
-        root.set_required_features(envelope.required_features);
-        root.set_optional_features(envelope.optional_features);
-        fill_node(root.reborrow().init_sender(), &envelope.sender);
-        if let Some(recipient) = &envelope.recipient {
-            fill_node(root.reborrow().init_recipient(), recipient);
-        }
-        root.set_cluster_id(envelope.cluster_id.as_bytes());
-        root.set_epoch(envelope.epoch);
-        root.set_correlation_id(envelope.correlation_id.as_bytes());
-        if let Some(causation_id) = envelope.causation_id {
-            root.set_causation_id(causation_id.as_bytes());
-        }
-        root.set_stream_id(envelope.stream_id);
-        root.set_sequence(envelope.sequence);
-        root.set_deadline_unix_nanos(envelope.deadline_unix_nanos.unwrap_or(0));
-        root.set_trace_id(&envelope.trace_id);
-        root.set_span_id(&envelope.span_id);
-        root.set_trace_flags(envelope.trace_flags);
+        stamp_envelope_header(&mut root, envelope);
 
         match &envelope.payload {
             CapnpPayload::Cluster(cluster) => {
@@ -424,6 +589,11 @@ pub fn encode_envelope(envelope: &CapnpEnvelope) -> Result<Vec<u8>, CapnpDecodeE
             CapnpPayload::Stream(stream) => {
                 root.set_message_family(MessageFamily::Stream);
                 write_stream(stream, root.init_payload().init_stream())?;
+            }
+            CapnpPayload::Accord(accord) => {
+                root.set_message_family(MessageFamily::Accord);
+                root.set_message_kind(accord_message_kind(accord));
+                write_accord(accord, root.init_payload().init_accord())?;
             }
             CapnpPayload::Error(error) => {
                 root.set_message_family(error.failed_family);
@@ -480,6 +650,9 @@ pub fn decode_envelope(bytes: &[u8]) -> Result<CapnpEnvelope, CapnpDecodeError> 
         }
         envelope::payload::Stream(stream) => {
             CapnpPayload::Stream(read_stream(stream.map_err(CapnpDecodeError::from)?)?)
+        }
+        envelope::payload::Accord(accord) => {
+            CapnpPayload::Accord(read_accord(accord.map_err(CapnpDecodeError::from)?)?)
         }
         envelope::payload::Error(error) => {
             CapnpPayload::Error(read_error(error.map_err(CapnpDecodeError::from)?)?)
@@ -678,15 +851,53 @@ fn validate_envelope(envelope: &CapnpEnvelope) -> Result<(), CapnpDecodeError> {
         CapnpPayload::Cluster(_) | CapnpPayload::Recovery(_) | CapnpPayload::Bootstrap(_) => {
             validate_node("sender", &envelope.sender)?;
         }
-        CapnpPayload::Stream(_) | CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => {}
+        CapnpPayload::Stream(_)
+        | CapnpPayload::Accord(_)
+        | CapnpPayload::Error(_)
+        | CapnpPayload::Legacy(_) => {}
     }
     match &envelope.payload {
         CapnpPayload::Cluster(msg) => validate_cluster(msg),
         CapnpPayload::Recovery(msg) => validate_recovery(msg),
         CapnpPayload::Bootstrap(msg) => validate_bootstrap(msg),
         CapnpPayload::Stream(msg) => validate_stream(msg),
+        CapnpPayload::Accord(msg) => validate_accord(msg),
         CapnpPayload::Error(_) | CapnpPayload::Legacy(_) => Ok(()),
     }
+}
+
+/// Validate an Accord payload's shape.
+///
+/// An Accord body carries no sender identity of its own, so — like Stream — it
+/// needs no node check. The one field that must not be silently empty is a
+/// read-vote's target table: a row read with an empty keyspace/table is a
+/// routing bug that would make F+1 agreement meaningless, so it fails loud here
+/// rather than reading the wrong (or no) partition.
+fn validate_accord(msg: &AccordControlMessage) -> Result<(), CapnpDecodeError> {
+    if let AccordControlMessage::Read { predicate, .. } = msg {
+        match predicate {
+            AccordReadPredicate::ReadRow { keyspace, table } => {
+                if keyspace.is_empty() || table.is_empty() {
+                    return Err(CapnpDecodeError::InvalidRequiredField(
+                        "accord read row keyspace/table".to_string(),
+                    ));
+                }
+            }
+            AccordReadPredicate::ReadClusteringRow {
+                keyspace, table, ..
+            } => {
+                if keyspace.is_empty() || table.is_empty() {
+                    return Err(CapnpDecodeError::InvalidRequiredField(
+                        "accord read clustering row keyspace/table".to_string(),
+                    ));
+                }
+            }
+            AccordReadPredicate::NotExists
+            | AccordReadPredicate::SnapshotBarrier
+            | AccordReadPredicate::Always => {}
+        }
+    }
+    Ok(())
 }
 
 fn validate_cluster(msg: &ClusterControlMessage) -> Result<(), CapnpDecodeError> {
@@ -1478,6 +1689,1063 @@ fn read_legacy(reader: legacy_payload::Reader<'_>) -> Result<LegacyPayload, Capn
     })
 }
 
+// ---------------------------------------------------------------------------
+// Accord family adapters (ADR-019).
+//
+// These mirror `ferrosa-cluster`'s `accord::wire` bincode payloads 1:1 so that a
+// capnp-encoded Accord frame decodes to EXACTLY what the bincode frame decoded
+// to. The Apply family is the bulk data path; the rest carry Accord's
+// identity/dependency bookkeeping.
+// ---------------------------------------------------------------------------
+
+/// The bincode `MsgType` discriminant an Accord payload rides under, so a capnp
+/// Accord frame's `messageKind` matches what the bincode frame carried.
+fn accord_message_kind(msg: &AccordControlMessage) -> u16 {
+    let msg_type = match msg {
+        AccordControlMessage::ApplyV2 { .. } => MsgType::AccordApplyV2,
+        AccordControlMessage::ApplyV2Region { .. } => MsgType::AccordApplyV2Region,
+        AccordControlMessage::Apply { .. } => MsgType::AccordApply,
+        AccordControlMessage::ApplyOk { .. } => MsgType::AccordApplyOK,
+        AccordControlMessage::PreAccept { .. } => MsgType::AccordPreAccept,
+        AccordControlMessage::PreAcceptV2 { .. } => MsgType::AccordPreAcceptV2,
+        AccordControlMessage::PreAcceptOk { .. } => MsgType::AccordPreAcceptOK,
+        AccordControlMessage::Accept { .. } => MsgType::AccordAccept,
+        AccordControlMessage::AcceptOk { .. } => MsgType::AccordAcceptOK,
+        AccordControlMessage::Commit { .. } => MsgType::AccordCommit,
+        // There is no `AccordCommitOK` wire code: the commit ack reuses the
+        // request's discriminant, exactly as it does on the bincode path.
+        AccordControlMessage::CommitOk { .. } => MsgType::AccordCommit,
+        AccordControlMessage::Recover { .. } => MsgType::AccordRecover,
+        AccordControlMessage::RecoverOk => MsgType::AccordRecoverOK,
+        AccordControlMessage::Read { .. } => MsgType::AccordRead,
+        AccordControlMessage::ReadOk { .. } => MsgType::AccordReadOK,
+    };
+    msg_type as u16
+}
+
+fn write_accord_txn_id(txn_id: AccordTxnId, mut builder: accord_txn_id::Builder<'_>) {
+    builder.set_epoch(txn_id.epoch);
+    builder.set_time(txn_id.time);
+    builder.set_seq(txn_id.seq);
+    builder.set_node(txn_id.node);
+}
+
+fn read_accord_txn_id(reader: accord_txn_id::Reader<'_>) -> AccordTxnId {
+    AccordTxnId {
+        epoch: reader.get_epoch(),
+        time: reader.get_time(),
+        seq: reader.get_seq(),
+        node: reader.get_node(),
+    }
+}
+
+fn read_accord_txn_ids(
+    reader: capnp::struct_list::Reader<'_, accord_txn_id::Owned>,
+) -> Result<Vec<AccordTxnId>, CapnpDecodeError> {
+    (0..reader.len())
+        .map(|idx| Ok(read_accord_txn_id(reader.get(idx))))
+        .collect()
+}
+
+fn write_accord_txn_ids(
+    deps: &[AccordTxnId],
+    builder: capnp::struct_list::Builder<'_, accord_txn_id::Owned>,
+) {
+    let mut builder = builder;
+    for (idx, dep) in deps.iter().enumerate() {
+        write_accord_txn_id(*dep, builder.reborrow().get(idx as u32));
+    }
+}
+
+fn write_accord_writes(
+    writes: &[AccordWriteSetEntry],
+    builder: capnp::struct_list::Builder<'_, accord_write_set_entry::Owned>,
+) {
+    let mut builder = builder;
+    for (idx, write) in writes.iter().enumerate() {
+        let mut entry = builder.reborrow().get(idx as u32);
+        entry.set_key(&write.key);
+        entry.set_mutation(&write.mutation);
+    }
+}
+
+fn read_accord_writes(
+    reader: capnp::struct_list::Reader<'_, accord_write_set_entry::Owned>,
+) -> Result<Vec<AccordWriteSetEntry>, CapnpDecodeError> {
+    (0..reader.len())
+        .map(|idx| {
+            let entry = reader.get(idx);
+            Ok(AccordWriteSetEntry {
+                key: entry.get_key()?.to_vec(),
+                mutation: entry.get_mutation()?.to_vec(),
+            })
+        })
+        .collect()
+}
+
+fn write_accord_read_predicate(
+    predicate: &AccordReadPredicate,
+    builder: accord_read_predicate::Builder<'_>,
+) {
+    let mut op = builder.init_op();
+    match predicate {
+        AccordReadPredicate::NotExists => op.set_not_exists(()),
+        AccordReadPredicate::ReadRow { keyspace, table } => {
+            let mut row = op.init_read_row();
+            row.set_keyspace(keyspace);
+            row.set_table(table);
+        }
+        AccordReadPredicate::SnapshotBarrier => op.set_snapshot_barrier(()),
+        AccordReadPredicate::Always => op.set_always(()),
+        AccordReadPredicate::ReadClusteringRow {
+            keyspace,
+            table,
+            clustering,
+        } => {
+            let mut row = op.init_read_clustering_row();
+            row.set_keyspace(keyspace);
+            row.set_table(table);
+            row.set_clustering(clustering);
+        }
+    }
+}
+
+fn read_accord_read_predicate(
+    reader: accord_read_predicate::Reader<'_>,
+) -> Result<AccordReadPredicate, CapnpDecodeError> {
+    use accord_read_predicate::op;
+    Ok(match reader.get_op().which().map_err(not_in_schema)? {
+        op::NotExists(()) => AccordReadPredicate::NotExists,
+        op::ReadRow(row) => {
+            let row = row?;
+            AccordReadPredicate::ReadRow {
+                keyspace: row.get_keyspace()?.to_string()?,
+                table: row.get_table()?.to_string()?,
+            }
+        }
+        op::SnapshotBarrier(()) => AccordReadPredicate::SnapshotBarrier,
+        op::Always(()) => AccordReadPredicate::Always,
+        op::ReadClusteringRow(row) => {
+            let row = row?;
+            AccordReadPredicate::ReadClusteringRow {
+                keyspace: row.get_keyspace()?.to_string()?,
+                table: row.get_table()?.to_string()?,
+                clustering: row.get_clustering()?.to_vec(),
+            }
+        }
+    })
+}
+
+fn write_accord(
+    msg: &AccordControlMessage,
+    builder: accord_control::Builder<'_>,
+) -> Result<(), CapnpDecodeError> {
+    match msg {
+        AccordControlMessage::ApplyV2 { txn_id, writes } => {
+            let mut out = builder.init_op().init_apply_v2();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_writes(writes, out.init_writes(writes.len() as u32));
+        }
+        AccordControlMessage::ApplyV2Region {
+            txn_id,
+            offsets,
+            lengths,
+            compression,
+            uncompressed_len,
+            block_bytes,
+        } => {
+            let mut out = builder.init_op().init_apply_v2_region();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_entry_count(offsets.len() as u32);
+            {
+                let mut list = out.reborrow().init_offsets(offsets.len() as u32);
+                for (idx, offset) in offsets.iter().enumerate() {
+                    list.set(idx as u32, *offset);
+                }
+            }
+            {
+                let mut list = out.reborrow().init_lengths(lengths.len() as u32);
+                for (idx, len) in lengths.iter().enumerate() {
+                    list.set(idx as u32, *len);
+                }
+            }
+            out.set_compression(*compression);
+            out.set_uncompressed_len(*uncompressed_len);
+            out.set_block_bytes(*block_bytes);
+        }
+        AccordControlMessage::Apply {
+            txn_id,
+            result_data,
+        } => {
+            let mut out = builder.init_op().init_apply();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_result_data(result_data);
+        }
+        AccordControlMessage::ApplyOk { txn_id, from } => {
+            let mut out = builder.init_op().init_apply_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_from(*from);
+        }
+        AccordControlMessage::PreAccept {
+            txn_id,
+            t0,
+            key,
+            ballot,
+            epoch,
+        } => {
+            let mut out = builder.init_op().init_pre_accept();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            out.set_key(key);
+            out.set_ballot(*ballot);
+            out.set_epoch(*epoch);
+        }
+        AccordControlMessage::PreAcceptV2 {
+            txn_id,
+            t0,
+            keys,
+            ballot,
+            epoch,
+            snapshot_ts,
+        } => {
+            let mut out = builder.init_op().init_pre_accept_v2();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            {
+                let mut list = out.reborrow().init_keys(keys.len() as u32);
+                for (idx, key) in keys.iter().enumerate() {
+                    list.set(idx as u32, key);
+                }
+            }
+            out.set_ballot(*ballot);
+            out.set_epoch(*epoch);
+            if let Some(snapshot_ts) = snapshot_ts {
+                write_accord_txn_id(*snapshot_ts, out.init_snapshot_ts());
+            }
+        }
+        AccordControlMessage::PreAcceptOk {
+            from,
+            t,
+            deps,
+            snapshot_stale,
+        } => {
+            let mut out = builder.init_op().init_pre_accept_ok();
+            out.set_from(*from);
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            write_accord_txn_ids(deps, out.reborrow().init_deps(deps.len() as u32));
+            out.set_snapshot_stale(*snapshot_stale);
+        }
+        AccordControlMessage::Accept {
+            txn_id,
+            t0,
+            t,
+            deps,
+            ballot,
+        } => {
+            let mut out = builder.init_op().init_accept();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            write_accord_txn_ids(deps, out.reborrow().init_deps(deps.len() as u32));
+            out.set_ballot(*ballot);
+        }
+        AccordControlMessage::AcceptOk { txn_id, deps } => {
+            let mut out = builder.init_op().init_accept_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_ids(deps, out.init_deps(deps.len() as u32));
+        }
+        AccordControlMessage::Commit {
+            txn_id,
+            t0,
+            t,
+            deps,
+        } => {
+            let mut out = builder.init_op().init_commit();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            write_accord_txn_ids(deps, out.init_deps(deps.len() as u32));
+        }
+        AccordControlMessage::CommitOk { txn_id, from } => {
+            let mut out = builder.init_op().init_commit_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_from(*from);
+        }
+        AccordControlMessage::Recover { txn_id, t0, ballot } => {
+            let mut out = builder.init_op().init_recover();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t0, out.reborrow().init_t0());
+            out.set_ballot(*ballot);
+        }
+        AccordControlMessage::RecoverOk => {
+            builder.init_op().set_recover_ok(());
+        }
+        AccordControlMessage::Read {
+            txn_id,
+            t,
+            key,
+            predicate,
+        } => {
+            let mut out = builder.init_op().init_read();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            write_accord_txn_id(*t, out.reborrow().init_t());
+            out.set_key(key);
+            write_accord_read_predicate(predicate, out.init_predicate());
+        }
+        AccordControlMessage::ReadOk {
+            txn_id,
+            from,
+            condition_holds,
+            current_row,
+        } => {
+            let mut out = builder.init_op().init_read_ok();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_from(*from);
+            out.set_condition_holds(*condition_holds);
+            out.set_current_row(current_row);
+        }
+    }
+    Ok(())
+}
+
+fn read_accord(
+    reader: accord_control::Reader<'_>,
+) -> Result<AccordControlMessage, CapnpDecodeError> {
+    use accord_control::op;
+    Ok(match reader.get_op().which().map_err(not_in_schema)? {
+        op::ApplyV2(apply) => {
+            let apply = apply?;
+            AccordControlMessage::ApplyV2 {
+                txn_id: read_accord_txn_id(apply.get_txn_id()?),
+                writes: read_accord_writes(apply.get_writes()?)?,
+            }
+        }
+        op::ApplyV2Region(region) => {
+            let region = region?;
+            let offsets = region.get_offsets()?.iter().collect();
+            let lengths = region.get_lengths()?.iter().collect();
+            AccordControlMessage::ApplyV2Region {
+                txn_id: read_accord_txn_id(region.get_txn_id()?),
+                offsets,
+                lengths,
+                compression: region.get_compression(),
+                uncompressed_len: region.get_uncompressed_len(),
+                block_bytes: region.get_block_bytes(),
+            }
+        }
+        op::Apply(apply) => {
+            let apply = apply?;
+            AccordControlMessage::Apply {
+                txn_id: read_accord_txn_id(apply.get_txn_id()?),
+                result_data: apply.get_result_data()?.to_vec(),
+            }
+        }
+        op::ApplyOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::ApplyOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                from: ok.get_from(),
+            }
+        }
+        op::PreAccept(v) => {
+            let v = v?;
+            AccordControlMessage::PreAccept {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                key: v.get_key()?.to_vec(),
+                ballot: v.get_ballot(),
+                epoch: v.get_epoch(),
+            }
+        }
+        op::PreAcceptV2(v) => {
+            let v = v?;
+            let keys = v.get_keys()?;
+            let keys = (0..keys.len())
+                .map(|idx| keys.get(idx).map(<[u8]>::to_vec))
+                .collect::<Result<Vec<_>, _>>()?;
+            AccordControlMessage::PreAcceptV2 {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                keys,
+                ballot: v.get_ballot(),
+                epoch: v.get_epoch(),
+                snapshot_ts: if v.has_snapshot_ts() {
+                    Some(read_accord_txn_id(v.get_snapshot_ts()?))
+                } else {
+                    None
+                },
+            }
+        }
+        op::PreAcceptOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::PreAcceptOk {
+                from: ok.get_from(),
+                t: read_accord_txn_id(ok.get_t()?),
+                deps: read_accord_txn_ids(ok.get_deps()?)?,
+                snapshot_stale: ok.get_snapshot_stale(),
+            }
+        }
+        op::Accept(v) => {
+            let v = v?;
+            AccordControlMessage::Accept {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                t: read_accord_txn_id(v.get_t()?),
+                deps: read_accord_txn_ids(v.get_deps()?)?,
+                ballot: v.get_ballot(),
+            }
+        }
+        op::AcceptOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::AcceptOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                deps: read_accord_txn_ids(ok.get_deps()?)?,
+            }
+        }
+        op::Commit(v) => {
+            let v = v?;
+            AccordControlMessage::Commit {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                t: read_accord_txn_id(v.get_t()?),
+                deps: read_accord_txn_ids(v.get_deps()?)?,
+            }
+        }
+        op::CommitOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::CommitOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                from: ok.get_from(),
+            }
+        }
+        op::Recover(v) => {
+            let v = v?;
+            AccordControlMessage::Recover {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t0: read_accord_txn_id(v.get_t0()?),
+                ballot: v.get_ballot(),
+            }
+        }
+        op::RecoverOk(()) => AccordControlMessage::RecoverOk,
+        op::Read(v) => {
+            let v = v?;
+            AccordControlMessage::Read {
+                txn_id: read_accord_txn_id(v.get_txn_id()?),
+                t: read_accord_txn_id(v.get_t()?),
+                key: v.get_key()?.to_vec(),
+                predicate: read_accord_read_predicate(v.get_predicate()?)?,
+            }
+        }
+        op::ReadOk(ok) => {
+            let ok = ok?;
+            AccordControlMessage::ReadOk {
+                txn_id: read_accord_txn_id(ok.get_txn_id()?),
+                from: ok.get_from(),
+                condition_holds: ok.get_condition_holds(),
+                current_row: ok.get_current_row()?.to_vec(),
+            }
+        }
+    })
+}
+
+/// Encode one Accord payload into a standalone capnp envelope.
+///
+/// The transport-version and feature fields are stamped exactly as the generic
+/// [`encode_envelope`] path stamps them, so a frame produced here is the frame a
+/// peer that negotiated [`CapnpPayload::Accord`] receives.
+pub fn encode_accord_envelope(payload: &AccordControlMessage) -> Result<Vec<u8>, CapnpDecodeError> {
+    encode_envelope(&base_envelope(
+        Uuid::nil(),
+        0,
+        CapnpPayload::Accord(payload.clone()),
+    ))
+}
+
+/// Decode a frame produced by [`encode_accord_envelope`] back to its Accord payload.
+pub fn decode_accord_envelope(bytes: &[u8]) -> Result<AccordControlMessage, CapnpDecodeError> {
+    match decode_envelope(bytes)?.payload {
+        CapnpPayload::Accord(payload) => Ok(payload),
+        other => Err(CapnpDecodeError::UnknownPayload(format!(
+            "expected an Accord payload, found {other:?}"
+        ))),
+    }
+}
+
+/// Encode a multi-key Accord Apply (`AccordControlMessage::ApplyV2`) directly from
+/// borrowed `(key, mutation)` byte slices, writing each entry straight into the
+/// capnp arena as it is visited.
+///
+/// This is the hot-path encoder for a transactional bulk load (`pgbench -i`'s
+/// `TRUNCATE + COPY + COMMIT`, ~1M rows in ONE transaction). The coordinator walks
+/// its write-set once and copies each entry's bytes once INTO the message. There is
+/// no intermediate owned `Vec<AccordWriteSetEntry>` and no clone of the write-set —
+/// which is exactly the extra alloc-per-entry plus full-write-set clone that a
+/// `encode_accord_envelope(&ApplyV2Payload::to_capnp())` call would pay on top of the
+/// copy the wire itself needs.
+///
+/// `writes` is an `ExactSizeIterator` so the capnp list is sized once
+/// (`init_writes(len)`) and never reallocated.
+pub fn encode_accord_apply_v2<'a, I>(
+    txn_id: AccordTxnId,
+    writes: I,
+) -> Result<Vec<u8>, CapnpDecodeError>
+where
+    I: ExactSizeIterator<Item = (&'a [u8], &'a [u8])>,
+{
+    // Build the header from the same shape `encode_accord_envelope` stamps, so a
+    // peer cannot tell the two encoders apart except by the payload bytes.
+    let base = base_envelope(
+        Uuid::nil(),
+        0,
+        CapnpPayload::Accord(AccordControlMessage::ApplyV2 {
+            txn_id,
+            writes: Vec::new(),
+        }),
+    );
+    let mut message = message::Builder::new_default();
+    {
+        let mut root = message.init_root::<envelope::Builder>();
+        stamp_envelope_header(&mut root, &base);
+        root.set_message_family(MessageFamily::Accord);
+        root.set_message_kind(MsgType::AccordApplyV2 as u16);
+        let mut apply = root.init_payload().init_accord().init_op().init_apply_v2();
+        write_accord_txn_id(txn_id, apply.reborrow().init_txn_id());
+        let mut list = apply.init_writes(writes.len() as u32);
+        for (idx, (key, mutation)) in writes.enumerate() {
+            let mut entry = list.reborrow().get(idx as u32);
+            entry.set_key(key);
+            entry.set_mutation(mutation);
+        }
+    }
+    Ok(serialize::write_message_to_words(&message))
+}
+
+/// Decode a frame produced by [`encode_accord_apply_v2`] (or the generic
+/// [`encode_accord_envelope`]) and assert it is the multi-key Apply payload.
+///
+/// Fails loud on a frame that is a valid Accord envelope of a DIFFERENT kind: a
+/// mis-routed Apply reply must never be silently reinterpreted as an Apply.
+pub fn decode_accord_apply_v2(bytes: &[u8]) -> Result<AccordControlMessage, CapnpDecodeError> {
+    match decode_accord_envelope(bytes)? {
+        payload @ AccordControlMessage::ApplyV2 { .. } => Ok(payload),
+        other => Err(CapnpDecodeError::UnknownPayload(format!(
+            "expected an ApplyV2 payload, found a different Accord kind: {other:?}"
+        ))),
+    }
+}
+
+/// Region payload compression codec — one tag per codec already in the dependency set
+/// (`lz4_flex`, `snap`, `zstd`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegionCodec {
+    /// No compression: the region is sent verbatim (the default).
+    None,
+    /// LZ4 block format: the cheap, fast end.
+    Lz4,
+    /// Snappy: fast, comparable to LZ4.
+    Snap,
+    /// Zstandard: the ratio end; honours [`RegionCompression::level`].
+    Zstd,
+}
+
+impl RegionCodec {
+    /// The wire tag for this codec.
+    pub fn tag(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Lz4 => 1,
+            Self::Snap => 2,
+            Self::Zstd => 3,
+        }
+    }
+
+    /// Decode a wire tag, failing loud on a codec this build does not know.
+    pub fn from_tag(tag: u8) -> Result<Self, CapnpDecodeError> {
+        Ok(match tag {
+            0 => Self::None,
+            1 => Self::Lz4,
+            2 => Self::Snap,
+            3 => Self::Zstd,
+            other => {
+                return Err(CapnpDecodeError::MalformedFrame(format!(
+                    "unknown region compression codec tag {other}"
+                )))
+            }
+        })
+    }
+}
+
+impl std::fmt::Display for RegionCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::None => "none",
+            Self::Lz4 => "lz4",
+            Self::Snap => "snappy",
+            Self::Zstd => "zstd",
+        })
+    }
+}
+
+/// The compression a coordinator applies to an Apply region.
+///
+/// `codec == None` is the default and reproduces the pre-compression wire exactly. The
+/// other fields only matter when a codec is selected:
+/// - `level` is the codec level where the codec has one (Zstd); the fixed-level codecs
+///   ignore it.
+/// - `block_bytes` is the block size the region is compressed in (0 = one block).
+/// - `min_bytes` is the frame size below which no compression is attempted — on a small
+///   frame the CPU cost plus the block headers lose to just sending the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegionCompression {
+    pub codec: RegionCodec,
+    pub level: i32,
+    pub block_bytes: usize,
+    pub min_bytes: usize,
+}
+
+impl RegionCompression {
+    /// The default: no compression, byte-identical to the pre-compression wire.
+    pub const NONE: Self = Self {
+        codec: RegionCodec::None,
+        level: 3,
+        block_bytes: 0,
+        min_bytes: usize::MAX,
+    };
+
+    /// Whether no compression will be applied.
+    pub fn is_none(&self) -> bool {
+        matches!(self.codec, RegionCodec::None)
+    }
+}
+
+fn compress_block(
+    codec: RegionCodec,
+    level: i32,
+    block: &[u8],
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    Ok(match codec {
+        RegionCodec::None => block.to_vec(),
+        RegionCodec::Lz4 => lz4_flex::block::compress(block),
+        RegionCodec::Snap => snap::raw::Encoder::new()
+            .compress_vec(block)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("snappy compress: {e}")))?,
+        RegionCodec::Zstd => zstd::bulk::compress(block, level)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("zstd compress: {e}")))?,
+    })
+}
+
+fn decompress_block(
+    codec: RegionCodec,
+    block: &[u8],
+    expected_len: usize,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    Ok(match codec {
+        RegionCodec::None => block.to_vec(),
+        RegionCodec::Lz4 => lz4_flex::block::decompress(block, expected_len)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("lz4 decompress: {e}")))?,
+        RegionCodec::Snap => snap::raw::Decoder::new()
+            .decompress_vec(block)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("snappy decompress: {e}")))?,
+        RegionCodec::Zstd => zstd::bulk::decompress(block, expected_len)
+            .map_err(|e| CapnpDecodeError::MalformedFrame(format!("zstd decompress: {e}")))?,
+    })
+}
+
+/// Compress a region into a blocked, length-prefixed stream: for each block, a `u32`
+/// little-endian compressed length followed by the compressed bytes. The block's
+/// UNCOMPRESSED size is `block_bytes` except for the last block (which is the
+/// remainder), so the decoder needs only `uncompressed_len` + `block_bytes` to read it.
+fn compress_region(
+    region: &[u8],
+    codec: RegionCodec,
+    level: i32,
+    block_bytes: usize,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    let block_bytes = block_bytes.max(1);
+    let mut out = Vec::with_capacity(region.len());
+    let mut off = 0usize;
+    while off < region.len() {
+        let end = (off + block_bytes).min(region.len());
+        let compressed = compress_block(codec, level, &region[off..end])?;
+        let len = u32::try_from(compressed.len()).map_err(|_| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "compressed block of {} bytes exceeds the u32 framing bound",
+                compressed.len()
+            ))
+        })?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&compressed);
+        off = end;
+    }
+    Ok(out)
+}
+
+fn decompress_region(
+    payload: &[u8],
+    codec: RegionCodec,
+    uncompressed_len: usize,
+    block_bytes: usize,
+) -> Result<Vec<u8>, CapnpDecodeError> {
+    let block_bytes = block_bytes.max(1);
+    let mut out = Vec::with_capacity(uncompressed_len);
+    let mut pos = 0usize;
+    while pos < payload.len() {
+        let len_bytes = payload.get(pos..pos + 4).ok_or_else(|| {
+            CapnpDecodeError::MalformedFrame(
+                "region block framing: truncated u32 length prefix".into(),
+            )
+        })?;
+        let len = u32::from_le_bytes(len_bytes.try_into().expect("4 bytes")) as usize;
+        pos += 4;
+        let end = pos.checked_add(len).ok_or_else(|| {
+            CapnpDecodeError::MalformedFrame("region block length overflows usize".into())
+        })?;
+        let block = payload.get(pos..end).ok_or_else(|| {
+            CapnpDecodeError::MalformedFrame(format!(
+                "region block {pos}..{end} escapes the {} byte payload",
+                payload.len()
+            ))
+        })?;
+        let remaining = uncompressed_len.saturating_sub(out.len());
+        let expected = block_bytes.min(remaining);
+        out.extend_from_slice(&decompress_block(codec, block, expected)?);
+        pos = end;
+    }
+    if out.len() != uncompressed_len {
+        return Err(CapnpDecodeError::MalformedFrame(format!(
+            "region decompressed to {} bytes, expected {uncompressed_len}",
+            out.len()
+        )));
+    }
+    Ok(out)
+}
+
+/// Encode a multi-key Accord Apply as a region-REFERENCE frame, uncompressed.
+///
+/// The frame is a capnp HEADER (the transaction stamp plus a parallel
+/// `offsets`/`lengths` index) followed by ONE contiguous REGION that concatenates the
+/// borrowed `mutations`, in order — entry `i` is `region[offsets[i]..offsets[i]+lengths[i]]`.
+///
+/// This is the hot-path encoder for a transactional bulk load. The coordinator passes
+/// the write-set's mutation slices as returned by
+/// `WriteSetSpill::entry` (each a slice of the spill's memory map), and each entry's
+/// bytes are appended to the region exactly ONCE, as a bulk copy — never into a capnp
+/// struct, so there is no per-entry arena node and no per-entry small allocation. The
+/// partition KEY is not carried: the frame is already scoped to the peer's keys and the
+/// replica applies the mutation bytes in order.
+pub fn encode_accord_apply_v2_region<'a, I>(
+    txn_id: AccordTxnId,
+    mutations: I,
+) -> Result<Vec<u8>, CapnpDecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    encode_accord_apply_v2_region_with_compression(txn_id, mutations, RegionCompression::NONE)
+}
+
+/// [`encode_accord_apply_v2_region`] with an optional region compression.
+///
+/// When `cfg` selects a codec AND the region is at least `cfg.min_bytes`, the region is
+/// compressed in `cfg.block_bytes` blocks (see `compress_region`); the header records
+/// the codec tag, the uncompressed length and the block size so the peer can decompress
+/// and address entries by the SAME `(offset, length)` index. If the compressed region is
+/// not smaller than the raw one, or the region is below `min_bytes`, the frame is sent
+/// uncompressed — compression must never inflate a frame.
+pub fn encode_accord_apply_v2_region_with_compression<'a, I>(
+    txn_id: AccordTxnId,
+    mutations: I,
+    cfg: RegionCompression,
+) -> Result<Vec<u8>, CapnpDecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut offsets: Vec<u64> = Vec::new();
+    let mut lengths: Vec<u32> = Vec::new();
+    // Resolve the borrowed mutations into a slice list and the parallel
+    // `offsets`/`lengths` index in ONE pass, WITHOUT building the region yet.
+    // The region is appended to the frame exactly once, below. Building it first
+    // and then copying it into the header (the previous shape) needed a full
+    // extra copy of the peer's whole shard: a 236 MB Apply frame briefly cost
+    // ~2x its size in RSS, which the COMMIT residency probe measured as the
+    // fan-out's dominant transient at a ~1.1M-row commit. The slice list costs
+    // 16 bytes per entry and borrows the write-set — it copies nothing.
+    let mut entries: Vec<&[u8]> = Vec::new();
+    let mut region_len: usize = 0;
+    for mutation in mutations {
+        let len = u32::try_from(mutation.len()).map_err(|_| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry of {} bytes exceeds the u32 length bound",
+                mutation.len()
+            ))
+        })?;
+        offsets.push(region_len as u64);
+        lengths.push(len);
+        region_len += mutation.len();
+        entries.push(mutation);
+    }
+    let uncompressed_len = region_len as u64;
+    // Effective block size: the configured one, or the whole region (one block) when 0.
+    let effective_block = if cfg.block_bytes == 0 {
+        region_len.max(1)
+    } else {
+        cfg.block_bytes
+    };
+    let try_compress = !cfg.is_none() && region_len > 0 && region_len >= cfg.min_bytes;
+    let (compression, block_bytes, compressed) = if try_compress {
+        // A codec needs the region contiguous to block-compress it, so this path
+        // still materializes it once (compression is opt-in and off by default).
+        let mut region: Vec<u8> = Vec::with_capacity(region_len);
+        for entry in &entries {
+            region.extend_from_slice(entry);
+        }
+        let compressed = compress_region(&region, cfg.codec, cfg.level, effective_block)?;
+        if compressed.len() < region.len() {
+            (
+                cfg.codec.tag(),
+                u32::try_from(effective_block).unwrap_or(u32::MAX),
+                Some(compressed),
+            )
+        } else {
+            // The codec did not shrink the region: never inflate a frame.
+            (RegionCodec::None.tag(), 0u32, None)
+        }
+    } else {
+        (RegionCodec::None.tag(), 0u32, None)
+    };
+    let mut header = encode_accord_envelope(&AccordControlMessage::ApplyV2Region {
+        txn_id,
+        offsets,
+        lengths,
+        compression,
+        uncompressed_len,
+        block_bytes,
+    })?;
+    match compressed {
+        // The compressed block is already contiguous; append it once.
+        Some(compressed) => header.extend_from_slice(&compressed),
+        // Uncompressed: append the region straight from the borrowed write-set
+        // slices into the ONE frame buffer. No intermediate region `Vec`.
+        None => {
+            header.reserve(region_len);
+            for entry in &entries {
+                header.extend_from_slice(entry);
+            }
+        }
+    }
+    Ok(header)
+}
+
+/// A BORROWED view of a region-REFERENCE Apply frame: the header's transaction stamp
+/// plus an index into the appended region.
+///
+/// The region bytes are not copied out of the received body — [`Self::entry`] and
+/// [`Self::mutations`] hand out `&[u8]` slices of it, so the peer decodes the frame by
+/// OFFSET rather than parsing it into owned per-entry structures.
+#[derive(Debug)]
+pub struct AccordApplyV2RegionView<'a> {
+    /// The transaction the write-set belongs to.
+    pub txn_id: AccordTxnId,
+    /// The region bytes. Borrowed from the received body when the frame was sent
+    /// uncompressed; OWNED (decompressed into this view) when a codec was applied.
+    region: std::borrow::Cow<'a, [u8]>,
+    offsets: Vec<u64>,
+    lengths: Vec<u32>,
+    compression: RegionCodec,
+}
+
+impl<'a> AccordApplyV2RegionView<'a> {
+    /// Number of write-set entries.
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Whether the frame carries no write-set entries.
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// The raw region bytes (borrowed from the body, or the view's own decompressed
+    /// buffer when the frame was compressed).
+    pub fn region(&self) -> &[u8] {
+        &self.region
+    }
+
+    /// The codec that was applied to the region ([`RegionCodec::None`] if uncompressed).
+    pub fn compression(&self) -> RegionCodec {
+        self.compression
+    }
+
+    /// Borrow entry `index` by its `(offset, length)` — a slice of the region.
+    ///
+    /// FAILS LOUD on an index that was never present and on a range that escapes the
+    /// region: a corrupt index must never read past the received body.
+    pub fn entry(&self, index: usize) -> Result<&[u8], CapnpDecodeError> {
+        let (&offset, &len) = self
+            .offsets
+            .get(index)
+            .zip(self.lengths.get(index))
+            .ok_or_else(|| {
+                CapnpDecodeError::InvalidRequiredField(format!(
+                    "accord apply region: entry {index} is out of range ({} entries)",
+                    self.offsets.len()
+                ))
+            })?;
+        let start = usize::try_from(offset).map_err(|_| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry {index} offset {offset} does not fit in usize"
+            ))
+        })?;
+        let end = start.checked_add(len as usize).ok_or_else(|| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry {index} range {start}..(start+{len}) overflows usize"
+            ))
+        })?;
+        self.region.get(start..end).ok_or_else(|| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry {index} range {start}..{end} escapes the {} byte region",
+                self.region.len()
+            ))
+        })
+    }
+
+    /// Borrow every entry in write-set order.
+    pub fn mutations(&self) -> impl Iterator<Item = Result<&[u8], CapnpDecodeError>> + '_ {
+        (0..self.len()).map(move |index| self.entry(index))
+    }
+
+    /// The region length the index claims: `sum(lengths)`.
+    pub fn indexed_region_len(&self) -> u64 {
+        self.lengths.iter().map(|&len| u64::from(len)).sum()
+    }
+
+    /// FAIL LOUD unless the index is a self-consistent contiguous partition of the
+    /// region: `offsets` and `lengths` parallel and non-empty, `offsets[i+1] ==
+    /// offsets[i] + lengths[i]`, `offsets[0] == 0`, and the entries cover the region
+    /// exactly. A header whose index does not cover the region is corrupt, and a peer
+    /// must never apply a silently truncated or misaligned write-set.
+    fn validate(&self) -> Result<(), CapnpDecodeError> {
+        if self.offsets.len() != self.lengths.len() {
+            return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: {} offsets but {} lengths",
+                self.offsets.len(),
+                self.lengths.len()
+            )));
+        }
+        let mut expected: u64 = 0;
+        for (index, (&offset, &len)) in self.offsets.iter().zip(&self.lengths).enumerate() {
+            if offset != expected {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "accord apply region: entry {index} offset {offset} is not the contiguous \
+                     position {expected}"
+                )));
+            }
+            expected = expected.checked_add(u64::from(len)).ok_or_else(|| {
+                CapnpDecodeError::InvalidRequiredField(format!(
+                    "accord apply region: entry {index} makes the running length overflow u64"
+                ))
+            })?;
+        }
+        // Every entry must be in bounds (this also catches the LAST entry's end).
+        for index in 0..self.len() {
+            self.entry(index)?;
+        }
+        if expected != self.region.len() as u64 {
+            return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: index claims {expected} bytes but the region holds {}",
+                self.region.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Decode a frame produced by [`encode_accord_apply_v2_region`] into a BORROWED view.
+///
+/// The capnp header is read out of a `Cursor` to find where the message ends; the
+/// region is everything after it. When the header names a codec the region is
+/// decompressed into an owned buffer held by the view (see
+/// [`decode_accord_apply_v2_region`]'s `Cow`); when it is uncompressed the view borrows
+/// the received body directly. Either way the entries are read BY OFFSET — no owned
+/// per-entry structure is produced.
+pub fn decode_accord_apply_v2_region(
+    bytes: &[u8],
+) -> Result<AccordApplyV2RegionView<'_>, CapnpDecodeError> {
+    // Find where the capnp header message ends: `read_message` consumes exactly one
+    // message from the cursor, leaving the position at the region's first byte. The
+    // reader is dropped before the position is read, so no message data is retained.
+    let header_len = {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let _reader = serialize::read_message(
+            &mut cursor,
+            message::ReaderOptions {
+                traversal_limit_in_words: Some(8 * 1024 * 1024),
+                nesting_limit: 64,
+            },
+        )?;
+        usize::try_from(cursor.position()).map_err(|_| {
+            CapnpDecodeError::MalformedFrame("region frame header length overflows usize".into())
+        })?
+    };
+    let raw_payload = bytes.get(header_len..).ok_or_else(|| {
+        CapnpDecodeError::MalformedFrame(format!(
+            "region frame header of {header_len} bytes is longer than the {} byte body",
+            bytes.len()
+        ))
+    })?;
+    let (txn_id, offsets, lengths, codec, uncompressed_len, block_bytes) =
+        match decode_accord_envelope(bytes)? {
+            AccordControlMessage::ApplyV2Region {
+                txn_id,
+                offsets,
+                lengths,
+                compression,
+                uncompressed_len,
+                block_bytes,
+            } => (
+                txn_id,
+                offsets,
+                lengths,
+                RegionCodec::from_tag(compression)?,
+                uncompressed_len,
+                block_bytes,
+            ),
+            other => {
+                return Err(CapnpDecodeError::UnknownPayload(format!(
+                    "expected an applyV2Region payload, found a different Accord kind: {other:?}"
+                )))
+            }
+        };
+    let uncompressed_len = usize::try_from(uncompressed_len).map_err(|_| {
+        CapnpDecodeError::MalformedFrame("region uncompressed length overflows usize".into())
+    })?;
+    let region: std::borrow::Cow<'_, [u8]> = match codec {
+        RegionCodec::None => {
+            if raw_payload.len() != uncompressed_len {
+                return Err(CapnpDecodeError::MalformedFrame(format!(
+                    "region frame claims {uncompressed_len} bytes but carries {}",
+                    raw_payload.len()
+                )));
+            }
+            std::borrow::Cow::Borrowed(raw_payload)
+        }
+        _ => std::borrow::Cow::Owned(decompress_region(
+            raw_payload,
+            codec,
+            uncompressed_len,
+            block_bytes as usize,
+        )?),
+    };
+    let view = AccordApplyV2RegionView {
+        txn_id,
+        region,
+        offsets,
+        lengths,
+        compression: codec,
+    };
+    view.validate()?;
+    Ok(view)
+}
+
 fn read_required_uuid(field: &str, data: &[u8]) -> Result<Uuid, CapnpDecodeError> {
     let id = read_optional_uuid(data)?.ok_or_else(|| {
         CapnpDecodeError::InvalidRequiredField(format!("{field} must be 16 bytes"))
@@ -1606,7 +2874,9 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::AccordRecover
             | MsgType::AccordRecoverOK
             | MsgType::AccordPreAcceptV2
-            | MsgType::AccordApplyV2,
+            | MsgType::AccordApplyV2
+            | MsgType::AccordApplyV2Capnp
+            | MsgType::AccordApplyV2Region,
         ) => MessageFamily::Accord,
         Ok(MsgType::BootstrapComplete | MsgType::BootstrapCompleteAck) => MessageFamily::Bootstrap,
         Ok(MsgType::ClusterMembershipForward | MsgType::ClusterMembershipForwardAck) => {

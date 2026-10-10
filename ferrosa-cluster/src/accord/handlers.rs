@@ -18,9 +18,9 @@ use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 
 use super::state_machine::{AccordStateMachine, SmResponse};
 use super::wire::{
-    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, ApplyV2Payload, CommitPayload,
-    PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload, ReadVotePayload,
-    RecoverPayload,
+    AcceptOkPayload, AcceptPayload, ApplyOkPayload, ApplyPayload, ApplyV2Payload, CommitOkPayload,
+    CommitPayload, PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload,
+    ReadVotePayload, RecoverPayload,
 };
 
 /// Shared mutable access to the Accord state machine.
@@ -129,9 +129,9 @@ pub struct AccordHandler {
     local_node_id: u64,
 }
 
-/// Total bound on how long a `ReadVote` dep-wait will block for conflicting
-/// transactions to reach `Applied` before abstaining (fail-loud).
-const READ_DEP_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Re-exported from [`crate::accord::state_machine`], where both Accord bounds
+/// and their resolvers live. Kept here as the operator-facing name.
+pub use crate::accord::state_machine::DEFAULT_TXN_TIMEOUT;
 
 /// Per-iteration cap on a single `notified()` wait. A coalesced/lost broadcast
 /// wake (the apply fired between our unlock and re-arming the notify) costs at
@@ -145,6 +145,30 @@ impl AccordHandler {
             state,
             local_node_id,
         }
+    }
+
+    /// Apply a decoded multi-key write-set on this replica and ack, or `None` if the
+    /// transaction could not be brought to `Applied`.
+    ///
+    /// Shared by the bincode `AccordApplyV2` arm and the Cap'n Proto
+    /// `AccordApplyV2Capnp` arm so both apply the SAME way — the wire encoding is a
+    /// transport detail, never an apply-behaviour fork.
+    async fn apply_writeset_and_ack(&self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> Option<Message> {
+        let apply_status = on_state_machine(&self.state, move |sm| {
+            sm.handle_apply_writeset(txn_id, writes)
+        })
+        .await?;
+        if !matches!(apply_status, SmResponse::NoWriteFinalized)
+            && !await_txn_applied(&self.state, txn_id).await
+        {
+            return None;
+        }
+        let ok = ApplyOkPayload {
+            txn_id,
+            from: self.local_node_id,
+        };
+        let bytes = bincode::serialize(&ok).ok()?;
+        Some(Message::AccordApplyOK(Bytes::from(bytes)))
     }
 }
 
@@ -196,7 +220,27 @@ where
 /// `handle_apply` (which fires the notify that unblocks us) takes the same lock,
 /// so holding it across the await would deadlock.
 pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: Timestamp) -> bool {
-    let deadline = tokio::time::Instant::now() + READ_DEP_WAIT_TIMEOUT;
+    await_conflicting_deps_applied_within(
+        state,
+        key,
+        t,
+        crate::accord::state_machine::configured_barrier_timeout(),
+    )
+    .await
+}
+
+/// [`await_conflicting_deps_applied`] with an explicit bound.
+///
+/// The bound is a parameter rather than a process-global read so a test can
+/// exercise expiry in microseconds without mutating the environment (which is
+/// racy under parallel tests).
+pub(crate) async fn await_conflicting_deps_applied_within(
+    state: &AccordState,
+    key: &[u8],
+    t: Timestamp,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         // Compute the pending set and grab the notify UNDER the lock, then drop
         // the lock before awaiting. The future only enrolls on first poll, so a
@@ -221,10 +265,19 @@ pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: 
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
+            // Name the poison. The bare timeout says only "dependencies were not
+            // applied locally"; without each stuck transaction's phase and agreed
+            // t, a PreAccepted orphan and a Committed-but-unapplied txn look the
+            // same from the log, and they need different fixes.
+            let owned_key = key.to_vec();
+            let stuck =
+                on_state_machine(state, move |sm| sm.pending_conflicts_detail(&owned_key, &t))
+                    .await;
             tracing::error!(
+                pending = ?stuck,
                 "accord: ReadVote dep-wait timed out after {:?} waiting for conflicting \
                  transactions to apply — abstaining (fail-loud)",
-                READ_DEP_WAIT_TIMEOUT
+                timeout
             );
             return false;
         }
@@ -243,7 +296,22 @@ pub async fn await_conflicting_deps_applied(state: &AccordState, key: &[u8], t: 
 /// not itself a durable Apply acknowledgement. This bounded wait is shared by
 /// inbound handlers and the coordinator's local self-apply path.
 pub async fn await_txn_applied(state: &AccordState, txn_id: TxnId) -> bool {
-    let deadline = tokio::time::Instant::now() + READ_DEP_WAIT_TIMEOUT;
+    await_txn_applied_within(
+        state,
+        txn_id,
+        crate::accord::state_machine::configured_txn_timeout(),
+    )
+    .await
+}
+
+/// [`await_txn_applied`] with an explicit bound (see
+/// [`await_conflicting_deps_applied_within`] for why the bound is a parameter).
+pub(crate) async fn await_txn_applied_within(
+    state: &AccordState,
+    txn_id: TxnId,
+    timeout: std::time::Duration,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let observed = on_state_machine(state, move |sm| {
             sm.get_state(&txn_id).map(|txn| {
@@ -274,14 +342,19 @@ pub async fn await_txn_applied(state: &AccordState, txn_id: TxnId) -> bool {
 
         let now = tokio::time::Instant::now();
         if now >= deadline {
+            // Name the poison (see `AccordStateMachine::dep_detail`): a dep this
+            // replica never registered needs a different fix from one that is
+            // registered here but stuck.
+            let detail = on_state_machine(state, move |sm| sm.dep_detail(&txn_id)).await;
             let phase = Some(phase);
             tracing::error!(
                 txn_id = ?txn_id,
                 ?phase,
                 dependency_count,
                 result_bytes,
+                deps = ?detail,
                 "accord: Apply timed out after {:?} waiting for ordered dependencies — refusing ApplyOK",
-                READ_DEP_WAIT_TIMEOUT
+                timeout
             );
             return false;
         }
@@ -404,13 +477,23 @@ impl RpcHandler for AccordHandler {
                 let payload: CommitPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordCommit: deserialize failed: {e}"))
                     .ok()?;
+                let txn_id = payload.txn_id;
                 on_state_machine(&self.state, move |sm| {
                     sm.handle_commit(payload.txn_id, payload.t0, payload.t, payload.deps)
                 })
                 .await?;
-                // Commit is fire-and-forget in Accord but we need a response
-                // for the request-response transport.
-                Some(Message::AccordCommit(Bytes::new()))
+                // Commit is fire-and-forget in Accord, but the request-response
+                // transport needs a reply, and the coordinator's commit quorum
+                // verifies it proves THIS transaction was committed. Echo the
+                // inbound `txn_id` in a structured `CommitOkPayload`, exactly as
+                // the Apply ack does — a bare reply proves nothing about which
+                // transaction, if any, this replica committed.
+                let ok = CommitOkPayload {
+                    txn_id,
+                    from: self.local_node_id,
+                };
+                let bytes = bincode::serialize(&ok).ok()?;
+                Some(Message::AccordCommit(Bytes::from(bytes)))
             }
 
             Message::AccordApply(b) => {
@@ -440,35 +523,89 @@ impl RpcHandler for AccordHandler {
             }
 
             Message::AccordApplyV2(b) => {
-                // Multi-key Apply: the coordinator already scoped this payload to
-                // exactly the keys this replica is a participant for (per-replica
-                // filtered fan-out), so the replica applies every write it was
-                // sent — the same "coordinator scopes, replica trusts" invariant
-                // as the v1 AccordApply arm, generalized to N partitions. The
-                // writes are routed as ONE write-set so they park/apply atomically
+                // Multi-key Apply (bincode body — sent to every peer that has NOT
+                // advertised `CAP_ACCORD_CAPNP`): the coordinator already scoped this
+                // payload to exactly the keys this replica is a participant for
+                // (per-replica filtered fan-out), so the replica applies every write it
+                // was sent — the same "coordinator scopes, replica trusts" invariant as
+                // the v1 AccordApply arm, generalized to N partitions. The writes are
+                // routed as ONE write-set so they park/apply atomically
                 // (DATA-LOSS-CRITICAL: writes 2..N must never be dropped).
                 let payload: ApplyV2Payload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordApplyV2: deserialize failed: {e}"))
                     .ok()?;
                 let txn_id = payload.txn_id;
                 let writes: Vec<Vec<u8>> = payload.writes.into_iter().map(|w| w.mutation).collect();
-                let apply_status = on_state_machine(&self.state, move |sm| {
-                    sm.handle_apply_writeset(txn_id, writes)
-                })
-                .await?;
-                if !matches!(
-                    apply_status,
-                    crate::accord::state_machine::SmResponse::NoWriteFinalized
-                ) && !await_txn_applied(&self.state, txn_id).await
-                {
-                    return None;
-                }
-                let ok = ApplyOkPayload {
-                    txn_id,
-                    from: self.local_node_id,
+                self.apply_writeset_and_ack(txn_id, writes).await
+            }
+
+            Message::AccordApplyV2Capnp(b) => {
+                // Same multi-key Apply, but the body is a Cap'n Proto `accord.applyV2`
+                // frame (`ferrosa_net::protocol::encode_accord_apply_v2`). Only a peer
+                // that advertised `CAP_ACCORD_CAPNP` is ever sent this type.
+                let (txn_id, writes) = match ferrosa_net::protocol::decode_accord_apply_v2(&b) {
+                    Ok(ferrosa_net::protocol::AccordControlMessage::ApplyV2 { txn_id, writes }) => {
+                        let txn_id = TxnId(Timestamp {
+                            epoch: txn_id.epoch,
+                            time: txn_id.time,
+                            seq: txn_id.seq,
+                            node: txn_id.node,
+                        });
+                        let writes = writes.into_iter().map(|w| w.mutation).collect();
+                        (txn_id, writes)
+                    }
+                    Ok(other) => {
+                        // A valid Accord envelope of the wrong kind on the Apply type is a
+                        // routing bug, not a payload to reinterpret as a write-set.
+                        tracing::error!(
+                            "AccordApplyV2Capnp: expected an ApplyV2 payload, got {other:?}"
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        tracing::error!("AccordApplyV2Capnp: capnp decode failed: {error}");
+                        return None;
+                    }
                 };
-                let bytes = bincode::serialize(&ok).ok()?;
-                Some(Message::AccordApplyOK(Bytes::from(bytes)))
+                self.apply_writeset_and_ack(txn_id, writes).await
+            }
+
+            Message::AccordApplyV2Region(b) => {
+                // The region-REFERENCE multi-key Apply: a capnp HEADER (txn stamp + an
+                // (offset, length) index) followed by ONE contiguous REGION holding the
+                // write-set payload bytes. Only a peer that advertised
+                // `CAP_ACCORD_APPLY_REGION` is ever sent this type. The decode BORROWS
+                // the region — there is no per-entry owned wire structure; each entry is
+                // read by offset. The mutations are then materialized into the `Vec<u8>`
+                // per write the storage applier requires (`ApplyMutation.data` moves
+                // owned bytes through the blocking apply seam); that is the applier's
+                // input, not a decode of the message into owned entries.
+                let view = match ferrosa_net::protocol::decode_accord_apply_v2_region(&b) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        tracing::error!("AccordApplyV2Region: region decode failed: {error}");
+                        return None;
+                    }
+                };
+                let txn_id = TxnId(Timestamp {
+                    epoch: view.txn_id.epoch,
+                    time: view.txn_id.time,
+                    seq: view.txn_id.seq,
+                    node: view.txn_id.node,
+                });
+                let mut writes: Vec<Vec<u8>> = Vec::with_capacity(view.len());
+                for entry in view.mutations() {
+                    match entry {
+                        Ok(bytes) => writes.push(bytes.to_vec()),
+                        Err(error) => {
+                            tracing::error!(
+                                "AccordApplyV2Region: entry out of the region's index: {error}"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.apply_writeset_and_ack(txn_id, writes).await
             }
 
             Message::AccordRecover(b) => {
@@ -622,6 +759,69 @@ mod tests {
 
     fn ts(micros: u64) -> Timestamp {
         Timestamp::synthetic(micros)
+    }
+
+    /// Drive a transaction to `Committed` on this state (the phase whose Apply
+    /// can park behind unapplied ordered dependencies).
+    fn commit(state: &AccordState, txn_id: TxnId, t0: u64, t: u64, deps: Vec<TxnId>) {
+        let key = b"bounded-wait-key";
+        let mut sm = state.lock();
+        sm.handle_preaccept(txn_id, ts(t0), key, BallotNumber(0), 0);
+        sm.handle_accept(txn_id, ts(t0), ts(t), deps.clone(), BallotNumber(1));
+        sm.handle_commit(txn_id, ts(t0), ts(t), deps);
+    }
+
+    /// The bound expiry must REFUSE the apply ack, promptly.
+    ///
+    /// This is the half of the abandon contract that lives on the replica: when a
+    /// dependency never applies, the wait must give up at its bound and report
+    /// `false` — NOT hang, and NOT report a transaction that never reached
+    /// `Applied` as applied. The coordinator turns that refusal into an abandoned
+    /// (rolled back, retryable) transaction instead of a permanently poisoned key.
+    #[tokio::test]
+    async fn await_txn_applied_refuses_at_its_bound_when_a_dependency_never_applies() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+
+        let dep = TxnId::new(1, ts(1000));
+        let target = TxnId::new(2, ts(2000));
+        // `dep` is Committed but NEVER applied — exactly the stall the bound exists
+        // for. `target` depends on it, so `target` can never reach Applied.
+        commit(&state, dep, 1000, 1001, vec![]);
+        commit(&state, target, 2000, 2001, vec![dep]);
+
+        let started = std::time::Instant::now();
+        let applied =
+            await_txn_applied_within(&state, target, std::time::Duration::from_millis(30)).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            !applied,
+            "a transaction still parked on an unapplied dependency must be refused"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the wait must expire at its bound, not hang (took {elapsed:?})"
+        );
+    }
+
+    /// Control: the wait reports success for a transaction that really applied.
+    ///
+    /// Without this, "returns false" is satisfied by a wait that always refuses.
+    #[tokio::test]
+    async fn await_txn_applied_reports_success_for_an_applied_transaction() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+
+        let txn_id = TxnId::new(1, ts(1000));
+        commit(&state, txn_id, 1000, 1001, vec![]);
+        // No dependencies: the apply persists and the txn advances to Applied.
+        state.lock().handle_apply(txn_id, b"write".to_vec());
+
+        assert!(
+            await_txn_applied_within(&state, txn_id, std::time::Duration::from_millis(50)).await,
+            "an Applied transaction must be reported as applied"
+        );
     }
 
     /// `publish_accord_state` must make the slot observe the EXACT `AccordState`

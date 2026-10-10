@@ -81,6 +81,10 @@ full = ["otel", "flight", "ferrosa-cql/asc-udf"]
 # Enables jemalloc's heap profiler with libunwind, which avoids the default
 # unwinder crash on Linux musl. Profiling remains off until MALLOC_CONF opts in.
 profiling = ["tikv-jemallocator/profiling_libunwind"]
+# Installs a counting global allocator (see `counting_alloc` in `src/main.rs`)
+# so `FERROSA_PG_COMMIT_PROFILE` can attribute a COMMIT's residency peak to the
+# phase that caused it. Diagnostic-only; a production build leaves it off.
+alloc-probe = ["ferrosa-common/alloc-probe"]
 
 # Optional OTel dependencies, gated behind the `otel` feature.
 [dependencies.tracing-opentelemetry]
@@ -116,3 +120,6 @@ tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.26"
 tower = { version = "0.5", features = ["util"] }
+# Real multi-node PROCESS test drives DROP TABLE over the PostgreSQL wire (there
+# is no cqlsh on this host), so the test needs a real Postgres client.
+tokio-postgres = "0.7"

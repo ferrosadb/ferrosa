@@ -143,7 +143,7 @@ use crate::ring::TokenRing;
 use crate::state::RaftClusterState;
 use crate::streaming::{
     sender::{SstableSendRequest, StreamSender},
-    StreamConfig, StreamedMutation,
+    StreamConfig,
 };
 use crate::write_path::WritePath;
 
@@ -1661,6 +1661,10 @@ impl ModeController {
             self.registry
                 .register(MsgType::AccordApplyV2, accord_handler.clone());
             self.registry
+                .register(MsgType::AccordApplyV2Capnp, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordApplyV2Region, accord_handler.clone());
+            self.registry
                 .register(MsgType::AccordRecover, accord_handler);
         }
 
@@ -1813,6 +1817,25 @@ impl ModeController {
                                 pruned,
                                 "maintenance: pruned applied Accord transactions"
                             );
+                        }
+
+                        // Reclaim parked write-sets whose dependency never arrived.
+                        // The graph bounds its own bookkeeping; this bounds the parked
+                        // PAYLOADS. Reported at ERROR — a fact, never a silent drop.
+                        let reclaimed =
+                            crate::accord::handlers::on_state_machine(&accord_state, move |sm| {
+                                sm.reclaim_stale_parked_applies_default()
+                            })
+                            .await;
+                        if let Some(reclaimed) = reclaimed {
+                            if !reclaimed.is_empty() {
+                                tracing::error!(
+                                    count = reclaimed.len(),
+                                    "maintenance: reclaimed unresolvable parked Accord write-sets \
+                                     (dependency never arrived; NOT applied — the coordinator \
+                                     abandons the txn and the client retries)"
+                                );
+                            }
                         }
 
                         // Log table-level memory stats.
@@ -2645,7 +2668,6 @@ impl ModeController {
                                 let stream_plan = super::bootstrap::bootstrap_stream::plan_table_stream(
                                     super::bootstrap::bootstrap_stream::TableStreamPlanInput {
                                         sstable_dir_count: sstable_dirs.len(),
-                                        row_fallback_limit: super::bootstrap::bootstrap_stream::BOUNDED_ROW_FALLBACK_LIMIT,
                                     },
                                 );
                                 if let super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } = stream_plan {
@@ -2716,54 +2738,39 @@ impl ModeController {
                                     continue;
                                 }
 
-                                let row_fallback_limit = match stream_plan {
-                                    super::bootstrap::bootstrap_stream::TableStreamPlan::BoundedRows { limit } => limit,
+                                match stream_plan {
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::StreamRows => {}
                                     super::bootstrap::bootstrap_stream::TableStreamPlan::RetryRequired => {
                                         tracing::warn!(
                                             ks,
                                             tbl,
-                                            "bootstrap: table stream requires retry/repair; skipping row materialization"
+                                            "bootstrap: table stream requires retry/repair; skipping row streaming"
                                         );
                                         continue;
                                     }
                                     super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } => unreachable!(
-                                        "SSTable-backed bootstrap tables return above and never row-materialize"
+                                        "SSTable-backed bootstrap tables return above and never row-stream"
                                     ),
-                                };
-                                let partitions = match storage_for_bootstrap.read_range(
+                                }
+
+                                // Stream EVERY partition of the table, one at a
+                                // time, into the per-owner batches. There is no row
+                                // cap: the capped read this replaces silently dropped
+                                // the tail of a table larger than the limit.
+                                let by_node = match super::bootstrap::bootstrap_stream::stream_row_fallback_into(
+                                    &storage_for_bootstrap,
                                     &table_id,
-                                    None,
-                                    None,
-                                    row_fallback_limit,
+                                    ks,
+                                    tbl,
+                                    local_node_id,
+                                    |token| ring.primary_owner(token).unwrap_or(local_node_id),
                                 ) {
-                                    Ok(p) => p,
+                                    Ok(by_node) => by_node,
                                     Err(e) => {
-                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read small in-memory table");
+                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to stream in-memory table");
                                         continue;
                                     }
                                 };
-
-                                let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
-                                    std::collections::HashMap::new();
-                                for partition in &partitions {
-                                    let token = partition.key.token.0;
-                                    let owner = ring.primary_owner(token).unwrap_or(local_node_id);
-
-                                    if owner != local_node_id {
-                                        let mutation = match StreamedMutation::from_partition(ks, tbl, partition) {
-                                            Ok(mutation) => mutation,
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    %e,
-                                                    partition_key = ?partition.key,
-                                                    "bootstrap: failed to serialize partition, skipping partition (data loss avoided)"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        by_node.entry(owner).or_default().push(mutation);
-                                    }
-                                }
 
                                 for (target_node_id, mutations) in by_node {
                                     let target_uuid = node_map.get(&target_node_id).copied();

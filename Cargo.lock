@@ -2284,6 +2284,7 @@ dependencies = [
  "tikv-jemalloc-sys",
  "tikv-jemallocator",
  "tokio",
+ "tokio-postgres",
  "tokio-rustls",
  "tokio-tungstenite 0.26.2",
  "tokio-util",
@@ -2642,6 +2643,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "zstd",
 ]
 
 [[package]]
@@ -2652,6 +2654,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "capnp",
  "chrono",
  "ferrosa-cluster",
  "ferrosa-common",

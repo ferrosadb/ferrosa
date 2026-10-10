@@ -138,6 +138,40 @@ impl SSTableAssembler {
     pub fn total_bytes(&self) -> u64 {
         self.bytes_written
     }
+
+    /// Materialise every component the manifest declared with size 0 that
+    /// received no chunks, returning their names.
+    ///
+    /// A zero-byte component produces NO chunks on the wire:
+    /// [`read_sstable_component`] reads 0 bytes, `if read == 0 { break }` fires on
+    /// the first read, and the component contributes nothing. Without this step the
+    /// receiver promotes a generation missing that component entirely — and every
+    /// existing integrity check passes, because an absent empty file contributes 0
+    /// bytes to both the byte-sum and the CRC32. The source replica keeps the file,
+    /// so only the streamed copy is silently corrupt. `Rows.db` is the case in
+    /// practice (it is a mandatory BTI component, empty for a generation with no
+    /// clustered rows), which is why generations showed up missing only Rows.db on
+    /// the receiving node.
+    pub fn ensure_declared_empty_components(
+        &mut self,
+        declared: &[SSTableComponent],
+    ) -> std::io::Result<Vec<String>> {
+        let mut created = Vec::new();
+        std::fs::create_dir_all(&self.sstable_dir)?;
+        for component in declared {
+            // Only an EMPTY declared component may be missing here. A non-zero one
+            // that received no chunks is a real shortfall and must already have
+            // failed the byte-count check; do not paper over it.
+            if component.size != 0 || self.components.contains_key(&component.name) {
+                continue;
+            }
+            let path = self.sstable_dir.join(&component.name);
+            std::fs::File::create(&path)?;
+            self.components.insert(component.name.clone(), path);
+            created.push(component.name.clone());
+        }
+        Ok(created)
+    }
 }
 
 #[cfg(unix)]

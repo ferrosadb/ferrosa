@@ -199,6 +199,18 @@ pub enum MsgType {
     // Multi-key Accord (additive V2 — see message.rs)
     AccordPreAcceptV2 = 0x7B,
     AccordApplyV2 = 0x7C,
+    /// Multi-key Accord Apply whose body is a Cap'n Proto `accord.applyV2` frame
+    /// instead of the bincode `ApplyV2Payload`. Sent ONLY to a peer that advertised
+    /// [`crate::handshake::CAP_ACCORD_CAPNP`]: a peer without the bit would read the
+    /// unknown type byte as a protocol error and drop the connection.
+    AccordApplyV2Capnp = 0x7D,
+    /// Multi-key Accord Apply whose body is a Cap'n Proto `accord.applyV2Region`
+    /// header followed by ONE contiguous REGION holding the write-set payload
+    /// bytes by reference (offset+length), rather than inline. Sent ONLY to a peer
+    /// that advertised [`crate::handshake::CAP_ACCORD_APPLY_REGION`]: a peer without
+    /// the bit would read the unknown type byte as a protocol error and drop the
+    /// connection.
+    AccordApplyV2Region = 0x7E,
     // Bootstrap coordination
     BootstrapComplete = 0x80,
     BootstrapCompleteAck = 0x81,
@@ -339,6 +351,8 @@ impl TryFrom<u8> for MsgType {
             0x7A => Ok(Self::AccordRecoverOK),
             0x7B => Ok(Self::AccordPreAcceptV2),
             0x7C => Ok(Self::AccordApplyV2),
+            0x7D => Ok(Self::AccordApplyV2Capnp),
+            0x7E => Ok(Self::AccordApplyV2Region),
             0x80 => Ok(Self::BootstrapComplete),
             0x81 => Ok(Self::BootstrapCompleteAck),
             0x82 => Ok(Self::ClusterMembershipForward),
@@ -781,6 +795,23 @@ mod tests {
         let val = MsgType::IndexBuildComplete as u8;
         let parsed = MsgType::try_from(val).unwrap();
         assert_eq!(parsed, MsgType::IndexBuildComplete);
+    }
+
+    /// 0x7D (`AccordApplyV2Capnp`) must round-trip through `TryFrom<u8>`: a byte the
+    /// decoder does not know rejects the frame and drops the whole connection, and the
+    /// coordinator sends this type ONLY to a peer that advertised `CAP_ACCORD_CAPNP`.
+    /// It must also stay distinct from the bincode `AccordApplyV2` (0x7C).
+    #[test]
+    fn msg_type_accord_apply_v2_capnp_roundtrip() {
+        assert_eq!(MsgType::AccordApplyV2Capnp as u8, 0x7D);
+        assert_eq!(
+            MsgType::try_from(0x7Du8).unwrap(),
+            MsgType::AccordApplyV2Capnp
+        );
+        assert_ne!(
+            MsgType::AccordApplyV2Capnp as u8,
+            MsgType::AccordApplyV2 as u8
+        );
     }
 
     /// t_4ae47a9f: the streaming-fulltext frame family round-trips through

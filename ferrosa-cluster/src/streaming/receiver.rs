@@ -24,21 +24,42 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-const DEFAULT_STREAM_MAX_MUTATIONS: u64 = 50_000;
-const DEFAULT_STREAM_MAX_BYTES: u64 = 128 * 1024 * 1024;
+/// Resident staging-buffer size (bytes) for a row-stream session, externalized
+/// via `FERROSA_STREAM_RESIDENT_BUFFER_BYTES` so it is a tunable, not a constant.
+///
+/// This is a STREAMING BUFFER, not a cap. Encoded `(len, mutation)` records
+/// accumulate in memory up to this size and then SPILL to the session's staging
+/// file; a record larger than the buffer is written straight through. Exceeding
+/// it never refuses the stream and never truncates it. `0` means "hold nothing
+/// resident": every record is spilled immediately.
+pub const STREAM_RESIDENT_BUFFER_ENV: &str = "FERROSA_STREAM_RESIDENT_BUFFER_BYTES";
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct StreamSessionLimits {
-    max_mutations: u64,
-    max_bytes: u64,
-}
+/// Default resident staging buffer: 4 MiB. Not a bound on how much a session may
+/// carry — a session of any size spills to disk (its staging file) and keeps
+/// streaming; the file's size is bounded by the disk, not by a refusal.
+pub const DEFAULT_STREAM_RESIDENT_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-impl Default for StreamSessionLimits {
-    fn default() -> Self {
-        Self {
-            max_mutations: DEFAULT_STREAM_MAX_MUTATIONS,
-            max_bytes: DEFAULT_STREAM_MAX_BYTES,
-        }
+/// Resolve the resident staging-buffer size from a raw env value.
+///
+/// An absent or unparseable value keeps the default (and is logged). No value
+/// makes the session refuse data: the knob only decides how much is held
+/// resident before spilling.
+pub(crate) fn resolve_stream_resident_buffer(raw: Option<&str>) -> usize {
+    match raw {
+        None => DEFAULT_STREAM_RESIDENT_BUFFER_BYTES,
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    variable = STREAM_RESIDENT_BUFFER_ENV,
+                    value,
+                    %error,
+                    default_bytes = DEFAULT_STREAM_RESIDENT_BUFFER_BYTES,
+                    "invalid resident stream buffer size; keeping the default"
+                );
+                DEFAULT_STREAM_RESIDENT_BUFFER_BYTES
+            }
+        },
     }
 }
 
@@ -80,11 +101,21 @@ pub struct StreamSession {
     pub(crate) checksum: crc32fast::Hasher,
     pub(crate) received_mutations: u64,
     pub(crate) received_bytes: u64,
-    pub(crate) limits: StreamSessionLimits,
+    /// Resident staging buffer: encoded `(len, mutation)` records held in memory
+    /// before they SPILL to `staging_file`. Sized by `resident_buffer_bytes`.
+    pub(crate) spill_buf: Vec<u8>,
+    /// Tunable resident-buffer size (bytes); `0` holds nothing resident. A
+    /// streaming buffer, never a cap: exceeding it spills, it never refuses.
+    pub(crate) resident_buffer_bytes: usize,
 }
 
 impl StreamSession {
     /// Accept the mutations from one `StreamChunk`.
+    ///
+    /// There is no budget on how much a session may receive: every mutation is
+    /// staged — held in memory up to the resident buffer, then spilled to the
+    /// staging file. Exceeding the buffer spills; it never refuses the stream and
+    /// never truncates it.
     pub fn apply_chunk(&mut self, chunk: StreamChunkPayload) -> Result<()> {
         if let Some(error) = self.staging_error.as_deref() {
             return Err(ClusterError::Internal(format!(
@@ -99,46 +130,62 @@ impl StreamSession {
             )));
         }
 
-        if self.received_mutations + chunk.mutations.len() as u64 > self.limits.max_mutations {
-            return Err(ClusterError::Internal(format!(
-                "stream: mutation budget exceeded: limit {}, received {}",
-                self.limits.max_mutations,
-                self.received_mutations + chunk.mutations.len() as u64
-            )));
-        }
-
-        let Some(file) = self.staging_file.as_mut() else {
-            return Err(ClusterError::Internal(
-                "stream: staging file is not open".to_string(),
-            ));
-        };
         for mutation in &chunk.mutations {
             let encoded = bincode::serialize(mutation).map_err(|e| {
                 ClusterError::Internal(format!("stream: failed to serialize mutation: {e}"))
             })?;
             let len = encoded.len() as u64;
-            if self.received_bytes + len > self.limits.max_bytes {
-                self.staging_error = Some(format!(
-                    "byte budget exceeded: limit {}, received {}",
-                    self.limits.max_bytes,
-                    self.received_bytes + len
-                ));
-                return Err(ClusterError::Internal(format!(
-                    "stream: byte budget exceeded: limit {}, received {}",
-                    self.limits.max_bytes,
-                    self.received_bytes + len
-                )));
-            }
             self.checksum.update(&encoded);
-            file.write_all(&len.to_le_bytes()).map_err(|e| {
-                ClusterError::Internal(format!("stream: failed to write mutation length: {e}"))
-            })?;
-            file.write_all(&encoded).map_err(|e| {
-                ClusterError::Internal(format!("stream: failed to write staged mutation: {e}"))
-            })?;
+            self.stage_record(&encoded, len)?;
             self.received_mutations += 1;
             self.received_bytes += len;
         }
+        Ok(())
+    }
+
+    /// Stage one encoded mutation as a `(len, bytes)` record, spilling the
+    /// resident buffer to the staging file when it fills.
+    ///
+    /// Never refuses and never truncates: a record larger than
+    /// `resident_buffer_bytes` is written straight through.
+    fn stage_record(&mut self, encoded: &[u8], len: u64) -> Result<()> {
+        const LEN_PREFIX: usize = 8;
+        let record_len = LEN_PREFIX + encoded.len();
+
+        // Spill the resident buffer first when this record would not fit and the
+        // buffer already holds something.
+        if !self.spill_buf.is_empty()
+            && self.spill_buf.len() + record_len > self.resident_buffer_bytes
+        {
+            self.flush_spill_buf()?;
+        }
+
+        self.spill_buf.extend_from_slice(&len.to_le_bytes());
+        self.spill_buf.extend_from_slice(encoded);
+
+        // Keep the resident buffer bounded: once what we just staged reaches the
+        // tunable size (or buffering is disabled), spill it now rather than
+        // holding it until the next record arrives.
+        if self.spill_buf.len() >= self.resident_buffer_bytes {
+            self.flush_spill_buf()?;
+        }
+        Ok(())
+    }
+
+    /// Spill the resident buffer to the staging file and clear it.
+    fn flush_spill_buf(&mut self) -> Result<()> {
+        if self.spill_buf.is_empty() {
+            return Ok(());
+        }
+        let Some(file) = self.staging_file.as_mut() else {
+            return Err(ClusterError::Internal(
+                "stream: staging file is not open".to_string(),
+            ));
+        };
+        file.write_all(&self.spill_buf).map_err(|e| {
+            ClusterError::Internal(format!("stream: failed to spill staged mutations: {e}"))
+        })?;
+        self.spill_buf.clear();
         Ok(())
     }
 
@@ -179,6 +226,9 @@ impl StreamSession {
             )));
         }
 
+        // Spill anything still resident before sealing the staging file, so the
+        // replay below sees every accepted mutation.
+        self.flush_spill_buf()?;
         if let Some(mut file) = self.staging_file.take() {
             file.flush().map_err(|e| {
                 ClusterError::Internal(format!("stream: failed to flush staged mutations: {e}"))
@@ -193,6 +243,13 @@ impl StreamSession {
         // static row, LIVE deletion); counted so the session log shows it
         // rather than reporting the mutation as applied data.
         let mut empty_row_payloads = 0u64;
+        // A corrupt staging file could carry a bogus length prefix; bound each
+        // read by the file's own size (a record cannot exceed the whole file) so a
+        // bad length fails loud instead of allocating an enormous buffer. This is a
+        // corrupt-input guard, not a cap on how much a session may carry.
+        let staged_file_len = std::fs::metadata(&self.staging_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         let mut staged = std::fs::File::open(&self.staging_path).map_err(|e| {
             ClusterError::Internal(format!(
                 "stream: failed to open staged mutations {}: {e}",
@@ -207,10 +264,10 @@ impl StreamSession {
                 ))
             })?;
             let len = u64::from_le_bytes(len_buf);
-            if len > self.limits.max_bytes {
+            if len > staged_file_len {
                 return Err(ClusterError::Internal(format!(
-                    "stream: staged mutation length {len} exceeds session byte limit {}",
-                    self.limits.max_bytes
+                    "stream: staged mutation length {len} exceeds the {staged_file_len}-byte \
+                     staging file (corrupt staging)"
                 )));
             }
             let mut encoded = vec![0u8; len as usize];
@@ -336,7 +393,10 @@ impl StreamReceiver {
             staging_error,
             received_mutations: 0,
             received_bytes: 0,
-            limits: StreamSessionLimits::default(),
+            spill_buf: Vec::new(),
+            resident_buffer_bytes: resolve_stream_resident_buffer(
+                std::env::var(STREAM_RESIDENT_BUFFER_ENV).ok().as_deref(),
+            ),
         }
     }
 
@@ -454,7 +514,7 @@ impl SstableStreamSession {
     }
 
     /// Validate `SstableStreamEnd` and write all component files to disk.
-    pub fn finish(self, end: SstableStreamEndPayload) -> Result<SstableStreamResult> {
+    pub fn finish(mut self, end: SstableStreamEndPayload) -> Result<SstableStreamResult> {
         if end.session_id != self.start.session_id {
             return Err(ClusterError::Internal(format!(
                 "sstable_stream: session_id mismatch in end: expected {}, got {}",
@@ -496,6 +556,29 @@ impl SstableStreamSession {
                 written_files: existing_files,
                 total_bytes: self.bytes_received,
             });
+        }
+
+        // A zero-byte component (e.g. `Rows.db` for a generation with no clustered
+
+        // rows) sends no chunks, so it is absent from staging unless we materialise
+        // it from the manifest here. Without this the promoted generation silently
+        // loses that component and becomes corrupt/unopenable on this replica while
+        // the source keeps it — the byte-sum and CRC32 checks both pass, because an
+        // absent empty file contributes 0. See `sstable_transfer.rs`.
+        let materialised = self
+            .assembler
+            .ensure_declared_empty_components(&self.start.components)
+            .map_err(|e| {
+                ClusterError::Internal(format!(
+                    "sstable_stream: could not materialise declared zero-byte components: {e}"
+                ))
+            })?;
+        if !materialised.is_empty() {
+            tracing::info!(
+                session_id = self.start.session_id,
+                components = ?materialised,
+                "sstable_stream: materialised zero-byte components declared by the manifest"
+            );
         }
 
         // Write files to staging, then promote atomically.
@@ -1220,11 +1303,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 4b. Exceeding limits is rejected before unbounded growth
+    // 4b. No hard bound on incoming data. The former mutation/byte budgets were
+    // DATA-PATH REFUSALS on an inbound stream (a cap, not a buffer): exceeding
+    // them errored. They are gone. A session now SPILLS to its staging file and
+    // streams; it never refuses and it never truncates.
     // -----------------------------------------------------------------------
+
+    /// A stream larger than the former `DEFAULT_STREAM_MAX_MUTATIONS` (50_000)
+    /// budget must be accepted and staged in full. RED before the fix:
+    /// `apply_chunk` returned "stream: mutation budget exceeded: limit 50000 …".
     #[test]
-    fn apply_chunk_rejects_when_limits_are_exceeded() {
-        let row = vec![0u8; 1024];
+    fn apply_chunk_accepts_a_stream_larger_than_the_former_mutation_budget() {
         let start = StreamStartPayload {
             session_id: 5,
             source_node: 10,
@@ -1232,54 +1321,29 @@ mod tests {
             token_range_end: 100,
             estimated_bytes: 0,
         };
-
         let mut session = StreamReceiver::begin(start);
-        session.limits = StreamSessionLimits {
-            max_mutations: 2,
-            max_bytes: 2048,
-        };
 
-        let first_chunk = StreamChunkPayload {
-            session_id: 5,
-            mutations: vec![StreamedMutation {
-                keyspace: "ks".to_string(),
-                table: "tbl".to_string(),
-                key: vec![0],
-                row: row.clone(),
-                timestamp: 0,
-            }],
-        };
-        assert!(session.apply_chunk(first_chunk).is_ok());
+        let total: u64 = 50_001; // one past the former DEFAULT_STREAM_MAX_MUTATIONS
+        for i in 0..total {
+            session
+                .apply_chunk(StreamChunkPayload {
+                    session_id: 5,
+                    mutations: vec![make_mutation(i as usize)],
+                })
+                .expect("an incoming stream must never be refused by a mutation budget");
+        }
 
-        let second_chunk = StreamChunkPayload {
-            session_id: 5,
-            mutations: vec![
-                StreamedMutation {
-                    keyspace: "ks".to_string(),
-                    table: "tbl".to_string(),
-                    key: vec![1],
-                    row: row.clone(),
-                    timestamp: 1,
-                },
-                StreamedMutation {
-                    keyspace: "ks".to_string(),
-                    table: "tbl".to_string(),
-                    key: vec![2],
-                    row,
-                    timestamp: 2,
-                },
-            ],
-        };
-
-        let result = session.apply_chunk(second_chunk);
-        assert!(
-            matches!(result, Err(ClusterError::Internal(_))),
-            "mutations and bytes over limit should be rejected"
+        assert_eq!(
+            session.received_mutations, total,
+            "every mutation must be staged; none dropped or truncated"
         );
     }
 
+    /// A single mutation larger than the former `DEFAULT_STREAM_MAX_BYTES`
+    /// (128 MiB) budget must be accepted and staged in full. RED before the fix:
+    /// "stream: byte budget exceeded: limit 134217728 …".
     #[test]
-    fn apply_chunk_rejects_when_byte_limit_is_exceeded() {
+    fn apply_chunk_accepts_a_record_larger_than_the_former_byte_budget() {
         let start = StreamStartPayload {
             session_id: 6,
             source_node: 10,
@@ -1287,27 +1351,110 @@ mod tests {
             token_range_end: 100,
             estimated_bytes: 0,
         };
-
         let mut session = StreamReceiver::begin(start);
-        session.limits = StreamSessionLimits {
-            max_mutations: 10,
-            max_bytes: 64,
-        };
 
-        let big_row = vec![0u8; 128];
+        let oversized = vec![0u8; 128 * 1024 * 1024 + 1]; // one past the former cap
+        let mutation = StreamedMutation {
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: vec![0],
+            row: oversized,
+            timestamp: 0,
+        };
+        // `received_bytes` counts each mutation's bincode encoding (the bytes the
+        // session stages); measure it without a second full buffer.
+        let expected = bincode::serialized_size(&mutation).unwrap();
+        assert!(
+            expected > 128 * 1024 * 1024,
+            "precondition: the encoded record must exceed the former budget"
+        );
         let chunk = StreamChunkPayload {
             session_id: 6,
-            mutations: vec![StreamedMutation {
-                keyspace: "ks".to_string(),
-                table: "tbl".to_string(),
-                key: vec![0],
-                row: big_row,
-                timestamp: 0,
-            }],
+            mutations: vec![mutation],
         };
 
-        let result = session.apply_chunk(chunk);
-        assert!(matches!(result, Err(ClusterError::Internal(_))));
+        session
+            .apply_chunk(chunk)
+            .expect("an incoming record must never be refused by a byte budget");
+        assert_eq!(
+            session.received_bytes, expected,
+            "the whole record must be counted and staged; none truncated"
+        );
+    }
+
+    /// The resident-buffer knob is externalized and never refuses data: an
+    /// absent value keeps the default, a valid value is honored (including `0`,
+    /// which holds nothing resident), and a garbage value falls back to the
+    /// default rather than erroring.
+    #[test]
+    fn resident_buffer_knob_is_tunable_and_never_refuses_data() {
+        assert_eq!(
+            resolve_stream_resident_buffer(None),
+            DEFAULT_STREAM_RESIDENT_BUFFER_BYTES
+        );
+        assert_eq!(resolve_stream_resident_buffer(Some("8192")), 8192);
+        assert_eq!(resolve_stream_resident_buffer(Some(" 65536 ")), 65536);
+        assert_eq!(resolve_stream_resident_buffer(Some("0")), 0);
+        assert_eq!(
+            resolve_stream_resident_buffer(Some("not-a-number")),
+            DEFAULT_STREAM_RESIDENT_BUFFER_BYTES
+        );
+    }
+
+    /// A session whose data far exceeds a tiny resident buffer still stages and
+    /// applies EVERY mutation: exceeding the buffer SPILLS to the staging file,
+    /// it never refuses and never truncates. With the buffer forced to `0`, every
+    /// record spills, so this drives the real `apply_chunk` → `finish` path.
+    #[tokio::test]
+    async fn spilling_to_the_staging_file_applies_every_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_table(&storage, "ks", "tbl");
+
+        let total = 2_000u64;
+        let mutations: Vec<StreamedMutation> = (0..total as usize).map(make_mutation).collect();
+        let checksum = compute_checksum(&mutations);
+
+        let start = StreamStartPayload {
+            session_id: 61,
+            source_node: 10,
+            token_range_start: 0,
+            token_range_end: 100,
+            estimated_bytes: 0,
+        };
+        let mut session = StreamReceiver::begin(start);
+        session.resident_buffer_bytes = 0; // hold nothing resident: spill every record
+
+        for chunk in mutations.chunks(64) {
+            session
+                .apply_chunk(StreamChunkPayload {
+                    session_id: 61,
+                    mutations: chunk.to_vec(),
+                })
+                .unwrap();
+        }
+        assert_eq!(session.received_mutations, total);
+
+        let end = StreamEndPayload {
+            session_id: 61,
+            total_mutations: total,
+            checksum,
+        };
+        let result = session.finish(end, &storage).unwrap();
+        assert_eq!(
+            result.applied, total,
+            "every spilled mutation must be applied, none dropped"
+        );
+
+        // The last-staged mutation must be readable — a spill must not lose the tail.
+        let last_key = ferrosa_common::key::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            (total - 1).to_be_bytes().to_vec(),
+        ));
+        let read = storage.read(&TableId::new("ks", "tbl"), &last_key).unwrap();
+        assert!(
+            read.is_some_and(|p| !p.rows.is_empty()),
+            "the last spilled mutation must be present after replay"
+        );
     }
 
     #[test]
@@ -1574,6 +1721,83 @@ mod tests {
 
         let written_index = std::fs::read(dest_path.join("Index.db")).unwrap();
         assert_eq!(written_index, index_content);
+    }
+
+    // -----------------------------------------------------------------------
+    // 8b. SSTable stream must materialise a declared ZERO-BYTE component
+    // -----------------------------------------------------------------------
+    /// A zero-byte component (e.g. `Rows.db` for a generation with no clustered
+    /// rows) produces no chunks on the wire, so before this fix the receiver
+    /// promoted a generation missing it — silently, because an absent empty file
+    /// contributes 0 to both the byte-sum and the CRC32. That is how a replicated
+    /// generation ended up with every component EXCEPT `Rows.db` on the peer while
+    /// the source kept it: corruption on one replica only. This is the regression.
+    #[test]
+    fn sstable_stream_materialises_a_declared_zero_byte_component() {
+        use super::{
+            SstableStreamChunkPayload, SstableStreamEndPayload, SstableStreamStartPayload,
+        };
+        use crate::streaming::sstable_transfer::SSTableComponent;
+
+        let dst_dir = tempfile::tempdir().unwrap();
+        let dest_path = dst_dir.path().join("received-sstable");
+
+        let data_content = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        // `Rows.db` is declared, and is legitimately EMPTY (size 0).
+        let components = vec![
+            SSTableComponent {
+                name: "Data.db".to_string(),
+                size: data_content.len() as u64,
+            },
+            SSTableComponent {
+                name: "Rows.db".to_string(),
+                size: 0,
+            },
+        ];
+        let start = SstableStreamStartPayload {
+            session_id: 200,
+            source_node: 1,
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            sstable_id: "mc-002".to_string(),
+            components: components.clone(),
+            total_bytes: data_content.len() as u64,
+        };
+
+        // Only Data.db has bytes, so only Data.db produces a chunk.
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&data_content);
+        let chunks = vec![SstableStreamChunkPayload {
+            session_id: 200,
+            component: "Data.db".to_string(),
+            offset: 0,
+            data: data_content.clone(),
+        }];
+        let end = SstableStreamEndPayload {
+            session_id: 200,
+            total_bytes: data_content.len() as u64,
+            checksum: hasher.finalize(),
+        };
+
+        let result =
+            SstableStreamReceiver::receive_and_write(start, chunks, end, dest_path.clone())
+                .unwrap();
+
+        // THEN the empty Rows.db must exist on the receiving replica, byte-for-byte
+        // empty — not be silently absent.
+        let rows = dest_path.join("Rows.db");
+        assert!(
+            rows.exists(),
+            "a declared zero-byte component must be materialised, not dropped: {:?}",
+            std::fs::read_dir(&dest_path)
+                .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+        );
+        assert_eq!(
+            std::fs::metadata(&rows).unwrap().len(),
+            0,
+            "the materialised Rows.db must be empty"
+        );
+        assert_eq!(result.written_files.len(), components.len());
     }
 
     // -----------------------------------------------------------------------

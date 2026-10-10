@@ -31,12 +31,14 @@ use ferrosa_common::accord::{
     AcceptedBallot, BallotNumber, HybridLogicalClock, PromisedBallot, Timestamp, TxnId, TxnPhase,
     TxnState,
 };
-use ferrosa_storage::accord::conflict_index::{ConflictIndex, InFlightWrite, TxnStatus};
+use ferrosa_storage::accord::conflict_index::{
+    ConflictIndex, InFlightWrite, TxnStatus, DEFAULT_CONFLICT_INDEX_RESERVE,
+};
 use ferrosa_storage::accord::sync_writer::{SyncWriteResult, SyncWriter};
 use tokio::sync::Notify;
 
 use crate::accord::apply::{
-    ApplyMutation, DepWaitApplier, NoopStorageApplier, StorageApplier, StorageReader,
+    DepWaitApplier, MutationView, NoopStorageApplier, StorageApplier, StorageReader,
 };
 use crate::accord::finalized::{DecidedBy, FinalizedTxns};
 
@@ -165,6 +167,37 @@ impl AccordStateMachine {
         self.apply_engine.register_postgres_mvcc_observer(observer)
     }
 
+    /// Prune the dep-wait graph so a test can reproduce the hole where an applied
+    /// transaction is evicted while a later transaction still names it.
+    #[cfg(test)]
+    pub fn prune_graph_for_test(&self, max_age: std::time::Duration) -> usize {
+        self.apply_engine.prune_graph_for_test(max_age)
+    }
+
+    /// How many transactions the dep-wait graph believes are applied.
+    #[cfg(test)]
+    pub fn applied_count_for_test(&self) -> usize {
+        self.apply_engine.applied_count_for_test()
+    }
+
+    /// Reclaim parked write-sets whose dependency never arrived within the
+    /// configured bound, returning each with its unresolved dependency set so the
+    /// caller can surface it (fail loud, never a silent drop). See
+    /// [`crate::accord::apply::DepWaitApplier::reclaim_stale`].
+    pub fn reclaim_stale_parked_applies(
+        &self,
+        max_age: std::time::Duration,
+    ) -> Vec<crate::accord::apply::ReclaimedPark> {
+        self.apply_engine.reclaim_stale(max_age)
+    }
+
+    /// Reclaim stale parked write-sets using the dep-wait engine's configured
+    /// bound ([`crate::accord::apply::PARKED_APPLY_RECLAIM_ENV`]). See
+    /// [`Self::reclaim_stale_parked_applies`].
+    pub fn reclaim_stale_parked_applies_default(&self) -> Vec<crate::accord::apply::ReclaimedPark> {
+        self.apply_engine.reclaim_stale_default()
+    }
+
     /// Create a new state machine for the given node.
     ///
     /// Uses a [`NoopStorageApplier`]: the apply seam records `(txn_id, t)` but
@@ -174,32 +207,7 @@ impl AccordStateMachine {
         Self {
             node_id,
             txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(100_000),
-            sync_writer,
-            dep_waiters: HashMap::new(),
-            committed_txns: HashSet::new(),
-            last_notified: Vec::new(),
-            apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
-            reader: None,
-            applied_notify: Arc::new(Notify::new()),
-            clock: None,
-            finalized: FinalizedTxns::default(),
-            refusing_by_floor: false,
-        }
-    }
-
-    /// Create with a custom conflict index capacity.
-    ///
-    /// Uses a [`NoopStorageApplier`] (see [`Self::new`]).
-    pub fn with_capacity(
-        node_id: u64,
-        sync_writer: Arc<dyn SyncWriter>,
-        conflict_index_capacity: usize,
-    ) -> Self {
-        Self {
-            node_id,
-            txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(conflict_index_capacity),
+            conflict_index: ConflictIndex::new(DEFAULT_CONFLICT_INDEX_RESERVE),
             sync_writer,
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
@@ -226,7 +234,7 @@ impl AccordStateMachine {
         Self {
             node_id,
             txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(100_000),
+            conflict_index: ConflictIndex::new(DEFAULT_CONFLICT_INDEX_RESERVE),
             sync_writer,
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
@@ -256,7 +264,7 @@ impl AccordStateMachine {
         Self {
             node_id,
             txn_states: HashMap::new(),
-            conflict_index: ConflictIndex::new(100_000),
+            conflict_index: ConflictIndex::new(DEFAULT_CONFLICT_INDEX_RESERVE),
             sync_writer,
             dep_waiters: HashMap::new(),
             committed_txns: HashSet::new(),
@@ -386,6 +394,75 @@ impl AccordStateMachine {
             }
         }
         pending
+    }
+
+    /// Diagnostic detail for every conflicting transaction a read at `t` is
+    /// still waiting on: `(t0, node, phase, deps, agreed t)`.
+    ///
+    /// Names the poison. The live symptom of the barrier stall is only the
+    /// message "dependencies were not applied locally"; a dependency that is
+    /// `PreAccepted` or `Accepted` with its coordinator gone is the one that
+    /// never clears, and `Committed` with an earlier `t` is the one that should
+    /// have applied. Without the phase and the agreed timestamp the two are
+    /// indistinguishable from the log.
+    pub fn pending_conflicts_detail(
+        &self,
+        key: &[u8],
+        t: &Timestamp,
+    ) -> Vec<(u64, u64, &'static str, usize, u64)> {
+        self.unapplied_conflicts_before(key, t)
+            .into_iter()
+            .map(|dep_id| {
+                let (phase, deps, agreed_t) = self
+                    .txn_states
+                    .get(&dep_id)
+                    .map(|state| (state.phase, state.deps.len(), state.t.time))
+                    .unwrap_or((TxnPhase::PreAccepted, 0, 0));
+                let phase = match phase {
+                    TxnPhase::PreAccepted => "PreAccepted",
+                    TxnPhase::Accepted => "Accepted",
+                    TxnPhase::Committed => "Committed",
+                    TxnPhase::Applied => "Applied",
+                };
+                (dep_id.0.time, dep_id.0.node, phase, deps, agreed_t)
+            })
+            .collect()
+    }
+
+    /// Diagnostic detail for a transaction's resolved dependency list: for each
+    /// dep, `(t0, node, phase)` where phase is `"absent"` when THIS replica never
+    /// registered it.
+    ///
+    /// Names the apply-side poison. `DepWaitApplier` gates on
+    /// `DepWaitGraph::is_applied`, which only knows transactions this replica
+    /// itself applied, so a dependency whose Apply never landed here parks its
+    /// waiter forever. From the bare "Apply timed out … refusing ApplyOK" line the
+    /// two causes are indistinguishable: a dep that is registered here but stuck
+    /// (needs re-driving) versus a dep that is `absent` here (nothing will ever
+    /// apply it locally).
+    pub fn dep_detail(&self, txn_id: &TxnId) -> Vec<(u64, u64, &'static str)> {
+        self.txn_states
+            .get(txn_id)
+            .map(|state| {
+                state
+                    .deps
+                    .iter()
+                    .map(|dep| match self.txn_states.get(dep) {
+                        Some(dep_state) => (
+                            dep.0.time,
+                            dep.0.node,
+                            match dep_state.phase {
+                                TxnPhase::PreAccepted => "PreAccepted",
+                                TxnPhase::Accepted => "Accepted",
+                                TxnPhase::Committed => "Committed",
+                                TxnPhase::Applied => "Applied",
+                            },
+                        ),
+                        None => (dep.0.time, dep.0.node, "absent"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Get the current state for a transaction (if any).
@@ -534,9 +611,12 @@ impl AccordStateMachine {
         self.witness_timestamp(t);
 
         // Register the txn under EVERY key it writes, so a later conflicting
-        // txn on any of them sees it as a dependency. A partial registration is
-        // unsafe: it could acknowledge a transaction without indexing all of its
-        // conflicts. Roll back and abstain if capacity is exhausted.
+        // txn on any of them sees it as a dependency. Registration is
+        // all-or-nothing and cannot fail: the index GROWS to hold the whole
+        // write-set (there is no capacity that could drop a key — a partial
+        // registration would acknowledge a transaction without indexing all of
+        // its conflicts, and one key over an old cap silently destroyed the
+        // entire transaction live at pgbench -i scale).
         let newly_created = !self.txn_states.contains_key(&txn_id);
         for key in keys {
             let entry = InFlightWrite {
@@ -549,19 +629,7 @@ impl AccordStateMachine {
                 accord_ts: Some(t),
                 status: TxnStatus::PreAccepted,
             };
-            if let Err(e) = self.conflict_index.register(key, entry) {
-                self.conflict_index.remove(&txn_id);
-                if newly_created {
-                    self.txn_states.remove(&txn_id);
-                }
-                tracing::error!(
-                    txn_id = ?txn_id,
-                    key_count = keys.len(),
-                    %e,
-                    "accord: refusing PreAccept because conflict index registration was incomplete"
-                );
-                return SmResponse::None;
-            }
+            self.conflict_index.register(key, entry);
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can
@@ -806,7 +874,26 @@ impl AccordStateMachine {
     /// is advanced to `Applied` and fsyncs its protocol-log marker exactly once
     /// (N markers per txn would corrupt the log).
     pub fn handle_apply_writeset(&mut self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> SmResponse {
-        let no_write = writes.iter().all(Vec::is_empty);
+        // Owned payloads: borrow a view over them and share the ONE apply body with
+        // the borrowed entry point below, so the two shapes cannot drift.
+        let borrowed: Vec<&[u8]> = writes.iter().map(|write| write.as_slice()).collect();
+        self.handle_apply_writeset_borrowed(txn_id, &borrowed)
+    }
+
+    /// Apply a **multi-key** transaction from BORROWED payloads.
+    ///
+    /// The borrowed twin of [`Self::handle_apply_writeset`], and the path the
+    /// coordinator's OWN local apply takes when its write-set is STAGED: the payloads
+    /// are slices of the spill's memory map, so no owned `Vec<u8>` is materialized per
+    /// entry. Behaviour is identical — every key is routed through the dep-ordered
+    /// apply engine as one unit (parked together, applied atomically), writes 2..N are
+    /// never dropped, and an empty payload is still the no-write finalize.
+    pub fn handle_apply_writeset_borrowed(
+        &mut self,
+        txn_id: TxnId,
+        writes: &[&[u8]],
+    ) -> SmResponse {
+        let no_write = writes.iter().all(|write| write.is_empty());
         // Read the agreed timestamp + deps from committed state BEFORE mutating,
         // so each mutation we hand to storage carries the real `(t, deps)`.
         let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
@@ -838,14 +925,34 @@ impl AccordStateMachine {
         // Wait only for dependencies that execute BEFORE this transaction. The
         // dependency set was computed from `t0`, so it can name a transaction
         // whose final `t` was bumped past ours; that one waits for us (CL-28).
+        //
+        // Also drop every dependency this replica holds no live state for. Such a
+        // dependency can never become applied here: it was either applied and then
+        // pruned (`prune_applied` forgets the `TxnState` and leaves only a
+        // `finalized` tombstone) or it never registered at all. The dep-wait graph
+        // forgets the same transaction on its own retention timer, so
+        // `graph.is_applied(dep)` stays false forever and nothing can ever resolve
+        // it — the waiter then parks until its bound expires and is abandoned.
+        // Measured live: ~30% of explicit transactions hit the bound and 4 of 4
+        // retries never committed.
+        //
+        // The read path already refuses to wait on such a dependency
+        // (`unapplied_conflicts_before`: "Applied / pruned: already applied — never
+        // waited on"); the apply path must not be stricter than the read path.
+        // Filtering before the graph sees the set is the whole fix: no extra lock,
+        // no clone of any state, and the existing allocation is reused.
         let deps: Vec<TxnId> = deps
             .into_iter()
-            .filter(|dep| !self.executes_after(dep, &t))
+            .filter(|dep| !self.executes_after(dep, &t) && self.txn_states.contains_key(dep))
             .collect();
 
         // Drop no-write entries (empty payloads): a key the replica owns but for
         // which this txn writes no row.
-        let writes: Vec<Vec<u8>> = writes.into_iter().filter(|d| !d.is_empty()).collect();
+        let writes: Vec<&[u8]> = writes
+            .iter()
+            .copied()
+            .filter(|data| !data.is_empty())
+            .collect();
 
         // No-write finalize: nothing to persist and no dependency ordering to
         // respect. Advance to Applied, then advance any waiters it unblocks.
@@ -862,15 +969,18 @@ impl AccordStateMachine {
         // Real write-set: route through the dep-ordered apply engine. It persists
         // every key atomically (idempotent on `(txn_id, key, t)`) once every
         // dependency has applied on this replica; otherwise it parks the set.
-        let mutations: Vec<ApplyMutation> = writes
-            .into_iter()
-            .map(|data| ApplyMutation {
+        let views: Vec<MutationView<'_>> = writes
+            .iter()
+            .map(|data| MutationView {
                 data,
                 t,
-                deps: deps.clone(),
+                deps: &deps,
             })
             .collect();
-        let applied = match self.apply_engine.try_apply_writeset(txn_id, mutations) {
+        let applied = match self
+            .apply_engine
+            .try_apply_writeset_borrowed(txn_id, &views)
+        {
             Ok(applied) => applied,
             Err(e) => {
                 // Storage apply failed: do NOT advance to Applied — fail loud,
@@ -1123,6 +1233,135 @@ impl AccordStateMachine {
 /// (`bug-accord-lwt-acks-phantom-write.md`), where a replica recorded
 /// `(txn_id, t)` and returned `ApplyOK` while nothing was persisted.
 ///
+/// Environment variable tuning the **apply** bound: how long a transaction may
+/// wait for its ordered dependencies to reach `Applied` before the coordinator
+/// abandons it — rolls it back, never commits it — and tells the client to retry.
+///
+/// This is the knob an operator raises for a slow mutator: a client updating many
+/// rows in one transaction legitimately needs a larger window than a benchmark
+/// burst.
+pub const TXN_TIMEOUT_ENV: &str = "FERROSA_ACCORD_TXN_TIMEOUT_SECS";
+
+/// Environment variable tuning the **barrier** bound: how long the PostgreSQL
+/// snapshot-barrier read-vote (and every inbound `ReadVote`) waits for its
+/// conflicting transactions to reach `Applied` before it ABSTAINS.
+///
+/// A separate knob, and deliberately tighter than the apply bound, because the
+/// two waits have opposite costs. Raising the apply bound buys a slow
+/// transaction time to finish; raising the barrier bound only makes a *failing*
+/// transaction slower — an abstain is fail-loud and the client retries, so there
+/// is nothing to wait longer for.
+pub const BARRIER_TIMEOUT_ENV: &str = "FERROSA_ACCORD_BARRIER_TIMEOUT_SECS";
+
+/// Default **apply** bound.
+///
+/// Single-sourced from [`crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT`] on
+/// purpose: the epoch drain period is sized as `SkewMax + DEFAULT_TXN_TIMEOUT`,
+/// so an in-flight transaction is never cut off by a drain shorter than the
+/// transaction bound. An operator who raises this must raise the drain with it.
+pub const DEFAULT_TXN_TIMEOUT: std::time::Duration =
+    crate::accord::epoch_drain::DEFAULT_TXN_TIMEOUT;
+
+/// Default **barrier** abstain bound — the historical dependency-wait value.
+pub const DEFAULT_BARRIER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Sentinel meaning "not yet resolved".
+const TIMEOUT_UNRESOLVED: u64 = u64::MAX;
+
+/// The resolved apply bound, cached as nanoseconds.
+///
+/// Read on the hot path — every inbound Apply and every abandoned transaction —
+/// so it is a single relaxed atomic load: no lock, no allocation, no
+/// `spawn_blocking` hop, no repeated `getenv`. An operator setting is
+/// process-wide by nature (it comes from the environment at startup), so one
+/// atomic is the whole store; there is deliberately no per-instance copy to
+/// drift out of sync.
+static TXN_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TIMEOUT_UNRESOLVED);
+
+/// The resolved barrier abstain bound, cached as nanoseconds (same rationale).
+static BARRIER_TIMEOUT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(TIMEOUT_UNRESOLVED);
+
+/// Parse an operator setting into a bound.
+///
+/// Pure, so it is testable without touching the process environment — `set_var`
+/// is process-global and racy under parallel tests. A non-numeric,
+/// non-positive, or non-finite value is reported and ignored rather than
+/// silently clamped to zero: zero would fail every transaction the instant it
+/// parked, which is a footgun, not a configuration.
+fn resolve_bound(
+    raw: Option<&str>,
+    env: &str,
+    default: std::time::Duration,
+) -> std::time::Duration {
+    match raw {
+        Some(value) => match value.trim().parse::<f64>() {
+            Ok(secs) if secs.is_finite() && secs > 0.0 => std::time::Duration::from_secs_f64(secs),
+            _ => {
+                tracing::warn!(
+                    value = %value,
+                    env,
+                    "accord: ignoring invalid timeout; using the default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Parse [`TXN_TIMEOUT_ENV`] into the apply bound.
+pub fn resolve_txn_timeout(raw: Option<&str>) -> std::time::Duration {
+    resolve_bound(raw, TXN_TIMEOUT_ENV, DEFAULT_TXN_TIMEOUT)
+}
+
+/// Parse [`BARRIER_TIMEOUT_ENV`] into the barrier abstain bound.
+pub fn resolve_barrier_timeout(raw: Option<&str>) -> std::time::Duration {
+    resolve_bound(raw, BARRIER_TIMEOUT_ENV, DEFAULT_BARRIER_TIMEOUT)
+}
+
+/// A cached nanosecond bound: one relaxed load once resolved, `parse` on the
+/// first caller. First writer wins; a racing writer resolves the same
+/// environment, so the loser's value is identical and either store is correct.
+#[inline]
+fn cached_bound(
+    slot: &std::sync::atomic::AtomicU64,
+    env: &str,
+    parse: fn(Option<&str>) -> std::time::Duration,
+) -> std::time::Duration {
+    let cached = slot.load(std::sync::atomic::Ordering::Relaxed);
+    if cached != TIMEOUT_UNRESOLVED {
+        return std::time::Duration::from_nanos(cached);
+    }
+    let resolved = parse(std::env::var(env).ok().as_deref());
+    let nanos = resolved.as_nanos().min(u64::MAX as u128) as u64;
+    let _ = slot.compare_exchange(
+        TIMEOUT_UNRESOLVED,
+        nanos,
+        std::sync::atomic::Ordering::Relaxed,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    resolved
+}
+
+/// The process-wide **apply** bound (see [`TXN_TIMEOUT_ENV`]), a lock-free read.
+#[inline]
+pub fn configured_txn_timeout() -> std::time::Duration {
+    cached_bound(&TXN_TIMEOUT_NANOS, TXN_TIMEOUT_ENV, resolve_txn_timeout)
+}
+
+/// The process-wide **barrier abstain** bound (see [`BARRIER_TIMEOUT_ENV`]),
+/// a lock-free read.
+#[inline]
+pub fn configured_barrier_timeout() -> std::time::Duration {
+    cached_bound(
+        &BARRIER_TIMEOUT_NANOS,
+        BARRIER_TIMEOUT_ENV,
+        resolve_barrier_timeout,
+    )
+}
+
 /// `node_id` is the Accord node identifier, `sync_writer` the protocol-log
 /// fsync writer, and `storage` the live engine handle whose write/batch path
 /// the applier persists through.
@@ -1185,8 +1424,179 @@ impl TxnPhaseExt for TxnPhase {
 mod tests {
     use super::*;
     use crate::accord::apply::{ApplyError, ApplyMutation, StorageApplier};
+    use crate::accord::handlers::DEFAULT_TXN_TIMEOUT;
     use ferrosa_storage::accord::sync_writer::{MockSyncWriter, SyncWriteCall};
     use parking_lot::Mutex;
+
+    /// The operator tunable resolves to the bound the operator asked for, and every
+    /// malformed or nonsensical value falls back to the default rather than silently
+    /// disabling the bound — a 0 s bound would abandon every transaction the instant
+    /// it parked, turning a config typo into an outage.
+    #[test]
+    fn txn_timeout_resolver_honours_valid_values_and_rejects_the_rest() {
+        assert_eq!(resolve_txn_timeout(None), DEFAULT_TXN_TIMEOUT);
+        assert_eq!(
+            resolve_txn_timeout(Some("30")),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(
+            resolve_txn_timeout(Some(" 2.5 ")),
+            std::time::Duration::from_secs_f64(2.5)
+        );
+        for bad in ["", "   ", "abc", "0", "-1", "0.0", "inf", "-inf", "NaN"] {
+            assert_eq!(
+                resolve_txn_timeout(Some(bad)),
+                DEFAULT_TXN_TIMEOUT,
+                "{bad:?} must fall back to the default, never disable the bound"
+            );
+        }
+    }
+
+    /// The apply bound and the barrier abstain bound are independent knobs, and
+    /// both resolve/reject the same way.
+    ///
+    /// The apply bound buys a slow transaction time to finish; the barrier bound
+    /// only paces a *failing* transaction, so it must be tunable separately and
+    /// must never silently inherit the apply value.
+    #[test]
+    fn the_apply_and_barrier_bounds_are_independently_tunable() {
+        assert_eq!(resolve_barrier_timeout(None), DEFAULT_BARRIER_TIMEOUT);
+        assert_eq!(
+            resolve_barrier_timeout(Some("12")),
+            std::time::Duration::from_secs(12)
+        );
+        for bad in ["", "nope", "0", "-3", "inf", "NaN"] {
+            assert_eq!(
+                resolve_barrier_timeout(Some(bad)),
+                DEFAULT_BARRIER_TIMEOUT,
+                "{bad:?} must fall back to the barrier default"
+            );
+        }
+        // A malformed value for one knob must not move the other.
+        assert_eq!(resolve_txn_timeout(Some("nope")), DEFAULT_TXN_TIMEOUT);
+        assert_ne!(
+            DEFAULT_BARRIER_TIMEOUT, DEFAULT_TXN_TIMEOUT,
+            "the defaults are deliberately different: an abstain has nothing to wait longer for"
+        );
+    }
+
+    /// Both cached reads are stable: the first resolution wins and every later
+    /// call returns the identical value from the lock-free atomic, so two
+    /// concurrent waiters cannot disagree about either bound.
+    #[test]
+    fn configured_bounds_are_stable_across_calls() {
+        let first = configured_txn_timeout();
+        assert_eq!(first, configured_txn_timeout());
+        assert!(first > std::time::Duration::ZERO);
+        let barrier = configured_barrier_timeout();
+        assert_eq!(barrier, configured_barrier_timeout());
+        assert!(barrier > std::time::Duration::ZERO);
+    }
+
+    /// `dep_detail` must separate a dependency this replica never registered
+    /// ("absent") from one it registered but never applied.
+    ///
+    /// They need different fixes, and the live log otherwise shows only a
+    /// dependency count — which is why the apply-side stall could not be
+    /// attributed from production.
+    #[test]
+    fn dep_detail_names_absent_dependencies_separately() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, applier);
+
+        let absent = txn(9, 900);
+        let stuck = txn(1, 1000);
+        let waiter = txn(2, 2000);
+        let key = b"dep-detail-key";
+
+        // `stuck` is registered here but never applied.
+        sm.handle_preaccept(stuck, ts(1000), key, BallotNumber(0), 0);
+        sm.handle_accept(stuck, ts(1000), ts(1001), vec![], BallotNumber(1));
+        sm.handle_commit(stuck, ts(1000), ts(1001), vec![]);
+        // `absent` is never registered on this replica at all; the waiter's
+        // dependency set is the union agreed across replicas, so it can name it.
+        sm.handle_preaccept(waiter, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(
+            waiter,
+            ts(2000),
+            ts(2001),
+            vec![stuck, absent],
+            BallotNumber(1),
+        );
+        sm.handle_commit(waiter, ts(2000), ts(2001), vec![stuck, absent]);
+
+        let detail = sm.dep_detail(&waiter);
+        assert_eq!(detail.len(), 2, "both deps must be reported: {detail:?}");
+        let phases: Vec<&str> = detail.iter().map(|(_, _, phase)| *phase).collect();
+        assert!(
+            phases.contains(&"Committed"),
+            "a registered-but-unapplied dep must show its phase: {detail:?}"
+        );
+        assert!(
+            phases.contains(&"absent"),
+            "a never-registered dep must read 'absent': {detail:?}"
+        );
+    }
+
+    /// A dependency this replica holds no live state for must not park its waiter.
+    ///
+    /// `prune_applied` forgets an applied transaction's `TxnState` and leaves only a
+    /// `finalized` tombstone; the dep-wait graph separately evicts the same
+    /// transaction from its `applied` set on a retention timer. Once both have
+    /// forgotten it, `graph.is_applied(dep)` is false forever and nothing can ever
+    /// resolve it — so the waiter parks until its bound expires and is then
+    /// abandoned. Measured live: ~30% of explicit transactions hit the bound and 4
+    /// of 4 retries never committed.
+    ///
+    /// The read path already refuses to wait on such a dependency
+    /// (`unapplied_conflicts_before`: "Applied / pruned: already applied — never
+    /// waited on"). The apply path must not be stricter than the read path.
+    #[test]
+    fn a_dependency_forgotten_by_both_state_and_graph_does_not_park_the_waiter() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let applier = Arc::new(CapturingApplier::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, applier.clone());
+
+        let forgotten = txn(9, 900);
+        let waiter = txn(2, 2000);
+        let key = b"forgotten-dep-key";
+
+        sm.handle_preaccept(forgotten, ts(900), key, BallotNumber(0), 0);
+        sm.handle_accept(forgotten, ts(900), ts(901), vec![], BallotNumber(1));
+        sm.handle_commit(forgotten, ts(900), ts(901), vec![]);
+        sm.handle_apply_writeset(forgotten, Vec::new());
+        assert_eq!(
+            sm.get_state(&forgotten).unwrap().phase,
+            TxnPhase::Applied,
+            "precondition: it applied here"
+        );
+
+        sm.prune_applied();
+        assert!(
+            sm.get_state(&forgotten).is_none(),
+            "prune_applied must forget the state"
+        );
+        sm.prune_graph_for_test(std::time::Duration::ZERO);
+        assert_eq!(
+            sm.applied_count_for_test(),
+            0,
+            "the graph must have forgotten it too, or this test proves nothing"
+        );
+
+        sm.handle_preaccept(waiter, ts(2000), key, BallotNumber(0), 0);
+        sm.handle_accept(waiter, ts(2000), ts(2001), vec![forgotten], BallotNumber(1));
+        sm.handle_commit(waiter, ts(2000), ts(2001), vec![forgotten]);
+
+        sm.handle_apply_writeset(waiter, vec![b"write-waiter".to_vec()]);
+
+        let ids: Vec<_> = applier.captured().iter().map(|(id, _, _)| *id).collect();
+        assert!(
+            ids.contains(&waiter),
+            "a dependency forgotten by both the state machine and the graph can never be \
+             applied here, so it must not park the waiter; got {ids:?}"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Test helpers
@@ -1232,16 +1642,6 @@ mod tests {
     fn make_sm(node_id: u64) -> (AccordStateMachine, Arc<MockSyncWriter>) {
         let writer = Arc::new(MockSyncWriter::new());
         let sm = AccordStateMachine::new(node_id, writer.clone());
-        (sm, writer)
-    }
-
-    #[allow(dead_code)]
-    fn make_sm_with_capacity(
-        node_id: u64,
-        cap: usize,
-    ) -> (AccordStateMachine, Arc<MockSyncWriter>) {
-        let writer = Arc::new(MockSyncWriter::new());
-        let sm = AccordStateMachine::with_capacity(node_id, writer.clone(), cap);
         (sm, writer)
     }
 
@@ -1466,12 +1866,18 @@ mod tests {
         let writer = Arc::new(MockSyncWriter::new());
         let mut sm = AccordStateMachine::with_applier(1, writer, capturing.clone());
 
-        let absent_dependency = txn(2, 1000);
+        // The dependency the waiter parks on must be REGISTERED here. A
+        // transaction this replica holds no state for can never be applied here,
+        // so it is not something the waiter can or should wait on — see
+        // `a_dependency_forgotten_by_both_state_and_graph_does_not_park_the_waiter`.
+        // Registering it is what makes this a genuine park.
+        let registered_dependency = txn(2, 1000);
         let waiting_txn = txn(1, 1001);
         let t0 = ts(1001);
         let mutation = b"dependent-write".to_vec();
+        sm.handle_preaccept(registered_dependency, ts(1000), b"key", BallotNumber(0), 0);
         sm.handle_preaccept(waiting_txn, t0, b"key", BallotNumber(0), 0);
-        sm.handle_commit(waiting_txn, t0, ts(1002), vec![absent_dependency]);
+        sm.handle_commit(waiting_txn, t0, ts(1002), vec![registered_dependency]);
 
         sm.handle_apply_writeset(waiting_txn, vec![mutation.clone()]);
         assert_eq!(
@@ -1481,25 +1887,32 @@ mod tests {
         );
         assert!(capturing.captured().is_empty());
 
-        assert!(matches!(
-            sm.handle_apply_writeset(absent_dependency, vec![b"unexpected-write".to_vec()]),
-            SmResponse::None
-        ));
-        assert_eq!(
-            sm.get_state(&waiting_txn).unwrap().phase,
-            TxnPhase::Committed,
-            "a missing dependency with mutation bytes must not be treated as a no-write"
+        // The no-state arm's own contract is separate from the park: a real write
+        // for a transaction this replica never registered must NOT be acknowledged
+        // (an ApplyOK would claim durability it does not have), and an explicit
+        // no-write finalize for it is terminal.
+        let unregistered = txn(9, 999);
+        assert!(
+            matches!(
+                sm.handle_apply_writeset(unregistered, vec![b"unexpected-write".to_vec()]),
+                SmResponse::None
+            ),
+            "a write for a transaction this replica never registered must not be acknowledged"
         );
-
         assert!(matches!(
-            sm.handle_apply_writeset(absent_dependency, Vec::new()),
+            sm.handle_apply_writeset(unregistered, Vec::new()),
             SmResponse::NoWriteFinalized
         ));
+
+        // The registered dependency resolves — an empty Apply carries no write for
+        // it — and releases its waiter. Its wire variant differs from the no-state
+        // arm's (pinned above); what this test is about is that the park is released.
+        sm.handle_apply_writeset(registered_dependency, Vec::new());
 
         assert_eq!(
             sm.get_state(&waiting_txn).unwrap().phase,
             TxnPhase::Applied,
-            "an absent dependency finalized as no-write must release dependent writes"
+            "a dependency finalized as no-write must release dependent writes"
         );
         assert_eq!(capturing.captured(), [(waiting_txn, mutation, ts(1002))]);
     }
@@ -2177,7 +2590,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept a new txn on the same key with t0=1000 (> 500).
         let new_txn = txn(1, 1000);
@@ -2208,7 +2621,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // Register txn with t0=1200.
         let txn_1200 = txn(3, 1200);
@@ -2218,7 +2631,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept with t0=1000. deps_before_t0 should include 800 but not 1200.
         let new_txn = txn(1, 1000);
@@ -2262,17 +2675,90 @@ mod tests {
         }
     }
 
+    /// The INVERSE of the old `sm_preaccept_capacity_failure_*` test: a multi-key
+    /// write-set registers under EVERY key and votes — there is no capacity at
+    /// which one key is dropped. (The retired test asserted the defect: that a
+    /// 2-key write-set was refused and rolled back when the cap was 1.)
     #[test]
-    fn sm_preaccept_capacity_failure_abstains_and_rolls_back_partial_registration() {
-        let (mut sm, _writer) = make_sm_with_capacity(1, 1);
+    fn sm_preaccept_registers_every_key_of_a_multi_key_write_set() {
+        let (mut sm, _writer) = make_sm(1);
         let keys: &[&[u8]] = &[b"key_one", b"key_two"];
         let txn_id = txn(2, 500);
 
         let response = sm.handle_preaccept_multi(txn_id, ts(500), keys, BallotNumber(0), 0);
 
-        assert!(matches!(response, SmResponse::None));
-        assert!(sm.conflict_index().is_empty());
-        assert!(sm.get_state(&txn_id).is_none());
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "both keys must register and the txn vote; got {response:?}"
+        );
+        assert_eq!(
+            sm.conflict_index().len(),
+            2,
+            "every key of the write-set must be registered, none dropped"
+        );
+        assert!(sm.get_state(&txn_id).is_some());
+    }
+
+    /// `n` distinct keys, so a write-set can be built at the failing scale.
+    fn distinct_keys(n: u32) -> Vec<Vec<u8>> {
+        (0..n).map(|i| i.to_be_bytes().to_vec()).collect()
+    }
+
+    /// The real pgbench -i load: ONE transaction carrying ~1,000,112 keys (the
+    /// TRUNCATE + COPY of pgbench_accounts, buffered and committed as one Accord
+    /// transaction). At the historical fixed 100 000-entry capacity every replica
+    /// refused the PreAccept — `key_count=1000112 e=conflict index at capacity` —
+    /// so the coordinator collected ZERO votes and reported "Accord quorum
+    /// unavailable" on a fully healthy cluster. The write-set itself is legal and
+    /// the index must GROW to hold it: this test is the INVERSE of the defect — it
+    /// asserts the write-set is ACCEPTED, not that it is refused.
+    ///
+    /// Deliberately at the failing scale. A small-N test cannot see the capacity
+    /// boundary, which is how this class of defect shipped green twice.
+    #[test]
+    fn a_million_key_preaccept_registers_whole_and_votes() {
+        let keys = distinct_keys(1_000_112);
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+
+        let (mut sm, _w) = make_sm(1);
+        let accepted = sm.handle_preaccept_multi(txn(1, 1000), ts(1000), &refs, BallotNumber(0), 0);
+        assert!(
+            matches!(accepted, SmResponse::PreAcceptOK { .. }),
+            "a 1,000,112-key write-set the front end admits must register whole and vote; \
+             got {accepted:?}"
+        );
+        assert_eq!(
+            sm.conflict_index().len(),
+            keys.len(),
+            "every key of the write-set must be registered — no cap may truncate it"
+        );
+        // A key beyond the old 100 000 boundary must still resolve to the txn.
+        assert_eq!(
+            sm.conflict_index()
+                .max_conflicting_timestamp(&keys[999_999]),
+            Some(ts(1000)),
+            "a key past the old capacity boundary must still be indexed"
+        );
+    }
+
+    /// Every production constructor must build a conflict index that admits a
+    /// write-set of ANY size — there is no capacity to configure, so no future
+    /// constructor can silently reintroduce the fixed 100 000-entry cap. This
+    /// exercises the constructor through a real multi-key PreAccept well past the
+    /// old cap.
+    #[test]
+    fn production_constructors_admit_a_write_set_past_the_old_cap() {
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::new(1, writer);
+        let keys = distinct_keys(120_000);
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        let response = sm.handle_preaccept_multi(txn(1, 1000), ts(1000), &refs, BallotNumber(0), 0);
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "a production-built state machine must admit a write-set past the old cap; \
+             got {response:?}"
+        );
+        assert_eq!(sm.conflict_index().len(), keys.len());
     }
 
     /// Multi-key PreAccept returns the UNION of dependencies across all of the
@@ -2286,7 +2772,7 @@ mod tests {
         // A pre-existing conflicting txn on each key, both with t0 < 1000.
         let on_k1 = txn(2, 400);
         let on_k2 = txn(3, 600);
-        let _ = sm.conflict_index_mut().register(
+        sm.conflict_index_mut().register(
             k1,
             InFlightWrite {
                 txn_id: on_k1,
@@ -2295,7 +2781,7 @@ mod tests {
                 status: TxnStatus::PreAccepted,
             },
         );
-        let _ = sm.conflict_index_mut().register(
+        sm.conflict_index_mut().register(
             k2,
             InFlightWrite {
                 txn_id: on_k2,
@@ -2333,7 +2819,7 @@ mod tests {
 
         // A conflict on k2 (not k1) with t0=1500 >= our t0=1000.
         let hot = txn(2, 1500);
-        let _ = sm.conflict_index_mut().register(
+        sm.conflict_index_mut().register(
             k2,
             InFlightWrite {
                 txn_id: hot,
@@ -2785,7 +3271,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept new txn with t0=1000 (lower than existing t0=1500).
         let new_txn = txn(1, 1000);
@@ -2896,7 +3382,7 @@ mod tests {
             accord_ts: None,
             status: TxnStatus::PreAccepted,
         };
-        let _ = sm.conflict_index_mut().register(key, entry);
+        sm.conflict_index_mut().register(key, entry);
 
         // PreAccept with epoch=1 (mismatch from epoch=0 on existing txns).
         // The epoch mismatch means the coordinator's proposed t0 may be

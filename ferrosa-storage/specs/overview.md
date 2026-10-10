@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-storage
 status: implemented
-last_updated: 2026-10-03
+last_updated: 2026-10-09
 executive_summary: >
   The single-node storage engine and durable substrate of the platform:
   memtable, write-ahead commit log, flush to BTI SSTables, S3 write-behind
@@ -61,11 +61,13 @@ without changing the process environment. Digest verification is unconditional.
 | `index/` | Index state tracker (registered/pending/current completeness; compaction swaps retire inputs, failed/stalled backfills healed by `StorageEngine::heal_secondary_index_backfills`, ST-85), build scheduler, local/remote/off backends, artifact manifest, virtual table; `LocalBackend` resolves flat and engine table-dir SSTable layouts and writes sidecars beside table SSTables |
 | `snapshot/`, `restore/` | S3 snapshot manager + restore manager + validation (PITR); `restore/intent.rs` carries the restore-on-boot intent (`FERROSA_RESTORE_*`) and the apply-once marker that keeps a reboot-surviving env var from re-restoring on every start |
 | `quarantine`, `self_heal/` | Malformed-row quarantine sidecar; deterministic self-heal control loop + corrupt-SSTable detector |
-| `accord/` | Per-shard conflict index + protocol log for Accord transactions |
+| `accord/` | Per-shard conflict index + protocol log for Accord transactions. The protocol log's framing reader bounds a record by the FILE length, not a fixed size ceiling: a valid record of any size is recovered, never mistaken for a torn tail |
 | `timeseries/` | Ring aggregation, late-data, WASM aggregates, materialization |
 | `data_store` | `DataStore` trait + `LocalDataStore` |
 | `spill_budget` | Process RAM-budget detection (cgroup v2/v1 → `/proc/meminfo` → floor, injectable + cached) and the ORDER BY spill threshold (50% default; `FERROSA_RANGE_SPILL_THRESHOLD_{PCT,BYTES}`) |
 | `external_sort` | Bounded-memory spilling external merge sort of CQL rows (`ExternalSorter`, cascade k-way merge, `MERGE_FANIN`) for unbounded `ORDER BY`; `SortedRows::into_disk_backed` parks a remainder on disk for CQL result cursors; fail-loud on spill/merge I/O |
+| `write_set_spill` | Local temp staging for a large transaction's write-set mutation payloads (`WriteSetSpill`): `stage` drains the payloads to a temp file (reusing `TempSortTableReservation` cleanup) once they cross `WRITE_SET_SPILL_FLOOR_BYTES` (8 MiB), then MMAPS the region read-only (`memmap2`) so `entry(i)` is a borrowed slice — no seek, no read, no per-read lock — and `mutation(i)` its owned twin. The region-REFERENCE Apply wire (`ferrosa_net::protocol::encode_accord_apply_v2_region`) consumes the borrowed `entry(i)` slices directly, writing them into ONE contiguous region on the frame with no per-entry capnp struct. Keeps the coordinator's resident write-set at the KEYS + a small index instead of the payload bulk; below the floor nothing is staged. The file + mapping are released on the last drop of the `Arc<WriteSetSpill>` the driver holds |
+| `write_set_stage` | A **streaming**, threshold-bounded staging area for a transaction's write-set payloads (`WriteSetStage`). Where `write_set_spill` stages payloads that are already materialized, this is driven AS THE ROWS ARRIVE: `append(payload)` holds a bounded resident prefix and spills the rest to a private temp file, so the front end that BUILDS a write-set (a `COPY` inside `BEGIN`) never holds the bulk. `finish()` mmaps the spilled region and `entry(i)` returns a borrowed slice (resident prefix or mapping) in APPEND order; an un-staged index fails loud. The resident limit is a streaming BUFFER SIZE, externalized as `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` (default 8 MiB) — never a cap; a larger write-set spills, it is not refused. Cleanup reuses `TempSortTableReservation` |
 | `metrics`, `virtual_tables`, `observer`, `subscription_observer` | Prometheus metrics; system virtual tables; write observers (CDC/SUBSCRIBE) |
 | `batchlog` | Batchlog manager for atomic multi-partition batches |
 
@@ -128,8 +130,10 @@ volume or changing query results.
    PR CI; a larger randomized sweep is in `mod slow`.
    Periodic S3 sync skips incomplete generations before upload or manifest
    publication: all four required components (`Data.db`, `Partitions.db`,
-   `Rows.db`, and `Filter.db`) must be present. This is a presence check;
-   zero-byte `Rows.db` is a valid component.
+   `Rows.db`, and `Filter.db`) must be present. This is a presence check; a
+   zero-byte `Rows.db` is valid, but an ABSENT one is corruption — `Rows.db` is a
+   mandatory BTI component (row index, listed in TOC.txt) — so the generation is
+   withheld and never uploaded, never synthesized or worked around.
    **Exception — local `file://` backend** (`FERROSA_LOCAL_STORE_PATH` /
    `[s3].local_path`): the local disk *is* the authoritative durable store, so
    `ObjectStoreConfig::is_local()` is threaded into `LocalCache` as `durable` and
@@ -200,6 +204,24 @@ volume or changing query results.
     immutable and bound to its memtable; index DDL and `ALTER` rotate the
     memtable. Invariant: a memtable's index postings are exactly the sidecars
     its flush writes for the catalog it is bound to (ST-70).
+14. **A table tombstone is a normal row, and is never purged.** A whole-table
+    `TRUNCATE` is ONE reserved-partition row in the table's own LSM
+    (`src/table_tombstone.rs`); every read path folds its `DeletionTime` into the
+    partition it reads (`merge::apply_table_deletion`) so the table reads as empty
+    *immediately* on commit, while `merge::reclaim_covers_table` drops the covered
+    rows only at the next compaction — **logically immediate, physically lazy**.
+    `TRUNCATE` then `VACUUM` is strictly equivalent in effect to an immediate
+    truncate; the split is deliberate for client compatibility, and making
+    reclamation synchronous would be a separate change. The marker's lifetime rule
+    is *no resurrection*: it is EXEMPT from purge in `compaction::purge` and
+    retained until the table is dropped, so a stale replica's older copy can never
+    re-appear. Cluster-scope caveat: the marker is a single key, so the ordinary
+    write path would route it to only that key's RF replica set — a proper subset of
+    the ring when `RF < node count`. It is therefore replicated to **every node
+    serving the table at `ConsistencyLevel::All`**, with the target set being the
+    whole ring (not one key's RF set) and a loud failure if any node does not ack;
+    `CL=ALL` alone is not sufficient because it only filters the replica slice it is
+    handed.
 
 ## Concurrency
 

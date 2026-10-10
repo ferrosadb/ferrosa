@@ -34,6 +34,214 @@ transaction reaches `Applied` and every participating shard reaches Apply
 quorum, so a locally parked dependency does not delay propagation or become an
 early acknowledgement.
 
+The Apply fan-out is **bounded on both axes**: `apply_fanout_bounded` drives the
+per-replica `AccordApplyV2` sends through a `FuturesUnordered` with
+`APPLY_FANOUT_WINDOW` payloads in flight, so replicas OVERLAP while the number of
+resident payloads stays capped. The per-shard quorum accounting is unchanged.
+Getting only one axis right is a trap this has already fallen into once: bounding
+memory by sending SEQUENTIALLY made the coordinator pay the SUM of replica apply
+latencies instead of the MAX, which measured as 57% of a large commit. Hence the
+test asserts both — peak in-flight > 1 and <= the window. See FMEA `CL-50`.
+
+The coordinator's own replica apply runs inside the SAME `tokio::join!` as the
+remote fan-out and the local dependency wait, so the Apply phase pays
+`max(local, remote)` instead of `local + remote`. It used to run serially ahead of
+the fan-out (measured 889 ms at N=100 000). See FMEA `CL-51`.
+
+A large write-set is **staged in local temp storage**: `drive_accord` pushes the
+transaction's encoded mutation payloads through `ferrosa_storage::WriteSetSpill`
+once they cross an 8 MiB floor and hands the driver `with_spilled_write_set`, so
+the resident write-set is the KEYS (Accord's conflict ordering and the per-shard
+participant set need them) plus a ~1.2 MB offset index at N=100 000 — never the
+~51 MB payload bulk. The fan-out borrows each payload as a slice of the spill's mmap,
+and the coordinator's own apply borrows it the same way (see below — no owned
+`Vec<u8>` per entry), so a staged entry's empty `mutation` never reaches the wire and
+never becomes a per-entry copy; small write-sets stay wholly resident. See FMEA
+`CL-51` and `ferrosa-storage`'s `write_set_spill`.
+
+When the write-set is the **same for every peer** — no per-key resolver, or every
+key resolving to the same replica set (the `RF == node count` shape) — the payload
+is built and CAPNP-encoded ONCE (`borrowed_write_set_entries` borrows `(key, mutation)`
+slices straight out of the resident write-set, or out of the spill's mmap, so not even
+one clone is materialized) and the resulting frame is handed to each peer by refcount.
+The Apply frame is capnproto (`encode_accord_apply_v2`), not bincode; a peer that has
+not advertised `CAP_ACCORD_CAPNP` still receives the legacy bincode frame. That removes N-1 write-set copies, N-1 staged-payload re-reads and N-1
+whole-frame serializations from Apply. A genuinely per-peer write-set (a token-aware
+ring with `RF < node count`) still gets its OWN scoped frame and never a shared one —
+sharing a frame across scopes would put a key on a peer that does not own it. The
+`FERROSA_PG_COMMIT_PROFILE` fan-out line reports `frame_bytes` (the largest frame on
+the wire, which is what the Data-lane wait bound is spent on) and `shared_frame`.
+
+**Where the Apply phase's time actually goes (measured, N=1 100 000, 3-node, the
+`pgbench -i` shape).** The dependency-wait bound is 10 s; the commit is ABANDONED
+(`unmet=3 timeout=10s`). The `FERROSA_PG_COMMIT_PROFILE` split of the 25.4 s apply
+phase, with the peer-side `accord apply_writeset attribution` lines:
+
+| Component | Before mmap (N=1.1M) | After mmap (see below) |
+|---|---|---|
+| (a) coordinator frame build + serialize | **15.2 s** (`serialize_ms=15229`, bincode) | **86 ms** at N=100 000 after the capnp rewire (`serialize_ms=86.13`, **15.6x**; `frame_bytes` +22%) |
+| (b) transport + peer-side frame deserialize | **~9.4 s** (`max_ack_ms=17442` minus peer apply) | unchanged (still bincode) |
+| (c) peer's own local apply (decode+`apply_batch`) | **~8.0 s** (node1 7.4 s, node2 8.0 s, node3 7.6 s) | unchanged |
+| per-peer payload bytes | **195 MB** (`frame_bytes=204541573`), `shared_frame=false` | unchanged |
+
+So the peer's own local apply (~8.0 s) is BELOW the 10 s bound — it does NOT alone
+make acceptance unreachable — but the peer ROUND TRIP (`(max_ack_ms)=17.4 s`) is
+`transport + peer-deserialize + apply`, and that exceeds the bound on its own. **A
+frame that carries the write-set INLINE — capnp or bincode — still copies every one
+of the ~1.1M entries into the message on the coordinator and out of it on the peer,
+so capnp structs alone are NOT sufficient: acceptance needs the region-REFERENCE
+wire** (an offset+length into a shared/mapped buffer rather than inline bytes). The
+`ferrosa-storage` write-set spill is now MMAPPED (`entry(i)` is a slice of the
+mapping), which removes the ~1.1M per-entry seek+read+mutex that was the bulk of (a).
+The 10 s bound was NOT raised.
+
+### The region-REFERENCE Apply wire (`AccordApplyV2Region`)
+
+The inline frame above copies every entry's key+mutation into the capnp arena on the
+coordinator and decodes them back into owned `AccordWriteSetEntry`s on the peer; at
+N=1.1M that copy bound stays on the path and `frame_bytes` never falls. The region
+wire removes it. It adds ONE message type, `MsgType::AccordApplyV2Region` (0x7E),
+gated on the capability bit `CAP_ACCORD_APPLY_REGION` (bit 4). The body is two byte
+regions laid end to end:
+
+```text
+    0                     H                        H+R
+    +---------------------+--------------------------+
+    |  capnp HEADER (H)   |   REGION (R bytes)       |
+    +---------------------+--------------------------+
+                           ^ region[0..] — this peer's write-set payload bytes
+```
+
+* **HEADER** — a capnp `Envelope` whose payload is `accord.op.applyV2Region`:
+  `txnId`, `entryCount`, and two parallel lists `offsets : List(UInt64)` and
+  `lengths : List(UInt32)`. It carries NO entry bytes — it is the index into the
+  region plus the transaction stamp. The per-shard SCOPE is applied
+  coordinator-side (only the keys this peer owns are in the region), exactly as the
+  per-peer `applyV2` frame scoped today. The partition KEY is NOT carried: the
+  replica already discards it (it applies the `mutation` bytes in order) and the
+  coordinator has already scoped the frame to the peer's keys.
+* **REGION** — the concatenation, in write-set order, of this peer's encoded
+  mutation payloads. Entry `i` is `region[offsets[i] .. offsets[i] + lengths[i]]`.
+  The region begins at the first byte AFTER the capnp message; the decoder finds `H`
+  by reading the capnp message out of a `std::io::Cursor` and taking its position, so
+  no length field is required and the capnp word-padding costs nothing extra.
+
+**Coordinator — no copy into the arena.** `encode_accord_apply_v2_region` walks the
+borrowed `(key, mutation)` slices from `borrowed_write_set_entries` (each `mutation`
+is a slice of the spill's mmap, `WriteSetSpill::entry`) and appends them to the region
+buffer. Each entry's bytes are copied exactly ONCE, as a bulk `extend_from_slice`,
+never into a capnp struct; the header holds only the index. The whole body
+(`header ++ region`) is built once and — when the write-set is uniform — shared to
+every peer by refcount, as before.
+
+**Peer — reads by offset, no owned wire structure.** `decode_accord_apply_v2_region`
+returns an `AccordApplyV2RegionView<'_>` that BORROWS the received `Bytes`:
+`entry(i)` / `mutations()` yield `&[u8]` slices of the region, with no
+`Vec<AccordWriteSetEntry>` and no per-entry wire decode. The one copy that remains
+on the peer is the `Vec<u8>` per mutation the storage applier requires
+(`ApplyMutation.data` moves owned bytes through the blocking apply seam); it is NOT
+a decode of the message into owned entries.
+
+**Lifetimes.** The coordinator's mapped region is owned by the `Arc<WriteSetSpill>`
+the driver holds (`with_spilled_write_set`); consumers borrow slices of it and the
+mapping plus the staging file are released on the LAST drop of that `Arc`
+(`WriteSetSpill` declares `map` before the temp-dir reservation, so it unmaps before
+the directory is removed).
+
+**The coordinator's own local apply BORROWS a staged write-set — the mapping, not a
+copy.** A previous revision recorded the owned read-back as *structurally required*;
+that claim was **wrong and is superseded**. The `'static` bound
+`handlers::on_state_machine` imposes
+(`F: FnOnce(&mut AccordStateMachine) -> R + Send + 'static`) constrains the closure's
+**captures**, not the payload representation: an `Arc` IS `'static`, so
+`apply_phase_within` MOVES the `Arc<WriteSetSpill>` into the closure and borrows the
+mapping INSIDE its body via `WriteSetSpill::entry`, handing
+`AccordStateMachine::handle_apply_writeset_borrowed` a `&[&[u8]]` of mapped slices —
+which it forwards to `StorageApplier::apply_writeset_borrowed` with no owned `Vec<u8>`
+per entry. This is compile-verified by `apply.rs`'s
+`an_arc_owned_by_the_static_closure_lets_the_mapping_be_borrowed_inside`; the seam
+contract itself is the RUNNABLE doctest on
+`StorageApplier::apply_writeset_borrowed` (an applier handed a `MutationView` sees the
+caller's buffer, not a copy — `cargo test --doc` fails if that changes); the applier
+seam is held by the POINTER-IDENTITY guard
+`staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy` (its in-test
+negative control drives the owned path through the same probe, so the guard can
+fail), and the coordinator wiring is held end to end by
+`coordinator_local_apply_borrows_the_staged_write_set_not_a_copy`, which runs the real
+coordinator driver with a staged write-set and asserts the applier receives the
+spill's OWN addresses (a doc example cannot drive `AccordCoordinatorDriver`).
+
+Two paths still hand over owned bytes, each a deliberate choice rather than a lifetime
+wall: a RESIDENT write-set (below the staging floor — the bytes are already in RAM, so
+a disk round-trip would cost more than it saves) and the no-state-machine
+`local_applier` fallback (which persists but has no `AccordStateMachine` to borrow
+through). Both read back through `entry_mutation`. A write-set that PARKS on an
+unresolved dependency materializes once to outlive the call (and a large park is staged
+to disk), and the dep-cascade that applies a parked set goes through the owned
+`apply_writeset`. See FMEA `CL-53`. The dep-wait engine likewise no
+longer needs owned bytes to park: a large parked write-set is held as
+`ParkedWriteSet::Staged` — an `Arc<WriteSetSpill>` plus per-entry indices — so the
+bytes outlive the coordinator's call behind the Arc, and the file plus mapping are
+freed on its last drop.
+
+**A parked write-set is bounded by the buffer, not by the payload.** A parked
+write-set whose payloads reach the staging floor is staged on disk and the park keeps
+only an `Arc<WriteSetSpill>` plus indices; `DepWaitApplier::parked_residency` reports
+the resident-vs-staged split, and a large park must show `resident_payload_bytes == 0`
+(see `parked_write_sets_spill_so_residency_is_bounded_not_proportional_to_payload`, with
+its negative control `control_resident_parks_grow_with_the_payload_when_staging_is_disabled`).
+An unresolvable park is additionally reclaimed by time (see the apply-phase section
+below); the `ApplyMutation::data` doc carries a compiling doctest showing the Arc-owns
+-and-borrows-inside shape.
+
+**Version skew.** A peer that did not advertise `CAP_ACCORD_APPLY_REGION` receives
+the capnp-inline `AccordApplyV2Capnp` frame (if it advertised `CAP_ACCORD_CAPNP`) or
+the bincode `AccordApplyV2` frame (if it did not) — never a type byte it would reject.
+
+**Reused bulk channel?** No. The `ferrosa-cluster/src/streaming/` path
+(`StreamStart`/`StreamChunk`/`StreamEnd` + `sstable_transfer`) is a multi-message,
+per-chunk-ACKED session protocol whose receiver applies its own `StreamedMutation`
+shape; it is the token-range join/decommission channel, not a single request/response
+Apply frame with one ack. Folding the Apply region into it would replace one Apply
+RPC with a session (and a per-chunk ack round-trip) for no gain, so the region rides
+the existing single-frame Accord message path.
+
+#### Region compression: measured (loopback, N = 100,000)
+
+The compression tunable (`FERROSA_ACCORD_COMPRESSION`, see
+[../PROFILE.md](../PROFILE.md)) is opt-in and default-`none`; this is its first
+measurement. Each row is a 3-node **loopback** cluster receiving ONE transactional
+`COPY` of **exactly N = 100,000 rows** and its COMMIT — N is verified from the logs
+(the follower applies total 100,000 mutations: 31,798 + 35,180 + 33,022). The CAPs
+are advertised by all three nodes (identical build), confirmed behaviourally by
+`frame_bytes` falling when a codec is set. `serialize_ms` is the coordinator's frame
+build; the codec's own cost is its delta against `none`.
+
+| setting | frame_bytes | ratio | serialize_ms | codec ms | fanout_ms | max_ack_ms | RSS n1/n2/n3 (MB) |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `none` (default) | 21,671,344 | 1.00x | 82.1 | — | 1086 | 1043 | 608 / 376 / 368 |
+| `lz4` | 3,774,361 | 5.74x | 576.8 | +494.7 | 1582 | 1285 | 568 / 380 / 371 |
+| `lz4` blk 64 KiB | 3,805,439 | 5.69x | 583.4 | +501.2 | 1615 | 1318 | 573 / 386 / 363 |
+| `lz4` blk 1 MiB | 3,767,994 | 5.75x | 554.2 | +472.1 | 1563 | 1279 | 520 / 378 / 371 |
+| `snappy` | 4,234,224 | 5.12x | 217.7 | +135.5 | 1208 | 1097 | 527 / 387 / 370 |
+| `zstd` | 2,055,220 | 10.54x | 198.7 | +116.6 | 1154 | 1053 | 536 / 373 / 367 |
+| `zstd` blk 64 KiB | 2,008,826 | 10.79x | 196.7 | +114.6 | 1158 | 1059 | 554 / 383 / 368 |
+| `zstd` blk 1 MiB | 2,117,670 | 10.23x | 212.8 | +130.6 | 1167 | 1059 | 537 / 377 / 367 |
+
+* `zstd` is the best on both axes (cheapest build, best ratio); `lz4` is the worst
+  on both (5.7x for +472–501 ms); `snappy` buys `lz4`'s ratio for ~1/4 the CPU.
+* Block size barely matters: `zstd` is 10.2–10.8x over 64 KiB…1 MiB, `lz4` 5.7x at
+  every block. The 256 KiB default is fine.
+* RSS is flat across codecs (±~40 MB): the compressed frame is transient and does
+  not change peer memory.
+* On a **loopback** cluster compression LOSES on latency — `fanout_ms` rises from
+  1086 ms to 1154–1615 ms — because the transport term is ~free and the codec is
+  pure added CPU. The byte saving only pays when the transport is byte-bound.
+
+> **The ratio is a benchmark artifact.** The pgbench `accounts` filler is one
+> repeated character, near-ideal for LZ; do not quote 5–11x as a general claim. And
+> this is a loopback run: it measures the codec's cost, not its wire benefit.
+
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and
 > simulated-nemesis). There is **no external/public Jepsen run yet** — the
@@ -62,7 +270,15 @@ early acknowledgement.
   types, UDFs/UDAs, members, token map, per-node index status, cluster config.
   `DropTable` apply removes the table's index entries from `RaftState` and, via
   `engine.unregister_table`, cascades tombstones over the dropped table's
-  `system_schema.indexes` registrations (t_ae06e925). `DropIndex` apply now
+  `system_schema.indexes` registrations (t_ae06e925). A refused apply — the
+  engine could not remove the table's SSTables — is folded into a
+  `RaftResponse::Error`, and the client-facing cluster route
+  `ddl_path::execute_via_raft` now SURFACES that refusal as an error instead of
+  reporting success; the storage half records the durable sweep intent so the
+  node's schema can never say "dropped" while its directory survives unrecorded
+  (t_c8625592, CL-47; regression
+  `tests/drop_table_replica_agreement.rs::a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects`).
+  `DropIndex` apply now
   also calls `engine.drop_index`, so live memtable/vector index state, sidecar
   read guards, and `IndexStateTracker` entries are removed on the applying node
   immediately. `CreateIndex` apply is now symmetric with it: it calls
@@ -258,6 +474,41 @@ early acknowledgement.
 - **Write backpressure**: `WRITE_CONCURRENCY_LIMIT = 128` semaphore prevents bulk
   CQL inserts from starving Raft heartbeats on the tokio runtime.
 
+### No hard bounds on streamed data (cap census)
+
+There is no hard bound on the SIZE of data the engine accepts or returns: a cap that
+refuses `DataError`s or silently truncates streamed/bootstrap data is the smell to
+remove (you either lose the data or blow memory up). A **buffer** is the only bounding
+structure, and exceeding a buffer SPILLS — it never refuses and never truncates.
+Every other constant here is a resource bound that cannot change data completeness.
+Three data-path caps were removed:
+
+| cap (removed) | where | what it did | replacement |
+|---|---|---|---|
+| `DEFAULT_STREAM_MAX_MUTATIONS` 50 000 / `DEFAULT_STREAM_MAX_BYTES` 128 MiB | `streaming/receiver.rs` | `apply_chunk` returned `stream: mutation budget exceeded` / `stream: byte budget exceeded` — a REFUSAL on an inbound stream | resident buffer (tunable `FERROSA_STREAM_RESIDENT_BUFFER_BYTES`, default 4 MiB, `0` = hold nothing) that SPILLS to the staging file; a record larger than the buffer is written straight through |
+| `read_range(.., 10_000)` ×3 | `system_table_loader.rs` | keyspaces/roles/grants cold-start read SILENTLY returned ≤ 10 000 (no error, no flag) — data loss for a larger deployment | `walk_all_partitions` streams every partition via `StorageEngine::walk_token_range`, one resident at a time |
+| `BOUNDED_ROW_FALLBACK_LIMIT` 1 000 | `controller/bootstrap/bootstrap_stream.rs` + `controller/cluster.rs` | the 0-SSTable row fallback read SILENTLY dropped the tail of a table larger than 1 000 partitions | `TableStreamPlan::StreamRows` + `stream_row_fallback_into` streams EVERY partition through `walk_token_range` |
+
+The receiver's only remaining bound on replay is a corrupt-file guard: a staged length
+prefix larger than the staging file fails loud instead of allocating a huge buffer
+(never a cap on how much a session may carry). Red-first evidence:
+`streaming::receiver::tests::{apply_chunk_accepts_a_stream_larger_than_the_former_mutation_budget,
+apply_chunk_accepts_a_record_larger_than_the_former_byte_budget,
+spilling_to_the_staging_file_applies_every_mutation, resident_buffer_knob_is_tunable_and_never_refuses_data}`,
+`system_table_loader::tests::load_keyspace_names_returns_every_persisted_keyspace_past_ten_thousand`,
+`controller::bootstrap::bootstrap_stream::tests::row_fallback_streams_every_partition_past_the_former_cap`.
+
+**Kept, and why** — each cannot affect data completeness: `accord` `APPLY_FANOUT_WINDOW`
+(bounds resident Apply *frames*, not their size — CL-53); `accord/apply.rs`
+`DEFAULT_PARKED_APPLY_RECLAIM_SECS` (a TIME bound; parked write-sets already spill, CL-55);
+`repair` fetch/apply chunk sizes (mid-stream chunks carrying a resume cursor, every batch
+sent); `hints/` per-peer byte budget (`ClusterError::Overloaded` — loud backpressure,
+never a silent drop); `MAX_CONNECTED_PEERS` / `MAX_PENDING_JOINS` / `MAX_SEEN_INVITE_INITIATORS`
+(evict-oldest maps that never refuse a real member); `cluster_rejoin`
+`MAX_REJOIN_ATTEMPTS` / `BACKOFF_MAX_SECS` (retries/backoff); `ferrosa-net` lane
+`channel_capacity` / `pending_stream_capacity` (bounded channels that await, or fail loud
+with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
+
 ### Formation (`controller/`, `mode.rs`, `ring/`, `pair/`, `rebalance.rs`)
 - `DeploymentMode` + `ModeController` — the `Standalone → Pair → Forming →
   Cluster` state machine with degraded states; `ClusterStateHolder` dispatches
@@ -380,6 +631,23 @@ early acknowledgement.
   after PreAccept and return that effective set in AcceptOK; the coordinator
   unions the accepted quorum's dependencies before Commit. This prevents a
   delayed Accept from dropping a conflict discovered during the first round.
+  **The conflict index is UNBOUNDED — it grows to hold any write-set.**
+  A PreAccept registers the transaction under EVERY key in its write-set and is
+  all-or-nothing, so a bound here was a hard floor on the largest decidable
+  transaction. `ConflictIndex::register`/`register_range` are now infallible:
+  there is no capacity, `ConflictIndexFull`/`capacity()` and the
+  `AccordDriverError::WriteSetExceedsCapacity` refusal are gone, and the
+  constructor argument (`DEFAULT_CONFLICT_INDEX_RESERVE`) is a pre-allocation
+  hint, never a bound. Before this the index was a fixed 100 000 that no setting
+  could raise — a ~1,000,112-key transactional `COPY` (`pgbench -i`, admitted
+  because `FERROSA_POSTGRES_MAX_TXN_WRITES=3000000`) was refused by all three
+  replicas (`key_count=1000112 e=conflict index at capacity`, zero votes) and
+  surfaced as an opaque "Accord quorum unavailable" on a healthy cluster (CL-49).
+  The index grows (rather than spilling) because it holds only *in-flight*
+  registrations — every entry is removed by `gc_applied`/`remove` once the
+  transaction applies — so it is a working set, not a store. It therefore has no
+  disk tier: a single transaction with hundreds of millions of keys would still
+  grow it resident.
   The read-vote phase is the LWT `IF`-condition gate: every conditional
   statement, `INSERT IF NOT EXISTS` included, sends `ReadClusteringRow`, the
   replicas read only that table's row at `t` (`StorageReader::
@@ -410,8 +678,43 @@ early acknowledgement.
   dependency set is computed from `t0`, so a dependency committed with a later
   `t` is waived (at apply time, or when that dependency's commit lands). Without
   this, two transactions whose PreAccepts crossed each waited on the other until
-  the 5 s dependency wait failed both, with every replica live (FMEA CL-28). A
+  the dependency wait failed both, with every replica live (FMEA CL-28). A
   dependency cycle among parked transactions is refused loudly, never dropped.
+  A parked write-set that is never resolved is **reclaimed by time**, so it
+  cannot retain its payloads forever: the graph bounds its own
+  `applied`/`aborted` bookkeeping, and `DepWaitApplier::reclaim_stale` is the
+  payload-side counterpart — a park whose dependency never arrives (an abandoned
+  dependency, a lost apply, a dead coordinator) is released after
+  `FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS` (default 60 s, strictly above the
+  apply bound), and every release is **reported at ERROR** with the unresolved
+  dependency set — never a silent drop. The reclaimed transaction's graph waits
+  are cleared, so a dependency that resolves *later* can never wake it into a
+  false `Applied` with nothing left to persist.
+  The wait is **bounded and operator-tunable**: `FERROSA_ACCORD_TXN_TIMEOUT_SECS`
+  (config `[accord] txn_timeout_secs`), defaulting to
+  `epoch_drain::DEFAULT_TXN_TIMEOUT` (10 s, single-sourced so the drain that must
+  exceed it cannot drift) and read on the hot path through a lock-free atomic —
+  no state lock, no blocking-pool hop, no allocation per RPC. When the bound
+  expires the coordinator **abandons** the transaction: it finalizes it as a
+  no-write — rolled back, never applied, which also releases every successor
+  parked behind it — and returns `AccordDriverError::TxnAbandoned`. A stuck apply
+  therefore cannot poison a key permanently, and the client is told the
+  transaction did not commit and may retry: the PostgreSQL front end maps the
+  `abandoned:` reason to SQLSTATE 40001 (serialization failure) and the CQL
+  router to a retryable server error.
+  **The abandon is decided before the coordinator writes anything.** The
+  coordinator's own-shard apply is deferred until the remote Apply quorum is
+  secured; before that point NO replica has applied, so the "NOT committed"
+  report is the truth and leaves no row readable (pinned by
+  `abandon_durability::an_abandoned_transaction_leaves_no_row_readable_across_restart`,
+  a point lookup of a known key that must survive a restart as absent). If the
+  Apply quorum *is* secured, the transaction is committed and durably applied on
+  a quorum and is never reported as abandoned: a coordinator whose own replica
+  then fails to converge fails loud with a non-retryable durability error instead
+  (`coordinator local Apply did not reach Applied ... (NOT an abandon)`), because
+  "safe to retry" would invite a double-apply. The residual boundary — a remote
+  that persists a write before its `ApplyOK` is lost — is inherent to Accord's
+  at-least-once apply and is not closed here.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write
@@ -440,14 +743,42 @@ early acknowledgement.
   `handlers::publish_accord_state` fills the slot at cluster formation with the
   SAME `AccordState` the node's `AccordHandler` serves, so the coordinator's
   self-vote and its remote peers agree on dependencies.
+  **Table tombstones (`TRUNCATE`).** A `TRUNCATE` is ONE reserved-partition
+  mutation. Routing it through the per-key Accord path above would place it by
+  that key's token on the key's RF replica set — a proper subset of the ring when
+  `RF < node count` — so the nodes outside it would keep serving the truncated
+  rows. `commit_postgres` therefore splits table-tombstone writes out of the
+  Accord write-set and replicates them through the `AllServingMarkerWriter` seam
+  (`WritePathAllServingMarkerWriter` over the live `WritePath` in production),
+  which fans the marker to **every node serving the table** at
+  `ConsistencyLevel::All`: `ClusterCoordinator::coordinate_all_serving_write` uses
+  the whole ring as the target set (`WritePath::all_serving_host_ids`) and requires
+  **every** target to acknowledge — no quorum shortcut, no hint fallback, because
+  `CL=ALL` alone only filters the replica slice it is handed (that one key's RF
+  set). An unwired writer, or any node that does not ack, **refuses the commit
+  loudly** — an unconfirmed truncate would resurrect the rows on the node that
+  missed it.
 - `apply.rs` — `DepWaitApplier` (dep-wait + `StorageApplier` seam) +
   `EngineStorageApplier`/`EngineStorageReader` (real persistence and linearizable
   read-at-`t`). **Multi-key (Phase 2/3):** `DepWaitApplier::try_apply_writeset`
   parks a transaction's WHOLE write-set and applies every key on resolve;
   `StorageApplier::apply_writeset` commits all of a txn's partitions in ONE atomic
-  `apply_batch` (all-or-nothing — a failure on any key persists none); idempotency
+  all-or-nothing batch (a failure on any key persists none); idempotency
   is keyed by `(txn_id, partition_key, t)` so writes 2..N of one transaction are
-  never deduped/dropped.
+  never deduped/dropped. **The decoded batch is never materialized:** the apply
+  resolves the survivors (idempotency + PostgreSQL MVCC metadata) in a pass that
+  decodes each partition, keeps only its `(txn,key,t)` triple and view index, and
+  drops its rows; the survivors then STREAM through ONE atomic `write_atomic_batch`
+  (`AccordWriteSet: WriteSetSource`), which decodes one partition per visit — so the
+  whole decoded `Vec<BatchOp>` the path used to build first is gone, not merely
+  consumed (FMEA `CL-54`). **Parked residency is bounded:** a parked write-set whose
+  payloads reach the staging floor is held as a `ParkedWriteSet::Staged`
+  (`Arc<WriteSetSpill>` + per-entry indices) rather than resident bytes, so the
+  park keeps a pointer plus indices, not the payload; `parked_residency()` reports
+  the resident-vs-staged split. An unresolvable park (a dependency that never
+  arrives) is reclaimed by time (`FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS`) and
+  every release is reported at ERROR — never a silent drop — with its graph waits
+  cleared so a late dependency cannot wake it into a false `Applied`.
 - `wire.rs` — bincode payloads for each protocol message. **Multi-key:**
   `WriteSetEntry` + `ApplyV2Payload` back the additive `AccordPreAcceptV2`/
   `AccordApplyV2` wire codes; `AccordCoordinatorDriver::new_multi(write_set)` is

@@ -35,40 +35,61 @@ impl SystemTableLoader {
         Self { engine }
     }
 
+    /// Visit every partition of `tid`, streamed one at a time by the engine's
+    /// token-range walk.
+    ///
+    /// The walk covers the merged memtable + SSTable view, so a table of any size
+    /// is read in full while at most one partition is resident. This is how the
+    /// loaders read: the capped `read_range(.., N)` it replaces silently dropped
+    /// the tail of a large system table, and a dropped role/grant/keyspace is
+    /// data loss on cold start.
+    fn walk_all_partitions(
+        &self,
+        tid: &TableId,
+        mut visit: impl FnMut(&ferrosa_sstable::types::Partition) -> ferrosa_common::Result<()>,
+    ) -> ferrosa_common::Result<()> {
+        self.engine
+            .walk_token_range(tid, i64::MIN, i64::MAX, |p| visit(p))
+    }
+
     /// Load keyspace names from `system_schema.keyspaces`.
     ///
     /// Returns the partition key (keyspace name) for each row.
     pub fn load_keyspace_names(&self) -> ferrosa_common::Result<Vec<String>> {
         let tid = TableId::new("system_schema", "keyspaces");
-        let partitions = self.engine.read_range(&tid, None, None, 10_000)?;
-        let names: Vec<String> = partitions
-            .iter()
-            .filter_map(|p| String::from_utf8(p.key.key.as_bytes().to_vec()).ok())
-            .collect();
+        let mut names: Vec<String> = Vec::new();
+        self.walk_all_partitions(&tid, |p| {
+            if let Ok(name) = String::from_utf8(p.key.key.as_bytes().to_vec()) {
+                names.push(name);
+            }
+            Ok(())
+        })?;
         Ok(names)
     }
 
     /// Load authoritative role records from system_auth.roles.
     pub fn load_roles(&self) -> ferrosa_common::Result<Vec<RoleMetadata>> {
         let tid = TableId::new("system_auth", "roles");
-        let partitions = self.engine.read_range(&tid, None, None, 10_000)?;
         let mut roles = Vec::new();
 
-        for partition in partitions {
+        self.walk_all_partitions(&tid, |partition| {
             if !partition.deletion.is_live() {
-                continue;
+                return Ok(());
             }
             let name = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
                 FerrosaError::InvalidData(format!("invalid roles role key utf8: {e}"))
             })?;
-            let Some(row) = partition
-                .rows
-                .into_iter()
-                .find(|row| row.deletion.is_live())
-            else {
-                continue;
+            let Some(row) = partition.rows.iter().find(|row| row.deletion.is_live()) else {
+                return Ok(());
             };
-            let mut cells: HashMap<_, _> = row.cells.into_iter().collect();
+            // Lookups by column id over a BORROW of the row's cells. The previous
+            // shape deep-cloned every `CellValue` into a second map; because the
+            // walker lends `&Partition` there is nothing to move out, and nothing
+            // needs to be — the map only needs to point at the row we already hold.
+            // `row.cells` is a Vec, so `collect` into a HashMap keeps the LAST
+            // occurrence of a duplicated column id, which is the behaviour the
+            // cloned map had; hence the reference map preserves it exactly.
+            let cells: HashMap<_, _> = row.cells.iter().map(|(col, cell)| (*col, cell)).collect();
             let bool_cell = |column, field: &str| -> ferrosa_common::Result<bool> {
                 let bytes = cells
                     .get(&column)
@@ -89,10 +110,10 @@ impl SystemTableLoader {
             let is_superuser = bool_cell(ROLES_COL_IS_SUPERUSER, "is_superuser")?;
             let can_login = bool_cell(ROLES_COL_CAN_LOGIN, "can_login")?;
             let salted_hash = cells
-                .remove(&ROLES_COL_SALTED_HASH)
-                .and_then(|cell| cell.value)
+                .get(&ROLES_COL_SALTED_HASH)
+                .and_then(|cell| cell.value.as_deref())
                 .map(|bytes| {
-                    String::from_utf8(bytes).map_err(|e| {
+                    std::str::from_utf8(bytes).map(str::to_owned).map_err(|e| {
                         FerrosaError::InvalidData(format!(
                             "role {name} has invalid salted_hash utf8: {e}"
                         ))
@@ -100,10 +121,10 @@ impl SystemTableLoader {
                 })
                 .transpose()?;
             let scram = cells
-                .remove(&ROLES_COL_SCRAM)
-                .and_then(|cell| cell.value)
+                .get(&ROLES_COL_SCRAM)
+                .and_then(|cell| cell.value.as_deref())
                 .map(|bytes| {
-                    serde_json::from_slice(&bytes).map_err(|e| {
+                    serde_json::from_slice(bytes).map_err(|e| {
                         FerrosaError::InvalidData(format!(
                             "role {name} has invalid SCRAM verifier: {e}"
                         ))
@@ -119,7 +140,8 @@ impl SystemTableLoader {
                 member_of: Default::default(),
                 scram,
             });
-        }
+            Ok(())
+        })?;
 
         Ok(roles)
     }
@@ -139,18 +161,17 @@ impl SystemTableLoader {
     /// Load persisted grants from `system_auth.role_permissions`.
     pub fn load_role_permissions(&self) -> ferrosa_common::Result<Vec<GrantEntry>> {
         let tid = TableId::new("system_auth", "role_permissions");
-        let partitions = self.engine.read_range(&tid, None, None, 10_000)?;
         let mut grants = Vec::new();
 
-        for partition in partitions {
+        self.walk_all_partitions(&tid, |partition| {
             if !partition.deletion.is_live() {
-                continue;
+                return Ok(());
             }
             let role = String::from_utf8(partition.key.key.as_bytes().to_vec()).map_err(|e| {
                 FerrosaError::InvalidData(format!("invalid role_permissions role key utf8: {e}"))
             })?;
 
-            for row in partition.rows {
+            for row in &partition.rows {
                 if !row.deletion.is_live() {
                     continue;
                 }
@@ -185,7 +206,8 @@ impl SystemTableLoader {
                     permissions,
                 });
             }
-        }
+            Ok(())
+        })?;
 
         Ok(grants)
     }
@@ -507,8 +529,9 @@ mod tests {
     use std::sync::Arc;
 
     use ferrosa_schema::{
-        AuthContext, AuthMethod, EnvSecretsProvider, GrantEntry, LogAuditSink, PasswordHasher,
-        PasswordPolicy, Permission, RateLimitConfig, Resource, RoleMetadata, Schema, SchemaConfig,
+        AuthContext, AuthMethod, EnvSecretsProvider, GrantEntry, KeyspaceMetadata, LogAuditSink,
+        PasswordHasher, PasswordPolicy, Permission, RateLimitConfig, ReplicationParams, Resource,
+        RoleMetadata, Schema, SchemaConfig,
     };
     use ferrosa_storage::engine::StorageEngineConfig;
     use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngine};
@@ -516,6 +539,15 @@ mod tests {
     use crate::system_table_writer::SystemTableWriter;
 
     fn test_engine(dir: &std::path::Path) -> Arc<StorageEngine> {
+        test_engine_with_flush_threshold(dir, 4096)
+    }
+
+    /// A test engine whose memtable auto-flush threshold is a parameter, so a
+    /// test can hold many small partitions resident without flush churn.
+    fn test_engine_with_flush_threshold(
+        dir: &std::path::Path,
+        flush_threshold_bytes: u64,
+    ) -> Arc<StorageEngine> {
         let config = StorageEngineConfig {
             commit_log: CommitLogConfig {
                 log_dir: dir.to_path_buf(),
@@ -527,7 +559,7 @@ mod tests {
             object_store: None,
             local_cache_max_bytes: 1024 * 1024,
             local_disk_free_reserve_bytes: 0,
-            flush_threshold_bytes: 4096,
+            flush_threshold_bytes,
             memtable_backpressure_bytes: u64::MAX,
             flush_max_age_secs: 5,
             data_dir: dir.to_path_buf(),
@@ -607,6 +639,52 @@ mod tests {
         );
         assert!(grants[0].permissions.contains(&Permission::Modify));
         assert!(grants[0].permissions.contains(&Permission::Select));
+    }
+
+    /// The loader must return EVERY persisted keyspace, not just the first
+    /// 10_000. RED before the fix: `load_keyspace_names` read with a hard
+    /// `read_range(.., 10_000)` limit, so keyspace #10_001 was silently dropped —
+    /// no error, no truncated flag. That is data loss on cold start.
+    #[test]
+    fn load_keyspace_names_returns_every_persisted_keyspace_past_ten_thousand() {
+        let dir = tempfile::tempdir().unwrap();
+        // Keep every keyspace resident in the memtable: this test is about the
+        // loader's cap, not flush/compaction churn.
+        let engine = test_engine_with_flush_threshold(dir.path(), u64::MAX);
+        engine.register_system_tables().unwrap();
+        let writer = SystemTableWriter::new(Arc::clone(&engine));
+
+        let total = 10_001usize; // one past the former 10_000 limit
+        for i in 0..total {
+            writer
+                .apply(
+                    ferrosa_schema::system::persistence::SystemTableMutation::KeyspaceCreated(
+                        KeyspaceMetadata {
+                            name: format!("ks_{i:05}"),
+                            durable_writes: true,
+                            replication: ReplicationParams {
+                                strategy: "SimpleStrategy".to_string(),
+                                options: Default::default(),
+                            },
+                        },
+                    ),
+                )
+                .unwrap();
+        }
+
+        let names = SystemTableLoader::new(engine)
+            .load_keyspace_names()
+            .unwrap();
+
+        assert_eq!(
+            names.len(),
+            total,
+            "every persisted keyspace must be loaded; the tail must not be silently dropped"
+        );
+        assert!(
+            names.iter().any(|n| n == "ks_10000"),
+            "the keyspace past the former cap must be present"
+        );
     }
 
     #[test]

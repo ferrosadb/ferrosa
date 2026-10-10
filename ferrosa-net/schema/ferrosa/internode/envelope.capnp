@@ -39,6 +39,8 @@ struct Envelope {
     legacy @27 :LegacyPayload;
     bootstrap @28 :BootstrapControl;
     stream @29 :StreamControl;
+    # Accord consensus family (ADR-019). Append-only: new ordinal only.
+    accord @30 :AccordControl;
   }
 }
 
@@ -350,4 +352,273 @@ enum RecoveryAction {
   replayRaft @2;
   runBootstrap @3;
   fullBootstrapRequired @4;
+}
+
+# ---------------------------------------------------------------------------
+# Accord consensus family (ADR-019). Append-only: these are NEW types; new
+# ordinals only. The struct field shapes mirror `ferrosa-cluster`'s
+# `accord::wire` bincode payloads 1:1, so a capnp-encoded Accord frame decodes
+# to exactly what the bincode frame decoded to.
+#
+# The Apply family (`applyV2` and its single-key degenerate `apply`) is the
+# BULK DATA PATH — a transactional COPY's whole write-set rides in one
+# `AccordApplyV2`. The rest carry Accord's identity/dependency bookkeeping.
+# ---------------------------------------------------------------------------
+
+struct AccordTxnId {
+  # ferrosa_common::accord::Timestamp — Accord's total-order execution stamp.
+  epoch @0 :UInt64;
+  time @1 :UInt64;
+  seq @2 :UInt32;
+  node @3 :UInt64;
+}
+
+struct AccordWriteSetEntry {
+  # One write in a multi-key transaction's write-set (wire.rs `WriteSetEntry`).
+  key @0 :Data;
+  mutation @1 :Data;
+}
+
+struct AccordApplyV2 {
+  # wire.rs `ApplyV2Payload`: the multi-key Apply request. The whole write-set
+  # travels here, which is the heaviest object on the data path.
+  txnId @0 :AccordTxnId;
+  writes @1 :List(AccordWriteSetEntry);
+}
+
+struct AccordApplyV2Region {
+  # The region-REFERENCE multi-key Apply: the write-set payload bytes travel as ONE
+  # contiguous REGION appended AFTER this capnp message (see ferrosa-cluster README,
+  # "The region-REFERENCE Apply wire"). This header carries only the index.
+  txnId @0 :AccordTxnId;
+  # Number of entries; `offsets`/`lengths` are parallel lists of this length.
+  entryCount @1 :UInt32;
+  # Byte offset of entry i within the (UNCOMPRESSED) region, and its byte length.
+  offsets @2 :List(UInt64);
+  lengths @3 :List(UInt32);
+  # Region codec tag: 0=none, 1=lz4, 2=snappy, 3=zstd. When non-zero the appended
+  # region is a blocked, length-prefixed compression of the same bytes.
+  compression @4 :UInt8;
+  # Uncompressed region length (the decoder sizes its output buffer from this).
+  uncompressedLen @5 :UInt64;
+  # Block size the region was compressed in (0 = whole region as one block).
+  blockBytes @6 :UInt32;
+}
+
+struct AccordApply {
+  # wire.rs `ApplyPayload`: the single-key Apply (degenerate one-entry case).
+  txnId @0 :AccordTxnId;
+  resultData @1 :Data;
+}
+
+struct AccordApplyOk {
+  # wire.rs `ApplyOkPayload`.
+  txnId @0 :AccordTxnId;
+  from @1 :UInt64;
+}
+
+struct AccordPreAccept {
+  # wire.rs `PreAcceptPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  key @2 :Data;
+  ballot @3 :UInt64;
+  epoch @4 :UInt64;
+}
+
+struct AccordPreAcceptV2 {
+  # wire.rs `PreAcceptV2Payload`. `snapshotTs` is optional (has_*).
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  keys @2 :List(Data);
+  ballot @3 :UInt64;
+  epoch @4 :UInt64;
+  snapshotTs @5 :AccordTxnId;
+}
+
+struct AccordPreAcceptOk {
+  # wire.rs `PreAcceptOkPayload`.
+  from @0 :UInt64;
+  t @1 :AccordTxnId;
+  deps @2 :List(AccordTxnId);
+  snapshotStale @3 :Bool;
+}
+
+struct AccordAccept {
+  # wire.rs `AcceptPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  t @2 :AccordTxnId;
+  deps @3 :List(AccordTxnId);
+  ballot @4 :UInt64;
+}
+
+struct AccordAcceptOk {
+  # wire.rs `AcceptOkPayload` (the current shape; a pre-dependency coordinator
+  # sent a body with `deps` absent, which decodes here as an empty list).
+  txnId @0 :AccordTxnId;
+  deps @1 :List(AccordTxnId);
+}
+
+struct AccordCommit {
+  # wire.rs `CommitPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  t @2 :AccordTxnId;
+  deps @3 :List(AccordTxnId);
+}
+
+struct AccordCommitOk {
+  # wire.rs `CommitOkPayload`.
+  txnId @0 :AccordTxnId;
+  from @1 :UInt64;
+}
+
+struct AccordRecover {
+  # wire.rs `RecoverPayload`.
+  txnId @0 :AccordTxnId;
+  t0 @1 :AccordTxnId;
+  ballot @2 :UInt64;
+}
+
+struct AccordRead {
+  # wire.rs `ReadVotePayload` — the linearizable read-vote request.
+  txnId @0 :AccordTxnId;
+  t @1 :AccordTxnId;
+  key @2 :Data;
+  predicate @3 :AccordReadPredicate;
+}
+
+struct AccordReadPredicate {
+  # wire.rs `ReadPredicate`.
+  op :union {
+    notExists @0 :Void;
+    readRow @1 :AccordReadRow;
+    snapshotBarrier @2 :Void;
+    always @3 :Void;
+    readClusteringRow @4 :AccordReadClusteringRow;
+  }
+}
+
+struct AccordReadRow {
+  keyspace @0 :Text;
+  table @1 :Text;
+}
+
+struct AccordReadClusteringRow {
+  keyspace @0 :Text;
+  table @1 :Text;
+  clustering @2 :Data;
+}
+
+struct AccordReadOk {
+  # wire.rs `ReadVoteOkPayload` — the read-vote response.
+  txnId @0 :AccordTxnId;
+  from @1 :UInt64;
+  conditionHolds @2 :Bool;
+  currentRow @3 :Data;
+}
+
+struct AccordControl {
+  op :union {
+    # Apply family — the bulk data path.
+    applyV2 @0 :AccordApplyV2;
+    apply @1 :AccordApply;
+    applyOk @2 :AccordApplyOk;
+    # Consensus control / bookkeeping.
+    preAccept @3 :AccordPreAccept;
+    preAcceptV2 @4 :AccordPreAcceptV2;
+    preAcceptOk @5 :AccordPreAcceptOk;
+    accept @6 :AccordAccept;
+    acceptOk @7 :AccordAcceptOk;
+    commit @8 :AccordCommit;
+    commitOk @9 :AccordCommitOk;
+    recover @10 :AccordRecover;
+    # `AccordRecoverOK` carries no payload (wire.rs defines no RecoverOk struct).
+    recoverOk @11 :Void;
+    # Linearizable read-vote.
+    read @12 :AccordRead;
+    readOk @13 :AccordReadOk;
+    # Region-REFERENCE Apply (the region is appended after this capnp message).
+    applyV2Region @14 :AccordApplyV2Region;
+  }
+}
+
+# ---------------------------------------------------------------------------
+# PostgreSQL MVCC row-version metadata (ferrosa-postgres `RowChange`).
+#
+# This is the binary Cap'n Proto replacement for the JSON row-version blob that
+# used to travel inside a PostgreSQL commit's Accord write-set: `RowChange`
+# (the before/after row images plus the SQL key and partition key for one row
+# version) was encoded with `serde_json` and re-decoded with `serde_json` on
+# replica apply. It rides INSIDE the storage mutation's envelope (it is not an
+# envelope payload of its own); the `PgMvccRowChanges` root carries one
+# partition's `Vec<RowChange>`.
+#
+# Append-only: these are NEW types at new ordinals; no existing ordinal is
+# reused and no existing field is renumbered.
+# ---------------------------------------------------------------------------
+
+struct PgMvccTextOrNull {
+  # One `text[]` element, which may be NULL.
+  present @0 :Bool;
+  value @1 :Text;
+}
+
+struct PgMvccNumeric {
+  # `Value::Numeric`: arbitrary-precision `unscaled` as little-endian
+  # two's-complement bytes (`BigInt::to_signed_bytes_le`) with the decimal scale.
+  unscaled @0 :Data;
+  scale @1 :Int32;
+}
+
+struct PgMvccInet {
+  # `Value::Inet`: an IPv4 (4 octets) or IPv6 (16 octets) address.
+  isV6 @0 :Bool;
+  octets @1 :Data;
+}
+
+struct PgMvccValue {
+  # `ferrosa_sql::Value` — one union member per variant, so the decoder keeps
+  # the derived `Eq`/`Hash` value semantics (floats by bit pattern, numeric by
+  # its exact normalized unscaled/scale pair).
+  op :union {
+    nullValue @0 :Void;
+    intValue @1 :Int64;
+    textValue @2 :Text;
+    boolValue @3 :Bool;
+    # `OrderedFloat<f64>` by bit pattern, so NaN and signed zero round-trip.
+    floatValue @4 :UInt64;
+    uuidValue @5 :Data;
+    byteaValue @6 :Data;
+    timestampValue @7 :Int64;
+    dateValue @8 :Int32;
+    timeValue @9 :Int64;
+    inetValue @10 :PgMvccInet;
+    numericValue @11 :PgMvccNumeric;
+    # Validated jsonb canonical cell bytes (`JsonbValue::as_bytes`).
+    jsonbValue @12 :Data;
+    jsonPathValue @13 :Text;
+    textArrayValue @14 :List(PgMvccTextOrNull);
+  }
+}
+
+struct PgMvccRow {
+  # `ferrosa_sql::Row`.
+  values @0 :List(PgMvccValue);
+}
+
+struct PgMvccRowChange {
+  # `ferrosa-postgres` `RowChange`: the row-version metadata for one SQL key.
+  table @0 :Text;
+  key @1 :List(PgMvccValue);
+  partitionKey @2 :Data;
+  # Optional before/after images (`hasBefore()`/`hasAfter()`).
+  before @3 :PgMvccRow;
+  after @4 :PgMvccRow;
+}
+
+struct PgMvccRowChanges {
+  # One partition's `Vec<RowChange>`.
+  changes @0 :List(PgMvccRowChange);
 }

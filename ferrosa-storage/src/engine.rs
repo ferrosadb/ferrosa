@@ -59,6 +59,7 @@ use crate::timeseries::{
     TimeSeriesTimestampUnit,
 };
 use crate::upload::{ObjectStoreConfig, UploadManager};
+use crate::write_set_stage::WriteSetSource;
 
 // T-023 crash injection belongs to the poll future that explicitly opts in.
 // Task-local scope follows Tokio task migration and resets on unwind/drop;
@@ -1626,6 +1627,16 @@ pub struct StorageEngine {
     /// sync, compaction retry, and operator-triggered syncs can otherwise race
     /// from the same manifest snapshot and re-upload the same SSTables.
     s3_sync_running: AtomicBool,
+    /// Generations a prior sync pass found missing at least one
+    /// `REQUIRED_SSTABLE_COMPONENTS` file, mapped to exactly which components
+    /// were absent. Such a generation cannot be uploaded yet, so re-scanning and
+    /// re-warning about it on every pass is pure churn — one live node emitted
+    /// ~95 `skipping incomplete SSTable generation` WARNs every 30 s for 122 such
+    /// generations, 99 % of its log. Storing the missing set (not just the key)
+    /// lets a later pass re-verify only those few files, so a generation that
+    /// gains its missing component is still uploaded. Keyed by
+    /// `table_id/generation`; pruned once the generation leaves disk.
+    incomplete_generations: parking_lot::Mutex<std::collections::HashMap<String, Vec<String>>>,
     /// Edge state for the "hot tables alone keep the cache over its limit"
     /// warning: true while the last eviction pass was blocked by hot data.
     cache_hot_blocked: AtomicBool,
@@ -3361,6 +3372,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -3622,6 +3634,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -3868,6 +3881,7 @@ impl StorageEngine {
             object_store,
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -4894,6 +4908,37 @@ impl StorageEngine {
 
         let table_id = TableId::new(&schema.keyspace, &schema.table);
         let table_dir = config.data_dir.join("sstables").join(table_id.to_string());
+
+        // A DROP/TRUNCATE that could not remove this table's directory left
+        // orphaned SSTables behind (forge t_c8625592; the live "orphaned SSTables
+        // remained under public.pgbench_accounts"). Registration precedes any
+        // write, so EVERYTHING in the directory here was written before the drop
+        // and belongs to a previous incarnation: remove it rather than load it, or
+        // a same-name CREATE would silently contain a mix of old and new rows. The
+        // sweep is loud on failure — never load a directory known to hold a dropped
+        // table's rows.
+        if crate::table_drops::is_pending_sweep(&config.data_dir, &schema.keyspace, &schema.table)?
+        {
+            if table_dir.exists() {
+                std::fs::remove_dir_all(&table_dir).map_err(|e| {
+                    ferrosa_common::Error::InvalidFormat(format!(
+                        "refusing to register {table_id}: a prior DROP could not remove its \
+                         SSTables and sweeping them now failed ({e}); loading them would \
+                         resurrect the dropped table's rows"
+                    ))
+                })?;
+            }
+            crate::table_drops::clear_pending_sweep(
+                &config.data_dir,
+                &schema.keyspace,
+                &schema.table,
+            )?;
+            tracing::warn!(
+                table = %table_id,
+                "swept orphaned SSTables left by a DROP that could not remove them"
+            );
+        }
+
         std::fs::create_dir_all(&table_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create table dir: {e}"))
         })?;
@@ -4977,13 +5022,42 @@ impl StorageEngine {
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        // A same-name re-create after a DROP whose removal failed must never
+        // reach the previous incarnation's still-registered store. When a
+        // pending-sweep intent names this table, retire whatever is registered
+        // instead of taking the "already registered" shortcut below, so
+        // `build_table_state` gets to sweep the orphaned directory before it
+        // loads anything. (forge t_c8625592 — invariant "all replicas agree".)
+        let pending_sweep = crate::table_drops::is_pending_sweep(
+            &self.config.data_dir,
+            &schema.keyspace,
+            &schema.table,
+        )?;
         {
             let tables = self.tables.load();
             if tables.contains_key(&table_id) {
                 drop(tables);
-                self.merge_index_declarations_for_registered_table(&table_id, &indexed_columns)?;
-                self.replay_deferred_mutations_for_table(&table_id);
-                return Ok(());
+                if !pending_sweep {
+                    self.merge_index_declarations_for_registered_table(
+                        &table_id,
+                        &indexed_columns,
+                    )?;
+                    self.replay_deferred_mutations_for_table(&table_id);
+                    return Ok(());
+                }
+                // Retire the stale store; the rebuild below installs a clean
+                // one and its directory is swept by `build_table_state`.
+                self.clear_compaction_retry_state(&table_id);
+                if let Some(state) = remove_table(&self.tables, &table_id)? {
+                    state.store.retire();
+                }
+                self.remove_time_series_consolidator(&table_id);
+                self.index_tracker
+                    .remove_table_indexes(table_id.keyspace(), table_id.table());
+                tracing::warn!(
+                    table = %table_id,
+                    "re-registration swept a live store whose DROP could not remove its SSTables"
+                );
             }
         }
         let time_series_handle = self.build_time_series_consolidator(&table_id, &schema)?;
@@ -5161,6 +5235,30 @@ impl StorageEngine {
     /// from this path). Local deletion is sufficient to prevent stale data
     /// from being loaded on re-creation.
     pub fn unregister_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        // A DROP that is about to happen must be recorded durably BEFORE any
+        // step that can refuse or abort it. The in-memory schema is dropped
+        // first on every DDL route (cluster `apply_command`, `apply_direct`,
+        // the pair coordinator), so unless the durable half is written here too
+        // the node is left reporting the table dropped while its directory —
+        // and therefore its rows — survives on disk. Recording the intent first
+        // means a refusal can never leave the two disagreeing: the next
+        // `build_table_state` for this name sweeps the directory instead of
+        // loading it. `unregister_table_quiesced` clears the intent on a
+        // removal that succeeds, so a legitimately re-created table is
+        // untouched. (forge t_c8625592 — invariant "all replicas agree".)
+        if self.tables.load().contains_key(table_id) {
+            crate::table_drops::record_drop(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+                crate::table_drops::now_millis()?,
+            )?;
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
+        }
         let pause = self
             .compaction_executor
             .pause_table(table_id, ferrosa_common::CancelReason::TableDropped);
@@ -5243,24 +5341,47 @@ impl StorageEngine {
         }
 
         // Delete local SSTable directory so DROP+CREATE starts empty.
+        //
+        // A failed removal must not report success: the dropped rows would stay
+        // readable and a same-name CREATE would silently reload them (forge
+        // t_c8625592; live: the census grew 1.0M -> 1.15M -> 1.25M across reloads).
+        // The pending-sweep intent is recorded durably BEFORE the removal, so a
+        // removal that fails leaves it in place and the next `build_table_state`
+        // sweeps the directory instead of loading it; a removal that succeeds
+        // clears it.
         let table_dir = self
             .config
             .data_dir
             .join("sstables")
             .join(table_id.to_string());
         if table_dir.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&table_dir) {
-                tracing::warn!(
-                    table = %table_id,
-                    path = %table_dir.display(),
-                    %e,
-                    "failed to delete SSTable directory on DROP TABLE"
-                );
-            } else {
-                tracing::info!(
-                    table = %table_id,
-                    "deleted local SSTable directory on DROP TABLE"
-                );
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
+            match std::fs::remove_dir_all(&table_dir) {
+                Ok(()) => {
+                    crate::table_drops::clear_pending_sweep(
+                        &self.config.data_dir,
+                        table_id.keyspace(),
+                        table_id.table(),
+                    )?;
+                    tracing::info!(
+                        table = %table_id,
+                        "deleted local SSTable directory on DROP TABLE"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(
+                        table = %table_id,
+                        path = %table_dir.display(),
+                        %e,
+                        "DROP TABLE: could not delete the SSTable directory — refusing to \
+                         report success; a same-name CREATE will sweep it"
+                    );
+                    return Err(ferrosa_common::Error::Io(e));
+                }
             }
         }
 
@@ -9449,14 +9570,28 @@ impl StorageEngine {
     /// Writes a batch of mutations atomically.
     ///
     /// All mutations are appended to the commit log first, then applied to
-    /// their respective memtables. If the process crashes between commit log
-    /// append and memtable apply, commit log replay will recover all mutations.
+    /// their respective memtables, all under ONE fsync group. If the process
+    /// crashes between commit log append and memtable apply, commit log replay
+    /// will recover all mutations.
     ///
     /// This is the single-node fast path for logged batches: no batchlog
     /// coordination needed because the commit log provides the atomicity
     /// guarantee.
-    pub fn write_atomic_batch(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
-        if mutations.is_empty() {
+    ///
+    /// The set is read from a [`WriteSetSource`] as a STREAM: a resident
+    /// `Vec<Mutation>` for the small autocommit batch, or a spilled
+    /// [`StagedWriteSet`](crate::write_set_stage::StagedWriteSet) whose frames are
+    /// decoded one at a time. Each of the passes below visits ONE mutation at a
+    /// time, so the commit path never needs the whole write-set resident — its
+    /// residency is the source's own tunable buffer, never the write-set size.
+    ///
+    /// # Errors
+    ///
+    /// A rejected preflight (unregistered table, overload admission, an entry
+    /// larger than a fresh commit-log segment) fails the whole set before
+    /// anything is appended. A staging or decode failure fails loud.
+    pub fn write_atomic_batch<S: WriteSetSource>(&self, source: S) -> ferrosa_common::Result<()> {
+        if source.is_empty_set() {
             return Ok(());
         }
 
@@ -9470,7 +9605,7 @@ impl StorageEngine {
             let tables = self.tables.load();
             let max_entry = self.commit_log.max_entry_size();
             let mut checked = HashSet::new();
-            for m in &mutations {
+            source.for_each_mutation(&mut |m| {
                 self.check_write_admission()?;
 
                 // Oversized-entry preflight: an entry larger than a fresh
@@ -9487,7 +9622,7 @@ impl StorageEngine {
 
                 let table_id = TableId::new(&m.keyspace, &m.table);
                 if !checked.insert(table_id.clone()) {
-                    continue;
+                    return Ok(());
                 }
                 let state = tables.get(&table_id).ok_or_else(|| {
                     ferrosa_common::Error::InvalidFormat(format!(
@@ -9495,18 +9630,20 @@ impl StorageEngine {
                     ))
                 })?;
                 self.check_memtable_write_admission(&table_id, state)?;
-            }
+                Ok(())
+            })?;
         }
 
         // Phase 1: Append all mutations to the commit log, tracking positions.
         // Sync health must not refuse an append partway (that would leave a
         // torn prefix); the force_sync below is this batch's durability.
         let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
-        for m in &mutations {
+        source.for_each_mutation(&mut |m| {
             let cl_pos = self.commit_log.append_for_explicit_sync(m)?;
             let table_id = TableId::new(&m.keyspace, &m.table);
             positions.insert(table_id, cl_pos);
-        }
+            Ok(())
+        })?;
 
         // Durability barrier: synchronously fsync the appended batch BEFORE it
         // is made visible in the memtable (Phase 2). Without this, under the
@@ -9522,7 +9659,7 @@ impl StorageEngine {
 
         // Phase 2: Apply to memtables and update commit log positions.
         let tables = self.tables.load();
-        for m in &mutations {
+        source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
             let state = tables.get(&table_id).ok_or_else(|| {
                 ferrosa_common::Error::InvalidFormat(format!("table not registered: {table_id}"))
@@ -9547,15 +9684,17 @@ impl StorageEngine {
                 }
             }
             self.request_flush_if_needed(state);
-        }
+            Ok(())
+        })?;
         drop(tables);
 
-        // Phase 3: Notify observers.
-        for m in &mutations {
+        // Phase 3: Notify observers, in the same order the log was appended.
+        source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
             self.dispatch_sync_observers(&table_id, m);
             self.dispatch_async_observers(&table_id, m);
-        }
+            Ok(())
+        })?;
 
         Ok(())
     }
@@ -9574,7 +9713,7 @@ impl StorageEngine {
         if ops.is_empty() {
             return Ok(());
         }
-        let mutations = ops.into_iter().map(BatchOp::into_mutation).collect();
+        let mutations: Vec<Mutation> = ops.into_iter().map(BatchOp::into_mutation).collect();
         self.write_atomic_batch(mutations)
     }
 
@@ -9712,6 +9851,37 @@ impl StorageEngine {
                 state.store.read_clustering_row(key, clustering)
             }
             None => Ok(None),
+        }
+    }
+
+    /// Batch point-read of one clustered row each across many partitions, against a
+    /// single store-view snapshot — the batched form of [`Self::read_clustering_row`]
+    /// (see [`TableStore::read_clustering_rows_batch`](crate::store::TableStore::read_clustering_rows_batch)).
+    ///
+    /// `requests` are `(partition key, clustering key)` pairs. The result has one
+    /// entry per request, in order; an absent partition is `None`. The table's
+    /// foreground-read stamp is refreshed once for the batch rather than once per
+    /// request, which is the same heuristic on a coarser granularity.
+    pub fn read_clustering_rows_batch(
+        &self,
+        table_id: &TableId,
+        requests: &[(DecoratedKey, Vec<u8>)],
+    ) -> ferrosa_common::Result<Vec<Option<Partition>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _span = tracing::info_span!(
+            "storage.read_clustering_rows_batch",
+            table = %table_id,
+            requests = requests.len(),
+        )
+        .entered();
+        match self.table_state(table_id) {
+            Some(state) => {
+                state.note_foreground_read();
+                state.store.read_clustering_rows_batch(requests)
+            }
+            None => Ok(vec![None; requests.len()]),
         }
     }
 
@@ -10000,6 +10170,49 @@ impl StorageEngine {
         visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
     ) -> ferrosa_common::Result<()> {
         self.read_by_index_each_after(table_id, index_name, key, None, visitor)
+    }
+
+    /// Whether ANY row of `table_id` carries an `index_name` posting for `key_bytes`.
+    ///
+    /// A thin, `ferrosa-index`-free convenience over [`Self::read_by_index_each`] for a
+    /// caller that holds only the encoded key bytes (the Postgres front end's foreign-key
+    /// probe does). It stops at the first match, so the cost is one index point lookup,
+    /// never O(result) or a scan. Errors propagate from `read_by_index_each`, which refuses
+    /// loudly when the index is undeclared or not current — a probe never reports "no such
+    /// parent" for an index it could not actually consult.
+    pub fn read_by_index_exists(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key_bytes: &[u8],
+    ) -> ferrosa_common::Result<bool> {
+        let key = ferrosa_index::IndexKey(key_bytes.to_vec());
+        let mut found = false;
+        self.read_by_index_each(table_id, index_name, &key, &mut |_| {
+            found = true;
+            std::ops::ControlFlow::Break(())
+        })?;
+        Ok(found)
+    }
+
+    /// Declare an ordered (BTree) secondary index over the column at `column_position`.
+    ///
+    /// The declaration half of the pair whose read half is [`Self::read_by_index_exists`]: a
+    /// front end that must build and probe an index without naming `ferrosa-index`'s
+    /// `IndexType` calls both. Idempotent for a matching re-declaration; a conflicting one fails
+    /// loud (see [`Self::add_index_with_predicate`]).
+    pub fn add_btree_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
+    ) -> ferrosa_common::Result<()> {
+        self.add_index(
+            table_id,
+            index_name,
+            column_position,
+            ferrosa_index::IndexType::BTree,
+        )
     }
 
     /// Visit a secondary-index result in row order — `(partition key,
@@ -10630,22 +10843,36 @@ impl StorageEngine {
         // Clear in-memory state (memtable + SSTable references).
         state.store.truncate()?;
 
-        // Delete local SSTable files so data doesn't reappear on restart.
+        // Delete local SSTable files so data doesn't reappear on restart. As for
+        // DROP, a failure must not be swallowed: record the sweep intent first, and
+        // fail loud if the removal does not complete (forge t_c8625592).
         let table_dir = self
             .config
             .data_dir
             .join("sstables")
             .join(table_id.to_string());
         if table_dir.exists() {
+            crate::table_drops::mark_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
             if let Err(e) = std::fs::remove_dir_all(&table_dir) {
-                tracing::warn!(
+                tracing::error!(
                     table = %table_id,
                     %e,
-                    "TRUNCATE: failed to delete local SSTable directory"
+                    "TRUNCATE: could not delete the SSTable directory — refusing to report \
+                     success; a later registration will sweep it"
                 );
+                return Err(ferrosa_common::Error::Io(e));
             }
+            crate::table_drops::clear_pending_sweep(
+                &self.config.data_dir,
+                table_id.keyspace(),
+                table_id.table(),
+            )?;
             // Re-create empty directory so future flushes have a target.
-            let _ = std::fs::create_dir_all(&table_dir);
+            std::fs::create_dir_all(&table_dir)?;
         }
 
         Ok(())
@@ -13331,7 +13558,19 @@ impl StorageEngine {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs() as i64);
-        Some(purge::policy_for(now, gc_grace, guard))
+        let table_delete = match state.store.table_tombstone() {
+            Ok(deletion) => deletion,
+            Err(reason) => {
+                crate::metrics::inc_compaction_purge_policy_errors();
+                tracing::error!(
+                    %table_id,
+                    %reason,
+                    "compaction: unreadable table tombstone; not purging or reclaiming"
+                );
+                return None;
+            }
+        };
+        Some(purge::policy_for(now, gc_grace, guard, table_delete))
     }
 
     /// Collects SSTable metadata for compaction strategy evaluation.
@@ -14154,6 +14393,36 @@ impl StorageEngine {
         *self.s3_manifest_stats.write() = stats;
     }
 
+    /// Record `missing` as the components `key` lacks. Returns whether the
+    /// recorded set changed — i.e. whether this is worth warning about. A repeat
+    /// sighting of the same set is silent; that repetition was the measured churn.
+    fn mark_generation_incomplete(&self, key: String, missing: Vec<String>) -> bool {
+        let mut map = self.incomplete_generations.lock();
+        let changed = map.get(&key).map(|prev| prev != &missing).unwrap_or(true);
+        map.insert(key, missing);
+        changed
+    }
+
+    /// Whether this generation is recorded as incomplete (missing components not
+    /// since seen to appear). See [`Self::incomplete_generations`].
+    fn generation_is_known_incomplete(&self, key: &str) -> bool {
+        self.incomplete_generations.lock().contains_key(key)
+    }
+
+    /// The components a prior pass recorded as missing for `key`, or `None` if the
+    /// generation is not in the memo.
+    fn missing_components_for(&self, key: &str) -> Option<Vec<String>> {
+        self.incomplete_generations.lock().get(key).cloned()
+    }
+
+    /// Forget generations no longer present in `present` so the memo cannot grow
+    /// without bound and a vanished generation is re-examined if it returns.
+    fn prune_incomplete_generations(&self, present: &std::collections::HashSet<String>) {
+        self.incomplete_generations
+            .lock()
+            .retain(|key, _| present.contains(key));
+    }
+
     /// Sync all local SSTables to S3 and update the manifest.
     ///
     /// Scans each registered table's SSTable directory, collects component
@@ -14192,6 +14461,10 @@ impl StorageEngine {
         self.update_s3_manifest_stats(&manifest);
 
         let mut uploaded = 0usize;
+        // Generations seen on disk this pass, so the incomplete memo can be
+        // pruned to exactly what still exists (and cannot grow without bound).
+        let mut present_generation_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         // Collect table IDs and directories under the lock, then release
         // before any .await (RwLockReadGuard is !Send).
@@ -14223,8 +14496,28 @@ impl StorageEngine {
 
             for gen in generations {
                 let gen_str = gen.to_string();
+                let memo_key = format!("{table_id_str}/{gen_str}");
+                present_generation_keys.insert(memo_key.clone());
                 if existing_ids.contains(&gen_str) {
                     continue;
+                }
+
+                // If a prior pass recorded this generation as missing components,
+                // re-verify only those files: if one has since appeared the
+                // generation is now complete and must fall through to upload.
+                // Otherwise skip silently — re-scanning and re-warning the same
+                // set every pass is pure churn (one live node logged ~95 of these
+                // every 30 s, 99 % of its log).
+                if self.generation_is_known_incomplete(&memo_key) {
+                    let missing = self.missing_components_for(&memo_key).unwrap_or_default();
+                    let still_missing = missing.iter().all(|component| {
+                        let required_name = format!("{gen_str}-{component}");
+                        !Self::sstable_file_exists(table_dir, &required_name)
+                    });
+                    if still_missing {
+                        continue;
+                    }
+                    self.incomplete_generations.lock().remove(&memo_key);
                 }
 
                 let files = Self::collect_sstable_files(table_dir, gen);
@@ -14241,12 +14534,20 @@ impl StorageEngine {
                     })
                     .collect();
                 if !missing_components.is_empty() {
-                    tracing::warn!(
-                        table = table_id_str,
-                        sstable = gen_str,
-                        ?missing_components,
-                        "s3-sync: skipping incomplete SSTable generation"
-                    );
+                    // Warn only when the missing set is new or has changed; a
+                    // repeat sighting is silent, which is what removes the churn.
+                    let missing_owned: Vec<String> = missing_components
+                        .iter()
+                        .map(|c| (*c).to_string())
+                        .collect();
+                    if self.mark_generation_incomplete(memo_key, missing_owned) {
+                        tracing::warn!(
+                            table = table_id_str,
+                            sstable = gen_str,
+                            ?missing_components,
+                            "s3-sync: skipping incomplete SSTable generation"
+                        );
+                    }
                     continue;
                 }
 
@@ -14323,6 +14624,10 @@ impl StorageEngine {
                 }
             }
         }
+
+        // Prune the incomplete memo to generations still on disk: bounded memory,
+        // and a generation that reappears is re-examined rather than trusted stale.
+        self.prune_incomplete_generations(&present_generation_keys);
 
         self.upload_pending_index_sidecars(upload_mgr, &manifest)
             .await;
@@ -15756,6 +16061,19 @@ impl StorageEngine {
             })
             .collect()
     }
+
+    /// Whether a named component file exists for a generation, mirroring the
+    /// directory resolution used by [`Self::collect_sstable_files`]. Used by the
+    /// incomplete-generation memo to cheaply re-verify a handful of files instead
+    /// of re-scanning the whole generation.
+    fn sstable_file_exists(table_dir: &std::path::Path, file_name: &str) -> bool {
+        let dir = file_name
+            .split_once('-')
+            .and_then(|(gen, _)| gen.parse::<u64>().ok())
+            .and_then(|gen| Self::generation_dir_path(table_dir, gen))
+            .unwrap_or_else(|| table_dir.to_path_buf());
+        dir.join(file_name).exists()
+    }
 }
 
 struct CompactionResultInputClaim<'a> {
@@ -15898,6 +16216,7 @@ impl StorageEngine {
             object_store: Some(Arc::clone(&store)),
             s3_cas_supported: std::sync::atomic::AtomicBool::new(true),
             s3_sync_running: AtomicBool::new(false),
+            incomplete_generations: parking_lot::Mutex::new(std::collections::HashMap::new()),
             cache_hot_blocked: AtomicBool::new(false),
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
@@ -18031,6 +18350,297 @@ mod tests {
             result.is_none(),
             "data must be gone after DROP+CREATE — got {:?}",
             result
+        );
+    }
+
+    /// DROP TABLE must not leave its rows readable after a same-name CREATE,
+    /// even when the physical SSTable deletion could not complete.
+    ///
+    /// An aborted bulk load can leave an undeletable entry inside the table's
+    /// SSTable directory (the live incident: "orphaned SSTables remained under
+    /// `public.pgbench_accounts`"). `unregister_table_quiesced` logs the
+    /// `remove_dir_all` failure and returns `Ok(())`, so the DROP reports
+    /// success while every row stays on disk; the next `register_table` for the
+    /// same name scans that directory and reloads them. The dropped table's rows
+    /// are then readable, and a same-name CREATE silently returns a mix of old
+    /// and new data (the census that grew 1.0M -> 1.15M -> 1.25M across reloads).
+    ///
+    /// RED against the current code. The guard is the DROP contract: either the
+    /// drop fails loud, or no read path returns a dropped row.
+    #[cfg(unix)]
+    #[test]
+    fn a_drop_that_cannot_remove_its_sstables_leaves_no_readable_rows() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+
+        // The bulk load: rows flushed to real SSTables on disk.
+        for i in 0..5 {
+            let key = make_key(&format!("old{i}"));
+            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        assert_eq!(
+            engine.count_range(&tid, None, None).unwrap(),
+            5,
+            "precondition: five rows are on disk before the DROP"
+        );
+
+        // The aborted load left the table directory undeletable. Make it
+        // unreadable too, so `remove_dir_all` cannot even enumerate it — the
+        // order-independent form of "the deletion did not complete".
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(table_dir.exists(), "the table directory must exist on disk");
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        // DROP TABLE.
+        let drop = engine.unregister_table(&tid);
+
+        // The transient condition clears (the process that held the directory
+        // released it; an operator runs a cleanup). The SSTable files were never
+        // removed, so they are readable again — this is the live state.
+        let mut perms = std::fs::metadata(&table_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&table_dir, perms).unwrap();
+
+        // CREATE the same name and load a DIFFERENT row count.
+        engine.register_table(test_schema()).unwrap();
+        for i in 0..3 {
+            let key = make_key(&format!("new{i}"));
+            engine
+                .write(&tid, &key, make_row(b"fresh", 100), 100)
+                .unwrap();
+        }
+
+        // The table must contain ONLY the newly written rows. Assert the exact
+        // count, not a lower bound: a stale count must not be able to match.
+        let visible = engine.count_range(&tid, None, None).unwrap();
+        assert_eq!(
+            visible,
+            3,
+            "DROP+CREATE must contain ONLY the new rows; the dropped table's rows \
+             came back (drop returned {:?})",
+            drop.as_ref().map(|_| "Ok").map_err(|e| e.to_string())
+        );
+
+        // And the survivors must not be reachable by a full scan either.
+        let scanned: usize = engine
+            .read_range_limited_rows(&tid, None, None, 1000, 0)
+            .unwrap()
+            .iter()
+            .map(|p| p.rows.len())
+            .sum();
+        assert_eq!(scanned, 3, "a full scan must not return dropped rows");
+        assert!(
+            !table_dir.join("orphaned-generation").exists(),
+            "the orphaned entry must be gone"
+        );
+    }
+
+    /// Restores a table directory's mode when dropped, so a test that made it
+    /// unreadable still leaves a cleanable tempdir.
+    #[cfg(unix)]
+    struct RestoreDirMode(std::path::PathBuf);
+    #[cfg(unix)]
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(&self.0) {
+                let mut p = md.permissions();
+                p.set_mode(0o755);
+                let _ = std::fs::set_permissions(&self.0, p);
+            }
+        }
+    }
+
+    /// Make the table's SSTable directory unreadable so `remove_dir_all` cannot
+    /// enumerate it (the order-independent form of "the removal did not complete").
+    /// Returns a guard that restores the mode.
+    #[cfg(unix)]
+    fn make_undeletable(table_dir: &std::path::Path) -> RestoreDirMode {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(table_dir).unwrap().permissions();
+        perms.set_mode(0o000);
+        std::fs::set_permissions(table_dir, perms).unwrap();
+        RestoreDirMode(table_dir.to_path_buf())
+    }
+
+    /// Every `-Data.db` component under `dir` (flat or `<gen>/` layout).
+    fn data_files_under(dir: &std::path::Path) -> usize {
+        fn walk(d: &std::path::Path, n: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(d) else {
+                return;
+            };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    walk(&p, n);
+                } else if p
+                    .file_name()
+                    .map(|f| f.to_string_lossy().ends_with("-Data.db"))
+                    .unwrap_or(false)
+                {
+                    *n += 1;
+                }
+            }
+        }
+        let mut n = 0;
+        walk(dir, &mut n);
+        n
+    }
+
+    /// INV-1 / INV-2 (NO RESURRECTION, NAME REUSE IS CLEAN): after a DROP that
+    /// could not remove its SSTables, a same-name CREATE contains ONLY the new
+    /// rows, and they stay the only rows after a full restart — the sweep is
+    /// durable, not merely in-memory.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_name_recreate_after_an_unremovable_drop_holds_only_new_rows_across_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..7 {
+                let key = make_key(&format!("old{i}"));
+                engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert_eq!(engine.count_range(&tid, None, None).unwrap(), 7);
+
+            let table_dir = dir.path().join("sstables").join(tid.to_string());
+            let guard = make_undeletable(&table_dir);
+            let drop_result = engine.unregister_table(&tid);
+            assert!(
+                drop_result.is_err(),
+                "INV-6: an unremovable drop must not succeed"
+            );
+            drop(guard);
+
+            // The re-created table loads a DIFFERENT row count.
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..4 {
+                let key = make_key(&format!("new{i}"));
+                engine
+                    .write(&tid, &key, make_row(b"fresh", 100), 100)
+                    .unwrap();
+            }
+            assert_eq!(
+                engine.count_range(&tid, None, None).unwrap(),
+                4,
+                "INV-2: the re-created table must hold exactly the new rows"
+            );
+            // Flush the new rows so they are on disk and must survive the restart
+            // below (an unflushed memtable is not a durability claim).
+            engine.flush(&tid).unwrap();
+        }
+
+        // A full restart must not bring the dropped rows back (INV-1).
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+        assert_eq!(
+            engine.count_range(&tid, None, None).unwrap(),
+            4,
+            "INV-1: after a restart the dropped rows must still be gone"
+        );
+        let scanned: usize = engine
+            .read_range_limited_rows(&tid, None, None, 1000, 0)
+            .unwrap()
+            .iter()
+            .map(|p| p.rows.len())
+            .sum();
+        assert_eq!(
+            scanned, 4,
+            "INV-1: a full scan must return only the new rows"
+        );
+    }
+
+    /// INV-4 (SPACE RECLAIMED): the orphaned SSTables are physically removed, not
+    /// merely hidden by a count. After the re-create, no component of the dropped
+    /// incarnation is left on disk.
+    #[cfg(unix)]
+    #[test]
+    fn the_orphaned_sstables_are_physically_reclaimed_on_recreate() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let tid = table_id();
+        engine.register_table(test_schema()).unwrap();
+        for i in 0..5 {
+            let key = make_key(&format!("old{i}"));
+            engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+        }
+        engine.flush(&tid).unwrap();
+        let table_dir = dir.path().join("sstables").join(tid.to_string());
+        assert!(
+            data_files_under(&table_dir) > 0,
+            "precondition: the bulk load wrote real SSTables"
+        );
+
+        let guard = make_undeletable(&table_dir);
+        engine.unregister_table(&tid).unwrap_err();
+        drop(guard);
+        engine.register_table(test_schema()).unwrap();
+
+        assert_eq!(
+            data_files_under(&table_dir),
+            0,
+            "INV-4: the orphaned SSTables must be deleted, not hidden"
+        );
+    }
+
+    /// INV-3 (TRUNCATE IS ABSOLUTE): a TRUNCATE leaves zero rows readable even when
+    /// the SSTable files could not be removed, and they do not return after a
+    /// restart; the failed disk removal is loud.
+    #[cfg(unix)]
+    #[test]
+    fn truncate_leaves_zero_rows_even_when_its_sstables_cannot_be_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            let tid = table_id();
+            engine.register_table(test_schema()).unwrap();
+            for i in 0..5 {
+                let key = make_key(&format!("old{i}"));
+                engine.write(&tid, &key, make_row(b"stale", 1), 1).unwrap();
+            }
+            engine.flush(&tid).unwrap();
+            assert_eq!(engine.count_range(&tid, None, None).unwrap(), 5);
+
+            let table_dir = dir.path().join("sstables").join(tid.to_string());
+            let guard = make_undeletable(&table_dir);
+            let truncate = engine.truncate(&tid);
+            assert!(
+                truncate.is_err(),
+                "INV-6: a TRUNCATE that cannot reclaim its files must fail loud"
+            );
+            drop(guard);
+
+            assert_eq!(
+                engine.count_range(&tid, None, None).unwrap(),
+                0,
+                "INV-3: TRUNCATE must leave zero rows readable regardless"
+            );
+        }
+
+        // Restart: the rows must not come back (INV-3, durable).
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        assert_eq!(
+            engine.count_range(&table_id(), None, None).unwrap(),
+            0,
+            "INV-3: a truncated table must read empty after a restart"
         );
     }
 
@@ -26973,6 +27583,285 @@ mod tests {
         assert!(result_b.is_some(), "mutation to tbl_b should be visible");
     }
 
+    // -- Streaming commit-path tests (non-resident write-set) --
+    //
+    // `StorageEngine::write_atomic_batch` reads its write-set from a
+    // `WriteSetSource`, not a resident `Vec<Mutation>`. These tests drive it from
+    // a SPILLED `StagedWriteSet` — the shape a large transaction's commit
+    // consumes — and pin one invariant each.
+
+    /// The schema the streaming commit-path tests write through: one UTF8 column.
+    fn stream_test_schema(table: &str) -> TableSchema {
+        TableSchema {
+            keyspace: "ks".to_string(),
+            table: table.to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// A single-row mutation for `table`, partition key `pk`, cell value `value`
+    /// at cell timestamp `ts` (also the partition token, so keys stay distinct).
+    fn stream_mutation(table: &str, pk: &[u8], value: &[u8], ts: i64) -> Mutation {
+        use ferrosa_common::Token;
+        Mutation {
+            mutation_id: [0x5Au8; 16],
+            keyspace: "ks".to_string(),
+            table: table.to_string(),
+            key: DecoratedKey {
+                token: Token(ts),
+                key: PartitionKey::new(pk.to_vec()),
+            },
+            rows: vec![Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(value.to_vec(), ts))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            }],
+            timestamp: ts,
+        }
+    }
+
+    /// The partition key that [`stream_mutation`] builds for `(pk, ts)`.
+    fn stream_key(pk: &[u8], ts: i64) -> DecoratedKey {
+        use ferrosa_common::Token;
+        DecoratedKey {
+            token: Token(ts),
+            key: PartitionKey::new(pk.to_vec()),
+        }
+    }
+
+    /// Stage `mutations` into a `WriteSetStage` under `root`, spilling past
+    /// `threshold` bytes, then finish. Returns the readable write-set and the
+    /// resident bytes held at the end of staging (0 once anything spilled).
+    fn stage_write_set(
+        mutations: &[Mutation],
+        root: &std::path::Path,
+        threshold: u64,
+    ) -> (crate::write_set_stage::StagedWriteSet, u64) {
+        let mut stage = crate::write_set_stage::WriteSetStage::with_threshold(root, threshold);
+        for mutation in mutations {
+            let mut frame = vec![0u8; mutation.serialized_size()];
+            mutation.serialize_into(&mut frame);
+            stage.append(&frame).expect("stage append");
+        }
+        let resident = stage.resident_bytes();
+        (stage.finish().expect("stage finish"), resident)
+    }
+
+    /// INVARIANT 1 (DATA PRESERVED). Every mutation of a write-set that has
+    /// SPILLED to disk is appended to the commit log and applied to the memtable,
+    /// so every row is readable afterwards. The set is forced past the staging
+    /// threshold, so the commit path reads it back out of the spill — not from a
+    /// resident `Vec<Mutation>` — and must lose nothing crossing the boundary.
+    #[test]
+    fn streamed_commit_lands_every_row_from_a_spilled_write_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table(stream_test_schema("streamed"))
+            .unwrap();
+
+        let n: usize = 200;
+        let mutations: Vec<Mutation> = (0..n)
+            .map(|i| {
+                let ts = i as i64 + 1;
+                stream_mutation(
+                    "streamed",
+                    format!("pk{i}").as_bytes(),
+                    format!("v{i}").as_bytes(),
+                    ts,
+                )
+            })
+            .collect();
+        let (staged, _resident) = stage_write_set(&mutations, &dir.path().join("stage"), 64);
+        assert!(
+            staged.spilled_to_disk(),
+            "the write-set must have SPILLED, or this is not the streaming path"
+        );
+        assert_eq!(staged.len(), n, "every frame is staged");
+
+        engine.write_atomic_batch(staged).expect("streamed commit");
+
+        for i in 0..n {
+            let key = stream_key(format!("pk{i}").as_bytes(), i as i64 + 1);
+            let partition = engine
+                .read(&TableId::new("ks", "streamed"), &key)
+                .expect("read");
+            assert!(
+                partition.is_some(),
+                "row {i} must be readable after a streamed commit across the spill"
+            );
+        }
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT 3 (PREFLIGHT REJECTS FIRST). Pass 1 validates the WHOLE set
+    /// before pass 2 appends anything. Here the offending entry is LAST, so an
+    /// append-then-validate preflight would already have appended the earlier,
+    /// valid entries. The commit log's position must be UNCHANGED — no replayable
+    /// prefix — and nothing may be visible.
+    #[test]
+    fn streamed_preflight_rejects_the_whole_set_before_any_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table(stream_test_schema("present"))
+            .unwrap();
+
+        let mut mutations = vec![
+            stream_mutation("present", b"pk0", b"v0", 1),
+            stream_mutation("present", b"pk1", b"v1", 2),
+            // The offending entry is LAST: everything before it is valid.
+            stream_mutation("absent", b"pk2", b"v2", 3),
+        ];
+        let (staged, _resident) = stage_write_set(&mutations, &dir.path().join("stage"), 4096);
+
+        let before = engine.commit_log.current_position();
+        let error = engine
+            .write_atomic_batch(staged)
+            .expect_err("an unregistered table must reject the whole set");
+        assert!(
+            error.to_string().contains("absent"),
+            "the rejection names the table: {error}"
+        );
+        assert_eq!(
+            before,
+            engine.commit_log.current_position(),
+            "preflight must reject the whole set BEFORE pass 2 appends anything"
+        );
+        assert!(
+            engine
+                .read(&TableId::new("ks", "present"), &stream_key(b"pk0", 1))
+                .unwrap()
+                .is_none(),
+            "a rejected batch must apply nothing"
+        );
+        mutations.clear();
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT 5 (CAPACITY). Residency does not grow with the write-set: a
+    /// small set and a set two orders of magnitude larger are BOTH committed
+    /// completely, and the staged residency never exceeds the tunable buffer.
+    /// This is the opposite of a cap test — the large set SUCCEEDS; a structure
+    /// that cannot hold the data spills, it never refuses.
+    #[test]
+    fn streamed_commit_residency_is_flat_across_write_set_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(stream_test_schema("flat")).unwrap();
+
+        let threshold = 512u64;
+        let payload = vec![b'x'; 32];
+
+        let small: Vec<Mutation> = (0..8)
+            .map(|i| stream_mutation("flat", format!("s{i}").as_bytes(), &payload, i as i64 + 1))
+            .collect();
+        let large: Vec<Mutation> = (0..5_000)
+            .map(|i| {
+                stream_mutation(
+                    "flat",
+                    format!("l{i}").as_bytes(),
+                    &payload,
+                    i as i64 + 1000,
+                )
+            })
+            .collect();
+
+        let (small_staged, small_resident) =
+            stage_write_set(&small, &dir.path().join("stage-small"), threshold);
+        let (large_staged, large_resident) =
+            stage_write_set(&large, &dir.path().join("stage-large"), threshold);
+
+        assert!(
+            small_resident <= threshold,
+            "resident {small_resident} must stay within the {threshold}-byte buffer"
+        );
+        assert!(
+            large_resident <= threshold,
+            "resident {large_resident} must stay within the {threshold}-byte buffer; \
+             residency must not track the write-set size"
+        );
+        assert_eq!(
+            large_staged.len(),
+            5_000,
+            "a write-set far larger than the buffer is ACCEPTED, never refused for size"
+        );
+        assert!(large_staged.spilled_to_disk());
+
+        engine
+            .write_atomic_batch(small_staged)
+            .expect("small commit");
+        engine
+            .write_atomic_batch(large_staged)
+            .expect("a large write-set commits; it is never refused for being large");
+
+        assert!(
+            engine
+                .read(
+                    &TableId::new("ks", "flat"),
+                    &stream_key(b"l4999", 1000 + 4999)
+                )
+                .unwrap()
+                .is_some(),
+            "the LAST row of the large set must land"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT 6 (FAIL LOUD). A staged frame that is not a decodable mutation
+    /// is a clear error, never a silent empty mutation that would drop a row.
+    #[test]
+    fn streamed_commit_fails_loud_on_a_corrupt_staged_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine
+            .register_table(stream_test_schema("corrupt"))
+            .unwrap();
+
+        let good = stream_mutation("corrupt", b"pk0", b"v0", 1);
+        let mut frame = vec![0u8; good.serialized_size()];
+        good.serialize_into(&mut frame);
+        let mut stage =
+            crate::write_set_stage::WriteSetStage::with_threshold(dir.path().join("stage"), 8);
+        stage.append(&frame).expect("append good");
+        stage.append(&frame[..8]).expect("append truncated");
+        let staged = stage.finish().expect("finish");
+
+        let before = engine.commit_log.current_position();
+        let error = engine
+            .write_atomic_batch(staged)
+            .expect_err("a corrupt frame must fail loud");
+        assert!(
+            error.to_string().contains("not a decodable mutation frame"),
+            "a clear error, never a silent empty mutation: {error}"
+        );
+        assert_eq!(
+            before,
+            engine.commit_log.current_position(),
+            "a decode failure in preflight must append nothing"
+        );
+        assert!(
+            engine
+                .read(&TableId::new("ks", "corrupt"), &stream_key(b"pk0", 1))
+                .unwrap()
+                .is_none(),
+            "a failed streamed commit must apply nothing"
+        );
+        engine.shutdown().unwrap();
+    }
+
     // -- System table registration tests --
 
     #[test]
@@ -33646,6 +34535,164 @@ mod tests {
         (dir, engine, store, prefix, tid)
     }
 
+    /// The incomplete-generation memo must warn once per distinct missing set and
+    /// then stay silent, and must forget a generation once it leaves disk. Measured
+    /// churn this guards: a node holding 122 incomplete generations emitted ~95
+    /// `s3-sync: skipping incomplete SSTable generation` WARNs every 30 s, 99 % of
+    /// that node's log, because each pass re-reported the same unchanged set.
+    #[tokio::test]
+    async fn sync_warns_once_for_a_permanently_incomplete_generation() {
+        let (_dir, engine, _store, _prefix, tid) = s3_sync_fixture(
+            "test-sync-churn-memo",
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+            ],
+        );
+        let key = format!("{tid}/1");
+        let missing = vec!["Rows.db".to_string()];
+
+        // GIVEN a generation first seen missing a component
+        // THEN the first sighting is reported
+        assert!(
+            !engine.generation_is_known_incomplete(&key),
+            "a generation must not be pre-marked incomplete before it is seen"
+        );
+        assert!(
+            engine.mark_generation_incomplete(key.clone(), missing.clone()),
+            "the first sighting of an incomplete generation must warn"
+        );
+
+        // AND an identical repeat sighting must NOT warn again — the churn fix
+        assert!(
+            !engine.mark_generation_incomplete(key.clone(), missing.clone()),
+            "a repeat sighting of the same missing set must NOT warn again"
+        );
+
+        // AND a changed missing set (a different component vanished) is news again
+        assert!(
+            engine.mark_generation_incomplete(key.clone(), vec!["Filter.db".to_string()]),
+            "a changed missing set must be reported"
+        );
+
+        // AND pruning keeps only generations still on disk, so the memo is bounded
+        // and a vanished generation is re-examined if it returns
+        engine.prune_incomplete_generations(&std::collections::HashSet::new());
+        assert!(
+            !engine.generation_is_known_incomplete(&key),
+            "a generation no longer on disk must be forgotten"
+        );
+    }
+
+    /// A generation recorded incomplete must still be uploaded if its missing
+    /// component later appears — the churn fix must not permanently withhold a
+    /// now-complete generation (data-preservation invariant).
+    #[tokio::test]
+    async fn sync_re_examines_a_generation_after_its_missing_component_appears() {
+        let (_dir, engine, _store, _prefix, tid) = s3_sync_fixture(
+            "test-sync-memo-completes",
+            &[
+                ("Data.db", b"legacy data"),
+                ("Partitions.db", b"legacy partitions"),
+                ("Filter.db", b"legacy filter"),
+            ],
+        );
+        let key = format!("{tid}/1");
+        let table_dir = engine.table_sstable_dir(&tid);
+
+        // GIVEN a generation with Rows.db missing, already recorded as incomplete
+        assert!(engine.mark_generation_incomplete(key.clone(), vec!["Rows.db".to_string()]));
+
+        // WHEN Rows.db later appears on disk
+        std::fs::write(table_dir.join("1-Rows.db"), b"rows").unwrap();
+        assert!(
+            StorageEngine::sstable_file_exists(&table_dir, "1-Rows.db"),
+            "the memo's file check must see the newly written component"
+        );
+
+        // THEN the next sync uploads the now-complete generation rather than
+        // skipping it from a stale memo
+        let uploaded = engine.sync_sstables_to_s3().await.unwrap();
+        assert!(
+            uploaded >= 1,
+            "a generation whose missing component appeared must be uploaded, not skipped"
+        );
+        assert!(
+            !engine.generation_is_known_incomplete(&key),
+            "the memo must drop the entry once the generation is complete"
+        );
+    }
+
+    /// A generation that lost its `Rows.db` must FAIL LOUD and stay withheld — the
+    /// file is a mandatory component (BTI layout: Rows.db is the row index, listed
+    /// in TOC.txt, and the reader requires it). It must never be silently
+    /// synthesized: writing an empty placeholder would fabricate a component the
+    /// reader trusts for clustered lookups and would hide a real loss. This is the
+    /// measured s3-sync churn (121 of 122 incomplete generations on a live node
+    /// were missing only Rows.db), and corruption is exactly why they were
+    /// withheld and never uploaded — correct, not a bug to work around.
+    #[tokio::test]
+    async fn generation_missing_its_mandatory_row_index_fails_loud() {
+        // GIVEN a real flushed generation of a no-clustering table (whose writer
+        // emitted a zero-byte Rows.db, as it does for every generation).
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let mut schema = test_schema();
+        schema.clustering_columns.clear();
+        engine.register_table(schema).unwrap();
+        let tid = table_id();
+        for i in 0..200i64 {
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"v".to_vec(), 1_000 + i))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1_000 + i),
+            };
+            engine
+                .write(&tid, &make_key(&i.to_string()), row, 1_000 + i)
+                .unwrap();
+        }
+        engine.flush(&tid).unwrap();
+
+        let table_dir = engine.table_sstable_dir(&tid);
+        let gens = StorageEngine::list_generations_in_dir(&table_dir);
+        assert_eq!(
+            gens.len(),
+            1,
+            "the flush must leave exactly one generation: {gens:?}"
+        );
+        let gen = gens[0];
+        let gen_str = gen.to_string();
+        let rows_path =
+            StorageEngine::generation_component_path(&table_dir, &gen_str, "Rows.db").unwrap();
+
+        // The generation's own TOC.txt lists Rows.db, so it is mandatory for it.
+        let toc = std::fs::read_to_string(table_dir.join(format!("{gen_str}-TOC.txt"))).unwrap();
+        assert!(
+            toc.contains("Rows.db"),
+            "the writer must list Rows.db in TOC.txt: {toc:?}"
+        );
+        assert!(StorageEngine::open_sstable_from_dir(&table_dir, &gen_str).is_ok());
+
+        // WHEN the mandatory Rows.db is lost — the measured live failure
+        std::fs::remove_file(&rows_path).unwrap();
+
+        // THEN opening must fail loud (not fall back, not synthesize), so the
+        // generation is withheld from readers and never uploaded — surfacing the
+        // loss instead of hiding it.
+        assert!(
+            StorageEngine::open_sstable_from_dir(&table_dir, &gen_str).is_err(),
+            "a generation missing its mandatory Rows.db must fail loud, never fall back"
+        );
+        // AND nothing may recreate the file: the absence must persist so the loss
+        // stays visible to repair-from-replica and to the operator.
+        assert!(
+            !rows_path.exists(),
+            "the engine must not silently regenerate a mandatory component"
+        );
+    }
+
     /// Build an S3-backed engine over `dir` whose uploaded-SSTable cache is
     /// one byte, so every sync evicts what it uploaded, exactly as disk
     /// pressure did on the live cluster.
@@ -34916,6 +35963,12 @@ mod tests {
         );
     }
 
+    /// A generation that lost its `Rows.db` is NOT uploadable — the file is a
+    /// mandatory component (BTI row index, listed in TOC.txt), so publishing a
+    /// generation without it would produce an entry the download path then refuses
+    /// (`download_sstables_into` requires Rows.db): a permanently unrestorable
+    /// SSTable. The withheld generation is CORRECT — it is corrupt and must be
+    /// repaired from a replica, not worked around.
     #[tokio::test]
     async fn sync_s3_rejects_generation_missing_required_rows_component() {
         let (_dir, engine, store, prefix, tid) = s3_sync_fixture(

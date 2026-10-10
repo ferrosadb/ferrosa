@@ -585,6 +585,191 @@ impl ClusterCoordinator {
         }
     }
 
+    /// Coordinate a write to **every node that can serve the table**, requiring
+    /// `cl` acknowledgements from that whole set.
+    ///
+    /// Where [`Self::coordinate_write_with`] targets the key's RF replica set,
+    /// this targets the **entire ring**. Under `ConsistencyLevel::All` that is
+    /// every node that can serve the table — the property a table-level
+    /// tombstone (`TRUNCATE`) needs: the marker must reach every node, because a
+    /// node outside the marker's RF set would keep serving the truncated rows
+    /// (silent resurrection).
+    ///
+    /// Unlike the ordinary write path there is **no quorum shortcut and no hint
+    /// fallback**: a replica that does not acknowledge fails the write loudly.
+    /// A partially replicated table tombstone is exactly the silent resurrection
+    /// this refuses to produce.
+    pub async fn coordinate_all_serving_write(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        row: Row,
+        timestamp: i64,
+        cl: ConsistencyLevel,
+    ) -> crate::error::Result<()> {
+        let permit = self
+            .write_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| crate::error::ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required: 0,
+                alive: 0,
+            })?;
+        let permit = TrackedWritePermit::new(permit);
+
+        let ring = self.ring.load();
+        // The whole ring is the candidate serving set. `eligible_replicas_for_cl`
+        // applies the ADR-014 role policy; for CL=ALL that keeps every voter and
+        // every token-owning learner, and there is no RF subset to drop to.
+        let all_nodes = ring.node_ids();
+        let targets = super::cl_routing::eligible_replicas_for_cl(cl, &all_nodes, &ring);
+        let required = targets.len();
+        // The coordinator must itself hold the marker (it serves the table too);
+        // otherwise "all acknowledged" would be a lie about this node.
+        if required == 0 || !targets.contains(&self.local_node_id) {
+            return Err(crate::error::ClusterError::Unavailable {
+                consistency: cl.to_string(),
+                required: required.max(1),
+                alive: 0,
+            });
+        }
+
+        let replica_targets: Vec<(u64, Option<(uuid::Uuid, String)>)> = targets
+            .iter()
+            .filter_map(|&replica_id| {
+                ring.get_node(replica_id)
+                    .map(|info| (replica_id, Some((info.host_id, info.addr.clone()))))
+            })
+            .collect();
+        drop(ring);
+
+        let mutation = Mutation::new(
+            table_id.keyspace.clone(),
+            table_id.table.clone(),
+            key.clone(),
+            vec![row.clone()],
+            timestamp,
+        );
+        let body = encode_mutation(&mutation);
+
+        let mut local_row = Some(row);
+        // Build the fan-out: local write when self is a target, `MutationForward`
+        // for every remote target.
+        let mut fan_out: FuturesUnordered<ReplicaWriteJoin> = replica_targets
+            .into_iter()
+            .filter_map(|(replica_id, remote)| {
+                if replica_id == self.local_node_id {
+                    let Some(row) = local_row.take() else {
+                        tracing::error!(replica_id, "token ring returned local replica twice");
+                        return None;
+                    };
+                    metrics::inc_replica_write_attempt(true);
+                    let storage = Arc::clone(&self.storage);
+                    let table_id = table_id.clone();
+                    let key = key.clone();
+                    return Some(tokio::spawn(async move {
+                        match spawn_storage_blocking(move || {
+                            storage.write(&table_id, &key, row, timestamp)
+                        })
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                metrics::inc_replica_write_ack(true);
+                                ReplicaResult::Ack { host_id: None }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(%e, "local all-serving write failed");
+                                metrics::inc_replica_write_failure(true);
+                                ReplicaResult::Failure { host_id: None }
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "local storage worker failed");
+                                metrics::inc_replica_write_failure(true);
+                                ReplicaResult::Failure { host_id: None }
+                            }
+                        }
+                    }));
+                }
+
+                let peer_manager = self.peer_manager.clone();
+                let forward_body = body.clone();
+                Some(
+                    ferrosa_net::task_pool::TaskPool::current("coordinator-all-serving-write").spawn(
+                        async move {
+                            metrics::inc_replica_write_attempt(false);
+                            match remote {
+                                None => {
+                                    tracing::warn!(
+                                        replica_id,
+                                        "no host_id for a serving node — dropping marker"
+                                    );
+                                    ReplicaResult::Failure { host_id: None }
+                                }
+                                Some((hid, addr)) => {
+                                    match ClusterCoordinator::send_remote_write_with_reconnect(
+                                        peer_manager,
+                                        hid,
+                                        &addr,
+                                        Message::MutationForward(forward_body),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Message::MutationAck(_)) => {
+                                            metrics::inc_replica_write_ack(false);
+                                            ReplicaResult::Ack { host_id: Some(hid) }
+                                        }
+                                        Ok(other) => {
+                                            tracing::warn!(
+                                                ?other,
+                                                "unexpected response from serving node"
+                                            );
+                                            metrics::inc_replica_write_failure(false);
+                                            ReplicaResult::Failure { host_id: Some(hid) }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(%e, %hid, "MutationForward (all-serving) failed");
+                                            metrics::inc_replica_write_failure(false);
+                                            ReplicaResult::Failure { host_id: Some(hid) }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    ),
+                )
+            })
+            .collect();
+
+        // Require EVERY target to acknowledge. No quorum shortcut (a quorum-sized
+        // ack would leave a serving node without the marker) and no hint fallback
+        // (a hint is a deferred, best-effort write; a table tombstone must be held
+        // now, or the truncate is a lie).
+        let mut acks = 0usize;
+        let mut failed = 0usize;
+        while let Some(joined) = fan_out.next().await {
+            match joined {
+                Ok(ReplicaResult::Ack { .. }) => acks += 1,
+                Ok(ReplicaResult::Failure { .. }) => failed += 1,
+                Err(e) => {
+                    tracing::warn!(%e, "serving-node write task failed");
+                    failed += 1;
+                }
+            }
+        }
+        drop(permit);
+
+        if failed > 0 || acks < required {
+            return Err(ClusterError::WriteTimeout {
+                consistency: cl.to_string(),
+                received: acks,
+                required,
+            });
+        }
+        Ok(())
+    }
+
     /// Coordinate a write using NetworkTopologyStrategy with DC-aware consistency.
     ///
     /// For `LOCAL_QUORUM`: compute required ACKs from the local DC's RF only.

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use bytes::BytesMut;
 use ferrosa_schema::Schema;
+use ferrosa_storage::write_set_stage::WriteSetSource as _;
 use ferrosa_storage::StorageEngine;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -331,6 +332,35 @@ where
     loop {
         match codec::read_frontend(frames) {
             Ok(Some(msg)) => {
+                // `COPY ... FROM STDIN` is the one statement that cannot be answered in a single
+                // step: the client sends the payload only AFTER `CopyInResponse`. So it is driven
+                // here, where the frame buffer, the stream and the read buffer are in scope,
+                // rather than from `handle_frontend`.
+                if let FrontendMessage::Query(sql) = &msg {
+                    // A leading `COPY` is the ONLY shape that can need this path, and the check is
+                    // a byte compare rather than a parse: every ordinary statement must not pay for
+                    // a second parse here (`execute_simple_to` parses it once, below).
+                    let head = sql.trim_start();
+                    if !session.is_error_pending()
+                        && head.len() >= 4
+                        && head.as_bytes()[..4].eq_ignore_ascii_case(b"copy")
+                    {
+                        if let Ok(ferrosa_sql::Statement::CopyFromStdin(copy)) =
+                            ferrosa_sql::parse_statement(sql)
+                        {
+                            crate::copy_stdin::drive(
+                                stream,
+                                frames,
+                                read_buf,
+                                ctx,
+                                &mut session,
+                                &copy,
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                }
                 if handle_frontend(stream, ctx, &mut session, msg).await? {
                     return Ok(()); // Terminate
                 }
@@ -453,6 +483,16 @@ where
             BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
         }
         FrontendMessage::Terminate => return Ok(true),
+        // COPY data with no COPY in progress. The wire layer understands these frames so a COPY
+        // can be implemented, but the server does not open one yet — so any of them arriving here
+        // means the client and we disagree about what is in flight. That is reported rather than
+        // ignored: swallowing the payload would let a client's data be reinterpreted as SQL.
+        FrontendMessage::CopyData { .. }
+        | FrontendMessage::CopyDone
+        | FrontendMessage::CopyFail { .. } => {
+            crate::query::error_response("08P01", "COPY data received outside a COPY operation")
+                .encode(&mut out);
+        }
         // SASL after auth, or any other unexpected message: ignore.
         FrontendMessage::SaslResponse { .. } | FrontendMessage::Unknown { .. } => {}
     }
@@ -508,7 +548,12 @@ impl<St: AsyncWrite + Unpin> ReplySink for SocketSink<'_, St> {
 /// A `SELECT`'s rows are written to `out` as they are produced; the returned
 /// messages are the tail still to send (its `CommandComplete`, or the
 /// `ErrorResponse` that ended it).
-async fn execute_simple_to<O: ReplySink>(
+///
+/// `pub(crate)` so the `COPY ... FROM STDIN` tests can drive `BEGIN`/`COMMIT`
+/// through the SAME transaction path a connection uses, rather than
+/// re-implementing it: a COPY's transactionality is only proven by committing
+/// and rolling back through this seam.
+pub(crate) async fn execute_simple_to<O: ReplySink>(
     ctx: &QueryContext,
     session: &mut Session,
     sql: &str,
@@ -519,7 +564,13 @@ async fn execute_simple_to<O: ReplySink>(
         Ok(ferrosa_sql::Statement::Select(_)
             | ferrosa_sql::Statement::Insert(_)
             | ferrosa_sql::Statement::Update(_)
-            | ferrosa_sql::Statement::Delete(_))
+            | ferrosa_sql::Statement::Delete(_)
+            // TRUNCATE is a replicated WRITE too. It MUST take this path, or an
+            // autocommit TRUNCATE would bypass Accord entirely and write to LOCAL
+            // storage only — a scope hole worse than the reserved key's RF subset.
+            // Wrapping it in an implicit transaction routes the tombstone through
+            // the cluster commit (and, there, to every serving node at CL=ALL).
+            | ferrosa_sql::Statement::Truncate(_))
     );
     if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
         return execute_simple_inner(ctx, session, sql, out).await;
@@ -686,9 +737,9 @@ fn read_env<'a>(
 }
 
 /// The storage and limits context for one extended-protocol DML statement.
-fn dml_context<'a>(
+pub(crate) fn dml_context<'a>(
     ctx: &'a QueryContext,
-    txn: Option<&'a mut Vec<crate::PgWrite>>,
+    txn: Option<&'a mut crate::TxnWriteSet>,
 ) -> query::DmlContext<'a> {
     query::DmlContext {
         engine: &ctx.engine,
@@ -698,6 +749,17 @@ fn dml_context<'a>(
         txn,
         jsonb_limits: &ctx.jsonb_limits,
     }
+}
+
+/// The context for a no-`FROM` expression select: storage over the session's
+/// current snapshot (so a scalar subquery can run), plus the session's pending
+/// writes so the inner query sees the caller's uncommitted rows.
+fn scalar_read_ctx<'a>(
+    ctx: &'a QueryContext,
+    snapshot: &'a crate::mvcc::MvccSnapshot,
+    pending: &'a [crate::PgWrite],
+) -> query::ScalarReadCtx<'a> {
+    query::ScalarReadCtx::new(read_env(ctx, snapshot), Some(pending))
 }
 
 /// The snapshot a read runs at: the transaction's own under serializable
@@ -800,7 +862,16 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         }];
     }
 
-    let writes = session.take_txn_writes();
+    let staged = match session.take_txn_stage() {
+        Ok(staged) => staged,
+        Err(error) => {
+            session.end_txn();
+            return vec![query::error_response(
+                "58000",
+                &format!("transaction commit failed: {error}"),
+            )];
+        }
+    };
     let read_tables = session.take_txn_read_tables();
     let snapshot = session
         .txn_snapshot()
@@ -810,7 +881,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // An empty write-set (`BEGIN; COMMIT;` with no DML, or only reads) is a
     // no-op that commits cleanly — there is nothing to apply, so no atomicity to
     // honor. This is NOT a fake success: zero writes means zero state change.
-    if writes.is_empty() {
+    if staged.is_empty() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &read_tables) {
             session.end_txn();
             return match error {
@@ -869,123 +940,127 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     }
 
     let mut write_tables = read_tables;
-    let mutations: Vec<_> = writes
-        .into_iter()
-        .map(|write| {
-            write_tables.insert(format!("{}.{}", write.0.keyspace, write.0.table));
-            write.0
-        })
-        .collect();
+    // Stream the write-set once to learn the tables it touches. The set is read
+    // one mutation at a time out of the staging (resident prefix or spill), so the
+    // table set is built WITHOUT materializing the write-set.
+    if let Err(error) = staged.for_each_mutation(&mut |mutation| {
+        write_tables.insert(format!("{}.{}", mutation.keyspace, mutation.table));
+        Ok(())
+    }) {
+        session.end_txn();
+        return vec![query::error_response(
+            "58000",
+            &format!("transaction commit failed: {error}"),
+        )];
+    }
     let _commit_guard = ctx.mvcc.commit_guard().await;
+    // Per-phase attribution for the COMMIT (see `MvccProfile`). Zero-valued and
+    // unused unless `FERROSA_PG_COMMIT_PROFILE` is set.
+    let commit_started = std::time::Instant::now();
+    let mut prepare_nanos: u64 = 0;
+    let mut accord_nanos: u64 = 0;
+    // Residency attribution: `FERROSA_PG_COMMIT_PROFILE=1` on an `alloc-probe`
+    // build logs the live heap at each COMMIT phase boundary, so a peak is
+    // attributed to the phase that caused it rather than guessed at.
+    let residency_profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
+        && ferrosa_common::mem_probe::installed();
+    if residency_profile {
+        tracing::info!(
+            phase = "commit_start",
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "pg commit residency"
+        );
+    }
     let outcome = if let Some(committer) = ctx.accord.committer() {
         if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
             Err(error)
         } else {
-            let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations);
-            match changes {
-                Err(error) => Err(error),
-                Ok(changes) => {
-                    let mut changes_by_partition =
-                        std::collections::HashMap::<Vec<u8>, Vec<_>>::new();
-                    for change in changes {
-                        changes_by_partition
-                            .entry(change.partition_key.clone())
-                            .or_default()
-                            .push(change);
-                    }
-                    let accord_writes = mutations
-                                  .iter()
-                                  .map(|mutation| {
-                                      let mut bytes = vec![0; mutation.serialized_size()];
-                                      mutation.serialize_into(&mut bytes);
-                                      let partition_key = mutation.key.key.as_bytes().to_vec();
-                                      let metadata = changes_by_partition.remove(&partition_key);
-                                      let mutation_bytes = match metadata {
-                                          Some(changes) => {
-                                              let metadata = serde_json::to_vec(&changes).map_err(|error| {
-                                                  MvccCommitError::Storage(ferrosa_common::Error::InvalidData(
-                                                      format!("serialize PostgreSQL MVCC row versions: {error}"),
-                                                  ))
-                                              })?;
-                                              ferrosa_storage::accord::encode_postgres_mvcc_mutation(
-                                                  &bytes,
-                                                  &metadata,
-                                              )
-                                              .map_err(|error| {
-                                                  MvccCommitError::Storage(
-                                                      ferrosa_common::Error::InvalidData(error),
-                                                  )
-                                              })?
-                                          }
-                                          None => bytes,
-                                      };
-                                      Ok(ferrosa_storage::accord::TransactionWrite {
-                                          keyspace: mutation.keyspace.clone(),
-                                          key: partition_key,
-                                          mutation: mutation_bytes,
-                                      })
-                                  })
-                                  .collect::<Result<Vec<_>, MvccCommitError>>()
-                                  .and_then(|writes| {
-                                      if changes_by_partition.is_empty() {
-                                          Ok(writes)
-                                      } else {
-                                          Err(MvccCommitError::Storage(
-                                              ferrosa_common::Error::InvalidData(format!(
-                                                  "{} PostgreSQL row version(s) were not attached to an Accord partition",
-                                                  changes_by_partition.values().map(Vec::len).sum::<usize>()
-                                              )),
-                                          ))
-                                      }
-                                  });
-                    let accord_writes = match accord_writes {
-                        Ok(writes) => writes,
-                        Err(error) => {
-                            session.end_txn();
-                            return vec![query::error_response(
-                                "58000",
-                                &format!("transaction commit failed: {error:?}"),
-                            )];
-                        }
-                    };
-                    let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
+            // One streaming pass builds the Accord write-set: each partition's
+            // row-version metadata is produced, encoded and handed off as the
+            // mutation is visited, so no whole-table row-image map and no
+            // per-partition re-grouping map exist at the COMMIT peak. `mutations`
+            // is consumed here; the raw whole-table write-set is therefore gone by
+            // the time Accord runs, instead of staying resident alongside
+            // `accord_writes` for the whole PreAccept/Commit/Apply sequence.
+            let prepare_started = std::time::Instant::now();
+            if residency_profile {
+                tracing::info!(
+                    phase = "accord_build.entry",
+                    staged = staged.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
+            }
+            // Stream the staged write-set STRAIGHT into the Accord write-set builder.
+            // The former shape deep-cloned every staged frame into a resident
+            // `Vec<Mutation>` (the `mutations_cloned` phase, ~690 MB at 1.1M rows)
+            // solely to hand it to the builder; the builder now consumes the source
+            // one OWNED mutation at a time and holds at most one bounded prefetch
+            // chunk. The `TransactionWrite` bytes it produces ARE the apply payload
+            // the coordinator hands to Accord. `staged` is BORROWED, not consumed —
+            // the non-Accord commit path below still needs it.
+            let accord_writes =
+                match query::prepare_accord_writes_streaming(&ctx.engine, &ctx.schema, &staged) {
+                    Ok(writes) => writes,
+                    Err(error) => {
                         session.end_txn();
                         return vec![query::error_response(
                             "58000",
-                            "cluster PostgreSQL transaction has no Accord snapshot timestamp",
+                            &format!("transaction commit failed: {error:?}"),
                         )];
-                    };
-                    let tables = write_tables.iter().cloned().collect();
-                    match committer
-                        .commit_postgres(
-                            &ctx.default_schema,
-                            accord_writes,
-                            tables,
-                            cluster_snapshot,
-                        )
-                        .await
-                    {
-                        Ok(ferrosa_storage::accord::CommitOutcome::Committed) => {
-                            Ok(ctx.mvcc.current_commit_seq())
-                        }
-                        Ok(ferrosa_storage::accord::CommitOutcome::Aborted { .. }) => {
-                            Err(MvccCommitError::SerializationFailure)
-                        }
-                        // Accord's `CommitError` is itself only a `reason: String`,
-                        // so the typed error is already gone by the time it
-                        // reaches here — a THIRD erasure, in the committer trait,
-                        // too deep to widen in this change. Wrapping the reason in
-                        // `InvalidData` at least reaches `is_backpressure()`'s
-                        // documented string branch (`starts_with("overloaded:")`),
-                        // which matches `Error::Overloaded`'s Display, so a
-                        // distributed commit refused for pressure can still be
-                        // classified. Best-effort by construction, not by accident.
-                        Err(error) => Err(MvccCommitError::Storage(
-                            ferrosa_common::Error::InvalidData(error.reason),
-                        )),
                     }
-                }
+                };
+            if residency_profile {
+                tracing::info!(
+                    phase = "accord_writes_built",
+                    writes = accord_writes.len(),
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    "pg commit residency"
+                );
             }
+            prepare_nanos = u64::try_from(prepare_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            let Some(cluster_snapshot) = snapshot.cluster_timestamp() else {
+                session.end_txn();
+                return vec![query::error_response(
+                    "58000",
+                    "cluster PostgreSQL transaction has no Accord snapshot timestamp",
+                )];
+            };
+            let tables = write_tables.iter().cloned().collect();
+            let accord_started = std::time::Instant::now();
+            let accord_result = match committer
+                .commit_postgres(&ctx.default_schema, accord_writes, tables, cluster_snapshot)
+                .await
+            {
+                Ok(ferrosa_storage::accord::CommitOutcome::Committed) => {
+                    Ok(ctx.mvcc.current_commit_seq())
+                }
+                Ok(ferrosa_storage::accord::CommitOutcome::Aborted { .. }) => {
+                    Err(MvccCommitError::SerializationFailure)
+                }
+                // Accord's `CommitError` is itself only a `reason: String`,
+                // so the typed error is already gone by the time it
+                // reaches here — a THIRD erasure, in the committer trait,
+                // too deep to widen in this change. Wrapping the reason in
+                // `InvalidData` at least reaches `is_backpressure()`'s
+                // documented string branch (`starts_with("overloaded:")`),
+                // which matches `Error::Overloaded`'s Display, so a
+                // distributed commit refused for pressure can still be
+                // classified. Best-effort by construction, not by accident.
+                Err(error) => Err(MvccCommitError::Storage(
+                    ferrosa_common::Error::InvalidData(error.reason),
+                )),
+            };
+            accord_nanos = u64::try_from(accord_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            if residency_profile {
+                tracing::info!(
+                    phase = "after_accord",
+                    live_mib = ferrosa_common::mem_probe::live_mib(),
+                    peak_mib = ferrosa_common::mem_probe::peak_mib(),
+                    "pg commit residency"
+                );
+            }
+            accord_result
         }
     } else {
         query::commit_mutations(
@@ -994,10 +1069,44 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             &ctx.mvcc,
             &snapshot,
             &write_tables,
-            mutations,
+            staged,
         )
     };
     session.end_txn();
+    if std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some() {
+        // Attribution line for a large transaction's commit: how the wall time
+        // splits between building the Accord write-set (row decode + encode),
+        // driving Accord (registration + apply fan-out), and the rest; and how
+        // much resident MVCC history the transaction left behind.
+        let stats = ctx.mvcc.history_stats();
+        let total_ms = commit_started.elapsed().as_secs_f64() * 1_000.0;
+        tracing::info!(
+            total_ms,
+            prepare_ms = prepare_nanos as f64 / 1_000_000.0,
+            accord_ms = accord_nanos as f64 / 1_000_000.0,
+            decoded_rows = ctx.mvcc.profile_decoded(),
+            versions_inserted = ctx.mvcc.profile_versions_inserted(),
+            history_keys = stats.total_keys(),
+            history_versions = stats.total_versions(),
+            history_kib = stats.total_bytes() / 1024,
+            dist_keys = stats.distributed_keys,
+            dist_versions = stats.distributed_versions,
+            dist_kib = stats.distributed_bytes / 1024,
+            applied_accord = stats.applied_accord_txns,
+            "pg commit phase attribution"
+        );
+        for (label, calls, nanos) in ctx.mvcc.profile_report() {
+            if calls > 0 {
+                tracing::info!(
+                    phase = label,
+                    calls,
+                    total_ms = nanos as f64 / 1_000_000.0,
+                    per_call_us = nanos as f64 / 1_000.0 / calls as f64,
+                    "pg commit phase attribution: mvcc"
+                );
+            }
+        }
+    }
     match outcome {
         Ok(_) => vec![BackendMessage::CommandComplete {
             tag: "COMMIT".to_string(),
@@ -1019,6 +1128,19 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             vec![query::error_response(
                 "53000",
                 &format!("transaction refused: {error}"),
+            )]
+        }
+        // An abandoned transaction — the operator-configured dependency-wait
+        // bound expired and the transaction was rolled back — is NOT committed
+        // and is safe to retry. Report it as a retryable serialization failure
+        // (40001), never as an opaque 58000 fault: the client must be able to
+        // tell "retry me" from "something is broken". Classified by the
+        // `abandoned:` prefix for the same reason `is_backpressure()` above is.
+        Err(MvccCommitError::Storage(error)) if matches!(&error, ferrosa_common::Error::InvalidData(msg) if msg.contains("abandoned:")) =>
+        {
+            vec![query::error_response(
+                "40001",
+                &format!("transaction was abandoned and NOT committed: {error}"),
             )]
         }
         Err(e @ MvccCommitError::Storage(_)) => vec![query::error_response(
@@ -1081,7 +1203,13 @@ async fn describe(
                 // No-FROM expression select: no parameters (rejected at parse),
                 // so an empty ParameterDescription + columns from the scalars.
                 PreparedKind::Exprs(items) => {
-                    match query::execute_scalar_select(&items, &ctx.default_schema) {
+                    let snapshot = read_snapshot(ctx, session);
+                    let pending = match session.materialized_txn_writes() {
+                        Ok(pending) => pending,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+                    match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => vec![
                             extended::parameter_description(&[]),
                             extended::describe_statement_rows(&result.columns),
@@ -1186,7 +1314,13 @@ async fn describe(
                     }
                 }
                 PreparedKind::Exprs(items) => {
-                    match query::execute_scalar_select(&items, &ctx.default_schema) {
+                    let snapshot = read_snapshot(ctx, session);
+                    let pending = match session.materialized_txn_writes() {
+                        Ok(pending) => pending,
+                        Err(err) => return vec![session.fail(err)],
+                    };
+                    let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+                    match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => {
                             vec![extended::describe_portal_rows(
                                 &result.columns,
@@ -1404,11 +1538,22 @@ async fn open_portal_stream(
         return Err(error);
     }
     track_select_reads(ctx, session, &select);
+    // Read-your-own-writes: a portal SELECT inside the open transaction must see
+    // its own uncommitted rows, so decode the staged write-set into resident
+    // writes the stream reader folds into the scan. The COMMIT path does NOT do
+    // this — it consumes the staging as a stream.
+    let pending = match session.materialized_txn_writes() {
+        Ok(pending) => pending,
+        Err(error) => {
+            session.mark_txn_failed();
+            return Err(error);
+        }
+    };
     let snapshot = read_snapshot(ctx, session);
     query::open_select_stream(
         read_env(ctx, &snapshot),
         *select,
-        Some(session.txn_writes()),
+        Some(pending.as_slice()),
         params,
     )
     .await
@@ -1537,7 +1682,13 @@ async fn execute_portal_inner(
         ))],
         // No-FROM expression select: no tables, no params. Evaluate and render.
         PreparedKind::Exprs(items) => {
-            match query::execute_scalar_select(&items, &ctx.default_schema) {
+            let snapshot = read_snapshot(ctx, session);
+            let pending = match session.materialized_txn_writes() {
+                Ok(pending) => pending,
+                Err(err) => return vec![session.fail(err)],
+            };
+            let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+            match query::execute_scalar_select(&items, scalar_ctx).await {
                 Ok(result) => {
                     let msgs = query::render_execute_result(Ok(result), &result_formats);
                     if matches!(msgs.first(), Some(BackendMessage::ErrorResponse { .. })) {
@@ -1662,9 +1813,10 @@ where
 /// buffers its DML and commits through the local MVCC manager. ROLLBACK discards
 /// the buffer. These tests do not establish cluster-wide commit ordering.
 #[cfg(test)]
-mod txn_atomicity_tests {
+pub(crate) mod txn_atomicity_tests {
     use super::*;
     use crate::extended::Session;
+    use ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN;
     use ferrosa_schema::{
         AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
         EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
@@ -1720,7 +1872,7 @@ mod txn_atomicity_tests {
         }
     }
 
-    fn superuser() -> AuthContext {
+    pub(crate) fn superuser() -> AuthContext {
         AuthContext {
             role: "cassandra".to_string(),
             is_superuser: true,
@@ -1830,7 +1982,7 @@ mod txn_atomicity_tests {
         }
     }
 
-    fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
+    pub(crate) fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
         QueryContext {
             engine,
             schema,
@@ -1843,12 +1995,137 @@ mod txn_atomicity_tests {
         }
     }
 
-    async fn make_ctx() -> (tempfile::TempDir, QueryContext) {
+    pub(crate) async fn make_ctx() -> (tempfile::TempDir, QueryContext) {
         let dir = tempfile::tempdir().unwrap();
         let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
         engine.register_table(kv_storage_schema()).unwrap();
         let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_kv()));
         (dir, ctx)
+    }
+
+    /// `make_ctx` for a table whose partition key is the synthetic `_sys_ck_` column —
+    /// the shape `ddl::plan_create_table` produces for a `CREATE TABLE` with no
+    /// `PRIMARY KEY`. `public.sk(_sys_ck_ uuid, v text)`, keyed on `_sys_ck_`. The key
+    /// column is invisible to the client, so every INSERT/COPY row must have one minted.
+    pub(crate) async fn make_ctx_synthetic_key() -> (tempfile::TempDir, QueryContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine
+            .register_table(synthetic_key_storage_schema())
+            .unwrap();
+        let ctx = ctx_with(Arc::new(engine), Arc::new(schema_with_synthetic_key()));
+        (dir, ctx)
+    }
+
+    fn synthetic_key_storage_schema() -> ferrosa_common::schema::TableSchema {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        TableSchema {
+            keyspace: "public".to_string(),
+            table: "sk".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UUIDType".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "v".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    /// `public.sk`, whose partition key is the synthetic `_sys_ck_` column of type `uuid`
+    /// — the shape `plan_create_table` produces for a PK-less table.
+    fn schema_with_synthetic_key() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        let mut cols = IndexMap::new();
+        cols.insert(
+            SYNTHETIC_KEY_COLUMN.to_string(),
+            column(SYNTHETIC_KEY_COLUMN, ColumnKind::PartitionKey, "uuid"),
+        );
+        cols.insert("v".to_string(), column("v", ColumnKind::Regular, "text"));
+        schema
+            .create_table(
+                TableMetadata {
+                    keyspace: "public".to_string(),
+                    name: "sk".to_string(),
+                    id: Uuid::new_v4(),
+                    columns: cols,
+                    partition_key: vec![SYNTHETIC_KEY_COLUMN.to_string()],
+                    clustering_key: vec![],
+                    params: TableParams::default(),
+                    flags: HashSet::new(),
+                    extensions: HashMap::new(),
+                    is_system: false,
+                },
+                &auth,
+            )
+            .expect("create table sk");
+        schema
+    }
+
+    /// Every DISTINCT synthetic key visible through `SELECT _sys_ck_ FROM sk`, as its
+    /// 16 raw bytes. The synthetic key is invisible to `SELECT *`; naming it returns it.
+    pub(crate) async fn synthetic_keys(ctx: &QueryContext) -> Vec<Vec<u8>> {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            "SELECT _sys_ck_ FROM sk",
+            &ctx.default_schema,
+            &ctx.jsonb_limits,
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "SELECT _sys_ck_ failed: {msgs:?}"
+        );
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(columns[0].clone().unwrap_or_default()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The `v` values visible through `SELECT v FROM sk`, in read order.
+    pub(crate) async fn synthetic_values(ctx: &QueryContext) -> Vec<String> {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            "SELECT v FROM sk",
+            &ctx.default_schema,
+            &ctx.jsonb_limits,
+            None,
+        )
+        .await;
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some(
+                    String::from_utf8_lossy(columns[0].as_deref().unwrap_or_default()).into_owned(),
+                ),
+                _ => None,
+            })
+            .collect()
     }
 
     /// `make_ctx` with hard write admission enabled, so a client can fill the
@@ -1869,7 +2146,7 @@ mod txn_atomicity_tests {
 
     /// Rows visible for key `k`, read back through the `execute_query` SELECT
     /// path with no transaction buffer.
-    async fn row_count(ctx: &QueryContext, key: &str) -> usize {
+    pub(crate) async fn row_count(ctx: &QueryContext, key: &str) -> usize {
         let msgs = query::execute_query(
             &ctx.engine,
             &ctx.schema,
@@ -1888,6 +2165,459 @@ mod txn_atomicity_tests {
         msgs.iter()
             .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
             .count()
+    }
+
+    /// The `(k, v)` CELL VALUES of every `kv` row with key `key`, read back through the
+    /// `execute_query` SELECT path. Asserts VALUES, not the count (a count passes a
+    /// write that landed only its first row).
+    async fn read_kv_values(
+        ctx: &QueryContext,
+        key: &str,
+    ) -> Vec<(Option<String>, Option<String>)> {
+        let msgs = query::execute_query(
+            &ctx.engine,
+            &ctx.schema,
+            &format!("SELECT k, v FROM kv WHERE k = '{key}'"),
+            &ctx.default_schema,
+            &ctx.jsonb_limits,
+            None,
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT for {key} failed: {msgs:?}"
+        );
+        let decode = |cell: Option<&Option<Vec<u8>>>| {
+            cell.and_then(|c| c.as_ref())
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        };
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => {
+                    Some((decode(columns.first()), decode(columns.get(1))))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// INVARIANT (transactionality): a multi-row INSERT buffered inside an explicit
+    /// transaction commits EVERY row, each with its own values — ONE statement, ONE
+    /// commit.
+    ///
+    /// This is how the server reaches a multi-row INSERT (`Some(txn_writes_mut())`),
+    /// buffered as a write-set and applied atomically at COMMIT. The rows must be
+    /// invisible until COMMIT, then ALL readable with their own values.
+    #[tokio::test]
+    async fn a_multi_row_insert_in_a_committed_transaction_writes_every_row() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('t1', 'one'), ('t2', 'two'), ('t3', 'three')",
+        )
+        .await;
+        assert_eq!(
+            command_tag(&m).as_deref(),
+            Some("INSERT 0 3"),
+            "a buffered multi-row INSERT acks the STATEMENT count: {m:?}"
+        );
+        for key in ["t1", "t2", "t3"] {
+            assert!(
+                read_kv_values(&ctx, key).await.is_empty(),
+                "row {key} must NOT be in storage before COMMIT"
+            );
+        }
+
+        let m = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(command_tag(&m).as_deref(), Some("COMMIT"), "{m:?}");
+        for (key, val) in [("t1", "one"), ("t2", "two"), ("t3", "three")] {
+            assert_eq!(
+                read_kv_values(&ctx, key).await,
+                vec![(Some(key.to_string()), Some(val.to_string()))],
+                "row {key} must carry its own value {val} after COMMIT"
+            );
+        }
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// INVARIANT (transactionality + atomicity): a multi-row INSERT inside a transaction
+    /// that ROLLS BACK leaves NO row behind — the WHOLE statement is discarded, not one
+    /// row of it.
+    #[tokio::test]
+    async fn a_multi_row_insert_in_a_rolled_back_transaction_writes_nothing() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let m = execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('r1', 'one'), ('r2', 'two')",
+        )
+        .await;
+        assert_eq!(command_tag(&m).as_deref(), Some("INSERT 0 2"), "{m:?}");
+
+        let m = execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        assert_eq!(command_tag(&m).as_deref(), Some("ROLLBACK"), "{m:?}");
+        for key in ["r1", "r2"] {
+            assert!(
+                read_kv_values(&ctx, key).await.is_empty(),
+                "ROLLBACK must discard the whole statement — row {key} must be gone"
+            );
+        }
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// The SQLSTATE of the sole `ErrorResponse` in a reply, if any.
+    fn error_sqlstate(messages: &[BackendMessage]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::ErrorResponse { fields } => fields
+                .iter()
+                .find(|(k, _)| *k == b'C')
+                .map(|(_, v)| v.to_string()),
+            _ => None,
+        })
+    }
+
+    fn command_tag(messages: &[BackendMessage]) -> Option<String> {
+        messages.iter().find_map(|m| match m {
+            BackendMessage::CommandComplete { tag } => Some(tag.clone()),
+            _ => None,
+        })
+    }
+
+    /// `TRUNCATE` is a normal replicated WRITE of a table-level tombstone: the
+    /// row disappears immediately, and the mechanism is a tombstone written into
+    /// the table's own store — NOT a node-local `StorageEngine::truncate`, which
+    /// would leave no marker (and would empty only this replica).
+    #[tokio::test]
+    async fn truncate_writes_a_table_tombstone_not_a_local_truncate() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
+        // Logically immediate: the row is gone at once.
+        assert_eq!(row_count(&ctx, "k1").await, 0);
+
+        // The mechanism is a write: the reserved table-tombstone partition is
+        // present in the table's store with a non-LIVE deletion. A node-local
+        // `StorageEngine::truncate` empties the store and would leave no marker.
+        let table_id = ferrosa_storage::TableId::new("public", "kv");
+        let marker = ctx
+            .engine
+            .read_limited_rows(
+                &table_id,
+                &ferrosa_storage::table_tombstone::table_tombstone_key(),
+                0,
+            )
+            .expect("read the tombstone partition")
+            .expect("the table tombstone must have been written");
+        assert!(
+            !marker.deletion.is_live(),
+            "TRUNCATE must write a table tombstone, not empty a replica"
+        );
+
+        // A stale copy of the pre-truncate row, re-inserted at its ORIGINAL older
+        // timestamp (what a repair from a stale replica would do), stays invisible.
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        // The re-insert is newer than the tombstone, so it is NOT the stale-copy
+        // case; the storage-level no-resurrection test covers the older copy. Here
+        // we only pin that the newly written row is visible (property 4).
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+    }
+
+    /// A table that does not exist is `42P01`, and the truncate applies nothing.
+    #[tokio::test]
+    async fn truncate_of_a_missing_table_is_refused_42p01() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE nope").await;
+        assert_eq!(error_sqlstate(&messages).as_deref(), Some("42P01"));
+    }
+
+    /// In CLUSTER mode an autocommit `TRUNCATE` must be routed through the cluster
+    /// commit path — NOT applied to local storage directly.
+    ///
+    /// `TRUNCATE` is a replicated write; if it were omitted from the "data
+    /// statement" set it would never enter the implicit-transaction/Accord path
+    /// and the marker would be written locally only, so no cluster replication (and
+    /// no `ConsistencyLevel::All` commit) could ever govern it. This pins the
+    /// routing by asserting the tombstone reaches the committer, and that the
+    /// front-end did not write the marker to its own storage.
+    #[tokio::test]
+    async fn cluster_autocommit_truncate_is_routed_through_the_cluster_not_local_only() {
+        let (_dir, mut ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+
+        let committer =
+            std::sync::Arc::new(ferrosa_storage::accord::MockTransactionCommitter::new());
+        ctx.accord = AccordAccess::fixed(committer.clone());
+
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
+
+        // The tombstone reached the cluster committer: an autocommit TRUNCATE is
+        // wrapped in an implicit transaction and committed via the cluster path.
+        let tombstone_key = ferrosa_storage::table_tombstone::table_tombstone_key()
+            .key
+            .as_bytes()
+            .to_vec();
+        let routed = committer
+            .committed()
+            .iter()
+            .flatten()
+            .any(|w| w.key == tombstone_key);
+        assert!(
+            routed,
+            "an autocommit TRUNCATE on a cluster must commit through the cluster \
+             (its tombstone must reach the committer), not write local-only"
+        );
+
+        // And the front-end did NOT apply the marker to its own storage — the
+        // write is the cluster's to replicate and apply.
+        let table_id = ferrosa_storage::TableId::new("public", "kv");
+        let local_marker = ctx
+            .engine
+            .read_limited_rows(
+                &table_id,
+                &ferrosa_storage::table_tombstone::table_tombstone_key(),
+                0,
+            )
+            .expect("read the tombstone partition");
+        assert!(
+            local_marker.is_none(),
+            "with a committer present the front-end must not apply the truncate \
+             marker locally; that would bypass cluster replication"
+        );
+    }
+
+    /// TRUNCATE is transactional: inside a transaction it is accepted (no `25001`),
+    /// applies on COMMIT, and is discarded by ROLLBACK.
+    #[tokio::test]
+    async fn truncate_applies_on_commit_and_is_discarded_by_rollback() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+
+        // Inside a transaction TRUNCATE is accepted.
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "TRUNCATE must be accepted inside a transaction now: {messages:?}"
+        );
+        // Buffered, not applied yet.
+        assert_eq!(row_count(&ctx, "k1").await, 1);
+        // ROLLBACK discards it.
+        execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            1,
+            "ROLLBACK must discard the buffered truncate"
+        );
+
+        // COMMIT applies it.
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(&ctx, &mut session, "TRUNCATE TABLE kv").await;
+        execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            0,
+            "COMMIT must apply the buffered truncate"
+        );
+    }
+
+    /// A PK-less table keys on the invisible synthetic `_sys_ck_` uuid. `TRUNCATE`
+    /// buffers a table-level tombstone under a RESERVED partition key — a
+    /// partition-tombstone MARKER, not a row — and building a transaction's row
+    /// images must skip it. Before the fix, COMMIT decoded the marker's magic bytes
+    /// as `_sys_ck_` (a uuid) and failed loud (`build transaction row image failed:
+    /// uuid requires 16 bytes`), losing the whole transaction. This is the exact
+    /// shape `pgbench -i` hits: it runs `TRUNCATE` INSIDE the load transaction, so
+    /// the deployed load died at COMMIT even though every row had landed. The `kv`
+    /// test above could not see this because a `text` key accepts any bytes.
+    #[tokio::test]
+    async fn truncate_inside_a_transaction_commits_on_a_pkless_table() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('a')").await;
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('b')").await;
+        assert_eq!(synthetic_values(&ctx).await.len(), 2);
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "TRUNCATE is accepted inside a transaction: {messages:?}"
+        );
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "COMMIT must build row images for the transaction's ROWS, never for the \
+             reserved table-tombstone key: {messages:?}"
+        );
+        assert_eq!(command_tag(&messages).as_deref(), Some("COMMIT"));
+        assert!(
+            synthetic_values(&ctx).await.is_empty(),
+            "the buffered truncate must apply on COMMIT"
+        );
+    }
+
+    /// The same reserved tombstone key reaches the open transaction's READ overlay:
+    /// a SELECT in the transaction that buffered the TRUNCATE must not decode it as a
+    /// data row either. Before the fix this failed loud (`transaction overlay failed:
+    /// uuid requires 16 bytes`).
+    #[tokio::test]
+    async fn reading_inside_a_transaction_after_a_truncate_does_not_decode_the_tombstone() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('a')").await;
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        let messages = execute_simple(&ctx, &mut session, "SELECT v FROM sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "the transaction overlay must skip the reserved tombstone key: {messages:?}"
+        );
+        execute_simple(&ctx, &mut session, "COMMIT").await;
+    }
+
+    /// An autocommit `TRUNCATE` on a PK-less table is an implicit transaction and
+    /// takes the same row-image path; it must commit too. Before the fix it failed
+    /// with `write failed: invalid data: build transaction row image failed: uuid
+    /// requires 16 bytes`.
+    #[tokio::test]
+    async fn autocommit_truncate_on_a_pkless_table_commits() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "INSERT INTO sk (v) VALUES ('a')").await;
+
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "an autocommit TRUNCATE on a PK-less table must commit: {messages:?}"
+        );
+        assert_eq!(command_tag(&messages).as_deref(), Some("TRUNCATE TABLE"));
+        assert!(
+            synthetic_values(&ctx).await.is_empty(),
+            "the truncate applied"
+        );
+    }
+
+    /// A `TRUNCATE` inside a transaction must also commit when a table tombstone
+    /// already exists in storage (from an earlier commit): the BEFORE-image read the
+    /// commit performs must skip the reserved marker key too, not only the after-image
+    /// build. Otherwise a second truncate of the same PK-less table fails loud
+    /// (`read before image failed: uuid requires 16 bytes`).
+    #[tokio::test]
+    async fn truncate_inside_a_transaction_commits_when_a_tombstone_already_exists() {
+        let (_dir, ctx) = make_ctx_synthetic_key().await;
+        let mut session = Session::new(superuser());
+        // Autocommit: the marker lands in storage.
+        let messages = execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "first truncate: {messages:?}"
+        );
+
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(&ctx, &mut session, "TRUNCATE TABLE sk").await;
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert_eq!(
+            error_sqlstate(&messages),
+            None,
+            "a second truncate of the same PK-less table must commit: {messages:?}"
+        );
+    }
+
+    /// VACUUM / VACUUM FULL / VACUUM ANALYZE are accepted and answered with the tag a client
+    /// expects; the rows survive, because flushing and compacting is not destructive. ANALYZE
+    /// really is a no-op: no statistics are collected, and that is stated in the dispatch arm
+    /// rather than being hidden here.
+    #[tokio::test]
+    async fn vacuum_flushes_and_submits_compaction_without_touching_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('k1', 'v')",
+        )
+        .await;
+        for (sql, tag) in [
+            ("VACUUM", "VACUUM"),
+            ("VACUUM FULL", "VACUUM"),
+            ("VACUUM FULL ANALYZE", "VACUUM"),
+            ("VACUUM ANALYZE kv", "VACUUM"),
+            ("ANALYZE kv", "ANALYZE"),
+        ] {
+            let messages = execute_simple(&ctx, &mut session, sql).await;
+            assert_eq!(
+                error_sqlstate(&messages),
+                None,
+                "`{sql}` must succeed, got {messages:?}"
+            );
+            assert_eq!(command_tag(&messages).as_deref(), Some(tag), "`{sql}` tag");
+        }
+        assert_eq!(
+            row_count(&ctx, "k1").await,
+            1,
+            "VACUUM flushes and compacts; it must not drop a live row"
+        );
+    }
+
+    /// VACUUM resolves the table it names. Accept-and-report ignored the table entirely, so a
+    /// `VACUUM` against a relation that does not exist used to succeed; now it is refused, which
+    /// is the assertion that the statement executes rather than only answering.
+    #[tokio::test]
+    async fn vacuum_on_a_missing_table_is_refused() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(&ctx, &mut session, "VACUUM nope").await;
+        assert!(
+            format!("{messages:?}").contains("42P01"),
+            "VACUUM must resolve the relation it names; got {messages:?}"
+        );
     }
 
     /// At the suspended-portal limit, a fresh portal executed with `max_rows`
@@ -2165,9 +2895,9 @@ mod txn_atomicity_tests {
         let mut session = Session::new(superuser());
 
         // Fill the memtable with autocommit writes first. The transaction's own
-        // write-set is capped (`max_txn_writes` -> 53400), so the pressure has
-        // to be built outside the transaction, then the COMMIT's write is what
-        // crosses the admission threshold.
+        // write-set no longer refuses for size (a large one SPILLS), so the pressure
+        // is built outside the transaction, then the COMMIT's write is what crosses
+        // the admission threshold.
         let payload = "x".repeat(1024);
         let mut filled = false;
         for seq in 0..4096u32 {
@@ -2271,13 +3001,14 @@ mod txn_atomicity_tests {
         .await;
         let mutations: Vec<_> = writer
             .take_txn_writes()
+            .expect("drain the staged write-set")
             .into_iter()
             .map(|write| write.0)
             .collect();
         assert_eq!(mutations.len(), 2);
 
         let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
-        let metadata = serde_json::to_vec(&changes).unwrap();
+        let metadata = crate::row_change_codec::encode_partition(&changes).unwrap();
         let txn_id =
             ferrosa_common::accord::TxnId::new(1, ferrosa_common::accord::Timestamp::synthetic(21));
         let metadata_batch = [metadata];
@@ -2349,6 +3080,83 @@ mod txn_atomicity_tests {
             &metadata_batch,
         )
         .unwrap();
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// The cluster COMMIT now builds its Accord write-set in ONE streaming pass
+    /// (`prepare_accord_writes`) instead of a whole-table `Vec<RowChange>` plus a
+    /// `changes_by_partition` re-grouping. The output must be **identical** to the
+    /// old path, partition by partition: same write order, same storage bytes, and
+    /// the same JSON row-version metadata attached to each partition.
+    #[tokio::test]
+    async fn streaming_accord_writes_match_prepare_row_changes_per_partition() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut writer = Session::new(superuser());
+        execute_simple(&ctx, &mut writer, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        for i in 0..8 {
+            execute_simple(
+                &ctx,
+                &mut writer,
+                &format!("INSERT INTO kv (k, v) VALUES ('stream-{i}', 'v-{i}')"),
+            )
+            .await;
+        }
+        let mutations: Vec<_> = writer
+            .take_txn_writes()
+            .expect("drain the staged write-set")
+            .into_iter()
+            .map(|write| write.0)
+            .collect();
+        assert_eq!(mutations.len(), 8);
+
+        // Old path: whole-table row images, then grouped by partition bytes.
+        let changes = query::prepare_row_changes(&ctx.engine, &ctx.schema, &mutations).unwrap();
+        let mut by_partition: std::collections::HashMap<Vec<u8>, Vec<crate::mvcc::RowChange>> =
+            std::collections::HashMap::new();
+        for change in changes {
+            by_partition
+                .entry(change.partition_key.clone())
+                .or_default()
+                .push(change);
+        }
+
+        // New path: one streaming pass, no whole-table map.
+        let writes =
+            query::prepare_accord_writes_streaming(&ctx.engine, &ctx.schema, &mutations).unwrap();
+        assert_eq!(
+            writes.len(),
+            mutations.len(),
+            "one Accord write per buffered mutation, in order"
+        );
+
+        for (write, mutation) in writes.iter().zip(&mutations) {
+            let partition_key = mutation.key.key.as_bytes().to_vec();
+            assert_eq!(
+                write.key, partition_key,
+                "write order must follow mutation order"
+            );
+            let expected = by_partition
+                .get(&partition_key)
+                .expect("every buffered partition has a row-version entry");
+
+            let (storage, metadata) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
+                    .expect("the streaming path must emit a valid MVCC envelope");
+            let metadata = metadata.expect("a data row partition carries row-version metadata");
+            let got = crate::row_change_codec::decode_partition(metadata).unwrap();
+            assert_eq!(
+                &got, expected,
+                "per-partition row-version metadata must match the whole-table path"
+            );
+
+            let mut bytes = vec![0; mutation.serialized_size()];
+            mutation.serialize_into(&mut bytes);
+            assert_eq!(
+                storage,
+                bytes.as_slice(),
+                "the storage mutation must survive the streaming path unchanged"
+            );
+        }
         ctx.engine.shutdown().unwrap();
     }
 
@@ -2844,6 +3652,153 @@ mod txn_atomicity_tests {
         ctx.engine.shutdown().unwrap();
     }
 
+    // ---- `::` cast: pgbench's object-existence check (`$1::pg_catalog.regclass`) ----
+
+    /// pgbench -i's object-existence check, the exact statement and the exact
+    /// protocol (Parse → Bind → Execute) the server runs:
+    ///
+    /// ```text
+    /// SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass
+    /// ```
+    ///
+    /// with `$1` bound to a real relation name. Before `::` existed the lexer
+    /// refused the `:` with `bad token: :`. The cast must now resolve the name to
+    /// the relation's real `pg_class.oid` — the SAME OID `pg_class` projects — so the
+    /// `oid =` comparison matches and the query returns that relation's actual
+    /// `relkind` ('r' for an ordinary table), not merely "no error".
+    #[tokio::test]
+    async fn the_pgbench_object_existence_check_returns_the_real_relkind() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        assert!(matches!(
+            session.on_parse(
+                "exists".to_string(),
+                "SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass",
+                vec![],
+            ),
+            BackendMessage::ParseComplete
+        ));
+        assert!(matches!(
+            session.on_bind(
+                "p".to_string(),
+                "exists".to_string(),
+                &[],
+                &[Some(b"kv".to_vec())],
+                vec![],
+                &crate::jsonb_wire::test_limits(),
+            ),
+            BackendMessage::BindComplete
+        ));
+
+        let messages = execute_portal(&ctx, &mut session, "p").await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "the object-existence check must not error: {messages:?}"
+        );
+        assert_eq!(
+            read_first_text_column(&messages).as_deref(),
+            Some("r"),
+            "the cast resolved `kv` to its real oid, so pg_class returned its relkind"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// Negative control for the case above: an unresolvable relation name is an
+    /// ERROR (PostgreSQL `42P01`), never an empty result that a client would read
+    /// as "the object does not exist".
+    #[tokio::test]
+    async fn the_pgbench_object_existence_check_errors_on_an_unknown_relation() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        session.on_parse(
+            "exists".to_string(),
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass",
+            vec![],
+        );
+        session.on_bind(
+            "p".to_string(),
+            "exists".to_string(),
+            &[],
+            &[Some(b"no_such_relation".to_vec())],
+            vec![],
+            &crate::jsonb_wire::test_limits(),
+        );
+
+        let messages = execute_portal(&ctx, &mut session, "p").await;
+        assert!(
+            is_error(&messages, "42P01"),
+            "an unresolvable relation name must be undefined_table: {messages:?}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { .. })),
+            "and must not be an empty result that looks like success: {messages:?}"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// The `pg_catalog.pg_class` projection is served to the query path (the cast
+    /// test above depends on it): a plain simple query reads a relation's relkind
+    /// with no cast involved.
+    #[tokio::test]
+    async fn pg_catalog_pg_class_is_queryable_and_reports_relkind() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(
+            &ctx,
+            &mut session,
+            "SELECT relkind FROM pg_catalog.pg_class WHERE relname = 'kv'",
+        )
+        .await;
+        assert_eq!(read_first_text_column(&messages).as_deref(), Some("r"));
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// A select-list `::regclass` resolves the same way the WHERE one does:
+    /// `'kv'::regclass` yields the relation's `pg_class.oid` (as an integer).
+    #[tokio::test]
+    async fn a_scalar_regclass_cast_yields_the_relations_oid() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let messages = execute_simple(&ctx, &mut session, "SELECT 'kv'::regclass").await;
+        let expected = crate::catalog::resolve_regclass(&ctx.schema, "public", "kv")
+            .expect("kv resolves to its oid")
+            .to_string();
+        assert_eq!(
+            read_first_text_column(&messages).as_deref(),
+            Some(expected.as_str()),
+            "the scalar cast must resolve to the real oid, not be dropped"
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// A cast to a type ferrosa does not implement is refused BY NAME at parse
+    /// time (never accepted and ignored): the type as written is in the message.
+    #[tokio::test]
+    async fn a_cast_to_an_unsupported_type_is_refused_by_name() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let response = session.on_parse(
+            "bad".to_string(),
+            "SELECT relkind FROM pg_catalog.pg_class WHERE oid = $1::text",
+            vec![],
+        );
+        match response {
+            BackendMessage::ErrorResponse { fields } => {
+                assert_eq!(fields[1], (b'C', "0A000".to_string()));
+                assert!(
+                    fields[2].1.contains('`') && fields[2].1.contains("text"),
+                    "the refusal names the type: {fields:?}"
+                );
+            }
+            other => panic!("expected ErrorResponse, got {other:?}"),
+        }
+        ctx.engine.shutdown().unwrap();
+    }
+
     fn read_first_text_column(messages: &[BackendMessage]) -> Option<String> {
         messages.iter().find_map(|message| match message {
             BackendMessage::DataRow { columns } => columns
@@ -2852,5 +3807,270 @@ mod txn_atomicity_tests {
                 .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
             _ => None,
         })
+    }
+
+    /// Frame one frontend message exactly as a client would: a tag byte, a big-endian length
+    /// that includes the length word itself, then the body.
+    fn pg_frame(tag: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(5 + body.len());
+        out.push(tag);
+        out.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// A simple-query (`Q`) message carrying one NUL-terminated SQL string.
+    fn pg_query(sql: &str) -> Vec<u8> {
+        let mut body = sql.as_bytes().to_vec();
+        body.push(0);
+        pg_frame(b'Q', &body)
+    }
+
+    /// A `CopyData` (`d`) frame.
+    fn pg_copy_data(data: &[u8]) -> Vec<u8> {
+        pg_frame(b'd', data)
+    }
+
+    /// Drive a whole client byte stream through the REAL connection loop (`query_loop`) and
+    /// return everything the server wrote back, as text.
+    ///
+    /// This is the seam the `COPY` tests in `copy_stdin.rs` do NOT cross: they call
+    /// `copy_stdin::drive` directly. Only `query_loop` holds the fast-path gate that decides
+    /// whether a `COPY` statement is handed to `drive` at all, so only a test that runs through
+    /// here can prove the handshake actually happens.
+    async fn run_wire(ctx: &QueryContext, wire: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, mut server) = tokio::io::duplex(1 << 20);
+        // The pipe must hold the whole request plus the server's reply without a reader running.
+        client.write_all(wire).await.unwrap();
+
+        let mut frames = bytes::BytesMut::new();
+        let mut read_buf = vec![0u8; 1 << 16];
+        let auth = superuser();
+        query_loop(&mut server, &mut frames, ctx, auth, &mut read_buf)
+            .await
+            .expect("query_loop returns on Terminate or EOF");
+        // Close our end so the read below reaches EOF instead of blocking forever.
+        drop(server);
+
+        let mut reply = Vec::new();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), client.read(&mut buf))
+                .await
+            {
+                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(n)) => reply.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
+    /// Count the `CopyInResponse` frames in a server reply — the 8-byte ack `G`, length `7`,
+    /// format `0`, column count `0`. Counting the FRAME rather than the letter `G` is deliberate:
+    /// a payload line or a command tag may legitimately contain a `G`.
+    ///
+    /// The ack is the one and only cue for the client to start streaming, so a second one — a
+    /// stale copy carried into the tail write — re-cues a real client into copy mode.
+    fn copy_in_responses(text: &str) -> usize {
+        const FRAME: [u8; 8] = [b'G', 0, 0, 0, 7, 0, 0, 0];
+        text.as_bytes()
+            .windows(FRAME.len())
+            .filter(|window| *window == FRAME)
+            .count()
+    }
+
+    /// `pgbench -i` (client-side data generation) speaks the LEGACY libpq copy protocol: it sends
+    /// the copy rows, then the in-band end-of-data marker `\.` as a `CopyData` line, and only then
+    /// calls `PQendcopy`, which sends a `CopyDone`. A server that does not honor `\.` decodes it as
+    /// a bad payload (a lone `\` before `.` is an unknown escape) and the whole load fails.
+    ///
+    /// This drives the exact byte stream through `query_loop` and asserts the rows LAND.
+    #[tokio::test]
+    async fn pgbench_legacy_copy_end_marker_lands_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("copy kv from stdin with (freeze on)"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        // pgbench's `PQputline(con, "\\.\n")`.
+        wire.extend(pg_copy_data(b"\\.\n"));
+        // `PQendcopy` sends `CopyDone`.
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_frame(b'X', &[])); // Terminate
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.starts_with('G'),
+            "the COPY must be acknowledged with CopyInResponse first: {text:?}"
+        );
+        assert!(
+            text.contains("COPY 1"),
+            "the row before the `\\.` marker must be reported as loaded: {text:?}"
+        );
+        assert!(
+            !text.contains("22P04"),
+            "the `\\.` marker must not be decoded as a payload error: {text:?}"
+        );
+        assert!(
+            !text.contains("08P01"),
+            "the trailing CopyDone from PQendcopy must not be a protocol violation: {text:?}"
+        );
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "pgbench's legacy COPY is acknowledged exactly once: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "the row must have landed, not merely been acknowledged"
+        );
+    }
+
+    /// The fast-path gate in `query_loop` and the ordinary parser must agree on what a COPY
+    /// statement is. psql appends the statement terminator, so the wire text carries a trailing
+    /// `;`; the gate must still route it to `copy_stdin::drive`.
+    #[tokio::test]
+    async fn a_copy_statement_with_a_trailing_semicolon_still_enters_copy_mode() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("copy kv from stdin;"));
+        wire.extend(pg_copy_data(b"z\tq\n"));
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_frame(b'X', &[]));
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.starts_with('G'),
+            "a trailing `;` must still open COPY mode: {text:?}"
+        );
+        assert!(text.contains("COPY 1"), "the row is counted: {text:?}");
+        assert_eq!(row_count(&ctx, "z").await, 1, "the row must have landed");
+    }
+
+    /// `pgbench -i` wraps its whole data load in `begin` → 3× `COPY` → `commit`. The
+    /// SAME `COPY ... FROM STDIN` that works in autocommit must therefore also enter
+    /// COPY mode when a transaction block is open. The gate that decides this lives in
+    /// `query_loop` (the fast-path `COPY` check), NOT in `copy_stdin::drive`, so this
+    /// test drives the whole `BEGIN`/`Query(copy)`/`CopyData`/`CopyDone`/`COMMIT` byte
+    /// stream through `query_loop` — the seam the existing transactional COPY tests
+    /// (`run_copy_in`) bypass by calling `drive()` directly. That bypass is why a green
+    /// suite coexisted with a live `PQendcopy failed`.
+    ///
+    /// RED first: before the fix, the COPY's `Query` never reaches `drive`, the client's
+    /// payload arrives as stray frames, and the server answers `08P01` instead of
+    /// `CopyInResponse`. Asserting the rows LAND (read back) is the point: an
+    /// acknowledgement that drops the payload would also "not error".
+    #[tokio::test]
+    async fn copy_inside_a_transaction_over_the_wire_enters_copy_mode_and_lands_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("BEGIN"));
+        wire.extend(pg_query("copy kv from stdin"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        wire.extend(pg_frame(b'c', &[])); // CopyDone
+        wire.extend(pg_query("COMMIT"));
+        wire.extend(pg_frame(b'X', &[])); // Terminate
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.contains('G'),
+            "a COPY inside a transaction must still be acknowledged with \
+             CopyInResponse: {text:?}"
+        );
+        assert!(
+            !text.contains("08P01"),
+            "the payload must not be rejected as stray frames outside a COPY: {text:?}"
+        );
+        assert!(
+            text.contains("COPY 1"),
+            "the COPY still reports its own row count: {text:?}"
+        );
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "the COPY is acknowledged exactly once: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "the row must land after COMMIT — the whole point of the fix"
+        );
+    }
+
+    /// The ACID half, through the same `query_loop` seam: a COPY inside a transaction
+    /// whose `ROLLBACK` follows must leave NO rows. Without this, "it entered COPY mode"
+    /// could still mean a COPY that writes regardless of the block's outcome.
+    #[tokio::test]
+    async fn copy_inside_a_rolled_back_transaction_over_the_wire_leaves_no_rows() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("BEGIN"));
+        wire.extend(pg_query("copy kv from stdin"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_query("ROLLBACK"));
+        wire.extend(pg_frame(b'X', &[]));
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.contains("COPY 1"),
+            "the COPY itself succeeds inside the block: {text:?}"
+        );
+        assert!(
+            !text.contains("08P01"),
+            "no stray-frame rejection: {text:?}"
+        );
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "the COPY is acknowledged exactly once: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            0,
+            "ROLLBACK must discard the buffered COPY rows"
+        );
+    }
+
+    /// The legacy `\.` end-of-data marker must keep working when the COPY runs inside a
+    /// transaction too — `pgbench -i` sends it in exactly that shape.
+    #[tokio::test]
+    async fn copy_inside_a_transaction_honors_the_legacy_marker() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut wire = Vec::new();
+        wire.extend(pg_query("BEGIN"));
+        wire.extend(pg_query("copy kv from stdin with (freeze on)"));
+        wire.extend(pg_copy_data(b"a\tb\n"));
+        wire.extend(pg_copy_data(b"\\.\n"));
+        wire.extend(pg_frame(b'c', &[]));
+        wire.extend(pg_query("COMMIT"));
+        wire.extend(pg_frame(b'X', &[]));
+
+        let text = run_wire(&ctx, &wire).await;
+
+        assert!(
+            text.contains('G'),
+            "COPY mode must open inside the transaction: {text:?}"
+        );
+        assert!(
+            !text.contains("22P04"),
+            "the `\\.` marker must not be decoded as a payload error: {text:?}"
+        );
+        assert!(text.contains("COPY 1"), "the row is counted: {text:?}");
+        assert_eq!(
+            copy_in_responses(&text),
+            1,
+            "the COPY is acknowledged exactly once, marker and all: {text:?}"
+        );
+        assert_eq!(
+            row_count(&ctx, "a").await,
+            1,
+            "the row before the marker must land on COMMIT"
+        );
     }
 }

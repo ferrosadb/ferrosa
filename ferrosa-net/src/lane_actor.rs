@@ -50,8 +50,8 @@ use crate::message::Message;
 use crate::metrics;
 use crate::reconnect::{
     connect_once_cancelable, connect_with_retry_cancelable, dec_dormant_peer_count,
-    inc_dormant_peer_count, slow_retry_interval, spawn_alive_watcher, with_jitter, LaneState,
-    DORMANT_AFTER_EXHAUSTIONS,
+    inc_dormant_peer_count, lane_probe_timeout, slow_retry_interval, spawn_alive_watcher,
+    with_jitter, LaneAction, LaneHealth, LaneState, DORMANT_AFTER_EXHAUSTIONS,
 };
 use crate::rpc::client::RpcClient;
 use crate::task_pool::TaskPool;
@@ -130,6 +130,11 @@ pub(crate) enum LaneCommand {
     /// Trigger a slow-retry probe attempt.  Sent by the dormant wake-up task
     /// after sleeping for one jittered [`slow_retry_interval`].
     DormantProbe,
+    /// A lane health probe answered: the connection is alive after all, so the
+    /// peer is slow rather than gone and keeps its connection.
+    ProbeSucceeded,
+    /// A lane health probe timed out or failed: the connection is dead.
+    ProbeFailed,
     /// Query the current lane status.
     QueryStatus {
         reply: oneshot::Sender<LaneStatusReport>,
@@ -629,6 +634,10 @@ async fn lane_actor_loop(
     let mut in_flight_streams = 0usize;
     let mut pending_streams = VecDeque::new();
     let mut dispatch_retry_scheduled = false;
+    // Per-RPC outcomes fed back into connection health. A half-open socket has
+    // no clean close for the alive watcher to observe, so this is the only
+    // signal that the peer has stopped answering.
+    let mut health = LaneHealth::default();
 
     // The node this lane was opened to. Every later reconnect must reach the
     // same node: a different one that took over the address (container IP
@@ -746,7 +755,15 @@ async fn lane_actor_loop(
             }
             LaneCommand::SendComplete { result, reply } => {
                 in_flight_streams = in_flight_streams.saturating_sub(1);
+                let action = note_lane_outcome(&mut health, &result, lane, &ctx.peer_host);
                 let _ = reply.send(result);
+                match action {
+                    LaneAction::Probe => spawn_lane_probe(&ctx),
+                    LaneAction::Reconnect => {
+                        begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host)
+                    }
+                    LaneAction::None => {}
+                }
                 dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
@@ -759,7 +776,15 @@ async fn lane_actor_loop(
             }
             LaneCommand::FireComplete { result, reply } => {
                 in_flight_streams = in_flight_streams.saturating_sub(1);
+                let action = note_lane_outcome(&mut health, &result, lane, &ctx.peer_host);
                 let _ = reply.send(result);
+                match action {
+                    LaneAction::Probe => spawn_lane_probe(&ctx),
+                    LaneAction::Reconnect => {
+                        begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host)
+                    }
+                    LaneAction::None => {}
+                }
                 dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
@@ -812,6 +837,7 @@ async fn lane_actor_loop(
                     }
                 }
                 identity_refusal_logged = false;
+                health.record_success(Instant::now());
                 if matches!(state, LaneState::Dormant) {
                     dec_dormant_peer_count();
                     tracing::info!(
@@ -845,16 +871,7 @@ async fn lane_actor_loop(
             }
             LaneCommand::ConnectionLost => {
                 if matches!(state, LaneState::Connected(_)) {
-                    tracing::warn!(
-                        ?lane,
-                        peer = %ctx.peer_host,
-                        "lane connection lost; entering reconnecting state"
-                    );
-                    state = LaneState::Reconnecting {
-                        attempt: 0,
-                        exhaustion_count: 0,
-                    };
-                    fail_pending_streams_reconnecting(&mut pending_streams);
+                    begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host);
                 }
             }
             LaneCommand::MarkFailed { exhaustion_count } => {
@@ -950,6 +967,28 @@ async fn lane_actor_loop(
                         }
                     }
                 });
+            }
+            LaneCommand::ProbeSucceeded => {
+                if health.is_probing() {
+                    health.record_success(Instant::now());
+                    tracing::info!(
+                        ?lane,
+                        peer = %ctx.peer_host,
+                        "lane probe succeeded; keeping the connection — the peer is slow, not gone"
+                    );
+                }
+            }
+            LaneCommand::ProbeFailed => {
+                if health.probe_failed() == LaneAction::Reconnect {
+                    tracing::warn!(
+                        ?lane,
+                        peer = %ctx.peer_host,
+                        "lane probe failed; the peer is unreachable, reconnecting"
+                    );
+                    if matches!(state, LaneState::Connected(_)) {
+                        begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host);
+                    }
+                }
             }
             LaneCommand::QueryStatus { reply } => {
                 let report = match &state {
@@ -1102,6 +1141,86 @@ fn schedule_dispatch_retry(ctx: &ActorReconnectContext) {
         tokio::time::sleep(DATA_LANE_CAP_RETRY_DELAY).await;
         let _ = tx.send(LaneCommand::DispatchPending).await;
     });
+}
+
+/// Feed one RPC outcome into the lane's health.
+///
+/// Logs on the condemning edge only — one line per wedged connection, never one
+/// per failing request.
+fn note_lane_outcome<T>(
+    health: &mut LaneHealth,
+    result: &Result<T>,
+    lane: Lane,
+    peer: &str,
+) -> LaneAction {
+    if result.is_ok() {
+        health.record_success(Instant::now());
+        return LaneAction::None;
+    }
+    let action = health.record_failure(Instant::now());
+    if action == LaneAction::Probe {
+        tracing::warn!(
+            ?lane,
+            peer = %peer,
+            "lane failing repeatedly within the window; probing the connection before declaring \
+             it dead — a half-open socket never signals its own death, so the alive watcher \
+             cannot fire and every RPC would otherwise time out forever"
+        );
+    }
+    action
+}
+
+/// Probe a suspected lane on its existing connection.
+///
+/// The probe travels the lane's normal send path, so it exercises exactly the
+/// path the timeouts came from. Its result is fed back to the actor, which
+/// decides whether to keep the connection or hand the lane to the ladder.
+fn spawn_lane_probe(ctx: &ActorReconnectContext) {
+    let handle = ctx.handle.clone();
+    let tx = ctx.handle.tx.clone();
+    let cancelled = Arc::clone(&ctx.cancelled);
+    ctx.task_pool.spawn(async move {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        let probe = Message::Ping {
+            nonce: 0,
+            sent_at: 0,
+        };
+        let outcome = handle.send(probe, Some(lane_probe_timeout())).await;
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        let cmd = if outcome.is_ok() {
+            LaneCommand::ProbeSucceeded
+        } else {
+            LaneCommand::ProbeFailed
+        };
+        let _ = tx.send(cmd).await;
+    });
+}
+
+/// Move a connected lane to `Reconnecting` and fail its queued work.
+///
+/// Shared by the alive watcher (`ConnectionLost`) and the consecutive-failure
+/// path, so a wedged lane enters exactly the same backoff/dormant ladder a clean
+/// close would have taken it into.
+fn begin_reconnect(
+    state: &mut LaneState,
+    pending_streams: &mut VecDeque<PendingLaneCommand>,
+    lane: Lane,
+    peer: &str,
+) {
+    tracing::warn!(
+        ?lane,
+        peer = %peer,
+        "lane connection lost; entering reconnecting state"
+    );
+    *state = LaneState::Reconnecting {
+        attempt: 0,
+        exhaustion_count: 0,
+    };
+    fail_pending_streams_reconnecting(pending_streams);
 }
 
 fn fail_pending_streams_reconnecting(pending_streams: &mut VecDeque<PendingLaneCommand>) {
@@ -1387,5 +1506,164 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Half-open lane detection
+    //
+    // A half-open connection produces no clean close, so the alive watcher never
+    // fires and the lane stays `Connected` while every RPC times out. Per-RPC
+    // timeouts therefore have to feed back into lane health. The policy is a pure
+    // value so it is testable without sockets; the actor loop only performs the
+    // action the value names.
+    //
+    // A wedged lane is PROBED before it is disconnected: a peer that is merely
+    // slow (a GC pause, host contention) answers the probe and keeps its
+    // connection. Only a probe that fails condemns the lane.
+    // -----------------------------------------------------------------------
+
+    /// A synthetic, strictly increasing clock. The policy must not read the wall
+    /// clock itself, or its window behaviour could not be tested.
+    fn at(ms: u64) -> Instant {
+        Instant::now() + Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn lane_health_below_threshold_takes_no_action() {
+        let mut h = LaneHealth::new(3, Duration::from_secs(30));
+        assert_eq!(h.record_failure(at(0)), LaneAction::None);
+        assert_eq!(h.record_failure(at(1)), LaneAction::None);
+        assert!(!h.is_probing());
+        assert!(!h.is_condemned());
+    }
+
+    #[test]
+    fn lane_health_probes_before_declaring_the_lane_dead() {
+        let mut h = LaneHealth::new(2, Duration::from_secs(30));
+        assert_eq!(h.record_failure(at(0)), LaneAction::None);
+        assert_eq!(
+            h.record_failure(at(1)),
+            LaneAction::Probe,
+            "a suspected lane must be probed, not disconnected on suspicion"
+        );
+        assert!(h.is_probing());
+        assert!(
+            !h.is_condemned(),
+            "the lane is not dead until the probe fails"
+        );
+    }
+
+    #[test]
+    fn lane_health_probe_failure_condemns_the_lane() {
+        let mut h = LaneHealth::new(2, Duration::from_secs(30));
+        h.record_failure(at(0));
+        h.record_failure(at(1));
+        assert_eq!(
+            h.probe_failed(),
+            LaneAction::Reconnect,
+            "a peer that fails the probe is unreachable; hand it to the ladder"
+        );
+        assert!(h.is_condemned());
+    }
+
+    #[test]
+    fn lane_health_probe_success_keeps_a_slow_peer() {
+        let mut h = LaneHealth::new(2, Duration::from_secs(30));
+        h.record_failure(at(0));
+        h.record_failure(at(1));
+        h.record_success(at(2));
+        assert!(!h.is_condemned(), "the peer answered: slow, not gone");
+        assert!(!h.is_probing());
+        assert_eq!(
+            h.record_failure(at(3)),
+            LaneAction::None,
+            "the counter is re-armed and needs the full threshold again"
+        );
+    }
+
+    #[test]
+    fn lane_health_never_re_probes_or_re_reconnects() {
+        let mut h = LaneHealth::new(1, Duration::from_secs(30));
+        assert_eq!(h.record_failure(at(0)), LaneAction::Probe);
+        for ms in 1..10 {
+            assert_eq!(
+                h.record_failure(at(ms)),
+                LaneAction::None,
+                "a probe is already in flight; starting another would multiply dials"
+            );
+        }
+        assert_eq!(h.probe_failed(), LaneAction::Reconnect);
+        for ms in 10..20 {
+            assert_eq!(
+                h.record_failure(at(ms)),
+                LaneAction::None,
+                "a reconnect is already running; the ladder owns the next move"
+            );
+        }
+        assert_eq!(
+            h.probe_failed(),
+            LaneAction::None,
+            "a stale probe result must not re-condemn the lane"
+        );
+    }
+
+    #[test]
+    fn lane_health_success_clears_the_run() {
+        let mut h = LaneHealth::new(3, Duration::from_secs(30));
+        h.record_failure(at(0));
+        h.record_failure(at(1));
+        h.record_success(at(2));
+        assert_eq!(
+            h.record_failure(at(3)),
+            LaneAction::None,
+            "only CONSECUTIVE failures count toward the threshold"
+        );
+    }
+
+    #[test]
+    fn lane_health_interleaved_successes_never_probe() {
+        let mut h = LaneHealth::new(3, Duration::from_secs(30));
+        for i in 0..10u64 {
+            h.record_failure(at(i * 3));
+            h.record_failure(at(i * 3 + 1));
+            h.record_success(at(i * 3 + 2));
+            assert!(
+                !h.is_probing(),
+                "a lane that answers between failures is slow, not dead"
+            );
+        }
+    }
+
+    #[test]
+    fn lane_health_failures_outside_the_window_do_not_accumulate() {
+        let mut h = LaneHealth::new(3, Duration::from_secs(10));
+        assert_eq!(h.record_failure(at(0)), LaneAction::None);
+        // A trickle of timeouts minutes apart must never add up to a wedged lane.
+        assert_eq!(h.record_failure(at(60_000)), LaneAction::None);
+        assert_eq!(h.record_failure(at(120_000)), LaneAction::None);
+        assert!(!h.is_probing());
+    }
+
+    #[test]
+    fn lane_health_failures_inside_the_window_accumulate() {
+        let mut h = LaneHealth::new(3, Duration::from_secs(10));
+        assert_eq!(h.record_failure(at(0)), LaneAction::None);
+        assert_eq!(h.record_failure(at(1_000)), LaneAction::None);
+        assert_eq!(
+            h.record_failure(at(2_000)),
+            LaneAction::Probe,
+            "three failures inside the window are a wedged connection"
+        );
+    }
+
+    #[test]
+    fn lane_health_zero_window_means_no_time_limit() {
+        let mut h = LaneHealth::new(2, Duration::ZERO);
+        assert_eq!(h.record_failure(at(0)), LaneAction::None);
+        assert_eq!(
+            h.record_failure(at(3_600_000)),
+            LaneAction::Probe,
+            "a zero window must not permanently disarm the guard"
+        );
     }
 }

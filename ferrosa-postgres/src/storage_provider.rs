@@ -248,6 +248,64 @@ fn storage_to_table_indices(meta: &TableMetadata) -> Vec<usize> {
     pairs.into_iter().map(|(_, table_idx)| table_idx).collect()
 }
 
+/// The per-table decode projections a row image needs — computed **once** per
+/// table for a commit, not once per row.
+///
+/// `read_row_image` used to rebuild every one of these on each call: the
+/// declared column names, the per-column CQL types (each a keyspace-scoped
+/// parse), the partition/clustering key indices, and the storage-ordinal ->
+/// declared-index map. A transactional `COPY` calls it once per row, so a
+/// 1.1M-row load rebuilt data that cannot change within one COMMIT ~1.1M times —
+/// an O(rows x columns) cost where O(columns) suffices. The projections are a
+/// pure function of the registered table schema, so hoisting them is
+/// behaviour-preserving. This is the "the allocations themselves are the
+/// defect" rule applied to the read path: remove the repeated allocation rather
+/// than shrink the schema.
+pub(crate) struct TableCodec {
+    /// Declared column names, in declared order.
+    names: Vec<String>,
+    /// Parsed CQL type per declared column, in declared order.
+    types: Vec<CqlType>,
+    /// Declared-index positions of the partition key, in key order.
+    pk: Vec<usize>,
+    /// Declared-index positions of the clustering key, in clustering order.
+    ck: Vec<usize>,
+    /// Storage ordinal -> declared-index map for regular/static columns.
+    storage_to_table: Vec<usize>,
+}
+
+impl TableCodec {
+    /// Build the projections for `keyspace.table`. Fails loud if the table is
+    /// not registered or a column type cannot be parsed in its keyspace.
+    pub(crate) fn build(keyspace: &str, table: &str, schema: &Schema) -> Result<Self, String> {
+        let snapshot = schema.snapshot();
+        let meta = snapshot
+            .tables
+            .get(&(keyspace.to_string(), table.to_string()))
+            .ok_or_else(|| format!("table {keyspace}.{table} is not registered"))?;
+        let names: Vec<String> = meta.columns.keys().cloned().collect();
+        let types = meta
+            .columns
+            .values()
+            .map(|column| {
+                ferrosa_row_bridge::parse_cql_type_in_keyspace(
+                    &column.column_type,
+                    keyspace,
+                    schema,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            names,
+            types,
+            pk: pk_indices(meta),
+            ck: ck_indices(meta),
+            storage_to_table: storage_to_table_indices(meta),
+        })
+    }
+}
+
 /// How many decoded rows may sit between the async producer and the sync
 /// consumer at once.
 ///
@@ -591,56 +649,110 @@ pub(crate) fn apply_pending_writes(
     overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
     writes: &[crate::mvcc::PgWrite],
 ) -> Result<(), String> {
-    apply_pending_writes_with_partition_keys(engine, schema, keyspace, table, overlay, writes, None)
+    let codec = TableCodec::build(keyspace, table, schema)?;
+    apply_pending_writes_with_partition_keys(
+        engine,
+        &codec,
+        keyspace,
+        table,
+        overlay,
+        writes.iter().map(|w| &w.0),
+        ApplyOutputs::default(),
+    )
 }
 
-pub(crate) fn apply_pending_writes_with_partition_keys(
+///
+/// `writes` is an iterator of `&Mutation` (not `&[PgWrite]`) so a caller that
+/// already owns the mutations — the transactional-`COPY` commit's
+/// `prepare_row_changes` — does not have to CLONE the whole write-set into a
+/// throwaway `Vec<PgWrite>` first. That clone was a full extra copy of every
+/// buffered row (a megabyte-per-thousand-rows of pure waste on the commit's
+/// peak), since this function makes a single pass.
+///
+/// The per-table decode projections arrive as a prebuilt [`TableCodec`] rather
+/// than being rebuilt here, so a caller that visits many mutations of one table
+/// pays for them once.
+///
+/// `before_images`, when supplied, records the **storage** before-image of every
+/// key this call had to read (i.e. every key the transaction's overlay did not
+/// already hold). A streaming caller can then attach the correct before-image to
+/// each partition's row-version metadata without a second storage read — the
+/// commit path used to read every row twice for exactly this reason.
+/// Env-gated attribution counters for the commit path's per-row storage read.
+/// Temporary measurement scaffolding (see `FERROSA_PG_COMMIT_PROFILE`).
+pub(crate) static READ_IMAGE_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static READ_IMAGE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+fn commit_profile_enabled() -> bool {
+    std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some()
+}
+
+#[derive(Default)]
+pub(crate) struct ApplyOutputs<'a> {
+    /// Per-key partition bytes, when the caller needs them for the commit payload.
+    pub partition_keys: Option<&'a mut std::collections::HashMap<Vec<Value>, Vec<u8>>>,
+    /// Before-image of every key this call had to read from storage, so a streaming
+    /// caller can attach it to that partition's row-version metadata instead of
+    /// reading the row a second time.
+    pub before_images: Option<&'a mut std::collections::HashMap<Vec<Value>, Option<Row>>>,
+    /// Batch-prefetched storage before-images, keyed by SQL key, produced by
+    /// [`prefetch_before_images`] against ONE store-view snapshot.
+    ///
+    /// When an entry is present it is used instead of a per-row [`read_row_image`]
+    /// call: the value is the SAME pre-transaction storage image the per-row read
+    /// would return, so an absent entry means "not prefetched — read it now" while a
+    /// present `Some(None)` means "read, and there is no live row". That distinction
+    /// is what lets a batched prefetch stand in for the per-row read without changing
+    /// which keys see a before-image.
+    pub before_cache: Option<&'a std::collections::HashMap<Vec<Value>, Option<Row>>>,
+}
+
+pub(crate) fn apply_pending_writes_with_partition_keys<'a, I>(
     engine: &StorageEngine,
-    schema: &Schema,
+    codec: &TableCodec,
     keyspace: &str,
     table: &str,
     overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
-    writes: &[crate::mvcc::PgWrite],
-    mut partition_keys: Option<&mut std::collections::HashMap<Vec<Value>, Vec<u8>>>,
-) -> Result<(), String> {
-    let snapshot = schema.snapshot();
-    let meta = snapshot
-        .tables
-        .get(&(keyspace.to_string(), table.to_string()))
-        .ok_or_else(|| format!("table {keyspace}.{table} is not registered"))?;
-    let names: Vec<String> = meta.columns.keys().cloned().collect();
-    let types = meta
-        .columns
-        .values()
-        .map(|column| {
-            ferrosa_row_bridge::parse_cql_type_in_keyspace(&column.column_type, keyspace, schema)
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let pk = pk_indices(meta);
-    let ck = ck_indices(meta);
-    let storage_to_table = storage_to_table_indices(meta);
-
-    for write in writes {
-        let mutation = &write.0;
+    writes: I,
+    outputs: ApplyOutputs<'_>,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = &'a ferrosa_storage::Mutation>,
+{
+    let mut partition_keys = outputs.partition_keys;
+    let mut before_images = outputs.before_images;
+    let before_cache = outputs.before_cache;
+    for mutation in writes {
         if mutation.keyspace != keyspace || mutation.table != table {
             continue;
         }
-        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, pk.len());
+        // A whole-table tombstone (`TRUNCATE`) is buffered as a partition-tombstone
+        // MARKER under a RESERVED partition key, not as a data row: its key bytes are
+        // the marker magic, not a value of any key column. Decoding them as this
+        // table's declared key type is meaningless — for a length-constrained key (a
+        // PK-less table's synthetic `_sys_ck_` uuid, or an `int`) it fails loud and
+        // takes the whole statement or transaction with it. The marker carries no row
+        // image, so skip it here; the COMMIT path applies and replicates it itself
+        // (the cluster committer routes it to every serving node at CL=ALL).
+        if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
+            continue;
+        }
+        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, codec.pk.len());
         for mutation_row in &mutation.rows {
             let ck_parts =
-                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, ck.len());
-            let mut key = Vec::with_capacity(pk.len() + ck.len());
-            let mut values = vec![Value::Null; names.len()];
-            for (index, part) in pk.iter().zip(pk_parts.iter()) {
-                let cql = ferrosa_row_bridge::decode_value(&types[*index], part)
+                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, codec.ck.len());
+            let mut key = Vec::with_capacity(codec.pk.len() + codec.ck.len());
+            let mut values = vec![Value::Null; codec.names.len()];
+            for (index, part) in codec.pk.iter().zip(pk_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
                     .map_err(|error| error.to_string())?;
                 let value = cql_to_value(&cql)?;
                 key.push(value.clone());
                 values[*index] = value;
             }
-            for (index, part) in ck.iter().zip(ck_parts.iter()) {
-                let cql = ferrosa_row_bridge::decode_value(&types[*index], part)
+            for (index, part) in codec.ck.iter().zip(ck_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
                     .map_err(|error| error.to_string())?;
                 let value = cql_to_value(&cql)?;
                 key.push(value.clone());
@@ -652,9 +764,28 @@ pub(crate) fn apply_pending_writes_with_partition_keys(
 
             let base = if let Some(snapshot_row) = overlay.get(&key) {
                 snapshot_row.clone()
+            } else if let Some(cached) = before_cache.and_then(|cache| cache.get(&key)) {
+                // Prefetched batch before-image: byte-for-byte what the per-row
+                // read below would return, but resolved once per key across a whole
+                // window of mutations against one store view (see
+                // `prefetch_before_images`).
+                if let Some(before) = before_images.as_deref_mut() {
+                    before.insert(key.clone(), cached.clone());
+                }
+                cached.clone()
             } else {
-                read_row_image(engine, schema, mutation, &mutation_row.clustering)?
-                    .map(|(_, row)| row)
+                let started = commit_profile_enabled().then(std::time::Instant::now);
+                let image = read_row_image(engine, codec, mutation, &mutation_row.clustering)?
+                    .map(|(_, row)| row);
+                if let Some(started) = started {
+                    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                    READ_IMAGE_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    READ_IMAGE_NS.fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(before) = before_images.as_deref_mut() {
+                    before.insert(key.clone(), image.clone());
+                }
+                image
             };
             if let Some(base) = base {
                 values = base.0;
@@ -665,13 +796,14 @@ pub(crate) fn apply_pending_writes_with_partition_keys(
             }
             for (storage_index, cell) in &mutation_row.cells {
                 let storage_index = usize::from(*storage_index & 0x3fff);
-                let Some(table_index) = storage_to_table.get(storage_index).copied() else {
+                let Some(table_index) = codec.storage_to_table.get(storage_index).copied() else {
                     continue;
                 };
                 values[table_index] = match &cell.value {
                     Some(bytes) => {
-                        let cql = ferrosa_row_bridge::decode_value(&types[table_index], bytes)
-                            .map_err(|error| error.to_string())?;
+                        let cql =
+                            ferrosa_row_bridge::decode_value(&codec.types[table_index], bytes)
+                                .map_err(|error| error.to_string())?;
                         cql_to_value(&cql)?
                     }
                     None => Value::Null,
@@ -685,61 +817,47 @@ pub(crate) fn apply_pending_writes_with_partition_keys(
 
 /// Read one PostgreSQL row image by its storage partition and clustering key.
 /// Returns the SQL primary-key tuple with the decoded row for MVCC history.
+///
+/// The per-table projections come from a prebuilt [`TableCodec`]; hoisting them
+/// out of this call is what keeps a 1.1M-row commit from rebuilding the same
+/// schema projection once per row.
 pub(crate) fn read_row_image(
     engine: &StorageEngine,
-    schema: &Schema,
+    codec: &TableCodec,
     mutation: &ferrosa_storage::Mutation,
     clustering: &[u8],
 ) -> Result<Option<(Vec<Value>, Row)>, String> {
-    let snapshot = schema.snapshot();
-    let meta = snapshot
-        .tables
-        .get(&(mutation.keyspace.clone(), mutation.table.clone()))
-        .ok_or_else(|| {
-            format!(
-                "table {}.{} is not registered",
-                mutation.keyspace, mutation.table
-            )
-        })?;
-    let names: Vec<String> = meta.columns.keys().cloned().collect();
-    let types = meta
-        .columns
-        .values()
-        .map(|column| {
-            ferrosa_row_bridge::parse_cql_type_in_keyspace(
-                &column.column_type,
-                &mutation.keyspace,
-                schema,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
+    let table_id = TableId::new(&mutation.keyspace, &mutation.table);
+    let looked_up = engine
+        .read_clustering_row(&table_id, &mutation.key, clustering)
         .map_err(|error| error.to_string())?;
-    let pk = pk_indices(meta);
-    let ck = ck_indices(meta);
-    let storage_to_table = storage_to_table_indices(meta);
-    let Some(partition) = engine
-        .read_clustering_row(
-            &TableId::new(&mutation.keyspace, &mutation.table),
-            &mutation.key,
-            clustering,
-        )
-        .map_err(|error| error.to_string())?
-    else {
+    let Some(partition) = looked_up else {
         return Ok(None);
     };
+    partition_row_image(codec, &mutation.keyspace, &mutation.table, &partition)
+}
+
+/// Decode one storage [`Partition`](ferrosa_sstable::types::Partition) into a SQL
+/// primary-key tuple and the row image the MVCC history stores.
+///
+/// Shared by the per-row [`read_row_image`] and the batched
+/// [`prefetch_before_images`] so both produce byte-identical before-images — the
+/// batch path is a different read SHAPE, never a different answer.
+fn partition_row_image(
+    codec: &TableCodec,
+    keyspace: &str,
+    table: &str,
+    partition: &ferrosa_sstable::types::Partition,
+) -> Result<Option<(Vec<Value>, Row)>, String> {
     let rows = ferrosa_row_bridge::partition_to_rows_with_clustering(
-        &partition,
-        &names,
-        &types,
-        &pk,
-        &ck,
-        &storage_to_table,
+        partition,
+        &codec.names,
+        &codec.types,
+        &codec.pk,
+        &codec.ck,
+        &codec.storage_to_table,
     )
-    .map_err(|error| {
-        error
-            .in_table(format!("{}.{}", mutation.keyspace, mutation.table))
-            .to_string()
-    })?;
+    .map_err(|error| error.in_table(format!("{keyspace}.{table}")).to_string())?;
     let Some((_, cells)) = rows.into_iter().next() else {
         return Ok(None);
     };
@@ -750,12 +868,89 @@ pub(crate) fn read_row_image(
             None => Ok(Value::Null),
         })
         .collect::<Result<_, _>>()?;
-    let key = pk
+    let key = codec
+        .pk
         .iter()
-        .chain(ck.iter())
+        .chain(codec.ck.iter())
         .map(|index| values[*index].clone())
         .collect();
     Ok(Some((key, Row::new(values))))
+}
+
+/// Batch-prefetch the storage before-images a chunk of mutations will need, in ONE
+/// store-view snapshot, so the per-mutation overlay merge does not issue a point read
+/// per row.
+///
+/// The commit's before-image read is one point read of the PRE-transaction row for
+/// every key the transaction writes (the row-version metadata needs it). Issued one
+/// row at a time that pays the storage view/schema/tombstone fixed cost once per row;
+/// this resolves the whole chunk against one view and returns a `SQL key -> Option<Row>`
+/// map the caller hands back through [`ApplyOutputs::before_cache`].
+///
+/// Keys already present in `overlay` are skipped: the merge uses the overlay's
+/// accumulated row as its base and never reads storage for them. A key the overlay
+/// gains LATER — an earlier mutation in the same chunk wrote it — is read here anyway,
+/// which is harmless: the merge simply does not consult it.
+pub(crate) fn prefetch_before_images<'a, I>(
+    engine: &StorageEngine,
+    codec: &TableCodec,
+    keyspace: &str,
+    table: &str,
+    overlay: &std::collections::HashMap<Vec<Value>, Option<Row>>,
+    writes: I,
+) -> Result<std::collections::HashMap<Vec<Value>, Option<Row>>, String>
+where
+    I: IntoIterator<Item = &'a ferrosa_storage::Mutation>,
+{
+    let mut requests: Vec<(ferrosa_common::DecoratedKey, Vec<u8>)> = Vec::new();
+    let mut keys: Vec<Vec<Value>> = Vec::new();
+    for mutation in writes {
+        if mutation.keyspace != keyspace || mutation.table != table {
+            continue;
+        }
+        if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
+            continue;
+        }
+        let pk_parts = ferrosa_row_bridge::decode_pk(&mutation.key, codec.pk.len());
+        for mutation_row in &mutation.rows {
+            let ck_parts =
+                ferrosa_row_bridge::decode_clustering(&mutation_row.clustering, codec.ck.len());
+            let mut key = Vec::with_capacity(codec.pk.len() + codec.ck.len());
+            for (index, part) in codec.pk.iter().zip(pk_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
+                    .map_err(|error| error.to_string())?;
+                key.push(cql_to_value(&cql)?);
+            }
+            for (index, part) in codec.ck.iter().zip(ck_parts.iter()) {
+                let cql = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
+                    .map_err(|error| error.to_string())?;
+                key.push(cql_to_value(&cql)?);
+            }
+            if overlay.contains_key(&key) {
+                continue;
+            }
+            requests.push((mutation.key.clone(), mutation_row.clustering.clone()));
+            keys.push(key);
+        }
+    }
+    let mut cache = std::collections::HashMap::with_capacity(requests.len());
+    if requests.is_empty() {
+        return Ok(cache);
+    }
+    let table_id = TableId::new(keyspace, table);
+    let images = engine
+        .read_clustering_rows_batch(&table_id, &requests)
+        .map_err(|error| error.to_string())?;
+    for (key, partition) in keys.into_iter().zip(images) {
+        let image = match partition {
+            Some(partition) => {
+                partition_row_image(codec, keyspace, table, &partition)?.map(|(_, row)| row)
+            }
+            None => None,
+        };
+        cache.insert(key, image);
+    }
+    Ok(cache)
 }
 
 #[cfg(test)]
@@ -1379,6 +1574,214 @@ mod tests {
             0,
             "empty table yields zero rows"
         );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// OWED RED-FIRST GUARD for the batched before-image read landed in b9900eb3.
+    ///
+    /// That commit replaced a point read per row with one batched read per
+    /// 4096-mutation window (`prefetch_before_images` -> `read_clustering_rows_batch`)
+    /// and shipped WITHOUT the differential guard it owed. This is that guard.
+    ///
+    /// The SAME request set is driven through BOTH reads:
+    ///   * the PER-ROW path — `query::prepare_row_changes`, which calls
+    ///     `read_row_image` once per row; and
+    ///   * the BATCHED path — `query::prepare_accord_writes`, which resolves a whole
+    ///     4096-row window of before-images against ONE store view.
+    ///
+    /// Their per-partition row-version metadata must be byte-identical: batching is a
+    /// different read SHAPE, never a different ANSWER. The request set deliberately
+    /// includes a MISSING key (a mutation whose key has no live storage row, so its
+    /// before-image is `None`) and crosses the 4096-row window boundary
+    /// (4096 + 64 mutations), so the batching walks two windows and must carry no
+    /// overlay / before-cache state incorrectly across the seam.
+    #[test]
+    fn batched_before_images_match_per_row_across_a_chunk_boundary() {
+        /// The prefetch window `prepare_accord_writes` walks in
+        /// (`BEFORE_IMAGE_PREFETCH_CHUNK`). Hard-coded in the test on purpose: if the
+        /// production window moves, this guard must be revisited rather than silently
+        /// no longer crossing it.
+        const CHUNK_BOUNDARY: usize = 4096;
+        const TOTAL: usize = CHUNK_BOUNDARY + 64;
+        const SEEDED: usize = 8;
+        const TS: i64 = 5_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let tid = TableId::new("ks", "t");
+
+        // Seed a handful of PRE-EXISTING rows, so a few mutations have a live
+        // before-image while the rest are genuinely absent.
+        for i in 0..SEEDED {
+            let key = DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes()));
+            engine
+                .write(
+                    &tid,
+                    &key,
+                    storage_row(1, "old", 100 + i as i32, 1_000),
+                    1_000,
+                )
+                .unwrap();
+        }
+
+        // One mutation per distinct PK. The first SEEDED reuse the seeded keys (present
+        // before-image); the rest are MISSING (no storage row).
+        let mutations: Vec<ferrosa_storage::Mutation> = (0..TOTAL)
+            .map(|i| ferrosa_storage::Mutation {
+                mutation_id: [0x42u8; 16],
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key: DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes())),
+                rows: vec![storage_row(1, "new", i as i32, TS)],
+                timestamp: TS,
+            })
+            .collect();
+        assert!(
+            mutations.len() > CHUNK_BOUNDARY,
+            "the request set must cross the {CHUNK_BOUNDARY}-row prefetch window"
+        );
+
+        // Per-row oracle.
+        let changes = crate::query::prepare_row_changes(&engine, &schema, &mutations)
+            .expect("the per-row path must build row versions");
+        let mut by_partition: HashMap<Vec<u8>, Vec<crate::mvcc::RowChange>> = HashMap::new();
+        for change in changes {
+            by_partition
+                .entry(change.partition_key.clone())
+                .or_default()
+                .push(change);
+        }
+
+        // Batched path (4096-row prefetch windows).
+        let writes = crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations)
+            .expect("the batched path must build row versions");
+        assert_eq!(
+            writes.len(),
+            mutations.len(),
+            "one Accord write per mutation, in order"
+        );
+
+        let mut saw_present_before = false;
+        let mut saw_missing_before = false;
+        for (write, mutation) in writes.iter().zip(&mutations) {
+            let partition_key = mutation.key.key.as_bytes().to_vec();
+            assert_eq!(
+                write.key, partition_key,
+                "write order must follow mutation order"
+            );
+            let expected = by_partition
+                .get(&partition_key)
+                .expect("every mutation partition has a row-version entry");
+
+            let (storage, metadata) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
+                    .expect("the batched path must emit a valid MVCC envelope");
+            let metadata = metadata.expect("a data row carries row-version metadata");
+            let got = crate::row_change_codec::decode_partition(metadata).unwrap();
+            assert_eq!(
+                &got, expected,
+                "batched before-images must equal the per-row answer for {partition_key:?}"
+            );
+
+            saw_present_before |= got.iter().any(|change| change.before.is_some());
+            saw_missing_before |= got.iter().any(|change| change.before.is_none());
+
+            let mut bytes = vec![0; mutation.serialized_size()];
+            mutation.serialize_into(&mut bytes);
+            assert_eq!(
+                storage,
+                bytes.as_slice(),
+                "the storage mutation must survive the batched path unchanged"
+            );
+        }
+        assert!(
+            saw_present_before,
+            "the request set must include a PRESENT key (a live before-image)"
+        );
+        assert!(
+            saw_missing_before,
+            "the request set must include a MISSING key (an absent before-image)"
+        );
+
+        engine.shutdown().unwrap();
+    }
+
+    /// `prepare_accord_writes` must reuse ONE serialize buffer without ever letting a
+    /// previous, larger mutation's tail leak into a smaller frame, and must MOVE the
+    /// partition-key bytes out of the consumed mutation rather than copy them.
+    ///
+    /// The request set deliberately alternates LARGE → small → LARGE → small
+    /// serialized sizes: a buffer that only truncated (instead of clearing and
+    /// resizing to the exact `serialized_size`) would carry the predecessor's tail
+    /// into the short frame. Each emitted mutation is compared byte-for-byte against a
+    /// FRESH-buffer serialization of the same mutation, and each emitted key against
+    /// the `as_bytes().to_vec()` copy the old path made.
+    #[test]
+    fn prepare_accord_writes_reuses_one_buffer_without_leaking_a_stale_tail() {
+        const TS: i64 = 7_000;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+
+        let widths = [64usize, 1, 200, 2];
+        let mutations: Vec<ferrosa_storage::Mutation> = widths
+            .iter()
+            .enumerate()
+            .map(|(i, width)| ferrosa_storage::Mutation {
+                mutation_id: [0x5Au8; 16],
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key: DecoratedKey::new(PartitionKey::new(format!("k{i}").into_bytes())),
+                rows: vec![storage_row(1, &"n".repeat(*width), 100 + i as i32, TS)],
+                timestamp: TS,
+            })
+            .collect();
+
+        // Fresh-buffer oracle, and the copied-key oracle the moved path must match.
+        let fresh: Vec<Vec<u8>> = mutations
+            .iter()
+            .map(|mutation| {
+                let mut bytes = vec![0; mutation.serialized_size()];
+                mutation.serialize_into(&mut bytes);
+                bytes
+            })
+            .collect();
+        let expected_keys: Vec<Vec<u8>> = mutations
+            .iter()
+            .map(|mutation| mutation.key.key.as_bytes().to_vec())
+            .collect();
+        assert!(
+            fresh[0].len() != fresh[1].len() && fresh[2].len() != fresh[3].len(),
+            "the request set must vary in serialized size, else it proves nothing"
+        );
+
+        let writes = crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations)
+            .expect("the batched path builds row versions");
+        assert_eq!(writes.len(), widths.len());
+
+        for (index, write) in writes.iter().enumerate() {
+            assert_eq!(
+                write.key, expected_keys[index],
+                "the MOVED partition-key bytes must equal the copied path's bytes"
+            );
+            let (storage, metadata) =
+                ferrosa_storage::accord::decode_postgres_mvcc_mutation(&write.mutation)
+                    .expect("a valid MVCC envelope");
+            assert!(
+                metadata.is_some(),
+                "a written row carries row-version metadata"
+            );
+            assert_eq!(
+                storage, fresh[index],
+                "the reused buffer must serialize mutation {index} exactly as a fresh \
+                 one would (a stale tail from the previous mutation would show here)"
+            );
+        }
 
         engine.shutdown().unwrap();
     }

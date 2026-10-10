@@ -42,7 +42,11 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   Chunk/Heartbeat/Done frames are `is_ordered_stream_response`), Accord
   (incl. the additive multi-key `AccordPreAcceptV2` `0x7B` / `AccordApplyV2` `0x7C`
   codes — bincode is not self-describing, so multi-key transactions get new codes
-  rather than extending the single-key payloads), and bootstrap message types
+  rather than extending the single-key payloads — and the additive region-REFERENCE
+  Apply `AccordApplyV2Region` `0x7E`, whose body is a capnp index HEADER followed by
+  ONE contiguous region of write-set payload bytes addressed by `(offset, length)`
+  rather than inline; `encode_accord_apply_v2_region` /
+  `decode_accord_apply_v2_region`), and bootstrap message types
   (`MsgType` discriminants `0x01`..=`0x83`). Optional trailing fields decode to
   `None` on pre-extension peers for backward compatibility.
 - **PSK-HMAC handshake** (`handshake`) — `initiate_handshake` /
@@ -57,7 +61,14 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   0) and ignores ours. A feature that adds a message type or frame kind gates
   sending it on the peer's bit, because an older node drops the whole connection
   on an unknown type byte. Bits: `CAP_RPC_ERROR_REPLY` (1<<0) — the peer
-  understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_RESULT_CURSOR_PAGE`
+  understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_ACCORD_CAPNP` (1<<3) —
+  the peer decodes the capnproto Accord Apply frame (`AccordApplyV2Capnp`, `0x7D`),
+  so the coordinator sends it capnp and falls back to legacy bincode for any peer
+  that has not advertised the bit; `CAP_ACCORD_APPLY_REGION` (1<<4) — the peer
+  decodes the region-REFERENCE Apply frame (`AccordApplyV2Region`, `0x7E`), so the
+  coordinator prefers it (one bulk region instead of a capnp struct per entry) and
+  falls back to the inline capnp frame — then bincode — for any peer without the
+  bit; `CAP_RESULT_CURSOR_PAGE`
   `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
   phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).
   (1<<1) — the peer serves `ResultCursorPage` (`0x68`) /
@@ -160,7 +171,7 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
 |------|-------------------|
 | Framing | `InternodeCodec`, `Frame`, `FrameHeader`, `Lane`, `MsgType`, `TraceContext`, `WireFrameFormat`, `HEADER_SIZE` |
 | Messages | `Message`, `accord_messages::AccordMessageType` |
-| Cap'n Proto envelope | `CapnpEnvelope`, `encode_message_envelope`, `decode_message_envelope`, `negotiate_capnp_capabilities` |
+| Cap'n Proto envelope | `CapnpEnvelope`, `encode_message_envelope`, `decode_message_envelope`, `negotiate_capnp_capabilities`; Accord family: `AccordControlMessage`, `encode_accord_envelope`, `decode_accord_envelope`; PG MVCC row-version family (`PgMvccRowChanges`/`PgMvccRowChange`/`PgMvccRow`/`PgMvccValue`) consumed by `ferrosa-postgres`'s `row_change_codec` |
 | Handshake | `initiate_handshake`, `accept_handshake`, `compute_auth_token`, `verify_auth_token`, `HandshakePeer` |
 | Pool / lanes | `PriorityPool`, `LaneHandle`, `LaneOutcome`, `LaneStatusReport`, `spawn_lane_actor` |
 | RPC | `RpcServer`, `RpcClient`, `HandlerRegistry`, `RpcHandler`, `PeerId`, `InboundPeerCallback`, `RpcErrorReply`, `RemoteFailureKind`, `NetError::RemoteHandlerFailed` |

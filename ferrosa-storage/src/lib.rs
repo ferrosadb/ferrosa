@@ -63,11 +63,14 @@ mod static_column_flush_tests;
 pub mod store;
 pub mod subscription_observer;
 pub mod table_drops;
+pub mod table_tombstone;
 #[cfg(feature = "test-generators")]
 pub mod test_support;
 pub mod timeseries;
 pub mod upload;
 pub mod virtual_tables;
+pub mod write_set_spill;
+pub mod write_set_stage;
 
 pub use batchlog::{BatchlogConfig, BatchlogEntry, BatchlogManager};
 pub use cache::LocalCache;
@@ -101,6 +104,7 @@ pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,
 };
 pub use upload::{ObjectStoreConfig, UploadManager};
+pub use write_set_spill::{WriteSetSpill, WRITE_SET_SPILL_FLOOR_BYTES};
 
 /// Process-global span collector for tracing tests.
 ///

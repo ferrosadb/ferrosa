@@ -7,38 +7,74 @@
 //! data to which joiners and tracks completion via
 //! `BootstrapComplete` RPC acks.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use ferrosa_storage::engine::StorageEngine;
+use ferrosa_storage::TableId;
+
+use crate::streaming::StreamedMutation;
 
 use super::phase::{BootstrapError, BootstrapPhase};
 
-/// Small-table row fallback cap. Row fallback is only selected when no SSTable
-/// directories exist for the table; SSTable-backed tables must use bulk streaming
-/// or be left for retry/repair.
-pub const BOUNDED_ROW_FALLBACK_LIMIT: usize = 1_000;
+/// Stream every partition of `table_id`, one at a time, into per-owner batches.
+///
+/// The row fallback is NOT bounded by a partition count: the capped `read_range`
+/// this replaces silently dropped the tail of a table larger than the limit (no
+/// error, no truncated flag). The walk covers the merged memtable + SSTable view,
+/// so every partition is streamed while at most one is resident. Owner resolution
+/// is injected so the batching is testable without a live ring.
+pub fn stream_row_fallback_into(
+    engine: &StorageEngine,
+    table_id: &TableId,
+    keyspace: &str,
+    table: &str,
+    local_node_id: u64,
+    owner_of: impl Fn(i64) -> u64,
+) -> Result<HashMap<u64, Vec<StreamedMutation>>, String> {
+    let mut by_node: HashMap<u64, Vec<StreamedMutation>> = HashMap::new();
+    engine
+        .walk_token_range(table_id, i64::MIN, i64::MAX, |partition| {
+            let owner = owner_of(partition.key.token.0);
+            if owner != local_node_id {
+                match StreamedMutation::from_partition(keyspace, table, partition) {
+                    Ok(mutation) => by_node.entry(owner).or_default().push(mutation),
+                    Err(e) => {
+                        tracing::error!(
+                            %e,
+                            partition_key = ?partition.key,
+                            "bootstrap: failed to serialize partition, skipping partition (data loss avoided)"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(by_node)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableStreamPlanInput {
     pub sstable_dir_count: usize,
-    pub row_fallback_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableStreamPlan {
-    SstableBulk { sstable_dir_count: usize },
-    BoundedRows { limit: usize },
+    SstableBulk {
+        sstable_dir_count: usize,
+    },
+    /// No SSTable directories exist for the table, so its rows are streamed
+    /// partition by partition. There is no row cap: the fallback streams EVERY
+    /// partition (spilling from disk), so a table of any size is transferred in
+    /// full. The former `BoundedRows { limit }` silently dropped the tail of a
+    /// table larger than the limit.
+    StreamRows,
     RetryRequired,
 }
 
 impl TableStreamPlan {
     pub fn allows_row_materialization(self) -> bool {
-        matches!(self, Self::BoundedRows { .. })
-    }
-
-    pub fn row_materialization_limit(self) -> Option<usize> {
-        match self {
-            Self::BoundedRows { limit } => Some(limit),
-            Self::SstableBulk { .. } | Self::RetryRequired => None,
-        }
+        matches!(self, Self::StreamRows)
     }
 
     pub fn requires_retry(self) -> bool {
@@ -59,9 +95,7 @@ pub fn plan_table_stream(input: TableStreamPlanInput) -> TableStreamPlan {
             sstable_dir_count: input.sstable_dir_count,
         }
     } else {
-        TableStreamPlan::BoundedRows {
-            limit: input.row_fallback_limit,
-        }
+        TableStreamPlan::StreamRows
     }
 }
 
@@ -142,7 +176,6 @@ mod tests {
     fn sstable_backed_table_uses_sstable_stream_before_row_materialization() {
         let plan = plan_table_stream(TableStreamPlanInput {
             sstable_dir_count: 3,
-            row_fallback_limit: BOUNDED_ROW_FALLBACK_LIMIT,
         });
 
         assert_eq!(
@@ -172,16 +205,17 @@ mod tests {
         );
     }
 
+    /// A table with no SSTable directories streams EVERY row: the fallback is not
+    /// bounded by a partition count (the former 1_000-row `BoundedRows` cap
+    /// silently dropped the tail of a larger table).
     #[test]
-    fn small_table_row_fallback_is_partition_bounded() {
+    fn row_fallback_streams_every_partition() {
         let plan = plan_table_stream(TableStreamPlanInput {
             sstable_dir_count: 0,
-            row_fallback_limit: 64,
         });
 
-        assert_eq!(plan, TableStreamPlan::BoundedRows { limit: 64 });
+        assert_eq!(plan, TableStreamPlan::StreamRows);
         assert!(plan.allows_row_materialization());
-        assert_eq!(plan.row_materialization_limit(), Some(64));
     }
 
     #[test]
@@ -193,5 +227,88 @@ mod tests {
 
         assert_eq!(retry, TableStreamPlan::RetryRequired);
         assert!(retry.requires_retry());
+    }
+
+    use std::sync::Arc;
+
+    fn stream_test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
+        use ferrosa_storage::{CommitLogConfig, CompactionConfig, StorageEngineConfig};
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                log_dir: dir.to_path_buf(),
+                checkpoint_dir: dir.to_path_buf(),
+                archive: None,
+                ..CommitLogConfig::default()
+            },
+            compaction: CompactionConfig::from_env(dir.join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: u64::MAX,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            auth_enabled: false,
+            auth_warn: false,
+            write_verify: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
+        };
+        Arc::new(StorageEngine::new(config, None).unwrap())
+    }
+
+    fn register_stream_table(storage: &StorageEngine, ks: &str, tbl: &str) {
+        use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+        storage
+            .register_table(TableSchema {
+                keyspace: ks.to_string(),
+                table: tbl.to_string(),
+                key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                clustering_columns: vec![],
+                static_columns: vec![],
+                regular_columns: vec![ColumnDefinition {
+                    name: "val".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                }],
+                extensions: Default::default(),
+            })
+            .unwrap();
+    }
+
+    /// The bootstrap row fallback must stream EVERY partition, not stop at the
+    /// former 1_000-partition cap. RED before the fix: the capped read returned
+    /// 1_000 of 1_001, silently dropping the tail (no error, no truncated flag).
+    #[test]
+    fn row_fallback_streams_every_partition_past_the_former_cap() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = stream_test_storage(dir.path());
+        register_stream_table(&storage, "ks", "tbl");
+        let tid = TableId::new("ks", "tbl");
+
+        let total = 1_001usize; // one past the former 1_000 cap
+        for i in 0..total {
+            let key = DecoratedKey::new(PartitionKey::new((i as u64).to_be_bytes().to_vec()));
+            let row = Row {
+                clustering: vec![],
+                cells: vec![(0, CellValue::live(b"v".to_vec(), 1))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            };
+            storage
+                .apply_partition_parts(&tid, &key, DeletionTime::LIVE, None, std::iter::once(row))
+                .unwrap();
+        }
+
+        // Node 1 owns every partition; this node is 0, so all are streamed.
+        let by_node = stream_row_fallback_into(&storage, &tid, "ks", "tbl", 0, |_| 1).unwrap();
+        let streamed: usize = by_node.values().map(|v| v.len()).sum();
+        assert_eq!(
+            streamed, total,
+            "every partition must be streamed; the former 1_000-row cap dropped the tail"
+        );
     }
 }

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 doc: roadmap
-last_updated: 2026-09-15
+last_updated: 2026-10-09
 ---
 
 # ferrosa-sql — Roadmap
@@ -12,6 +12,84 @@ the `ferrosa-postgres` consumer needs. The engine is intentionally an M1 slice
 toward the Postgres queries real clients send.
 
 ## Now (highest value)
+
+- **(done) `::` cast (`expr::type_name`), sufficient for pgbench's object-existence
+  query.** `SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass`
+  is what `pgbench -i` runs to check whether a table exists; before this the lexer
+  had no token for `:` and the query died with `bad token: :`. The lexer now yields
+  ONE `Tok::Cast` for `::` (a lone `:` stays a loud `bad token: :`, mirroring the
+  `||`/`|` precedent). It is a POSTFIX operator — `oid = $1::regclass` is
+  `oid = ($1::regclass)`, and `'a' || 'b'::regclass` is `'a' || ('b'::regclass)` —
+  so it binds tighter than both the comparison operators and `||`; that precedence
+  is pinned by `the_pgbench_object_existence_query_parses_a_regclass_cast` and
+  `a_cast_binds_tighter_than_string_concatenation`. The name may be bare or
+  schema-qualified (`pg_catalog.regclass`), and the target is recorded as
+  `Term::Cast` / `ScalarValue::Cast` (`CastTarget`). The parser only *records* the
+  cast: its **semantics are the front end's** (`ferrosa-postgres::query::resolve_casts`
+  and `catalog::resolve_regclass`), because the `pg_class.oid` scheme is
+  PostgreSQL-specific and this crate owns no catalog. Only `regclass` is implemented.
+  **Refused by name, never accepted-and-ignored**: any other target is
+  `ParseError::UnsupportedCast(<type as written>)` (`0A000`), and the `CAST(x AS t)`
+  spelling is `ParseError::UnsupportedCastExpr` (`0A000`) rather than mis-parsed as a
+  column named `CAST` (a bare `cast` column is still allowed). A cast that reaches the
+  pure engine unrewritten is `ExecError::UnresolvedCast` (`0A000`), not a no-op.
+
+- **(done) Scalar subqueries `( SELECT ... )` in the no-`FROM` select list.** An
+  LParen followed by `SELECT` in `parse_scalar_primary` begins a scalar subquery
+  operand (`ScalarValue::Subquery`), closed by the matching RParen; the inner
+  select reuses the full table-`SELECT` grammar (`parse_select_stmt`). The
+  front end (`ferrosa-postgres::query::eval_scalar_subquery`) runs the inner query
+  and takes its single value with PostgreSQL `EXPR_SUBLINK` semantics: no rows ⇒
+  NULL (distinct from the empty string), more than one row ⇒ `21000`
+  `cardinality_violation`, more than one output column ⇒ `42601` refused *before*
+  any row. The subquery's column type is the inner query's single output column
+  type (so `count(*)` types as int), and `||` still coerces it to text. This is
+  what makes pgbench's census line
+  `select (select count(*) from pgbench_accounts)||'|'||…` evaluate. An LParen not
+  followed by `SELECT` (`SELECT (1)`) is still refused.
+
+  **NOT supported, and refused by name (`0A000`)**: `||` over a `FROM` relation
+  (`SELECT name || '!' FROM t`) and every other select-list expression form
+  (arithmetic, function calls over columns, `CASE`). A scalar subquery is only a
+  no-`FROM` select-list operand: it does not appear in a `FROM` relation's
+  projection, in `WHERE`/`HAVING`, in `VALUES`, or nested in another subquery's
+  projection, and those forms are refused at parse (or, in DML values, by
+  `substitute_param`). The reason is structural, not an omission: the planner's
+  projection is a `Vec<usize>` of column indices
+  (`plan.rs::simple_projection` + `exec::try_project`), not computed cells, so
+  expressions over a relation need a real select-list expression tree, a new
+  projection operator, an aggregate-mode `Slot` variant, authz walking, and a
+  `Value`-to-text renderer. `WHERE`/DML grammar untouched.
+- **(done) Parse the maintenance statements** (pgbench `-i`/reset). `TRUNCATE
+  [TABLE] t [, …]`, `VACUUM [FULL] [ANALYZE|ANALYSE] [t]` and `ANALYZE|ANALYSE
+  [t]` now parse to `Statement::{Truncate,Vacuum,Analyze}`; the Postgres front
+  end executes them (replicated `TRUNCATE`; `VACUUM` flushes and submits
+  compaction; `ANALYZE` is an accepted no-op).
+  `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused by name.
+
+- **(done) `COPY ... FROM STDIN` options, incl. pgbench's `FREEZE`.** The parenthesised option
+  list parses (`FORMAT`/`DELIMITER`/`NULL`/`HEADER` applied). `FREEZE [ON|OFF]` — a heap-page
+  concept an LSM cannot honour — is accepted-and-**recorded** (`CopyFromStdinStmt::freeze`), not
+  applied, which is what lets `pgbench -i` (PostgreSQL v14+ writes `with (freeze on)`) load its
+  tables. Every other option, a bad option *value*, and `COPY ... TO` are refused **by name** as
+  COPY refusals (`ParseError::UnsupportedCopy`) — no longer funnelled through `UnsupportedAlter`,
+  whose "ALTER TABLE form" wording now only ever describes an `ALTER TABLE`.
+
+- **(done) `FOREIGN KEY` / column `REFERENCES` grammar.** `[CONSTRAINT <name>]
+  FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]` (table level) and a column-level
+  `REFERENCES` parse into `ForeignKeyConstraint`, recorded on
+  `CreateTableStmt::foreign_keys` and `AlterOperation::AddForeignKey`; `ALTER TABLE …
+  ADD [CONSTRAINT <name>] FOREIGN KEY …` is accepted. The referenced-column list is
+  optional (`parent_columns: None` ⇒ the parent's primary key; the executor resolves it).
+  The grammar accepts only what the front end enforces — the default `NO ACTION` and
+  `RESTRICT` — and refuses `ON DELETE`/`ON UPDATE CASCADE`/`SET NULL`/`SET DEFAULT`,
+  `MATCH FULL`/`PARTIAL`, `DEFERRABLE`, `INITIALLY`, `NOT VALID` **by name**
+  (`ParseError::UnsupportedAlter`). `ALTER TABLE` has no `expect_end`, so the referential
+  tail must be validated explicitly; it is. The five statements `pgbench -i
+  --foreign-keys` emits are pinned by `the_five_pgbench_foreign_keys_parse`; ENFORCEMENT
+  (the index-backed child-side and parent-side checks) lives in `ferrosa-postgres`, which
+  enforces the `ALTER TABLE … ADD FOREIGN KEY` form and refuses a `CREATE TABLE`-time
+  `FOREIGN KEY` by name (`0A000`) rather than accept one it cannot enforce.
 
 - **(done) Stream the result to the wire** (FMEA SQL-12, `t_f348ba0b`).
   `execute_streaming` + `RowSink` deliver rows as the pipeline yields them and

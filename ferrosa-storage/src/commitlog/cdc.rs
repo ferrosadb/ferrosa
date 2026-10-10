@@ -366,8 +366,13 @@ impl CdcReader {
         let mut resident_bytes = 0usize;
         let mut high_water = self.position;
         while entries.len() < limit.get() {
-            let Some((mutation, position)) =
-                self.next_mutation_with_payload_limit(MAX_DURABLE_CDC_PAGE_BYTES)?
+            // Decode one event at a time and never refuse it for size: a single
+            // event larger than the page budget is delivered alone in its own
+            // page. The byte budget bounds how many events are batched together
+            // (a streaming buffer / backpressure), NOT which events can be
+            // delivered. Refusing an oversized event made a row over the budget
+            // permanently undeliverable by CDC.
+            let Some((mutation, position)) = self.next_mutation_with_payload_limit(usize::MAX)?
             else {
                 // The reader may have skipped filtered mutations after the last
                 // returned entry. Advancing across them avoids rescanning them
@@ -376,14 +381,6 @@ impl CdcReader {
                 break;
             };
             let mutation_bytes = mutation.serialized_size();
-            if mutation_bytes > MAX_DURABLE_CDC_PAGE_BYTES {
-                self.pending_entry = Some((mutation, position));
-                self.position = high_water;
-                return Err(CdcReplayError::EventTooLarge {
-                    bytes: mutation_bytes,
-                    maximum: MAX_DURABLE_CDC_PAGE_BYTES,
-                });
-            }
             if !entries.is_empty()
                 && resident_bytes.saturating_add(mutation_bytes) > MAX_DURABLE_CDC_PAGE_BYTES
             {
@@ -463,13 +460,15 @@ impl CdcReader {
                 .len();
             if self.position.offset < file_len {
                 let mut reader = SegmentReader::open(&path)?;
-                while let Some(entry) = reader.next_entry_bounded(MAX_DURABLE_CDC_PAGE_BYTES)? {
+                // This walk only validates a cursor boundary; it must not
+                // refuse an entry for size, so decode without a payload cap.
+                while let Some(entry) = reader.next_entry_bounded(usize::MAX)? {
                     let position = match entry {
                         SegmentEntryRead::Mutation(position, _mutation) => position,
                         SegmentEntryRead::PayloadTooLarge { bytes, .. } => {
                             return Err(CdcReplayError::EventTooLarge {
                                 bytes,
-                                maximum: MAX_DURABLE_CDC_PAGE_BYTES,
+                                maximum: usize::MAX,
                             });
                         }
                     };
@@ -858,7 +857,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_cdc_page_fails_loud_for_event_larger_than_byte_budget() {
+    fn durable_cdc_page_delivers_an_event_larger_than_byte_budget() {
         let dir = tempfile::tempdir().unwrap();
         let config = CommitLogConfig {
             segment_size: 4 * 1024 * 1024,
@@ -880,17 +879,15 @@ mod tests {
             None,
         )
         .unwrap();
-        let error = reader
-            .read_page(CdcPageLimit::new(1).unwrap())
-            .err()
-            .expect("oversized event must fail instead of being truncated or skipped");
-        assert!(matches!(
-            error,
-            CdcReplayError::EventTooLarge {
-                maximum: MAX_DURABLE_CDC_PAGE_BYTES,
-                ..
-            }
-        ));
+        // The oversized event is delivered ALONE in its own page, never refused:
+        // the byte budget bounds how many events are batched, not deliverability.
+        let page = reader.read_page(CdcPageLimit::new(1).unwrap()).unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].0.table, "oversized");
+        assert!(
+            page.entries[0].0.serialized_size() > MAX_DURABLE_CDC_PAGE_BYTES,
+            "the delivered event is genuinely larger than the page budget"
+        );
     }
 
     #[test]

@@ -24,6 +24,15 @@ pub struct PurgePolicy {
     /// The minimum timestamp of any data outside the compaction that could overlap:
     /// dropping a tombstone newer than that data would resurrect it.
     pub max_purgeable_timestamp: i64,
+    /// The table-level tombstone in force when this compaction was planned
+    /// (microseconds), or [`DeletionTime::LIVE`]. Compaction is where a truncated
+    /// table's rows are physically reclaimed: every merged partition adopts this
+    /// watermark before it is written out, so rows older than the truncate are
+    /// dropped. It is carried on the policy so the whole table is reclaimed by the
+    /// NEXT compaction of any of its data (the logical effect stays immediate
+    /// regardless — reads suppress immediately). The reserved table-tombstone
+    /// partition itself is exempt from purge (see `compaction::executor`).
+    pub table_delete: DeletionTime,
 }
 
 impl PurgePolicy {
@@ -79,10 +88,12 @@ pub fn policy_for(
     now_secs: i64,
     gc_grace_seconds: u32,
     max_purgeable_timestamp: i64,
+    table_delete: DeletionTime,
 ) -> PurgePolicy {
     PurgePolicy {
         gc_before: now_secs - i64::from(gc_grace_seconds),
         max_purgeable_timestamp,
+        table_delete,
     }
 }
 
@@ -211,6 +222,7 @@ mod tests {
         PurgePolicy {
             gc_before: GC_BEFORE,
             max_purgeable_timestamp,
+            table_delete: DeletionTime::LIVE,
         }
     }
 
@@ -425,12 +437,13 @@ mod tests {
 
     #[test]
     fn policy_for_puts_gc_before_a_grace_period_in_the_past() {
-        let p = policy_for(2_000_000_000, 864_000, 55);
+        let p = policy_for(2_000_000_000, 864_000, 55, DeletionTime::LIVE);
         assert_eq!(p.gc_before, 2_000_000_000 - 864_000);
         assert_eq!(p.max_purgeable_timestamp, 55);
+        assert!(p.table_delete.is_live());
         // A grace period longer than the clock does not wrap: nothing is old enough.
-        assert!(policy_for(100, u32::MAX, 55).gc_before < 0);
-        assert_eq!(policy_for(100, 0, 55).gc_before, 100);
+        assert!(policy_for(100, u32::MAX, 55, DeletionTime::LIVE).gc_before < 0);
+        assert_eq!(policy_for(100, 0, 55, DeletionTime::LIVE).gc_before, 100);
     }
 
     #[test]
