@@ -70,6 +70,7 @@ pub mod timeseries;
 pub mod upload;
 pub mod virtual_tables;
 pub mod write_set_spill;
+pub mod write_set_stage;
 
 pub use batchlog::{BatchlogConfig, BatchlogEntry, BatchlogManager};
 pub use cache::LocalCache;

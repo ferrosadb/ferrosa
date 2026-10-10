@@ -63,6 +63,12 @@ use crate::engine::TempSortTableReservation;
 
 /// Payload bytes at or above which the write-set payloads are staged on disk.
 ///
+/// This is the DEFAULT resident buffer size for a write-set spill. It is a
+/// streaming BUFFER SIZE, not a cap: a write-set larger than it is staged, never
+/// refused. Override it at runtime with
+/// [`crate::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV`]
+/// (`FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`).
+///
 /// Not [`crate::spill_budget::process_spill_threshold_bytes`]: that is a fraction of
 /// the process memory budget (default 50%), which on a 4 GB node is ~2 GB — far above
 /// the write-set a single transaction materializes and far above what a 4 GB node can
@@ -106,8 +112,18 @@ impl std::fmt::Debug for WriteSetSpill {
 
 impl WriteSetSpill {
     /// Whether a write-set of `total_bytes` payload should be staged on disk.
+    ///
+    /// The threshold is the runtime-tunable
+    /// [`crate::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV`], defaulting to
+    /// [`WRITE_SET_SPILL_FLOOR_BYTES`]. This is a streaming BUFFER SIZE, never a
+    /// cap: a larger write-set is staged, not refused.
     pub fn should_stage(total_bytes: u64) -> bool {
-        total_bytes >= WRITE_SET_SPILL_FLOOR_BYTES
+        let threshold = crate::write_set_stage::resolve_spill_threshold(
+            std::env::var(crate::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV)
+                .ok()
+                .as_deref(),
+        );
+        total_bytes >= threshold
     }
 
     /// Stage `blobs` under `reservation`'s directory, draining each entry as it is

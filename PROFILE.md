@@ -354,6 +354,7 @@ rebuilding Ferrosa:
 | Environment variable | What it bounds | Default |
 |---|---|---:|
 | `FERROSA_POSTGRES_MAX_TXN_WRITES` | Mutations buffered by one PostgreSQL transaction before it fails with a resource-limit error | `10000` |
+| `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | Resident buffer size, in bytes, a transaction's write-set payloads may hold before they spill to a local temp file (both the streaming `WriteSetStage` and the coordinator's `WriteSetSpill::should_stage` read it). A streaming BUFFER SIZE, not a cap: a write-set larger than it SPILLS, it is never refused. Absolute bytes on purpose — a fraction of RAM is the wrong scale on a dataset larger than RAM | `8388608` (8 MiB) |
 | `FERROSA_PG_COMMIT_PROFILE` | Per-phase attribution for a PostgreSQL commit (prepare, Accord order/gate, apply fan-out, MVCC observer, prune, WAL) on the coordinator. Unset = zero cost | unset |
 | `FERROSA_ACCORD_COMPRESSION` | Codec for the Accord apply **region** body: `none` (default), `lz4`, `snappy`, `zstd`. Opt-in: compression costs CPU and only pays when the transport term is byte-bound rather than deserialize-bound | `none` |
 | `FERROSA_ACCORD_COMPRESSION_LEVEL` | Codec level where the codec has one (zstd); ignored by the fixed-level codecs | `3` |

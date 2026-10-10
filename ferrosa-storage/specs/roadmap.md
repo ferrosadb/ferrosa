@@ -13,6 +13,14 @@ open work lives in specs and the items below.
 
 ## Done (recent)
 
+- **Streaming write-set staging (`write_set_stage.rs`).** `WriteSetStage` is the
+  streaming twin of `WriteSetSpill`: driven one payload at a time as rows arrive, it
+  keeps a bounded resident prefix and spills the rest to a private temp file, so the
+  front end that BUILDS a write-set never holds the bulk. `entry(i)` reads back in
+  append order (resident slice or mmap slice) and fails loud on an un-staged index.
+  The resident limit is a streaming BUFFER SIZE externalized as
+  `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` (default 8 MiB), never a cap — a larger
+  write-set spills. See FMEA ST-WS-02.
 - **Two public helpers for the Postgres foreign-key front end.** `add_btree_index(table,
   name, column_position)` (the declaration half) and `read_by_index_exists(table, name,
   key_bytes)` (the read half) let `ferrosa-postgres`'s `FOREIGN KEY` enforcement build and
