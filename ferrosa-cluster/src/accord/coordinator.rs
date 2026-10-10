@@ -1134,6 +1134,9 @@ impl AccordCoordinatorDriver {
     /// replica's payload carries ONLY the write-set entries for keys it owns
     /// (the coordinator scopes; the replica trusts and applies what it received).
     /// Keyed by replica host-id, covering every id in `replica_ids`.
+    // Superseded in production by `apply_fanout_bounded` (one replica's payload
+    // resident at a time); retained for the wire-scoping tests.
+    #[cfg(test)]
     fn apply_v2_messages(
         &self,
     ) -> Result<std::collections::HashMap<uuid::Uuid, Message>, AccordDriverError> {
@@ -2460,19 +2463,9 @@ impl AccordCoordinatorDriver {
                         .await,
                 )
             } else {
-                let per_peer = self.apply_v2_messages()?;
-                Ok(self
-                    .quorum_broadcast_per_peer(
-                        &participant,
-                        |peer_id| {
-                            per_peer
-                                .get(&peer_id)
-                                .cloned()
-                                .expect("every replica_id has a per-peer AccordApplyV2 message")
-                        },
-                        is_apply_ok,
-                    )
-                    .await)
+                // Bound the fan-out: one replica's payload resident at a time,
+                // not every replica's at once (see `apply_fanout_bounded`).
+                self.apply_fanout_bounded(&participant, is_apply_ok).await
             }
         };
         let (local_applied, apply_result) = tokio::join!(local_apply_wait, remote_apply);
@@ -2584,6 +2577,67 @@ impl AccordCoordinatorDriver {
         // payload is key-independent or the same for all replicas).
         self.quorum_broadcast_per_peer(participant, |_| msg.clone(), is_ack)
             .await
+    }
+
+    /// Apply fan-out that keeps only ONE replica's `AccordApplyV2` payload
+    /// resident at a time.
+    ///
+    /// `apply_v2_messages` builds and serializes every replica's payload up front
+    /// and holds them all simultaneously. For a large multi-key transaction (a
+    /// transactional `COPY`) that is one full copy of the write-set PER REPLICA
+    /// resident at once — the largest coordinator-only allocation on the commit's
+    /// peak (measured: the coordinator peaked ~1.5 GB above the replicas it
+    /// coordinates). Peers are contacted in sequence here, each payload built
+    /// just before its send and dropped right after, so the fan-out holds
+    /// O(one replica's payload) rather than O(replicas x payload). Success is
+    /// decided by the SAME per-shard quorum accounting `quorum_broadcast_per_peer`
+    /// uses, including the coordinator's implicit self-ack.
+    async fn apply_fanout_bounded(
+        &self,
+        participant: &crate::accord::shard_quorum::ParticipantSet,
+        is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+    ) -> Result<bool, AccordDriverError> {
+        use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
+        let txn_id = self.coordinator.txn_id;
+        let self_id = self.self_id;
+        let mut quorum = participant.quorum();
+        if self.replica_ids.contains(&self_id) && self_id != uuid::Uuid::nil() {
+            quorum.record_node_ack(self_id);
+        }
+        if quorum.all_reached() {
+            return Ok(true);
+        }
+        for &peer_id in self.replica_ids.iter().filter(|&&id| id != self_id) {
+            let writes: Vec<WriteSetEntry> = self
+                .write_set
+                .iter()
+                .filter(|e| self.replica_owns_key(peer_id, &e.key))
+                .cloned()
+                .collect();
+            let payload = ApplyV2Payload { txn_id, writes };
+            let bytes = bincode::serialize(&payload)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
+            // Free the owned entries before the RPC: only the serialized frame is
+            // resident while the send is in flight, never the entries too.
+            drop(payload);
+            let msg = Message::AccordApplyV2(Bytes::from(bytes));
+            let result = self.peers.send(peer_id, msg, Lane::Data).await;
+            if let Err(error) = &result {
+                tracing::warn!(
+                    txn_id = ?txn_id,
+                    error = %error,
+                    peer = ?peer_id,
+                    "accord: quorum broadcast RPC failed"
+                );
+            }
+            if is_ack(&result) {
+                quorum.record_node_ack(peer_id);
+                if quorum.all_reached() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(quorum.all_reached())
     }
 
     /// Like [`quorum_broadcast`](Self::quorum_broadcast) but builds a **distinct
@@ -4167,6 +4221,87 @@ mod tests {
         );
         let keys: Vec<&[u8]> = mine.writes.iter().map(|w| w.key.as_slice()).collect();
         assert!(keys.contains(&b"key-1".as_slice()) && keys.contains(&b"key-2".as_slice()));
+    }
+
+    /// The apply fan-out must bound the coordinator's commit memory: at most ONE
+    /// replica's `AccordApplyV2` payload resident at a time, never every replica's
+    /// at once. The old `apply_v2_messages` materialized and serialized all of them
+    /// up front, so a transactional `COPY` of a whole table held one full copy of
+    /// the write-set PER REPLICA simultaneously — measured (RSS, 3-node local,
+    /// 1.1M-key COPY) as the largest coordinator-only term on a ~4.5 GB commit
+    /// peak, ~1.5 GB above the replicas the coordinator coordinates. This asserts
+    /// the bound DIRECTLY, by observing how many sends overlap, rather than only
+    /// that a small-N commit eventually succeeds (an outcome test cannot see it).
+    #[tokio::test]
+    async fn apply_fanout_never_holds_more_than_one_replica_payload_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        /// Records the peak number of simultaneous in-flight sends.
+        struct ConcurrencyProbe {
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+            sent: Mutex<Vec<uuid::Uuid>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for ConcurrencyProbe {
+            async fn send(
+                &self,
+                host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                // Hold the send open long enough that a concurrent fan-out would
+                // overlap measurably.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                self.sent.lock().expect("probe mutex").push(host);
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+        }
+
+        let a = uuid::Uuid::from_u128(0xA);
+        let b = uuid::Uuid::from_u128(0xB);
+        let c = uuid::Uuid::from_u128(0xC);
+        let probe = Arc::new(ConcurrencyProbe {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            sent: Mutex::new(Vec::new()),
+        });
+        // External coordinator (its id is in no replica set), so all three peers
+        // are remote sends.
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            vec![a, b, c],
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), b"mutation-1".to_vec()),
+                (b"key-2".to_vec(), b"mutation-2".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(Arc::new(move |_key: &[u8]| vec![a, b, c]));
+        let participant = driver.participant_set();
+
+        let ok = driver
+            .apply_fanout_bounded(&participant, |r| r.is_ok())
+            .await
+            .expect("bounded fan-out runs");
+
+        assert!(ok, "every replica acked; the per-shard quorum is reached");
+        assert_eq!(
+            probe.max_in_flight.load(Ordering::SeqCst),
+            1,
+            "at most one replica's apply payload may be in flight (resident) at a time"
+        );
+        assert!(
+            probe.sent.lock().expect("probe mutex").len() >= 2,
+            "the fan-out still reaches a quorum of replicas"
+        );
     }
 
     // -----------------------------------------------------------------------

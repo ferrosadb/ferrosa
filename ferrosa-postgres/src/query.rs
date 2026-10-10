@@ -1695,7 +1695,6 @@ pub(crate) fn prepare_row_changes(
                 }
             }
         }
-        let pending: Vec<PgWrite> = mutations.iter().cloned().map(PgWrite).collect();
         for (keyspace, table) in touched_tables {
             let overlay = table_rows
                 .entry((keyspace.clone(), table.clone()))
@@ -1706,7 +1705,7 @@ pub(crate) fn prepare_row_changes(
                 &keyspace,
                 &table,
                 overlay,
-                &pending,
+                mutations.iter(),
                 Some(&mut partition_keys),
             )
             .map_err(|error| {

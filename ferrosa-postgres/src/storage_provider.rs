@@ -591,18 +591,36 @@ pub(crate) fn apply_pending_writes(
     overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
     writes: &[crate::mvcc::PgWrite],
 ) -> Result<(), String> {
-    apply_pending_writes_with_partition_keys(engine, schema, keyspace, table, overlay, writes, None)
+    apply_pending_writes_with_partition_keys(
+        engine,
+        schema,
+        keyspace,
+        table,
+        overlay,
+        writes.iter().map(|w| &w.0),
+        None,
+    )
 }
 
-pub(crate) fn apply_pending_writes_with_partition_keys(
+///
+/// `writes` is an iterator of `&Mutation` (not `&[PgWrite]`) so a caller that
+/// already owns the mutations — the transactional-`COPY` commit's
+/// `prepare_row_changes` — does not have to CLONE the whole write-set into a
+/// throwaway `Vec<PgWrite>` first. That clone was a full extra copy of every
+/// buffered row (a megabyte-per-thousand-rows of pure waste on the commit's
+/// peak), since this function makes a single pass.
+pub(crate) fn apply_pending_writes_with_partition_keys<'a, I>(
     engine: &StorageEngine,
     schema: &Schema,
     keyspace: &str,
     table: &str,
     overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
-    writes: &[crate::mvcc::PgWrite],
+    writes: I,
     mut partition_keys: Option<&mut std::collections::HashMap<Vec<Value>, Vec<u8>>>,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = &'a ferrosa_storage::Mutation>,
+{
     let snapshot = schema.snapshot();
     let meta = snapshot
         .tables
@@ -621,8 +639,7 @@ pub(crate) fn apply_pending_writes_with_partition_keys(
     let ck = ck_indices(meta);
     let storage_to_table = storage_to_table_indices(meta);
 
-    for write in writes {
-        let mutation = &write.0;
+    for mutation in writes {
         if mutation.keyspace != keyspace || mutation.table != table {
             continue;
         }
