@@ -11,6 +11,17 @@ notes, in-code module markers (`self_heal`/`index` extension points), and the
 dependency/usage review. The crate has **no in-source `TODO`/`FIXME`** markers —
 open work lives in specs and the items below.
 
+## Done (recent)
+
+- **Two public helpers for the Postgres foreign-key front end.** `add_btree_index(table,
+  name, column_position)` (the declaration half) and `read_by_index_exists(table, name,
+  key_bytes)` (the read half) let `ferrosa-postgres`'s `FOREIGN KEY` enforcement build and
+  probe a single-column BTree index without naming `ferrosa-index`'s `IndexType`.
+  `read_by_index_exists` stops at the first posting (one lookup, never O(result)) and
+  propagates the same fail-loud errors as `read_by_index_each` — an undeclared or
+  not-current index is an error, never an empty "no such parent" answer. See
+  `ferrosa-postgres/specs/roadmap.md` for the enforcement feature.
+
 ## Now (highest value)
 
 - **Operator-facing durability guidance (FMEA ST-1).** The default `Periodic`

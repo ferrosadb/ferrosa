@@ -10015,6 +10015,49 @@ impl StorageEngine {
         self.read_by_index_each_after(table_id, index_name, key, None, visitor)
     }
 
+    /// Whether ANY row of `table_id` carries an `index_name` posting for `key_bytes`.
+    ///
+    /// A thin, `ferrosa-index`-free convenience over [`Self::read_by_index_each`] for a
+    /// caller that holds only the encoded key bytes (the Postgres front end's foreign-key
+    /// probe does). It stops at the first match, so the cost is one index point lookup,
+    /// never O(result) or a scan. Errors propagate from `read_by_index_each`, which refuses
+    /// loudly when the index is undeclared or not current — a probe never reports "no such
+    /// parent" for an index it could not actually consult.
+    pub fn read_by_index_exists(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key_bytes: &[u8],
+    ) -> ferrosa_common::Result<bool> {
+        let key = ferrosa_index::IndexKey(key_bytes.to_vec());
+        let mut found = false;
+        self.read_by_index_each(table_id, index_name, &key, &mut |_| {
+            found = true;
+            std::ops::ControlFlow::Break(())
+        })?;
+        Ok(found)
+    }
+
+    /// Declare an ordered (BTree) secondary index over the column at `column_position`.
+    ///
+    /// The declaration half of the pair whose read half is [`Self::read_by_index_exists`]: a
+    /// front end that must build and probe an index without naming `ferrosa-index`'s
+    /// `IndexType` calls both. Idempotent for a matching re-declaration; a conflicting one fails
+    /// loud (see [`Self::add_index_with_predicate`]).
+    pub fn add_btree_index(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        column_position: usize,
+    ) -> ferrosa_common::Result<()> {
+        self.add_index(
+            table_id,
+            index_name,
+            column_position,
+            ferrosa_index::IndexType::BTree,
+        )
+    }
+
     /// Visit a secondary-index result in row order — `(partition key,
     /// clustering)` — strictly after `after` when given, so a page can resume
     /// where the previous one stopped. O(posting sources) memory; see

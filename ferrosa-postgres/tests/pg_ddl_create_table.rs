@@ -418,7 +418,6 @@ async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
     let cases = [
         // (sql, expected sqlstate)
         ("CREATE TABLE t (id int PRIMARY KEY, v int UNIQUE)", "0A000"),
-        ("CREATE TABLE t (id int, v int)", "0A000"),
         (
             "CREATE TABLE t (id int PRIMARY KEY, v int DEFAULT 1)",
             "0A000",
@@ -435,6 +434,21 @@ async fn pg_ddl_create_table_named_refusals_survive_end_to_end() {
         let result = fx.client.batch_execute(sql).await;
         assert_eq!(sqlstate(result), code, "{sql}");
     }
+
+    // A PK-less `CREATE TABLE` is NO LONGER a named refusal: it is accepted with a
+    // synthesized `_sys_ck_` key (f7c03c1d), which is what lets `pgbench -i` create
+    // `pgbench_accounts (aid int, bid int, abalance int, filler char(84))`. Pinned
+    // positively here so the one shape that was removed from the list above stays covered.
+    fx.client
+        .batch_execute("CREATE TABLE pkless (id int, v int)")
+        .await
+        .expect("a PK-less CREATE TABLE is accepted with a synthesized key");
+    let cols = columns_of(&fx.schema, "pkless");
+    assert!(
+        cols.iter()
+            .any(|(name, kind, _, _)| name == "_sys_ck_" && *kind == ColumnKind::PartitionKey),
+        "the table carries a synthesized `_sys_ck_` partition key: {cols:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

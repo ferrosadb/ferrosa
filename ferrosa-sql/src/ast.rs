@@ -152,6 +152,30 @@ pub enum CopyFormatKind {
     Csv,
 }
 
+/// A parsed `FOREIGN KEY (...)` / column `REFERENCES` clause.
+///
+/// The referenced-column list is optional in PostgreSQL. When it is omitted
+/// (`REFERENCES parent`), the referenced columns default to the parent's
+/// declared primary key, which the executor resolves — the AST records only
+/// what was written.
+///
+/// `name` is the constraint name when one was written (`ADD CONSTRAINT <name>
+/// ...` or `CONSTRAINT <name> FOREIGN KEY ...`); `None` means the front end must
+/// generate the PostgreSQL default name (`<table>_<col>_fkey`). A `name` is
+/// carried for a table-level constraint but is `None` for a column-level
+/// `REFERENCES`, which PostgreSQL also auto-names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeignKeyConstraint {
+    pub name: Option<String>,
+    /// The referencing (child) columns, in order. ferrosa supports exactly one.
+    pub columns: Vec<String>,
+    /// The referenced (parent) table.
+    pub parent: TableRef,
+    /// The referenced (parent) columns, or `None` when the clause omitted them
+    /// and they default to the parent's primary key.
+    pub parent_columns: Option<Vec<String>>,
+}
+
 /// `ALTER TABLE <table> <operation>`.
 ///
 /// Only the operations ferrosa can actually apply are accepted. Every other `ALTER TABLE` form
@@ -181,6 +205,12 @@ pub enum AlterOperation {
     AddColumn(ColumnDef),
     /// `DROP [COLUMN] <name>`.
     DropColumn(String),
+    /// `ADD [CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]`.
+    ///
+    /// Enforced, and backed by a real secondary index over the referencing columns
+    /// (see `ferrosa-postgres`'s `ddl`/`pg_fk`): without the index the parent-side
+    /// check would scan.
+    AddForeignKey(ForeignKeyConstraint),
 }
 
 /// `CREATE TABLE [IF NOT EXISTS] [public.]name (col type [NOT NULL]..., PRIMARY KEY (...))`.
@@ -198,6 +228,10 @@ pub struct CreateTableStmt {
     /// key (see `ferrosa_common::timeuuid::SYNTHETIC_KEY_COLUMN`) rather than the parser
     /// refusing the statement.
     pub primary_key: Vec<String>,
+    /// The `FOREIGN KEY` / column `REFERENCES` clauses, in the order written. Recorded
+    /// faithfully; the executor resolves the parent and either enforces the constraint or
+    /// refuses it by name.
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
     /// The `WITH (key = value, ...)` table storage parameters, in the order written
     /// and with each key lowercased. **Recorded, not applied.** ferrosa is an
     /// LSM/SSTable store with no heap pages and no autovacuum, so these hints have no
@@ -281,8 +315,6 @@ impl PgType {
 /// by name, never dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsupportedClause {
-    /// `FOREIGN KEY (...)` or a column `REFERENCES`.
-    ForeignKey,
     /// `CHECK (...)`, table or column level.
     Check,
     /// `SERIAL` / `BIGSERIAL` / `SMALLSERIAL` (implicit sequences).
@@ -299,7 +331,6 @@ impl UnsupportedClause {
     /// The clause as a user would write it, for error messages.
     pub fn name(self) -> &'static str {
         match self {
-            UnsupportedClause::ForeignKey => "FOREIGN KEY",
             UnsupportedClause::Check => "CHECK",
             UnsupportedClause::Serial => "SERIAL",
             UnsupportedClause::DefaultExpr => "DEFAULT",
