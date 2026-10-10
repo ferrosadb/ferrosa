@@ -91,9 +91,73 @@ of the ~1.1M entries into the message on the coordinator and out of it on the pe
 so capnp structs alone are NOT sufficient: acceptance needs the region-REFERENCE
 wire** (an offset+length into a shared/mapped buffer rather than inline bytes). The
 `ferrosa-storage` write-set spill is now MMAPPED (`entry(i)` is a slice of the
-mapping), which removes the ~1.1M per-entry seek+read+mutex that was the bulk of (a)
-and is the enabling step for that wire — but nothing sends a region reference yet.
+mapping), which removes the ~1.1M per-entry seek+read+mutex that was the bulk of (a).
 The 10 s bound was NOT raised.
+
+### The region-REFERENCE Apply wire (`AccordApplyV2Region`)
+
+The inline frame above copies every entry's key+mutation into the capnp arena on the
+coordinator and decodes them back into owned `AccordWriteSetEntry`s on the peer; at
+N=1.1M that copy bound stays on the path and `frame_bytes` never falls. The region
+wire removes it. It adds ONE message type, `MsgType::AccordApplyV2Region` (0x7E),
+gated on the capability bit `CAP_ACCORD_APPLY_REGION` (bit 4). The body is two byte
+regions laid end to end:
+
+```text
+    0                     H                        H+R
+    +---------------------+--------------------------+
+    |  capnp HEADER (H)   |   REGION (R bytes)       |
+    +---------------------+--------------------------+
+                           ^ region[0..] — this peer's write-set payload bytes
+```
+
+* **HEADER** — a capnp `Envelope` whose payload is `accord.op.applyV2Region`:
+  `txnId`, `entryCount`, and two parallel lists `offsets : List(UInt64)` and
+  `lengths : List(UInt32)`. It carries NO entry bytes — it is the index into the
+  region plus the transaction stamp. The per-shard SCOPE is applied
+  coordinator-side (only the keys this peer owns are in the region), exactly as the
+  per-peer `applyV2` frame scoped today. The partition KEY is NOT carried: the
+  replica already discards it (it applies the `mutation` bytes in order) and the
+  coordinator has already scoped the frame to the peer's keys.
+* **REGION** — the concatenation, in write-set order, of this peer's encoded
+  mutation payloads. Entry `i` is `region[offsets[i] .. offsets[i] + lengths[i]]`.
+  The region begins at the first byte AFTER the capnp message; the decoder finds `H`
+  by reading the capnp message out of a `std::io::Cursor` and taking its position, so
+  no length field is required and the capnp word-padding costs nothing extra.
+
+**Coordinator — no copy into the arena.** `encode_accord_apply_v2_region` walks the
+borrowed `(key, mutation)` slices from `borrowed_write_set_entries` (each `mutation`
+is a slice of the spill's mmap, `WriteSetSpill::entry`) and appends them to the region
+buffer. Each entry's bytes are copied exactly ONCE, as a bulk `extend_from_slice`,
+never into a capnp struct; the header holds only the index. The whole body
+(`header ++ region`) is built once and — when the write-set is uniform — shared to
+every peer by refcount, as before.
+
+**Peer — reads by offset, no owned wire structure.** `decode_accord_apply_v2_region`
+returns an `AccordApplyV2RegionView<'_>` that BORROWS the received `Bytes`:
+`entry(i)` / `mutations()` yield `&[u8]` slices of the region, with no
+`Vec<AccordWriteSetEntry>` and no per-entry wire decode. The one copy that remains
+on the peer is the `Vec<u8>` per mutation the storage applier requires
+(`ApplyMutation.data` moves owned bytes through the blocking apply seam); it is NOT
+a decode of the message into owned entries.
+
+**Lifetimes.** The coordinator's mapped region is owned by the `Arc<WriteSetSpill>`
+the driver holds (`with_spilled_write_set`); consumers borrow slices of it and the
+mapping plus the staging file are released on the LAST drop of that `Arc`
+(`WriteSetSpill` declares `map` before the temp-dir reservation, so it unmaps before
+the directory is removed).
+
+**Version skew.** A peer that did not advertise `CAP_ACCORD_APPLY_REGION` receives
+the capnp-inline `AccordApplyV2Capnp` frame (if it advertised `CAP_ACCORD_CAPNP`) or
+the bincode `AccordApplyV2` frame (if it did not) — never a type byte it would reject.
+
+**Reused bulk channel?** No. The `ferrosa-cluster/src/streaming/` path
+(`StreamStart`/`StreamChunk`/`StreamEnd` + `sstable_transfer`) is a multi-message,
+per-chunk-ACKED session protocol whose receiver applies its own `StreamedMutation`
+shape; it is the token-range join/decommission channel, not a single request/response
+Apply frame with one ack. Folding the Apply region into it would replace one Apply
+RPC with a session (and a per-chunk ack round-trip) for no gain, so the region rides
+the existing single-frame Accord message path.
 
 > **Correctness-evidence honesty.** The Accord and Raft subsystems have extensive
 > *in-crate, deterministic* tests (state-machine, recovery, property, and

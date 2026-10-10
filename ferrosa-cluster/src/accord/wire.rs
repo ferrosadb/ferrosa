@@ -654,4 +654,179 @@ mod tests {
             assert_eq!(capnp_decoded, payload);
         }
     }
+
+    fn accord_txn(id: TxnId) -> ferrosa_net::protocol::AccordTxnId {
+        ferrosa_net::protocol::AccordTxnId {
+            epoch: id.0.epoch,
+            time: id.0.time,
+            seq: id.0.seq,
+            node: id.0.node,
+        }
+    }
+
+    /// The region-REFERENCE frame must decode BY OFFSET to exactly the mutation bytes
+    /// the inline frame carried, across every write-set shape: EMPTY, a single entry, a
+    /// multi-entry set, keys/mutations with embedded NULs, and an entry that ends at the
+    /// region's LAST offset (so an off-by-one in the bounds is caught).
+    #[test]
+    fn region_apply_frame_decodes_by_offset_to_the_inline_frame_bytes() {
+        use ferrosa_net::protocol::{
+            decode_accord_apply_v2, decode_accord_apply_v2_region, encode_accord_apply_v2,
+            encode_accord_apply_v2_region, AccordControlMessage,
+        };
+
+        let txn_id = txn(21, 4_242, 3, 22);
+        let accord = accord_txn(txn_id);
+        let cases: [Vec<(Vec<u8>, Vec<u8>)>; 3] = [
+            vec![],
+            vec![(b"only-key".to_vec(), b"only-mutation".to_vec())],
+            vec![
+                (b"key-alpha".to_vec(), b"mutation-for-alpha".to_vec()),
+                (b"key-beta\0with-nul".to_vec(), vec![0x7Fu8; 4096]),
+                (b"key-gamma".to_vec(), b"tail\0entry".to_vec()),
+            ],
+        ];
+
+        for writes in cases {
+            let region_frame =
+                encode_accord_apply_v2_region(accord, writes.iter().map(|(_, m)| m.as_slice()))
+                    .expect("region frame encodes");
+            let view = decode_accord_apply_v2_region(&region_frame).expect("region frame decodes");
+            assert_eq!(view.txn_id, accord, "the header carries the txn stamp");
+            assert_eq!(view.len(), writes.len());
+
+            // Every entry reads back byte-for-byte, and the LAST entry ends exactly at
+            // the region's end.
+            let region_mutations: Vec<&[u8]> = view
+                .mutations()
+                .map(|entry| entry.expect("entry in bounds"))
+                .collect();
+            assert_eq!(region_mutations.len(), writes.len());
+            for (index, ((_, expected), got)) in writes.iter().zip(&region_mutations).enumerate() {
+                assert_eq!(
+                    *got,
+                    expected.as_slice(),
+                    "region entry {index} must decode by offset to the staged bytes"
+                );
+            }
+            if let Some((_, last)) = writes.last() {
+                let last_start = view.indexed_region_len() - last.len() as u64;
+                assert_eq!(
+                    view.entry(writes.len() - 1).expect("last entry in bounds"),
+                    last.as_slice(),
+                    "an entry at the region's LAST offset must decode exactly"
+                );
+                assert_eq!(last_start as usize, view.region().len() - last.len());
+            }
+            // One past the end FAILS LOUD — never a silent empty write.
+            assert!(
+                view.entry(writes.len()).is_err(),
+                "an index past the last entry must fail loud"
+            );
+
+            // Equivalence: the inline frame's mutation bytes are exactly the region's.
+            let inline_frame = encode_accord_apply_v2(
+                accord,
+                writes.iter().map(|(k, m)| (k.as_slice(), m.as_slice())),
+            )
+            .expect("inline frame encodes");
+            let inline_mutations: Vec<Vec<u8>> =
+                match decode_accord_apply_v2(&inline_frame).expect("inline frame decodes") {
+                    AccordControlMessage::ApplyV2 { writes, .. } => {
+                        writes.into_iter().map(|w| w.mutation).collect()
+                    }
+                    other => panic!("expected an ApplyV2 payload, got {other:?}"),
+                };
+            assert_eq!(
+                region_mutations.len(),
+                inline_mutations.len(),
+                "the region and inline frames carry the same entry count"
+            );
+            for (region_bytes, inline_bytes) in region_mutations.iter().zip(&inline_mutations) {
+                assert_eq!(
+                    *region_bytes,
+                    inline_bytes.as_slice(),
+                    "a region entry must equal the inline frame's mutation bytes"
+                );
+            }
+        }
+    }
+
+    /// The region frame must SHRINK the wire: it drops the per-entry key and the capnp
+    /// struct/pointer overhead, replacing them with ONE contiguous region plus a flat
+    /// (offset, length) index. Assert it directly on the largest frame the fan-out ships.
+    #[test]
+    fn region_apply_frame_is_smaller_than_the_inline_capnp_frame() {
+        use ferrosa_net::protocol::{encode_accord_apply_v2, encode_accord_apply_v2_region};
+
+        let accord = accord_txn(txn(7, 1, 1, 1));
+        let writes: Vec<(Vec<u8>, Vec<u8>)> = (0..2_000u32)
+            .map(|i| {
+                (
+                    format!("partition-key-{i:08}").into_bytes(),
+                    vec![0xABu8; 128],
+                )
+            })
+            .collect();
+
+        let inline = encode_accord_apply_v2(
+            accord,
+            writes.iter().map(|(k, m)| (k.as_slice(), m.as_slice())),
+        )
+        .expect("inline frame encodes")
+        .len();
+        let region =
+            encode_accord_apply_v2_region(accord, writes.iter().map(|(_, m)| m.as_slice()))
+                .expect("region frame encodes")
+                .len();
+
+        assert!(
+            region < inline,
+            "the region frame must be SMALLER than the inline capnp frame \
+             (region={region}, inline={inline})"
+        );
+    }
+
+    /// A header whose index escapes the region — or is not a contiguous partition of it
+    /// — must FAIL LOUD, so a peer never applies a truncated or misaligned write-set.
+    #[test]
+    fn a_region_index_that_does_not_cover_the_region_fails_loud() {
+        use ferrosa_net::protocol::{
+            decode_accord_apply_v2_region, encode_accord_envelope, AccordControlMessage,
+        };
+
+        let txn_id = txn(9, 9, 9, 9);
+        let accord = accord_txn(txn_id);
+        let build = |offsets: Vec<u64>, lengths: Vec<u32>, region: &[u8]| {
+            let mut frame = encode_accord_envelope(&AccordControlMessage::ApplyV2Region {
+                txn_id: accord,
+                offsets,
+                lengths,
+            })
+            .expect("header encodes");
+            frame.extend_from_slice(region);
+            frame
+        };
+
+        // A length that runs past the region.
+        let escaping = build(vec![0], vec![99], b"short");
+        assert!(
+            decode_accord_apply_v2_region(&escaping).is_err(),
+            "an entry length past the region end must fail loud"
+        );
+
+        // A non-contiguous offset (a gap the region does not have).
+        let gapped = build(vec![0, 8], vec![2, 2], b"aabbccdd");
+        assert!(
+            decode_accord_apply_v2_region(&gapped).is_err(),
+            "a non-contiguous index must fail loud"
+        );
+
+        // A header whose lengths do not cover the whole region (trailing bytes).
+        let truncated = build(vec![0], vec![2], b"abcd");
+        assert!(
+            decode_accord_apply_v2_region(&truncated).is_err(),
+            "an index that does not cover the whole region must fail loud"
+        );
+    }
 }

@@ -28,10 +28,16 @@
 //! into an intermediate buffer per peer.
 //!
 //! [`WriteSetSpill::entry`] is the genuinely zero-copy accessor: it borrows the
-//! mapping. [`WriteSetSpill::mutation`] is the owned twin the Apply wire types still
-//! need today (`WriteSetEntry::mutation` is a `Vec<u8>`), so the per-entry copy into
-//! the serialized frame remains — see the crate README for exactly what is and is
-//! not zero-copy after mmapping.
+//! mapping. The region-REFERENCE Apply wire
+//! (`ferrosa_net::protocol::encode_accord_apply_v2_region`) consumes exactly these
+//! borrowed slices and writes them into ONE contiguous region on the frame — no
+//! per-entry capnp struct and no per-entry owned copy on the coordinator. The
+//! staging file plus the read-only mapping are owned behind the `Arc<WriteSetSpill>`
+//! the coordinator driver holds and are released on the LAST drop of that `Arc`
+//! ([`WriteSetSpill`] declares `map` before its temp-dir reservation, so the region is
+//! unmapped before the directory is removed). [`WriteSetSpill::mutation`] — the owned
+//! twin that `WriteSetEntry::mutation` (`Vec<u8>`) still needs on the legacy inline
+//! path — remains, but the hot bulk-load path no longer goes through it.
 //!
 //! # Reusing the spill machinery
 //!
@@ -402,6 +408,39 @@ mod tests {
         assert!(
             !dir.exists(),
             "dropping the spill must remove its staging directory"
+        );
+    }
+
+    /// The mapped region is owned behind an `Arc`; consumers borrow slices of it and the
+    /// FILE plus the MAPPING are released exactly once, on the LAST drop of that `Arc` —
+    /// never copied out and never leaked. A borrow of the mapping stays valid while any
+    /// `Arc` clone is alive, and the staging directory (and hence the region) is removed
+    /// only when the last clone goes.
+    #[test]
+    fn the_mapped_region_is_released_only_on_the_last_arc_drop() {
+        let mut blobs = vec![vec![0x5Au8; 4096]];
+        let spill = std::sync::Arc::new(stage(&mut blobs));
+        let dir = spill._reservation.path().to_path_buf();
+        let first = std::sync::Arc::clone(&spill);
+        let last = std::sync::Arc::clone(&spill);
+        assert_eq!(std::sync::Arc::strong_count(&spill), 3);
+
+        drop(spill);
+        drop(first);
+        assert!(
+            dir.exists(),
+            "the staging dir must survive while a borrow of the mapping is alive"
+        );
+        assert_eq!(
+            last.entry(0).unwrap(),
+            vec![0x5Au8; 4096].as_slice(),
+            "a live Arc clone still borrows the mapping"
+        );
+
+        drop(last);
+        assert!(
+            !dir.exists(),
+            "the file and mapping are released on the LAST Arc drop"
         );
     }
 

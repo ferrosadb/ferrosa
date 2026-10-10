@@ -332,6 +332,19 @@ pub enum AccordControlMessage {
         txn_id: AccordTxnId,
         writes: Vec<AccordWriteSetEntry>,
     },
+    /// The region-REFERENCE multi-key Apply header. The write-set payload bytes do
+    /// NOT travel here: they follow this message as one contiguous REGION, addressed
+    /// by `offsets[i]`/`lengths[i]` relative to the region's start. The generic
+    /// envelope round-trip carries the index only; the region is spliced on / sliced
+    /// off by [`encode_accord_apply_v2_region`] and
+    /// [`decode_accord_apply_v2_region`].
+    ApplyV2Region {
+        txn_id: AccordTxnId,
+        /// Byte offset of entry `i` within the appended region.
+        offsets: Vec<u64>,
+        /// Byte length of entry `i`.
+        lengths: Vec<u32>,
+    },
     /// Single-key Apply request (`wire.rs` `ApplyPayload`), the degenerate one-key case.
     Apply {
         txn_id: AccordTxnId,
@@ -1684,6 +1697,7 @@ fn read_legacy(reader: legacy_payload::Reader<'_>) -> Result<LegacyPayload, Capn
 fn accord_message_kind(msg: &AccordControlMessage) -> u16 {
     let msg_type = match msg {
         AccordControlMessage::ApplyV2 { .. } => MsgType::AccordApplyV2,
+        AccordControlMessage::ApplyV2Region { .. } => MsgType::AccordApplyV2Region,
         AccordControlMessage::Apply { .. } => MsgType::AccordApply,
         AccordControlMessage::ApplyOk { .. } => MsgType::AccordApplyOK,
         AccordControlMessage::PreAccept { .. } => MsgType::AccordPreAccept,
@@ -1825,6 +1839,27 @@ fn write_accord(
             let mut out = builder.init_op().init_apply_v2();
             write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
             write_accord_writes(writes, out.init_writes(writes.len() as u32));
+        }
+        AccordControlMessage::ApplyV2Region {
+            txn_id,
+            offsets,
+            lengths,
+        } => {
+            let mut out = builder.init_op().init_apply_v2_region();
+            write_accord_txn_id(*txn_id, out.reborrow().init_txn_id());
+            out.set_entry_count(offsets.len() as u32);
+            {
+                let mut list = out.reborrow().init_offsets(offsets.len() as u32);
+                for (idx, offset) in offsets.iter().enumerate() {
+                    list.set(idx as u32, *offset);
+                }
+            }
+            {
+                let mut list = out.reborrow().init_lengths(lengths.len() as u32);
+                for (idx, len) in lengths.iter().enumerate() {
+                    list.set(idx as u32, *len);
+                }
+            }
         }
         AccordControlMessage::Apply {
             txn_id,
@@ -1971,6 +2006,16 @@ fn read_accord(
             AccordControlMessage::ApplyV2 {
                 txn_id: read_accord_txn_id(apply.get_txn_id()?),
                 writes: read_accord_writes(apply.get_writes()?)?,
+            }
+        }
+        op::ApplyV2Region(region) => {
+            let region = region?;
+            let offsets = region.get_offsets()?.iter().collect();
+            let lengths = region.get_lengths()?.iter().collect();
+            AccordControlMessage::ApplyV2Region {
+                txn_id: read_accord_txn_id(region.get_txn_id()?),
+                offsets,
+                lengths,
             }
         }
         op::Apply(apply) => {
@@ -2174,6 +2219,216 @@ pub fn decode_accord_apply_v2(bytes: &[u8]) -> Result<AccordControlMessage, Capn
     }
 }
 
+/// Encode a multi-key Accord Apply as a region-REFERENCE frame.
+///
+/// The frame is a capnp HEADER (the transaction stamp plus a parallel
+/// `offsets`/`lengths` index) followed by ONE contiguous REGION that concatenates the
+/// borrowed `mutations`, in order — entry `i` is `region[offsets[i]..offsets[i]+lengths[i]]`.
+///
+/// This is the hot-path encoder for a transactional bulk load. The coordinator passes
+/// the write-set's mutation slices as returned by
+/// `WriteSetSpill::entry` (each a slice of the spill's memory map), and each entry's
+/// bytes are appended to the region exactly ONCE, as a bulk copy — never into a capnp
+/// struct, so there is no per-entry arena node and no per-entry small allocation. The
+/// partition KEY is not carried: the frame is already scoped to the peer's keys and the
+/// replica applies the mutation bytes in order.
+pub fn encode_accord_apply_v2_region<'a, I>(
+    txn_id: AccordTxnId,
+    mutations: I,
+) -> Result<Vec<u8>, CapnpDecodeError>
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut offsets: Vec<u64> = Vec::new();
+    let mut lengths: Vec<u32> = Vec::new();
+    let mut region: Vec<u8> = Vec::new();
+    for mutation in mutations {
+        let len = u32::try_from(mutation.len()).map_err(|_| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry of {} bytes exceeds the u32 length bound",
+                mutation.len()
+            ))
+        })?;
+        offsets.push(region.len() as u64);
+        lengths.push(len);
+        region.extend_from_slice(mutation);
+    }
+    let mut header = encode_accord_envelope(&AccordControlMessage::ApplyV2Region {
+        txn_id,
+        offsets,
+        lengths,
+    })?;
+    header.extend_from_slice(&region);
+    Ok(header)
+}
+
+/// A BORROWED view of a region-REFERENCE Apply frame: the header's transaction stamp
+/// plus an index into the appended region.
+///
+/// The region bytes are not copied out of the received body — [`Self::entry`] and
+/// [`Self::mutations`] hand out `&[u8]` slices of it, so the peer decodes the frame by
+/// OFFSET rather than parsing it into owned per-entry structures.
+#[derive(Debug)]
+pub struct AccordApplyV2RegionView<'a> {
+    /// The transaction the write-set belongs to.
+    pub txn_id: AccordTxnId,
+    region: &'a [u8],
+    offsets: Vec<u64>,
+    lengths: Vec<u32>,
+}
+
+impl<'a> AccordApplyV2RegionView<'a> {
+    /// Number of write-set entries.
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    /// Whether the frame carries no write-set entries.
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    /// The raw region bytes, borrowed from the received body.
+    pub fn region(&self) -> &'a [u8] {
+        self.region
+    }
+
+    /// Borrow entry `index` by its `(offset, length)` — a slice of the region.
+    ///
+    /// FAILS LOUD on an index that was never present and on a range that escapes the
+    /// region: a corrupt index must never read past the received body.
+    pub fn entry(&self, index: usize) -> Result<&'a [u8], CapnpDecodeError> {
+        let (&offset, &len) = self
+            .offsets
+            .get(index)
+            .zip(self.lengths.get(index))
+            .ok_or_else(|| {
+                CapnpDecodeError::InvalidRequiredField(format!(
+                    "accord apply region: entry {index} is out of range ({} entries)",
+                    self.offsets.len()
+                ))
+            })?;
+        let start = usize::try_from(offset).map_err(|_| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry {index} offset {offset} does not fit in usize"
+            ))
+        })?;
+        let end = start.checked_add(len as usize).ok_or_else(|| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry {index} range {start}..(start+{len}) overflows usize"
+            ))
+        })?;
+        self.region.get(start..end).ok_or_else(|| {
+            CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: entry {index} range {start}..{end} escapes the {} byte region",
+                self.region.len()
+            ))
+        })
+    }
+
+    /// Borrow every entry in write-set order.
+    pub fn mutations(&self) -> impl Iterator<Item = Result<&'a [u8], CapnpDecodeError>> + '_ {
+        (0..self.len()).map(move |index| self.entry(index))
+    }
+
+    /// The region length the index claims: `sum(lengths)`.
+    pub fn indexed_region_len(&self) -> u64 {
+        self.lengths.iter().map(|&len| u64::from(len)).sum()
+    }
+
+    /// FAIL LOUD unless the index is a self-consistent contiguous partition of the
+    /// region: `offsets` and `lengths` parallel and non-empty, `offsets[i+1] ==
+    /// offsets[i] + lengths[i]`, `offsets[0] == 0`, and the entries cover the region
+    /// exactly. A header whose index does not cover the region is corrupt, and a peer
+    /// must never apply a silently truncated or misaligned write-set.
+    fn validate(&self) -> Result<(), CapnpDecodeError> {
+        if self.offsets.len() != self.lengths.len() {
+            return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: {} offsets but {} lengths",
+                self.offsets.len(),
+                self.lengths.len()
+            )));
+        }
+        let mut expected: u64 = 0;
+        for (index, (&offset, &len)) in self.offsets.iter().zip(&self.lengths).enumerate() {
+            if offset != expected {
+                return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                    "accord apply region: entry {index} offset {offset} is not the contiguous \
+                     position {expected}"
+                )));
+            }
+            expected = expected.checked_add(u64::from(len)).ok_or_else(|| {
+                CapnpDecodeError::InvalidRequiredField(format!(
+                    "accord apply region: entry {index} makes the running length overflow u64"
+                ))
+            })?;
+        }
+        // Every entry must be in bounds (this also catches the LAST entry's end).
+        for index in 0..self.len() {
+            self.entry(index)?;
+        }
+        if expected != self.region.len() as u64 {
+            return Err(CapnpDecodeError::InvalidRequiredField(format!(
+                "accord apply region: index claims {expected} bytes but the region holds {}",
+                self.region.len()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Decode a frame produced by [`encode_accord_apply_v2_region`] into a BORROWED view.
+///
+/// The capnp header is read out of a `Cursor` to find where the message ends; the
+/// region is everything after it. The returned view borrows the region, so no entry is
+/// decoded into an owned structure here.
+pub fn decode_accord_apply_v2_region(
+    bytes: &[u8],
+) -> Result<AccordApplyV2RegionView<'_>, CapnpDecodeError> {
+    // Find where the capnp header message ends: `read_message` consumes exactly one
+    // message from the cursor, leaving the position at the region's first byte. The
+    // reader is dropped before the position is read, so no message data is retained.
+    let header_len = {
+        let mut cursor = std::io::Cursor::new(bytes);
+        let _reader = serialize::read_message(
+            &mut cursor,
+            message::ReaderOptions {
+                traversal_limit_in_words: Some(8 * 1024 * 1024),
+                nesting_limit: 64,
+            },
+        )?;
+        usize::try_from(cursor.position()).map_err(|_| {
+            CapnpDecodeError::MalformedFrame("region frame header length overflows usize".into())
+        })?
+    };
+    let region = bytes.get(header_len..).ok_or_else(|| {
+        CapnpDecodeError::MalformedFrame(format!(
+            "region frame header of {header_len} bytes is longer than the {} byte body",
+            bytes.len()
+        ))
+    })?;
+    let (txn_id, offsets, lengths) = match decode_accord_envelope(bytes)? {
+        AccordControlMessage::ApplyV2Region {
+            txn_id,
+            offsets,
+            lengths,
+        } => (txn_id, offsets, lengths),
+        other => {
+            return Err(CapnpDecodeError::UnknownPayload(format!(
+                "expected an applyV2Region payload, found a different Accord kind: {other:?}"
+            )))
+        }
+    };
+    let view = AccordApplyV2RegionView {
+        txn_id,
+        region,
+        offsets,
+        lengths,
+    };
+    view.validate()?;
+    Ok(view)
+}
+
 fn read_required_uuid(field: &str, data: &[u8]) -> Result<Uuid, CapnpDecodeError> {
     let id = read_optional_uuid(data)?.ok_or_else(|| {
         CapnpDecodeError::InvalidRequiredField(format!("{field} must be 16 bytes"))
@@ -2303,7 +2558,8 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::AccordRecoverOK
             | MsgType::AccordPreAcceptV2
             | MsgType::AccordApplyV2
-            | MsgType::AccordApplyV2Capnp,
+            | MsgType::AccordApplyV2Capnp
+            | MsgType::AccordApplyV2Region,
         ) => MessageFamily::Accord,
         Ok(MsgType::BootstrapComplete | MsgType::BootstrapCompleteAck) => MessageFamily::Bootstrap,
         Ok(MsgType::ClusterMembershipForward | MsgType::ClusterMembershipForwardAck) => {

@@ -1663,6 +1663,8 @@ impl ModeController {
             self.registry
                 .register(MsgType::AccordApplyV2Capnp, accord_handler.clone());
             self.registry
+                .register(MsgType::AccordApplyV2Region, accord_handler.clone());
+            self.registry
                 .register(MsgType::AccordRecover, accord_handler);
         }
 

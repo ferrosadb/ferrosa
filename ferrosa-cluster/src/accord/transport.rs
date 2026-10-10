@@ -34,6 +34,18 @@ pub trait AccordTransport: Send + Sync {
     async fn supports_accord_capnp(&self, _host_id: uuid::Uuid) -> bool {
         false
     }
+
+    /// Whether `host_id` advertised
+    /// [`ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION`], i.e. decodes the
+    /// region-REFERENCE `AccordApplyV2Region` body.
+    ///
+    /// Defaults to `false`: a transport that cannot positively confirm the peer's
+    /// capability must fall back to the inline `AccordApplyV2Capnp` (or bincode
+    /// `AccordApplyV2`) frame. Sending the region type to a peer that does not know
+    /// the type byte drops the whole internode connection.
+    async fn supports_accord_apply_region(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
 }
 
 #[async_trait]
@@ -52,5 +64,11 @@ impl AccordTransport for PeerManager {
         self.peer_capabilities(host_id)
             .await
             .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_CAPNP != 0)
+    }
+
+    async fn supports_accord_apply_region(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION != 0)
     }
 }

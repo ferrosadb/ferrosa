@@ -41,10 +41,22 @@ pub const CAP_PAIR_DISSOLVE: u32 = 1 << 2;
 /// understands, and an unknown type byte would otherwise drop the whole connection.
 pub const CAP_ACCORD_CAPNP: u32 = 1 << 3;
 
+/// The node decodes `MsgType::AccordApplyV2Region`: a multi-key Accord Apply whose
+/// body is a Cap'n Proto `accord.applyV2Region` HEADER followed by ONE contiguous
+/// region of write-set payload bytes addressed by (offset, length). The coordinator
+/// sends that type ONLY to a peer that advertised this bit — a peer without it is
+/// sent the capnp-inline `AccordApplyV2Capnp` (or the bincode `AccordApplyV2`) frame
+/// it already understands, and an unknown type byte would otherwise drop the whole
+/// connection.
+pub const CAP_ACCORD_APPLY_REGION: u32 = 1 << 4;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
-pub const LOCAL_CAPABILITIES: u32 =
-    CAP_RPC_ERROR_REPLY | CAP_RESULT_CURSOR_PAGE | CAP_PAIR_DISSOLVE | CAP_ACCORD_CAPNP;
+pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY
+    | CAP_RESULT_CURSOR_PAGE
+    | CAP_PAIR_DISSOLVE
+    | CAP_ACCORD_CAPNP
+    | CAP_ACCORD_APPLY_REGION;
 
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

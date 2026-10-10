@@ -570,6 +570,44 @@ impl RpcHandler for AccordHandler {
                 self.apply_writeset_and_ack(txn_id, writes).await
             }
 
+            Message::AccordApplyV2Region(b) => {
+                // The region-REFERENCE multi-key Apply: a capnp HEADER (txn stamp + an
+                // (offset, length) index) followed by ONE contiguous REGION holding the
+                // write-set payload bytes. Only a peer that advertised
+                // `CAP_ACCORD_APPLY_REGION` is ever sent this type. The decode BORROWS
+                // the region — there is no per-entry owned wire structure; each entry is
+                // read by offset. The mutations are then materialized into the `Vec<u8>`
+                // per write the storage applier requires (`ApplyMutation.data` moves
+                // owned bytes through the blocking apply seam); that is the applier's
+                // input, not a decode of the message into owned entries.
+                let view = match ferrosa_net::protocol::decode_accord_apply_v2_region(&b) {
+                    Ok(view) => view,
+                    Err(error) => {
+                        tracing::error!("AccordApplyV2Region: region decode failed: {error}");
+                        return None;
+                    }
+                };
+                let txn_id = TxnId(Timestamp {
+                    epoch: view.txn_id.epoch,
+                    time: view.txn_id.time,
+                    seq: view.txn_id.seq,
+                    node: view.txn_id.node,
+                });
+                let mut writes: Vec<Vec<u8>> = Vec::with_capacity(view.len());
+                for entry in view.mutations() {
+                    match entry {
+                        Ok(bytes) => writes.push(bytes.to_vec()),
+                        Err(error) => {
+                            tracing::error!(
+                                "AccordApplyV2Region: entry out of the region's index: {error}"
+                            );
+                            return None;
+                        }
+                    }
+                }
+                self.apply_writeset_and_ack(txn_id, writes).await
+            }
+
             Message::AccordRecover(b) => {
                 let payload: RecoverPayload = bincode::deserialize(&b)
                     .map_err(|e| tracing::error!("AccordRecover: deserialize failed: {e}"))
