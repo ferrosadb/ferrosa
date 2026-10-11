@@ -103,6 +103,32 @@ currently uncommitted and failing with
   so the working tree is the breadcrumb). PR 548's head is untouched and green.
 - I2-I6 remain unwritten. I3 can only be judged by the live probe.
 
+## Cycle state (2026-10-11, updated)
+
+**DONE — I1, committed `427c5c77` and pushed to `feat/read-in-transaction` (PR 548).** A `LET` block
+parses into a `TransactionBlock` whose read is explicit at PARSE time: `LetBinding` carried on the
+variant, `LET` as a SOFT keyword on the `TIMEOUT` precedent (so a table named `let` keeps working),
+interception at the top of the block loop before `parse_statement`, and a binding that is not a
+SELECT refused by name. Red first on `SyntaxError(unexpected token Ident("LET"))`. Gates: ferrosa-cql
+lib 1244 passed / 0 failed, workspace clippy clean under `-D warnings`, fmt clean.
+
+**NEXT — I2: resolve the binding into the consuming statement's value.** `route_transaction_block`
+loops the block's statements through `route_in_transaction` and IGNORES `bindings` (deferred on
+purpose), so `cur` in `SET v = cur + 1` remains an unresolved identifier. The red asserts the bound
+name resolves to the value read in the same transaction, observable at the CQL entry point.
+
+**TRAP, do not write this test the obvious way.** The `dml_client_with_committer` fixture in
+`ferrosa-postgres/tests` installs a `MockTransactionCommitter`, which records whatever it is handed
+and reports `Committed`. A value assertion against it passes for a reason unrelated to any defect:
+it is green by construction, and it is precisely why the cell loss is invisible in-process at every
+level. The claim that a committed value SURVIVES belongs to I3 only.
+
+**THEN — I3:** the live probe (`txn-iso2-probe.sh`, V1 read-modify-write). The only level that can
+judge the lost cell - and the reason this work exists.
+
+**THEN — phase 2:** MVCC with strict ordering and PostgreSQL conflict-resolution semantics, so
+transactions behave from the front end the way PostgreSQL's do.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
