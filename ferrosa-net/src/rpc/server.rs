@@ -1844,7 +1844,8 @@ mod tests {
                     gated: gated.iter().copied().collect(),
                     silent: silent.iter().copied().collect(),
                 };
-                let client = connected_client(registry_with(MsgType::Ping, Arc::new(handler))).await;
+                let client =
+                    connected_client(registry_with(MsgType::Ping, Arc::new(handler))).await;
                 Peer {
                     seen,
                     gate,
@@ -1876,7 +1877,10 @@ mod tests {
                 let abandoned =
                     tokio::time::timeout(Duration::from_millis(10), peer.lane.send(ping(1), None))
                         .await;
-                assert!(abandoned.is_err(), "nonce 1 must still be queued: {abandoned:?}");
+                assert!(
+                    abandoned.is_err(),
+                    "nonce 1 must still be queued: {abandoned:?}"
+                );
 
                 peer.gate.add_permits(1);
                 let first = holder.await.unwrap().unwrap();
@@ -1908,9 +1912,10 @@ mod tests {
 
                 // 150 ms queued: dispatched with the remaining 50 ms.
                 let lane = peer.lane.clone();
-                let holder = tokio::spawn(async move {
-                    lane.send(ping(0), Some(Duration::from_secs(30))).await
-                });
+                let holder =
+                    tokio::spawn(
+                        async move { lane.send(ping(0), Some(Duration::from_secs(30))).await },
+                    );
                 wait_until_seen(&peer.seen, 0).await;
                 let lane = peer.lane.clone();
                 let enqueued = tokio::time::Instant::now();
@@ -1928,7 +1933,10 @@ mod tests {
                     "a 200 ms request took {total:?} end to end: its deadline restarted at \
                      dispatch instead of counting the 150 ms it spent queued"
                 );
-                assert!(peer.seen.lock().unwrap().contains(&1), "nonce 1 had 50 ms left and must be sent");
+                assert!(
+                    peer.seen.lock().unwrap().contains(&1),
+                    "nonce 1 had 50 ms left and must be sent"
+                );
 
                 // 250 ms queued: exhausted before dispatch, never sent.
                 let lane = peer.lane.clone();

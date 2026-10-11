@@ -21,7 +21,9 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     VoteRequest, VoteResponse,
 };
-use openraft::{BasicNode, CommittedLeaderId, LogId, RaftNetwork, RaftNetworkFactory, SnapshotMeta, Vote};
+use openraft::{
+    BasicNode, CommittedLeaderId, LogId, RaftNetwork, RaftNetworkFactory, SnapshotMeta, Vote,
+};
 
 use ferrosa_cluster::raft::handlers::{
     LazyRaft, RaftAppendHandler, RaftPreVoteHandler, RaftSnapshotHandler, RaftVoteHandler,
@@ -104,9 +106,15 @@ async fn ready_lazy_raft(dir: &tempfile::TempDir) -> (LazyRaft, Arc<FerrosRaft>)
         .expect("valid raft config"),
     );
     let log_store = SledLogStore::new(&dir.path().join("raft")).expect("sled log store");
-    let raft = FerrosRaft::new(1, config, NoPeersNetwork, log_store, FerrosStateMachine::new())
-        .await
-        .expect("FerrosRaft::new");
+    let raft = FerrosRaft::new(
+        1,
+        config,
+        NoPeersNetwork,
+        log_store,
+        FerrosStateMachine::new(),
+    )
+    .await
+    .expect("FerrosRaft::new");
     let raft = Arc::new(raft);
     let (tx, lazy) = LazyRaft::channel();
     tx.send(Some(Arc::clone(&raft))).expect("publish raft");

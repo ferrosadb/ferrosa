@@ -942,7 +942,9 @@ impl RpcHandler for RaftAppendHandler {
             &self.raft,
             &bytes,
             |raft, req: AppendEntriesRequest<FerrosRaftConfig>| async move {
-                raft.append_entries(req).await.map_err(|e| format!("append_entries failed: {e}"))
+                raft.append_entries(req)
+                    .await
+                    .map_err(|e| format!("append_entries failed: {e}"))
             },
             Message::RaftAppendResponse,
         )

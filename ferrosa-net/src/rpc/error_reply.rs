@@ -179,7 +179,10 @@ mod tests {
     /// rather than misreading them as an older kind.
     #[test]
     fn new_kinds_decode_as_other_on_the_previous_build() {
-        for kind in [RemoteFailureKind::HandlerFailed, RemoteFailureKind::NotReady] {
+        for kind in [
+            RemoteFailureKind::HandlerFailed,
+            RemoteFailureKind::NotReady,
+        ] {
             let reply = RpcErrorReply::new(kind, "raft not ready");
             let mut buf = BytesMut::new();
             reply.encode(&mut buf).unwrap();
@@ -191,7 +194,11 @@ mod tests {
                 "{kind:?} reuses a code the previous build already assigned"
             );
             assert_eq!(get_string(&mut body).unwrap(), "raft not ready");
-            assert_eq!(RemoteFailureKind::from_code(code), kind, "this build round-trips it");
+            assert_eq!(
+                RemoteFailureKind::from_code(code),
+                kind,
+                "this build round-trips it"
+            );
         }
     }
 
