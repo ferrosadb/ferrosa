@@ -147,8 +147,13 @@ in-memory table in tests and by Ferrosa storage in production.
   named `CAST`. A lone `:` is still a loud `bad token: :`: the `::` arm consumes both
   colons, a single one falls through to the catch-all.
 - Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`. The derived
-  output type follows PostgreSQL: `COUNT`/`COUNT(col)` ⇒ `BigInt` (int8),
-  `SUM`/`MIN`/`MAX` ⇒ the argument's engine type, `AVG` ⇒ `Float` (float8).
+  output type is **PostgreSQL's RESULT type**, not the argument's engine type:
+  `COUNT`/`COUNT(col)` ⇒ `BigInt` (int8); `SUM(int2|int4)` ⇒ `BigInt` (int8),
+  `SUM(int8|numeric)` ⇒ `Numeric`, `SUM(float4|float8)` ⇒ `Float` (float8);
+  `AVG(int2|int4|int8|numeric)` ⇒ `Numeric`, `AVG(float4|float8)` ⇒ `Float`;
+  `MIN`/`MAX` ⇒ the argument's engine type. A `Numeric` result has no
+  numeric-valued engine result yet and no binary codec, so the PostgreSQL front
+  end refuses to encode it (`0A000`) rather than mislabel the bytes.
 - Literals: int, float, string (with `''` escape), `TRUE`/`FALSE`/`NULL`, `$N`
   params, and typed literals `TIMESTAMP/DATE/TIME/INET/NUMERIC(=DECIMAL) '...'`.
 

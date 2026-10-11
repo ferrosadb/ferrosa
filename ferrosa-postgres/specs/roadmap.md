@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-10-10
+last_updated: 2026-10-11
 ---
 
 # ferrosa-postgres — Roadmap
@@ -13,6 +13,25 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **Aggregate RESULT types match PostgreSQL, and a `numeric` result is refused loud (I6/I7).**
+  `SELECT count(*)` advertised `int4` (OID 23) where PostgreSQL uses `int8`, so a client
+  reading `i64` failed `WrongType`; the same one-derivation defect left `SUM`/`AVG` deriving
+  the ARGUMENT's engine type (`sum(integer)⇒int4`, `avg⇒float8`) instead of PostgreSQL's
+  RESULT type. **Fix:** `ferrosa_sql::plan::aggregate_column` now derives PostgreSQL's real
+  types — `count`⇒int8, `sum(int2|int4)`⇒int8, `sum(int8|numeric)`⇒numeric,
+  `sum(float4|float8)`⇒float8, `avg(int2|int4|int8|numeric)`⇒numeric, `avg(float)⇒float8`,
+  `min`/`max`⇒the argument type. Both the `RowDescription` OID and the `DataRow` bytes come
+  from that one derivation, so they agree by construction. Where the RESULT type is `numeric`
+  the engine has no numeric-valued result yet and the wire layer has no binary numeric codec
+  (`pg_types`), so `query::encode_value` now refuses the DECLARED `numeric` column
+  (`0A000`, `feature_not_supported`) rather than emit `int`/`float` bytes under OID 1700 —
+  fail loud beats a silent wrong type. Tests:
+  `pg_ddl_create_table::count_star_is_reported_and_encoded_as_int8`,
+  `derived_columns_advertise_the_oid_their_bytes_carry` (sum⇒int8, read `i64`),
+  `numeric_typed_aggregates_fail_loud_instead_of_mislabelling_bytes` (sum(bigint)/avg(int)
+  ⇒ `0A000`); `ferrosa_sql` `plan::tests::derived_aggregate_column_types_match_postgres_on_both_paths`.
+  **Residual:** the exact numeric accumulator is FMEA SQL-6 (integer sums still accumulate in
+  `i64`); binary numeric is still roadmap Next.
 - **The `SELECT` read path consults the cluster (FMEA PG-READ-01).** `produce_scan` opened
   `StorageEngine::range_iter` on this node's local `TableStore` and never fanned a scan across
   the ring, so a read was complete only while the keyspace was replicated to every node it

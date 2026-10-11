@@ -1007,16 +1007,18 @@ async fn count_star_is_reported_and_encoded_as_int8() {
 }
 
 /// I7 — a computed/aggregate column is the GENERAL case. The invariant is not
-/// "count(*) is int8"; it is that every DERIVED column's advertised OID is the
-/// type its bytes are encoded as, so a client reading the matching Rust type
+/// "count(*) is int8"; it is that every DERIVED column's advertised OID is
+/// PostgreSQL's RESULT type for that aggregate, and that OID is the type its
+/// bytes are encoded as, so a client reading the matching Rust type
 /// deserializes. This SELECT derives several distinct aggregates through the
 /// SAME derivation path (`ferrosa_sql::plan::aggregate_column`), so a
 /// special-case fix for `count` alone would leave the rest unchecked.
 ///
-/// Derived here: `count(*)` -> int8; `min`/`max`/`sum` over an `integer`
-/// argument -> int4 (the argument's engine type). Each is read back with the Rust
-/// type its advertised OID names — the deserialization only succeeds if the OID
-/// and the bytes agree.
+/// Derived here, matching PostgreSQL exactly: `count(*)` -> int8;
+/// `min`/`max` over an `integer` argument -> int4 (the argument's engine type);
+/// `sum(integer)` -> int8 (PostgreSQL widens an int4 sum to int8). Each is read
+/// back with the Rust type its advertised OID names — the deserialization only
+/// succeeds if the OID and the bytes agree.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn derived_columns_advertise_the_oid_their_bytes_carry() {
     let fx = start().await;
@@ -1042,7 +1044,7 @@ async fn derived_columns_advertise_the_oid_their_bytes_carry() {
         ("count", Type::INT8),
         ("min", Type::INT4),
         ("max", Type::INT4),
-        ("sum", Type::INT4),
+        ("sum", Type::INT8),
     ];
     assert_eq!(columns.len(), expected.len());
     for (i, (name, want)) in expected.iter().enumerate() {
@@ -1058,5 +1060,63 @@ async fn derived_columns_advertise_the_oid_their_bytes_carry() {
     assert_eq!(row.get::<_, i64>(0), 3, "count");
     assert_eq!(row.get::<_, i32>(1), 1, "min");
     assert_eq!(row.get::<_, i32>(2), 3, "max");
-    assert_eq!(row.get::<_, i32>(3), 60, "sum");
+    // sum(integer) is int8 in PostgreSQL: read back as i64.
+    assert_eq!(row.get::<_, i64>(3), 60, "sum");
+}
+
+/// I6b — where PostgreSQL's result type is `numeric` (`sum(int8)`,
+/// `sum(numeric)`, and every `avg` over an integer/numeric argument) the engine
+/// has no numeric-valued result and the PG wire layer has no binary numeric
+/// codec (`pg_types::for_column_type(Numeric).binary == false`). The front end
+/// MUST fail loud (`0A000`, feature_not_supported) on the DECLARED numeric type
+/// rather than hand the driver `int`/`float` bytes under OID 1700, which it would
+/// decode as garbage. A silent wrong type is the one outcome that is not
+/// acceptable, so the refusal is asserted through a real client, which requests
+/// binary results — the format where the mislabelling would otherwise happen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn numeric_typed_aggregates_fail_loud_instead_of_mislabelling_bytes() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE numagg (aid bigint, aval integer)")
+        .await
+        .expect("a PK-less CREATE TABLE executes");
+    fx.client
+        .batch_execute("INSERT INTO numagg (aid, aval) VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("rows land");
+
+    // `sum(bigint)` -> numeric in PostgreSQL, never int8 bytes under OID 1700.
+    let err = fx
+        .client
+        .query("SELECT sum(aid) FROM numagg", &[])
+        .await
+        .expect_err("sum(bigint) types as numeric, which this front end cannot encode");
+    assert_numeric_refused(&err, "sum(bigint)");
+
+    // `avg(integer)` -> numeric in PostgreSQL: also refused.
+    let err = fx
+        .client
+        .query("SELECT avg(aval) FROM numagg", &[])
+        .await
+        .expect_err("avg(integer) types as numeric, which this front end cannot encode");
+    assert_numeric_refused(&err, "avg(integer)");
+}
+
+/// Assert the client surfaced the front end's fail-loud refusal: a server-side
+/// `ErrorResponse` with SQLSTATE `0A000` whose message names `numeric`.
+fn assert_numeric_refused(err: &tokio_postgres::Error, what: &str) {
+    let db = err
+        .as_db_error()
+        .unwrap_or_else(|| panic!("{what}: expected a server ErrorResponse, got {err:?}"));
+    assert_eq!(
+        db.code(),
+        &tokio_postgres::error::SqlState::FEATURE_NOT_SUPPORTED,
+        "{what}: the refusal must be 0A000 (feature_not_supported), not {:?}: {err}",
+        db.code()
+    );
+    assert!(
+        db.message().contains("numeric"),
+        "{what}: the refusal must name the type it cannot encode: {}",
+        db.message()
+    );
 }

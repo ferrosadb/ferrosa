@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 doc: roadmap
-last_updated: 2026-10-09
+last_updated: 2026-10-11
 ---
 
 # ferrosa-sql — Roadmap
@@ -106,7 +106,10 @@ toward the Postgres queries real clients send.
   `DATE '2024-01-01'`. Fail loud on an uncoercible body.
 - **Integer SUM/AVG overflow safety + `Numeric` aggregation** (FMEA SQL-6).
   Promote integer running sums to `BigInt`/checked add and feed `Numeric`
-  columns through `add_numeric`.
+  columns through `add_numeric`. Done alongside: the derived RESULT type now
+  matches PostgreSQL (`sum(int2|int4)⇒int8`, `sum(int8|numeric)⇒numeric`,
+  `avg(int2|int4|int8|numeric)⇒numeric`), and the PG front end refuses to encode
+  a `numeric`-declared result (`0A000`) instead of mislabelling the bytes.
 - **(done) Arithmetic `UPDATE ... SET`** (FMEA SQL-ARITH-1). The `+`/`-` lexer
   tokens (placed after the numeric-literal arm so `-123` stays one literal) and
   the `SetExpr{Value,Column,Binary}` / `ArithOp{Add,Sub,Mul}` grammar let

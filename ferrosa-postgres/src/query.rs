@@ -725,6 +725,25 @@ pub fn encode_value(
     if format != 1 {
         return render_value(v); // text format: reuse the existing renderer
     }
+    // SQL NULL has no bytes in any format.
+    if v.is_null() {
+        return Ok(None);
+    }
+    // A `numeric`-declared column has NO binary codec
+    // (`pg_types::for_column_type(Numeric).binary == false`), and a computed
+    // column that PostgreSQL types as `numeric` (`sum(int8)`, `sum(numeric)`,
+    // `avg(int2|int4|int8|numeric)`) carries an `Int`/`Float` engine value, not
+    // a `Numeric`. Emitting those bytes under OID 1700 would hand the driver a
+    // value it decodes wrongly, so refuse LOUDLY (`0A000`,
+    // feature_not_supported) instead of mislabelling them. This is the same
+    // rule the `SqlValue::Numeric` arm below enforces for a numeric VALUE; here
+    // it is keyed on the DECLARED type, so a non-numeric value can no longer
+    // slip out under a numeric OID.
+    if col_type == ColumnType::Numeric {
+        return Err(EncodeError::unsupported(
+            "binary result format for numeric is not implemented",
+        ));
+    }
     Ok(match v {
         SqlValue::Null => None,
         SqlValue::Int(i) => Some(encode_int_binary(col_type, *i)?),

@@ -955,20 +955,61 @@ fn intern_agg(
     agg_defs.len() - 1
 }
 
-/// The output column for an aggregate: name `count`/`sum`/`min`/`max`/`avg`.
+/// The output column for an aggregate, typed as **PostgreSQL** types it.
+///
 /// COUNT is always `BigInt` (PostgreSQL's `count()` is `int8` — its result can
 /// exceed `int4`, and a driver reading `i64` deserializes on the strength of the
-/// advertised OID); AVG is always `Float`; SUM and MIN/MAX take the argument
-/// column's type.
+/// advertised OID). SUM and AVG follow PostgreSQL's result-type rules, NOT the
+/// argument's engine type; MIN/MAX take the argument's engine type:
+///
+/// * `sum(int2 | int4)` -> `int8`; `sum(int8 | numeric)` -> `numeric`;
+///   `sum(float4 | float8)` -> `float8`;
+/// * `avg(int2 | int4 | int8 | numeric)` -> `numeric`;
+///   `avg(float4 | float8)` -> `float8`.
+///
+/// The engine carries one integer value type (`Value::Int`, an `i64`) for both
+/// `int4` and `int8` columns and one float value type (`Value::Float`, an `f64`)
+/// for `float4`/`float8`; the PG wire layer picks the byte width from THIS
+/// derived column type, so `sum(int4) -> int8` is encoded (and read) as an
+/// 8-byte int8 by construction. A `numeric` result has no numeric-valued engine
+/// result yet and no binary codec, so the front end refuses to encode it
+/// (loudly, `0A000`) rather than mislabel `int`/`float` bytes under OID 1700 —
+/// see `ferrosa_postgres::query::encode_value`.
 fn aggregate_column(func: AggFunc, arg_col: Option<usize>, schema: &RelSchema) -> Column {
     let (name, ty) = match func {
         AggFunc::Count => ("count", ColumnType::BigInt),
-        AggFunc::Sum => ("sum", arg_ty(arg_col, schema)),
-        AggFunc::Avg => ("avg", ColumnType::Float),
+        AggFunc::Sum => ("sum", sum_result_type(arg_ty(arg_col, schema))),
+        AggFunc::Avg => ("avg", avg_result_type(arg_ty(arg_col, schema))),
         AggFunc::Min => ("min", arg_ty(arg_col, schema)),
         AggFunc::Max => ("max", arg_ty(arg_col, schema)),
     };
     Column::new(name, ty)
+}
+
+/// PostgreSQL's result type for `sum(arg)` (see [`aggregate_column`]).
+fn sum_result_type(arg: ColumnType) -> ColumnType {
+    match arg {
+        // A sum of int4 can exceed int4, so PostgreSQL widens to int8.
+        ColumnType::Int => ColumnType::BigInt,
+        // A sum of int8 can exceed int8, so PostgreSQL widens to numeric.
+        ColumnType::BigInt | ColumnType::Numeric => ColumnType::Numeric,
+        // The engine has one float type; sum(float4|float8) is float8.
+        ColumnType::Float => ColumnType::Float,
+        // No PostgreSQL `sum` is defined for the remaining types; keep the
+        // argument's type rather than invent one here.
+        other => other,
+    }
+}
+
+/// PostgreSQL's result type for `avg(arg)` (see [`aggregate_column`]).
+fn avg_result_type(arg: ColumnType) -> ColumnType {
+    match arg {
+        // Every integer/numeric average is exact in PostgreSQL: numeric.
+        ColumnType::Int | ColumnType::BigInt | ColumnType::Numeric => ColumnType::Numeric,
+        // avg(float4|float8) -> float8 (the engine's one float type).
+        ColumnType::Float => ColumnType::Float,
+        other => other,
+    }
 }
 
 fn arg_ty(arg_col: Option<usize>, schema: &RelSchema) -> ColumnType {
@@ -1355,19 +1396,20 @@ mod tests {
     /// `describe` (the `RowDescription` a client deserializes against) and
     /// `execute` (the row bytes it deserializes) read. So the agreement check
     /// belongs on the derivation, not on `count(*)` alone: a special-case fix for
-    /// `count` would leave every other derived type unchecked. COUNT is
-    /// PostgreSQL's `int8` (a driver reading `i64` must work, and a count can
-    /// exceed `int4`); SUM/MIN/MAX take the argument's engine type; AVG is
-    /// `float8`. Asserted on BOTH paths so they cannot drift.
+    /// `count` would leave every other derived type unchecked. Every type here is
+    /// PostgreSQL's RESULT type: COUNT is `int8` (a driver reading `i64` must
+    /// work, and a count can exceed `int4`); `sum(int4)` is `int8`;
+    /// `avg(int4)` is `numeric`; MIN/MAX take the argument's engine type.
+    /// Asserted on BOTH paths so they cannot drift.
     #[test]
     fn derived_aggregate_column_types_match_postgres_on_both_paths() {
         let sql = "SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount), AVG(amount) FROM sales";
         let want = [
             ("count", ColumnType::BigInt),
-            ("sum", ColumnType::Int),
+            ("sum", ColumnType::BigInt),
             ("min", ColumnType::Int),
             ("max", ColumnType::Int),
-            ("avg", ColumnType::Float),
+            ("avg", ColumnType::Numeric),
         ];
         let described_all = describe(&parse(sql).unwrap(), &sales_catalog(), "public").unwrap();
         let described: Vec<(&str, ColumnType)> = described_all
@@ -1531,7 +1573,7 @@ mod tests {
             [
                 ("region", ColumnType::Text),
                 ("count", ColumnType::BigInt),
-                ("sum", ColumnType::Int),
+                ("sum", ColumnType::BigInt),
             ]
         );
         // east: count 2, sum 30; west: count 2, sum 5 (one NULL ignored).
@@ -1547,11 +1589,16 @@ mod tests {
 
     #[test]
     fn avg_ungrouped_gives_fractional_float() {
-        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 11.666...
+        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 11.666... The
+        // derived column type is PostgreSQL's `numeric` (avg(int4) -> numeric);
+        // the engine's VALUE representation is still an f64, which the PG front
+        // end refuses to encode as numeric rather than mislabel the bytes (see
+        // `ferrosa_postgres::query::encode_value`). An exact numeric accumulator
+        // is tracked as FMEA SQL-6.
         let r = run_sales("SELECT AVG(amount) FROM sales");
         assert_eq!(r.columns.len(), 1);
         assert_eq!(r.columns[0].name, "avg");
-        assert_eq!(r.columns[0].ty, ColumnType::Float);
+        assert_eq!(r.columns[0].ty, ColumnType::Numeric);
         let Value::Float(of) = &r.rows[0].0[0] else {
             panic!("expected float avg");
         };
@@ -1566,7 +1613,7 @@ mod tests {
                 .iter()
                 .map(|c| (c.name.as_str(), c.ty))
                 .collect::<Vec<_>>(),
-            [("region", ColumnType::Text), ("avg", ColumnType::Float)]
+            [("region", ColumnType::Text), ("avg", ColumnType::Numeric)]
         );
         // east: (10+20)/2 = 15.0; west: 5/1 = 5.0 (NULL ignored).
         assert_eq!(
