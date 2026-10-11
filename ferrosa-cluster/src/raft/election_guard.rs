@@ -58,6 +58,26 @@
 //! Two failed elections without log progress over 30 s is unambiguous storm
 //! regardless of within-poll delta.
 //!
+//! ## When the guard is allowed to fire — recent leader contact
+//!
+//! Suppression only helps if a LIVE leader exists to catch the divergent
+//! follower up.  A node cannot ask the cluster whether that is true, and a node
+//! with no leader is *always* a `Candidate` with a stalled log — locally
+//! identical to a divergent follower a healthy leader is about to repair.  Gating
+//! the detectors on `metrics.current_leader.is_some()` therefore silenced them in
+//! exactly the case they exist for: a divergent follower isolated from a leader it
+//! can no longer hear reports `current_leader == None` too, so both detectors went
+//! quiet and the follower stormed on (the 2026-10-11 regression).
+//!
+//! The two cases differ only in *time since last leader contact*.  So the guard
+//! tracks when it last observed a leader and suppresses only while that is within
+//! `LEADER_CONTACT_WINDOW_MS`.  In a leaderless outage no node has seen a leader
+//! for far longer than the window, so all suppression lapses and the cluster
+//! re-elects; a divergent follower was following its leader moments ago, so it is
+//! still suppressed and the leader catches it up.  The window starts at the guard's
+//! own start too, because the guard is spawned at node bootstrap — a freshly
+//! (re)joined node is given one window of grace before the guard gives up on it.
+//!
 //! ## Suppression duration
 //!
 //! Elections are re-enabled after at most `STORM_SUPPRESS_MS` milliseconds
@@ -110,6 +130,34 @@ pub fn election_storm_term_jumps_total() -> u64 {
 /// re-enabled regardless of whether the node has become a follower.
 const STORM_SUPPRESS_MS: u64 = 60_000;
 
+/// How long an observed leader keeps the guard willing to suppress (ms).
+///
+/// Suppression exists so a LIVE leader can catch a divergent follower up, so it
+/// is justified only while the node has had leader contact recently.  A node
+/// cannot ask the cluster whether a leader exists — and a leaderless node is
+/// *always* a `Candidate` with a stalled log, locally indistinguishable from a
+/// divergent follower a healthy leader is about to repair.  The two cases differ
+/// only in the *time since last leader contact*: a divergent follower was
+/// following its leader seconds ago, whereas in a leaderless outage no node has
+/// seen a leader for far longer.  The guard therefore suppresses only while it
+/// has observed `current_leader.is_some()` within this window.
+///
+/// Bound — why `STORM_SUPPRESS_MS`:
+///
+///  * Too short and the guard is disabled in the very case it was written for.
+///    A full production-cadence detection cycle is `ROLLING_WINDOW_MS` (30 s,
+///    for the window to become all-`Candidate`) plus the two rejected elections
+///    the detector needs (`>= 2 * election_timeout_max`, ~12 s at the 6 s fleet
+///    maximum) ≈ 42 s.  The window must clear 42 s, so the existing
+///    `ROLLING_WINDOW_MS` (30 s) is too tight by construction.
+///  * Too long and it re-opens the outage.  The 2026-10-11 leaderless stretch
+///    was ~35 min; 60 s is ~35× shorter, so a node that loses its leader always
+///    stops suppressing long before an outage could repeat. `STORM_SUPPRESS_MS`
+///    (60 s) clears 42 s with 1.4× margin and is already the guard's suppression
+///    quantum, so a divergent follower gets exactly one suppression window of
+///    grace after the last leader contact and no more.
+const LEADER_CONTACT_WINDOW_MS: u64 = STORM_SUPPRESS_MS;
+
 /// Watchdog poll interval (milliseconds).
 ///
 /// One observation per interval; burst storm is detected when `current_term`
@@ -144,42 +192,65 @@ const ROLLING_WINDOW_MIN_JUMPS: u64 = 2;
 // ---------------------------------------------------------------------------
 //
 // Extracted from the poll loop so the guard's decisions are testable without a
-// live `Raft` instance.  Both are pure: same inputs, same answer, no I/O.
+// live `Raft` instance.  All are pure: same inputs, same answer, no I/O.
 //
-// # Invariant — never mute a leaderless cluster
+// # Invariants
 //
-// Suppression exists so a LIVE leader can catch a divergent follower up.  With
-// no leader there is nothing to catch up from, and every node in the cluster
-// sees the same signature at the same time (a leaderless node is always a
-// `Candidate` with a stalled log).  Muting all of them leaves the cluster with
-// no node willing to call an election, so the guard *prolongs* the outage it
-// was added to shorten.  Neither detector may fire while `has_leader` is false.
+//   1. A node that has had no leader contact within `LEADER_CONTACT_WINDOW_MS`
+//      is never muted, so a genuinely leaderless cluster always regains a
+//      willing candidate within one window and the 2026-10-11 outage cannot
+//      recur.
+//   2. A divergent follower whose log is stale, on a cluster with a live leader
+//      (so it saw that leader within the window), IS muted so the leader can
+//      catch it up.
+//   3. Neither depends on global cluster state: a node only ever consults its
+//      own `current_leader` observations and its own clock.
+//
+// Both detectors gate on `leader_recently`, which is
+// [`leader_contact_is_recent`] evaluated over this node's last leader
+// observation.  Gating on `metrics.current_leader.is_some()` directly was the
+// bug: it is `None` both in a leaderless outage AND on a divergent follower that
+// is isolated from a live leader, so it silenced the detector in the very case
+// it exists for.
+
+/// Whether a leader was observed recently enough that suppressing elections is
+/// still justified — i.e. a live leader was seen within `window` and can catch a
+/// divergent follower up.  Pure and lock-free; `saturating_duration_since` keeps
+/// a clock that stepped backwards from panicking.
+pub(crate) fn leader_contact_is_recent(
+    now: Instant,
+    last_leader_seen: Instant,
+    window: Duration,
+) -> bool {
+    now.saturating_duration_since(last_leader_seen) < window
+}
 
 /// Fast-path burst detector (P0-17): two or more elections fired and were
 /// rejected inside one poll window while this node was a `Candidate`, with no
-/// log progress.
+/// log progress, and a leader was seen recently enough to repair the divergence.
 pub(crate) fn burst_storm(
     state: ServerState,
     term_delta: u64,
     log_advanced: bool,
-    has_leader: bool,
+    leader_recently: bool,
 ) -> bool {
-    has_leader
+    leader_recently
         && state == ServerState::Candidate
         && term_delta > TERM_JUMP_THRESHOLD
         && !log_advanced
 }
 
 /// Slow-path rolling-window detector (P0-19): every sample in the window was a
-/// `Candidate`, at least [`ROLLING_WINDOW_MIN_JUMPS`] elections fired, and the
-/// log did not advance.
+/// `Candidate`, at least [`ROLLING_WINDOW_MIN_JUMPS`] elections fired, the log
+/// did not advance, and a leader was seen recently enough to repair the
+/// divergence.
 pub(crate) fn rolling_window_storm(
     all_candidate: bool,
     total_jumps: u64,
     log_stalled: bool,
-    has_leader: bool,
+    leader_recently: bool,
 ) -> bool {
-    has_leader && all_candidate && total_jumps >= ROLLING_WINDOW_MIN_JUMPS && log_stalled
+    leader_recently && all_candidate && total_jumps >= ROLLING_WINDOW_MIN_JUMPS && log_stalled
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +303,17 @@ pub async fn run_election_guard<C>(
     let mut suppressing = false;
     let mut suppress_until = tokio::time::Instant::now();
 
+    // Leader-contact epoch.  Seeded to "now" because the guard is spawned at node
+    // bootstrap (`controller::cluster`), so a node that has *just* come up is
+    // presumed to be joining a cluster that still has (or is about to elect) a
+    // leader.  Refreshed on every poll that observes a leader; once it ages past
+    // LEADER_CONTACT_WINDOW_MS the guard stops suppressing, so a genuinely
+    // leaderless cluster always regains a willing candidate within one window.
+    let mut last_leader_seen: Instant = Instant::now();
+
     let poll = Duration::from_millis(POLL_INTERVAL_MS);
     let rolling_window = Duration::from_millis(ROLLING_WINDOW_MS);
+    let leader_window = Duration::from_millis(LEADER_CONTACT_WINDOW_MS);
 
     // Rolling window buffer — oldest samples at front, newest at back.
     let mut window: VecDeque<Sample> = VecDeque::new();
@@ -244,6 +324,7 @@ pub async fn run_election_guard<C>(
         term_jump_threshold = TERM_JUMP_THRESHOLD,
         rolling_window_ms = ROLLING_WINDOW_MS,
         rolling_window_min_jumps = ROLLING_WINDOW_MIN_JUMPS,
+        leader_contact_window_ms = LEADER_CONTACT_WINDOW_MS,
         suppress_ms = STORM_SUPPRESS_MS,
         "election_guard: watchdog started"
     );
@@ -264,11 +345,17 @@ pub async fn run_election_guard<C>(
         let current_term = metrics.current_term;
         let current_log_index = metrics.last_log_index;
         let state = metrics.state;
-        // A storm can only be ridden out by a LIVE leader catching a divergent
-        // follower up.  With no leader there is nothing to catch up from, and
-        // muting elections on every node at once is exactly what keeps a
-        // leaderless cluster leaderless — so the detectors must not fire.
-        let has_leader = metrics.current_leader.is_some();
+        // Refresh the leader-contact epoch whenever a leader is current, then ask
+        // whether suppression is still justified.  A storm can only be ridden out
+        // by a LIVE leader catching a divergent follower up; a leaderless node is
+        // *always* a `Candidate` with a stalled log, so a bare `current_leader`
+        // test cannot tell "the cluster has no leader" (never suppress) from "this
+        // node is isolated from a live leader it saw moments ago" (suppress).  The
+        // age of the last leader observation is the only local signal that does.
+        if metrics.current_leader.is_some() {
+            last_leader_seen = now;
+        }
+        let leader_recently = leader_contact_is_recent(now, last_leader_seen, leader_window);
 
         // --- Re-enable elections if suppress window expired ---
         if suppressing && tokio::time::Instant::now() >= suppress_until {
@@ -299,7 +386,7 @@ pub async fn run_election_guard<C>(
         // Two or more elections fired and were rejected within a single 1-second
         // poll window.  Catches short election_timeout_min scenarios.
         let log_advancing = current_log_index != prev_log_index;
-        let burst_storm = burst_storm(state, term_delta, log_advancing, has_leader);
+        let burst_storm = burst_storm(state, term_delta, log_advancing, leader_recently);
 
         if burst_storm {
             fire_suppression(
@@ -358,7 +445,7 @@ pub async fn run_election_guard<C>(
             let log_stalled = window_end.log_index == window_start.log_index;
 
             let slow_storm =
-                rolling_window_storm(all_candidate, total_jumps, log_stalled, has_leader);
+                rolling_window_storm(all_candidate, total_jumps, log_stalled, leader_recently);
 
             if slow_storm {
                 fire_suppression(
@@ -557,5 +644,70 @@ mod tests {
     fn rolling_window_threshold_is_inclusive_at_two_jumps() {
         assert!(rolling_window_storm(true, 2, true, true));
         assert!(!rolling_window_storm(true, 1, true, true));
+    }
+
+    // --- Leader-contact window: the signal that separates (A) from (B) -------
+
+    /// The epoch predicate is what distinguishes the two locally-identical
+    /// `Candidate`-with-stalled-log states:
+    ///
+    ///  * (B) divergent follower — a live leader was seen seconds ago → recent →
+    ///    suppression is allowed so that leader can catch the follower up; and
+    ///  * (A) leaderless outage — no leader seen for far longer than the window →
+    ///    not recent → suppression lapses and the cluster can re-elect.
+    ///
+    /// Asserted on values (the boolean), not on counts.
+    #[test]
+    fn suppression_is_allowed_only_within_the_leader_contact_window() {
+        let window = Duration::from_millis(LEADER_CONTACT_WINDOW_MS);
+        let t0 = Instant::now();
+
+        // (B) leader seen 3 s ago — a divergent follower the leader is repairing.
+        assert!(
+            leader_contact_is_recent(t0 + Duration::from_secs(3), t0, window),
+            "contact 3 s ago must keep suppression allowed so the leader can catch up"
+        );
+        // (B) at production cadence the last contact can be ~30 s old by the time
+        // the rolling window fires; that must still be allowed.
+        assert!(
+            leader_contact_is_recent(t0 + Duration::from_secs(30), t0, window),
+            "contact 30 s ago is within the window and must still suppress"
+        );
+        // (A) leaderless outage — no leader for 10 min, far past the window.
+        assert!(
+            !leader_contact_is_recent(t0 + Duration::from_secs(600), t0, window),
+            "a node leaderless for minutes must stop suppressing so the cluster re-elects"
+        );
+        // The window is exclusive at exactly one window.
+        assert!(!leader_contact_is_recent(t0 + window, t0, window));
+        assert!(leader_contact_is_recent(
+            t0 + window - Duration::from_millis(1),
+            t0,
+            window
+        ));
+    }
+
+    /// The window must clear one full production-cadence detection cycle
+    /// (`ROLLING_WINDOW_MS` to become all-`Candidate` plus two rejected elections),
+    /// or the guard dies in the very case it exists for — and it must stay far
+    /// below the ~35 min leaderless stretch of the 2026-10-11 outage, or it
+    /// re-opens it.  Pinned so a future edit that moves the bound fails loudly.
+    #[test]
+    fn leader_contact_window_spans_a_detection_cycle_but_not_the_outage() {
+        let window = Duration::from_millis(LEADER_CONTACT_WINDOW_MS);
+        // 30 s of rolling window + two rejected elections at the 6 s fleet
+        // maximum = 42 s.
+        let detection_cycle = Duration::from_millis(ROLLING_WINDOW_MS) + Duration::from_secs(2 * 6);
+        assert!(
+            window > detection_cycle,
+            "leader-contact window ({window:?}) must exceed one detection cycle \
+             ({detection_cycle:?}) or the guard is disabled in the divergent-follower case"
+        );
+        // The window must stay far shorter than the ~35 min leaderless outage.
+        let outage = Duration::from_secs(35 * 60);
+        assert!(
+            window * 10 < outage,
+            "leader-contact window ({window:?}) must stay far shorter than the ~35 min outage"
+        );
     }
 }

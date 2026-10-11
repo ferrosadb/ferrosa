@@ -313,12 +313,17 @@ build; the codec's own cost is its delta against `none`.
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.
   Both detectors are pure predicates (`burst_storm`, `rolling_window_storm`) and
-  both take `has_leader`: suppression exists so a LIVE leader can catch a
-  divergent follower up, so the guard never fires while `metrics.current_leader`
-  is `None`. A leaderless node is *always* a `Candidate` with a stalled log, so
-  without that gate every node in a leaderless cluster mutes its own elections at
-  the same instant and the guard holds the outage open instead of shortening it.
-  Pinned by `raft::election_guard::tests`.
+  both gate on `leader_recently` — whether this node observed a leader within
+  `LEADER_CONTACT_WINDOW_MS` (60 s = `STORM_SUPPRESS_MS`), seeded at guard start
+  (`leader_contact_is_recent`). Suppression exists so a LIVE leader can catch a
+  divergent follower up, but `metrics.current_leader` is `None` both in a
+  leaderless cluster AND on a divergent follower isolated from a live leader, so it
+  cannot gate the guard directly: gating on it (the first fix, `736fb0b4`) silenced
+  the detectors in the very case they exist for. The only node-local separator is
+  the *age* of the last leader observation — a divergent follower saw its leader
+  seconds ago → suppress; a leaderless outage has seen none for minutes → do not,
+  so the cluster re-elects and the 2026-10-11 outage cannot recur. Pinned by
+  `raft::election_guard::tests` and `tests/raft_election_storm.rs`.
 - `consensus_metrics.rs` — Prometheus surface for Raft liveness:
   `ferrosa_raft_current_term` / `_is_leader` / `_has_leader` (fed by
   `run_consensus_metrics_poller`, a per-cluster-node task that derives leadership
