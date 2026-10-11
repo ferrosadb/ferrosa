@@ -784,6 +784,22 @@ impl ModeController {
         self.config.expected_cluster_size
     }
 
+    /// The cluster size this node has actually COMMITTED to — itself plus the
+    /// peers it invited/joined when it last entered formation — or `0` before any
+    /// formation.
+    ///
+    /// Unlike [`Self::expected_cluster_size`], which is only an operator
+    /// declaration, this is the membership the node can really be read from. The
+    /// PostgreSQL-wire front end answers every `SELECT` from LOCAL storage only
+    /// (`storage_provider::produce_scan` never fans a range read across the ring),
+    /// so its default keyspace must be replicated to this many nodes or a scan
+    /// silently returns a fraction of the committed rows. See
+    /// `postgres_default_keyspace_replication_factor_for_cluster`.
+    pub fn committed_cluster_size(&self) -> usize {
+        self.committed_cluster_size
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether declared deployment state permits a native-protocol connection.
     /// Consensus health is intentionally excluded: a failed node must still
     /// answer OPTIONS/STARTUP and return typed errors for data opcodes.

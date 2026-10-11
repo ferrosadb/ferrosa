@@ -266,7 +266,45 @@ Two harness traps are load-bearing and easy to re-derive wrongly:
   host ids that differ only in the trailing group collide on one Accord node id
   and every write fails `unknown peer`. The test repeats `0x11/0x22/0x33` across
   all sixteen bytes, as `tests/docker-compose.cluster.yml` does.
-- **Seeding must be a full mesh.** Every node seeds off the other two so the
-  auto-created `public` keyspace is RF=3 (`seeds + 1`). A star topology leaves it
-  RF=1 and an Accord write that resolves to the coordinator's own host fails
-  `Accord quorum unavailable`.
+- **`public` must cover the cluster; this harness gets that from a full mesh.**
+  Every node here seeds off the other two, so the auto-created `public` keyspace
+  is RF=3 and an Accord write has two remote replicas to reach a quorum from. The
+  factor is `max(seeds + 1, FERROSA_EXPECTED_CLUSTER_SIZE, committed cluster
+  size)` (never below 1) — sizing it from the seed list ALONE was the live defect
+  described in the next subsection.
+
+### PostgreSQL default-keyspace replication (real-process)
+
+`tests/pg_public_keyspace_rf_process.rs` is the process-level red for the
+PostgreSQL-wire **read** defect behind the reported `INSERT 0 2` / one-row
+SELECT. It spawns three real `ferrosa` binaries in a **star** (node 0 carries no
+seed; nodes 1 and 2 seed off it), gives every node
+`FERROSA_EXPECTED_CLUSTER_SIZE=3`, and drives `INSERT … VALUES (…),(…)` then
+`SELECT` over the wire **from the node with no seed**.
+
+The PostgreSQL front end answers every `SELECT` from this node's LOCAL
+`TableStore` (`storage_provider::produce_scan` never fans a range read across the
+ring), so `public` must be replicated to every node the scan is served from —
+otherwise a committed row is invisible on a non-owner node. `main` sized it from
+the `[internode] seed` list alone (`seeds + 1`), so a node with no seed — the seed
+node of a star, and every node of the live `maas-loadtest` cluster — got **RF=1**:
+one owner per partition, a scan that returns its own third. The write is complete;
+the read is not. It is not data loss.
+
+The red asserts the **values** of every seeded row, never a count (a count check
+passes the defect: the INSERT reported all of them). PRE-change the star's node 0
+returned one of five rows; FIXED it returns all five, because the derivation is
+`max(seeds, expected, committed)`.
+
+Two operational consequences are load-bearing:
+
+- **`FERROSA_EXPECTED_CLUSTER_SIZE` (or a full-mesh seed list) must be set so the
+  factor is right on the FIRST creation.** An existing `public` cannot be repaired
+  in place — there is no `ALTER KEYSPACE` — so a cluster that already created it at
+  RF=1 must **re-create the keyspace while it runs**. A boot guard
+  (`postgres_default_keyspace_is_undersized`, driven by `undersized_guard_sweep`)
+  re-verifies the factor on a bounded schedule and logs one actionable ERROR per
+  distinct under-sized condition; it clears once the keyspace is re-created.
+- **RF=3 raises the cost of every write.** At RF=1 a write lands on one owner; at
+  RF=3 the same write fans out to all three nodes. The fix removes a
+  silent-wrong-read hole and moves that cost onto the write path.

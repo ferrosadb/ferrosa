@@ -513,6 +513,16 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
 - `DeploymentMode` + `ModeController` — the `Standalone → Pair → Forming →
   Cluster` state machine with degraded states; `ClusterStateHolder` dispatches
   `SingleNode` / `Pair` / `Raft` cluster state.
+- `ModeController::expected_cluster_size()` (the operator's
+  `FERROSA_EXPECTED_CLUSTER_SIZE` declaration) and `committed_cluster_size()`
+  (the membership the node has actually committed to — itself plus the peers it
+  invited/joined at last formation — or `0` before any formation) are the two
+  sizes the PostgreSQL front end's default `public` keyspace is sized from:
+  `max(seeds + 1, expected, committed)`. The seed list alone is not enough — a
+  cluster formed by the controller carries no `[internode] seed`, so the seed-only
+  rule left `public` at RF=1 and, because the PG read path answers only from local
+  storage, a wire `SELECT` returned a fraction of the committed rows (FMEA FE-17
+  in `ferrosa`).
 - `controller/bootstrap/` — 8-phase formation pipeline (DeliverInvites →
   EstablishPools → CreateRaft → WaitLeader → ReplaySchema → BootstrapStream →
   Promote → DrainQueue). ReplaySchema re-sends local user schema to the

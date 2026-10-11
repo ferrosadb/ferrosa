@@ -637,6 +637,107 @@ fn postgres_default_keyspace_replication_factor(configured_seeds: usize) -> usiz
     configured_seeds.saturating_add(1)
 }
 
+/// The replication factor the PostgreSQL default keyspace must carry so this
+/// node's LOCAL-only scan is complete, given everything the node actually knows
+/// about its cluster.
+///
+/// [`postgres_default_keyspace_replication_factor`] sizes the keyspace from the
+/// `[internode] seed` list alone. That is only sufficient when the operator
+/// configured every node to seed every other. A cluster formed by the controller
+/// (invite/mesh formation) configures **no** seeds — the live `maas-loadtest`
+/// nodes run with an empty seed list — so the seed-derived factor was `1`, every
+/// partition was placed on a single owner, and a 3-node `SELECT` returned one
+/// third of the rows that had committed. That is the `INSERT 0 2` / one-row
+/// visible defect: the write is complete, the read is not.
+///
+/// The factor therefore also takes the two sizes the node learns from its own
+/// cluster: the operator declaration ([`expected`]) and, decisively, the
+/// membership the node has actually committed to ([`committed`]) — both of which
+/// are non-zero by the time the ensure runs on a real cluster. `max` of the three
+/// (never below 1) so a larger cluster never gets a smaller keyspace.
+///
+/// [`expected`]: ferrosa_cluster::ModeController::expected_cluster_size
+/// [`committed`]: ferrosa_cluster::ModeController::committed_cluster_size
+#[must_use]
+fn postgres_default_keyspace_replication_factor_for_cluster(
+    configured_seeds: usize,
+    expected_cluster_size: usize,
+    committed_cluster_size: usize,
+) -> usize {
+    postgres_default_keyspace_replication_factor(configured_seeds)
+        .max(expected_cluster_size)
+        .max(committed_cluster_size)
+        .max(1)
+}
+
+/// The replication factor already carried by the PostgreSQL default keyspace, or
+/// `None` when the keyspace does not exist.
+fn postgres_default_keyspace_replication_of(schema: &ferrosa_schema::Schema) -> Option<usize> {
+    let snapshot = schema.snapshot();
+    let keyspace = snapshot.keyspaces.get(POSTGRES_DEFAULT_KEYSPACE)?;
+    Some(
+        keyspace
+            .replication
+            .options
+            .get("replication_factor")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1),
+    )
+}
+
+/// A `public` keyspace that EXISTS but cannot serve a complete scan from this
+/// node: it reports the too-small factor it carries.
+///
+/// The factor of an existing keyspace cannot be changed in place (there is no
+/// `ALTER KEYSPACE`); the repair is to re-create the keyspace while the cluster
+/// runs. This exists so the condition is LOUD at boot instead of surfacing as a
+/// scan that quietly returns fewer rows than were committed — the whole point of
+/// `postgres_default_keyspace_replication_factor_for_cluster` is that this state
+/// must never be reached.
+fn postgres_default_keyspace_is_undersized(
+    schema: &ferrosa_schema::Schema,
+    needed_replication_factor: usize,
+) -> Option<usize> {
+    let actual = postgres_default_keyspace_replication_of(schema)?;
+    (needed_replication_factor > 1 && actual < needed_replication_factor).then_some(actual)
+}
+
+/// One sweep of the under-sized-keyspace guard: decide whether to WARN now, and
+/// what to remember as already-reported.
+///
+/// Returns `(warn_now, next_reported)`. The rule is the whole point of the guard
+/// being a guard rather than a nag or a latch:
+///
+/// * **Once per distinct condition.** A condition is the pair
+///   `(actual_factor, required_factor)`. The same pair is reported once, however
+///   many sweeps it persists for.
+/// * **Re-verify, never latch.** A healed (or never under-sized) keyspace clears
+///   `next_reported`, so a *later* recurrence of the same pair warns again — the
+///   guard tracks the CURRENT state, not the first one it ever saw.
+/// * **Silent when the scan is complete.** `required < 2` is a genuine standalone
+///   node (or a cluster size not yet known): the local-only PostgreSQL scan IS
+///   complete there, and the guard must not cry wolf.
+///
+/// Pure and total, so this behaviour is unit-testable without a live cluster or a
+/// sleeping task.
+fn undersized_guard_sweep(
+    is_undersized: Option<usize>,
+    required: usize,
+    last_reported: Option<(usize, usize)>,
+) -> (bool, Option<(usize, usize)>) {
+    match is_undersized {
+        Some(actual) if required >= 2 => {
+            let now = (actual, required);
+            if last_reported == Some(now) {
+                (false, last_reported)
+            } else {
+                (true, Some(now))
+            }
+        }
+        _ => (false, None),
+    }
+}
+
 /// The action a boot-time ensure should take for a keyspace, given the keyspace
 /// is absent and the current DDL path kind. `Some(op)` means "create it through
 /// this DDL operation"; `None` means "wait" (the path cannot complete a creation).
@@ -699,7 +800,7 @@ fn ddl_path_kind_can_create_keyspace(kind: &str) -> bool {
 async fn ensure_postgres_default_keyspace(
     schema: &std::sync::Arc<ferrosa_schema::Schema>,
     ddl_path: &std::sync::Arc<arc_swap::ArcSwap<ferrosa_cluster::DdlPath>>,
-    replication_factor: usize,
+    replication_factor: impl Fn() -> usize,
 ) -> std::result::Result<bool, ferrosa_cluster::ClusterError> {
     // Nothing to do once the keyspace exists (any prior ensure, or a cluster DDL).
     if schema
@@ -720,7 +821,7 @@ async fn ensure_postgres_default_keyspace(
             let guard = ddl_path.load();
             guard.kind()
         };
-        if let Some(action) = default_keyspace_boot_action(kind, replication_factor) {
+        if let Some(action) = default_keyspace_boot_action(kind, replication_factor()) {
             op = Some(action);
             break;
         }
@@ -3293,29 +3394,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let schema = schema.clone();
             let ddl_path = shared_state.ddl_path.clone();
             // The PostgreSQL front end scans only THIS node's local storage, so
-            // its default keyspace must be replicated to every node it is
-            // configured to cluster with — itself plus its seeds — or a committed
-            // row is invisible on every non-owner node. See
-            // `postgres_default_keyspace_replication_factor`.
-            let pg_keyspace_rf = postgres_default_keyspace_replication_factor(
-                parse_seed_list(&config_val(
-                    "FERROSA_SEED",
-                    &file_config,
-                    "internode",
-                    "seed",
-                    "",
-                ))
-                .len(),
-            );
+            // its default keyspace must be replicated to EVERY node this node can
+            // be read from — otherwise a committed row is invisible on every
+            // non-owner node. The seed list is only ONE of the three sizes the node
+            // knows; a controller-formed cluster (the live `maas-loadtest` nodes)
+            // configures no seeds at all, and sizing the keyspace from seeds alone
+            // created `public` at RF=1 — one owner per partition, so a 3-node scan
+            // returned a third of the committed rows. See
+            // `postgres_default_keyspace_replication_factor_for_cluster`.
+            let configured_seeds = parse_seed_list(&config_val(
+                "FERROSA_SEED",
+                &file_config,
+                "internode",
+                "seed",
+                "",
+            ))
+            .len();
+            let cluster_state = shared_state.core.mode_controller.clone();
             runtimes.background.spawn(async move {
-                match ensure_postgres_default_keyspace(&schema, &ddl_path, pg_keyspace_rf).await {
-                    Ok(true) | Ok(false) => {}
+                let needed_rf = || {
+                    postgres_default_keyspace_replication_factor_for_cluster(
+                        configured_seeds,
+                        cluster_state.expected_cluster_size(),
+                        cluster_state.committed_cluster_size(),
+                    )
+                };
+                match ensure_postgres_default_keyspace(&schema, &ddl_path, &needed_rf).await {
+                    Ok(_) => {}
                     Err(error) => tracing::error!(
                         %error,
                         keyspace = POSTGRES_DEFAULT_KEYSPACE,
                         "could not create the PostgreSQL default keyspace; \
                          PostgreSQL DDL/DML will fail until it exists"
                     ),
+                }
+                // An already-under-replicated `public` cannot be repaired in place
+                // (there is no `ALTER KEYSPACE`): the only fix is to re-create the
+                // keyspace while the cluster runs. So this is a GUARD, not a
+                // retry. Re-verify on a bounded schedule and emit ONE actionable
+                // ERROR per distinct condition — never a per-tick flood, never a
+                // latch, so re-creating the keyspace clears it on the next sweep.
+                // A genuine standalone node is silent: its local-only scan IS
+                // complete. The schedule (30 s x 60 = 30 min) spans formation,
+                // which is a minute or two in practice.
+                let mut last_reported: Option<(usize, usize)> = None;
+                for _ in 0..60u32 {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let required = needed_rf();
+                    let undersized = postgres_default_keyspace_is_undersized(&schema, required);
+                    let (warn_now, next_reported) =
+                        undersized_guard_sweep(undersized, required, last_reported);
+                    last_reported = next_reported;
+                    if let (true, Some(actual)) = (warn_now, undersized) {
+                        tracing::error!(
+                            keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                            actual_replication_factor = actual,
+                            required_replication_factor = required,
+                            "the PostgreSQL default keyspace is replicated to FEWER nodes than \
+                             this node's cluster. PostgreSQL answers every SELECT from LOCAL \
+                             storage only, so scans and keyed reads served by a non-owner node \
+                             SILENTLY return fewer rows than were committed. Re-create keyspace \
+                             `public` while the cluster is running to repair it (there is no \
+                             ALTER KEYSPACE); this warning clears once it is re-created."
+                        );
+                    }
                 }
             });
         }
@@ -3797,6 +3939,209 @@ mod tests {
                 _ => panic!("{kind}: expected a CreateKeyspace operation"),
             }
         }
+    }
+
+    /// A schema carrying ONLY the PostgreSQL default keyspace at `replication_factor`
+    /// — the fixture for the boot-time completeness guard.
+    fn postgres_default_keyspace_schema_at(replication_factor: usize) -> ferrosa_schema::Schema {
+        let schema = ferrosa_schema::Schema::new(test_schema_config()).unwrap();
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: POSTGRES_DEFAULT_KEYSPACE.into(),
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), replication_factor.to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+                durable_writes: true,
+            })
+            .unwrap();
+        schema
+    }
+
+    /// The LIVE defect, pinned at the boot decision.
+    ///
+    /// The `maas-loadtest` nodes carry NO `[internode] seed` at all — they are
+    /// formed by the controller — yet they commit a THREE-node cluster. Sizing the
+    /// PostgreSQL default keyspace from the seed list alone therefore produced
+    /// `RF=1`: one owner per partition, and since the PostgreSQL front end answers
+    /// every `SELECT` from LOCAL storage, a 3-node scan returned a THIRD of the
+    /// committed rows. That is why `INSERT ... VALUES (1,'x'),(2,'y')` reported
+    /// `INSERT 0 2` while the coordinator saw one row: the write was complete and
+    /// the read was not.
+    ///
+    /// This asserts the FACTOR the boot path derives, not a row count — a count
+    /// assertion is satisfied by the defect.
+    #[test]
+    fn postgres_default_keyspace_covers_a_cluster_formed_without_configured_seeds() {
+        // The live cluster's inputs, verbatim.
+        let configured_seeds = parse_seed_list(&config_val(
+            "FERROSA_SEED",
+            &toml::Value::Table(Default::default()),
+            "internode",
+            "seed",
+            "",
+        ))
+        .len();
+        assert_eq!(
+            configured_seeds, 0,
+            "a controller-formed cluster configures no [internode] seed"
+        );
+        let expected_cluster_size = 0; // no FERROSA_EXPECTED_CLUSTER_SIZE either
+        let committed_cluster_size = 3; // node1 + node2 + node3
+
+        assert_eq!(
+            postgres_default_keyspace_replication_factor_for_cluster(
+                configured_seeds,
+                expected_cluster_size,
+                committed_cluster_size,
+            ),
+            3,
+            "the PostgreSQL default keyspace must cover the cluster the node ACTUALLY \
+             committed to, or its local-only scan silently returns fewer rows than \
+             were committed"
+        );
+
+        // NEGATIVE CONTROL — the seed-only rule the defect ran on. It must NOT
+        // already satisfy the invariant, or the assertion above would be vacuous.
+        let seed_only = postgres_default_keyspace_replication_factor(configured_seeds);
+        assert_eq!(
+            seed_only, 1,
+            "the seed-only rule produced RF=1 on the live 3-node cluster"
+        );
+        assert_ne!(
+            seed_only, 3,
+            "control: if the seed-only rule already covered the cluster there would be \
+             no defect to fix"
+        );
+
+        // And the boot action must carry the corrected factor, not a hardcoded 1.
+        match default_keyspace_boot_action(
+            "cluster",
+            postgres_default_keyspace_replication_factor_for_cluster(
+                configured_seeds,
+                expected_cluster_size,
+                committed_cluster_size,
+            ),
+        ) {
+            Some(ferrosa_cluster::pair::ddl::DdlOperation::CreateKeyspace(ks)) => assert_eq!(
+                ks.replication
+                    .options
+                    .get("replication_factor")
+                    .map(String::as_str),
+                Some("3"),
+                "the created keyspace must be replicated to all three nodes"
+            ),
+            other => panic!("expected a CreateKeyspace operation, got {other:?}"),
+        }
+
+        // Larger declarations never shrink the factor.
+        assert_eq!(
+            postgres_default_keyspace_replication_factor_for_cluster(0, 5, 3),
+            5
+        );
+        // A genuine standalone node (nothing committed, nothing declared, no seeds)
+        // keeps RF=1 — the fix must not inflate a single node into a cluster.
+        assert_eq!(
+            postgres_default_keyspace_replication_factor_for_cluster(0, 0, 0),
+            1
+        );
+    }
+
+    /// The guard that makes an ALREADY under-replicated `public` loud instead of
+    /// silent. The live `public` carries RF=1 on a 3-node cluster; it cannot be
+    /// repaired in place (there is no `ALTER KEYSPACE`), so the only correct
+    /// behaviour is to say so.
+    #[test]
+    fn postgres_default_keyspace_undersized_is_reported_only_when_it_is() {
+        let at_rf_one = postgres_default_keyspace_schema_at(1);
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&at_rf_one, 3),
+            Some(1),
+            "a 3-node cluster reading `public` at RF=1 must be reported as under-sized"
+        );
+
+        // NEGATIVE CONTROL: correctly sized is never reported.
+        let at_rf_three = postgres_default_keyspace_schema_at(3);
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&at_rf_three, 3),
+            None,
+            "control: a keyspace already covering the cluster must not be reported"
+        );
+
+        // NEGATIVE CONTROL: a genuine standalone node (needs 1) is never reported,
+        // even at RF=1 — the guard must not cry wolf where the scan IS complete.
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&at_rf_one, 1),
+            None,
+            "control: RF=1 is complete for a standalone node"
+        );
+
+        // NEGATIVE CONTROL: an absent keyspace has nothing to report (the ensure
+        // creates it instead).
+        let empty = ferrosa_schema::Schema::new(test_schema_config()).unwrap();
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&empty, 3),
+            None,
+            "control: no keyspace yet means nothing is under-sized"
+        );
+    }
+
+    /// The guard is a GUARD: it warns once per distinct condition, it re-verifies
+    /// rather than latching, and it stays silent where the local scan is actually
+    /// complete. Each of those is a separate way the naive shape goes wrong — a
+    /// per-tick flood, a latch that never re-arms after a repair, or a cry-wolf on
+    /// a standalone node — so each gets a control.
+    #[test]
+    fn undersized_guard_reports_once_per_distinct_condition_and_clears_on_heal() {
+        // A fresh under-sized 3-node condition warns, and remembers what it said.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 3, None),
+            (true, Some((1, 3))),
+            "an RF=1 `public` on a 3-node cluster is the condition the guard exists for"
+        );
+        // The SAME condition on the next sweep is NOT re-warned — no per-tick flood.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 3, Some((1, 3))),
+            (false, Some((1, 3))),
+            "the identical condition must not be re-reported on every sweep"
+        );
+        // A DIFFERENT condition (the cluster grew to 5) is distinct, so it warns.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 5, Some((1, 3))),
+            (true, Some((1, 5))),
+            "a new (actual, required) pair is a new condition and must be reported"
+        );
+
+        // HEAL: a complete keyspace produces no warning AND clears the memory, so
+        // the guard is not latched — a later recurrence warns again.
+        assert_eq!(
+            undersized_guard_sweep(None, 3, Some((1, 3))),
+            (false, None),
+            "a healed keyspace must clear the reported condition (do not latch)"
+        );
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 3, None),
+            (true, Some((1, 3))),
+            "after the memory is cleared, a recurrence of the condition warns again"
+        );
+
+        // NO CRY WOLF: a genuine standalone node (nothing declared, nothing
+        // committed, no seeds ⇒ required 1) never warns, even though its `public`
+        // reports RF=1 — its local-only scan IS complete.
+        assert_eq!(
+            undersized_guard_sweep(None, 1, None),
+            (false, None),
+            "control: nothing to guard while required < 2"
+        );
+        // Defensive: even handed a spurious Some for required == 1, the guard is
+        // silent — `required < 2` is complete by definition.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 1, None),
+            (false, None),
+            "control: required < 2 is never an under-sized condition"
+        );
     }
 
     #[test]
