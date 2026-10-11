@@ -837,7 +837,7 @@ fn build_flight_service(
     )
     .unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
-        lifecycle::fatal_exit(1, &format!("{error}"));
+        lifecycle::fatal_exit(1, &error.to_string());
     });
     let mut service = ferrosa_flight::service::FerrosaFlight::new(state, signing_key)
         .with_token_ttl(token_ttl_secs);
@@ -880,7 +880,7 @@ fn parse_flight_token_ttl(raw: Option<String>) -> Result<u64, String> {
 fn resolve_flight_enabled_or_exit(file_config: &toml::Value) -> bool {
     resolve_flight_enabled(file_config).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
-        lifecycle::fatal_exit(1, &format!("{error}"));
+        lifecycle::fatal_exit(1, &error.to_string());
     })
 }
 
@@ -1602,7 +1602,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             match log_rotation::RotatingWriter::open(&dir, "ferrosa.log", rotation.clone()) {
                 Ok(writer) => (
                     Some(dir.join("ferrosa.log")),
-                    tracing_appender::non_blocking(writer),
+                    lifecycle::non_blocking(writer),
                 ),
                 Err(error) => {
                     // Say so and keep the logs, rather than start a database
@@ -1611,11 +1611,11 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
                         "ferrosa: cannot open the log directory {}: {error} -- logging to stdout",
                         dir.display()
                     );
-                    (None, tracing_appender::non_blocking(std::io::stdout()))
+                    (None, lifecycle::non_blocking(std::io::stdout()))
                 }
             }
         }
-        _ => (None, tracing_appender::non_blocking(std::io::stdout())),
+        _ => (None, lifecycle::non_blocking(std::io::stdout())),
     };
 
     // Before the subscriber. The Sentry layer is inert without a client, and
@@ -2820,7 +2820,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             )
             .unwrap_or_else(|error| {
                 eprintln!("FATAL: {error}");
-                lifecycle::fatal_exit(1, &format!("{error}"));
+                lifecycle::fatal_exit(1, &error.to_string());
             });
             let service = build_flight_service(flight_state)
                 .with_tls_locations(serves_tls)

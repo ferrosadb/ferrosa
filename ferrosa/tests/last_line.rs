@@ -27,6 +27,11 @@ impl Node {
     /// Start the binary in a fresh directory. `fault` sets the hidden fault
     /// injector.
     fn start(fault: Option<&str>) -> Self {
+        Self::start_with(fault, &[])
+    }
+
+    /// [`Node::start`] with extra environment.
+    fn start_with(fault: Option<&str>, extra_env: &[(&str, &str)]) -> Self {
         let dir = tempfile::tempdir().expect("temp dir");
         let config = dir.path().join("ferrosa.toml");
         std::fs::write(&config, "").expect("write empty config");
@@ -52,6 +57,7 @@ impl Node {
         if let Some(fault) = fault {
             cmd.env("FERROSA_TEST_FAULT_INJECT", fault);
         }
+        cmd.envs(extra_env.iter().copied());
         let child = cmd.spawn().expect("spawn the ferrosa binary");
         Self { child, dir }
     }
@@ -158,21 +164,43 @@ fn panic_on_any_thread_writes_a_final_log_line() {
     );
 }
 
-/// T-F3-2: `fatal_exit(3, "x")` flushes the buffered log and leaves
+/// T-F3-2: `fatal_exit(3, "x")` drains the buffered log COMPLETELY and leaves
 /// `ferrosa exiting code=3 reason=x` as the last line.
+///
+/// The writer is slowed to 100 us per line (hidden
+/// `FERROSA_TEST_LOG_WRITE_DELAY_US`), so 20,000 queued lines take seconds to
+/// drain, the way they do on a loaded machine. The full workspace run under
+/// load lost all but ~209 of them: `WorkerGuard::drop` waits at most 100 ms to
+/// queue its shutdown and 1 s for the writer (tracing-appender 0.2.5
+/// `non_blocking.rs`), then gives up silently.
 #[test]
 fn fatal_exit_flushes_and_logs_reason() {
-    let mut node = Node::start(Some("fatal-exit"));
+    let mut node = Node::start_with(
+        Some("fatal-exit"),
+        &[("FERROSA_TEST_LOG_WRITE_DELAY_US", "100")],
+    );
     let status = node.wait();
     let log = node.log();
     assert_eq!(status.code(), Some(3), "log:\n{log}");
     // The fault queues 20,000 lines and an ERROR through the non-blocking
     // writer an instant before the exit: they are in the file only if the
     // exit drained the buffer.
+    let buffered = log
+        .lines()
+        .filter(|l| l.contains("injected fault: buffered line "))
+        .count();
+    let tail: Vec<&str> = log.lines().rev().take(3).collect();
+    assert_eq!(
+        buffered, 20_000,
+        "every queued line reaches the file before the exit line; last lines: {tail:?}"
+    );
     assert!(
-        log.contains("injected fault: buffered line 19999")
-            && log.contains(r#"fatal: exiting code=3 reason="x""#),
-        "the buffered lines before the exit were flushed:\n{log}"
+        log.contains(r#"fatal: exiting code=3 reason="x""#),
+        "the ERROR queued last was flushed too; last lines: {tail:?}"
+    );
+    assert!(
+        !log.contains("log drain"),
+        "a complete drain reports no shortfall; last lines: {tail:?}"
     );
     assert!(
         last_line(&log).ends_with("ferrosa exiting code=3 reason=x"),
