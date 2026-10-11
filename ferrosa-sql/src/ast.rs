@@ -362,16 +362,97 @@ pub struct InsertStmt {
     pub returning: Option<Returning>,
 }
 
-/// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]
+/// `UPDATE [schema.]table SET col = <expr>, ... WHERE col = val [AND ...]
 /// [RETURNING ...]`. The `WHERE` is restricted to equality on key columns
 /// (Cassandra-style upsert: the full primary key identifies the row);
-/// `assignments` are the SET cells.
+/// `assignments` are the SET cells, each an [`SetExpr`] — a constant value or
+/// an arithmetic read-modify-write over the row's own current columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateStmt {
     pub table: TableRef,
-    pub assignments: Vec<(String, ScalarValue)>,
+    pub assignments: Vec<(String, SetExpr)>,
     pub where_eq: Vec<(String, ScalarValue)>,
     pub returning: Option<Returning>,
+}
+
+/// A binary arithmetic operator in a DML `SET` right-hand side. Only the three
+/// arithmetic operators are modelled: `+`, `-`, `*` (division and modulo are
+/// deliberately absent — they are not part of any workload this surface exists
+/// for, and a missing operator is refused loudly rather than approximated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    Add,
+    Sub,
+    Mul,
+}
+
+impl ArithOp {
+    /// The operator as a user would write it, for messages.
+    pub fn symbol(self) -> char {
+        match self {
+            ArithOp::Add => '+',
+            ArithOp::Sub => '-',
+            ArithOp::Mul => '*',
+        }
+    }
+}
+
+/// The right-hand side of a DML `SET <col> = <expr>`.
+///
+/// A `SET` value is either a constant ([`SetExpr::Value`], the historical form:
+/// a literal, a `$N` placeholder, or a zero-arg value function) or an arithmetic
+/// expression over the row being updated. An arithmetic `SET` is a
+/// **read-modify-write**: `UPDATE t SET c = c + 1` reads the row's CURRENT value
+/// of `c` and writes `current + 1`. This is the pgbench shape
+/// (`abalance = abalance + :delta`) and the reason `SET c = c + 1` used to be a
+/// syntax error.
+///
+/// Precedence is the SQL one: `*` binds tighter than `+`/`-`, parentheses
+/// override, and both are left-associative. Division and modulo have no variant
+/// here, so `SET c = c / 2` is refused by the lexer/parser rather than mis-parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SetExpr {
+    /// A constant: an inline literal, a `$N` parameter, or a zero-arg value
+    /// function (`now()`).
+    Value(ScalarValue),
+    /// A read of the CURRENT value of a column of the row being updated. The
+    /// PostgreSQL front end resolves it against the committed row (and the open
+    /// transaction's own buffered writes).
+    Column(ColumnRef),
+    /// `left <op> right`.
+    Binary {
+        op: ArithOp,
+        left: Box<SetExpr>,
+        right: Box<SetExpr>,
+    },
+}
+
+impl SetExpr {
+    /// Whether this expression reads any column of the row being updated — i.e.
+    /// whether evaluating it requires a read-modify-write rather than a blind
+    /// upsert.
+    pub fn references_column(&self) -> bool {
+        match self {
+            SetExpr::Column(_) => true,
+            SetExpr::Value(_) => false,
+            SetExpr::Binary { left, right, .. } => {
+                left.references_column() || right.references_column()
+            }
+        }
+    }
+
+    /// Collect every `$N` parameter index referenced by this expression, at any
+    /// depth, in the order encountered.
+    pub fn collect_params(&self, out: &mut Vec<usize>) {
+        match self {
+            SetExpr::Value(ScalarValue::Param(n)) => out.push(*n),
+            SetExpr::Value(_) | SetExpr::Column(_) => {}
+            SetExpr::Binary { left, right, .. } => {
+                left.collect_params(out);
+                right.collect_params(out);
+            }
+        }
+    }
 }
 
 /// `DELETE FROM [schema.]table WHERE col = val [AND ...] [RETURNING ...]`.
@@ -594,11 +675,32 @@ pub enum Projection {
     Items(Vec<SelectItem>),
 }
 
-/// One entry in a non-star SELECT list: a plain column or an aggregate.
+/// One entry in a non-star SELECT list: a plain column or an aggregate, with an
+/// optional output alias (`expr AS name`). The alias only names the OUTPUT
+/// column — it does not change which cell is read, so `SELECT pad AS label FROM t`
+/// returns the same `pad` values under a different `RowDescription` name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
-    Column(ColumnRef),
-    Aggregate { func: AggFunc, arg: AggArg },
+    Column {
+        col: ColumnRef,
+        alias: Option<String>,
+    },
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
+        alias: Option<String>,
+    },
+}
+
+impl SelectItem {
+    /// The output alias, if the item names one.
+    pub fn alias(&self) -> Option<&str> {
+        match self {
+            SelectItem::Column { alias, .. } | SelectItem::Aggregate { alias, .. } => {
+                alias.as_deref()
+            }
+        }
+    }
 }
 
 /// The argument to an aggregate: `COUNT(*)` vs `FUNC(col)`.

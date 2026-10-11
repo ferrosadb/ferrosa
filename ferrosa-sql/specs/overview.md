@@ -36,10 +36,10 @@ inner equi-join — and widens outward.
 | `types` (`src/types.rs`) | ~488 | `Value` enum, `Row`, `Column`, `ColumnType`, `RelSchema`; `Value::sql_cmp` three-valued comparison + numeric normalization |
 | `exec` (`src/exec.rs`) | ~900 | Physical operators: streaming `seq_scan`, `filter`, `project`; **blocking, spilling** `hash_join`, `sort`, `hash_aggregate`, `dedup`; `limit_offset`, `Predicate`, `CmpOp`, `AggFunc` |
 | `spill` (`src/spill.rs`) | ~700 | Spill backing for the blocking operators: `SpillCtx`/`SpillReserver` (per-node temp location), `SpillSort` over `ferrosa_storage::ExternalSorter`, `ReplayBuffer` (the join's replayable inner group), `canonical_cmp` (type-aware total order for grouping/DISTINCT), orphan sweep |
-| `parser` (`src/parser.rs`) | ~1752 | Hand-written lexer + recursive-descent parser; `parse`, `parse_statement`, `ParseError`, typed-literal parsing |
+| `parser` (`src/parser.rs`) | ~3888 | Hand-written lexer + recursive-descent parser; `parse`, `parse_statement`, `ParseError`, typed-literal parsing; `Tok::Plus`/`Tok::Minus` (lexed AFTER the numeric-literal arm, so `-123` stays one literal) and the `parse_set_add`/`parse_set_mul`/`parse_set_primary` SET-expression grammar |
 | `parser_ddl` (`src/parser_ddl.rs`, child of `parser`) | ~430 | `CREATE TABLE` (Ecto subset, D10): PG type map, PRIMARY KEY merge/validation, optional `WITH (key = value, ...)` storage parameters recorded on the AST, typed refusal of out-of-scope clauses; also the `COPY ... FROM STDIN` option list (incl. the recorded-no-op `FREEZE`). Parse only |
 | `plan` (`src/plan.rs`) | ~1598 | Binder + planner: `execute`, `describe`, `infer_param_types`; scope resolution, Kleene WHERE/HAVING eval, `ExecError` |
-| `ast` (`src/ast.rs`) | ~207 | Logical AST: `Statement`, `SelectStmt`, DML statements, `Expr`, `Operand`, `Projection`, `OrderItem` |
+| `ast` (`src/ast.rs`) | ~737 | Logical AST: `Statement`, `SelectStmt`, DML statements, `Expr`, `Operand`, `Projection`, `OrderItem`; `UpdateStmt::assignments: Vec<(String, SetExpr)>` where `SetExpr{Value,Column,Binary}` + `ArithOp{Add,Sub,Mul}` model an arithmetic `SET` read-modify-write (`references_column`, `collect_params`) |
 | `catalog` (`src/catalog.rs`) | ~81 | `Catalog` trait + `MapCatalog`; name → provider resolution (fail-loud on miss) |
 | `provider` (`src/provider.rs`) | ~39 | `TableProvider` scan contract + `InMemoryTable` |
 

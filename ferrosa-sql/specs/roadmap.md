@@ -106,6 +106,12 @@ toward the Postgres queries real clients send.
 - **Integer SUM/AVG overflow safety + `Numeric` aggregation** (FMEA SQL-6).
   Promote integer running sums to `BigInt`/checked add and feed `Numeric`
   columns through `add_numeric`.
+- **(done) Arithmetic `UPDATE ... SET`** (FMEA SQL-ARITH-1). The `+`/`-` lexer
+  tokens (placed after the numeric-literal arm so `-123` stays one literal) and
+  the `SetExpr{Value,Column,Binary}` / `ArithOp{Add,Sub,Mul}` grammar let
+  `UPDATE t SET c = c + 1` parse; `WHERE` stays equality-only. The value is
+  evaluated by the front end, not the parser — see `ferrosa-postgres`'s
+  `eval_set_expr`/`apply_arith`. Division and modulo are deliberately absent.
 
 ## Next
 

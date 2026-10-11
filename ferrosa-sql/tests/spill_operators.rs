@@ -27,8 +27,10 @@ use ferrosa_sql::types::{Row, Value};
 const TINY_THRESHOLD: u64 = 256;
 
 /// A context whose threshold forces the spill+merge path rather than the
-/// in-memory fast path.
+/// in-memory fast path. Every spilling test builds its context through here,
+/// which is also where the process descriptor budget is established.
 fn spilling_ctx(root: &std::path::Path) -> SpillCtx {
+    raise_fd_limit();
     SpillCtx::new(Arc::new(DirReserver::new(root)), TINY_THRESHOLD)
 }
 
@@ -46,6 +48,38 @@ fn drain(s: TryRowStream<'_>) -> Vec<Row> {
 
 /// Enough rows that the tiny threshold forces many runs and a cascade merge.
 const BIG: i64 = 4_000;
+
+/// Establish the open-file-descriptor budget these tests actually need.
+///
+/// Every test here forces thousands of spilled runs, and a sort's cascade merge
+/// holds up to `MERGE_FANIN` (64) run files open at once while it merges them.
+/// libtest runs all of a binary's tests as threads in ONE process, so the merge
+/// readers of every concurrently spilling test add up: a dozen 64-reader merges
+/// need on the order of 800 descriptors. A host whose soft `RLIMIT_NOFILE` is
+/// the macOS default of 256 then fails a *correct* merge with `EMFILE` ("Too
+/// many open files"), which is a property of the shell's descriptor default,
+/// not of the spill code under test. Raise the soft limit to the hard limit
+/// once so the suite measures spill behaviour rather than the host's fd
+/// default. CI runs the suite under nextest (one process per test), so it never
+/// shares the budget; this keeps the plain `cargo test` gate honest on a dev box.
+fn raise_fd_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: `getrlimit`/`setrlimit` are standard POSIX calls. `lim` is a
+        // fully-owned, zero-initialized `rlimit` that `getrlimit` fills before
+        // its fields can be read, and the read is guarded by the return code.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 {
+                let hard = lim.rlim_max;
+                if hard > lim.rlim_cur {
+                    lim.rlim_cur = hard;
+                    let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                }
+            }
+        }
+    });
+}
 
 #[test]
 fn sort_returns_every_row_when_forced_to_spill() {

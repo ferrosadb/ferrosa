@@ -3,9 +3,9 @@
 use std::fmt;
 
 use crate::ast::{
-    AggArg, CastTarget, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join, Operand,
-    OrderItem, Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt, Statement,
-    TableRef, Term, UnsupportedClause, UpdateStmt,
+    AggArg, ArithOp, CastTarget, ColumnRef, DeleteStmt, Expr, InsertStmt, IsolationLevel, Join,
+    Operand, OrderItem, Projection, Returning, ScalarItem, ScalarValue, SelectItem, SelectStmt,
+    SetExpr, Statement, TableRef, Term, UnsupportedClause, UpdateStmt,
 };
 use crate::exec::{AggFunc, CmpOp, SortDir};
 use crate::types::Value;
@@ -237,6 +237,11 @@ enum Tok {
     Le,
     Gt,
     Ge,
+    /// The `+` arithmetic operator (only meaningful in a DML `SET` expression).
+    Plus,
+    /// The `-` arithmetic operator. A leading `-` immediately before a digit is
+    /// part of a NUMERIC LITERAL (see the lexer), never this token.
+    Minus,
 }
 
 /// Lex a top-level statement. A `CREATE` statement is lexed leniently on a
@@ -400,6 +405,18 @@ fn lex_mode(sql: &str, lenient: bool) -> Result<Vec<Tok>, ParseError> {
                         .map_err(|_| ParseError::BadToken(text))?;
                     toks.push(Tok::Int(n));
                 }
+            }
+            // Arithmetic operators for a DML `SET` value. `+` and `-` are lexed
+            // here; `*` is already `Tok::Star` (above). The `-` arm is placed
+            // AFTER the numeric-literal arm so `-123` stays ONE `Int`/`Float`
+            // token — a leading minus binds to a number, never to a subtraction.
+            '+' => {
+                toks.push(Tok::Plus);
+                i += 1;
+            }
+            '-' => {
+                toks.push(Tok::Minus);
+                i += 1;
             }
             c if c.is_alphabetic() || c == '_' => {
                 let start = i;
@@ -956,18 +973,20 @@ impl Parser {
         Ok(values)
     }
 
-    /// `UPDATE [schema.]table SET col = val, ... WHERE col = val [AND ...]`.
-    /// Assumes `self.pos` is at the `UPDATE` ident. `WHERE` is equality-only
+    /// `UPDATE [schema.]table SET col = <expr>, ... WHERE col = val [AND ...]`.
+    /// Assumes `self.pos` is at the `UPDATE` ident. Each SET right-hand side is a
+    /// [`SetExpr`] — a constant, or an arithmetic read-modify-write
+    /// (`c = c + 1`, `c = (c + 1) * 2`). `WHERE` stays equality-only
     /// (the key columns identify the row, Cassandra-style upsert).
     fn parse_update(&mut self) -> Result<Statement, ParseError> {
         self.next(); // UPDATE
         let table = self.parse_qualified_table()?;
 
         self.expect_ident_kw("SET")?;
-        let mut assignments = vec![self.parse_assignment()?];
+        let mut assignments = vec![self.parse_set_assignment()?];
         while matches!(self.peek(), Some(Tok::Comma)) {
             self.next();
-            assignments.push(self.parse_assignment()?);
+            assignments.push(self.parse_set_assignment()?);
         }
 
         self.expect(&Tok::Where, "WHERE")?;
@@ -1065,12 +1084,114 @@ impl Parser {
         })
     }
 
-    /// A `col = value` pair (used by `UPDATE`'s SET list and equality WHERE).
+    /// A `col = <scalar>` pair for an equality `WHERE` (key columns identify the
+    /// row). The SET list uses [`Self::parse_set_assignment`], whose right-hand
+    /// side is the arithmetic [`SetExpr`] grammar.
     fn parse_assignment(&mut self) -> Result<(String, ScalarValue), ParseError> {
         let col = self.ident()?;
         self.expect(&Tok::Eq, "=")?;
         let value = self.parse_scalar_value()?;
         Ok((col, value))
+    }
+
+    /// One `col = <set-expr>` pair of an `UPDATE`'s SET list.
+    fn parse_set_assignment(&mut self) -> Result<(String, SetExpr), ParseError> {
+        let col = self.ident()?;
+        self.expect(&Tok::Eq, "=")?;
+        let value = self.parse_set_value()?;
+        Ok((col, value))
+    }
+
+    /// The full `SET` right-hand side grammar. Precedence, lowest first:
+    ///
+    /// ```text
+    /// set_value := add_expr
+    /// add_expr  := mul_expr ( ('+' | '-') mul_expr )*
+    /// mul_expr  := primary  ( '*' primary )*
+    /// primary   := '(' add_expr ')' | const | column
+    /// ```
+    ///
+    /// `+`/`-` are left-associative and looser than `*`, matching SQL. The
+    /// grammar is deliberately small: no division, no modulo, no unary `+`/`-`
+    /// (a leading minus is part of a numeric literal). Anything it does not
+    /// recognize fails loud at the token it could not consume — never silently.
+    fn parse_set_value(&mut self) -> Result<SetExpr, ParseError> {
+        self.nested(Self::parse_set_add)
+    }
+
+    fn parse_set_add(&mut self) -> Result<SetExpr, ParseError> {
+        let mut left = self.parse_set_mul()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => ArithOp::Add,
+                Some(Tok::Minus) => ArithOp::Sub,
+                _ => break,
+            };
+            self.next();
+            let right = self.parse_set_mul()?;
+            left = SetExpr::Binary {
+                op,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_set_mul(&mut self) -> Result<SetExpr, ParseError> {
+        let mut left = self.parse_set_primary()?;
+        while matches!(self.peek(), Some(Tok::Star)) {
+            self.next(); // `*`
+            let right = self.parse_set_primary()?;
+            left = SetExpr::Binary {
+                op: ArithOp::Mul,
+                left: Box::new(left),
+                right: Box::new(right),
+            };
+        }
+        Ok(left)
+    }
+
+    /// One SET operand: a parenthesised sub-expression, a constant (literal,
+    /// `$N`, or zero-arg value function), or a read of a COLUMN of the row being
+    /// updated. A bare identifier is a column read *unless* it is a value keyword
+    /// (`TRUE`/`FALSE`/`NULL`/`CURRENT_TIMESTAMP`/…) or a typed-literal keyword
+    /// followed by a string (`TIMESTAMP '…'`) — those stay constants, exactly as
+    /// [`Self::parse_scalar_value`] builds them.
+    fn parse_set_primary(&mut self) -> Result<SetExpr, ParseError> {
+        if matches!(self.peek(), Some(Tok::LParen)) {
+            self.next(); // `(`
+            let inner = self.nested(Self::parse_set_add)?;
+            self.expect(&Tok::RParen, ")")?;
+            return Ok(inner);
+        }
+        if let Some(Tok::Ident(w)) = self.peek() {
+            if self.ident_starts_a_column(w) {
+                return Ok(SetExpr::Column(self.parse_column_ref()?));
+            }
+        }
+        Ok(SetExpr::Value(self.parse_scalar_value()?))
+    }
+
+    /// Whether the identifier at the cursor begins a COLUMN reference (rather
+    /// than a constant) in a SET value. It is a column when it is not:
+    ///
+    /// - a zero-arg function call — `now()` / `func(` — (`(` immediately follows),
+    /// - a typed-literal keyword followed by a string — `TIMESTAMP '…'`,
+    /// - a bare value keyword — `TRUE` / `FALSE` / `NULL`,
+    /// - a bare zero-arg value function — `CURRENT_TIMESTAMP` / `CURRENT_DATE` /
+    ///   `CURRENT_TIME`.
+    fn ident_starts_a_column(&self, word: &str) -> bool {
+        let upper = word.to_ascii_uppercase();
+        if matches!(self.toks.get(self.pos + 1), Some(Tok::LParen)) {
+            return false; // a function call, not a column
+        }
+        if typed_literal_kind(&upper).is_some()
+            && matches!(self.toks.get(self.pos + 1), Some(Tok::Str(_)))
+        {
+            return false; // a typed literal `TIMESTAMP '…'`
+        }
+        !matches!(upper.as_str(), "TRUE" | "FALSE" | "NULL") && !bare_value_function(&upper)
     }
 
     /// A single SELECT-list entry: an aggregate `FUNC(...)` if an identifier
@@ -1082,11 +1203,20 @@ impl Parser {
     /// have (its projection is column indices, not computed cells), so a `||`
     /// that follows an item is a named refusal rather than a token mismatch.
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
-        let item = self.parse_select_item_primary()?;
+        let mut item = self.parse_select_item_primary()?;
         if matches!(self.peek(), Some(Tok::Concat)) {
             return Err(ParseError::UnsupportedSelectExpr(
                 "`||` concatenation over a FROM relation",
             ));
+        }
+        // An optional output alias (`AS name`, or a bare `name`) names this item's
+        // result column. Consumed after the concatenation refusal so `col || 'x'`
+        // is still refused by name rather than mistaken for an alias.
+        let alias = self.parse_optional_alias()?;
+        match &mut item {
+            SelectItem::Column { alias: a, .. } | SelectItem::Aggregate { alias: a, .. } => {
+                *a = alias;
+            }
         }
         Ok(item)
     }
@@ -1109,10 +1239,17 @@ impl Parser {
                     AggArg::Column(self.parse_column_ref()?)
                 };
                 self.expect(&Tok::RParen, ")")?;
-                return Ok(SelectItem::Aggregate { func, arg });
+                return Ok(SelectItem::Aggregate {
+                    func,
+                    arg,
+                    alias: None,
+                });
             }
         }
-        Ok(SelectItem::Column(self.parse_column_ref()?))
+        Ok(SelectItem::Column {
+            col: self.parse_column_ref()?,
+            alias: None,
+        })
     }
 
     fn parse_column_list(&mut self) -> Result<Vec<ColumnRef>, ParseError> {
@@ -1550,7 +1687,7 @@ mod tests {
             Projection::Items(items) => {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
-                    SelectItem::Column(c) => {
+                    SelectItem::Column { col: c, .. } => {
                         assert_eq!(c.name, "id");
                         assert!(c.qualifier.is_none());
                     }
@@ -1568,17 +1705,23 @@ mod tests {
             Projection::Items(items) => {
                 assert_eq!(
                     items[0],
-                    SelectItem::Column(ColumnRef {
-                        qualifier: Some("u".into()),
-                        name: "name".into()
-                    })
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: Some("u".into()),
+                            name: "name".into()
+                        },
+                        alias: None
+                    }
                 );
                 assert_eq!(
                     items[1],
-                    SelectItem::Column(ColumnRef {
-                        qualifier: Some("o".into()),
-                        name: "oid".into()
-                    })
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: Some("o".into()),
+                            name: "oid".into()
+                        },
+                        alias: None
+                    }
                 );
             }
             other => panic!("expected items, got {other:?}"),
@@ -1742,16 +1885,20 @@ mod tests {
                 assert_eq!(items.len(), 3);
                 assert_eq!(
                     items[0],
-                    SelectItem::Column(ColumnRef {
-                        qualifier: None,
-                        name: "region".into()
-                    })
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: None,
+                            name: "region".into()
+                        },
+                        alias: None
+                    }
                 );
                 assert_eq!(
                     items[1],
                     SelectItem::Aggregate {
                         func: AggFunc::Count,
-                        arg: AggArg::Star
+                        arg: AggArg::Star,
+                        alias: None
                     }
                 );
                 assert_eq!(
@@ -1761,7 +1908,8 @@ mod tests {
                         arg: AggArg::Column(ColumnRef {
                             qualifier: None,
                             name: "amount".into()
-                        })
+                        }),
+                        alias: None
                     }
                 );
             }
@@ -1775,10 +1923,13 @@ mod tests {
         match stmt.projection {
             Projection::Items(items) => assert_eq!(
                 items[0],
-                SelectItem::Column(ColumnRef {
-                    qualifier: None,
-                    name: "count".into()
-                })
+                SelectItem::Column {
+                    col: ColumnRef {
+                        qualifier: None,
+                        name: "count".into()
+                    },
+                    alias: None
+                }
             ),
             other => panic!("expected items, got {other:?}"),
         }
@@ -1795,11 +1946,81 @@ mod tests {
                     arg: AggArg::Column(ColumnRef {
                         qualifier: None,
                         name: "amount".into()
-                    })
+                    }),
+                    alias: None
                 }
             ),
             other => panic!("expected items, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_as_alias_on_an_aggregate_and_a_column() {
+        // `AS n` names the output column of an aggregate; `AS label` of a plain
+        // column. The alias attaches to the ITEM, not to the source column.
+        let stmt = parse("SELECT count(*) AS n, pad AS label FROM t").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0],
+                    SelectItem::Aggregate {
+                        func: AggFunc::Count,
+                        arg: AggArg::Star,
+                        alias: Some("n".into())
+                    }
+                );
+                assert_eq!(
+                    items[1],
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: None,
+                            name: "pad".into()
+                        },
+                        alias: Some("label".into())
+                    }
+                );
+                assert_eq!(items[0].alias(), Some("n"));
+                assert_eq!(items[1].alias(), Some("label"));
+            }
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_bare_alias_without_as_and_leaves_unaliased_items_none() {
+        // PostgreSQL accepts `expr name` as well as `expr AS name`; an item with no
+        // trailing identifier keeps `alias: None`.
+        let stmt = parse("SELECT pad label, count(*) FROM t").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].alias(), Some("label"));
+                assert_eq!(
+                    items[0],
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: None,
+                            name: "pad".into()
+                        },
+                        alias: Some("label".into())
+                    }
+                );
+                assert_eq!(items[1].alias(), None, "a bare `count(*)` is unaliased");
+            }
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concatenation_is_refused_by_name_and_not_read_as_an_alias() {
+        // The alias is consumed AFTER the `||` refusal, so `pad || 'x'` is still a
+        // named UnsupportedSelectExpr and is never reinterpreted as `pad AS ||`.
+        let err = parse("SELECT pad || 'x' FROM t").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnsupportedSelectExpr(_)),
+            "expected the named concatenation refusal, got {err:?}"
+        );
     }
 
     #[test]
@@ -2161,9 +2382,12 @@ mod tests {
                     vec![
                         (
                             "v".to_string(),
-                            ScalarValue::Literal(Value::Text("x".into()))
+                            SetExpr::Value(ScalarValue::Literal(Value::Text("x".into())))
                         ),
-                        ("n".to_string(), ScalarValue::Literal(Value::Int(3))),
+                        (
+                            "n".to_string(),
+                            SetExpr::Value(ScalarValue::Literal(Value::Int(3)))
+                        ),
                     ]
                 );
                 assert_eq!(
@@ -2185,12 +2409,138 @@ mod tests {
             Statement::Update(u) => {
                 assert_eq!(
                     u.assignments,
-                    vec![("v".to_string(), ScalarValue::Param(1))]
+                    vec![("v".to_string(), SetExpr::Value(ScalarValue::Param(1)))]
                 );
                 assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
             }
             other => panic!("expected Update, got {other:?}"),
         }
+    }
+
+    /// A `SET c = c + 1` right-hand side is an arithmetic read-modify-write,
+    /// `Binary{ Add, Column(c), Value(1) }`. Before this fix the statement died
+    /// at LEX time with `bad token: +`, so the whole pgbench workload shape
+    /// (`abalance = abalance + :delta`) was impossible.
+    #[test]
+    fn parse_update_set_column_plus_literal_is_arithmetic() {
+        let stmt = parse_statement("UPDATE t SET c = c + 1 WHERE id = 1").unwrap();
+        let Statement::Update(u) = stmt else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            u.assignments,
+            vec![(
+                "c".to_string(),
+                SetExpr::Binary {
+                    op: ArithOp::Add,
+                    left: Box::new(SetExpr::Column(ColumnRef {
+                        qualifier: None,
+                        name: "c".into()
+                    })),
+                    right: Box::new(SetExpr::Value(ScalarValue::Literal(Value::Int(1)))),
+                }
+            )]
+        );
+        // The WHERE stays an equality pair on the key column.
+        assert_eq!(
+            u.where_eq,
+            vec![("id".to_string(), ScalarValue::Literal(Value::Int(1)))]
+        );
+    }
+
+    /// `*` binds tighter than `+`: `c + 2 * 3` is `c + (2 * 3)`, not `(c + 2) * 3`.
+    /// The pgbench workloads use `+` (and custom ones use `*`), so precedence has
+    /// to be the SQL one, not a right-fold.
+    #[test]
+    fn parse_update_set_arithmetic_precedence_and_parentheses() {
+        let plus_mul = parse_statement("UPDATE t SET c = c + 2 * 3 WHERE id = 1").unwrap();
+        let Statement::Update(u) = plus_mul else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            u.assignments[0].1,
+            SetExpr::Binary {
+                op: ArithOp::Add,
+                left: Box::new(SetExpr::Column(ColumnRef {
+                    qualifier: None,
+                    name: "c".into()
+                })),
+                right: Box::new(SetExpr::Binary {
+                    op: ArithOp::Mul,
+                    left: Box::new(SetExpr::Value(ScalarValue::Literal(Value::Int(2)))),
+                    right: Box::new(SetExpr::Value(ScalarValue::Literal(Value::Int(3)))),
+                }),
+            }
+        );
+
+        // Parentheses override precedence: `(c + 1) * 2`.
+        let parens = parse_statement("UPDATE t SET c = (c + 1) * 2 WHERE id = 1").unwrap();
+        let Statement::Update(u) = parens else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            u.assignments[0].1,
+            SetExpr::Binary {
+                op: ArithOp::Mul,
+                left: Box::new(SetExpr::Binary {
+                    op: ArithOp::Add,
+                    left: Box::new(SetExpr::Column(ColumnRef {
+                        qualifier: None,
+                        name: "c".into()
+                    })),
+                    right: Box::new(SetExpr::Value(ScalarValue::Literal(Value::Int(1)))),
+                }),
+                right: Box::new(SetExpr::Value(ScalarValue::Literal(Value::Int(2)))),
+            }
+        );
+    }
+
+    /// `-` and `$N` in the SET expression: `c = c - $1`. A leading minus before a
+    /// digit must still lex as ONE negative literal (`c = -5`), never as a
+    /// subtraction from an implied zero.
+    #[test]
+    fn parse_update_set_minus_param_and_negative_literal() {
+        let minus = parse_statement("UPDATE t SET c = c - $1 WHERE id = $2").unwrap();
+        let Statement::Update(u) = minus else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            u.assignments[0].1,
+            SetExpr::Binary {
+                op: ArithOp::Sub,
+                left: Box::new(SetExpr::Column(ColumnRef {
+                    qualifier: None,
+                    name: "c".into()
+                })),
+                right: Box::new(SetExpr::Value(ScalarValue::Param(1))),
+            }
+        );
+
+        let negative = parse_statement("UPDATE t SET c = -5 WHERE id = 1").unwrap();
+        let Statement::Update(u) = negative else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            u.assignments[0].1,
+            SetExpr::Value(ScalarValue::Literal(Value::Int(-5))),
+            "a leading minus binds to the number, not a subtraction"
+        );
+    }
+
+    /// A plain constant SET is unchanged: it is still a `SetExpr::Value`, not an
+    /// arithmetic node. This pins that the arithmetic grammar did not change the
+    /// meaning of `SET b = 'yy'`.
+    #[test]
+    fn parse_update_set_plain_value_is_not_arithmetic() {
+        let stmt = parse_statement("UPDATE t SET b = 'yy' WHERE id = 1").unwrap();
+        let Statement::Update(u) = stmt else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            u.assignments[0].1,
+            SetExpr::Value(ScalarValue::Literal(Value::Text("yy".into())))
+        );
+        assert!(!u.assignments[0].1.references_column());
     }
 
     #[test]
@@ -2256,7 +2606,7 @@ mod tests {
             Statement::Update(u) => {
                 assert_eq!(
                     u.assignments,
-                    vec![("v".to_string(), ScalarValue::Param(1))]
+                    vec![("v".to_string(), SetExpr::Value(ScalarValue::Param(1)))]
                 );
                 assert_eq!(u.where_eq, vec![("id".to_string(), ScalarValue::Param(2))]);
                 assert_eq!(
@@ -3549,7 +3899,7 @@ mod tests {
                     if items.len() == 1
                         && matches!(
                             &items[0],
-                            SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star }
+                            SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star, alias: None }
                         )
             ),
             "expected `count(*)`, got {:?}",

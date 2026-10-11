@@ -18,11 +18,11 @@ pub mod types;
 
 pub use ast::SelectStmt;
 pub use ast::{
-    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, CastTarget, ColumnDef, CopyFormatKind,
-    CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr, ForeignKeyConstraint,
-    InsertStmt, IsolationLevel, Operand, OrderItem, PgType, Projection, Returning, ScalarItem,
-    ScalarValue, SelectItem, Statement, Term, TruncateStatement, UnsupportedClause, UpdateStmt,
-    VacuumStmt,
+    AggArg, AlterOperation, AlterTableStmt, AnalyzeStmt, ArithOp, CastTarget, ColumnDef,
+    CopyFormatKind, CopyFromStdinStmt, CreateTableStmt, DeleteStmt, DropTableStatement, Expr,
+    ForeignKeyConstraint, InsertStmt, IsolationLevel, Operand, OrderItem, PgType, Projection,
+    Returning, ScalarItem, ScalarValue, SelectItem, SetExpr, Statement, Term, TruncateStatement,
+    UnsupportedClause, UpdateStmt, VacuumStmt,
 };
 pub use catalog::{Catalog, MapCatalog, SharedTable};
 pub use exec::{

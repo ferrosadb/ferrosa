@@ -70,7 +70,10 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   no-`FROM` scalar selects (`SELECT 1`, `SELECT version()`, `current_database()`,
   `'a' || 'b'`, and a scalar subquery `( SELECT ... )` as an operand — incl.
   pgbench's `select (select count(*) from a)||'|'||…` census line), and single-row
-  `INSERT` / `UPDATE` / `DELETE`.
+  `INSERT` / `UPDATE` / `DELETE`. A projection item may carry an output alias
+  (`expr AS name`, or a bare `expr name`) that names its `RowDescription` column
+  without changing which cell is read, so `select count(*) as n from t` is served
+  rather than refused `42601 expected FROM`.
 - **Extended query protocol** — `Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`
   with a per-connection [`Session`] (prepared statements + portals), `$N`
   parameter type inference (`ParameterDescription`), text + binary parameter and
@@ -141,7 +144,20 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   the write is buffered until commit (see above).
   UPDATE/DELETE are Cassandra-style blind
   upserts/tombstones keyed by a full-primary-key equality `WHERE` (reported as
-  `UPDATE 1` / `DELETE 1`).
+  `UPDATE 1` / `DELETE 1`) — **except that a `SET` value which READS a column is a real
+  read-modify-write.** `UPDATE t SET c = c + 1` (pgbench's `abalance = abalance + :delta`)
+  reads the row's current value first — the committed storage image, with the open
+  transaction's own buffered writes overlaid, so an earlier statement in the same
+  transaction is visible — evaluates the arithmetic, and writes the result; a constant
+  `SET` (`SET b = 'yy'`) still reads nothing and keeps the blind-upsert path. The
+  arithmetic is PostgreSQL-faithful: `NULL <op> x` is NULL, `integer` is exact and
+  overflow is `22003` (never a wrap), `numeric` is exact and a decimal literal resolves
+  `numeric <op> float8` to `double precision`, and any other operand type is refused by
+  name (`42883`), never coerced. `/` and `%` are absent from the grammar and fail at the
+  token. The read is an ordinary point read, so it enters the read set a serializable
+  `COMMIT` validates — a concurrent writer of the same row fails that commit instead of
+  silently losing this update. When the `WHERE` matches no live row the engine still
+  upserts (every column reads SQL NULL), the documented Cassandra divergence.
 - **Literal → column coercion (`query::value_to_cql`)** — a DML value is coerced
   to its target column's CQL type. A `numeric`/`decimal` column takes an integer
   literal, widened exactly at scale 0 (`1`), and a decimal literal, recovered from

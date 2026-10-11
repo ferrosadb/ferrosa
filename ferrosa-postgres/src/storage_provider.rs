@@ -843,7 +843,7 @@ pub(crate) fn read_row_image(
 /// Shared by the per-row [`read_row_image`] and the batched
 /// [`prefetch_before_images`] so both produce byte-identical before-images — the
 /// batch path is a different read SHAPE, never a different answer.
-fn partition_row_image(
+pub(crate) fn partition_row_image(
     codec: &TableCodec,
     keyspace: &str,
     table: &str,

@@ -104,7 +104,9 @@ O(batch). A fetch never waits on the client, so a query waiting for its client
 after 10 ms and holds none either (ferrosa-storage ST-82). Extended `Execute`
 honours `max_rows` with `PortalSuspended`; suspended portals are capped per
 connection and per node (`53000` past either) and closed after an idle
-timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
+timeout (`portal_limits`, PG-14/PG-15). Each projection item's output alias
+(`expr AS name`, or a bare `expr name`) becomes its `RowDescription` field name
+while the row cells are unchanged. → `RowDescription`
 + streamed `DataRow`s + `CommandComplete "SELECT n"`. The caller appends one
 `ReadyForQuery`.
 
@@ -112,7 +114,13 @@ timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
 `CqlValue` driven by the target column's `CqlType` (`value_to_cql`, fail-loud on
 type mismatch `42804` / out-of-range `22003`) → `build_decorated_key` +
 `build_row`/`build_delete_row` (the SAME `ferrosa-row-bridge` encoder the engine
-and CQL decode) → `Mutation`. An `INSERT` of N rows builds and validates EVERY
+and CQL decode) → `Mutation`. An `UPDATE` whose SET right-hand side reads a column
+(`SET c = c + 1`) first resolves its key `WHERE`, does a **read-modify-write**
+(`read_current_row_for_update`: committed point read + the transaction's own buffered
+writes overlaid), evaluates each side with `eval_set_expr`/`apply_arith` and writes the
+result (`42883` for an operand without an operator, `22003` on integer overflow, NULL
+propagating); a constant SET keeps the blind-upsert path and reads nothing. An `INSERT`
+of N rows builds and validates EVERY
 row first, then applies the whole set as ONE atomic batch (`apply_batch_or_buffer`):
 **autocommit** → `engine.write_atomic_batch` (or one MVCC commit), **in a
 transaction** → buffer the rows into the write-set for one commit at `COMMIT`.

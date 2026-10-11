@@ -28,7 +28,7 @@ in-memory table in tests and by Ferrosa storage in production.
   recurses per level, so an unbounded depth overflows the worker stack and
   aborts the process (`tests/parser_depth.rs`).
 
-- `SELECT [DISTINCT] <* | items> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
+- `SELECT [DISTINCT] <* | items [AS alias]> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
 - No-`FROM` scalar selects: `SELECT 1`, `SELECT version()` (zero-arg func),
@@ -47,8 +47,29 @@ in-memory table in tests and by Ferrosa storage in production.
   (`SELECT (1)`), and every other select-list expression form is refused by name
   (`ParseError::UnsupportedSelectExpr`). A subquery outside the no-`FROM` select
   list (a `FROM` relation's projection, `WHERE`, `VALUES`) is not parsed.
+- **SELECT-list output alias** (`item [AS] name`): an item of a `FROM` relation's
+  projection may be named with `AS <name>` or a bare trailing `<name>`. The alias
+  renames only the OUTPUT column — it sets the `RowDescription` column name and
+  changes nothing about which cell is read (`SELECT pad AS label FROM t` returns
+  the same `pad` values under the name `label`). It is applied to the output
+  `Column.name` in all three projection derivations — `simple_projection`, the
+  aggregate plan (`plan_aggregate`), and `aggregate_output_columns` — so `describe`
+  advertises the same names `execute` produces. It is consumed AFTER the `||`
+  refusal, so `col || 'x'` is still refused by name and is never mis-read as
+  `col AS ||`. The accessor is `SelectItem::alias()`.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
-  `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
+  `DELETE FROM t WHERE k = v [AND ...]`, and
+  `UPDATE t SET <col> = <set-expr> [, ...] WHERE k = v [AND ...]`. A SET right-hand
+  side is either a constant — a literal, a `$N`, or a zero-arg value function — or an
+  **arithmetic read-modify-write** over the row's own current columns: `+`, `-` and `*`
+  with SQL precedence (`*` binds tighter) and parentheses, over literals, `$N` and
+  column names (`SET c = c + 1`, `SET c = (c + 2) * 3`). Division and modulo are NOT in
+  the grammar and are refused at the token the parser cannot consume, never mis-parsed;
+  a leading `-` binds to a numeric literal (`SET c = -5`), it is not a subtraction. The
+  new AST nodes are `ArithOp{Add,Sub,Mul}` and `SetExpr{Value,Column,Binary}`, and
+  `SetExpr::references_column()` is what tells the front end that an assignment must
+  READ the row rather than blind-upsert it. `WHERE` stays equality-only: the key columns
+  identify the row (Cassandra-style upsert).
 - **`COPY t [(cols)] FROM STDIN [[WITH] (<options>)]`** → `Statement::CopyFromStdin` (the
   payload arrives later as `CopyData` frames, so `ferrosa-postgres` drives it). Options are the
   parenthesised form: `FORMAT (text|csv)`, `DELIMITER '<c>'`, `NULL '<s>'` and `HEADER` are
@@ -210,7 +231,7 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 | Area | Items |
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
-| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `CastTarget`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
+| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `CastTarget`, `Projection`, `SelectItem` (with `SelectItem::alias()`), `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
 | Plan | `execute_streaming`, `RowSink`, `open_cursor`, `RowCursor`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
@@ -233,7 +254,9 @@ already share, and duplicated its failure handling with it.
 External crates: `ordered-float` (total-order `f64` for join/group keys),
 `num-bigint` (arbitrary-precision `Numeric`), `uuid`, `chrono` (std-only, typed
 temporal literal parsing), `serde` + `serde_json` (spilled runs are
-length-prefixed JSON records), `tracing`.
+length-prefixed JSON records), `tracing`. Dev-only: `tempfile` and `libc` —
+`libc` because `tests/spill_operators.rs` raises the process soft
+`RLIMIT_NOFILE` to its hard limit (see the Tests section).
 
 **Called by**: `ferrosa-postgres` — lowers parsed SQL onto this engine's
 operators and serves results over the Postgres wire.
@@ -241,18 +264,28 @@ operators and serves results over the Postgres wire.
 ## Tests
 
 In-crate unit tests (no `#[ignore]`, no live-infra): `exec.rs`, `parser.rs`,
-`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 186 total. They cover
+`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 223 total. They cover
 NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
-normalization, join key resolution, binder fail-loud paths, the `TRUNCATE` /
+normalization, join key resolution, binder fail-loud paths, the SELECT-list
+`AS` output alias (parser and `describe`), the `TRUNCATE` /
 `VACUUM` / `ANALYZE` grammar (including the named refusals), and the spill
 module's orders, replay buffer and orphan sweep.
 
-`tests/spill_operators.rs` (11 tests, including a negative control that proves
+`tests/spill_operators.rs` (13 tests, including a negative control that proves
 the budget assertions fail when the threshold is unreachable) holds the per-operator spill invariant:
 given an input larger than the threshold, the operator returns EVERY row, peak
 resident rows stay an order of magnitude below the rows processed, output order
 is unchanged, a dropped stream removes its temp directory, and a reservation
 failure is loud.
+
+Every test there forces thousands of spilled runs and a sort's cascade merge
+holds up to `MERGE_FANIN` (64) run files open at once. libtest runs a binary's
+tests as threads in ONE process, so a dozen concurrently spilling tests need on
+the order of 800 descriptors; on a host whose soft `RLIMIT_NOFILE` is the macOS
+default of 256 that fails a *correct* merge with `EMFILE`. The binary therefore
+raises the soft limit to the hard limit once (`raise_fd_limit()`), so the suite
+measures spill behaviour, not the shell's descriptor default. CI runs the suite
+under nextest (one process per test) and never shares the budget.
 
 ## Specs
 
