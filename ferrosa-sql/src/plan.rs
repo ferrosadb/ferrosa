@@ -956,11 +956,13 @@ fn intern_agg(
 }
 
 /// The output column for an aggregate: name `count`/`sum`/`min`/`max`/`avg`.
-/// COUNT is always `Int`; AVG is always `Float`; SUM and MIN/MAX take the
-/// argument column's type.
+/// COUNT is always `BigInt` (PostgreSQL's `count()` is `int8` — its result can
+/// exceed `int4`, and a driver reading `i64` deserializes on the strength of the
+/// advertised OID); AVG is always `Float`; SUM and MIN/MAX take the argument
+/// column's type.
 fn aggregate_column(func: AggFunc, arg_col: Option<usize>, schema: &RelSchema) -> Column {
     let (name, ty) = match func {
-        AggFunc::Count => ("count", ColumnType::Int),
+        AggFunc::Count => ("count", ColumnType::BigInt),
         AggFunc::Sum => ("sum", arg_ty(arg_col, schema)),
         AggFunc::Avg => ("avg", ColumnType::Float),
         AggFunc::Min => ("min", arg_ty(arg_col, schema)),
@@ -1348,6 +1350,40 @@ mod tests {
         assert_eq!(described, executed);
     }
 
+    /// I7 (derivation path): the OUTPUT type of a computed/aggregate column is
+    /// DERIVED by `aggregate_column`, and that one derivation is what BOTH
+    /// `describe` (the `RowDescription` a client deserializes against) and
+    /// `execute` (the row bytes it deserializes) read. So the agreement check
+    /// belongs on the derivation, not on `count(*)` alone: a special-case fix for
+    /// `count` would leave every other derived type unchecked. COUNT is
+    /// PostgreSQL's `int8` (a driver reading `i64` must work, and a count can
+    /// exceed `int4`); SUM/MIN/MAX take the argument's engine type; AVG is
+    /// `float8`. Asserted on BOTH paths so they cannot drift.
+    #[test]
+    fn derived_aggregate_column_types_match_postgres_on_both_paths() {
+        let sql = "SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount), AVG(amount) FROM sales";
+        let want = [
+            ("count", ColumnType::BigInt),
+            ("sum", ColumnType::Int),
+            ("min", ColumnType::Int),
+            ("max", ColumnType::Int),
+            ("avg", ColumnType::Float),
+        ];
+        let described_all = describe(&parse(sql).unwrap(), &sales_catalog(), "public").unwrap();
+        let described: Vec<(&str, ColumnType)> = described_all
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty))
+            .collect();
+        assert_eq!(described, want, "describe (RowDescription) derivation");
+        let run = run_sales(sql);
+        let executed: Vec<(&str, ColumnType)> = run
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty))
+            .collect();
+        assert_eq!(executed, want, "execute (row bytes) derivation");
+    }
+
     #[test]
     fn describe_reports_the_output_alias_names() {
         // `AS` names the output column in BOTH the `describe` shape and the executed
@@ -1494,7 +1530,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("region", ColumnType::Text),
-                ("count", ColumnType::Int),
+                ("count", ColumnType::BigInt),
                 ("sum", ColumnType::Int),
             ]
         );

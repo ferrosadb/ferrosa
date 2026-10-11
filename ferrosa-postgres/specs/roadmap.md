@@ -115,7 +115,8 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   string), more than one row ⇒ `21000 cardinality_violation`, more than one output
   column ⇒ `42601` ("subquery must return only one column") refused *before* any
   row. Its column type is the inner query's single output column type (so
-  `count(*)` types as int), and `||` still coerces it to text. `ResultStream` grew
+  `count(*)` types as `bigint`/int8, PostgreSQL's own type for `count()`), and
+  `||` still coerces it to text. `ResultStream` grew
   `next_row` for this internal pull. `substitute_param` refuses a subquery in a DML
   value (`0A000`; the grammar never builds one). A subquery is only a no-`FROM`
   select-list operand: a `FROM` relation's projection, `WHERE`/`HAVING`, `VALUES`,

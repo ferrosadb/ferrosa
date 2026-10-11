@@ -43,7 +43,8 @@ toward the Postgres queries real clients send.
   NULL (distinct from the empty string), more than one row ⇒ `21000`
   `cardinality_violation`, more than one output column ⇒ `42601` refused *before*
   any row. The subquery's column type is the inner query's single output column
-  type (so `count(*)` types as int), and `||` still coerces it to text. This is
+  type (so `count(*)` types as `bigint`/int8, PostgreSQL's own type for
+  `count()`), and `||` still coerces it to text. This is
   what makes pgbench's census line
   `select (select count(*) from pgbench_accounts)||'|'||…` evaluate. An LParen not
   followed by `SELECT` (`SELECT (1)`) is still refused.

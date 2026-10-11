@@ -146,7 +146,9 @@ in-memory table in tests and by Ferrosa storage in production.
   refused by name (`ParseError::UnsupportedCastExpr`) — never mis-parsed as a column
   named `CAST`. A lone `:` is still a loud `bad token: :`: the `::` arm consumes both
   colons, a single one falls through to the catch-all.
-- Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`.
+- Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`. The derived
+  output type follows PostgreSQL: `COUNT`/`COUNT(col)` ⇒ `BigInt` (int8),
+  `SUM`/`MIN`/`MAX` ⇒ the argument's engine type, `AVG` ⇒ `Float` (float8).
 - Literals: int, float, string (with `''` escape), `TRUE`/`FALSE`/`NULL`, `$N`
   params, and typed literals `TIMESTAMP/DATE/TIME/INET/NUMERIC(=DECIMAL) '...'`.
 

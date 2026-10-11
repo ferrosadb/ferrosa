@@ -29,6 +29,7 @@ use ferrosa_storage::{
 };
 use tokio::net::TcpListener;
 use tokio_postgres::config::SslMode;
+use tokio_postgres::types::Type;
 use tokio_postgres::{Config, NoTls};
 
 struct OneRole(ScramVerifier);
@@ -716,9 +717,161 @@ async fn a_delete_by_the_declared_key_removes_exactly_that_row() {
         .expect("read the survivors");
     let mut ids: Vec<i32> = survivors.iter().map(|r| r.get::<_, i32>(0)).collect();
     ids.sort_unstable();
-    assert_eq!(ids, vec![1, 7], "exactly the row the predicate named is gone");
+    assert_eq!(
+        ids,
+        vec![1, 7],
+        "exactly the row the predicate named is gone"
+    );
 }
 
+/// Invariants for tpcb's statements, stated BEFORE the assertions. Each must hold AFTER the
+/// statement runs — not merely "the statement returned no error", which is the check that
+/// let a live UPDATE pass: it returned in 0 s, logged no error, and changed nothing.
+///
+///  I1  a load that reports success lands EVERY row: `count(*)` is exactly N. (Live at
+///      scale 10 the census was exactly 1000000|100|10, so the invariant is measured.)
+///  I2  a point lookup by the DECLARED key returns the named row, compared by VALUE — the
+///      key must address the row, not a prefix of the table.
+///  I3  that lookup does NOT fall back to a scan. The observable is the warning
+///      `ferrosa_postgres::query` emits when it scans — the loud log added for exactly this
+///      purpose — so its ABSENCE is evidence the index was used. Paired with a POSITIVE
+///      CONTROL below, without which the absence assertion would be vacuous.
+///  I4  after `UPDATE ... WHERE <declared key> = k`, reading k back returns the UPDATED
+///      value and every other row is unchanged (identity, never a count).
+#[test]
+fn the_tpcb_statement_invariants_hold_after_each_statement() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let fx = start().await;
+
+            // I1 — the load must land every row, at test scale.
+            const N: i64 = 64;
+            fx.client
+                .batch_execute("CREATE TABLE inv (aid integer, abalance integer)")
+                .await
+                .expect("a PK-less CREATE TABLE executes");
+            for aid in 1..=N {
+                fx.client
+                    .execute(
+                        "INSERT INTO inv (aid, abalance) VALUES ($1, $2)",
+                        &[&(aid as i32), &100i32],
+                    )
+                    .await
+                    .expect("row lands");
+            }
+            let counted: i64 = fx
+                .client
+                .query_one("SELECT count(*) FROM inv", &[])
+                .await
+                .expect("count(*) is queryable")
+                .get(0);
+            assert_eq!(counted, N, "I1: every inserted row must be countable");
+
+            // I6 (strengthened here): the `count` column is advertised as int8,
+            // so the `i64` read above deserializes — asserted directly on the wire
+            // OID, not inferred from the cast succeeding.
+            let typed = fx
+                .client
+                .query_one("SELECT count(*) FROM inv", &[])
+                .await
+                .expect("count(*) is queryable for its type");
+            assert_eq!(
+                typed.columns()[0].type_(),
+                &Type::INT8,
+                "I6: count(*) must be advertised as int8 (a client reads i64)"
+            );
+
+            // The declared key arrives by ALTER: `aid` becomes a SECONDARY index and the
+            // storage key stays the synthetic `_sys_ck_`.
+            fx.client
+                .batch_execute("ALTER TABLE inv ADD PRIMARY KEY (aid)")
+                .await
+                .expect("ALTER ADD PRIMARY KEY executes");
+            await_index_current(&fx, "inv", "inv_pkey").await;
+
+            // I2 + I3 — the row comes back, and it comes back through the index.
+            let read: i32 = fx
+                .client
+                .query_one("SELECT abalance FROM inv WHERE aid = 42", &[])
+                .await
+                .expect("I2: the named row must come back")
+                .get(0);
+            assert_eq!(
+                read, 100,
+                "I2: the lookup must return the row the key names"
+            );
+            assert!(
+                !logs.text().contains("names no indexed column"),
+                "I3: a lookup by the declared key must not scan. captured:\n{}",
+                logs.text()
+            );
+
+            // I4 — the update takes effect, and only on the named row.
+            fx.client
+                .execute("UPDATE inv SET abalance = abalance + 5 WHERE aid = 42", &[])
+                .await
+                .expect("I4: UPDATE by the declared key must not be refused");
+            let after: i32 = fx
+                .client
+                .query_one("SELECT abalance FROM inv WHERE aid = 42", &[])
+                .await
+                .expect("read back after the update")
+                .get(0);
+            assert_eq!(
+                after, 105,
+                "I4: the UPDATE must be visible when the row is read back"
+            );
+            let sibling: i32 = fx
+                .client
+                .query_one("SELECT abalance FROM inv WHERE aid = 43", &[])
+                .await
+                .expect("read the sibling")
+                .get(0);
+            assert_eq!(
+                sibling, 100,
+                "I4: rows the predicate did not name must be unchanged"
+            );
+
+            // POSITIVE CONTROL for I3: the same capture, on a column with NO index, MUST see
+            // the warning. Without this, "the warning was absent" proves nothing about the
+            // index — it would also be absent if the capture were broken.
+            fx.client
+                .batch_execute("CREATE TABLE inv2 (aid integer, abalance integer)")
+                .await
+                .expect("a PK-less CREATE TABLE executes");
+            fx.client
+                .execute("INSERT INTO inv2 (aid, abalance) VALUES (1, 100)", &[])
+                .await
+                .expect("row lands");
+            fx.client
+                .execute("UPDATE inv2 SET abalance = abalance + 5 WHERE aid = 1", &[])
+                .await
+                .expect("a non-indexed UPDATE must not be refused");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline
+                && !logs.text().contains("names no indexed column")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                logs.text().contains("names no indexed column"),
+                "positive control: a non-indexed WHERE MUST log the scan warning, otherwise \
+                 I3's absence assertion is vacuous. captured:\n{}",
+                logs.text()
+            );
+        });
+    });
+}
 /// A `MakeWriter` that collects everything logged into a shared buffer, so a test can
 /// assert a warning was actually emitted. The same pattern ferrosa-cql's router tests and
 /// ferrosa-storage's engine tests use for their scan/index warnings.
@@ -812,4 +965,98 @@ fn a_scan_fallback_is_logged_loudly() {
         "the warning must say the statement is streaming a full scan with filtering. \
          --- captured warnings ---\n{captured}"
     );
+}
+
+/// I6 — `count(*)` MUST be reported and encoded as `int8` (PostgreSQL's own type
+/// for `count()`), so a client reading `i64` deserializes it.
+///
+/// RED before the fix: the front end derived `count` as `int4` (OID 23), so
+/// tokio-postgres refused the value with `WrongType { postgres: Int4, rust:
+/// "i64" }` — a client could not read a `count(*)` at all. The advertised OID is
+/// the whole contract a client deserializes against, so it is asserted directly
+/// rather than inferred from the cast succeeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn count_star_is_reported_and_encoded_as_int8() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE cnt (aid integer)")
+        .await
+        .expect("a PK-less CREATE TABLE executes");
+    fx.client
+        .batch_execute("INSERT INTO cnt (aid) VALUES (1), (2), (3)")
+        .await
+        .expect("rows land");
+
+    let row = fx
+        .client
+        .query_one("SELECT count(*) FROM cnt", &[])
+        .await
+        .expect("count(*) is queryable");
+    let column = &row.columns()[0];
+    assert_eq!(column.name(), "count");
+    assert_eq!(
+        column.type_(),
+        &Type::INT8,
+        "I6: count(*) must be advertised as int8, not {}",
+        column.type_()
+    );
+    assert_eq!(column.type_().oid(), 20, "I6: int8 is OID 20");
+    // The client reads in the type the advertised OID names.
+    let n: i64 = row.get(0);
+    assert_eq!(n, 3, "I6: a client reading i64 must deserialize the count");
+}
+
+/// I7 — a computed/aggregate column is the GENERAL case. The invariant is not
+/// "count(*) is int8"; it is that every DERIVED column's advertised OID is the
+/// type its bytes are encoded as, so a client reading the matching Rust type
+/// deserializes. This SELECT derives several distinct aggregates through the
+/// SAME derivation path (`ferrosa_sql::plan::aggregate_column`), so a
+/// special-case fix for `count` alone would leave the rest unchecked.
+///
+/// Derived here: `count(*)` -> int8; `min`/`max`/`sum` over an `integer`
+/// argument -> int4 (the argument's engine type). Each is read back with the Rust
+/// type its advertised OID names — the deserialization only succeeds if the OID
+/// and the bytes agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn derived_columns_advertise_the_oid_their_bytes_carry() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE aggd (aid integer, abalance integer)")
+        .await
+        .expect("a PK-less CREATE TABLE executes");
+    fx.client
+        .batch_execute("INSERT INTO aggd (aid, abalance) VALUES (1, 10), (2, 20), (3, 30)")
+        .await
+        .expect("rows land");
+
+    let row = fx
+        .client
+        .query_one(
+            "SELECT count(*), min(aid), max(aid), sum(abalance) FROM aggd",
+            &[],
+        )
+        .await
+        .expect("derived columns are queryable");
+    let columns = row.columns();
+    let expected = [
+        ("count", Type::INT8),
+        ("min", Type::INT4),
+        ("max", Type::INT4),
+        ("sum", Type::INT4),
+    ];
+    assert_eq!(columns.len(), expected.len());
+    for (i, (name, want)) in expected.iter().enumerate() {
+        assert_eq!(columns[i].name(), *name, "column {i}");
+        assert_eq!(
+            columns[i].type_(),
+            want,
+            "I7: derived column {i} ({name}) must be advertised as {want}, not {}",
+            columns[i].type_()
+        );
+    }
+    // A client deserializes each column on the strength of its advertised OID.
+    assert_eq!(row.get::<_, i64>(0), 3, "count");
+    assert_eq!(row.get::<_, i32>(1), 1, "min");
+    assert_eq!(row.get::<_, i32>(2), 3, "max");
+    assert_eq!(row.get::<_, i32>(3), 60, "sum");
 }

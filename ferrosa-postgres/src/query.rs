@@ -9044,7 +9044,8 @@ mod scalar_subquery_tests {
     #[tokio::test]
     async fn a_scalar_subquery_alone_reports_its_inner_column_type() {
         // The subquery's column type is the INNER query's single output type, not
-        // always text: `count(*)` types as int (OID 23) on this front end.
+        // always text: `count(*)` types as bigint (OID 20) on this front end,
+        // matching PostgreSQL's `count()`.
         let (_dir, engine, schema) = new_engine();
         seed(&engine, &schema, "pgbench_tellers", 3).await;
         let msgs = run(
@@ -9054,8 +9055,144 @@ mod scalar_subquery_tests {
         )
         .await;
         assert_eq!(single_text(&msgs).as_deref(), Some("3"));
-        assert_eq!(row_description_oid(&msgs), 23, "count(*) types as int");
+        assert_eq!(row_description_oid(&msgs), 20, "count(*) types as bigint");
         engine.shutdown().unwrap();
+    }
+
+    /// Parse a single table `SELECT` for the agreement checks below.
+    fn select_stmt(sql: &str) -> SelectStmt {
+        match parse_statement(sql).expect("parses") {
+            Statement::Select(stmt) => *stmt,
+            other => panic!("expected a table SELECT, got {other:?}"),
+        }
+    }
+
+    /// Open `select` and pull its FIRST row, so the shape and the bytes checked
+    /// are the ones the PRODUCT emits, not a hand-built value.
+    async fn first_row_of(
+        engine: &Arc<StorageEngine>,
+        schema: &Schema,
+        select: SelectStmt,
+    ) -> (Vec<Column>, Row) {
+        let disabled = crate::ClusterRead::disabled();
+        let limits = crate::jsonb_wire::test_limits();
+        let env = ReadEnv {
+            engine,
+            schema,
+            default_schema: "public",
+            mvcc: None,
+            snapshot: None,
+            ddl: None,
+            jsonb_limits: &limits,
+            cluster_read: &disabled,
+        };
+        let mut stream = open_select_stream(env, select, None, Vec::new())
+            .await
+            .expect("the stream opens");
+        let row = stream
+            .next_row()
+            .await
+            .expect("the stream does not fail")
+            .expect("at least one row");
+        (stream.columns().to_vec(), row)
+    }
+
+    /// I5's contract, on the wire facts a client deserializes against: for EVERY
+    /// column, the `RowDescription` field and the encoded `DataRow` cell must
+    /// agree. The field's `type_size` must equal the OID's fixed `typlen`, and a
+    /// fixed-width column must carry exactly that many bytes (a NULL carries
+    /// none). A client reads on the strength of the OID alone, so the declared
+    /// type and the encoded value are one contract.
+    ///
+    /// Returned as a `Result` rather than asserted inline so the CONTROL below can
+    /// drive the SAME code with a deliberately mismatched column — otherwise a
+    /// passing assertion proves nothing.
+    fn oid_agrees_with_row(columns: &[Column], row: &Row) -> Result<(), String> {
+        // Binary format: only there is a fixed OID's byte WIDTH a fact.
+        let fields = row_description_fields(columns, &[1]);
+        let types: Vec<ColumnType> = columns.iter().map(|c| c.ty).collect();
+        let data = match encode_data_row(row, &types, &[1]) {
+            Ok(BackendMessage::DataRow { columns }) => columns,
+            Ok(other) => return Err(format!("expected a DataRow, got {other:?}")),
+            Err(error) => return Err(format!("encoding failed: {error:?}")),
+        };
+        if fields.len() != data.len() {
+            return Err(format!(
+                "{} row-description fields for {} data columns",
+                fields.len(),
+                data.len()
+            ));
+        }
+        for (i, (field, cell)) in fields.iter().zip(data.iter()).enumerate() {
+            let pg = crate::pg_types::by_oid(field.type_oid as u32).ok_or_else(|| {
+                format!(
+                    "column {i}: OID {} is not minted by ferrosa",
+                    field.type_oid
+                )
+            })?;
+            if field.type_size != pg.typlen {
+                return Err(format!(
+                    "column {i} ({}): type_size {} disagrees with typlen {} for OID {}",
+                    field.name, field.type_size, pg.typlen, field.type_oid
+                ));
+            }
+            if let Some(bytes) = cell {
+                if pg.typlen >= 0 && bytes.len() != pg.typlen as usize {
+                    return Err(format!(
+                        "column {i} ({}): OID {} ({}) promises {}-byte values but the row \
+                         carried {} bytes",
+                        field.name,
+                        field.type_oid,
+                        pg.typname,
+                        pg.typlen,
+                        bytes.len()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// I5 — the OID a `SELECT`'s row description advertises for a column MUST be
+    /// the type its row bytes are encoded as, for EVERY column. Checked on the
+    /// real RowDescription and the real DataRow bytes the product produces for a
+    /// COMPUTED SELECT, so it lands on the aggregate-derivation path rather than
+    /// on `count(*)` alone.
+    #[tokio::test]
+    async fn i5_a_computed_selects_oids_agree_with_the_bytes_its_rows_carry() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_tellers", 3).await;
+        let (columns, row) = first_row_of(
+            &engine,
+            &schema,
+            select_stmt("SELECT count(*), count(pad) FROM pgbench_tellers"),
+        )
+        .await;
+        assert_eq!(columns.len(), 2, "two DERIVED columns");
+        assert_eq!(
+            columns.iter().map(|c| c.ty).collect::<Vec<_>>(),
+            [ColumnType::BigInt, ColumnType::BigInt],
+            "both derived columns type as int8"
+        );
+        oid_agrees_with_row(&columns, &row).expect("I5: every column's OID must match its bytes");
+        engine.shutdown().unwrap();
+    }
+
+    /// CONTROL for I5: the SAME checker MUST reject a deliberately mismatched
+    /// column, or the assertion above is vacuous. Here the column DECLARES `bool`
+    /// (OID 16, one byte) but carries an integer, which the encoder writes as
+    /// eight bytes — the class of disagreement I5 forbids. Without this, "every
+    /// column agreed" would also be consistent with a checker that can never fail.
+    #[test]
+    fn i5_control_a_mismatched_column_fails_the_agreement_check() {
+        let columns = vec![Column::new("flag", ColumnType::Bool)];
+        let row = Row::new(vec![SqlValue::Int(1)]);
+        let error = oid_agrees_with_row(&columns, &row)
+            .expect_err("a bool-typed column carrying 8 integer bytes must be caught");
+        assert!(
+            error.contains("promises") && error.contains("8 bytes"),
+            "the mismatch must be reported as a byte-width disagreement: {error}"
+        );
     }
 
     #[tokio::test]
