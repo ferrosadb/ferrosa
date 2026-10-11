@@ -215,6 +215,38 @@ engine's read API, then the fixture is a copy of that helper. The assertion stay
 value in the row after the block commits — never a mock recording, because the committer here is
 built on demand and cannot be replaced.
 
+### I2 RED ACHIEVED — and the product's answer is a named refusal (2026-10-11)
+
+The fixture landed and the test runs against a REAL commit path: a cluster-mode CQL core built from
+`SessionCore`'s public fields (one-node ring → `WritePath::Cluster` + peer manager + Accord clock),
+installed on the state, with `accord_transaction_committer()` asserted `Some` before anything else so
+the test cannot pass by quietly having no commit path at all. Read-back is the EFFECT through the
+front end (`route_select_raw` → `SelectRawResult.rows`), never a recorded call.
+
+Result, verbatim:
+
+    the LET block must commit, not fail: column 'v': unsupported collection assignment:
+    Add of a non-collection value — not supported inside a transaction (BEGIN…COMMIT) or logged
+    batch; use a non-transactional UPDATE
+
+So read-modify-write inside a transaction is **not silently wrong on the CQL front end — it is
+refused**, by name and with the remedy. Deliberate unsupported-feature refusal, not a defect.
+
+**The consequence that matters:** the two front ends DISAGREE about the same operation.
+
+- CQL: read-modify-write in a transaction → refused loudly (this message).
+- PG (live, RT-3): read-modify-write in a transaction → commits, and silently leaves the cell NULL.
+
+That is exactly the requirement this work serves — transactions must behave the same way from either
+front end. Neither is the target, but they are different failures, and the fix must reconcile them:
+support the read-in-transaction form and make the written value come from the bound read.
+
+The red is preserved as `let-i2-red.patch` in the session scratch rather than committed, because a red
+test on the PR branch breaks the branch's gate. It gets committed together with its green.
+
+Next: the GREEN. Two named gaps to close — (1) permit a read-modify-write assignment inside a
+transaction, (2) resolve the bound name to the value this transaction read so the write carries it.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
