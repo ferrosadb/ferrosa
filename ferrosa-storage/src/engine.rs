@@ -3788,6 +3788,8 @@ impl StorageEngine {
                 Ok(())
             },
             || set_aside.lock().sync(),
+            // A replay can run for minutes; say where it is every 5 s.
+            Some(&mut crate::commitlog::LogReplayProgress),
         )?;
         let set_aside = set_aside.into_inner();
         let absent_spilled_total: u64 = absent_table_spilled.values().sum();
@@ -21663,6 +21665,56 @@ mod tests {
             "flushing replayed data must checkpoint its re-logged copy"
         );
         assert!(engine.read(&table_a, &key).unwrap().is_some());
+    }
+
+    /// T-F4-1 at the engine: `open` logs the replay summary with its totals
+    /// (outage 2026-10-10: a node replayed for minutes and said nothing).
+    #[test]
+    fn open_logs_the_commit_log_replay_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let table_a = table_id();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine.register_table(test_schema_2()).unwrap();
+            for i in 0..7 {
+                engine
+                    .write(
+                        &table_a,
+                        &make_key(&format!("replayed-{i}")),
+                        make_row(b"v", 3000),
+                        3000,
+                    )
+                    .unwrap();
+            }
+            // Persist the local schema so the restart replays into table_a.
+            engine.flush(&table_id_2()).unwrap();
+            drop(engine);
+        }
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        let (engine, _pending) = tracing::subscriber::with_default(subscriber, || {
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap()
+        });
+        let captured = logs.text();
+        let summary = captured
+            .lines()
+            .find(|l| l.contains("commitlog: replay finished:"))
+            .unwrap_or_else(|| panic!("no replay summary logged:\n{captured}"));
+        assert!(
+            summary.contains(", 7 mutations") && summary.contains("mutations=7"),
+            "the summary carries the replayed count: {summary}"
+        );
+        assert!(engine
+            .read(&table_a, &make_key("replayed-6"))
+            .unwrap()
+            .is_some());
     }
 
     /// Layer 3 of the timeuuid-flush-wedge fix: a malformed mutation

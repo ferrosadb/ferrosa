@@ -49,7 +49,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
   it before deleting the old segment, so a second crash before the table
-  flushes loses nothing (FMEA ST-78).
+  flushes loses nothing (FMEA ST-78). Replay reports through a
+  `ReplayProgress` observer (`commitlog/replay_progress.rs`): a progress line
+  every 5 s (segments done/total, bytes, mutations, elapsed) and a final
+  summary, which `StorageEngine::open` logs. Replayed segments are unlinked on
+  the `commitlog-retire` thread, handed over only after the per-segment
+  barrier; a crash before the unlink replays them again, harmlessly
+  (outage 2026-10-10, F4).
   durability window: writes are refused with `CommitLogNotDurable` while the
   sync thread is dead, fsync is failing, or the oldest unsynced write is past
   `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
