@@ -69,6 +69,13 @@ supplying the commit decision:
 1. **Reads are staged, not executed, inside an open transaction.** A `SELECT` inside
    `BEGIN...COMMIT` records `TransactionRead { keyspace, table, key }` in the transaction's
    read-set; the front end returns rows read at the transaction's snapshot.
+   **Surface: Cassandra's `LET` block.** The standard spelling of a transactional read is
+   `BEGIN TRANSACTION` ... `LET <var> = SELECT <cols> FROM <t> WHERE <pk> = ?` ...
+   `COMMIT TRANSACTION`, where each `LET` binds one read of the transaction and later
+   statements in the same transaction may reference the variable. Implementing `LET` rather
+   than an ad-hoc select-in-transaction form keeps the CQL surface wire-compatible with
+   Cassandra 5 and makes the read-set explicit at PARSE time instead of inferred from an
+   open transaction, which is what the read-set validation needs.
 2. **The read-set is validated through Accord at the agreed commit timestamp.** The engine
    executes each read key at the transaction's agreed `t` (multi-key read-at-`t`), so reads
    observe the transaction's own writes and the commit is strict-serializable rather than
