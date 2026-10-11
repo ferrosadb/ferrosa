@@ -397,7 +397,16 @@ the public [`PROFILE.md`](../PROFILE.md) for tuning guidance and caveats.
 ## Data flow
 
 **Read (`SELECT`):** `Q`/`Execute` → `ferrosa_sql::parse_statement` →
-`load_catalog` opens each referenced table as a streamed storage provider. A
+`load_catalog` opens each referenced table as a streamed storage provider. The
+provider scans the **cluster** when this deployment has one: it opens
+`WritePath::range_read_stream_all_with` at [`DEFAULT_READ_CONSISTENCY`]
+(`QUORUM`) through the `ClusterRead` seam the binary wires to the live
+`WritePath`, so a `SELECT` fans out across the ring exactly as a CQL `SELECT`
+does. A standalone node (or an in-process unit test) keeps the local
+`StorageEngine::range_iter` path, which IS complete there. A cluster read that
+cannot be served at the requested consistency level is a **loud failure**
+(`ScanFailure` → `58000`), never a downgrade to a local-only scan: an
+under-return that looks like a small table is the defect this removes. A
 snapshot's sparse MVCC row overlay replaces current versions and restores
 deleted historical rows as the scan passes. The provider uses a bounded channel
 and decodes one storage partition at a time. `ferrosa_sql::execute_streaming`
@@ -577,7 +586,9 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 - **`ferrosa-cluster`** — `ddl_path::DdlPath` (the DDL path `ClusterDdl` adapts)
   and `write_path::WritePath` (the replicated write path the cluster committer
   replicates a `TRUNCATE` table tombstone over, at `ConsistencyLevel::All` to every
-  serving node), so PG DDL and `TRUNCATE` reach the cluster through the
+  serving node; and the **read** path `ClusterRangeRead` opens at
+  `ConsistencyLevel::Quorum` so a `SELECT` reads the ring, not only local
+  storage), so PG DDL, `TRUNCATE` and `SELECT` reach the cluster through the
   SAME paths CQL uses.
 - **`ferrosa-net`** — `tls::optional_server_config`, the shared TLS acceptor
   builder and crypto provider.

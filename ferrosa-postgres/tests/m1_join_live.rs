@@ -322,6 +322,7 @@ async fn m1_join_returns_rows_to_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -416,6 +417,7 @@ async fn extended_query_error_recovers_after_sync() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -467,6 +469,7 @@ async fn extended_parameterized_join_over_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -526,6 +529,7 @@ async fn group_by_order_by_limit_over_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -595,6 +599,7 @@ async fn where_having_distinct_over_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -713,6 +718,7 @@ async fn dml_client_with_committer(
         None => AccordAccess::disabled(),
     };
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -792,6 +798,7 @@ async fn dml_client_with_local_accord() -> (
     );
     let query_committer: Arc<dyn TransactionCommitter> = committer;
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine,
         schema,
         default_schema: "public".into(),
@@ -920,6 +927,7 @@ async fn dml_clients_on_two_accord_nodes() -> (
         );
         let query_committer: Arc<dyn TransactionCommitter> = committer;
         let ctx = Arc::new(QueryContext {
+            cluster_read: Default::default(),
             engine,
             schema,
             default_schema: "public".into(),

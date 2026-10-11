@@ -94,6 +94,17 @@ differential oracle exercise.
 **Read path (`SELECT`):** SQL string → `ferrosa_sql::parse_statement` →
 `query::load_catalog` resolves every referenced table (FROM + optional JOIN) by
 opening each referenced table as a bounded-channel storage provider. The scan
+**consults the cluster**: when the deployment has a range-read path
+(`QueryContext::cluster_read`, wired by the binary to the live
+`ferrosa_cluster::write_path::WritePath`), the producer opens
+`WritePath::range_read_stream_all_with` at `ConsistencyLevel::Quorum`
+(`DEFAULT_READ_CONSISTENCY`) with the keyspace's replication strategy, so the
+scan fans out across the ring instead of reading only this node's local
+`StorageEngine`. A cluster read that cannot reach the replicas the level
+requires is a **loud failure** recorded in `ScanFailure` (`58000`) — never a
+downgrade to a local-only scan, which would be a silent subset. A standalone
+node, and any in-process unit test (`ClusterRead::disabled()`), keeps the local
+`range_iter` path, which IS complete there. The scan
 producer decodes storage partitions as the synchronous executor pulls rows;
 the scan channel capacity defaults to 64 and is configurable. The executor is
 an owned `ferrosa_sql::RowCursor`, pulled 16 rows at a time on a blocking

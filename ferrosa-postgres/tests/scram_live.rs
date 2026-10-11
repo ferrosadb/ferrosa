@@ -101,6 +101,7 @@ fn minimal_ctx() -> (Arc<QueryContext>, tempfile::TempDir) {
     let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
     let schema = Schema::new(schema_config()).expect("schema bootstraps");
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),

@@ -282,11 +282,11 @@ seed; nodes 1 and 2 seed off it), gives every node
 `FERROSA_EXPECTED_CLUSTER_SIZE=3`, and drives `INSERT … VALUES (…),(…)` then
 `SELECT` over the wire **from the node with no seed**.
 
-The PostgreSQL front end answers every `SELECT` from this node's LOCAL
-`TableStore` (`storage_provider::produce_scan` never fans a range read across the
-ring), so `public` must be replicated to every node the scan is served from —
-otherwise a committed row is invisible on a non-owner node. `main` sized it from
-the `[internode] seed` list alone (`seeds + 1`), so a node with no seed — the seed
+The PostgreSQL front end **used to** answer every `SELECT` from this node's LOCAL
+`TableStore` (`storage_provider::produce_scan` fanned out over no ring), so
+`public` had to be replicated to every node the scan was served from — otherwise a
+committed row was invisible on a non-owner node. `main` sized it from the
+`[internode] seed` list alone (`seeds + 1`), so a node with no seed — the seed
 node of a star, and every node of the live `maas-loadtest` cluster — got **RF=1**:
 one owner per partition, a scan that returns its own third. The write is complete;
 the read is not. It is not data loss.
@@ -295,6 +295,29 @@ The red asserts the **values** of every seeded row, never a count (a count check
 passes the defect: the INSERT reported all of them). PRE-change the star's node 0
 returned one of five rows; FIXED it returns all five, because the derivation is
 `max(seeds, expected, committed)`.
+
+**The read now consults the ring, not only local storage.** Every `SELECT` opens
+the deployment's range-read path through a new `ferrosa-postgres::ClusterRead`
+seam (`cluster_read.rs`), wired by the binary to the live
+`ferrosa_cluster::write_path::WritePath`, at `ConsistencyLevel::Quorum`
+(`ClusterRangeRead`). A `QUORUM` read paired with the `QUORUM` Accord write gives
+`W + R > RF`, so a read on any node sees every committed row; and a read that
+cannot reach the replicas the level requires **fails loud** (the coordinator
+refuses to serve a partial fan-out; `ScanFailure` → `58000`) instead of returning
+a short result set that looks like a small table. A standalone node — or an
+in-process unit test with `ClusterRead::disabled()` — keeps the local
+`StorageEngine::range_iter` path, which IS complete there. Because reads no longer
+assume `RF == node_count`, the replication factor is free to be a **quorum**
+rather than the whole cluster: `RF = quorum` with `CL = QUORUM` is coherent
+(`W + R = 2q > q` for `RF = q = floor(N/2)+1`).
+
+`tests/pg_select_cluster_read_process.rs` is the process-level red for that read
+path: three real nodes in a star whose `public` is at `RF < 3` (node 0 boots alone
+with no seed, so the boot guard's "replicated to FEWER nodes" ERROR is the proven
+precondition). It asserts that a `SELECT` served by **each** of the three nodes
+returns the full committed row set by value and order, and that once an owner is
+stopped the same `SELECT` either returns every committed row or fails loud —
+never a silent subset.
 
 Two operational consequences are load-bearing:
 
@@ -305,6 +328,8 @@ Two operational consequences are load-bearing:
   (`postgres_default_keyspace_is_undersized`, driven by `undersized_guard_sweep`)
   re-verifies the factor on a bounded schedule and logs one actionable ERROR per
   distinct under-sized condition; it clears once the keyspace is re-created.
-- **RF=3 raises the cost of every write.** At RF=1 a write lands on one owner; at
-  RF=3 the same write fans out to all three nodes. The fix removes a
-  silent-wrong-read hole and moves that cost onto the write path.
+- **A larger factor raises the cost of every write, but a read no longer needs it
+  to be the whole cluster.** At RF=1 a write lands on one owner; at RF=3 the same
+  write fans out to all three nodes. With the cluster read in place a **quorum**
+  factor is sufficient for a `QUORUM` read, so the write cost can be held at
+  `floor(N/2)+1` rather than `N`.

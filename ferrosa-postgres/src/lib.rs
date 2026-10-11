@@ -14,6 +14,7 @@
 
 pub(crate) mod authz;
 pub mod catalog;
+pub mod cluster_read;
 pub mod codec;
 pub mod connection;
 pub mod copy_decode;
@@ -40,6 +41,7 @@ mod txn_write_set;
 mod accord_access;
 
 pub use connection::{ConnError, Connection, TlsPolicy};
+pub use cluster_read::{ClusterRangeRead, ClusterRead, RangeRead};
 pub use ddl::{ClusterDdl, DdlExecutor};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;

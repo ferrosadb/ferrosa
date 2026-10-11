@@ -227,6 +227,7 @@ pub async fn start_server_with(rows: usize, limits: ferrosa_postgres::PortalLimi
     let engine = Arc::new(engine);
     let portals = Arc::new(ferrosa_postgres::SuspendedPortals::new(limits));
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::clone(&engine),
         schema: Arc::new(schema_with_table()),
         default_schema: "ks".into(),

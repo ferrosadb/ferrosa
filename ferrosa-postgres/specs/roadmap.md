@@ -13,6 +13,19 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 ## Done (recent)
 
+- **The `SELECT` read path consults the cluster (FMEA PG-READ-01).** `produce_scan` opened
+  `StorageEngine::range_iter` on this node's local `TableStore` and never fanned a scan across
+  the ring, so a read was complete only while the keyspace was replicated to every node it
+  could be served from AND every owner was up with its partitions. At `RF < node_count` (and
+  from a down or mid-join node) a scan returned a FRACTION of the committed rows **silently** —
+  a short result set is indistinguishable from a small table. **Fix:** every `SELECT` opens the
+  cluster range read (`WritePath::range_read_stream_all_with`) at `ConsistencyLevel::Quorum`
+  through the new `ClusterRead` seam (`cluster_read.rs`, `ClusterRangeRead`), which the binary
+  wires to the live `WritePath`; a standalone node or a unit test (`ClusterRead::disabled()`)
+  keeps the local path, which IS complete there. A read that cannot meet the level **fails
+  loud** (`ScanFailure` → `58000`) and is never downgraded to a local-only scan. `QUORUM` read
+  + `QUORUM` write give `W + R > RF`, so `RF = quorum` is coherent — the factor no longer needs
+  to be the whole cluster. Process red: `ferrosa/tests/pg_select_cluster_read_process.rs`.
 - **The transactional `TRUNCATE` row-image decode fix (FMEA PG-TRUNCATE-03).** Building a
   transaction's MVCC row images — and the transaction's read overlay — used to decode EVERY
   buffered mutation's key as its column type, including the `TRUNCATE` table-tombstone
