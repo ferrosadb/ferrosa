@@ -1634,14 +1634,31 @@ mod tests {
         }
     }
 
+    /// REPLACES `lane_health_failures_outside_the_window_do_not_accumulate`,
+    /// which asserted the opposite of this. That test pinned a time window as
+    /// the reset condition for a run of failures, so failures minutes apart
+    /// never accumulated. Elapsed time is not evidence that a connection
+    /// recovered -- only a successful round trip is, which `record_success`
+    /// records. The lane this policy exists to catch is HALF-OPEN: it fails on
+    /// EVERY use while delivering nothing, and its traffic may be sparse (a Raft
+    /// heartbeat every few minutes). Under the window such a lane was never
+    /// probed, never condemned and never re-dialled -- the live
+    /// `timeout: Raft lane timeout` loop, repeating for twenty minutes.
+    ///
+    /// The slow peer the old test protected is protected by the PROBE instead,
+    /// which `lane_health_probe_success_keeps_a_slow_peer` and
+    /// `lane_health_interleaved_successes_never_probe` still pin.
     #[test]
-    fn lane_health_failures_outside_the_window_do_not_accumulate() {
+    fn lane_health_sparse_failures_still_accumulate() {
         let mut h = LaneHealth::new(3, Duration::from_secs(10));
         assert_eq!(h.record_failure(at(0)), LaneAction::None);
-        // A trickle of timeouts minutes apart must never add up to a wedged lane.
         assert_eq!(h.record_failure(at(60_000)), LaneAction::None);
-        assert_eq!(h.record_failure(at(120_000)), LaneAction::None);
-        assert!(!h.is_probing());
+        assert_eq!(
+            h.record_failure(at(120_000)),
+            LaneAction::Probe,
+            "three failures with no success between them is a wedge at any spacing"
+        );
+        assert!(h.is_probing());
     }
 
     #[test]

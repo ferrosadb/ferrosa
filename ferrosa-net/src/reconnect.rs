@@ -188,40 +188,44 @@ enum LaneVerdict {
 /// the peer silently receives nothing and the local side never reconnects.
 /// Feeding per-RPC outcomes back in makes that observable.
 ///
-/// Detection is deliberately two-stage. A run of consecutive failures *within
-/// the window* only suspends trust: the lane is probed, and a peer that answers
-/// keeps its connection. Only a probe that fails condemns the lane. A peer that
-/// is merely slow — a GC pause, host contention — must not be disconnected, and
-/// only *consecutive* failures count: a trickle of timeouts spread over time
-/// never accumulates into a wedge.
+/// Detection is deliberately two-stage. A run of consecutive failures only
+/// suspends trust: the lane is probed, and a peer that answers keeps its
+/// connection. Only a probe that fails condemns the lane. A peer that is
+/// merely slow — a GC pause, host contention — must not be disconnected, and
+/// only *consecutive* failures count — consecutive meaning **no successful
+/// round trip in between**, not "close together in time". A time window is the
+/// wrong predicate: a half-open lane fails on every use while its traffic may
+/// be sparse (a Raft heartbeat every few minutes), so an idle gap is not
+/// evidence of recovery and must not clear the run. The probe is what protects
+/// a slow peer, and it is cheap.
 ///
 /// The policy reads no clock of its own; callers pass the observation time, so
-/// the window behaviour is testable.
+/// the run behaviour is testable.
 #[derive(Debug, Clone)]
 pub struct LaneHealth {
     threshold: u32,
-    /// Failures must fall within this span of the run's first failure to count.
-    /// `Duration::ZERO` disables the time limit (counts indefinitely).
-    window: Duration,
     failures: u32,
-    first_failure: Option<Instant>,
     verdict: LaneVerdict,
 }
 
 impl Default for LaneHealth {
     fn default() -> Self {
-        Self::new(lane_failure_threshold(), lane_failure_window())
+        Self::new(lane_failure_threshold(), Duration::ZERO)
     }
 }
 
 impl LaneHealth {
     /// A threshold of `0` would act on no evidence at all; treat it as `1`.
-    pub fn new(threshold: u32, window: Duration) -> Self {
+    ///
+    /// The second parameter is ignored: a run of failures is cleared ONLY by
+    /// [`Self::record_success`]. The time window this used to honour silently
+    /// disarmed the guard for a lane whose traffic is sparse, which is exactly
+    /// the half-open case the guard exists to catch. It is kept only so the
+    /// existing call sites compile; removing it is a follow-up.
+    pub fn new(threshold: u32, _window: Duration) -> Self {
         Self {
             threshold: threshold.max(1),
-            window,
             failures: 0,
-            first_failure: None,
             verdict: LaneVerdict::Healthy,
         }
     }
@@ -231,27 +235,26 @@ impl LaneHealth {
     /// resolves the same way, which is what keeps a slow peer connected.
     pub fn record_success(&mut self, _now: Instant) {
         self.failures = 0;
-        self.first_failure = None;
         self.verdict = LaneVerdict::Healthy;
     }
 
     /// Record a send failure or timeout observed at `now`.
-    pub fn record_failure(&mut self, now: Instant) -> LaneAction {
+    ///
+    /// A run of failures is broken ONLY by [`Self::record_success`] — that is
+    /// what "consecutive" means here. Elapsed time is not evidence that the
+    /// connection recovered: a half-open lane fails on EVERY use while
+    /// delivering nothing, and a peer that is merely slow still succeeds
+    /// sometimes. `record_success` is therefore the only reset, which is what
+    /// keeps a sparse-but-wedged lane — a Raft heartbeat every few minutes —
+    /// reachable by the probe.
+    ///
+    /// `now` is accepted for call-site symmetry with [`Self::record_success`];
+    /// the run no longer depends on it.
+    pub fn record_failure(&mut self, _now: Instant) -> LaneAction {
         if self.verdict != LaneVerdict::Healthy {
             // A probe or a reconnect is already under way. Starting another
             // would multiply dials against a peer that is already down.
             return LaneAction::None;
-        }
-        if let Some(first) = self.first_failure {
-            if !self.window.is_zero() && now.duration_since(first) > self.window {
-                // The earlier failures are too old to belong to this outage, so
-                // a slow trickle cannot accumulate into a false positive.
-                self.failures = 0;
-                self.first_failure = None;
-            }
-        }
-        if self.first_failure.is_none() {
-            self.first_failure = Some(now);
         }
         self.failures = self.failures.saturating_add(1);
         if self.failures >= self.threshold {
@@ -280,6 +283,81 @@ impl LaneHealth {
     /// Whether the probe failed and the lane needs a fresh dial.
     pub fn is_condemned(&self) -> bool {
         self.verdict == LaneVerdict::Condemned
+    }
+}
+
+#[cfg(test)]
+mod lane_health_sparse_traffic_tests {
+    use super::*;
+
+    /// A lane that fails on EVERY use, but is only used every few minutes, is
+    /// still a wedge. The Raft heartbeat lane to a half-open peer looks exactly
+    /// like this: nothing is delivered, the local side gets no clean close, and
+    /// the lane fails again on its next use minutes later.
+    ///
+    /// Elapsed time between failures is NOT evidence of health -- only a
+    /// successful round trip is, which is what `record_success` records. The run
+    /// must therefore survive gaps wider than `window` and still reach the probe
+    /// threshold; otherwise such a lane is never probed, never condemned, and
+    /// never re-dialled, and every RPC through it times out forever.
+    #[test]
+    fn a_sparse_but_unbroken_run_of_failures_still_reaches_the_probe() {
+        let mut health = LaneHealth::new(3, Duration::from_secs(30));
+        let t0 = Instant::now();
+
+        assert_eq!(
+            health.record_failure(t0),
+            LaneAction::None,
+            "the 1st failure is under the threshold"
+        );
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(60)),
+            LaneAction::None,
+            "the 2nd failure is still under the threshold"
+        );
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(120)),
+            LaneAction::Probe,
+            "the 3rd consecutive failure must ask for a probe even though the \
+             gaps exceed the window: a half-open lane on sparse traffic is \
+             otherwise never probed and never reconnects"
+        );
+    }
+
+    /// Negative control for the fix: same count, same spacing, but a SUCCESS in
+    /// the middle. A peer that is merely slow answers sometimes, and the two
+    /// failures after that success are below the threshold of three -- so it must
+    /// keep its connection.
+    #[test]
+    fn a_success_between_failures_still_resets_the_run() {
+        let mut health = LaneHealth::new(3, Duration::from_secs(30));
+        let t0 = Instant::now();
+
+        assert_eq!(health.record_failure(t0), LaneAction::None);
+        health.record_success(t0 + Duration::from_secs(1));
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(60)),
+            LaneAction::None
+        );
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(120)),
+            LaneAction::None,
+            "a run broken by a success must not probe"
+        );
+    }
+
+    /// Negative control for the threshold: exactly one failure short of it never
+    /// probes, however wide the gaps.
+    #[test]
+    fn one_short_of_the_threshold_never_probes() {
+        let mut health = LaneHealth::new(3, Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert_eq!(health.record_failure(t0), LaneAction::None);
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(600)),
+            LaneAction::None,
+            "two failures must not probe when the threshold is three"
+        );
     }
 }
 

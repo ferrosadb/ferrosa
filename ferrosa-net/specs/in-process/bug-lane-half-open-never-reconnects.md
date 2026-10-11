@@ -6,7 +6,8 @@ with no lane-loss event, until the *local* node restarts.
 **Component:** `ferrosa-net` — `lane_actor.rs` (actor loop + alive watcher),
 `reconnect.rs` (`spawn_alive_watcher`), `pool.rs` / `peer.rs` (pool ownership)
 **Status:** in-process — probe-first detection implemented and unit-tested;
-**live verification still pending**
+**the accumulation window that hid sparse failures has been removed** (see
+Implementation Notes); **live verification still pending**
 
 ## Symptom
 
@@ -73,7 +74,9 @@ Done (10 tests, pure logic, no sockets):
 - [x] never re-probes or re-reconnects while one is already in flight (a stale probe result is ignored)
 - [x] only *consecutive* failures count — a success clears the run
 - [x] interleaved successes never probe
-- [x] failures spread beyond the window do not accumulate
+- [x] ~~failures spread beyond the window do not accumulate~~ **REVERSED** — the
+      window silently disarmed the guard for exactly this failure mode; the test now
+      asserts `lane_health_sparse_failures_still_accumulate` (see Implementation Notes)
 - [x] failures inside the window do accumulate
 - [x] a zero window means no time limit (the guard is not permanently disarmed)
 - [x] control: `mark_failed_transitions_through_exhaustion_to_dormant` stays green
@@ -102,9 +105,10 @@ unusable value warns once and falls back rather than panicking.
 - `FERROSA_NET_LANE_FAILURE_THRESHOLD` — consecutive send failures within the
   window before the lane is probed (default 3; `1` is the footgun setting that
   probes on a single slow request).
-- `FERROSA_NET_LANE_FAILURE_WINDOW_MS` — span within which consecutive failures
-  must occur to count (default 30000), so a trickle of timeouts minutes apart
-  never accumulates into a false positive.
+- `FERROSA_NET_LANE_FAILURE_WINDOW_MS` — **NO LONGER CONSULTED.** A time window is
+  the wrong predicate: a half-open lane fails on every use while its traffic may be
+  sparse, so an idle gap is not evidence of recovery. Kept wired but inert; removing
+  it (with the ignored second parameter of `LaneHealth::new`) is a follow-up.
 - `FERROSA_NET_LANE_PROBE_TIMEOUT_MS` — how long a probe waits for a reply before
   calling the peer unreachable (default 2000).
 
@@ -126,3 +130,40 @@ so routing lane RPCs through `PriorityPool` is explicitly not part of this fix.
   logs show **0** `identity mismatch` lines, and the peer *did* reconnect
   (`lane reconnected lane=Data …`), so this is not it.
 - **Backoff/dormant ladder.** `slow-retry` count is 0; the ladder was never entered.
+
+## Implementation Notes (2026-10-11) — the window is WHY the ladder was never entered
+
+The detection above was correct but **could not fire for this failure mode**, and
+this item's own evidence already showed it: *5 timeouts to the same peer* against a
+threshold of *3*, yet **`slow-retry` count 0 — the ladder was never entered**.
+
+`LaneHealth::record_failure` cleared the whole failure run whenever a failure
+arrived more than `window` (default 30 s) after the run's *first* failure. Elapsed
+time is not evidence that a connection recovered — only a successful round trip is,
+which is what `record_success` records. A half-open lane fails on EVERY use, but a
+Raft heartbeat to that peer only leaves every few minutes, so each failure reset the
+run to 1 and the threshold of 3 was never reached: never probed, never condemned,
+never re-dialled — the live ~20-minute `timeout: Raft lane timeout` loop.
+
+**Fix:** a run is cleared ONLY by `record_success`. The slow peer the window was
+meant to protect is protected by the **probe** instead, which is what the two-stage
+design always intended — `lane_health_probe_success_keeps_a_slow_peer` and
+`lane_health_interleaved_successes_never_probe` both still pin that.
+
+**Tests:** red first —
+`reconnect::lane_health_sparse_traffic_tests::a_sparse_but_unbroken_run_of_failures_still_reaches_the_probe`
+failed `left: None, right: Probe` against the unmodified policy: a behavioural red at
+the real decision point, and simultaneously the control on the diagnosis.
+`lane_health_failures_outside_the_window_do_not_accumulate` **pinned the defect**, so
+it was rewritten to the corrected contract with its assertion strengthened (never
+relaxed). `ferrosa-net`: 237 passed / 0 failed; `clippy --all-targets --all-features
+-D warnings` clean; `cargo fmt --check` clean.
+
+Still outstanding:
+
+- [ ] **live verification**: wedge a lane on a real cluster and watch it probe,
+      condemn, reconnect, and re-drive the dropped Applies. Unchanged — the fly
+      `machine exec` channel was too unreliable to drive it in this session.
+- [ ] **remove the inert knob**: the now-ignored second parameter of
+      `LaneHealth::new`, `lane_failure_window()`, `DEFAULT_LANE_FAILURE_WINDOW_MS`,
+      `ENV_LANE_FAILURE_WINDOW_MS`, and the ~10 test call sites that pass it.
