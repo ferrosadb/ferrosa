@@ -148,7 +148,7 @@ lock-free atomic — changing them needs a restart, not a rebuild.
   (PostgreSQL SQLSTATE `40001`; CQL a retryable server error). Raise this for a
   slow mutator: a client updating many rows in one transaction legitimately needs
   a longer window than a benchmark burst. It is single-sourced from the epoch
-  drain period's `DEFAULT_TXN_TIMEOUT` (10 s) because the drain is sized as
+  drain period's `DEFAULT_TXN_TIMEOUT` (20 s) because the drain is sized as
   `SkewMax + DEFAULT_TXN_TIMEOUT` — raising this without raising the drain would
   let a drain cut off a transaction still inside its bound.
 - **Barrier abstain bound.** How long the PostgreSQL snapshot-barrier read-vote,
@@ -160,7 +160,7 @@ lock-free atomic — changing them needs a restart, not a rebuild.
 
 | Environment variable | What it bounds | Default |
 |---|---|---:|
-| `FERROSA_ACCORD_TXN_TIMEOUT_SECS` | Apply bound: how long a transaction may wait for its dependencies before it is abandoned (rolled back, client told to retry) | `10` s |
+| `FERROSA_ACCORD_TXN_TIMEOUT_SECS` | Apply bound: how long a transaction may wait for its dependencies before it is abandoned (rolled back, client told to retry) | `20` s |
 | `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` | Barrier bound: how long the snapshot-barrier read-vote and inbound `ReadVote` wait before abstaining | `5` s |
 | `FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS` | Parked-apply reclamation: how long the dep-wait apply engine may retain a **parked** write-set whose dependency has not arrived before it releases it. This is a TIME bound on residency, never a hard cap on how much may be parked: the park is reclaimed only once its dependency has had far longer than the protocol allows it to arrive. Reclamation is fail-loud (logged at ERROR with the unresolved dependency set; the coordinator abandons the transaction and the client retries), never a silent drop. Keep it **above** the apply bound above | `60` s |
 
