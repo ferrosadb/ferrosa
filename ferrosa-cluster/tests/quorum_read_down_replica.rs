@@ -238,11 +238,16 @@ impl Drop for Replica {
 }
 
 /// A remote replica: its own storage holding the ledger row, served by the
-/// production `ReadRequestHandler`.
-fn spawn_replica() -> Replica {
+/// production `ReadRequestHandler`. `unreadable` damages its copy so every
+/// read of the ledger partition fails in storage while the node stays up, as
+/// node1's did in the outage.
+fn spawn_replica(unreadable: bool) -> Replica {
     let dir = tempfile::tempdir().unwrap();
     let storage = engine(dir.path());
     seed(&storage);
+    if unreadable {
+        make_unreadable(dir.path());
+    }
     let host_id = uuid::Uuid::new_v4();
     let handler = Arc::new(ReadRequestHandler::new(storage));
     let registry = Arc::new(HandlerRegistry::new());
@@ -274,23 +279,32 @@ fn spawn_replica() -> Replica {
 
 struct Cluster {
     coordinator: ClusterCoordinator,
+    /// node1's connections to the replicas, for sending a raw read.
+    peers: Arc<PeerManager>,
     node2: Replica,
     /// Held so node3 stays up for the whole test; dropped (killed) at the end.
     _node3: Replica,
     _dir1: tempfile::TempDir,
 }
 
+/// Which replica copies cannot be read (the node itself stays up).
+#[derive(Clone, Copy, Default)]
+struct Unreadable {
+    node1: bool,
+    node2: bool,
+}
+
 /// Three nodes, every one a replica of every token (RF 3 on 3 nodes), node 1
-/// coordinating. `node1_unreadable` damages node1's local copy.
-async fn three_node_cluster(node1_unreadable: bool) -> Cluster {
+/// coordinating.
+async fn three_node_cluster(unreadable: Unreadable) -> Cluster {
     let dir1 = tempfile::tempdir().unwrap();
     let storage1 = engine(dir1.path());
     seed(&storage1);
-    if node1_unreadable {
+    if unreadable.node1 {
         make_unreadable(dir1.path());
     }
-    let node2 = spawn_replica();
-    let node3 = spawn_replica();
+    let node2 = spawn_replica(unreadable.node2);
+    let node3 = spawn_replica(false);
 
     let node1_id = uuid::Uuid::new_v4();
     let mut ring = TokenRing::new();
@@ -322,7 +336,7 @@ async fn three_node_cluster(node1_unreadable: bool) -> Cluster {
 
     let coordinator = ClusterCoordinator::new(
         Arc::new(ArcSwap::from_pointee(ring)),
-        peers,
+        Arc::clone(&peers),
         1,
         storage1,
         RF,
@@ -330,6 +344,7 @@ async fn three_node_cluster(node1_unreadable: bool) -> Cluster {
     );
     Cluster {
         coordinator,
+        peers,
         node2,
         _node3: node3,
         _dir1: dir1,
@@ -388,7 +403,7 @@ fn assert_is_ledger_row(rows: Option<Vec<Row>>, context: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_quorum_read_succeeds_with_one_of_three_replicas_down() {
     let _serial = SERIAL.lock().await;
-    let mut cluster = three_node_cluster(false).await;
+    let mut cluster = three_node_cluster(Unreadable::default()).await;
     kill(&mut cluster.node2).await;
 
     let (result, elapsed) = ledger_read(&cluster.coordinator).await;
@@ -403,7 +418,11 @@ async fn local_quorum_read_succeeds_with_one_of_three_replicas_down() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_quorum_read_is_served_by_the_live_replicas_when_the_coordinator_cannot_read() {
     let _serial = SERIAL.lock().await;
-    let cluster = three_node_cluster(true).await;
+    let cluster = three_node_cluster(Unreadable {
+        node1: true,
+        node2: false,
+    })
+    .await;
 
     let (result, elapsed) = ledger_read(&cluster.coordinator).await;
     let rows = result.unwrap_or_else(|e| {
@@ -421,7 +440,11 @@ async fn local_quorum_read_is_served_by_the_live_replicas_when_the_coordinator_c
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_quorum_read_fails_loud_when_only_one_replica_can_answer() {
     let _serial = SERIAL.lock().await;
-    let mut cluster = three_node_cluster(true).await;
+    let mut cluster = three_node_cluster(Unreadable {
+        node1: true,
+        node2: false,
+    })
+    .await;
     kill(&mut cluster.node2).await;
 
     let (result, elapsed) = ledger_read(&cluster.coordinator).await;
@@ -449,4 +472,89 @@ async fn local_quorum_read_fails_loud_when_only_one_replica_can_answer() {
              ReadTimeout received=1 required=2, got {other:?} after {elapsed:?}"
         ),
     }
+}
+
+/// Well under the 10 s Data-lane deadline a silent replica costs, and well
+/// over a loopback round trip plus a failed SSTable open.
+const PROMPT: Duration = Duration::from_secs(3);
+
+/// A replica that is up but whose storage read fails must SAY so: the
+/// requester gets an error naming the storage failure at once, instead of
+/// nothing until its 10 s lane deadline (t_9113289f; in the outage each of
+/// node1's 37 failed reads cost the coordinator exactly 10 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replica_storage_read_failure_is_answered_with_an_error_naming_it() {
+    let _serial = SERIAL.lock().await;
+    let cluster = three_node_cluster(Unreadable {
+        node1: false,
+        node2: true,
+    })
+    .await;
+
+    let request = ferrosa_cluster::raft::handlers::ReadRequestPayload {
+        keyspace: KS.to_string(),
+        table: TBL.to_string(),
+        key: ledger_key().key.as_bytes().to_vec(),
+        digest_only: true,
+        page_size: 0,
+        page_state: vec![],
+        clustering: vec![],
+    };
+    let message = ferrosa_net::message::Message::ReadRequest(bytes::Bytes::from(
+        bincode::serialize(&request).unwrap(),
+    ));
+    let started = Instant::now();
+    let reply = cluster
+        .peers
+        .send(
+            cluster.node2.host_id,
+            message,
+            ferrosa_net::codec::Lane::Data,
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    let err = match reply {
+        Err(e) => e.to_string(),
+        Ok(msg) => panic!(
+            "node2 cannot read the partition, so it must not answer with data; got {:?}",
+            msg.msg_type()
+        ),
+    };
+    assert!(
+        elapsed < PROMPT,
+        "the failure took {elapsed:?} to reach the requester ({err}); a replica \
+         that cannot read must answer at once, not leave the requester to its \
+         lane deadline"
+    );
+    assert!(
+        err.contains("handler_failed")
+            && err.contains("ReadRequestHandler: storage read failed")
+            && err.contains("SSTable"),
+        "the error must say the replica's handler failed and why (the storage \
+         error); got: {err}"
+    );
+}
+
+/// A quorum read whose digest replica cannot read moves on to the spare at
+/// once and succeeds, instead of first waiting out the lane deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quorum_read_moves_to_the_spare_at_once_when_a_replica_cannot_read() {
+    let _serial = SERIAL.lock().await;
+    let cluster = three_node_cluster(Unreadable {
+        node1: false,
+        node2: true,
+    })
+    .await;
+
+    let (result, elapsed) = ledger_read(&cluster.coordinator).await;
+    let rows = result.unwrap_or_else(|e| {
+        panic!("node1 and node3 can serve LOCAL_QUORUM; got {e} after {elapsed:?}")
+    });
+    assert_is_ledger_row(rows, "digest replica unreadable");
+    assert!(
+        elapsed < PROMPT,
+        "the read took {elapsed:?}: it waited on node2's silence instead of \
+         hearing its storage failure and asking node3"
+    );
 }
