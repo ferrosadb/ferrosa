@@ -467,7 +467,37 @@ pub fn evict_global_fd_for_test(path: impl AsRef<Path>) {
     global_fd_cache().invalidate(path.as_ref());
 }
 
-fn should_mmap_component(path: &std::path::Path) -> bool {
+/// Environment variable naming the largest index component (`-Partitions.db`,
+/// `-Rows.db`) served from a whole-file memory map.
+///
+/// A component larger than this ceiling is streamed through the bounded,
+/// fd-cached `pread` path (`FileReadAtInner::CachedFd`) instead, which keeps its
+/// pages out of the process's resident set. This is a streaming BUFFER bound,
+/// never a cap: a component above the ceiling is read in full, one `pread` at a
+/// time — never refused and never truncated. It also bounds the file-backed
+/// resident (and hence dirty) footprint the mapping can add to the process, so
+/// a single large index cannot pin gigabytes of file pages the way an unbounded
+/// whole-file map does.
+pub const INDEX_MMAP_MAX_BYTES_ENV: &str = "FERROSA_SSTABLE_INDEX_MMAP_MAX_BYTES";
+
+/// Default ceiling for [`INDEX_MMAP_MAX_BYTES_ENV`]. The index components this
+/// crate maps are described as the "small, hot" ones; 16 MiB leaves every
+/// realistic `Partitions.db`/`Rows.db` on the lock-free mapping path while
+/// refusing to map a pathologically large one.
+const DEFAULT_INDEX_MMAP_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The resolved index-mapping ceiling, read at open time so an operator can
+/// retune it without a rebuild.
+fn index_mmap_max_bytes() -> u64 {
+    std::env::var(INDEX_MMAP_MAX_BYTES_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_INDEX_MMAP_MAX_BYTES)
+}
+
+/// Whether `path` names an index component this crate maps when it is small
+/// enough. The length test is applied by the caller, which knows the file size.
+fn is_index_component(path: &std::path::Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .map(|name| name.ends_with("-Partitions.db") || name.ends_with("-Rows.db"))
@@ -476,9 +506,14 @@ fn should_mmap_component(path: &std::path::Path) -> bool {
 
 impl FileReadAt {
     /// Open a file for positional reading.
+    ///
+    /// A small `-Partitions.db`/`-Rows.db` is memory-mapped so index traversal
+    /// is lock-free and syscall-free; a larger one is served through the bounded
+    /// fd-cached `pread` path so it cannot become a whole-file resident mapping.
+    /// See [`INDEX_MMAP_MAX_BYTES_ENV`].
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if !should_mmap_component(&path) {
+        if !is_index_component(&path) {
             return Self::open_with_cache(path, global_fd_cache());
         }
 
@@ -494,6 +529,13 @@ impl FileReadAt {
             return Ok(Self {
                 inner: FileReadAtInner::Empty,
             });
+        }
+        if len > index_mmap_max_bytes() {
+            // Too large to keep resident: stream it through the bounded
+            // fd-cached `pread` path (one `File::open`, then positional reads),
+            // which the mapping is never allowed to pin into the process's RSS.
+            drop(file);
+            return Self::open_with_cache(path, global_fd_cache());
         }
 
         // SAFETY: SSTable component files are immutable after they are opened by

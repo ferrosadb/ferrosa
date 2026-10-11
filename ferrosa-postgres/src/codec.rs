@@ -154,6 +154,16 @@ pub fn read_frontend(buf: &mut BytesMut) -> Result<Option<FrontendMessage>, Code
         b'D' => parse_describe(&mut frame),
         b'E' => parse_execute(&mut frame),
         b'C' => parse_close(&mut frame),
+        // COPY sub-protocol: the payload is opaque here (see `FrontendMessage::CopyData`).
+        b'd' => Ok(Some(FrontendMessage::CopyData {
+            data: frame.to_vec(),
+        })),
+        b'c' => Ok(Some(FrontendMessage::CopyDone)),
+        b'f' => {
+            let message = read_cstring(&mut frame)?
+                .ok_or(CodecError::Malformed("CopyFail message not NUL-terminated"))?;
+            Ok(Some(FrontendMessage::CopyFail { message }))
+        }
         b'S' => Ok(Some(FrontendMessage::Sync)),
         b'X' => Ok(Some(FrontendMessage::Terminate)),
         b'p' => Ok(Some(FrontendMessage::SaslResponse {
@@ -679,6 +689,101 @@ mod tests {
                 assert!(result_formats.is_empty());
             }
             other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[cfg(test)]
+    mod copy_frame_tests {
+        use super::*;
+        use bytes::BytesMut;
+
+        fn frame(tag: u8, body: &[u8]) -> BytesMut {
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(&[tag]);
+            buf.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+            buf.extend_from_slice(body);
+            buf
+        }
+
+        /// `d` carries the payload verbatim. It must not be decoded here: how a payload splits into
+        /// rows depends on the COPY format and options, which this layer does not have.
+        #[test]
+        fn copy_data_is_carried_verbatim() {
+            let mut buf = frame(b'd', b"1\thello\n2\tworld\n");
+            match read_frontend(&mut buf).unwrap() {
+                Some(FrontendMessage::CopyData { data }) => {
+                    assert_eq!(data, b"1\thello\n2\tworld\n");
+                    assert!(buf.is_empty(), "the whole frame is consumed");
+                }
+                other => panic!("expected CopyData, got {other:?}"),
+            }
+        }
+
+        /// An empty `d` is legal (the protocol allows a zero-length payload) and must not be
+        /// confused with end-of-data.
+        #[test]
+        fn an_empty_copy_data_is_not_end_of_data() {
+            let mut buf = frame(b'd', b"");
+            match read_frontend(&mut buf).unwrap() {
+                Some(FrontendMessage::CopyData { data }) => assert!(data.is_empty()),
+                other => panic!("expected an empty CopyData, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn copy_done_and_copy_fail_parse() {
+            let mut buf = frame(b'c', b"");
+            assert_eq!(
+                read_frontend(&mut buf).unwrap(),
+                Some(FrontendMessage::CopyDone)
+            );
+
+            let mut buf = frame(b'f', b"client gave up\0");
+            match read_frontend(&mut buf).unwrap() {
+                Some(FrontendMessage::CopyFail { message }) => {
+                    assert_eq!(message, "client gave up")
+                }
+                other => panic!("expected CopyFail, got {other:?}"),
+            }
+        }
+
+        /// A split frame is not a message: the parser waits for the rest rather than reporting a
+        /// truncated payload as complete.
+        #[test]
+        fn a_partial_copy_data_waits_for_the_rest() {
+            let full = frame(b'd', b"1\thello\n");
+            let mut buf = BytesMut::from(&full[..full.len() - 3]);
+            assert_eq!(read_frontend(&mut buf).unwrap(), None);
+            buf.extend_from_slice(&full[full.len() - 3..]);
+            assert!(matches!(
+                read_frontend(&mut buf).unwrap(),
+                Some(FrontendMessage::CopyData { .. })
+            ));
+        }
+
+        /// `CopyInResponse` is `G`: format byte, then a per-COLUMN count and those formats. An empty
+        /// format list means "every column is text" and must encode as a zero count, not as one
+        /// default entry.
+        #[test]
+        fn copy_in_response_encodes_format_then_per_column_formats() {
+            let mut out = BytesMut::new();
+            BackendMessage::CopyInResponse {
+                format: 0,
+                column_formats: vec![],
+            }
+            .encode(&mut out);
+            assert_eq!(out[0], b'G');
+            let len = i32::from_be_bytes(out[1..5].try_into().unwrap());
+            assert_eq!(len, 4 + 1 + 2, "length counts itself + format byte + count");
+            assert_eq!(&out[5..], &[0, 0, 0], "format 0, then zero column formats");
+
+            let mut out = BytesMut::new();
+            BackendMessage::CopyInResponse {
+                format: 0,
+                column_formats: vec![0, 1],
+            }
+            .encode(&mut out);
+            assert_eq!(&out[5..], &[0, 0, 2, 0, 0, 0, 1]);
         }
     }
 }

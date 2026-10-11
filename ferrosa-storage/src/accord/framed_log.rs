@@ -39,11 +39,6 @@ use std::path::Path;
 /// Magic header identifying a length-framed protocol log.
 pub const FRAMED_LOG_MAGIC: &[u8; 8] = b"FACCLOG1";
 
-/// Largest record accepted while reading. A length beyond this means the file
-/// is corrupt or not actually framed; treat it as a truncated tail rather than
-/// attempting a multi-gigabyte allocation from a bad length.
-pub const MAX_RECORD_LEN: usize = 64 * 1024 * 1024;
-
 /// Wrap one serialized entry in its length prefix.
 pub fn frame_record(payload: &[u8]) -> Vec<u8> {
     let mut framed = Vec::with_capacity(payload.len() + 4);
@@ -137,9 +132,12 @@ pub fn read_framed_log(path: &Path) -> Result<FramedLogRead, FramedLogError> {
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().expect("4 bytes")) as usize;
         pos += 4;
 
-        // A length past the end, or absurdly large, means the tail is torn.
-        // Stop rather than allocating from a bad length.
-        if len > MAX_RECORD_LEN || pos + len > bytes.len() {
+        // A length past the end means the tail is torn. The file length is the
+        // ONLY bound: checking it here rejects a bad length BEFORE allocating
+        // from it, so a valid record of any size is never refused for its size
+        // alone. (A fixed size ceiling would make a large-but-valid record
+        // indistinguishable from a torn tail — silent data loss on replay.)
+        if pos + len > bytes.len() {
             truncated_tail = true;
             break;
         }
@@ -260,6 +258,31 @@ mod tests {
         let read = read_framed_log(&path).expect("reads");
         assert_eq!(read.records, vec![b"good".to_vec()]);
         assert!(read.truncated_tail);
+    }
+
+    /// A record larger than the old 64 MiB reading guard must be recovered
+    /// intact, not mistaken for a torn tail. The guard refused/truncated a
+    /// valid record purely on its size — a data-path cap. The file length is
+    /// the real bound: `pos + len > bytes.len()` rejects a bad length before
+    /// any allocation, so no size ceiling is needed.
+    #[test]
+    fn a_record_larger_than_the_old_reading_guard_is_recovered_not_dropped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // One byte past the removed 64 MiB reading guard.
+        let payload = vec![0xabu8; 64 * 1024 * 1024 + 1];
+        let path = write_log(dir.path(), &[payload.as_slice()]);
+
+        let read = read_framed_log(&path).expect("reads");
+        assert!(
+            !read.truncated_tail,
+            "a valid oversized record must not be reported as a torn tail"
+        );
+        assert_eq!(
+            read.records.len(),
+            1,
+            "the oversized record must be recovered, not dropped"
+        );
+        assert_eq!(read.records[0].len(), payload.len());
     }
 
     /// A file containing only the magic is a log that was created but never

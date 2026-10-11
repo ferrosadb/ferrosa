@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rand::RngExt;
 use tokio::sync::watch;
@@ -96,6 +96,269 @@ pub fn slow_retry_interval() -> Duration {
     static WARNED: AtomicBool = AtomicBool::new(false);
     let default_ms = DORMANT_PROBE_INTERVAL.as_millis() as u64;
     Duration::from_millis(env_positive(ENV_SLOW_INTERVAL_MS, default_ms, &WARNED))
+}
+
+/// Default number of consecutive send failures on a lane before the lane is
+/// suspected wedged and probed.  See [`lane_failure_threshold`].
+pub const DEFAULT_LANE_FAILURE_THRESHOLD: u32 = 3;
+
+/// Environment variable overriding [`DEFAULT_LANE_FAILURE_THRESHOLD`]
+/// (positive integer).
+pub const ENV_LANE_FAILURE_THRESHOLD: &str = "FERROSA_NET_LANE_FAILURE_THRESHOLD";
+
+/// Consecutive failures before a lane is suspected wedged:
+/// [`ENV_LANE_FAILURE_THRESHOLD`] or [`DEFAULT_LANE_FAILURE_THRESHOLD`].
+///
+/// `1` is the footgun setting: it probes a lane on a single slow request.
+pub fn lane_failure_threshold() -> u32 {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let n = env_positive(
+        ENV_LANE_FAILURE_THRESHOLD,
+        u64::from(DEFAULT_LANE_FAILURE_THRESHOLD),
+        &WARNED,
+    );
+    u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// Default span (milliseconds) within which consecutive failures must occur to
+/// count toward the threshold.  See [`lane_failure_window`].
+pub const DEFAULT_LANE_FAILURE_WINDOW_MS: u64 = 30_000;
+
+/// Environment variable overriding [`DEFAULT_LANE_FAILURE_WINDOW_MS`], in
+/// milliseconds (positive integer).
+pub const ENV_LANE_FAILURE_WINDOW_MS: &str = "FERROSA_NET_LANE_FAILURE_WINDOW_MS";
+
+/// Window within which lane send failures accumulate:
+/// [`ENV_LANE_FAILURE_WINDOW_MS`] or [`DEFAULT_LANE_FAILURE_WINDOW_MS`].
+pub fn lane_failure_window() -> Duration {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    Duration::from_millis(env_positive(
+        ENV_LANE_FAILURE_WINDOW_MS,
+        DEFAULT_LANE_FAILURE_WINDOW_MS,
+        &WARNED,
+    ))
+}
+
+/// Default timeout for a lane health probe, in milliseconds.
+pub const DEFAULT_LANE_PROBE_TIMEOUT_MS: u64 = 2_000;
+
+/// Environment variable overriding [`DEFAULT_LANE_PROBE_TIMEOUT_MS`], in
+/// milliseconds (positive integer).
+pub const ENV_LANE_PROBE_TIMEOUT_MS: &str = "FERROSA_NET_LANE_PROBE_TIMEOUT_MS";
+
+/// How long a health probe waits for a reply before calling the peer
+/// unreachable: [`ENV_LANE_PROBE_TIMEOUT_MS`] or
+/// [`DEFAULT_LANE_PROBE_TIMEOUT_MS`].
+pub fn lane_probe_timeout() -> Duration {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    Duration::from_millis(env_positive(
+        ENV_LANE_PROBE_TIMEOUT_MS,
+        DEFAULT_LANE_PROBE_TIMEOUT_MS,
+        &WARNED,
+    ))
+}
+
+/// What the actor must do about a lane, as decided by [`LaneHealth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaneAction {
+    /// Nothing to do: the lane is within its failure budget, or a probe or a
+    /// reconnect it already asked for is still running.
+    None,
+    /// Probe the existing connection before disconnecting it. A peer that is
+    /// slow rather than gone answers and keeps its connection.
+    Probe,
+    /// The probe failed: the connection is dead. Perform the `ConnectionLost`
+    /// transition so the backoff/dormant ladder takes over.
+    Reconnect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaneVerdict {
+    Healthy,
+    /// A probe is in flight; the lane's fate is undecided.
+    Probing,
+    /// The probe failed. The ladder owns recovery from here.
+    Condemned,
+}
+
+/// Whether a lane's connection is still worth using.
+///
+/// A half-open connection never produces a clean close, so the alive watcher
+/// never fires and the lane stays `Connected` while **every** RPC times out —
+/// the peer silently receives nothing and the local side never reconnects.
+/// Feeding per-RPC outcomes back in makes that observable.
+///
+/// Detection is deliberately two-stage. A run of consecutive failures only
+/// suspends trust: the lane is probed, and a peer that answers keeps its
+/// connection. Only a probe that fails condemns the lane. A peer that is
+/// merely slow — a GC pause, host contention — must not be disconnected, and
+/// only *consecutive* failures count — consecutive meaning **no successful
+/// round trip in between**, not "close together in time". A time window is the
+/// wrong predicate: a half-open lane fails on every use while its traffic may
+/// be sparse (a Raft heartbeat every few minutes), so an idle gap is not
+/// evidence of recovery and must not clear the run. The probe is what protects
+/// a slow peer, and it is cheap.
+///
+/// The policy reads no clock of its own; callers pass the observation time, so
+/// the run behaviour is testable.
+#[derive(Debug, Clone)]
+pub struct LaneHealth {
+    threshold: u32,
+    failures: u32,
+    verdict: LaneVerdict,
+}
+
+impl Default for LaneHealth {
+    fn default() -> Self {
+        Self::new(lane_failure_threshold(), Duration::ZERO)
+    }
+}
+
+impl LaneHealth {
+    /// A threshold of `0` would act on no evidence at all; treat it as `1`.
+    ///
+    /// The second parameter is ignored: a run of failures is cleared ONLY by
+    /// [`Self::record_success`]. The time window this used to honour silently
+    /// disarmed the guard for a lane whose traffic is sparse, which is exactly
+    /// the half-open case the guard exists to catch. It is kept only so the
+    /// existing call sites compile; removing it is a follow-up.
+    pub fn new(threshold: u32, _window: Duration) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            failures: 0,
+            verdict: LaneVerdict::Healthy,
+        }
+    }
+
+    /// Record a successful round trip: the connection demonstrably works, so
+    /// clear both the run of failures and any verdict. A successful probe
+    /// resolves the same way, which is what keeps a slow peer connected.
+    pub fn record_success(&mut self, _now: Instant) {
+        self.failures = 0;
+        self.verdict = LaneVerdict::Healthy;
+    }
+
+    /// Record a send failure or timeout observed at `now`.
+    ///
+    /// A run of failures is broken ONLY by [`Self::record_success`] — that is
+    /// what "consecutive" means here. Elapsed time is not evidence that the
+    /// connection recovered: a half-open lane fails on EVERY use while
+    /// delivering nothing, and a peer that is merely slow still succeeds
+    /// sometimes. `record_success` is therefore the only reset, which is what
+    /// keeps a sparse-but-wedged lane — a Raft heartbeat every few minutes —
+    /// reachable by the probe.
+    ///
+    /// `now` is accepted for call-site symmetry with [`Self::record_success`];
+    /// the run no longer depends on it.
+    pub fn record_failure(&mut self, _now: Instant) -> LaneAction {
+        if self.verdict != LaneVerdict::Healthy {
+            // A probe or a reconnect is already under way. Starting another
+            // would multiply dials against a peer that is already down.
+            return LaneAction::None;
+        }
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= self.threshold {
+            self.verdict = LaneVerdict::Probing;
+            return LaneAction::Probe;
+        }
+        LaneAction::None
+    }
+
+    /// Record the outcome of a health probe. Returns [`LaneAction::Reconnect`]
+    /// when this probe's failure condemns the lane, and [`LaneAction::None`] for
+    /// a stale result arriving after the verdict was already resolved.
+    pub fn probe_failed(&mut self) -> LaneAction {
+        if self.verdict == LaneVerdict::Probing {
+            self.verdict = LaneVerdict::Condemned;
+            return LaneAction::Reconnect;
+        }
+        LaneAction::None
+    }
+
+    /// Whether a probe is in flight and the lane's fate is undecided.
+    pub fn is_probing(&self) -> bool {
+        self.verdict == LaneVerdict::Probing
+    }
+
+    /// Whether the probe failed and the lane needs a fresh dial.
+    pub fn is_condemned(&self) -> bool {
+        self.verdict == LaneVerdict::Condemned
+    }
+}
+
+#[cfg(test)]
+mod lane_health_sparse_traffic_tests {
+    use super::*;
+
+    /// A lane that fails on EVERY use, but is only used every few minutes, is
+    /// still a wedge. The Raft heartbeat lane to a half-open peer looks exactly
+    /// like this: nothing is delivered, the local side gets no clean close, and
+    /// the lane fails again on its next use minutes later.
+    ///
+    /// Elapsed time between failures is NOT evidence of health -- only a
+    /// successful round trip is, which is what `record_success` records. The run
+    /// must therefore survive gaps wider than `window` and still reach the probe
+    /// threshold; otherwise such a lane is never probed, never condemned, and
+    /// never re-dialled, and every RPC through it times out forever.
+    #[test]
+    fn a_sparse_but_unbroken_run_of_failures_still_reaches_the_probe() {
+        let mut health = LaneHealth::new(3, Duration::from_secs(30));
+        let t0 = Instant::now();
+
+        assert_eq!(
+            health.record_failure(t0),
+            LaneAction::None,
+            "the 1st failure is under the threshold"
+        );
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(60)),
+            LaneAction::None,
+            "the 2nd failure is still under the threshold"
+        );
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(120)),
+            LaneAction::Probe,
+            "the 3rd consecutive failure must ask for a probe even though the \
+             gaps exceed the window: a half-open lane on sparse traffic is \
+             otherwise never probed and never reconnects"
+        );
+    }
+
+    /// Negative control for the fix: same count, same spacing, but a SUCCESS in
+    /// the middle. A peer that is merely slow answers sometimes, and the two
+    /// failures after that success are below the threshold of three -- so it must
+    /// keep its connection.
+    #[test]
+    fn a_success_between_failures_still_resets_the_run() {
+        let mut health = LaneHealth::new(3, Duration::from_secs(30));
+        let t0 = Instant::now();
+
+        assert_eq!(health.record_failure(t0), LaneAction::None);
+        health.record_success(t0 + Duration::from_secs(1));
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(60)),
+            LaneAction::None
+        );
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(120)),
+            LaneAction::None,
+            "a run broken by a success must not probe"
+        );
+    }
+
+    /// Negative control for the threshold: exactly one failure short of it never
+    /// probes, however wide the gaps.
+    #[test]
+    fn one_short_of_the_threshold_never_probes() {
+        let mut health = LaneHealth::new(3, Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert_eq!(health.record_failure(t0), LaneAction::None);
+        assert_eq!(
+            health.record_failure(t0 + Duration::from_secs(600)),
+            LaneAction::None,
+            "two failures must not probe when the threshold is three"
+        );
+    }
 }
 
 /// `base` plus 0-25% random jitter.
@@ -427,6 +690,7 @@ pub(crate) async fn connect_once_cancelable(
 mod tests {
     use super::*;
     use serial_test::serial;
+    use std::sync::Mutex;
 
     /// Assert delay is within [base, base + 25%] range (accounting for jitter).
     fn assert_in_range(actual: Duration, base_ms: u64) {
@@ -613,5 +877,89 @@ mod tests {
             before,
             "cancelled reconnect should not record an attempt"
         );
+    }
+
+    /// The three lane knobs are independent resolver functions over the
+    /// environment. They share `parse_positive`, so a change to that helper
+    /// could silently move one knob while another looks correct — this pins
+    /// each one's own value, its own fallback, and their independence.
+    ///
+    /// `set_var` is process-global and these tests run in parallel, so the body
+    /// holds a process-wide mutex AND takes the `serial` key: a plain mutex
+    /// alone would not stop a *different* env-reading test from observing a
+    /// half-set environment.
+    #[test]
+    #[serial(lane_env)]
+    fn lane_knobs_honour_the_env_and_the_knobs_are_independent() {
+        static ENV_GUARD: Mutex<()> = Mutex::new(());
+        let _guard = ENV_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        const THRESHOLD: &str = ENV_LANE_FAILURE_THRESHOLD;
+        const WINDOW: &str = ENV_LANE_FAILURE_WINDOW_MS;
+        const PROBE: &str = ENV_LANE_PROBE_TIMEOUT_MS;
+        let default_window = Duration::from_millis(DEFAULT_LANE_FAILURE_WINDOW_MS);
+        let default_probe = Duration::from_millis(DEFAULT_LANE_PROBE_TIMEOUT_MS);
+
+        for name in [THRESHOLD, WINDOW, PROBE] {
+            std::env::remove_var(name);
+        }
+
+        // Unset: every knob reports its documented default.
+        assert_eq!(lane_failure_threshold(), DEFAULT_LANE_FAILURE_THRESHOLD);
+        assert_eq!(lane_failure_window(), default_window);
+        assert_eq!(lane_probe_timeout(), default_probe);
+
+        // Valid values are honoured.
+        std::env::set_var(THRESHOLD, "7");
+        std::env::set_var(WINDOW, "5000");
+        std::env::set_var(PROBE, "250");
+        assert_eq!(lane_failure_threshold(), 7);
+        assert_eq!(lane_failure_window(), Duration::from_millis(5_000));
+        assert_eq!(lane_probe_timeout(), Duration::from_millis(250));
+
+        // Unusable values fall back to the default instead of panicking, and the
+        // knob recovers as soon as a valid value returns.
+        for bad in ["", "abc", "0", "-1", "1.5", "NaN"] {
+            std::env::set_var(THRESHOLD, bad);
+            assert_eq!(
+                lane_failure_threshold(),
+                DEFAULT_LANE_FAILURE_THRESHOLD,
+                "threshold {bad:?} must fall back"
+            );
+        }
+        std::env::set_var(THRESHOLD, "7");
+        for bad in ["", "abc", "0", "-1", "NaN"] {
+            std::env::set_var(WINDOW, bad);
+            assert_eq!(
+                lane_failure_window(),
+                default_window,
+                "window {bad:?} must fall back"
+            );
+        }
+        std::env::set_var(WINDOW, "5000");
+        for bad in ["", "abc", "0", "-1", "NaN"] {
+            std::env::set_var(PROBE, bad);
+            assert_eq!(
+                lane_probe_timeout(),
+                default_probe,
+                "probe timeout {bad:?} must fall back"
+            );
+        }
+        std::env::set_var(PROBE, "250");
+
+        // Independence: a malformed value for one knob must not move the others.
+        std::env::set_var(THRESHOLD, "not-a-number");
+        assert_eq!(lane_failure_window(), Duration::from_millis(5_000));
+        assert_eq!(lane_probe_timeout(), Duration::from_millis(250));
+        std::env::set_var(THRESHOLD, "7");
+        std::env::set_var(WINDOW, "nonsense");
+        assert_eq!(lane_failure_threshold(), 7);
+        assert_eq!(lane_probe_timeout(), Duration::from_millis(250));
+
+        for name in [THRESHOLD, WINDOW, PROBE] {
+            std::env::remove_var(name);
+        }
     }
 }

@@ -53,7 +53,7 @@ async/S3 wrapper (`S3ReadAt`) deliberately lives one layer up in
 | `writer` (`src/writer.rs`) | ~4300 | `SSTableWriter`, `WriteOptions`, `SSTableOutput[Files]`, self-readback verify, source checksums |
 | `checksum` (`src/checksum.rs`) | ~230 | `DigestCrc32`/`ChunkCrc` (write-time), `ChunkCrcTable` (read-time) — Cassandra-compatible `Digest.crc32`/`CRC.db` formats (T-011) |
 | `data` (`src/data.rs`) | ~2700 | Data.db row/cell codec, delta-decode vs header |
-| `io` (`src/io.rs`) | ~1165 | `ReadAt`/`WriteAt`, `FileReadAt`/`FileWriteAt`, `CachedReadAt` block cache |
+| `io` (`src/io.rs`) | ~1200 | `ReadAt`/`WriteAt`, `FileReadAt`/`FileWriteAt`, `CachedReadAt` block cache. `FileReadAt::open` maps an index component only up to `FERROSA_SSTABLE_INDEX_MMAP_MAX_BYTES` (default 16 MiB); larger components use the bounded fd-cached `pread` path (a streaming buffer bound, never a cap) |
 | `trie/{node,builder,walker,mod}` | ~2160 | On-disk trie used by both indexes |
 | `statistics` (`src/statistics.rs`) | ~1006 | Statistics.db, `SerializationHeader` |
 | `partition_index` / `row_index` | ~875 | Trie-backed Partitions.db / Rows.db |

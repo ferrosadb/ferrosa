@@ -28,13 +28,59 @@ in-memory table in tests and by Ferrosa storage in production.
   recurses per level, so an unbounded depth overflows the worker stack and
   aborts the process (`tests/parser_depth.rs`).
 
-- `SELECT [DISTINCT] <* | items> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
+- `SELECT [DISTINCT] <* | items [AS alias]> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
 - No-`FROM` scalar selects: `SELECT 1`, `SELECT version()` (zero-arg func),
-  `SELECT $1`, `SELECT TRUE`.
+  `SELECT $1`, `SELECT TRUE`, `||` string concatenation over those scalars
+  (`SELECT 'a' || 'b'`, `SELECT 'a' || $1 || current_database()`), a postfix
+  `::type_name` cast (`SELECT 'kv'::regclass`), and a **scalar
+  subquery** `( SELECT ... )` as an operand
+  (`SELECT (SELECT count(*) FROM t) || '|'`). `||` is left-associative, evaluates
+  to `text`, and propagates NULL (NULL on either side ⇒ NULL, which is *not* the
+  empty string). A scalar subquery evaluates to its inner query's single value
+  with PostgreSQL `EXPR_SUBLINK` semantics: no rows ⇒ NULL, more than one row ⇒
+  `21000 cardinality_violation`, more than one output column ⇒ refused by name
+  (`42601`); its column type is the inner query's single output column type. The
+  `SELECT` list is still not a general expression grammar: `||` over a `FROM`
+  relation (`SELECT name || '!' FROM t`), parenthesised non-subquery scalars
+  (`SELECT (1)`), and every other select-list expression form is refused by name
+  (`ParseError::UnsupportedSelectExpr`). A subquery outside the no-`FROM` select
+  list (a `FROM` relation's projection, `WHERE`, `VALUES`) is not parsed.
+- **SELECT-list output alias** (`item [AS] name`): an item of a `FROM` relation's
+  projection may be named with `AS <name>` or a bare trailing `<name>`. The alias
+  renames only the OUTPUT column — it sets the `RowDescription` column name and
+  changes nothing about which cell is read (`SELECT pad AS label FROM t` returns
+  the same `pad` values under the name `label`). It is applied to the output
+  `Column.name` in all three projection derivations — `simple_projection`, the
+  aggregate plan (`plan_aggregate`), and `aggregate_output_columns` — so `describe`
+  advertises the same names `execute` produces. It is consumed AFTER the `||`
+  refusal, so `col || 'x'` is still refused by name and is never mis-read as
+  `col AS ||`. The accessor is `SelectItem::alias()`.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
-  `UPDATE t SET ... WHERE k = v [AND ...]`, `DELETE FROM t WHERE k = v [AND ...]`.
+  `DELETE FROM t WHERE k = v [AND ...]`, and
+  `UPDATE t SET <col> = <set-expr> [, ...] WHERE k = v [AND ...]`. A SET right-hand
+  side is either a constant — a literal, a `$N`, or a zero-arg value function — or an
+  **arithmetic read-modify-write** over the row's own current columns: `+`, `-` and `*`
+  with SQL precedence (`*` binds tighter) and parentheses, over literals, `$N` and
+  column names (`SET c = c + 1`, `SET c = (c + 2) * 3`). Division and modulo are NOT in
+  the grammar and are refused at the token the parser cannot consume, never mis-parsed;
+  a leading `-` binds to a numeric literal (`SET c = -5`), it is not a subtraction. The
+  new AST nodes are `ArithOp{Add,Sub,Mul}` and `SetExpr{Value,Column,Binary}`, and
+  `SetExpr::references_column()` is what tells the front end that an assignment must
+  READ the row rather than blind-upsert it. `WHERE` stays equality-only: the key columns
+  identify the row (Cassandra-style upsert).
+- **`COPY t [(cols)] FROM STDIN [[WITH] (<options>)]`** → `Statement::CopyFromStdin` (the
+  payload arrives later as `CopyData` frames, so `ferrosa-postgres` drives it). Options are the
+  parenthesised form: `FORMAT (text|csv)`, `DELIMITER '<c>'`, `NULL '<s>'` and `HEADER` are
+  applied; `FREEZE [ON|OFF]` is **accepted and recorded but not applied**
+  (`CopyFromStdinStmt::freeze`) — PostgreSQL freezes the loaded rows into heap pages and ferrosa
+  is an LSM with no heap pages and therefore no frozen-row concept, so the option has no
+  analogue and is accepted for client compatibility only. `pgbench -i` writes
+  `with (freeze on)` for every ordinary table on PostgreSQL v14+, so this is the option that lets
+  it load. Every other option name, a bad option *value*, and `COPY ... TO` are refused **by
+  name** as a COPY refusal (`ParseError::UnsupportedCopy`, whose message names the option) —
+  never reported as an ALTER TABLE form, which is what `ParseError::UnsupportedAlter` means.
 - PG DDL (T-130, D10), **parsed only** (no execution or schema creation yet; the
   Postgres front end answers `0A000`): `CREATE TABLE [IF NOT EXISTS] [public.]t
   (col type [NOT NULL | PRIMARY KEY], ..., [CONSTRAINT n] PRIMARY KEY (a, b))`
@@ -42,8 +88,38 @@ in-memory table in tests and by Ferrosa storage in production.
   precision, numeric(p,s), boolean, text, varchar(n), bytea, uuid, date, time,
   timestamp[tz], inet, `jsonb`, `json` (`PgType::storage()` maps `json` to
   `jsonb`, D11). Double-quoted identifiers are supported. Refused by name with
-  `ParseError::UnsupportedClause`: `FOREIGN KEY`/`REFERENCES`, `CHECK`,
-  `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`.
+  `ParseError::UnsupportedClause`: `CHECK`,
+  `SERIAL` types, `DEFAULT`, a schema other than `public`, `UNIQUE`. An optional
+  trailing `WITH (key = value, ...)` storage-parameter clause is parsed and each
+  accepted pair is recorded on `CreateTableStmt::storage_parameters` — `fillfactor`
+  and `autovacuum_enabled` are PostgreSQL physical-layout / background-maintenance
+  hints ferrosa has no equivalent for (it is an LSM/SSTable store: no heap pages, no
+  autovacuum), so they are recorded but not applied. Any other option name is refused
+  by name (`ParseError::UnsupportedStorageParameter`, `0A000`) rather than dropped;
+  pgbench's `create table ... with (fillfactor=100)` is the motivating case.
+- **`FOREIGN KEY` / column `REFERENCES` grammar** (parsed here; **enforced** by the
+  Postgres front end — see `ferrosa-postgres`'s README and roadmap). A table-level
+  `[CONSTRAINT <name>] FOREIGN KEY (<cols>) REFERENCES <parent> [(<pcols>)]` and a
+  column-level `REFERENCES` both parse into `ForeignKeyConstraint` and are recorded on
+  `CreateTableStmt::foreign_keys` / `AlterOperation::AddForeignKey`. The referenced-column
+  list is optional: `REFERENCES parent` leaves `parent_columns` `None`, meaning the
+  parent's primary key — the executor resolves it, so the AST records only what was
+  written. **An FK that parses but is not enforced is a lie**: the grammar accepts only
+  the referential actions the front end actually implements — the default **NO ACTION**
+  and its immediate equivalent **RESTRICT** — and refuses `ON DELETE`/`ON UPDATE`
+  `CASCADE`, `SET NULL`, `SET DEFAULT`, `MATCH FULL`/`PARTIAL`, `DEFERRABLE`, `INITIALLY`
+  and `NOT VALID` **by name** (`ParseError::UnsupportedAlter`), so a client that asked to
+  CASCADE never receives a NO ACTION constraint in its place. The five statements
+  `pgbench -i --foreign-keys` emits are pinned by
+  `the_five_pgbench_foreign_keys_parse`. `ferrosa-postgres` **enforces** the
+  `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY` form and **refuses a `CREATE TABLE`-time
+  `FOREIGN KEY` / column `REFERENCES` by name** (`0A000`) rather than accepting a constraint
+  it cannot enforce — so a parsed FK is never silently left unchecked.
+- Maintenance statements **parsed** (executed by the Postgres front end):
+  `TRUNCATE [TABLE] t [, …]` into `Statement::Truncate`; `VACUUM [FULL]
+  [ANALYZE|ANALYSE] [t]` into `Statement::Vacuum`; `ANALYZE|ANALYSE [t]` into
+  `Statement::Analyze`. `TRUNCATE … CASCADE` / `… RESTART IDENTITY` are refused
+  by name (no foreign keys, no sequences to honour).
 - jsonb values (T-160): `Value::Jsonb(ferrosa_jsonb::JsonbValue)`, plus
   `Value::JsonPath(String)` (text until the path parser, T-162) and
   `Value::TextArray`; `ColumnType` gains `Jsonb`, `Json`, `JsonPath`, `TextArray`.
@@ -55,8 +131,29 @@ in-memory table in tests and by Ferrosa storage in production.
 - Transaction / session statements **parsed** (not executed here): `BEGIN`/`START`,
   `COMMIT`/`END`, `ROLLBACK`/`ABORT`, `SET`, `RESET`.
 - WHERE/HAVING boolean expressions: `AND` / `OR` / `NOT` with parentheses and
-  the six comparison operators `= != <> < <= > >=`. RHS is a literal or `$N`.
-- Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`.
+  the six comparison operators `= != <> < <= > >=`. RHS is a literal, a `$N`, or
+  either followed by a postfix `::type_name` cast (`oid = $1::regclass`).
+- **`::` cast (`expr::type_name`).** A POSTFIX cast, so it binds tighter than the
+  operator beside it: `oid = $1::regclass` is `oid = ($1::regclass)`, and
+  `'a' || 'b'::regclass` is `'a' || ('b'::regclass)`. The name may be bare
+  (`::regclass`) or schema-qualified (`::pg_catalog.regclass`). The parser records
+  the target (`CastTarget`); its **semantics** are the front end's (see
+  `ferrosa-postgres`): `::regclass` resolves a relation name to the `pg_class.oid`
+  of the relation it names, so `oid = $1::regclass` compares like PostgreSQL and an
+  unresolvable name is an error, never a zero OID. Only `regclass` is implemented;
+  **any other target is refused by name** (`ParseError::UnsupportedCast`, `0A000`)
+  rather than accepted and ignored, and the `CAST(x AS t)` spelling is likewise
+  refused by name (`ParseError::UnsupportedCastExpr`) — never mis-parsed as a column
+  named `CAST`. A lone `:` is still a loud `bad token: :`: the `::` arm consumes both
+  colons, a single one falls through to the catch-all.
+- Aggregates: `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, `AVG`. The derived
+  output type is **PostgreSQL's RESULT type**, not the argument's engine type:
+  `COUNT`/`COUNT(col)` ⇒ `BigInt` (int8); `SUM(int2|int4)` ⇒ `BigInt` (int8),
+  `SUM(int8|numeric)` ⇒ `Numeric`, `SUM(float4|float8)` ⇒ `Float` (float8);
+  `AVG(int2|int4|int8|numeric)` ⇒ `Numeric`, `AVG(float4|float8)` ⇒ `Float`;
+  `MIN`/`MAX` ⇒ the argument's engine type. A `Numeric` result has no
+  numeric-valued engine result yet and no binary codec, so the PostgreSQL front
+  end refuses to encode it (`0A000`) rather than mislabel the bytes.
 - Literals: int, float, string (with `''` escape), `TRUE`/`FALSE`/`NULL`, `$N`
   params, and typed literals `TIMESTAMP/DATE/TIME/INET/NUMERIC(=DECIMAL) '...'`.
 
@@ -141,7 +238,7 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 | Area | Items |
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
-| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `Expr`, `Operand`, `Term`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
+| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `CastTarget`, `Projection`, `SelectItem` (with `SelectItem::alias()`), `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
 | Plan | `execute_streaming`, `RowSink`, `open_cursor`, `RowCursor`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
@@ -164,7 +261,9 @@ already share, and duplicated its failure handling with it.
 External crates: `ordered-float` (total-order `f64` for join/group keys),
 `num-bigint` (arbitrary-precision `Numeric`), `uuid`, `chrono` (std-only, typed
 temporal literal parsing), `serde` + `serde_json` (spilled runs are
-length-prefixed JSON records), `tracing`.
+length-prefixed JSON records), `tracing`. Dev-only: `tempfile` and `libc` —
+`libc` because `tests/spill_operators.rs` raises the process soft
+`RLIMIT_NOFILE` to its hard limit (see the Tests section).
 
 **Called by**: `ferrosa-postgres` — lowers parsed SQL onto this engine's
 operators and serves results over the Postgres wire.
@@ -172,17 +271,28 @@ operators and serves results over the Postgres wire.
 ## Tests
 
 In-crate unit tests (no `#[ignore]`, no live-infra): `exec.rs`, `parser.rs`,
-`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 144 total. They cover
+`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 223 total. They cover
 NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
-normalization, join key resolution, binder fail-loud paths, and the spill
+normalization, join key resolution, binder fail-loud paths, the SELECT-list
+`AS` output alias (parser and `describe`), the `TRUNCATE` /
+`VACUUM` / `ANALYZE` grammar (including the named refusals), and the spill
 module's orders, replay buffer and orphan sweep.
 
-`tests/spill_operators.rs` (11 tests, including a negative control that proves
+`tests/spill_operators.rs` (13 tests, including a negative control that proves
 the budget assertions fail when the threshold is unreachable) holds the per-operator spill invariant:
 given an input larger than the threshold, the operator returns EVERY row, peak
 resident rows stay an order of magnitude below the rows processed, output order
 is unchanged, a dropped stream removes its temp directory, and a reservation
 failure is loud.
+
+Every test there forces thousands of spilled runs and a sort's cascade merge
+holds up to `MERGE_FANIN` (64) run files open at once. libtest runs a binary's
+tests as threads in ONE process, so a dozen concurrently spilling tests need on
+the order of 800 descriptors; on a host whose soft `RLIMIT_NOFILE` is the macOS
+default of 256 that fails a *correct* merge with `EMFILE`. The binary therefore
+raises the soft limit to the hard limit once (`raise_fd_limit()`), so the suite
+measures spill behaviour, not the shell's descriptor default. CI runs the suite
+under nextest (one process per test) and never shares the budget.
 
 ## Specs
 

@@ -50,9 +50,6 @@ const SET_ASIDE_EXT: &str = "unreplayed";
 /// `len:u32 | crc:u32`.
 const FRAME_HEADER_BYTES: u64 = 8;
 
-/// Largest frame accepted on read; guards against a corrupt length prefix.
-const MAX_FRAME_BYTES: usize = 256 * 1024 * 1024;
-
 static SET_ASIDE_MUTATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Process-wide count of mutations set aside because no schema was available
@@ -271,9 +268,10 @@ impl SetAsideReader {
         self.file.read_exact(&mut header)?;
         let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
         let crc = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-        if len > MAX_FRAME_BYTES {
-            return Err(self.corrupt(&format!("an implausible frame length {len}"), pos));
-        }
+        // The physical file length is the ONLY bound needed: a length past the
+        // remaining bytes is a torn frame, caught below before any large read.
+        // A fixed size ceiling would refuse a valid large frame for its size
+        // alone, making a mutation over that size unreadable forever.
         if len as u64 > remaining - FRAME_HEADER_BYTES {
             return Err(self.corrupt("a torn frame body", pos));
         }
@@ -826,6 +824,37 @@ mod tests {
         let status = scan_set_aside_dir(dir.path()).unwrap();
         assert!(status.is_empty());
         assert_eq!(status.mutations(), 0);
+    }
+
+    /// A frame whose declared length is larger than the old 256 MiB reading
+    /// guard must be bounded by the FILE, not refused for its size. The old
+    /// guard rejected a valid large frame as "implausible": a data-path cap
+    /// that would make a mutation over 256 MiB unreadable forever (its
+    /// set-aside file could never be re-ingested).
+    #[test]
+    fn a_frame_larger_than_the_old_guard_is_bounded_by_the_file_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("commitlog-unreplayed")
+            .join("big.unreplayed");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Header only: declares a length past the old guard, but the file ends.
+        let declared: u32 = 256 * 1024 * 1024 + 1;
+        let mut bytes = declared.to_be_bytes().to_vec();
+        bytes.extend_from_slice(&0u32.to_be_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = SetAsideReader::open(&path)
+            .unwrap()
+            .next_frame()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !err.contains("implausible frame length"),
+            "a large declared length must not be refused as implausible; got: {err}"
+        );
+        assert!(err.contains("torn frame body"), "got: {err}");
     }
 
     #[test]

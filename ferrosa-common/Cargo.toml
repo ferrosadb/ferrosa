@@ -23,6 +23,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 [features]
 test-generators = ["proptest"]
+# Installs a counting global allocator in the `ferrosa` binary and feeds
+# `mem_probe` with live-heap bytes, so a COMMIT's residency peak can be
+# attributed to the phase/structure that caused it. OFF by default: a
+# production build pays nothing and uses plain jemalloc.
+alloc-probe = []
 
 [dev-dependencies]
 proptest = "1"

@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_sql::{
-    parse_statement, DeleteStmt, InsertStmt, ScalarItem, ScalarValue, SelectStmt, Statement,
-    UpdateStmt, Value as SqlValue,
+    parse_statement, DeleteStmt, InsertStmt, ScalarItem, SelectStmt, Statement, UpdateStmt,
+    Value as SqlValue,
 };
 
 use crate::messages::{BackendMessage, TransactionStatus};
@@ -39,6 +39,7 @@ use crate::query::{
     decode_param_checked, error_response, exec_error_response, row_description_fields,
 };
 use crate::result_stream::ResultStream;
+use crate::txn_write_set::TxnWriteSet;
 
 /// What a prepared statement parses to: a table query, a no-`FROM` expression
 /// query (`SELECT version()`, `SELECT 1`), or parameterized DML (`INSERT` /
@@ -95,7 +96,11 @@ pub struct Session {
     /// transaction is BUFFERED here instead of applied; `COMMIT` drives the whole
     /// set through the PostgreSQL MVCC manager atomically; `ROLLBACK`/`end_txn` clears it
     /// so a discarded transaction never touches storage (FMEA PG-1).
-    txn_writes: Vec<PgWrite>,
+    ///
+    /// It is a [`TxnWriteSet`], NOT a `Vec<PgWrite>`: each row is staged into a
+    /// threshold-bounded, spilling structure, so a `COPY ... FROM STDIN` inside
+    /// `BEGIN` never grows front-end memory with the row count (FMEA PG-12).
+    txn_writes: TxnWriteSet,
     /// What each executed `SELECT` portal's query is doing, keyed by portal
     /// name: suspended (`Execute` with `max_rows` stopped short), finished, or
     /// closed by the server. A portal absent here has not started. Dropping a
@@ -146,7 +151,7 @@ impl Session {
             txn_isolation: None,
             txn_snapshot: None,
             txn_read_tables: HashSet::new(),
-            txn_writes: Vec::new(),
+            txn_writes: TxnWriteSet::default(),
             runs: HashMap::new(),
         }
     }
@@ -321,7 +326,7 @@ impl Session {
         isolation: Option<ferrosa_sql::IsolationLevel>,
         snapshot: MvccSnapshot,
     ) {
-        self.txn_writes.clear();
+        self.txn_writes = TxnWriteSet::default();
         self.txn_read_tables.clear();
         if matches!(self.txn, TransactionStatus::Idle) {
             self.txn = TransactionStatus::InTransaction;
@@ -341,21 +346,62 @@ impl Session {
         self.txn_isolation = None;
         self.txn_snapshot = None;
         self.txn_read_tables.clear();
-        self.txn_writes.clear();
+        // Drop the whole staged write-set (resident prefix and spill) so a
+        // committed or rolled-back transaction leaves nothing behind.
+        self.txn_writes = TxnWriteSet::default();
     }
 
     pub fn txn_isolation(&self) -> Option<ferrosa_sql::IsolationLevel> {
         self.txn_isolation
     }
 
-    /// Mutable handle to the open transaction's buffered write-set, for the DML
-    /// path to push a PostgreSQL write into while in a `T` block.
-    pub(crate) fn txn_writes_mut(&mut self) -> &mut Vec<PgWrite> {
+    /// Mutable handle to the open transaction's staged write-set, for the DML and
+    /// COPY paths to push a PostgreSQL write into while in a `T` block.
+    pub(crate) fn txn_writes_mut(&mut self) -> &mut TxnWriteSet {
         &mut self.txn_writes
     }
 
-    pub(crate) fn txn_writes(&self) -> &[PgWrite] {
+    /// The open transaction's staged write-set.
+    #[cfg(test)]
+    pub(crate) fn txn_writes(&self) -> &TxnWriteSet {
         &self.txn_writes
+    }
+
+    /// How many writes the open transaction has staged.
+    #[cfg(test)]
+    pub(crate) fn txn_write_count(&self) -> usize {
+        self.txn_writes.len()
+    }
+
+    /// Staging payload bytes still resident. Bounded by the staging buffer, and
+    /// independent of [`Self::txn_write_count`] once anything has spilled.
+    #[cfg(test)]
+    pub(crate) fn txn_writes_resident_bytes(&self) -> u64 {
+        self.txn_writes.resident_bytes()
+    }
+
+    /// The staging buffer size the write-set was configured with.
+    #[cfg(test)]
+    pub(crate) fn txn_writes_threshold_bytes(&self) -> u64 {
+        self.txn_writes.threshold_bytes()
+    }
+
+    /// Whether the open transaction's write-set has spilled to disk.
+    #[cfg(test)]
+    pub(crate) fn txn_writes_spilled(&self) -> bool {
+        self.txn_writes.spilled_to_disk()
+    }
+
+    /// Decode the staged write-set for READ-YOUR-OWN-WRITES: a `SELECT` inside the
+    /// transaction must see its own uncommitted rows. The commit path does NOT
+    /// use this — it consumes the staging as a stream.
+    pub(crate) fn materialized_txn_writes(&mut self) -> Result<Vec<PgWrite>, BackendMessage> {
+        self.txn_writes.pending_writes().map_err(|error| {
+            error_response(
+                "58000",
+                &format!("transaction write-set could not be read back: {error}"),
+            )
+        })
     }
 
     pub(crate) fn txn_snapshot(&self) -> Option<&MvccSnapshot> {
@@ -370,10 +416,23 @@ impl Session {
         std::mem::take(&mut self.txn_read_tables)
     }
 
-    /// Drain the buffered write-set, leaving it empty. Used by `COMMIT` to hand
-    /// the whole set to the PostgreSQL MVCC commit path.
-    pub(crate) fn take_txn_writes(&mut self) -> Vec<PgWrite> {
-        std::mem::take(&mut self.txn_writes)
+    /// Drain the staged write-set as a repeatable streaming source, leaving the
+    /// session empty. Used by `COMMIT` to hand the whole set to the commit path,
+    /// which reads it as a STREAM rather than a resident `Vec<PgWrite>`.
+    pub(crate) fn take_txn_stage(
+        &mut self,
+    ) -> Result<ferrosa_storage::write_set_stage::StagedWriteSet, ferrosa_common::Error> {
+        let staged = std::mem::take(&mut self.txn_writes);
+        staged.into_staged()
+    }
+
+    /// Drain the staged write-set into a resident `Vec<PgWrite>`, leaving the
+    /// session empty. A test convenience for the paths that still need an owned
+    /// vector; `COMMIT` uses [`Self::take_txn_stage`] instead.
+    #[cfg(test)]
+    pub(crate) fn take_txn_writes(&mut self) -> Result<Vec<PgWrite>, ferrosa_common::Error> {
+        let mut staged = std::mem::take(&mut self.txn_writes);
+        staged.pending_writes()
     }
 
     /// An error while executing a statement inside a transaction aborts it
@@ -398,11 +457,9 @@ impl Session {
             Ok(Statement::SelectExprs(items)) => {
                 // Parameterized expression selects need $N type inference with no
                 // column to infer from — not supported via the extended protocol
-                // yet. Fail loud rather than guess.
-                if items
-                    .iter()
-                    .any(|it| matches!(it.value, ScalarValue::Param(_)))
-                {
+                // yet. Fail loud rather than guess. The check walks a `||`
+                // concatenation, which can carry a `$N` below its top level.
+                if items.iter().any(|it| it.value.references_param()) {
                     self.error_pending = true;
                     return error_response(
                         "0A000",
@@ -431,7 +488,10 @@ impl Session {
             }
             Err(e) => {
                 self.error_pending = true;
-                return error_response("42601", &e.to_string());
+                // Same SQLSTATE as the simple-query path: a refused clause, key or
+                // CAST type is `0A000` (feature_not_supported), not the generic
+                // `42601` — a client must not read an unsupported feature as a typo.
+                return error_response(crate::query::parse_error_sqlstate(&e), &e.to_string());
             }
         };
         self.statements.insert(

@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use ferrosa_common::accord::HybridLogicalClock;
-use ferrosa_storage::accord::{CommitError, CommitOutcome, TransactionCommitter, TransactionWrite};
+use ferrosa_storage::accord::{
+    CommitError, CommitOutcome, StagedAccordWriteSet, TransactionCommitter, TransactionWrite,
+};
 
 use crate::accord::apply::StorageApplier;
 use crate::accord::coordinator::{AccordCoordinatorDriver, AccordDriverError};
@@ -33,6 +35,26 @@ use crate::accord::wire::ReadPredicate;
 /// key cannot be placed (e.g. not in cluster mode, or unknown keyspace) — the
 /// commit fails loud rather than guessing.
 pub type ReplicaResolver = Arc<dyn Fn(&str, &[u8]) -> Option<Vec<Uuid>> + Send + Sync>;
+
+/// Replicates a table-level tombstone (`TRUNCATE`) marker to **every node that
+/// serves the table**, requiring every one to acknowledge
+/// (`ConsistencyLevel::All`).
+///
+/// Accord orders a transaction by per-shard **quorum**, but a table tombstone is
+/// ONE reserved partition key whose write Accord would route to that key's RF
+/// replica set — a proper subset of the ring whenever `RF < node count`. A
+/// quorum on that subset leaves the nodes outside it serving the truncated rows
+/// (resurrection), and Accord's quorum can also decide without a node that is
+/// down and repair it later. A table tombstone must be held by every serving
+/// node NOW, so this seam is deliberately NOT Accord's quorum path: it fans the
+/// marker to the whole serving set and fails loud on any missing acknowledgement.
+#[async_trait]
+pub trait AllServingMarkerWriter: Send + Sync {
+    /// Write the table-tombstone `mutation_bytes` (a serialized single-partition
+    /// `Mutation`) to every node serving the table. `Err` if ANY node does not
+    /// acknowledge — never a silent degrade to quorum.
+    async fn write_marker_to_all_serving_nodes(&self, mutation_bytes: &[u8]) -> Result<(), String>;
+}
 
 /// Cluster-side [`TransactionCommitter`]: commits a buffered multi-key write-set
 /// as one unconditional Accord transaction.
@@ -56,6 +78,11 @@ pub struct AccordTransactionCommitter {
     /// Production creates the committer before cluster formation publishes the
     /// local state, so retain the slot and load it when each transaction runs.
     local_accord_state_slot: Option<crate::accord::handlers::AccordStateSlot>,
+    /// Replicates a table-level tombstone to every serving node (see
+    /// [`AllServingMarkerWriter`]). `None` refuses such a commit loudly rather
+    /// than routing it through per-key Accord, which would reach only the
+    /// reserved key's RF replica set.
+    marker_writer: Option<Arc<dyn AllServingMarkerWriter>>,
 }
 
 impl AccordTransactionCommitter {
@@ -74,7 +101,16 @@ impl AccordTransactionCommitter {
             resolve,
             local_accord_state: None,
             local_accord_state_slot: None,
+            marker_writer: None,
         }
+    }
+
+    /// Wire the all-serving-node writer used for table-level tombstones
+    /// (`TRUNCATE`). Production passes a writer over the live `WritePath`; left
+    /// unwired, a commit that contains a tombstone is refused loudly.
+    pub fn with_marker_writer(mut self, writer: Arc<dyn AllServingMarkerWriter>) -> Self {
+        self.marker_writer = Some(writer);
+        self
     }
 
     /// Wire the coordinator node's own Accord state machine so a
@@ -100,6 +136,37 @@ impl AccordTransactionCommitter {
     ) -> Self {
         self.local_accord_state_slot = Some(slot.clone());
         self
+    }
+
+    /// Replicate each table-level tombstone to EVERY node that serves the table,
+    /// requiring all of them to acknowledge (`ConsistencyLevel::All`).
+    ///
+    /// Fail loud: an unwired writer, or any node that does not acknowledge,
+    /// refuses the commit — an unconfirmed truncate would leave that node
+    /// serving the truncated rows (resurrection). There is deliberately no
+    /// quorum fallback and no hint: a truncate is not eventually consistent.
+    async fn replicate_tombstones_all_nodes(
+        &self,
+        tombstones: &[TransactionWrite],
+    ) -> Result<(), CommitError> {
+        let writer = self.marker_writer.as_ref().ok_or_else(|| CommitError {
+            reason: "cluster committer has no all-serving marker writer; refusing to route a \
+                     TRUNCATE tombstone through per-key Accord (it would reach only the \
+                     reserved key's RF replica set, resurrecting the rows on every other node)"
+                .to_string(),
+        })?;
+        for write in tombstones {
+            writer
+                .write_marker_to_all_serving_nodes(&write.mutation)
+                .await
+                .map_err(|reason| CommitError {
+                    reason: format!(
+                        "TRUNCATE was not acknowledged by every serving node; refusing rather \
+                         than truncating a subset: {reason}"
+                    ),
+                })?;
+        }
+        Ok(())
     }
 }
 
@@ -190,7 +257,7 @@ impl TransactionCommitter for AccordTransactionCommitter {
     async fn commit_postgres(
         &self,
         keyspace: &str,
-        mut writes: Vec<TransactionWrite>,
+        writes: StagedAccordWriteSet,
         _tables: Vec<String>,
         snapshot: ferrosa_common::accord::Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
@@ -198,23 +265,53 @@ impl TransactionCommitter for AccordTransactionCommitter {
             POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
         };
 
-        // The barrier key orders all BEGIN/COMMIT barriers. A second commit-only
-        // marker advances only for data transaction completions, so a BEGIN after
-        // our snapshot doesn't invalidate it. Empty mutation bytes participate in
-        // Accord conflicts and Apply finalization, but the storage applier drops
-        // them before applying data mutations.
-        writes.push(TransactionWrite {
-            keyspace: keyspace.to_string(),
-            key: POSTGRES_TRANSACTION_BARRIER_KEY.to_vec(),
-            mutation: Vec::new(),
-        });
-        writes.push(TransactionWrite {
-            keyspace: keyspace.to_string(),
-            key: POSTGRES_TRANSACTION_MARKER_KEY.to_vec(),
-            mutation: Vec::new(),
-        });
+        // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The per-key
+        // Accord commit below would route it to that key's RF replica set — a proper subset
+        // of the ring whenever RF < node count — leaving the nodes outside it serving the
+        // truncated rows (resurrection). The staged builder already CARRIED the tombstones
+        // apart (they never entered the payload spill), so here they are replicated to EVERY
+        // serving node at CL=ALL, failing loud if any node does not acknowledge. The reserved
+        // key's placement never decides a truncate's scope again.
+        if !writes.tombstones().is_empty() {
+            self.replicate_tombstones_all_nodes(writes.tombstones())
+                .await?;
+        }
 
-        match drive_accord(self, writes, ReadPredicate::Always, Some(snapshot)).await {
+        // Build the driven write-set from the staged ROUTING keys, in order. The write-set
+        // payloads stay on disk in `writes`' spill (only the small per-key index is resident).
+        // The two protocol markers are appended AFTER the staged payloads — the barrier key
+        // orders all BEGIN/COMMIT barriers; the commit-only marker advances only for data
+        // completions. Empty mutation bytes participate in Accord conflicts and Apply
+        // finalization, but the storage applier drops them before applying data mutations. The
+        // staged region is therefore an exact PREFIX of the driven write-set; the driver reads
+        // entries at/after the prefix from their resident (empty) mutation field.
+        let staged_count = writes.len();
+        let mut resolve_inputs: Vec<(String, Vec<u8>)> = Vec::with_capacity(staged_count + 2);
+        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(staged_count + 2);
+        for (keyspace, key) in writes.keys() {
+            resolve_inputs.push((keyspace.clone(), key.clone()));
+            write_set.push((key.clone(), Vec::new()));
+        }
+        for marker in [
+            POSTGRES_TRANSACTION_BARRIER_KEY,
+            POSTGRES_TRANSACTION_MARKER_KEY,
+        ] {
+            resolve_inputs.push((keyspace.to_string(), marker.to_vec()));
+            write_set.push((marker.to_vec(), Vec::new()));
+        }
+
+        let payloads = writes.payloads_arc();
+        match drive_accord_core(
+            self,
+            resolve_inputs,
+            write_set,
+            Some(payloads),
+            staged_count,
+            ReadPredicate::Always,
+            Some(snapshot),
+        )
+        .await
+        {
             Ok(_) => Ok(CommitOutcome::Committed),
             Err(AccordDriverError::SnapshotStale) => Ok(CommitOutcome::Aborted {
                 reason: "PostgreSQL transaction snapshot is stale".to_string(),
@@ -226,9 +323,13 @@ impl TransactionCommitter for AccordTransactionCommitter {
     }
 }
 
+/// Drive ONE multi-key Accord transaction for a RESIDENT write-set (the small autocommit
+/// batch and the LWT/snapshot-barrier keys). A large PostgreSQL commit does NOT go through
+/// here: it builds an already-staged write-set and calls [`drive_accord_core`] directly, so
+/// its payload bulk is never resident.
 async fn drive_accord(
     committer: &AccordTransactionCommitter,
-    writes: Vec<TransactionWrite>,
+    mut writes: Vec<TransactionWrite>,
     predicate: ReadPredicate,
     snapshot_ts: Option<ferrosa_common::accord::Timestamp>,
 ) -> Result<ferrosa_common::accord::Timestamp, AccordDriverError> {
@@ -238,33 +339,134 @@ async fn drive_accord(
         ));
     }
 
+    let resolve_inputs: Vec<(String, Vec<u8>)> = writes
+        .iter()
+        .map(|w| (w.keyspace.clone(), w.key.clone()))
+        .collect();
+
+    // Stage the payloads in local temp storage when the write-set is large enough to be the
+    // commit's memory problem, so the coordinator never holds ~1.1M encoded mutations
+    // resident. The KEYS stay in memory — Accord orders conflicts on them and the per-shard
+    // participant set is derived from them — while the payload bulk moves to a temp file and
+    // is read back on demand at Apply. Small write-sets stay wholly resident (no filesystem
+    // touch).
+    let payload_bytes: u64 = writes.iter().map(|w| w.mutation.len() as u64).sum();
+    let (write_blobs, staged_prefix) =
+        if ferrosa_storage::write_set_spill::WriteSetSpill::should_stage(payload_bytes) {
+            let reservation = ferrosa_storage::write_set_spill::reserve_write_set_stage()
+                .map_err(|e| AccordDriverError::Codec(format!("write-set spill: {e}")))?;
+            let mut blobs: Vec<Vec<u8>> = writes
+                .iter_mut()
+                .map(|write| std::mem::take(&mut write.mutation))
+                .collect();
+            let staged =
+                ferrosa_storage::write_set_spill::WriteSetSpill::stage(reservation, &mut blobs)
+                    .map_err(|e| AccordDriverError::Codec(format!("write-set spill: {e}")))?;
+            tracing::info!(
+                entries = staged.len(),
+                payload_bytes = staged.bytes(),
+                resident_index_bytes = staged.resident_index_bytes(),
+                "accord: staged the write-set payloads in local temp storage"
+            );
+            (Some(Arc::new(staged)), writes.len())
+        } else {
+            (None, 0)
+        };
+
+    let write_set: Vec<(Vec<u8>, Vec<u8>)> =
+        writes.into_iter().map(|w| (w.key, w.mutation)).collect();
+    drive_accord_core(
+        committer,
+        resolve_inputs,
+        write_set,
+        write_blobs,
+        staged_prefix,
+        predicate,
+        snapshot_ts,
+    )
+    .await
+}
+
+/// Drive one multi-key Accord transaction from an ALREADY-BUILT write-set.
+///
+/// `resolve_inputs` supplies each key's `(keyspace, partition key)` for replica resolution;
+/// `write_set` is the `(partition key, payload)` the driver fans out. When `write_blobs` holds
+/// a staged spill, `staged_prefix` is the number of LEADING `write_set` entries whose payload
+/// lives in it — the rest carry their resident payload (the committer's barrier/marker keys).
+/// The large PostgreSQL commit calls this directly with the staged write-set, so the payload
+/// bulk is never resident on the coordinator.
+///
+/// # Errors
+///
+/// A key with no resolvable replica set (fail loud, never a guessed placement), or a driver
+/// failure that leaves the commit undecided.
+#[allow(clippy::too_many_arguments)]
+async fn drive_accord_core(
+    committer: &AccordTransactionCommitter,
+    resolve_inputs: Vec<(String, Vec<u8>)>,
+    write_set: Vec<(Vec<u8>, Vec<u8>)>,
+    write_blobs: Option<Arc<ferrosa_storage::write_set_spill::WriteSetSpill>>,
+    staged_prefix: usize,
+    predicate: ReadPredicate,
+    snapshot_ts: Option<ferrosa_common::accord::Timestamp>,
+) -> Result<ferrosa_common::accord::Timestamp, AccordDriverError> {
+    if write_set.is_empty() {
+        return Err(AccordDriverError::Network(
+            "Accord transaction requires at least one conflict key".to_string(),
+        ));
+    }
+
     // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
     //    commit a write to a guessed/empty replica set).
+    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+    let t_resolve = profile.then(std::time::Instant::now);
     let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
     let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
-    for w in &writes {
-        let replicas = (committer.resolve)(&w.keyspace, &w.key).ok_or_else(|| {
+    for (keyspace, key) in &resolve_inputs {
+        let replicas = (committer.resolve)(keyspace, key).ok_or_else(|| {
             AccordDriverError::Network(format!(
-                "no replicas resolved for a key in keyspace '{}' (cluster mode required)",
-                w.keyspace
+                "no replicas resolved for a key in keyspace '{keyspace}' (cluster mode required)"
             ))
         })?;
         if replicas.is_empty() {
             return Err(AccordDriverError::Network(format!(
-                "empty replica set for a key in keyspace '{}'",
-                w.keyspace
+                "empty replica set for a key in keyspace '{keyspace}'"
             )));
         }
         for r in &replicas {
             replica_union.insert(*r);
         }
-        per_key.insert(w.key.clone(), replicas);
+        per_key.insert(key.clone(), replicas);
     }
     let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
+    let resolve_ns = t_resolve.map(|t| t.elapsed().as_nanos() as u64);
+    if profile {
+        tracing::info!(
+            phase = "drive.resolve_done",
+            keys = per_key.len(),
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "accord drive residency"
+        );
+    }
 
-    // 2. Build the write-set + the per-key participant resolver for the driver.
-    let write_set: Vec<(Vec<u8>, Vec<u8>)> =
-        writes.into_iter().map(|w| (w.key, w.mutation)).collect();
+    // 2b. The write-set is already built (the caller staged it); report what it cost.
+    let t_write_set = profile.then(std::time::Instant::now);
+    let write_set_len_hint = write_set.len();
+    if profile {
+        let (staged_entries, staged_bytes, staged_index) = match &write_blobs {
+            Some(spill) => (spill.len(), spill.bytes(), spill.resident_index_bytes()),
+            None => (0, 0, 0),
+        };
+        tracing::info!(
+            phase = "drive.write_set_built",
+            keys = write_set_len_hint,
+            staged_entries,
+            staged_payload_bytes = staged_bytes,
+            staged_index_bytes = staged_index,
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "accord drive residency"
+        );
+    }
     let per_key = Arc::new(per_key);
     let pk = per_key.clone();
     let participant_resolver =
@@ -282,6 +484,11 @@ async fn drive_accord(
     .with_per_key_replicas(Arc::new(participant_resolver))
     .with_local_applier(committer.applier.clone())
     .with_read_predicate(predicate);
+    if let Some(blobs) = write_blobs {
+        driver = driver
+            .with_spilled_write_set(blobs)
+            .with_staged_prefix(staged_prefix);
+    }
     if let Some(snapshot_ts) = snapshot_ts {
         driver = driver.with_postgres_snapshot(snapshot_ts);
     }
@@ -299,14 +506,28 @@ async fn drive_accord(
         driver = driver.with_local_accord_state(state);
     }
 
-    match driver.run_transaction().await {
+    let write_set_ns = t_write_set.map(|t| t.elapsed().as_nanos() as u64);
+    let write_set_len = write_set_len_hint;
+    let t_run = profile.then(std::time::Instant::now);
+    let result = match driver.run_transaction().await {
         Ok((timestamp, _)) => Ok(timestamp),
         // A general transaction is unconditional (Always mode), so a condition
         // abort should not arise — map it cleanly if it ever does.
         // Quorum/network/codec failures: the commit did not reach a decision —
         // surface as Err so the front-end never acks an uncommitted transaction.
         Err(e) => Err(e),
+    };
+    if let (Some(t_run), Some(resolve_ns), Some(write_set_ns)) = (t_run, resolve_ns, write_set_ns) {
+        tracing::info!(
+            keys = write_set_len,
+            resolve_ms = resolve_ns as f64 / 1_000_000.0,
+            write_set_ms = write_set_ns as f64 / 1_000_000.0,
+            driver_ms = t_run.elapsed().as_millis() as u64,
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "drive_accord attribution"
+        );
     }
+    result
 }
 
 #[cfg(test)]
@@ -410,6 +631,19 @@ mod tests {
             key: key.to_vec(),
             mutation: mutation.to_vec(),
         }
+    }
+
+    /// Build a staged Accord write-set from resident writes — the shape
+    /// [`TransactionCommitter::commit_postgres`] now takes. A small set stays wholly
+    /// resident (threshold `u64::MAX`), so the test drives the same routing/index path
+    /// production uses without touching the filesystem.
+    fn staged(writes: Vec<TransactionWrite>) -> StagedAccordWriteSet {
+        let mut builder =
+            ferrosa_storage::accord::StagedAccordWriteSetBuilder::with_threshold_bytes(u64::MAX);
+        for write in writes {
+            builder.accept(write).expect("stage write");
+        }
+        builder.finish().expect("finish staging")
     }
 
     fn committer_with(host: Uuid, applier: Arc<RecordingApplier>) -> AccordTransactionCommitter {
@@ -935,5 +1169,154 @@ mod tests {
             .await
             .expect_err("unplaceable key must fail loud");
         assert!(err.reason.contains("no replicas"), "got: {}", err.reason);
+    }
+
+    /// Records the marker bytes handed to the all-serving writer, and can be told
+    /// to fail (a serving node that did not acknowledge).
+    struct MarkerRecorder {
+        seen: Mutex<Vec<Vec<u8>>>,
+        result: Result<(), String>,
+    }
+
+    impl MarkerRecorder {
+        fn ok() -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                result: Ok(()),
+            }
+        }
+
+        fn failing(reason: &str) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                result: Err(reason.to_string()),
+            }
+        }
+
+        fn seen(&self) -> Vec<Vec<u8>> {
+            self.seen.lock().expect("marker recorder mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl AllServingMarkerWriter for MarkerRecorder {
+        async fn write_marker_to_all_serving_nodes(
+            &self,
+            mutation_bytes: &[u8],
+        ) -> Result<(), String> {
+            self.seen
+                .lock()
+                .expect("marker recorder mutex")
+                .push(mutation_bytes.to_vec());
+            self.result.clone()
+        }
+    }
+
+    fn tombstone_write() -> TransactionWrite {
+        TransactionWrite {
+            keyspace: "ks".to_string(),
+            key: ferrosa_storage::table_tombstone::table_tombstone_key()
+                .key
+                .as_bytes()
+                .to_vec(),
+            mutation: b"marker-bytes".to_vec(),
+        }
+    }
+
+    fn snapshot() -> ferrosa_common::accord::Timestamp {
+        ferrosa_common::accord::Timestamp {
+            epoch: 0,
+            time: 1,
+            seq: 0,
+            node: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn table_tombstone_is_routed_to_all_serving_nodes_not_per_key_accord() {
+        // A tombstone (TRUNCATE) must NOT travel the per-key Accord path: that
+        // routes it by its token to the reserved key's RF replica set and misses
+        // the rest of the ring (a node outside the set keeps serving the truncated
+        // rows). It must go to the all-serving marker writer instead, whatever the
+        // resolver would have answered for its token.
+        let recorder = Arc::new(MarkerRecorder::ok());
+        let resolver_keys: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen = resolver_keys.clone();
+        let resolve: ReplicaResolver = Arc::new(move |_ks: &str, key: &[u8]| {
+            seen.lock().expect("resolver mutex").push(key.to_vec());
+            // An RF-subset that does NOT include every node.
+            Some(vec![Uuid::from_u128(0xAA)])
+        });
+        let committer = AccordTransactionCommitter::new(
+            7u64,
+            Arc::new(HybridLogicalClock::new(7, 0)),
+            Arc::new(NoPeersTransport),
+            Arc::new(RecordingApplier::new()),
+            resolve,
+        )
+        .with_marker_writer(recorder.clone());
+
+        // Only the tombstone is in the write-set; the barrier keys still drive
+        // Accord and (with no peers) fail, but the tombstone fan-out has already
+        // run. The assertion is on the ROUTING, which is decided before Accord.
+        let _ = committer
+            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .await;
+
+        assert_eq!(
+            recorder.seen(),
+            vec![b"marker-bytes".to_vec()],
+            "the tombstone must be replicated to every serving node"
+        );
+        let keys = resolver_keys.lock().expect("resolver mutex").clone();
+        assert!(
+            !keys.contains(&tombstone_write().key),
+            "the tombstone must NOT be routed by its token to the per-key RF replica set"
+        );
+    }
+
+    #[tokio::test]
+    async fn table_tombstone_commit_fails_loud_when_a_serving_node_does_not_acknowledge() {
+        // An unacknowledged replica must REFUSE the truncate loudly — never a
+        // silent degrade to quorum. An unconfirmed truncate is a lie.
+        let recorder = Arc::new(MarkerRecorder::failing("node C did not acknowledge"));
+        let resolve: ReplicaResolver =
+            Arc::new(|_ks: &str, _key: &[u8]| Some(vec![Uuid::from_u128(0xAA)]));
+        let committer = AccordTransactionCommitter::new(
+            7u64,
+            Arc::new(HybridLogicalClock::new(7, 0)),
+            Arc::new(NoPeersTransport),
+            Arc::new(RecordingApplier::new()),
+            resolve,
+        )
+        .with_marker_writer(recorder);
+
+        let err = committer
+            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .await
+            .expect_err("a truncate that not every serving node acknowledged must be refused");
+        let reason = err.reason.to_lowercase();
+        assert!(
+            reason.contains("every serving node") || reason.contains("subset"),
+            "the refusal must say the truncate did not reach every node, got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn table_tombstone_commit_refuses_without_an_all_serving_writer() {
+        // No all-serving writer wired: refuse the tombstone commit loudly rather
+        // than let it fall through to per-key Accord (the RF-subset scope hole).
+        let committer = committer_with(Uuid::from_u128(0xAA), Arc::new(RecordingApplier::new()));
+
+        let err = committer
+            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .await
+            .expect_err("a tombstone with no all-serving writer must be refused");
+        assert!(
+            err.reason.to_lowercase().contains("all-serving"),
+            "got: {}",
+            err.reason
+        );
     }
 }

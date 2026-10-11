@@ -66,6 +66,21 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   here (not `ferrosa-storage`) so a future `ferrosa-sstable` write pump can
   share the exact same token `ferrosa-storage`'s compaction executor uses
   (T-021, `compaction-cancel-safety.md`).
+- **Live-heap probe** — `mem_probe` (the `alloc-probe` feature): a process-wide
+  live-heap counter (`live_bytes`/`peak_bytes`/`live_mib`/`peak_mib`) that the
+  `ferrosa` binary's counting global allocator feeds, so a diagnostics path can
+  read the resident heap at a phase boundary and attribute a memory peak to the
+  phase that caused it (see `PROFILE.md`, `FERROSA_PG_COMMIT_PROFILE`). The
+  feature is OFF by default: without it the recording calls are empty and inline
+  away, the binary uses jemalloc directly, and `installed()` is `false` so a
+  caller logs nothing rather than a fabricated zero.
+- **System-column key minting** — `timeuuid::v1_timeuuid(time_100ns, clock_seq,
+  node)` builds the 16 bytes of a v1 TimeUUID (RFC 4122 §4.1.2) and
+  `timeuuid::is_reserved_column_name` guards the `_sys_` prefix. Used for the
+  synthetic `_sys_ck_` partition key of a Postgres table created without a
+  `PRIMARY KEY`, where a time-ordered globally-unique row key is required. The
+  layout is bytes-only and takes no clock of its own, so callers own uniqueness.
+  See [Reserved `_sys_` columns](#reserved-_sys_-columns).
 - **Test generators** — behind the `test-generators` feature: proptest
   strategies (`arb_cell_value`, `arb_cell`, `arb_partition_key`,
   `arb_decorated_key`) shared across crates, plus shrink-friendly generated
@@ -94,6 +109,9 @@ HLC reading the system clock:
   qualified or not).
 - **`geometry`** — WKB marshal/parse for the supported geometry subset.
 - **`task_pool`** — runtime-aware spawn helper.
+- **`timeuuid`** — v1 TimeUUID byte layout plus the `_sys_` reserved-name rule.
+  Shares `UUID_EPOCH_OFFSET` with `complex_cell`'s Accord list-path mint so the
+  two encodings cannot drift apart.
 
 The crate root (`lib.rs`) re-exports the headline types so downstream code
 writes `ferrosa_common::{DecoratedKey, CqlValue, Error}` rather than reaching
@@ -129,6 +147,7 @@ back:
 | Accord | `Timestamp`, `TxnId`, `BallotNumber`/`AcceptedBallot`/`PromisedBallot`, `HybridLogicalClock`, `BallotGenerator`, `TxnPhase`, `TxnState` |
 | Schema | `TableSchema`, `ColumnDefinition`, `PinConfig`, `fixed_width_for_marshal_type`, `validate_cell_bytes`, `validate_clustering_shape` |
 | Geometry | `Geometry`, `marshal_wkb`, `parse_wkb` |
+| TimeUUID keys | `timeuuid::v1_timeuuid`, `timeuuid::SYNTHETIC_KEY_COLUMN`, `timeuuid::is_reserved_column_name`, `timeuuid::UUID_EPOCH_OFFSET` |
 | Spawning | `TaskPool` |
 | Cancellation | `CancelToken`, `CancelReason`, `Cancelled` |
 
@@ -171,9 +190,9 @@ back:
 
 ## Tests
 
-In-crate unit tests are healthy and co-located with each module: **103 `#[test]`
-functions** across the crate (accord 28, schema 18, geometry 17, murmur3 7, key
-6, token 5, cql_type 5, cancel 8, cell 4, error 3, data_type 2). Murmur3 is covered by
+In-crate unit tests are healthy and co-located with each module: **114 `#[test]`
+functions** across the crate (accord 28, schema 18, geometry 17, timeuuid 11,
+murmur3 7, key 6, token 5, cql_type 5, cancel 8, cell 4, error 3, data_type 2). Murmur3 is covered by
 characterization vectors generated from Cassandra source for bit-exact
 compatibility. Gaps and the highest-risk areas (HLC clock `expect`, geometry
 subset) are tracked in [specs/fmea.md](specs/fmea.md) and
@@ -185,6 +204,42 @@ subset) are tracked in [specs/fmea.md](specs/fmea.md) and
 rejection. Consumers should match the variant instead of parsing its display
 text; `is_backpressure()` still recognizes legacy string errors during
 transition.
+
+## Reserved `_sys_` columns
+
+A column whose name begins with `_sys_` (case-insensitive) is **reserved for
+ferrosa itself** and a user may not declare one: `is_reserved_column_name`
+matches the whole prefix, not just the one column ferrosa mints today, so a
+future system column cannot collide with a user's table the day it is added.
+
+Today it mints exactly one: **`_sys_ck_`** (`SYNTHETIC_KEY_COLUMN`, "system
+cluster key"), the synthetic partition key of a Postgres table created without a
+`PRIMARY KEY`. PostgreSQL allows such a table; ferrosa's storage needs a
+partition key, so the table gets a synthetic v1 TimeUUID key column instead of
+being refused.
+
+It is deliberately **invisible to a `SELECT *`** — and discoverable, the way
+Postgres's own `ctid`/`xmin`/`xmax` are:
+
+- `pg_catalog.pg_attribute` lists it, with a **negative `attnum`** (Postgres's
+  own marking for a system column), so it can be found by querying that catalog;
+- it can be selected by naming it explicitly, exactly as `SELECT ctid FROM t`
+  works in Postgres.
+
+The key is a v1 TimeUUID rather than a v4 UUID because it must be both globally
+unique *and* time-ordered. Uniqueness is what stops two rows colliding on the
+key and one write being lost; the `node` field is a random 48-bit value chosen
+once per process (RFC 4122 permits this — it is what v1 does with MAC
+addresses), so no cluster identity has to be plumbed to the Postgres front-end.
+
+> The Postgres front-end synthesises the column on a PK-less `CREATE TABLE`, mints a key
+> per row on `INSERT` (`ferrosa-postgres/src/synthetic_key.rs`), keeps it out of `SELECT *`,
+> and lists it in `pg_attribute` with a negative `attnum`. `ALTER TABLE ... ADD PRIMARY KEY`
+> records a **declared** key and indexes it, and `catalog` now projects `pg_index` /
+> `pg_constraint` (plus a `<table>_pkey` row in `pg_class`) from that declared key — never
+> from this synthesized one — so a client sees no primary key for a PK-less table. Still
+> open: minting on `COPY`. Tracked in
+> [ferrosa-postgres/specs/roadmap.md](../ferrosa-postgres/specs/roadmap.md).
 
 ## Specs
 

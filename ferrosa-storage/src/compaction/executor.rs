@@ -1680,7 +1680,16 @@ impl CompactionExecutor {
                 merge_start.elapsed(),
             );
             if let Some(policy) = task.purge.as_ref() {
-                if purge::has_purgeable_marker(&merged, policy) {
+                // Physically reclaim rows a table tombstone (TRUNCATE) covers. The
+                // logical effect is already immediate on every read; this is what
+                // makes the space come back. The reserved table-tombstone partition
+                // is exempt from the purge below — it may only be dropped once every
+                // replica has purged the data it covers, which is not tracked yet, so
+                // it is retained until the table is dropped.
+                merge::reclaim_covers_table(&mut merged, policy.table_delete);
+                if purge::has_purgeable_marker(&merged, policy)
+                    && !crate::table_tombstone::is_table_tombstone_key(&merged.key)
+                {
                     let original = held_back.is_none().then(|| merged.clone());
                     purged_markers += purge::purge_partition(&mut merged, policy).markers();
                     if purge::is_empty_partition(&merged) {
@@ -3161,6 +3170,7 @@ mod tests {
         super::super::purge::PurgePolicy {
             gc_before: i64::from(PURGE_OLD_LDT) + 1,
             max_purgeable_timestamp: i64::MAX,
+            table_delete: ferrosa_sstable::types::DeletionTime::LIVE,
         }
     }
 

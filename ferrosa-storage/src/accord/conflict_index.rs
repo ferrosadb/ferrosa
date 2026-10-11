@@ -9,17 +9,63 @@
 //!
 //! All access must be through a single-threaded shard executor — the index
 //! is intentionally `!Sync` (it uses non-atomic interior state).
+//!
+//! # No hard bound: the index GROWS
+//!
+//! There is deliberately **no cap** on how many `(key, transaction)`
+//! registrations the index holds. A PreAccept registers its transaction under
+//! EVERY key in the write-set, so a fixed capacity was a hard floor on the
+//! largest decidable transaction: the live `pgbench -i` load (a single
+//! ~1,000,112-key transactional COPY) hit the historical 100 000-entry cap, every
+//! replica refused the PreAccept, and the coordinator reported an opaque "Accord
+//! quorum unavailable" on a fully healthy cluster. The index must hold a
+//! write-set of any size, so it GROWS instead of refusing.
+//!
+//! Growth (rather than a disk spill) is the right shape here because the index
+//! holds only *in-flight* registrations: every entry is removed by
+//! [`gc_applied`](ConflictIndex::gc_applied) / [`remove`](ConflictIndex::remove)
+//! once its transaction applies, so the resident set is a working set, not a
+//! store. The lookups stay exactly as cheap as before — exact-key is an O(1) hash
+//! lookup, range overlap is O(log n + k) — which a spilled-file index could not
+//! promise on the PreAccept hot path.
+//!
+//! The per-key execution-timestamp high-water-mark (see
+//! [`max_conflicting_timestamp`](ConflictIndex::max_conflicting_timestamp)) is
+//! likewise unbounded: it used to skip new keys once full, which silently lost
+//! the skipped key's post-GC conflict — a real-time inversion and a missed
+//! conflict (t_813caf39). It is stored ON the key's own entry (see `KeyEntry`),
+//! not in a parallel map, so the key's bytes are held once.
+//!
+//! # Residency
+//!
+//! [`single_key`](ConflictIndex) is a `HashMap<Vec<u8>, KeyEntry>`: ONE map that
+//! holds each key's bytes, its in-flight writes, and its HWM together. The common
+//! case is exactly one in-flight write per key, so the writes buffer is seeded at
+//! capacity ONE instead of the four a bare `Vec` reserves for a >1-byte element,
+//! and the HWM no longer re-stores the key in a second map. Measured with a
+//! counting allocator at N = 200,000 keys, the whole index falls from 601 to 235
+//! bytes per key — the writes buffer alone from 448 to 112, the parallel HWM map
+//! from 82 to 0 — which projects to ~573 MiB → ~224 MiB at the live N = 1,000,112
+//! (a ~349 MiB cut). `tests/conflict_index_residency.rs` (a per-PR structural /
+//! same-run-ratio guard) and `tests/conflict_index_residency_absolute.rs` (the
+//! absolute projection, gated out of the per-PR lane like `accord::perf`) measure
+//! it and guard both factors.
 
 use ferrosa_common::accord::{Timestamp, TxnId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Reserved conflict key shared by PostgreSQL transactions to establish a
-/// cluster-wide serialization order. Its high-water mark is retained even when
-/// the ordinary bounded per-key high-water map is full.
+/// cluster-wide serialization order. Its high-water mark lives in a named field,
+/// not a per-key entry, so it survives regardless of how many ordinary keys the
+/// index tracks.
 pub const POSTGRES_TRANSACTION_MARKER_KEY: &[u8] = b"\0ferrosa:postgres:serializable:v1";
 /// PostgreSQL begin and commit barriers share this key to order their Accord
 /// transactions. BEGIN-only barriers do not advance the data-commit marker.
 pub const POSTGRES_TRANSACTION_BARRIER_KEY: &[u8] = b"\0ferrosa:postgres:barrier:v1";
+
+/// Default pre-allocation hint for [`ConflictIndex::new`] — a starting buffer
+/// size for the hot maps, never a bound on how much they may hold.
+pub const DEFAULT_CONFLICT_INDEX_RESERVE: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -60,17 +106,29 @@ impl TokenRange {
     }
 }
 
-/// Error returned when the [`ConflictIndex`] is at capacity.
-#[derive(Debug)]
-pub struct ConflictIndexFull;
-
-impl std::fmt::Display for ConflictIndexFull {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "conflict index at capacity")
-    }
+/// One key's entry in the [`ConflictIndex`]: its in-flight writes together with
+/// its per-key execution-timestamp high-water-mark.
+///
+/// Holding the key's bytes once (in the map key) and the HWM on the same entry
+/// replaces a parallel `HashMap<Vec<u8>, Timestamp>` that stored every key a
+/// second time.
+struct KeyEntry {
+    /// In-flight writes registered on this key. Almost every key holds exactly
+    /// ONE at a time: a PreAccept registers the transaction once per key and the
+    /// key is dropped as soon as that transaction is GC'd. A plain `Vec` reserved
+    /// capacity FOUR for that single element (Rust's first-growth rule for an
+    /// element larger than one byte) — three slots never used. The buffer is
+    /// seeded at capacity one here; a second concurrent write on the same key is
+    /// the rare case and the `Vec` grows normally when it happens.
+    writes: Vec<InFlightWrite>,
+    /// Highest committed **execution** timestamp ever seen for this key, raised by
+    /// [`set_commit_ts`](ConflictIndex::set_commit_ts) and monotonic. Unlike
+    /// `writes`, it is retained across [`gc_applied`](ConflictIndex::gc_applied) so
+    /// a later append still bumps past an already-applied one — the GC-boundary
+    /// real-time inversion (t_813caf39). An entry with empty `writes` and a
+    /// `Some(hwm)` is kept for exactly this reason.
+    hwm: Option<Timestamp>,
 }
-
-impl std::error::Error for ConflictIndexFull {}
 
 // ---------------------------------------------------------------------------
 // ConflictIndex
@@ -80,8 +138,9 @@ impl std::error::Error for ConflictIndexFull {}
 ///
 /// Designed to be owned by a single-threaded shard executor. Not `Sync`.
 pub struct ConflictIndex {
-    /// Single-partition writes: O(1) exact-key lookup.
-    single_key: HashMap<Vec<u8>, Vec<InFlightWrite>>,
+    /// Single-partition writes: O(1) exact-key lookup. Each key's bytes live
+    /// here ONCE, alongside its in-flight writes and its per-key HWM.
+    single_key: HashMap<Vec<u8>, KeyEntry>,
 
     /// Range-spanning operations: O(log n) range overlap.
     range_ops: BTreeMap<TokenRange, BTreeSet<(Timestamp, TxnId)>>,
@@ -89,95 +148,69 @@ pub struct ConflictIndex {
     /// Indexed column projections for transactional 2i.
     indexed_writes: HashMap<String, HashMap<Vec<u8>, Vec<TxnId>>>,
 
-    /// Per-key high-water-mark of the highest committed **execution** timestamp
-    /// ever seen for a key — retained across [`gc_applied`](Self::gc_applied),
-    /// unlike the in-flight [`single_key`] entries. Without it, once a committed
-    /// append is applied and GC'd, a later append on the same key sees no
-    /// conflict and mints a timestamp below the GC'd one — the GC-boundary
-    /// real-time inversion (t_813caf39). Bounded by `max_entries`; when full,
-    /// new keys are skipped (they fall back to the entry-based conflict path,
-    /// still correct while they have live entries).
-    single_key_hwm: HashMap<Vec<u8>, Timestamp>,
-
-    /// The PostgreSQL marker must never lose its high-water mark to the generic
-    /// per-key capacity limit: stale-snapshot validation depends on it.
+    /// The PostgreSQL marker must never lose its high-water mark: stale-snapshot
+    /// validation depends on it. Kept as a named field (not on a per-key entry)
+    /// because the marker's HWM must survive even after the marker's live entry is
+    /// GC'd and its `KeyEntry` is dropped.
     postgres_marker_hwm: Option<Timestamp>,
     postgres_barrier_hwm: Option<Timestamp>,
 
-    /// Hard cap on total entries.
-    max_entries: usize,
+    /// Total live registrations (single-key + range), for [`len`](Self::len) and
+    /// [`is_empty`](Self::is_empty). There is no cap — it grows with the
+    /// in-flight write-sets and shrinks as they apply.
     current_entries: usize,
 }
 
-/// Raise a key's execution-timestamp high-water-mark to `t` (monotonic). A new
-/// key is tracked only while under `cap`; a skipped new key degrades gracefully
-/// to the entry-based conflict path (correct while it has live entries), keeping
-/// the HWM map bounded.
-fn raise_hwm(hwm: &mut HashMap<Vec<u8>, Timestamp>, key: &[u8], t: Timestamp, cap: usize) {
-    match hwm.get_mut(key) {
-        Some(existing) => {
-            if t > *existing {
-                *existing = t;
-            }
-        }
-        None => {
-            if hwm.len() < cap {
-                hwm.insert(key.to_vec(), t);
-            }
-        }
-    }
-}
-
 impl ConflictIndex {
-    /// Create a new conflict index with the given capacity.
+    /// Create a new conflict index.
     ///
-    /// # Panics
-    ///
-    /// Panics if `max_entries` is zero.
-    pub fn new(max_entries: usize) -> Self {
-        assert!(max_entries > 0, "max_entries must be positive");
+    /// `reserve` is a **pre-allocation hint** for the hot maps — a buffer-size
+    /// tuning, never a bound. The index grows past it without limit: neither
+    /// [`register`](Self::register) nor [`register_range`](Self::register_range)
+    /// can refuse. Pass [`DEFAULT_CONFLICT_INDEX_RESERVE`] unless the caller has a
+    /// better guess at its working-set size.
+    pub fn new(reserve: usize) -> Self {
         Self {
-            single_key: HashMap::new(),
+            single_key: HashMap::with_capacity(reserve),
             range_ops: BTreeMap::new(),
             indexed_writes: HashMap::new(),
-            single_key_hwm: HashMap::new(),
             postgres_marker_hwm: None,
             postgres_barrier_hwm: None,
-            max_entries,
             current_entries: 0,
         }
     }
 
     /// Register a new in-flight transaction on a single key.
     ///
-    /// Returns `Err(ConflictIndexFull)` if the index is at capacity.
-    pub fn register(&mut self, key: &[u8], entry: InFlightWrite) -> Result<(), ConflictIndexFull> {
-        if self.current_entries >= self.max_entries {
-            return Err(ConflictIndexFull);
-        }
-        self.single_key.entry(key.to_vec()).or_default().push(entry);
+    /// Always succeeds: the index grows to hold the key. A PreAccept registers
+    /// its transaction under EVERY key of the write-set and is all-or-nothing,
+    /// so a refusal here would silently drop a conflict (two conflicting txns
+    /// could both commit — a lost update). There is deliberately no refusal path.
+    pub fn register(&mut self, key: &[u8], entry: InFlightWrite) {
+        // Seed the writes buffer at capacity ONE: the common case is a single
+        // in-flight write per key, and a bare `Vec` would reserve four slots for
+        // it. An existing key's buffer grows normally on its rare second write.
+        self.single_key
+            .entry(key.to_vec())
+            .or_insert_with(|| KeyEntry {
+                writes: Vec::with_capacity(1),
+                hwm: None,
+            })
+            .writes
+            .push(entry);
         self.current_entries += 1;
-        Ok(())
     }
 
     /// Register a range operation.
     ///
-    /// Returns `Err(ConflictIndexFull)` if the index is at capacity.
-    pub fn register_range(
-        &mut self,
-        range: TokenRange,
-        ts: Timestamp,
-        txn_id: TxnId,
-    ) -> Result<(), ConflictIndexFull> {
-        if self.current_entries >= self.max_entries {
-            return Err(ConflictIndexFull);
-        }
+    /// Always succeeds: the index grows to hold the range. See
+    /// [`register`](Self::register) for why there is no refusal path.
+    pub fn register_range(&mut self, range: TokenRange, ts: Timestamp, txn_id: TxnId) {
         self.range_ops
             .entry(range)
             .or_default()
             .insert((ts, txn_id));
         self.current_entries += 1;
-        Ok(())
     }
 
     /// Register an indexed column write.
@@ -204,24 +237,23 @@ impl ConflictIndex {
     /// a later txn assigned an execution `t` below it — a real-time inversion that
     /// reorders accumulating list elements (t_813caf39).
     pub fn max_conflicting_timestamp(&self, key: &[u8]) -> Option<Timestamp> {
-        let live = self
-            .single_key
-            .get(key)
-            .and_then(|writes| writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max());
+        let entry = self.single_key.get(key);
+        let live = entry.and_then(|e| e.writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max());
         // Fold in the per-key high-water-mark, which survives GC of the live
-        // entries — so a later append still bumps past an already-applied one.
+        // entries — so a later append still bumps past an already-applied one. It
+        // lives on the key's own entry, so the key's bytes are read once.
         let hwm = if key == POSTGRES_TRANSACTION_MARKER_KEY {
             self.postgres_marker_hwm
                 .into_iter()
-                .chain(self.single_key_hwm.get(key).copied())
+                .chain(entry.and_then(|e| e.hwm))
                 .max()
         } else if key == POSTGRES_TRANSACTION_BARRIER_KEY {
             self.postgres_barrier_hwm
                 .into_iter()
-                .chain(self.single_key_hwm.get(key).copied())
+                .chain(entry.and_then(|e| e.hwm))
                 .max()
         } else {
-            self.single_key_hwm.get(key).copied()
+            entry.and_then(|e| e.hwm)
         };
         match (live, hwm) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -234,18 +266,19 @@ impl ConflictIndex {
     /// lookups bump past its real serialization point rather than its stale `t0`.
     /// Called when the timestamp is finalized (Accept / Commit).
     ///
-    /// Also raises the per-key execution-timestamp **high-water-mark** for every
-    /// key the transaction touches, so the bump survives [`gc_applied`] once the
-    /// transaction is applied and its live entry is removed. No-op on the live
-    /// entries if the txn is already GC'd, but the HWM is still raised.
+    /// Also raises the per-key execution-timestamp **high-water-mark** on the
+    /// key's own entry for every key the transaction touches, so the bump survives
+    /// [`gc_applied`] once the transaction is applied and its live entry is
+    /// removed. No-op on the live entries if the txn is already GC'd, but the HWM
+    /// is still raised.
     ///
     /// [`gc_applied`]: Self::gc_applied
     pub fn set_commit_ts(&mut self, txn_id: &TxnId, t: Timestamp) {
-        for (key, writes) in self.single_key.iter_mut() {
+        for (key, entry) in self.single_key.iter_mut() {
             let mut touches_key = false;
-            for entry in writes.iter_mut() {
-                if entry.txn_id == *txn_id {
-                    entry.accord_ts = Some(t);
+            for w in entry.writes.iter_mut() {
+                if w.txn_id == *txn_id {
+                    w.accord_ts = Some(t);
                     touches_key = true;
                 }
             }
@@ -259,7 +292,8 @@ impl ConflictIndex {
                             .map_or(t, |current| current.max(t)),
                     );
                 } else {
-                    raise_hwm(&mut self.single_key_hwm, key, t, self.max_entries);
+                    // Monotonic raise on the key's own entry — no second key copy.
+                    entry.hwm = Some(entry.hwm.map_or(t, |current| current.max(t)));
                 }
             }
         }
@@ -288,8 +322,8 @@ impl ConflictIndex {
     /// Used for building the PreAccept dependency set.
     pub fn deps_before_t0(&self, key: &[u8], t0: &Timestamp) -> HashSet<TxnId> {
         let mut deps = HashSet::new();
-        if let Some(writes) = self.single_key.get(key) {
-            for w in writes {
+        if let Some(entry) = self.single_key.get(key) {
+            for w in &entry.writes {
                 if w.t0 < *t0 {
                     deps.insert(w.txn_id);
                 }
@@ -305,8 +339,8 @@ impl ConflictIndex {
     /// not against another `t0`.
     pub fn deps_before_t(&self, key: &[u8], t: &Timestamp) -> HashSet<TxnId> {
         let mut deps = HashSet::new();
-        if let Some(writes) = self.single_key.get(key) {
-            for w in writes {
+        if let Some(entry) = self.single_key.get(key) {
+            for w in &entry.writes {
                 if w.t0 < *t {
                     deps.insert(w.txn_id);
                 }
@@ -323,12 +357,13 @@ impl ConflictIndex {
     pub fn remove(&mut self, txn_id: &TxnId) {
         // Remove from single-key index.
         let mut empty_keys = Vec::new();
-        for (key, writes) in &mut self.single_key {
-            let before = writes.len();
-            writes.retain(|w| w.txn_id != *txn_id);
-            let removed = before - writes.len();
+        for (key, entry) in &mut self.single_key {
+            let before = entry.writes.len();
+            entry.writes.retain(|w| w.txn_id != *txn_id);
+            let removed = before - entry.writes.len();
             self.current_entries = self.current_entries.saturating_sub(removed);
-            if writes.is_empty() {
+            // Keep the entry while its HWM is set: the entry IS the per-key HWM.
+            if entry.writes.is_empty() && entry.hwm.is_none() {
                 empty_keys.push(key.clone());
             }
         }
@@ -379,10 +414,10 @@ impl ConflictIndex {
     /// to `TxnStatus::Applied`, making them eligible for garbage collection
     /// via [`gc_applied`](ConflictIndex::gc_applied).
     pub fn mark_applied(&mut self, txn_id: &TxnId) {
-        for writes in self.single_key.values_mut() {
-            for entry in writes.iter_mut() {
-                if entry.txn_id == *txn_id {
-                    entry.status = TxnStatus::Applied;
+        for entry in self.single_key.values_mut() {
+            for w in entry.writes.iter_mut() {
+                if w.txn_id == *txn_id {
+                    w.status = TxnStatus::Applied;
                 }
             }
         }
@@ -401,16 +436,18 @@ impl ConflictIndex {
         let mut applied_txn_ids = Vec::new();
         let mut removed = 0usize;
 
-        self.single_key.retain(|_key, writes| {
-            let before = writes.len();
-            for w in writes.iter() {
+        self.single_key.retain(|_key, entry| {
+            let before = entry.writes.len();
+            for w in entry.writes.iter() {
                 if w.status == TxnStatus::Applied {
                     applied_txn_ids.push(w.txn_id);
                 }
             }
-            writes.retain(|w| w.status != TxnStatus::Applied);
-            removed += before - writes.len();
-            !writes.is_empty()
+            entry.writes.retain(|w| w.status != TxnStatus::Applied);
+            removed += before - entry.writes.len();
+            // An entry with no live writes but a raised HWM must be KEPT: it is the
+            // surviving post-GC conflict (t_813caf39).
+            !entry.writes.is_empty() || entry.hwm.is_some()
         });
 
         // Remove applied transactions from range_ops.
@@ -513,11 +550,11 @@ mod tests {
         let key = b"partition-1";
 
         // Register T1 (t0 = 10).
-        idx.register(key, write_entry(10)).unwrap();
+        idx.register(key, write_entry(10));
         assert_eq!(idx.max_conflicting_timestamp(key), Some(ts(10)));
 
         // Register T2 with higher t0 (t0 = 20).
-        idx.register(key, write_entry(20)).unwrap();
+        idx.register(key, write_entry(20));
         assert_eq!(idx.max_conflicting_timestamp(key), Some(ts(20)));
     }
 
@@ -543,8 +580,7 @@ mod tests {
                 accord_ts: Some(ts(1000)),
                 status: TxnStatus::Committed,
             },
-        )
-        .unwrap();
+        );
 
         assert_eq!(
             idx.max_conflicting_timestamp(key),
@@ -573,8 +609,7 @@ mod tests {
                 accord_ts: Some(ts(1000)),
                 status: TxnStatus::Committed,
             },
-        )
-        .unwrap();
+        );
         idx.set_commit_ts(&id, ts(1000)); // records the per-key HWM
 
         // The txn applies and is GC'd — its live entry is removed.
@@ -590,23 +625,35 @@ mod tests {
         assert_eq!(idx.max_conflicting_timestamp(b"other"), None);
     }
 
+    /// The PostgreSQL marker's high-water mark must survive regardless of how
+    /// many ordinary keys the index tracks: stale-snapshot validation depends on
+    /// it. The ordinary per-key HWM is likewise unbounded (nothing is skipped),
+    /// so an ordinary key's post-GC conflict is retained too.
     #[test]
-    fn postgres_marker_hwm_survives_when_bounded_key_hwm_is_full() {
+    fn postgres_marker_hwm_survives_alongside_many_normal_keys() {
         let mut idx = ConflictIndex::new(1);
-        let ordinary = txn(10);
-        idx.register(
-            b"ordinary",
-            InFlightWrite {
-                txn_id: ordinary,
-                t0: ts(10),
-                accord_ts: Some(ts(10)),
-                status: TxnStatus::Committed,
-            },
-        )
-        .unwrap();
-        idx.set_commit_ts(&ordinary, ts(10));
-        idx.mark_applied(&ordinary);
+        // Far more ordinary keys than any old HWM bound.
+        for i in 0..1_000u64 {
+            let id = txn(100 + i);
+            idx.register(
+                &i.to_be_bytes(),
+                InFlightWrite {
+                    txn_id: id,
+                    t0: ts(100 + i),
+                    accord_ts: Some(ts(100 + i)),
+                    status: TxnStatus::Committed,
+                },
+            );
+            idx.set_commit_ts(&id, ts(100 + i));
+            idx.mark_applied(&id);
+        }
         idx.gc_applied();
+        // An ordinary key's HWM is retained (it was never skipped).
+        assert_eq!(
+            idx.max_conflicting_timestamp(&5u64.to_be_bytes()),
+            Some(ts(105)),
+            "an ordinary key's committed execution timestamp must survive gc_applied"
+        );
 
         let marker = txn(20);
         idx.register(
@@ -617,8 +664,7 @@ mod tests {
                 accord_ts: Some(ts(20)),
                 status: TxnStatus::Committed,
             },
-        )
-        .unwrap();
+        );
         idx.set_commit_ts(&marker, ts(20));
         idx.mark_applied(&marker);
         idx.gc_applied();
@@ -626,7 +672,8 @@ mod tests {
         assert_eq!(
             idx.max_conflicting_timestamp(POSTGRES_TRANSACTION_MARKER_KEY),
             Some(ts(20)),
-            "snapshot validation must retain the global marker timestamp even when normal key history fills the cap"
+            "snapshot validation must retain the global marker timestamp regardless of \
+             how many ordinary keys are tracked"
         );
     }
 
@@ -638,7 +685,7 @@ mod tests {
     fn conflict_index_single_key_no_false_positives() {
         let mut idx = ConflictIndex::new(100);
 
-        idx.register(b"key-A", write_entry(10)).unwrap();
+        idx.register(b"key-A", write_entry(10));
 
         // Querying a different key must return None.
         assert_eq!(idx.max_conflicting_timestamp(b"key-B"), None);
@@ -656,7 +703,7 @@ mod tests {
             start: 100,
             end: 200,
         };
-        idx.register_range(range1, ts(10), txn(10)).unwrap();
+        idx.register_range(range1, ts(10), txn(10));
 
         // Overlapping query range [150, 250] — should find conflict.
         let query_overlap = TokenRange {
@@ -685,9 +732,9 @@ mod tests {
         let mut idx = ConflictIndex::new(100);
         let key = b"key";
 
-        idx.register(key, write_entry(5)).unwrap();
-        idx.register(key, write_entry(10)).unwrap();
-        idx.register(key, write_entry(15)).unwrap();
+        idx.register(key, write_entry(5));
+        idx.register(key, write_entry(10));
+        idx.register(key, write_entry(15));
 
         // deps_before_t0(key, t0=12) should return T1(5) and T2(10), not T3(15).
         let deps = idx.deps_before_t0(key, &ts(12));
@@ -706,8 +753,8 @@ mod tests {
         let mut idx = ConflictIndex::new(100);
         let key = b"key";
 
-        idx.register(key, write_entry(5)).unwrap();
-        idx.register(key, write_entry(10)).unwrap();
+        idx.register(key, write_entry(5));
+        idx.register(key, write_entry(10));
 
         // deps_before_t(key, t=8) should return T1(5) only, not T2(10).
         let deps = idx.deps_before_t(key, &ts(8));
@@ -725,7 +772,7 @@ mod tests {
         let mut idx = ConflictIndex::new(100);
         let key = b"key";
 
-        idx.register(key, write_entry(10)).unwrap();
+        idx.register(key, write_entry(10));
         assert_eq!(idx.max_conflicting_timestamp(key), Some(ts(10)));
         assert_eq!(idx.len(), 1);
 
@@ -735,21 +782,29 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 7: Bounded capacity
+    // Test 7: The reserve hint is a hint, never a bound
     // -----------------------------------------------------------------------
 
+    /// The constructor argument is a pre-allocation HINT: the index grows past
+    /// it and NEVER refuses a registration. (Before the fix this test asserted
+    /// the inverse — that the 4th registration failed — which re-encoded the
+    /// defect as the specification.)
     #[test]
-    fn conflict_index_bounded_capacity() {
-        let mut idx = ConflictIndex::new(3);
+    fn conflict_index_grows_past_its_reserve_hint() {
+        let mut idx = ConflictIndex::new(1); // reserve of ONE entry
 
-        idx.register(b"k1", write_entry(1)).unwrap();
-        idx.register(b"k2", write_entry(2)).unwrap();
-        idx.register(b"k3", write_entry(3)).unwrap();
+        idx.register(b"k1", write_entry(1));
+        idx.register(b"k2", write_entry(2));
+        idx.register(b"k3", write_entry(3));
 
-        // 4th registration must fail.
-        let result = idx.register(b"k4", write_entry(4));
-        assert!(result.is_err());
-        assert_eq!(idx.len(), 3);
+        // The 4th registration must ALSO land: the reserve is a hint, not a cap.
+        idx.register(b"k4", write_entry(4));
+        assert_eq!(
+            idx.len(),
+            4,
+            "no registration may be refused at the reserve"
+        );
+        assert_eq!(idx.max_conflicting_timestamp(b"k4"), Some(ts(4)));
     }
 
     // -----------------------------------------------------------------------
@@ -772,8 +827,8 @@ mod tests {
         // Verify the index works correctly in a single-threaded context
         // with interleaved operations.
         let mut idx = ConflictIndex::new(100);
-        idx.register(b"k1", write_entry(1)).unwrap();
-        idx.register(b"k2", write_entry(2)).unwrap();
+        idx.register(b"k1", write_entry(1));
+        idx.register(b"k2", write_entry(2));
         assert_eq!(idx.max_conflicting_timestamp(b"k1"), Some(ts(1)));
         idx.remove(&txn(1));
         assert_eq!(idx.max_conflicting_timestamp(b"k1"), None);
@@ -815,8 +870,8 @@ mod tests {
         let key = b"users:alice";
 
         // Register T1 and T2 on the same key. T2 depends on T1.
-        idx.register(key, write_entry(100)).unwrap();
-        idx.register(key, write_entry(200)).unwrap();
+        idx.register(key, write_entry(100));
+        idx.register(key, write_entry(200));
         assert_eq!(idx.len(), 2);
 
         // Verify T2 sees T1 as a dependency.
@@ -844,7 +899,7 @@ mod tests {
         let mut idx = ConflictIndex::new(100);
         let key = b"orders:123";
 
-        idx.register(key, write_entry(100)).unwrap();
+        idx.register(key, write_entry(100));
         assert_eq!(idx.len(), 1);
 
         idx.mark_applied(&txn(100));
@@ -856,5 +911,186 @@ mod tests {
         // No deps should remain.
         let deps = idx.deps_before_t0(key, &ts(200));
         assert!(deps.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // GROWTH invariants — the index must never refuse, truncate or cap a
+    // write-set. The historical fixed cap was 100_000 entries; every test below
+    // crosses it. Their failure mode BEFORE the fix is exactly the live failure:
+    // `register` returned `Err(ConflictIndexFull)` and the registration was lost.
+    // -----------------------------------------------------------------------
+
+    /// INVARIANT (no false negative past the old boundary): a write-set may hold
+    /// far more keys than the historical 100_000-entry cap, and EVERY registered
+    /// key must still be found afterwards. The old index refused the writes past
+    /// the cap, so `len()` froze at 100_000 and the tail keys were silently lost —
+    /// the live `pgbench -i` failure at 1,000,112 keys.
+    #[test]
+    fn registers_every_key_of_a_write_set_far_past_the_old_boundary() {
+        const OLD_CAP: usize = 100_000;
+        const N: usize = 1_000_112;
+        let mut idx = ConflictIndex::new(OLD_CAP);
+        for i in 0..N as u64 {
+            let entry = InFlightWrite {
+                txn_id: txn(1),
+                t0: ts(1),
+                accord_ts: Some(ts(1)),
+                status: TxnStatus::PreAccepted,
+            };
+            idx.register(&i.to_be_bytes(), entry);
+        }
+        assert_eq!(
+            idx.len(),
+            N,
+            "every key of the write-set must be registered — no cap may truncate it"
+        );
+        for i in [0usize, OLD_CAP - 1, OLD_CAP, N - 1] {
+            assert_eq!(
+                idx.max_conflicting_timestamp(&(i as u64).to_be_bytes()),
+                Some(ts(1)),
+                "key {i} must still be found after growth past the old cap"
+            );
+        }
+    }
+
+    /// INVARIANT (conflict straddling the old boundary): two transactions that
+    /// share a key are still detected as conflicting when one of them registers
+    /// while the index already holds more than the old 100_000 entries on OTHER
+    /// keys. Before the fix the second registration was refused, so the shared-key
+    /// conflict vanished and two conflicting txns could both commit — a lost update.
+    #[test]
+    fn detects_a_conflict_straddling_the_old_boundary() {
+        const OLD_CAP: usize = 100_000;
+        let mut idx = ConflictIndex::new(OLD_CAP);
+        let shared: &[u8] = b"shared-key";
+        let a = txn(10);
+        let b = txn(20);
+
+        // Fill up to just under the old cap on unrelated keys.
+        for i in 0..(OLD_CAP as u64 - 1) {
+            idx.register(
+                &(i ^ 0x8000_0000_0000_0000).to_be_bytes(),
+                InFlightWrite {
+                    txn_id: txn(1),
+                    t0: ts(1),
+                    accord_ts: None,
+                    status: TxnStatus::PreAccepted,
+                },
+            );
+        }
+        // A registers the shared key as the index crosses the old boundary.
+        idx.register(
+            shared,
+            InFlightWrite {
+                txn_id: a,
+                t0: ts(10),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+        // The index grows well past the old boundary.
+        for i in 0..1_000u64 {
+            idx.register(
+                &(i ^ 0x4000_0000_0000_0000).to_be_bytes(),
+                InFlightWrite {
+                    txn_id: txn(1),
+                    t0: ts(1),
+                    accord_ts: None,
+                    status: TxnStatus::PreAccepted,
+                },
+            );
+        }
+        // B registers the SAME shared key far past the old cap.
+        idx.register(
+            shared,
+            InFlightWrite {
+                txn_id: b,
+                t0: ts(20),
+                accord_ts: None,
+                status: TxnStatus::PreAccepted,
+            },
+        );
+
+        assert_eq!(
+            idx.len(),
+            (OLD_CAP as u64 - 1 + 2 + 1_000) as usize,
+            "every registration must land — none may be refused at the old boundary"
+        );
+        let deps = idx.deps_before_t0(shared, &ts(1000));
+        assert!(
+            deps.contains(&a) && deps.contains(&b),
+            "the shared-key conflict straddling the old boundary must be detected: {deps:?}"
+        );
+    }
+
+    /// INVARIANT (all-or-nothing): registering a whole write-set registers EVERY
+    /// key; there is no capacity at which a prefix is accepted and the tail dropped.
+    #[test]
+    fn registers_a_large_multi_key_write_set_all_or_nothing() {
+        const N: usize = 250_000;
+        let mut idx = ConflictIndex::new(1024);
+        let id = txn(7);
+        for i in 0..N as u64 {
+            idx.register(
+                &i.to_be_bytes(),
+                InFlightWrite {
+                    txn_id: id,
+                    t0: ts(7),
+                    accord_ts: None,
+                    status: TxnStatus::PreAccepted,
+                },
+            );
+        }
+        assert_eq!(idx.len(), N, "the whole write-set must be registered");
+        assert_eq!(
+            idx.deps_before_t0(&((N as u64) - 1).to_be_bytes(), &ts(8))
+                .len(),
+            1,
+            "the last key of the write-set must resolve — no dropped tail"
+        );
+    }
+
+    /// INVARIANT (no missed conflict after growth + GC): the per-key execution
+    /// high-water-mark survives `gc_applied` even after the index has grown far
+    /// past the old 100_000-entry boundary, so a LATER txn on a GC'd key still
+    /// bumps past the earlier one (t_813caf39). The old bounded HWM map SKIPPED
+    /// new keys once full, silently losing their post-GC conflict — a lost update.
+    #[test]
+    fn detects_conflict_after_growth_and_gc_past_the_old_boundary() {
+        const OLD_CAP: usize = 100_000;
+        let mut idx = ConflictIndex::new(OLD_CAP);
+        let key: &[u8] = b"gc-key";
+        let id = txn(42);
+        idx.register(
+            key,
+            InFlightWrite {
+                txn_id: id,
+                t0: ts(42),
+                accord_ts: Some(ts(900)),
+                status: TxnStatus::Committed,
+            },
+        );
+        idx.set_commit_ts(&id, ts(900));
+
+        // Grow far past the old boundary on unrelated keys.
+        for i in 0..(OLD_CAP as u64 + 5) {
+            idx.register(
+                &(i ^ 0x2000_0000_0000_0000).to_be_bytes(),
+                InFlightWrite {
+                    txn_id: txn(1),
+                    t0: ts(1),
+                    accord_ts: None,
+                    status: TxnStatus::PreAccepted,
+                },
+            );
+        }
+
+        idx.mark_applied(&id);
+        idx.gc_applied();
+        assert_eq!(
+            idx.max_conflicting_timestamp(key),
+            Some(ts(900)),
+            "the GC'd conflict must still be detected after the index grew past the old boundary"
+        );
     }
 }

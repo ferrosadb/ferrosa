@@ -151,7 +151,7 @@ mod tests {
         let key = b"users:alice";
 
         // Register an in-flight write on the key.
-        conflict_index.register(key, write_entry(100)).unwrap();
+        conflict_index.register(key, write_entry(100));
 
         // Check: should detect the in-flight transaction.
         let result = mgr.check_conflicts(&conflict_index, key);
@@ -190,7 +190,7 @@ mod tests {
         let key = b"orders:123";
 
         // Register an in-flight write.
-        conflict_index.register(key, write_entry(200)).unwrap();
+        conflict_index.register(key, write_entry(200));
 
         // Initial check: must wait.
         let result = mgr.check_conflicts(&conflict_index, key);
@@ -216,9 +216,9 @@ mod tests {
         let key = b"accounts:savings";
 
         // Register multiple in-flight writes on the same key.
-        conflict_index.register(key, write_entry(100)).unwrap();
-        conflict_index.register(key, write_entry(200)).unwrap();
-        conflict_index.register(key, write_entry(300)).unwrap();
+        conflict_index.register(key, write_entry(100));
+        conflict_index.register(key, write_entry(200));
+        conflict_index.register(key, write_entry(300));
 
         // Check: should report all three pending.
         let result = mgr.check_conflicts(&conflict_index, key);

@@ -211,6 +211,7 @@ async fn start_with_tls(rate_limit: RateLimitConfig, tls: server::PgTls) -> Fixt
     engine.register_table(kv_storage_schema()).unwrap();
     let schema = Arc::new(build_schema(rate_limit));
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: schema.clone(),
         default_schema: "public".into(),

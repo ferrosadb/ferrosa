@@ -221,6 +221,7 @@ pub async fn start_ferrosa_pg() -> FerrosaPg {
     let jsonb_limits =
         Limits::from_config(&LimitsConfig::default(), 32 * 1024 * 1024).expect("limits resolve");
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine,
         schema,
         default_schema: "public".into(),

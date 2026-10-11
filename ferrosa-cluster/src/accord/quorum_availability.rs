@@ -30,6 +30,18 @@ use crate::accord::state_machine::AccordStateMachine;
 use crate::accord::transaction_commit::{AccordTransactionCommitter, ReplicaResolver};
 use crate::accord::transport::AccordTransport;
 
+/// Build a staged Accord write-set from resident writes — the shape
+/// [`TransactionCommitter::commit_postgres`] now takes. These tests drive one key at a
+/// time, so the set stays wholly resident and never touches the filesystem.
+fn staged(writes: Vec<TransactionWrite>) -> ferrosa_storage::accord::StagedAccordWriteSet {
+    let mut builder =
+        ferrosa_storage::accord::StagedAccordWriteSetBuilder::with_threshold_bytes(u64::MAX);
+    for write in writes {
+        builder.accept(write).expect("stage write");
+    }
+    builder.finish().expect("finish staging")
+}
+
 /// How a replica answers requests.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Reachability {
@@ -243,7 +255,7 @@ async fn run_postgres_transaction(
             mutation: format!("write-{actor}-{attempt}").into_bytes(),
         };
         match committer
-            .commit_postgres("ks", vec![write], vec!["t".to_string()], snapshot)
+            .commit_postgres("ks", staged(vec![write]), vec!["t".to_string()], snapshot)
             .await
         {
             Ok(CommitOutcome::Committed) => return Ok(()),
@@ -379,7 +391,7 @@ async fn a_snapshot_barrier_and_a_commit_whose_preaccepts_cross_do_not_deadlock(
     };
     let commit = tokio::spawn(async move {
         commit_node
-            .commit_postgres("ks", vec![write], vec!["t".to_string()], snapshot)
+            .commit_postgres("ks", staged(vec![write]), vec!["t".to_string()], snapshot)
             .await
     });
     let barrier = barrier.await.expect("barrier task panicked");

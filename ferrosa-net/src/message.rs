@@ -324,6 +324,18 @@ pub enum Message {
     // Accept/Commit/Read phases are key-agnostic and reuse the v1 variants.
     AccordPreAcceptV2(Bytes),
     AccordApplyV2(Bytes),
+    /// Multi-key Apply whose body is a Cap'n Proto `accord.applyV2` frame (see
+    /// [`crate::protocol::encode_accord_apply_v2`]). Additive to
+    /// [`Self::AccordApplyV2`], which keeps the bincode body, so a peer that has not
+    /// advertised [`crate::handshake::CAP_ACCORD_CAPNP`] is served the older type.
+    AccordApplyV2Capnp(Bytes),
+    /// Multi-key Apply whose body is a Cap'n Proto `accord.applyV2Region` HEADER
+    /// followed by ONE contiguous REGION of write-set payload bytes addressed by
+    /// (offset, length) (see [`crate::protocol::encode_accord_apply_v2_region`]).
+    /// Additive to [`Self::AccordApplyV2Capnp`], so a peer that advertised
+    /// [`crate::handshake::CAP_ACCORD_CAPNP`] but not
+    /// [`crate::handshake::CAP_ACCORD_APPLY_REGION`] is served the inline frame.
+    AccordApplyV2Region(Bytes),
 
     // Bootstrap coordination
     /// Sent by a non-leader node to the leader after bootstrap streaming completes.
@@ -444,6 +456,8 @@ impl Message {
             Self::AccordRecoverOK(_) => MsgType::AccordRecoverOK,
             Self::AccordPreAcceptV2(_) => MsgType::AccordPreAcceptV2,
             Self::AccordApplyV2(_) => MsgType::AccordApplyV2,
+            Self::AccordApplyV2Capnp(_) => MsgType::AccordApplyV2Capnp,
+            Self::AccordApplyV2Region(_) => MsgType::AccordApplyV2Region,
             Self::BootstrapComplete { .. } => MsgType::BootstrapComplete,
             Self::BootstrapCompleteAck => MsgType::BootstrapCompleteAck,
             Self::ClusterMembershipForward(_) => MsgType::ClusterMembershipForward,
@@ -617,6 +631,8 @@ impl Message {
             | Self::AccordRecoverOK(b)
             | Self::AccordPreAcceptV2(b)
             | Self::AccordApplyV2(b)
+            | Self::AccordApplyV2Capnp(b)
+            | Self::AccordApplyV2Region(b)
             | Self::ClusterMembershipForward(b)
             | Self::ClusterMembershipForwardAck(b) => buf.put_slice(b),
             Self::BootstrapComplete { node_id } => buf.put_slice(node_id.as_bytes()),
@@ -881,6 +897,12 @@ impl Message {
             MsgType::AccordRecoverOK => Self::AccordRecoverOK(body.split_to(body.remaining())),
             MsgType::AccordPreAcceptV2 => Self::AccordPreAcceptV2(body.split_to(body.remaining())),
             MsgType::AccordApplyV2 => Self::AccordApplyV2(body.split_to(body.remaining())),
+            MsgType::AccordApplyV2Capnp => {
+                Self::AccordApplyV2Capnp(body.split_to(body.remaining()))
+            }
+            MsgType::AccordApplyV2Region => {
+                Self::AccordApplyV2Region(body.split_to(body.remaining()))
+            }
             MsgType::BootstrapComplete => {
                 let mut id_bytes = [0u8; 16];
                 if body.remaining() >= 16 {

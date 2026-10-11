@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cql
 doc: roadmap
-last_updated: 2026-09-17
+last_updated: 2026-10-10
 ---
 
 # ferrosa-cql — Roadmap
@@ -50,6 +50,23 @@ real backlog is structural and security-shaped.
 
 ## Now (highest value)
 
+- **Remove the two data-refusing CQL caps (no-hard-bounds audit).** Under the
+  owner's rule *no hard bounds except spillable, tunable streaming buffers*, two
+  bounds in this crate REFUSE client data and are therefore illegitimate:
+  `FERROSA_CQL_TRANSACTION_MAX_STATEMENTS` (`session.rs::stage`/`stage_read` refuse
+  **and poison** the transaction) and `FERROSA_CQL_MAX_BATCH_STATEMENTS`
+  (`router.rs::route_batch` refuses the whole BATCH). Their removal is **REFUSED
+  for now, with evidence**: the transaction buffer is a resident
+  `Vec<TransactionWrite>` with no spill path and `TransactionCommitter::commit_with_reads`
+  consumes the whole `Vec`, and `route_logged_batch` builds a resident
+  `Vec<Mutation>` sized by the statement count — so lifting either cap makes a
+  single request (or a single commit) build an unbounded resident `Vec` (OOM). The
+  fix is the same shape as the PostgreSQL front end's: stage the write-set through
+  a spilling `WriteSetStage` and give `TransactionCommitter` a streaming commit;
+  give the logged-batch path a streaming atomic apply. `FERROSA_CQL_TRANSACTION_MAX_OPEN`
+  is **KEPT** — it bounds concurrent open transactions with a retryable `Overloaded`
+  and drops no write-set (a concurrency bound). See the cap census in
+  `ferrosa-postgres/README.md`.
 - **Sign / scope-bind the `paging_state` cursor** (FMEA CQL-2). Today
   `PagingState::encode/decode` is an unsigned length-prefixed pk+ck+flag. Add an
   HMAC with a per-server key (or bind the cursor to the originating query/prepared
