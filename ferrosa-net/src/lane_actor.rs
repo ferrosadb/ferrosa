@@ -94,15 +94,21 @@ pub fn lane_pending_stream_capacity() -> usize {
 /// Commands sent to a lane actor via [`LaneHandle`].
 pub(crate) enum LaneCommand {
     /// Request/response RPC: send a message and wait for a reply.
+    ///
+    /// `timeout` is the caller's whole budget, measured from `enqueued_at`
+    /// (when the caller asked), not from dispatch: time spent waiting for the
+    /// lane counts against it (outage 2026-10-10, D2).
     Send {
         msg: Message,
         timeout: Duration,
+        enqueued_at: tokio::time::Instant,
         reply: oneshot::Sender<Result<Message>>,
     },
     /// Fire-and-forget: send a message with no response expected.
     Fire {
         msg: Message,
         timeout: Duration,
+        enqueued_at: tokio::time::Instant,
         reply: oneshot::Sender<Result<()>>,
     },
     SendComplete {
@@ -144,14 +150,49 @@ enum PendingLaneCommand {
         msg: Message,
         timeout: Duration,
         reply: oneshot::Sender<Result<Message>>,
-        queued_at: Instant,
+        enqueued_at: tokio::time::Instant,
     },
     Fire {
         msg: Message,
         timeout: Duration,
         reply: oneshot::Sender<Result<()>>,
-        queued_at: Instant,
+        enqueued_at: tokio::time::Instant,
     },
+}
+
+/// What to do with a queued request when a stream slot is free for it.
+enum QueuedVerdict {
+    /// Send it with this much of its budget left.
+    Dispatch(Duration),
+    /// The caller dropped its reply receiver: nobody is waiting.
+    Abandoned,
+    /// Its whole budget was spent queued.
+    Expired { queued: Duration },
+}
+
+/// Decide a queued request's fate. A request whose caller gave up is never
+/// written to the peer, and one whose budget ran out while queued is answered
+/// `Timeout` without being sent (D2): delivering either only adds load to a
+/// peer that is already the bottleneck.
+fn queued_verdict(
+    reply_closed: bool,
+    timeout: Duration,
+    enqueued_at: tokio::time::Instant,
+) -> QueuedVerdict {
+    if reply_closed {
+        return QueuedVerdict::Abandoned;
+    }
+    let queued = enqueued_at.elapsed();
+    match timeout.checked_sub(queued) {
+        Some(remaining) if !remaining.is_zero() => QueuedVerdict::Dispatch(remaining),
+        _ => QueuedVerdict::Expired { queued },
+    }
+}
+
+fn expired_in_queue_error(lane: Lane, timeout: Duration, queued: Duration) -> NetError {
+    NetError::Timeout(format!(
+        "{lane:?} lane request spent {queued:?} of its {timeout:?} budget queued; not sent"
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +340,8 @@ impl LaneHandle {
     ) -> Result<Message> {
         let timeout = timeout_override.unwrap_or(self.default_timeout);
         let (reply_tx, reply_rx) = oneshot::channel();
+        // The budget starts now, before any wait for the lane (D2).
+        let enqueued_at = tokio::time::Instant::now();
 
         // Reserve a slot in the channel — cancel-safe because dropping the
         // permit before calling `permit.send()` simply releases the slot.
@@ -318,6 +361,7 @@ impl LaneHandle {
         permit.send(LaneCommand::Send {
             msg,
             timeout,
+            enqueued_at,
             reply: reply_tx,
         });
 
@@ -334,6 +378,7 @@ impl LaneHandle {
     ) -> Result<()> {
         let timeout = timeout_override.unwrap_or(self.default_timeout);
         let (reply_tx, reply_rx) = oneshot::channel();
+        let enqueued_at = tokio::time::Instant::now();
 
         let started = Instant::now();
         let permit = self
@@ -351,6 +396,7 @@ impl LaneHandle {
         permit.send(LaneCommand::Fire {
             msg,
             timeout,
+            enqueued_at,
             reply: reply_tx,
         });
 
@@ -683,6 +729,7 @@ async fn lane_actor_loop(
             LaneCommand::Send {
                 msg,
                 timeout,
+                enqueued_at,
                 reply,
             } => {
                 if pending_streams.len() >= pending_stream_capacity {
@@ -699,7 +746,7 @@ async fn lane_actor_loop(
                         msg,
                         timeout,
                         reply,
-                        queued_at: Instant::now(),
+                        enqueued_at,
                     },
                 );
                 dispatch_retry_scheduled = dispatch_stream_window(
@@ -715,6 +762,7 @@ async fn lane_actor_loop(
             LaneCommand::Fire {
                 msg,
                 timeout,
+                enqueued_at,
                 reply,
             } => {
                 if pending_streams.len() >= pending_stream_capacity {
@@ -731,7 +779,7 @@ async fn lane_actor_loop(
                         msg,
                         timeout,
                         reply,
-                        queued_at: Instant::now(),
+                        enqueued_at,
                     },
                 );
                 dispatch_retry_scheduled = dispatch_stream_window(
@@ -854,7 +902,7 @@ async fn lane_actor_loop(
                         attempt: 0,
                         exhaustion_count: 0,
                     };
-                    fail_pending_streams_reconnecting(&mut pending_streams);
+                    fail_pending_streams_reconnecting(lane, &mut pending_streams);
                 }
             }
             LaneCommand::MarkFailed { exhaustion_count } => {
@@ -990,7 +1038,7 @@ fn dispatch_stream_window(
     let client = match state {
         LaneState::Connected(c) => c.clone(),
         LaneState::Reconnecting { .. } | LaneState::Dormant => {
-            fail_pending_streams_reconnecting(pending_streams);
+            fail_pending_streams_reconnecting(lane, pending_streams);
             metrics::observe_lane_pending_streams(lane, pending_streams.len());
             return false;
         }
@@ -1007,15 +1055,33 @@ fn dispatch_stream_window(
                 msg,
                 timeout,
                 reply,
-                queued_at,
+                enqueued_at,
             } => {
-                metrics::record_lane_stream_wait(lane, queued_at.elapsed(), stream_limit);
+                let remaining = match queued_verdict(reply.is_closed(), timeout, enqueued_at) {
+                    QueuedVerdict::Dispatch(remaining) => remaining,
+                    QueuedVerdict::Abandoned => {
+                        metrics::record_lane_abandoned_unsent(lane);
+                        tracing::debug!(?lane, peer = %ctx.peer_host, "queued request abandoned by its caller; not sent");
+                        continue;
+                    }
+                    QueuedVerdict::Expired { queued } => {
+                        metrics::record_lane_expired_in_queue(lane);
+                        metrics::record_rpc_timeout(lane);
+                        // The caller is still waiting (checked above); if it
+                        // stops in this instant there is nobody left to tell.
+                        let _ = reply.send(Err(expired_in_queue_error(lane, timeout, queued)));
+                        continue;
+                    }
+                };
+                metrics::record_lane_stream_wait(lane, enqueued_at.elapsed(), stream_limit);
                 if !metrics::try_start_rpc(lane, ctx.config.data_lane_max_in_flight) {
+                    // Requeued with its original `enqueued_at`: the wait for
+                    // the process-wide cap also counts against its budget.
                     pending_streams.push_front(PendingLaneCommand::Send {
                         msg,
                         timeout,
                         reply,
-                        queued_at,
+                        enqueued_at,
                     });
                     metrics::observe_lane_pending_streams(lane, pending_streams.len());
                     if !retry_already_scheduled {
@@ -1029,7 +1095,7 @@ fn dispatch_stream_window(
                 let client = client.clone();
                 let complete_tx = ctx.handle.tx.clone();
                 ctx.task_pool.spawn(async move {
-                    let result = client.send_with_timeout(msg, lane, timeout).await;
+                    let result = client.send_with_timeout(msg, lane, remaining).await;
                     if matches!(result, Err(NetError::Timeout(_))) {
                         metrics::record_rpc_timeout(lane);
                     }
@@ -1043,15 +1109,29 @@ fn dispatch_stream_window(
                 msg,
                 timeout,
                 reply,
-                queued_at,
+                enqueued_at,
             } => {
-                metrics::record_lane_stream_wait(lane, queued_at.elapsed(), stream_limit);
+                let remaining = match queued_verdict(reply.is_closed(), timeout, enqueued_at) {
+                    QueuedVerdict::Dispatch(remaining) => remaining,
+                    QueuedVerdict::Abandoned => {
+                        metrics::record_lane_abandoned_unsent(lane);
+                        tracing::debug!(?lane, peer = %ctx.peer_host, "queued fire abandoned by its caller; not sent");
+                        continue;
+                    }
+                    QueuedVerdict::Expired { queued } => {
+                        metrics::record_lane_expired_in_queue(lane);
+                        metrics::record_rpc_timeout(lane);
+                        let _ = reply.send(Err(expired_in_queue_error(lane, timeout, queued)));
+                        continue;
+                    }
+                };
+                metrics::record_lane_stream_wait(lane, enqueued_at.elapsed(), stream_limit);
                 if !metrics::try_start_rpc(lane, ctx.config.data_lane_max_in_flight) {
                     pending_streams.push_front(PendingLaneCommand::Fire {
                         msg,
                         timeout,
                         reply,
-                        queued_at,
+                        enqueued_at,
                     });
                     metrics::observe_lane_pending_streams(lane, pending_streams.len());
                     if !retry_already_scheduled {
@@ -1065,7 +1145,8 @@ fn dispatch_stream_window(
                 let client = client.clone();
                 let complete_tx = ctx.handle.tx.clone();
                 ctx.task_pool.spawn(async move {
-                    let result = match tokio::time::timeout(timeout, client.fire(msg, lane)).await {
+                    let result = match tokio::time::timeout(remaining, client.fire(msg, lane)).await
+                    {
                         Ok(Ok(())) => Ok(()),
                         Ok(Err(e)) => Err(e),
                         Err(_elapsed) => {
@@ -1104,9 +1185,20 @@ fn schedule_dispatch_retry(ctx: &ActorReconnectContext) {
     });
 }
 
-fn fail_pending_streams_reconnecting(pending_streams: &mut VecDeque<PendingLaneCommand>) {
+fn fail_pending_streams_reconnecting(
+    lane: Lane,
+    pending_streams: &mut VecDeque<PendingLaneCommand>,
+) {
     while let Some(pending) = pending_streams.pop_front() {
+        // Count requests nobody is waiting for, so the abandoned-unsent metric
+        // covers every path that discards queued work, not only dispatch.
         match pending {
+            PendingLaneCommand::Send { reply, .. } if reply.is_closed() => {
+                metrics::record_lane_abandoned_unsent(lane);
+            }
+            PendingLaneCommand::Fire { reply, .. } if reply.is_closed() => {
+                metrics::record_lane_abandoned_unsent(lane);
+            }
             PendingLaneCommand::Send { reply, .. } => {
                 let _ = reply.send(Err(NetError::Reconnecting));
             }
