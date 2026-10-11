@@ -44,6 +44,43 @@ fly ssh console -a maas-loadtest-pgrunner -C "/usr/local/bin/pg-runner.sh probe 
 Items 2 and 3 are the real ones: pgbench creates PK-less tables and adds the primary key
 afterwards, so this is a genuine semantic difference from PostgreSQL, not parser surface.
 
+### Live evidence (2026-10-11): the UPDATE gate is what the bench actually hits
+
+With the lane fix deployed (`pgwire-a4ef88be`), `pgbench -i --scale 10 --foreign-keys` now
+completes (`rc=0`, 46 s, PKs and FKs created) and the census reads back exactly
+`1000000|100|10`. The bench still cannot run a single transaction:
+
+```
+$ pg-runner.sh raw f3 -n -c 1 -t 1
+pgbench: error: client 0 script 0 aborted in command 5 query 0:
+  ERROR:  UPDATE WHERE supports only key columns; "aid" is not a key
+number of transactions actually processed: 0/1
+```
+
+Command 5 is `UPDATE pgbench_accounts SET abalance = abalance + :delta WHERE aid = :aid`.
+The rows ARE there and `aid` IS the declared primary key — but the gate at
+`ferrosa-postgres/src/query.rs:3225` (and the twin for DELETE at `:3652`) admits only a
+column that is a **storage key**. On a table whose PK arrived by `ALTER … ADD PRIMARY KEY`,
+that is the synthetic `_sys_ck_`, never `aid`. So items 2/3 above are not just a CREATE-time
+semantic gap: they are what makes the UPDATE gate unsatisfiable for the exact statement
+tcpb issues, and therefore what blocks every tps comparison.
+
+Consequence for the acceptance test: the probe's step 2 (`scan of public.fprobe`) also still
+fails, and no tps number exists yet. **The gate is not to be widened** — accepting a
+non-key WHERE without a path that can actually find those rows would trade a loud `0A000`
+for a silent full-table rewrite. The correct fix is the item's decided design: a secondary
+index (or an equivalent find-rows-by-declared-PK path) so `WHERE aid = ?` is answerable.
+
+This is tracked as Forge **t_c83ed1f2** (priority 60). Its FIRST STEP is an `#[ignore]`d red at
+the real entry point — drive the UPDATE through the PG statement path over a table whose PK
+arrived by ALTER, asserting the row's VALUE changes — so the gate stays green and the finding
+survives as the specification of "fixed". **That red is not written yet**, and until it is, this
+is "found and tracked", not "held down by a test".
+
+The comparison this blocks is tracked as Forge **t_4b5e0fce** (child of t_c83ed1f2). The
+scale-100 superlinearity is tracked separately as **t_6fa292c5**, and the inert window knob as
+**t_2a8ab545**.
+
 ## Item 8 — multi-row INSERT (DONE)
 
 **Implemented: multi-row INSERT parses AND executes every row, atomically.**
@@ -200,7 +237,12 @@ Not yet decided, and needed before building: whether `SELECT *` should ever incl
 ## Also staged on #544 (not pgwire surface, but required to get through the gate)
 
 - zero-byte SSTable components dropped on the receiver (Rows.db corruption);
-- half-open lane never reconnects → probe-first detection bounded by a failure window;
+- half-open lane never reconnects → probe-first detection. **The failure WINDOW was
+  REMOVED 2026-10-11** (`45374bb9`, `a4ef88be`): an elapsed-time reset cleared the failure
+  run between uses, so a half-open lane whose traffic is sparse (a Raft heartbeat every few
+  minutes) never reached the probe — the live 20-minute `timeout: Raft lane timeout` loop.
+  A run is now cleared ONLY by a successful round trip. See
+  `ferrosa-net/specs/in-process/bug-lane-half-open-never-reconnects.md`;
 - the coordinator's local Apply bypassed the abandon (opaque 58000 → retryable 40001);
 - a dependency this replica has no live state for must not park its waiter — the cure for
   the ~30 % abandonment.
@@ -208,8 +250,11 @@ Not yet decided, and needed before building: whether `SELECT *` should ever incl
 ## Operator tunables
 
 `FERROSA_ACCORD_TXN_TIMEOUT_SECS` (10) · `FERROSA_ACCORD_BARRIER_TIMEOUT_SECS` (5) ·
-`FERROSA_NET_LANE_FAILURE_THRESHOLD` (3) · `FERROSA_NET_LANE_FAILURE_WINDOW_MS` (30000) ·
-`FERROSA_NET_LANE_PROBE_TIMEOUT_MS` (2000)
+`FERROSA_NET_LANE_FAILURE_THRESHOLD` (3) · `FERROSA_NET_LANE_PROBE_TIMEOUT_MS` (2000)
+
+`FERROSA_NET_LANE_FAILURE_WINDOW_MS` is **no longer consulted** (removed 2026-10-11 with the
+window itself). It is still wired but inert; removing the constant, its env var, and the
+ignored second parameter of `LaneHealth::new` is a tracked follow-up.
 
 ## TRUNCATE semantics to document (operator directive)
 
