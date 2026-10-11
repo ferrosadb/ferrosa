@@ -57,6 +57,28 @@ pub trait AccordTransport: Send + Sync {
     async fn supports_accord_apply_region_compressed(&self, _host_id: uuid::Uuid) -> bool {
         false
     }
+
+    /// Send `msg` to `host_id` on `lane` with an EXPLICIT response timeout, awaiting the
+    /// peer's reply.
+    ///
+    /// The timeout is a parameter so a caller can bound a phase by its OWN configured
+    /// bound instead of the lane's hard-coded default. The Apply fan-out passes the
+    /// operator-tunable transaction bound here, so `FERROSA_ACCORD_TXN_TIMEOUT_SECS`
+    /// governs the very bound the abandon message names — otherwise the knob and the
+    /// message both claim to govern a wait the fixed [`Lane::Data`] timeout actually ends.
+    ///
+    /// Defaults to [`Self::send`] (the lane's default timeout) so a transport that cannot
+    /// override a timeout behaves exactly as before.
+    async fn send_with_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+        timeout: std::time::Duration,
+    ) -> ferrosa_net::error::Result<Message> {
+        let _ = timeout;
+        self.send(host_id, msg, lane).await
+    }
 }
 
 #[async_trait]
@@ -87,5 +109,16 @@ impl AccordTransport for PeerManager {
         self.peer_capabilities(host_id).await.is_some_and(|caps| {
             caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED != 0
         })
+    }
+
+    async fn send_with_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+        timeout: std::time::Duration,
+    ) -> ferrosa_net::error::Result<Message> {
+        // Forward to the inherent method (this trait impl only adds the dyn seam).
+        PeerManager::send_with_timeout(self, host_id, msg, lane, timeout).await
     }
 }

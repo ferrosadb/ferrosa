@@ -314,27 +314,39 @@ pub(crate) async fn await_txn_applied_within(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let observed = on_state_machine(state, move |sm| {
-            sm.get_state(&txn_id).map(|txn| {
+            // Read the applied-and-pruned tombstone in the SAME critical section as the
+            // live state: a prune landing between two separate reads would otherwise drop
+            // a durably-applied txn on the floor and refuse its ack.
+            let applied_pruned = sm.was_applied_and_pruned(&txn_id);
+            let live = sm.get_state(&txn_id).map(|txn| {
                 (
                     txn.phase,
                     txn.deps.len(),
                     txn.result.as_ref().map_or(0, Vec::len),
                     sm.applied_notify(),
                 )
-            })
+            });
+            (applied_pruned, live)
         })
         .await;
-        let (phase, dependency_count, result_bytes, notify) = match observed {
-            Some(Some(txn)) => txn,
-            Some(None) => {
+        let (applied_pruned, live) = match observed {
+            Some(observed) => observed,
+            // Cancelled at shutdown (already logged): refuse the ack.
+            None => return false,
+        };
+        let (phase, dependency_count, result_bytes, notify) = match live {
+            Some(txn) => txn,
+            // This replica durably applied the txn and then pruned it. The apply is still
+            // true — the missing `TxnState` is bookkeeping, not a reason to refuse work
+            // this replica already did. Ack it.
+            None if applied_pruned => return true,
+            None => {
                 tracing::error!(
                     txn_id = ?txn_id,
                     "accord: Apply target is absent from local state — refusing ApplyOK"
                 );
                 return false;
             }
-            // Cancelled at shutdown (already logged): refuse the ack.
-            None => return false,
         };
         if phase == TxnPhase::Applied {
             return true;
@@ -821,6 +833,60 @@ mod tests {
         assert!(
             await_txn_applied_within(&state, txn_id, std::time::Duration::from_millis(50)).await,
             "an Applied transaction must be reported as applied"
+        );
+    }
+
+    /// RED-FIRST: a durably-Applied transaction that was then PRUNED must still ack.
+    ///
+    /// Observed live: a follower applied at `00:50:17.63`, `maintenance: pruned applied
+    /// Accord transactions pruned=4` at `00:50:18.95`, then `Apply target is absent from
+    /// local state — refusing ApplyOK` at `00:50:18.97`. `prune_applied` drops the volatile
+    /// `TxnState` and leaves only a tombstone, so the ack path re-looked-up `get_state`,
+    /// found `None`, and a replica REFUSED TO ACK a transaction it had correctly and
+    /// durably applied. Before the fix this test is RED: the wait returns `false`.
+    #[tokio::test]
+    async fn await_txn_applied_survives_prune_applied() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+
+        let txn_id = TxnId::new(1, ts(1000));
+        commit(&state, txn_id, 1000, 1001, vec![]);
+        // Durable apply: the state machine persists BEFORE it marks the txn Applied.
+        state.lock().handle_apply(txn_id, b"write".to_vec());
+        assert_eq!(
+            state.lock().get_state(&txn_id).map(|s| s.phase),
+            Some(TxnPhase::Applied)
+        );
+
+        // The maintenance tick forgets the applied txn; only the tombstone remains.
+        let pruned = state.lock().prune_applied();
+        assert!(
+            pruned > 0,
+            "precondition: prune must have removed the applied txn"
+        );
+        assert!(
+            state.lock().get_state(&txn_id).is_none(),
+            "precondition: only the applied tombstone remains"
+        );
+
+        // The retried Apply must still be ACKed.
+        assert!(
+            await_txn_applied_within(&state, txn_id, std::time::Duration::from_millis(50)).await,
+            "a transaction this replica durably applied must still ack after prune_applied"
+        );
+    }
+
+    /// NEGATIVE CONTROL for the prune fix: it must not turn the ack gate into an
+    /// always-ack. A transaction this replica NEVER registered (never applied) must
+    /// still be refused.
+    #[tokio::test]
+    async fn await_txn_applied_still_refuses_a_never_registered_txn() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let never = TxnId::new(9, ts(9999));
+        assert!(
+            !await_txn_applied_within(&state, never, std::time::Duration::from_millis(30)).await,
+            "an id this replica never applied must still be refused"
         );
     }
 

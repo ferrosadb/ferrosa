@@ -1152,8 +1152,10 @@ impl AccordStateMachine {
             self.committed_txns.remove(id);
             self.dep_waiters.remove(id);
             // Forgetting the state must not forget the decision: a PreAccept
-            // delayed past this prune would otherwise register it again (CL-36).
-            self.finalized.record(*id);
+            // delayed past this prune would otherwise register it again (CL-36). The
+            // tombstone records that this txn was durably APPLIED, not merely decided, so
+            // a retried Apply can still be acked from it (see `was_applied_and_pruned`).
+            self.finalized.record_applied(*id);
         }
 
         // Also GC the conflict index for applied transactions.
@@ -1204,6 +1206,16 @@ impl AccordStateMachine {
     /// Number of exact decided-txn tombstones held.
     pub fn finalized_tombstones(&self) -> usize {
         self.finalized.len()
+    }
+
+    /// Whether `txn_id` was durably applied by this replica and then pruned.
+    ///
+    /// `prune_applied` removes the volatile `TxnState`, so `get_state` returns `None` for
+    /// a transaction this replica has already applied. The Apply-ack path must not read
+    /// that `None` as "never applied" — the durable apply is still true, its record lives
+    /// in the applied tombstone, and a replica must not refuse to ack work it already did.
+    pub fn was_applied_and_pruned(&self, txn_id: &TxnId) -> bool {
+        self.finalized.was_applied(txn_id)
     }
 
     /// Number of transactions currently tracked.

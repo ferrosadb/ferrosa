@@ -2742,13 +2742,14 @@ impl AccordCoordinatorDriver {
                 let apply_bytes = self.apply_payload_bytes()?;
                 let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
                 Ok::<bool, AccordDriverError>(
-                    self.quorum_broadcast(apply_msg, &participant, is_apply_ok)
+                    self.quorum_broadcast_within(apply_msg, &participant, is_apply_ok, bound)
                         .await,
                 )
             } else {
                 // Bound the fan-out: one replica's payload resident at a time,
                 // not every replica's at once (see `apply_fanout_bounded`).
-                self.apply_fanout_bounded(&participant, is_apply_ok).await
+                self.apply_fanout_bounded_within(&participant, is_apply_ok, bound)
+                    .await
             }
         };
         // ------------------------------------------------------------------
@@ -2885,8 +2886,28 @@ impl AccordCoordinatorDriver {
     ) -> bool {
         // Same message to every peer — the degenerate case of the per-peer
         // fan-out (used by PreAccept/Commit/Read and single-key Apply, whose
-        // payload is key-independent or the same for all replicas).
-        self.quorum_broadcast_per_peer(participant, |_| msg.clone(), is_ack)
+        // payload is key-independent or the same for all replicas). The lane's
+        // default timeout bounds the RPC; an APPLY that must be bounded by the
+        // operator-tunable transaction bound uses `quorum_broadcast_within`.
+        self.quorum_broadcast_per_peer(participant, |_| msg.clone(), is_ack, Lane::Data.timeout())
+            .await
+    }
+
+    /// Like [`Self::quorum_broadcast`] but bounds every peer RPC by `timeout` instead of
+    /// the lane's fixed default.
+    ///
+    /// This is what lets `FERROSA_ACCORD_TXN_TIMEOUT_SECS` govern the bound the abandon
+    /// message NAMES: the Apply fan-out's per-peer RPC is bounded by the configured
+    /// transaction bound rather than the hard-coded [`Lane::Data`] constant, so tuning the
+    /// knob really does move the wait that decides an abandon.
+    pub(crate) async fn quorum_broadcast_within(
+        &self,
+        msg: Message,
+        participant: &crate::accord::shard_quorum::ParticipantSet,
+        is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+        timeout: std::time::Duration,
+    ) -> bool {
+        self.quorum_broadcast_per_peer(participant, |_| msg.clone(), is_ack, timeout)
             .await
     }
 
@@ -2915,10 +2936,27 @@ impl AccordCoordinatorDriver {
     /// clone of it is materialized) and handed to each peer by refcount, instead
     /// of copying the write-set, reading each staged payload back from disk and
     /// re-serializing the whole frame once PER PEER.
+    ///
+    /// Retained for the wire-scoping tests only; production calls
+    /// [`Self::apply_fanout_bounded_within`] directly with the configured bound.
+    #[cfg(test)]
     async fn apply_fanout_bounded(
         &self,
         participant: &crate::accord::shard_quorum::ParticipantSet,
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+    ) -> Result<bool, AccordDriverError> {
+        self.apply_fanout_bounded_within(participant, is_ack, Lane::Data.timeout())
+            .await
+    }
+
+    /// [`Self::apply_fanout_bounded`] with an explicit per-peer RPC timeout, so the Apply
+    /// fan-out is bounded by the operator-tunable transaction bound rather than the
+    /// hard-coded [`Lane::Data`] constant.
+    async fn apply_fanout_bounded_within(
+        &self,
+        participant: &crate::accord::shard_quorum::ParticipantSet,
+        is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+        timeout: std::time::Duration,
     ) -> Result<bool, AccordDriverError> {
         use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
         use futures::StreamExt;
@@ -3135,7 +3173,9 @@ impl AccordCoordinatorDriver {
                 let peers_handle = &self.peers;
                 let pushed = std::time::Instant::now();
                 inflight.push(async move {
-                    let result = peers_handle.send(peer_id, msg, Lane::Data).await;
+                    let result = peers_handle
+                        .send_with_timeout(peer_id, msg, Lane::Data, timeout)
+                        .await;
                     (peer_id, result, pushed)
                 });
             }
@@ -3174,6 +3214,7 @@ impl AccordCoordinatorDriver {
         participant: &crate::accord::shard_quorum::ParticipantSet,
         build_msg: impl Fn(uuid::Uuid) -> Message,
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
+        timeout: std::time::Duration,
     ) -> bool {
         use futures::StreamExt;
 
@@ -3192,7 +3233,9 @@ impl AccordCoordinatorDriver {
             let peers = Arc::clone(&self.peers);
             let msg = build_msg(peer_id);
             pending.push(async move {
-                let result = peers.send(peer_id, msg, Lane::Data).await;
+                let result = peers
+                    .send_with_timeout(peer_id, msg, Lane::Data, timeout)
+                    .await;
                 if let Err(error) = &result {
                     tracing::warn!(
                         txn_id = ?txn_id,
@@ -5327,6 +5370,100 @@ mod tests {
     /// coordinator's selection. A peer must NEVER receive an entry outside its shard
     /// scope (a data-placement violation the replica cannot detect — it trusts the
     /// coordinator).
+    /// The coordinator must actually APPLY the shipped compression codec to the Apply
+    /// region it puts on the wire — not merely negotiate it.
+    ///
+    /// The compression tunable once shipped "negotiated but never applied": the capability
+    /// gate passed and the config was non-`none`, yet the region still went out raw. This
+    /// drives the REAL fan-out with peers that advertise every capability and asserts on the
+    /// DECODED frame that (a) the region reports the configured codec and (b) the frame is
+    /// strictly smaller than the raw write-set it replaces.
+    #[tokio::test]
+    async fn region_fanout_actually_applies_the_configured_compression_codec() {
+        use std::sync::Mutex;
+
+        struct CompressionProbe {
+            frames: Mutex<Vec<Bytes>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for CompressionProbe {
+            async fn send(
+                &self,
+                _host: uuid::Uuid,
+                msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                if let Message::AccordApplyV2Region(bytes) = &msg {
+                    self.frames.lock().expect("probe mutex").push(bytes.clone());
+                }
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+            async fn supports_accord_capnp(&self, _host: uuid::Uuid) -> bool {
+                true
+            }
+            async fn supports_accord_apply_region(&self, _host: uuid::Uuid) -> bool {
+                true
+            }
+            async fn supports_accord_apply_region_compressed(&self, _host: uuid::Uuid) -> bool {
+                true
+            }
+        }
+
+        // A write-set well above the 64 KiB compression minimum, with a repetitive body (real
+        // pgbench rows compress; a random body would legitimately fall back to raw).
+        let mutation_a: Vec<u8> = std::iter::repeat_n(b'a', 40_000).collect();
+        let mutation_b: Vec<u8> = std::iter::repeat_n(b'b', 40_000).collect();
+        let raw_region_len = mutation_a.len() + mutation_b.len();
+
+        let a = uuid::Uuid::from_u128(0xA);
+        let b = uuid::Uuid::from_u128(0xB);
+        let c = uuid::Uuid::from_u128(0xC);
+        let probe = Arc::new(CompressionProbe {
+            frames: Mutex::new(Vec::new()),
+        });
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            vec![a, b, c],
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), mutation_a.clone()),
+                (b"key-2".to_vec(), mutation_b.clone()),
+            ],
+        )
+        .with_per_key_replicas(Arc::new(move |_key: &[u8]| vec![a, b, c]));
+        let participant = driver.participant_set();
+
+        let ok = driver
+            .apply_fanout_bounded(&participant, |r| r.is_ok())
+            .await
+            .expect("bounded fan-out runs");
+        assert!(ok, "every replica acked");
+
+        let frames = probe.frames.lock().expect("probe mutex");
+        assert!(!frames.is_empty(), "the region wire must have been used");
+        for frame in frames.iter() {
+            use ferrosa_net::protocol::decode_accord_apply_v2_region;
+            let view = decode_accord_apply_v2_region(frame).expect("region frame decodes");
+            assert_eq!(
+                view.compression(),
+                ferrosa_net::protocol::RegionCodec::Zstd,
+                "the coordinator must APPLY the configured codec, not merely negotiate it"
+            );
+            assert!(
+                frame.len() < raw_region_len,
+                "the compressed frame ({} B) must be smaller than the raw region ({} B): \
+                 the bytes on the wire really shrank",
+                frame.len(),
+                raw_region_len
+            );
+            assert_eq!(view.entry(0).expect("entry"), mutation_a.as_slice());
+            assert_eq!(view.entry(1).expect("entry"), mutation_b.as_slice());
+        }
+    }
+
     #[tokio::test]
     async fn region_fanout_never_sends_a_peer_an_entry_outside_its_shard_scope() {
         use std::sync::Mutex;
@@ -7357,6 +7494,93 @@ mod tests {
         }
     }
 
+    /// The apply fan-out must be bounded by the OPERATOR-TUNABLE transaction bound, not
+    /// the hard-coded [`Lane::Data`] timeout.
+    ///
+    /// This closes the silent fork: `FERROSA_ACCORD_TXN_TIMEOUT_SECS` and the abandon
+    /// message both claimed to govern "the dependency-wait bound", but the fan-out's RPC
+    /// timeout was the fixed `Lane::Data` constant, so tuning the knob could not move the
+    /// wait that decides an abandon — and the message named a bound that never expired.
+    /// The double injects a bound that DIFFERS from `Lane::Data.timeout()`, so the
+    /// assertion cannot pass by the accident of the two defaults being equal; and its
+    /// `send` arm PANICS, so a regression back to the lane default fails loudly.
+    #[tokio::test]
+    async fn apply_fanout_is_bounded_by_the_configured_bound_not_the_lane_default() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingTimeout {
+            seen: Mutex<Vec<std::time::Duration>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for RecordingTimeout {
+            async fn send(
+                &self,
+                _host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                panic!(
+                    "the apply fan-out must send WITH an explicit timeout, never the lane default"
+                );
+            }
+            async fn send_with_timeout(
+                &self,
+                _host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+                timeout: std::time::Duration,
+            ) -> ferrosa_net::error::Result<Message> {
+                self.seen.lock().expect("record mutex").push(timeout);
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+        }
+
+        let a = uuid::Uuid::from_u128(0xA);
+        let b = uuid::Uuid::from_u128(0xB);
+        let c = uuid::Uuid::from_u128(0xC);
+        let recorder = Arc::new(RecordingTimeout::default());
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            vec![a, b, c],
+            recorder.clone(),
+            false,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), b"mutation-1".to_vec()),
+                (b"key-2".to_vec(), b"mutation-2".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(Arc::new(move |_key: &[u8]| vec![a, b, c]));
+        let participant = driver.participant_set();
+
+        // A bound that CANNOT be confused with the 10 s `Lane::Data` default.
+        let configured = std::time::Duration::from_secs(7);
+        assert_ne!(
+            configured,
+            Lane::Data.timeout(),
+            "the test must use a bound distinct from the lane default, or it proves nothing"
+        );
+        let ok = driver
+            .apply_fanout_bounded_within(&participant, |r| r.is_ok(), configured)
+            .await
+            .expect("bounded fan-out runs");
+        assert!(ok, "every replica acked; the per-shard quorum is reached");
+
+        let seen = recorder.seen.lock().expect("record mutex").clone();
+        assert!(
+            !seen.is_empty(),
+            "the fan-out must have sent to at least one remote peer"
+        );
+        for timeout in &seen {
+            assert_eq!(
+                *timeout, configured,
+                "the apply RPC must be bounded by the configured bound, not Lane::Data.timeout()"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn quorum_broadcast_per_peer_delivers_scoped_message_to_each_replica() {
         let n = six_nodes();
@@ -7383,6 +7607,7 @@ mod tests {
                 &driver.participant_set(),
                 |peer| per_peer.get(&peer).cloned().unwrap(),
                 |r| r.is_ok(),
+                Lane::Data.timeout(),
             )
             .await;
         assert!(reached, "every shard acked → quorum reached");

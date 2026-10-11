@@ -27,9 +27,12 @@
 //!
 //! Two pieces, and a transaction is *decided* if either covers it:
 //!
-//! - **Tombstones**: an ordered set of exact [`TxnId`]s, recorded when a
-//!   no-write finalize lands on an unregistered transaction and when
-//!   `prune_applied` forgets an applied one.
+//! - **Tombstones**: a map from exact [`TxnId`]s to WHY they are remembered —
+//!   [`TombstoneKind::NoWriteFinalized`] when a no-write finalize lands on an
+//!   unregistered transaction, and [`TombstoneKind::Applied`] when `prune_applied`
+//!   forgets one that had reached the durable `Applied` phase. The kind matters: only
+//!   an `Applied` tombstone may answer the Apply-ack path (see
+//!   [`FinalizedTxns::was_applied`]); a no-write finalize must never be read as an apply.
 //! - **A floor**: every `TxnId` at or below it is decided. It rises in three
 //!   ways, and never falls:
 //!   1. **Retention** ([`FINALIZED_RETENTION`], 60 s). `advance_horizon(now)`
@@ -66,7 +69,7 @@
 //! than `60 s - RPC timeout`; a coordinator lagging more has its PreAccepts
 //! refused here, logged as an edge.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use ferrosa_common::accord::{Timestamp, TxnId};
@@ -88,10 +91,21 @@ pub enum DecidedBy {
     Floor,
 }
 
+/// Why a transaction is individually remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TombstoneKind {
+    /// A no-write finalize landed on a transaction this replica never registered: it is
+    /// decided (its PreAccept must not resurrect it), but it was NEVER applied here.
+    NoWriteFinalized,
+    /// `prune_applied` forgot a transaction that had reached the durable `Applied`
+    /// phase: it is decided AND it was durably applied by this replica.
+    Applied,
+}
+
 /// Bounded record of decided transactions. See the module docs.
 #[derive(Debug)]
 pub struct FinalizedTxns {
-    tombstones: BTreeSet<TxnId>,
+    tombstones: BTreeMap<TxnId, TombstoneKind>,
     floor: Option<Timestamp>,
     capacity: usize,
     /// Edge state for the eviction warning: set when an eviction first pushes
@@ -115,7 +129,7 @@ impl FinalizedTxns {
             "a zero-capacity finalized record forgets every txn at once"
         );
         Self {
-            tombstones: BTreeSet::new(),
+            tombstones: BTreeMap::new(),
             floor: None,
             capacity,
             evicting: false,
@@ -142,8 +156,20 @@ impl FinalizedTxns {
             return Some(DecidedBy::Floor);
         }
         self.tombstones
-            .contains(txn_id)
+            .contains_key(txn_id)
             .then_some(DecidedBy::Tombstone)
+    }
+
+    /// Whether `txn_id` reached the durable `Applied` phase on this replica and was then
+    /// pruned — the only record that may satisfy the Apply-ack path for a pruned txn.
+    ///
+    /// Deliberately NOT satisfied by the floor, and not by a
+    /// [`TombstoneKind::NoWriteFinalized`] entry: both mean "decided, refuse a late
+    /// PreAccept", which includes ids this replica never registered, let alone applied.
+    /// Answering `Applied` for those would let a replica ACK a write-set it never wrote,
+    /// breaking the apply-quorum's durable-ack guarantee.
+    pub fn was_applied(&self, txn_id: &TxnId) -> bool {
+        matches!(self.tombstones.get(txn_id), Some(TombstoneKind::Applied))
     }
 
     /// Remember that `txn_id` is decided. Ids already at or below the floor
@@ -153,9 +179,33 @@ impl FinalizedTxns {
         if self.decided(&txn_id) == Some(DecidedBy::Floor) {
             return;
         }
-        self.tombstones.insert(txn_id);
+        // Never downgrade an applied tombstone: `Applied` is the stronger fact and the ack
+        // path reads it. A no-write finalize for an id we already applied is a protocol
+        // inconsistency, not a reason to forget the apply.
+        self.tombstones
+            .entry(txn_id)
+            .or_insert(TombstoneKind::NoWriteFinalized);
+        self.enforce_capacity();
+    }
+
+    /// Remember that `txn_id` reached the durable `Applied` phase here and was pruned.
+    ///
+    /// Stronger than [`Self::record`]: it also satisfies [`Self::was_applied`], so a
+    /// replica that durably applied a transaction and then pruned it can still answer the
+    /// coordinator's retried Apply instead of refusing to ack work it already did.
+    pub fn record_applied(&mut self, txn_id: TxnId) {
+        if self.decided(&txn_id) == Some(DecidedBy::Floor) {
+            return;
+        }
+        self.tombstones.insert(txn_id, TombstoneKind::Applied);
+        self.enforce_capacity();
+    }
+
+    /// Evict the oldest tombstones into the floor until the cap holds. Shared by
+    /// [`Self::record`] and [`Self::record_applied`] so both stay bounded under load.
+    fn enforce_capacity(&mut self) {
         while self.tombstones.len() > self.capacity {
-            let Some(oldest) = self.tombstones.pop_first() else {
+            let Some((oldest, _)) = self.tombstones.pop_first() else {
                 break;
             };
             self.raise_floor(oldest.0);
@@ -188,7 +238,7 @@ impl FinalizedTxns {
         let floor = self.floor.unwrap_or(horizon);
         let before = self.tombstones.len();
         // Keep only ids strictly above the floor; everything else is covered.
-        self.tombstones.retain(|id| id.0 > floor);
+        self.tombstones.retain(|id, _| id.0 > floor);
         if self.evicting {
             tracing::info!(
                 evicted = self.evicted_since_horizon,
@@ -289,5 +339,55 @@ mod tests {
         let mut f = FinalizedTxns::new(8).with_restart_floor(Timestamp::synthetic(1000));
         f.record(id(1, 10));
         assert!(f.is_empty());
+    }
+
+    /// The prune race: a txn that reached `Applied` and was pruned must still answer
+    /// `was_applied`, while a no-write finalize (never applied) must not.
+    #[test]
+    fn an_applied_tombstone_answers_was_applied_and_a_no_write_one_does_not() {
+        let mut f = FinalizedTxns::new(1024);
+        let applied = id(2, secs(100));
+        let finalized = id(2, secs(110));
+        f.record_applied(applied);
+        f.record(finalized);
+        assert!(
+            f.was_applied(&applied),
+            "applied-then-pruned must be ackable"
+        );
+        assert!(
+            !f.was_applied(&finalized),
+            "a no-write finalize was NEVER applied and must not be ackable"
+        );
+        // Both are still DECIDED: the late-PreAccept refusal (CL-36) must survive.
+        assert_eq!(f.decided(&applied), Some(DecidedBy::Tombstone));
+        assert_eq!(f.decided(&finalized), Some(DecidedBy::Tombstone));
+    }
+
+    /// SAFETY NEGATIVE CONTROL: the floor must never be read as `Applied`. The floor
+    /// covers ids this replica never registered, far less applied; answering an ack from
+    /// it would let a replica vouch for a write it never wrote.
+    #[test]
+    fn the_floor_never_answers_was_applied() {
+        let f = FinalizedTxns::new(8).with_restart_floor(Timestamp::synthetic(secs(500)));
+        let id_below = id(1, secs(499));
+        assert_eq!(f.decided(&id_below), Some(DecidedBy::Floor));
+        assert!(
+            !f.was_applied(&id_below),
+            "an id merely at or below the floor is decided, NOT applied"
+        );
+    }
+
+    /// A no-write finalize for an id already recorded `Applied` must not downgrade it —
+    /// the apply is the stronger, ack-bearing fact.
+    #[test]
+    fn a_no_write_finalize_never_downgrades_an_applied_tombstone() {
+        let mut f = FinalizedTxns::new(1024);
+        let t = id(5, secs(200));
+        f.record_applied(t);
+        f.record(t);
+        assert!(
+            f.was_applied(&t),
+            "recording a no-write finalize for an applied id must not forget the apply"
+        );
     }
 }
