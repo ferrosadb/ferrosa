@@ -334,6 +334,39 @@ taken through the commit path instead.
 Red held out as `rt2-disjoint-keys.patch` in the scratch dir: a red inside a module cannot park its
 file, so the patch is the breadcrumb. It lands with its green.
 
+### CORRECTION: RT-3 IS reproducing — the old probe mislabelled it (2026-10-11)
+
+I previously reported "RT-3 did not reproduce on the settled build". **That was wrong, and the cause
+was the instrument.** The old probe printed that same outcome as "REPRODUCED" in a branch whose logic
+was inverted, so the run read as a false conflict rather than as a lost value. With the corrected
+judge (which decides each side by whether it was refused), the same shape reports precisely:
+
+    V1 read-modify-write:  A refused 40001; B SUCCEEDED and its value is EMPTY
+        after: aid=1 v='777'   aid=2 v='<empty>'
+        FAIL V1: aid=2 got '<empty>' want '202' (refused A=1 B=0)
+        NOTE: one side refused 40001 on DISJOINT keys - RT-2 false conflict
+    V2 blind write:        A refused 40001; B SUCCEEDED and its value is KEPT
+        after: aid=1 v='777'   aid=2 v='222'
+        PASS V2: no value lost (refused A=1 B=0)
+
+**So RT-3 is ALIVE**: a transaction reported success and its committed cell reads back EMPTY. And the
+single-variable isolation still holds — **V1 (with the read) loses the value, V2 (blind, no read of v)
+keeps it** — so the loss tracks the READ inside the transaction, as originally isolated.
+
+It is INTERMITTENT, not fixed: the preceding settled run of the same case showed `aid=2 v='200'`
+(the value simply unchanged). One clean run was never a green here, and the earlier report that
+treated it as one came from reading a mislabelled probe.
+
+**Mechanism now consistent with the code**: a successful transaction whose PostgreSQL metadata never
+materialised is SILENTLY skipped by the apply (`ferrosa-cluster/src/accord/apply.rs:1300`,
+`if !postgres_mvcc_metadata.is_empty()`), so no PG-visible history is written and the read comes back
+empty rather than with the value. That is the "never materialise the write-set" seam, and it is the
+leading hypothesis — stated as a hypothesis, not as a measurement.
+
+**Standing correction:** the corrected probe is the durable instrument and belongs in the skill's
+`scripts/` (`scripts/txn-iso-probe.sh` currently carries the mislabelled V1/V2). Until that lands, any
+run of the old probe's V1/V2 lines is not evidence in either direction.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
