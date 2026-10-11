@@ -247,6 +247,26 @@ test on the PR branch breaks the branch's gate. It gets committed together with 
 Next: the GREEN. Two named gaps to close — (1) permit a read-modify-write assignment inside a
 transaction, (2) resolve the bound name to the value this transaction read so the write carries it.
 
+### CQL green LANDED; PG is a DIFFERENT mechanism (2026-10-11)
+
+**CQL is green.** `a transaction resolves the read it declared` (3a49ac1d): the block's LET reads run
+up front, and each `Add`/`Sub` naming a binding is rewritten into the concrete assignment it means, so
+the write carries the value this transaction read. The old refusal is gone and the block reaches
+COMMIT. Gate: fmt/clippy clean, 1247 passed / 0 failed.
+
+**PG is NOT the same defect, and this matters for the fix.** The live probe showed the PostgreSQL
+front end COMPUTES a read-modify-write correctly (I-A PASS, v=105) - its value is right. What it loses
+is the APPLICATION: the committed cell comes back NULL for the survivor of a concurrent pair. So PG
+does not have CQL's gap (never computing the read) at all; it has the write-set materialization seam
+(`fix(accord): never materialize the PostgreSQL transaction write-set`, b839ef04).
+
+Consequences:
+1. Porting the CQL rewrite to PG would fix nothing: PG already resolves the read.
+2. The PG half is unverifiable locally by construction. It was NOT reproduced in-process (3/3 green) nor
+   at three real processes (1/1 green); the only judge is the live probe (txn-iso2-probe.sh V1).
+3. So "green on both front ends" for PG means: rebuild with the write-set fix, deploy, and re-run the
+   live isolation probe. Anything short of that is a claim without evidence.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
