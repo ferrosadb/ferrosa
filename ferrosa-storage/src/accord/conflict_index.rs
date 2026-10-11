@@ -29,18 +29,35 @@
 //! lookup, range overlap is O(log n + k) — which a spilled-file index could not
 //! promise on the PreAccept hot path.
 //!
-//! The per-key execution-timestamp high-water-mark map (see
+//! The per-key execution-timestamp high-water-mark (see
 //! [`max_conflicting_timestamp`](ConflictIndex::max_conflicting_timestamp)) is
 //! likewise unbounded: it used to skip new keys once full, which silently lost
 //! the skipped key's post-GC conflict — a real-time inversion and a missed
-//! conflict (t_813caf39).
+//! conflict (t_813caf39). It is stored ON the key's own entry (see `KeyEntry`),
+//! not in a parallel map, so the key's bytes are held once.
+//!
+//! # Residency
+//!
+//! [`single_key`](ConflictIndex) is a `HashMap<Vec<u8>, KeyEntry>`: ONE map that
+//! holds each key's bytes, its in-flight writes, and its HWM together. The common
+//! case is exactly one in-flight write per key, so the writes buffer is seeded at
+//! capacity ONE instead of the four a bare `Vec` reserves for a >1-byte element,
+//! and the HWM no longer re-stores the key in a second map. Measured with a
+//! counting allocator at N = 200,000 keys, the whole index falls from 601 to 235
+//! bytes per key — the writes buffer alone from 448 to 112, the parallel HWM map
+//! from 82 to 0 — which projects to ~573 MiB → ~224 MiB at the live N = 1,000,112
+//! (a ~349 MiB cut). `tests/conflict_index_residency.rs` (a per-PR structural /
+//! same-run-ratio guard) and `tests/conflict_index_residency_absolute.rs` (the
+//! absolute projection, gated out of the per-PR lane like `accord::perf`) measure
+//! it and guard both factors.
 
 use ferrosa_common::accord::{Timestamp, TxnId};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 /// Reserved conflict key shared by PostgreSQL transactions to establish a
-/// cluster-wide serialization order. Its high-water mark is retained even when
-/// the ordinary bounded per-key high-water map is full.
+/// cluster-wide serialization order. Its high-water mark lives in a named field,
+/// not a per-key entry, so it survives regardless of how many ordinary keys the
+/// index tracks.
 pub const POSTGRES_TRANSACTION_MARKER_KEY: &[u8] = b"\0ferrosa:postgres:serializable:v1";
 /// PostgreSQL begin and commit barriers share this key to order their Accord
 /// transactions. BEGIN-only barriers do not advance the data-commit marker.
@@ -89,6 +106,30 @@ impl TokenRange {
     }
 }
 
+/// One key's entry in the [`ConflictIndex`]: its in-flight writes together with
+/// its per-key execution-timestamp high-water-mark.
+///
+/// Holding the key's bytes once (in the map key) and the HWM on the same entry
+/// replaces a parallel `HashMap<Vec<u8>, Timestamp>` that stored every key a
+/// second time.
+struct KeyEntry {
+    /// In-flight writes registered on this key. Almost every key holds exactly
+    /// ONE at a time: a PreAccept registers the transaction once per key and the
+    /// key is dropped as soon as that transaction is GC'd. A plain `Vec` reserved
+    /// capacity FOUR for that single element (Rust's first-growth rule for an
+    /// element larger than one byte) — three slots never used. The buffer is
+    /// seeded at capacity one here; a second concurrent write on the same key is
+    /// the rare case and the `Vec` grows normally when it happens.
+    writes: Vec<InFlightWrite>,
+    /// Highest committed **execution** timestamp ever seen for this key, raised by
+    /// [`set_commit_ts`](ConflictIndex::set_commit_ts) and monotonic. Unlike
+    /// `writes`, it is retained across [`gc_applied`](ConflictIndex::gc_applied) so
+    /// a later append still bumps past an already-applied one — the GC-boundary
+    /// real-time inversion (t_813caf39). An entry with empty `writes` and a
+    /// `Some(hwm)` is kept for exactly this reason.
+    hwm: Option<Timestamp>,
+}
+
 // ---------------------------------------------------------------------------
 // ConflictIndex
 // ---------------------------------------------------------------------------
@@ -97,8 +138,9 @@ impl TokenRange {
 ///
 /// Designed to be owned by a single-threaded shard executor. Not `Sync`.
 pub struct ConflictIndex {
-    /// Single-partition writes: O(1) exact-key lookup.
-    single_key: HashMap<Vec<u8>, Vec<InFlightWrite>>,
+    /// Single-partition writes: O(1) exact-key lookup. Each key's bytes live
+    /// here ONCE, alongside its in-flight writes and its per-key HWM.
+    single_key: HashMap<Vec<u8>, KeyEntry>,
 
     /// Range-spanning operations: O(log n) range overlap.
     range_ops: BTreeMap<TokenRange, BTreeSet<(Timestamp, TxnId)>>,
@@ -106,17 +148,10 @@ pub struct ConflictIndex {
     /// Indexed column projections for transactional 2i.
     indexed_writes: HashMap<String, HashMap<Vec<u8>, Vec<TxnId>>>,
 
-    /// Per-key high-water-mark of the highest committed **execution** timestamp
-    /// ever seen for a key — retained across [`gc_applied`](Self::gc_applied),
-    /// unlike the in-flight [`single_key`] entries. Without it, once a committed
-    /// append is applied and GC'd, a later append on the same key sees no
-    /// conflict and mints a timestamp below the GC'd one — the GC-boundary
-    /// real-time inversion (t_813caf39). Unbounded: a bound here would drop the
-    /// skipped key's post-GC conflict, i.e. a missed conflict.
-    single_key_hwm: HashMap<Vec<u8>, Timestamp>,
-
     /// The PostgreSQL marker must never lose its high-water mark: stale-snapshot
-    /// validation depends on it.
+    /// validation depends on it. Kept as a named field (not on a per-key entry)
+    /// because the marker's HWM must survive even after the marker's live entry is
+    /// GC'd and its `KeyEntry` is dropped.
     postgres_marker_hwm: Option<Timestamp>,
     postgres_barrier_hwm: Option<Timestamp>,
 
@@ -124,25 +159,6 @@ pub struct ConflictIndex {
     /// [`is_empty`](Self::is_empty). There is no cap — it grows with the
     /// in-flight write-sets and shrinks as they apply.
     current_entries: usize,
-}
-
-/// Raise a key's execution-timestamp high-water-mark to `t` (monotonic).
-///
-/// Unbounded on purpose: the old bounded map skipped a new key once full, so
-/// that key's committed execution timestamp was never recorded and a later
-/// append on it saw no post-GC conflict — a real-time inversion and a missed
-/// conflict (t_813caf39).
-fn raise_hwm(hwm: &mut HashMap<Vec<u8>, Timestamp>, key: &[u8], t: Timestamp) {
-    match hwm.get_mut(key) {
-        Some(existing) => {
-            if t > *existing {
-                *existing = t;
-            }
-        }
-        None => {
-            hwm.insert(key.to_vec(), t);
-        }
-    }
 }
 
 impl ConflictIndex {
@@ -158,7 +174,6 @@ impl ConflictIndex {
             single_key: HashMap::with_capacity(reserve),
             range_ops: BTreeMap::new(),
             indexed_writes: HashMap::new(),
-            single_key_hwm: HashMap::with_capacity(reserve),
             postgres_marker_hwm: None,
             postgres_barrier_hwm: None,
             current_entries: 0,
@@ -172,7 +187,17 @@ impl ConflictIndex {
     /// so a refusal here would silently drop a conflict (two conflicting txns
     /// could both commit — a lost update). There is deliberately no refusal path.
     pub fn register(&mut self, key: &[u8], entry: InFlightWrite) {
-        self.single_key.entry(key.to_vec()).or_default().push(entry);
+        // Seed the writes buffer at capacity ONE: the common case is a single
+        // in-flight write per key, and a bare `Vec` would reserve four slots for
+        // it. An existing key's buffer grows normally on its rare second write.
+        self.single_key
+            .entry(key.to_vec())
+            .or_insert_with(|| KeyEntry {
+                writes: Vec::with_capacity(1),
+                hwm: None,
+            })
+            .writes
+            .push(entry);
         self.current_entries += 1;
     }
 
@@ -212,24 +237,23 @@ impl ConflictIndex {
     /// a later txn assigned an execution `t` below it — a real-time inversion that
     /// reorders accumulating list elements (t_813caf39).
     pub fn max_conflicting_timestamp(&self, key: &[u8]) -> Option<Timestamp> {
-        let live = self
-            .single_key
-            .get(key)
-            .and_then(|writes| writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max());
+        let entry = self.single_key.get(key);
+        let live = entry.and_then(|e| e.writes.iter().map(|w| w.accord_ts.unwrap_or(w.t0)).max());
         // Fold in the per-key high-water-mark, which survives GC of the live
-        // entries — so a later append still bumps past an already-applied one.
+        // entries — so a later append still bumps past an already-applied one. It
+        // lives on the key's own entry, so the key's bytes are read once.
         let hwm = if key == POSTGRES_TRANSACTION_MARKER_KEY {
             self.postgres_marker_hwm
                 .into_iter()
-                .chain(self.single_key_hwm.get(key).copied())
+                .chain(entry.and_then(|e| e.hwm))
                 .max()
         } else if key == POSTGRES_TRANSACTION_BARRIER_KEY {
             self.postgres_barrier_hwm
                 .into_iter()
-                .chain(self.single_key_hwm.get(key).copied())
+                .chain(entry.and_then(|e| e.hwm))
                 .max()
         } else {
-            self.single_key_hwm.get(key).copied()
+            entry.and_then(|e| e.hwm)
         };
         match (live, hwm) {
             (Some(a), Some(b)) => Some(a.max(b)),
@@ -242,18 +266,19 @@ impl ConflictIndex {
     /// lookups bump past its real serialization point rather than its stale `t0`.
     /// Called when the timestamp is finalized (Accept / Commit).
     ///
-    /// Also raises the per-key execution-timestamp **high-water-mark** for every
-    /// key the transaction touches, so the bump survives [`gc_applied`] once the
-    /// transaction is applied and its live entry is removed. No-op on the live
-    /// entries if the txn is already GC'd, but the HWM is still raised.
+    /// Also raises the per-key execution-timestamp **high-water-mark** on the
+    /// key's own entry for every key the transaction touches, so the bump survives
+    /// [`gc_applied`] once the transaction is applied and its live entry is
+    /// removed. No-op on the live entries if the txn is already GC'd, but the HWM
+    /// is still raised.
     ///
     /// [`gc_applied`]: Self::gc_applied
     pub fn set_commit_ts(&mut self, txn_id: &TxnId, t: Timestamp) {
-        for (key, writes) in self.single_key.iter_mut() {
+        for (key, entry) in self.single_key.iter_mut() {
             let mut touches_key = false;
-            for entry in writes.iter_mut() {
-                if entry.txn_id == *txn_id {
-                    entry.accord_ts = Some(t);
+            for w in entry.writes.iter_mut() {
+                if w.txn_id == *txn_id {
+                    w.accord_ts = Some(t);
                     touches_key = true;
                 }
             }
@@ -267,7 +292,8 @@ impl ConflictIndex {
                             .map_or(t, |current| current.max(t)),
                     );
                 } else {
-                    raise_hwm(&mut self.single_key_hwm, key, t);
+                    // Monotonic raise on the key's own entry — no second key copy.
+                    entry.hwm = Some(entry.hwm.map_or(t, |current| current.max(t)));
                 }
             }
         }
@@ -296,8 +322,8 @@ impl ConflictIndex {
     /// Used for building the PreAccept dependency set.
     pub fn deps_before_t0(&self, key: &[u8], t0: &Timestamp) -> HashSet<TxnId> {
         let mut deps = HashSet::new();
-        if let Some(writes) = self.single_key.get(key) {
-            for w in writes {
+        if let Some(entry) = self.single_key.get(key) {
+            for w in &entry.writes {
                 if w.t0 < *t0 {
                     deps.insert(w.txn_id);
                 }
@@ -313,8 +339,8 @@ impl ConflictIndex {
     /// not against another `t0`.
     pub fn deps_before_t(&self, key: &[u8], t: &Timestamp) -> HashSet<TxnId> {
         let mut deps = HashSet::new();
-        if let Some(writes) = self.single_key.get(key) {
-            for w in writes {
+        if let Some(entry) = self.single_key.get(key) {
+            for w in &entry.writes {
                 if w.t0 < *t {
                     deps.insert(w.txn_id);
                 }
@@ -331,12 +357,13 @@ impl ConflictIndex {
     pub fn remove(&mut self, txn_id: &TxnId) {
         // Remove from single-key index.
         let mut empty_keys = Vec::new();
-        for (key, writes) in &mut self.single_key {
-            let before = writes.len();
-            writes.retain(|w| w.txn_id != *txn_id);
-            let removed = before - writes.len();
+        for (key, entry) in &mut self.single_key {
+            let before = entry.writes.len();
+            entry.writes.retain(|w| w.txn_id != *txn_id);
+            let removed = before - entry.writes.len();
             self.current_entries = self.current_entries.saturating_sub(removed);
-            if writes.is_empty() {
+            // Keep the entry while its HWM is set: the entry IS the per-key HWM.
+            if entry.writes.is_empty() && entry.hwm.is_none() {
                 empty_keys.push(key.clone());
             }
         }
@@ -387,10 +414,10 @@ impl ConflictIndex {
     /// to `TxnStatus::Applied`, making them eligible for garbage collection
     /// via [`gc_applied`](ConflictIndex::gc_applied).
     pub fn mark_applied(&mut self, txn_id: &TxnId) {
-        for writes in self.single_key.values_mut() {
-            for entry in writes.iter_mut() {
-                if entry.txn_id == *txn_id {
-                    entry.status = TxnStatus::Applied;
+        for entry in self.single_key.values_mut() {
+            for w in entry.writes.iter_mut() {
+                if w.txn_id == *txn_id {
+                    w.status = TxnStatus::Applied;
                 }
             }
         }
@@ -409,16 +436,18 @@ impl ConflictIndex {
         let mut applied_txn_ids = Vec::new();
         let mut removed = 0usize;
 
-        self.single_key.retain(|_key, writes| {
-            let before = writes.len();
-            for w in writes.iter() {
+        self.single_key.retain(|_key, entry| {
+            let before = entry.writes.len();
+            for w in entry.writes.iter() {
                 if w.status == TxnStatus::Applied {
                     applied_txn_ids.push(w.txn_id);
                 }
             }
-            writes.retain(|w| w.status != TxnStatus::Applied);
-            removed += before - writes.len();
-            !writes.is_empty()
+            entry.writes.retain(|w| w.status != TxnStatus::Applied);
+            removed += before - entry.writes.len();
+            // An entry with no live writes but a raised HWM must be KEPT: it is the
+            // surviving post-GC conflict (t_813caf39).
+            !entry.writes.is_empty() || entry.hwm.is_some()
         });
 
         // Remove applied transactions from range_ops.

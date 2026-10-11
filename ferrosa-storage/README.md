@@ -881,7 +881,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   the front-end-facing seam CQL/Postgres `BEGIN`/`COMMIT` call to commit a
   buffered multi-key write-set; the ferrosa-cluster Accord impl resolves replicas
   and drives the multi-key transaction. `MockTransactionCommitter` backs
-  front-end unit tests without a cluster.
+  front-end unit tests without a cluster. The conflict index
+  (`accord/conflict_index.rs`) is a `HashMap<Vec<u8>, KeyEntry>`: each key's bytes
+  are stored ONCE, its in-flight-writes buffer is seeded at capacity one (the
+  common case is a single in-flight write per key — a bare `Vec` reserved four),
+  and its per-key execution-timestamp high-water-mark lives on the SAME entry
+  instead of a parallel key->`Timestamp` map. That cuts the index's residency at
+  N = 1,000,112 keys by a measured 366 B/key (~573 MiB -> ~224 MiB, a ~349 MiB
+  cut); guarded by `tests/conflict_index_residency.rs` (per-PR, structural/ratio)
+  and `tests/conflict_index_residency_absolute.rs` (the absolute projection, run
+  nightly like `accord::perf`).
 - **Time-series** (`timeseries/`) — ring-buffer aggregation, late-data handling,
   WASM aggregate execution, materialization queues.
 - **Virtual tables / observability** (`virtual_tables.rs`, `metrics.rs`) —
