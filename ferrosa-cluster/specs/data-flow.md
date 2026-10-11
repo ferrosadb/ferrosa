@@ -72,7 +72,10 @@ captured as hints without blocking the client. NTS / `LOCAL_QUORUM` /
 `EACH_QUORUM` variants compute per-DC ack thresholds via `block_for_dc`. The
 symmetric read path issues one full read plus `block_for - 1` digest reads, then
 on digest mismatch fail-loud re-fetches the newest copy and repairs stale
-replicas inline before returning.
+replicas inline before returning. A failed read is replaced by a spare replica;
+when the failed read was the full read, the spare does the full read (CL-51), so
+the live replicas serve the read whenever enough of them answer. A read that
+cannot meet its CL logs every failed replica and its reason once.
 
 ## 3. Accord transaction (strict-serializable)
 
