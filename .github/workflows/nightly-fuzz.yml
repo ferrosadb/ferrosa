@@ -415,3 +415,14 @@ jobs:
         run: |
           # `accord::perf` matches both accord::perf and accord::perf_regression.
           cargo test -p ferrosa-cluster --all-features --lib accord::perf -- --nocapture
+
+      - name: Run ConflictIndex residency bound (absolute)
+        # ABSOLUTE byte bound on the projected ConflictIndex residency saving at
+        # N=1,000,112 keys. Skipped in the per-PR lane (ci.yml `--skip
+        # conflict_index_residency_projection_absolute`) for the same reason as the
+        # accord perf bounds — it is absolute — and enforced here where the machine
+        # is not competing with the rest of the PR gate. Keep the ci.yml skip and
+        # this step in sync. The per-PR sibling
+        # `conflict_index_does_not_over_reserve_or_store_key_bytes_twice` is a
+        # same-run ratio and runs in ci.yml.
+        run: cargo test -p ferrosa-storage --all-features --test conflict_index_residency_absolute -- --nocapture
