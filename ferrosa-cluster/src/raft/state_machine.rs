@@ -419,20 +419,25 @@ impl FerrosStateMachine {
         self.current_snapshot.read().clone()
     }
 
+    /// Re-publish the cached snapshot with recovered membership.
+    ///
+    /// The snapshot is rebuilt from the LIVE state at `last_applied`, never by
+    /// re-labelling the cached bytes (t_919bb710). openraft treats a snapshot at
+    /// `last_log_id` as the state after every entry up to it; the old code
+    /// stamped the cached (older) state with the newer `last_applied`, so a
+    /// follower installing it skipped the entries in between and diverged
+    /// silently. Live state, `last_applied` and membership are mutually
+    /// consistent, so the rebuilt snapshot is too.
     fn refresh_current_snapshot_membership(&mut self) {
-        let Some((meta, bytes)) = self.current_snapshot_cloned() else {
+        if self.current_snapshot.read().is_none() {
             return;
-        };
+        }
 
-        let mut data: SnapshotData = match decode_snapshot(&bytes) {
-            Ok(data) => data,
-            Err(e) => {
-                tracing::warn!(%e, "failed to deserialize cached raft snapshot for membership refresh");
-                return;
-            }
+        let data = SnapshotData {
+            state: self.state.clone(),
+            last_applied: self.last_applied,
+            last_membership: self.last_membership.clone(),
         };
-        data.last_membership = self.last_membership.clone();
-        data.last_applied = self.last_applied;
 
         let refreshed_bytes = match encode_snapshot(&data) {
             Ok(bytes) => bytes,
@@ -442,10 +447,16 @@ impl FerrosStateMachine {
             }
         };
 
+        // New content, new id: a receiver must not treat it as a resend of
+        // the cached snapshot.
         let refreshed_meta = SnapshotMeta {
             last_log_id: self.last_applied,
             last_membership: self.last_membership.clone(),
-            snapshot_id: meta.snapshot_id,
+            snapshot_id: format!(
+                "{}-{}",
+                self.last_applied.map(|id| id.index).unwrap_or(0),
+                uuid::Uuid::new_v4()
+            ),
         };
         if !self.publish_snapshot(refreshed_meta.clone(), refreshed_bytes.clone()) {
             return;
@@ -3613,6 +3624,82 @@ mod tests {
                 .get_joint_config()[0],
             BTreeSet::from([uuid_to_node_id(node1), uuid_to_node_id(node2)])
         );
+    }
+
+    /// t_919bb710 (found during outage 2026-10-10 hardening). A membership
+    /// refresh after entries were applied past the cached snapshot must not
+    /// re-stamp the old snapshot's bytes with the newer index. openraft's
+    /// contract is that a snapshot at `last_log_id` IS the state after applying
+    /// every entry up to it; a follower that installs a mislabelled one skips
+    /// the entries in between and silently diverges.
+    #[tokio::test]
+    async fn membership_refresh_never_labels_old_state_with_a_newer_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("state-machine.snapshot.bin");
+        let mut leader = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        let join = |n: u128| {
+            RaftOp::JoinNode(NodeInfo {
+                host_id: Uuid::from_u128(n),
+                addr: format!("10.0.0.{n}:7000"),
+                data_center: "dc1".to_string(),
+                rack: "rack1".to_string(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            })
+        };
+        leader
+            .apply(vec![
+                make_entry(1, 1, join(1)),
+                make_entry(1, 2, join(2)),
+                make_entry(1, 3, RaftOp::CreateKeyspace(simple_keyspace("ks_a"))),
+            ])
+            .await
+            .unwrap();
+        let mut builder = leader.get_snapshot_builder().await;
+        builder.build_snapshot().await.unwrap();
+        // Applied past the snapshot (index 3): ks_b and ks_c exist only in
+        // entries 4 and 5.
+        leader
+            .apply(vec![
+                make_entry(1, 4, RaftOp::CreateKeyspace(simple_keyspace("ks_b"))),
+                make_entry(1, 5, RaftOp::CreateKeyspace(simple_keyspace("ks_c"))),
+            ])
+            .await
+            .unwrap();
+
+        leader.last_membership = StoredMembership::default();
+        assert!(leader.recover_membership_from_topology_state());
+
+        let served = leader.get_current_snapshot().await.unwrap().unwrap();
+        let served_index = served.meta.last_log_id.map(|id| id.index);
+        let mut follower = FerrosStateMachine::new();
+        follower
+            .install_snapshot(&served.meta, served.snapshot)
+            .await
+            .unwrap();
+        let keyspaces =
+            |sm: &FerrosStateMachine| sm.state().keyspaces.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            keyspaces(&follower),
+            keyspaces(&leader),
+            "a follower that installed the refreshed snapshot (labelled index {served_index:?}) \
+             must hold the leader's state at that index"
+        );
+        assert_eq!(follower.last_applied_index(), leader.last_applied_index());
+        assert_eq!(
+            served.meta.last_membership.membership().get_joint_config()[0],
+            BTreeSet::from([
+                uuid_to_node_id(Uuid::from_u128(1)),
+                uuid_to_node_id(Uuid::from_u128(2))
+            ]),
+            "the refresh still carries the recovered membership"
+        );
+
+        // The copy persisted for restart obeys the same rule.
+        let mut restarted = FerrosStateMachine::with_snapshot_path(snapshot_path);
+        assert!(restarted.recover_from_persisted_snapshot().unwrap());
+        assert_eq!(keyspaces(&restarted), keyspaces(&leader));
+        assert_eq!(restarted.last_applied_index(), leader.last_applied_index());
     }
 
     #[tokio::test]
