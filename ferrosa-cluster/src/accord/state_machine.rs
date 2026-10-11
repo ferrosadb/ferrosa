@@ -118,6 +118,27 @@ pub struct AccordStateMachine {
     /// [`NoopStorageApplier`] for protocol-only tests; production wires a real
     /// engine-backed applier via [`AccordStateMachine::with_applier`].
     apply_engine: Arc<DepWaitApplier>,
+    /// Serializes the durable *storage* half of the apply path — the dep-ordered
+    /// write-set (`write_atomic_batch` → commit-log `force_sync`) and the
+    /// dep-cascade it runs — so the apply engine is never entered concurrently.
+    ///
+    /// The state machine's own mutex used to provide that discipline implicitly.
+    /// The inbound apply path now releases that mutex across the blocking storage
+    /// fsync, so one long apply no longer serializes every inbound Accord RPC
+    /// behind it; this gate restores the engine's single-writer discipline WITHOUT
+    /// the state lock.
+    ///
+    /// Lock order: the state lock is taken BEFORE this gate. The inbound apply path
+    /// takes this gate alone, never while holding the state lock.
+    apply_gate: Arc<parking_lot::Mutex<()>>,
+    /// Transactions whose durable storage write is in flight on the lock-free
+    /// apply path (see [`AccordStateMachine::begin_apply_owned`]).
+    ///
+    /// The reservation is what keeps the "exactly one `Applied` protocol-log marker
+    /// per txn" contract that the state lock used to enforce: a duplicate Apply for
+    /// a txn already persisting is a no-op here, and the caller's
+    /// `await_txn_applied` then waits for the first one to finish.
+    applying: HashSet<TxnId>,
     /// Optional storage read seam for the generic-`IF` linearizable read-at-`t`
     /// (Gap 4). `None` keeps the conflict-index existence path used by
     /// `INSERT IF NOT EXISTS`. Production wires an engine-backed reader via
@@ -154,6 +175,101 @@ pub struct AccordStateMachine {
     /// refused by the floor, cleared (with one INFO) when a PreAccept is next
     /// accepted. Two lines per episode, never one per transaction.
     refusing_by_floor: bool,
+}
+
+/// The durable half of an inbound apply: computed under the state lock, then run
+/// **without** it (see [`AccordStateMachine::begin_apply_owned`]).
+///
+/// It OWNS everything the durable step needs — the payloads (moved in, never
+/// copied), the agreed `(t, deps)`, and the `Arc`s of the apply engine, the
+/// protocol-log writer and the apply gate — so it can outlive the borrow of the
+/// state machine.
+pub struct ApplyDurableWork {
+    gate: Arc<parking_lot::Mutex<()>>,
+    engine: Arc<DepWaitApplier>,
+    txn_id: TxnId,
+    t: Timestamp,
+    deps: Vec<TxnId>,
+    writes: Vec<Vec<u8>>,
+}
+
+/// What [`AccordStateMachine::finish_apply`] needs back from the durable half.
+pub struct ApplyDurableOutcome {
+    /// Every transaction the durable step actually persisted, in apply order —
+    /// the primary first, then each cascade-woken waiter. Empty when the write-set
+    /// parked behind an unapplied dependency.
+    applied: Vec<(TxnId, Vec<u8>)>,
+    /// False when the storage write failed. The txn then stays `Committed` (fail
+    /// loud; the per-txn Apply retry re-drives it, idempotently).
+    storage_ok: bool,
+}
+
+/// The result of [`AccordStateMachine::begin_apply_owned`].
+pub enum ApplyStep {
+    /// No durable work is owed: `response` is final.
+    Done(SmResponse),
+    /// Run `work` WITHOUT the state lock, then hand its outcome to
+    /// [`AccordStateMachine::finish_apply`] under it.
+    Durable(Box<ApplyDurableWork>),
+}
+
+/// The durable storage step of one apply, run WITHOUT the state-machine lock so
+/// an inbound Accord RPC is not serialized behind its fsync.
+///
+/// Holds the apply gate so the dep-ordered engine — the park decision, the
+/// `pending` insert and the cascade — is never entered concurrently; the state
+/// lock used to provide that single-writer discipline implicitly. The gate is
+/// NOT the state lock: an inbound PreAccept/Accept/Commit/ReadVote/Recover never
+/// touches the engine, so it never waits for this gate.
+///
+/// Durability ordering is unchanged: this returns only after `write_atomic_batch`
+/// (storage commit-log `force_sync`) has returned, and the transaction is not
+/// advanced to `Applied` until [`AccordStateMachine::finish_apply`] runs.
+pub fn execute_apply_durability(work: ApplyDurableWork) -> ApplyDurableOutcome {
+    let _gate = work.gate.lock();
+    let views: Vec<MutationView<'_>> = work
+        .writes
+        .iter()
+        .map(|data| MutationView {
+            data,
+            t: work.t,
+            deps: &work.deps,
+        })
+        .collect();
+    match work
+        .engine
+        .try_apply_writeset_borrowed(work.txn_id, &views)
+    {
+        Ok(applied) => ApplyDurableOutcome {
+            applied,
+            storage_ok: true,
+        },
+        Err(e) => {
+            tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
+            ApplyDurableOutcome {
+                applied: Vec::new(),
+                storage_ok: false,
+            }
+        }
+    }
+}
+
+/// The in-memory decision the apply path makes before any durable work.
+///
+/// Shared by the synchronous borrowed entry point
+/// ([`AccordStateMachine::handle_apply_writeset_borrowed`]) and the lock-free
+/// owned one ([`AccordStateMachine::begin_apply_owned`]) so the two cannot drift.
+enum ApplyDecision {
+    /// Nothing owed: already `Applied`, or a real write for a txn we hold no state
+    /// for.
+    Done(SmResponse),
+    /// A no-write finalize for a txn this replica never registered: record the
+    /// tombstone, then cascade.
+    FinalizeWithoutState,
+    /// A no-write finalize for a registered txn: marker it, then cascade.
+    NoWriteFinalize,
+    /// A real write-set: the agreed execution `t` and the raw dependency set.
+    Persist { t: Timestamp, deps: Vec<TxnId> },
 }
 
 impl AccordStateMachine {
@@ -213,6 +329,8 @@ impl AccordStateMachine {
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
             apply_engine: Arc::new(DepWaitApplier::new(Arc::new(NoopStorageApplier::new()))),
+            apply_gate: Arc::new(parking_lot::Mutex::new(())),
+            applying: HashSet::new(),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
             clock: None,
@@ -240,6 +358,8 @@ impl AccordStateMachine {
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
             apply_engine: Arc::new(DepWaitApplier::new(applier)),
+            apply_gate: Arc::new(parking_lot::Mutex::new(())),
+            applying: HashSet::new(),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
             clock: None,
@@ -270,6 +390,8 @@ impl AccordStateMachine {
             committed_txns: HashSet::new(),
             last_notified: Vec::new(),
             apply_engine: Arc::new(DepWaitApplier::new(applier)),
+            apply_gate: Arc::new(parking_lot::Mutex::new(())),
+            applying: HashSet::new(),
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
             clock: None,
@@ -880,6 +1002,57 @@ impl AccordStateMachine {
         self.handle_apply_writeset_borrowed(txn_id, &borrowed)
     }
 
+    /// The phase decision every apply entry point shares: already applied, a real
+    /// write with state, or one of the two no-write finalizes. PURE — it mutates
+    /// nothing, so a caller that turns out to owe no durable work can delegate to
+    /// the synchronous body without double-doing any state change.
+    fn plan_apply(&self, txn_id: TxnId, no_write: bool) -> ApplyDecision {
+        match self.txn_states.get(&txn_id) {
+            Some(state) => {
+                // Already applied: idempotent — do not re-persist or re-apply.
+                if state.phase == TxnPhase::Applied {
+                    return ApplyDecision::Done(SmResponse::None);
+                }
+                if no_write {
+                    ApplyDecision::NoWriteFinalize
+                } else {
+                    ApplyDecision::Persist {
+                        t: state.t,
+                        deps: state.deps.iter().copied().collect(),
+                    }
+                }
+            }
+            // No state for this txn: nothing to apply for a real write.
+            None if !no_write => ApplyDecision::Done(SmResponse::None),
+            // A coordinator can finalize a transaction on replicas that did not
+            // register it (for example, when another replica rejected its stale
+            // PostgreSQL snapshot). The missing txn still may be a dependency in
+            // a committed transaction's merged dependency set. Treat the explicit
+            // no-write Apply as terminal and cascade its waiters so they can apply.
+            None => ApplyDecision::FinalizeWithoutState,
+        }
+    }
+
+    /// The dependencies an apply must actually wait on: those that execute BEFORE
+    /// this transaction and that this replica still holds live state for.
+    ///
+    /// The dependency set was computed from `t0`, so it can name a transaction whose
+    /// final `t` was bumped past ours; that one waits for us instead (CL-28). A
+    /// dependency this replica holds no live state for can never become applied here
+    /// — it was applied and then pruned (`prune_applied` forgets the `TxnState` and
+    /// leaves only a `finalized` tombstone), or it never registered at all — so the
+    /// dep-wait graph would never resolve it and the waiter would park to
+    /// abandonment (measured live: ~30% of explicit transactions hit that bound).
+    /// The read path refuses to wait on such a dependency too
+    /// (`unapplied_conflicts_before`), so the apply path is not stricter than it.
+    /// Filtering before the graph sees the set is the whole fix: no extra lock, no
+    /// clone of any state, and the existing allocation is reused.
+    fn ordered_deps(&self, deps: Vec<TxnId>, t: &Timestamp) -> Vec<TxnId> {
+        deps.into_iter()
+            .filter(|dep| !self.executes_after(dep, t) && self.txn_states.contains_key(dep))
+            .collect()
+    }
+
     /// Apply a **multi-key** transaction from BORROWED payloads.
     ///
     /// The borrowed twin of [`Self::handle_apply_writeset`], and the path the
@@ -888,118 +1061,158 @@ impl AccordStateMachine {
     /// entry. Behaviour is identical — every key is routed through the dep-ordered
     /// apply engine as one unit (parked together, applied atomically), writes 2..N are
     /// never dropped, and an empty payload is still the no-write finalize.
+    ///
+    /// Runs the durable storage step INLINE (holding the apply gate). An inbound
+    /// apply uses [`Self::begin_apply_owned`] instead, so *it* does not hold the state
+    /// lock across that blocking step; this entry point is for a caller that already
+    /// holds the payloads by reference for the whole call.
     pub fn handle_apply_writeset_borrowed(
         &mut self,
         txn_id: TxnId,
         writes: &[&[u8]],
     ) -> SmResponse {
         let no_write = writes.iter().all(|write| write.is_empty());
-        // Read the agreed timestamp + deps from committed state BEFORE mutating,
-        // so each mutation we hand to storage carries the real `(t, deps)`.
-        let (t, deps): (Timestamp, Vec<TxnId>) = match self.txn_states.get(&txn_id) {
-            Some(state) => {
-                // Already applied: idempotent — do not re-persist or re-apply.
-                if state.phase == TxnPhase::Applied {
-                    return SmResponse::None;
-                }
-                (state.t, state.deps.iter().copied().collect())
-            }
-            // No state for this txn: nothing to apply.
-            None if !no_write => return SmResponse::None,
-            // A coordinator can finalize a transaction on replicas that did not
-            // register it (for example, when another replica rejected its stale
-            // PostgreSQL snapshot). The missing txn still may be a dependency in
-            // a committed transaction's merged dependency set. Treat the explicit
-            // no-write Apply as terminal and cascade its waiters so they can apply.
-            None => {
+        match self.plan_apply(txn_id, no_write) {
+            ApplyDecision::Done(resp) => resp,
+            ApplyDecision::FinalizeWithoutState => {
                 // Leaves no TxnState, so remember the decision: the txn's own
                 // PreAccept may still be queued behind this finalize (CL-36).
                 self.finalized.record(txn_id);
                 self.conflict_index.remove(&txn_id);
-                let woken = self.apply_engine.notify_applied(txn_id);
+                let woken = {
+                    let _gate = self.apply_gate.lock();
+                    self.apply_engine.notify_applied(txn_id)
+                };
                 self.bookkeep_applied_dedup(woken);
-                return SmResponse::NoWriteFinalized;
+                SmResponse::NoWriteFinalized
             }
-        };
-
-        // Wait only for dependencies that execute BEFORE this transaction. The
-        // dependency set was computed from `t0`, so it can name a transaction
-        // whose final `t` was bumped past ours; that one waits for us (CL-28).
-        //
-        // Also drop every dependency this replica holds no live state for. Such a
-        // dependency can never become applied here: it was either applied and then
-        // pruned (`prune_applied` forgets the `TxnState` and leaves only a
-        // `finalized` tombstone) or it never registered at all. The dep-wait graph
-        // forgets the same transaction on its own retention timer, so
-        // `graph.is_applied(dep)` stays false forever and nothing can ever resolve
-        // it — the waiter then parks until its bound expires and is abandoned.
-        // Measured live: ~30% of explicit transactions hit the bound and 4 of 4
-        // retries never committed.
-        //
-        // The read path already refuses to wait on such a dependency
-        // (`unapplied_conflicts_before`: "Applied / pruned: already applied — never
-        // waited on"); the apply path must not be stricter than the read path.
-        // Filtering before the graph sees the set is the whole fix: no extra lock,
-        // no clone of any state, and the existing allocation is reused.
-        let deps: Vec<TxnId> = deps
-            .into_iter()
-            .filter(|dep| !self.executes_after(dep, &t) && self.txn_states.contains_key(dep))
-            .collect();
-
-        // Drop no-write entries (empty payloads): a key the replica owns but for
-        // which this txn writes no row.
-        let writes: Vec<&[u8]> = writes
-            .iter()
-            .copied()
-            .filter(|data| !data.is_empty())
-            .collect();
-
-        // No-write finalize: nothing to persist and no dependency ordering to
-        // respect. Advance to Applied, then advance any waiters it unblocks.
-        if writes.is_empty() {
-            if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
-                // Marker fsync failed — fail loud, leave Committed; Apply retries.
-                return SmResponse::None;
+            ApplyDecision::NoWriteFinalize => {
+                // No-write finalize: nothing to persist and no dependency ordering
+                // to respect. Advance to Applied, then advance any waiters it
+                // unblocks.
+                if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
+                    // Marker fsync failed — fail loud, leave Committed; Apply retries.
+                    return SmResponse::None;
+                }
+                let woken = {
+                    let _gate = self.apply_gate.lock();
+                    self.apply_engine.notify_applied(txn_id)
+                };
+                self.bookkeep_applied_dedup(woken);
+                SmResponse::None
             }
-            let woken = self.apply_engine.notify_applied(txn_id);
-            self.bookkeep_applied_dedup(woken);
+            ApplyDecision::Persist { t, deps } => {
+                // A duplicate Apply for a txn whose durable write is already in
+                // flight on the lock-free path (which released the state lock across
+                // it) must not run that write a second time. The caller's
+                // `await_txn_applied` waits for the first one to finish.
+                if self.applying.contains(&txn_id) {
+                    return SmResponse::None;
+                }
+                let deps = self.ordered_deps(deps, &t);
+                // Drop no-write entries (empty payloads): a key the replica owns but
+                // for which this txn writes no row. `no_write == false` here, so at
+                // least one entry survives.
+                let writes: Vec<&[u8]> = writes
+                    .iter()
+                    .copied()
+                    .filter(|data| !data.is_empty())
+                    .collect();
+                let views: Vec<MutationView<'_>> = writes
+                    .iter()
+                    .map(|data| MutationView {
+                        data,
+                        t,
+                        deps: &deps,
+                    })
+                    .collect();
+                let applied = {
+                    // Serialize with the lock-free path: the engine's park/cascade
+                    // decision is a check-then-act the state lock no longer covers.
+                    let _gate = self.apply_gate.lock();
+                    self.apply_engine.try_apply_writeset_borrowed(txn_id, &views)
+                };
+                let applied = match applied {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        // Storage apply failed: do NOT advance to Applied — fail
+                        // loud, never fake success. The coordinator gets no implicit
+                        // ack and the Apply can be retried.
+                        tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
+                        return SmResponse::None;
+                    }
+                };
+                if applied.is_empty() {
+                    // Parked behind an unapplied dependency. This txn advances to
+                    // Applied later, when its last dependency's apply cascades to it.
+                    return SmResponse::None;
+                }
+                // Persisted: the primary's writes plus any cascade-woken waiters.
+                // Dedup by TxnId so each txn is marked Applied / fsynced exactly once.
+                self.bookkeep_applied_dedup(applied);
+                SmResponse::None
+            }
+        }
+    }
+
+    /// Phase 1 of the **lock-free** inbound apply: decide, under the state lock, and
+    /// hand back the durable work to run outside it.
+    ///
+    /// [`Self::handle_apply_writeset_borrowed`] split at the blocking storage step.
+    /// It shares [`Self::plan_apply`] with that method, so the two cannot drift on
+    /// the decision; the no-write finalizes have no storage batch to move out and
+    /// delegate to it directly.
+    ///
+    /// On the real-write path it RESERVES `txn_id` in `self.applying`: a concurrent
+    /// duplicate Apply then sees the reservation and does nothing, which preserves
+    /// the "exactly one `Applied` marker per txn" contract the state lock used to
+    /// give.
+    pub fn begin_apply_owned(&mut self, txn_id: TxnId, writes: Vec<Vec<u8>>) -> ApplyStep {
+        let no_write = writes.iter().all(|write| write.is_empty());
+        match self.plan_apply(txn_id, no_write) {
+            ApplyDecision::Done(resp) => ApplyStep::Done(resp),
+            ApplyDecision::FinalizeWithoutState | ApplyDecision::NoWriteFinalize => {
+                let borrowed: Vec<&[u8]> = writes.iter().map(Vec::as_slice).collect();
+                ApplyStep::Done(self.handle_apply_writeset_borrowed(txn_id, &borrowed))
+            }
+            ApplyDecision::Persist { t, deps } => {
+                if !self.applying.insert(txn_id) {
+                    // A duplicate Apply for a txn already persisting: the caller's
+                    // `await_txn_applied` waits for the first one.
+                    return ApplyStep::Done(SmResponse::None);
+                }
+                let deps = self.ordered_deps(deps, &t);
+                let writes: Vec<Vec<u8>> = writes.into_iter().filter(|w| !w.is_empty()).collect();
+                ApplyStep::Durable(Box::new(ApplyDurableWork {
+                    gate: Arc::clone(&self.apply_gate),
+                    engine: Arc::clone(&self.apply_engine),
+                    txn_id,
+                    t,
+                    deps,
+                    writes,
+                }))
+            }
+        }
+    }
+
+    /// Phase 3 of the **lock-free** inbound apply: under the state lock, mark the
+    /// durably-persisted transactions `Applied`.
+    ///
+    /// This is exactly the tail of [`Self::handle_apply_writeset_borrowed`] —
+    /// protocol-log `Applied` marker, `Applied` advance, conflict-index GC, dep-wait
+    /// wake — run after the storage batch has already committed. An empty `applied`
+    /// (the write-set parked on a dependency, or the storage write failed) advances
+    /// nothing and stays `Committed`, exactly as the synchronous path does.
+    pub fn finish_apply(&mut self, txn_id: TxnId, outcome: ApplyDurableOutcome) -> SmResponse {
+        // Release the reservation whatever the outcome.
+        self.applying.remove(&txn_id);
+        if !outcome.storage_ok {
             return SmResponse::None;
         }
-
-        // Real write-set: route through the dep-ordered apply engine. It persists
-        // every key atomically (idempotent on `(txn_id, key, t)`) once every
-        // dependency has applied on this replica; otherwise it parks the set.
-        let views: Vec<MutationView<'_>> = writes
-            .iter()
-            .map(|data| MutationView {
-                data,
-                t,
-                deps: &deps,
-            })
-            .collect();
-        let applied = match self
-            .apply_engine
-            .try_apply_writeset_borrowed(txn_id, &views)
-        {
-            Ok(applied) => applied,
-            Err(e) => {
-                // Storage apply failed: do NOT advance to Applied — fail loud,
-                // never fake success. The coordinator gets no implicit ack and
-                // the Apply can be retried.
-                tracing::error!(%e, "accord: storage applier failed — not advancing to Applied");
-                return SmResponse::None;
-            }
-        };
-
-        if applied.is_empty() {
-            // Parked behind an unapplied dependency. This txn advances to Applied
-            // later, when its last dependency's apply cascades to it.
-            return SmResponse::None;
+        for (id, _) in &outcome.applied {
+            self.applying.remove(id);
         }
-
-        // Persisted: the primary's writes plus any cascade-woken waiters. Dedup
-        // by TxnId so each txn is marked Applied / fsynced exactly once.
-        self.bookkeep_applied_dedup(applied);
+        self.bookkeep_applied_dedup(outcome.applied);
         SmResponse::None
     }
 
