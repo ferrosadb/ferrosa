@@ -182,10 +182,21 @@ unchanged) and carry its hidden-ness **in the Postgres front end by a reserved n
 INSERT arity all filter it in one place, and no schema-metadata change is needed.
 Only if CQL clients must also not see it does the metadata field become necessary.
 
-Still to build: the column synthesis, server-side per-row assignment on INSERT and COPY,
-the wire exclusions, and `ALTER TABLE ... ADD PRIMARY KEY` (not parsed at all today — a
-new statement type; where it names a column other than the synthetic key it becomes a
-secondary index, where it names nothing new it is a no-op).
+**Status 2026-10-11: this is BUILD, not to-build — the paragraph that used to sit here was
+stale.** The column synthesis exists (`ferrosa-common/src/timeuuid.rs`: `_sys_ck_`, a v1
+TimeUUID, with `is_reserved_column_name`), `AddPrimaryKey(Vec<String>)` exists in the AST
+(`ferrosa-sql/src/ast.rs:207`), and `ALTER … ADD PRIMARY KEY` is parsed, recorded AND indexed:
+`execute_add_primary_key` (`ferrosa-postgres/src/ddl.rs:302`) stores the declared key as
+`pg_key::PRIMARY_KEY_EXTENSION`/`encode(columns)` and builds a **secondary index over it when
+that key is not the storage key** (ddl.rs:159-163). The live init proves it end-to-end —
+`pgbench -i`'s "creating primary keys…" phase succeeds on the bench cluster.
+
+What is actually missing is ONE consumer: the UPDATE/DELETE gate
+(`ferrosa-postgres/src/query.rs:3222-3230`, DELETE twin at `:3652`) matches only
+`ColumnKind::PartitionKey | Clustering` — i.e. the STORAGE key — so a WHERE on the *declared*
+key is refused even though the index for it exists. `crate::pg_key::of(&meta)` is the predicate
+it should consult, and the row-find should go through the secondary index that ADD PRIMARY KEY
+already built. Scoped as t_c83ed1f2.
 
 ### Seeing the system columns: PG's own model beats a bespoke options table
 
