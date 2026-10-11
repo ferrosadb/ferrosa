@@ -60,6 +60,13 @@ pub struct QueryContext {
     /// per connection, per node, and an idle timeout. Shared by every
     /// connection on this listener.
     pub portals: Arc<crate::SuspendedPortals>,
+    /// The cluster range-read path a `SELECT` consults so it reads the ring
+    /// rather than only this node's local `TableStore`. Resolved **per
+    /// statement** (see [`crate::ClusterRead::reader`]), for the same reason the
+    /// committer is: this listener is built before the node has formed a
+    /// cluster. `ClusterRead::disabled()` keeps the local-only path for
+    /// standalone nodes and unit tests, where local storage IS complete.
+    pub cluster_read: crate::ClusterRead,
 }
 
 /// An unpredictable, printable SCRAM server nonce (base64, so no comma — the one
@@ -733,6 +740,7 @@ fn read_env<'a>(
         snapshot: Some(snapshot),
         ddl: ctx.ddl.as_deref(),
         jsonb_limits: &ctx.jsonb_limits,
+        cluster_read: &ctx.cluster_read,
     }
 }
 
@@ -2001,6 +2009,7 @@ pub(crate) mod txn_atomicity_tests {
 
     pub(crate) fn ctx_with(engine: Arc<StorageEngine>, schema: Arc<Schema>) -> QueryContext {
         QueryContext {
+            cluster_read: Default::default(),
             engine,
             schema,
             default_schema: "public".to_string(),

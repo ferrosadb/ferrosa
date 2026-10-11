@@ -109,6 +109,8 @@ use futures::{FutureExt, StreamExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
+use crate::cluster_read::{PartitionStream, RangeRead, DEFAULT_READ_CONSISTENCY};
+
 /// Convert a ferrosa [`CqlValue`] to [`ferrosa_sql::Value`]. Unsupported values
 /// return an error so callers cannot turn real data into fabricated SQL NULLs.
 pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
@@ -366,6 +368,45 @@ struct ScanContext {
     storage_to_table: Vec<usize>,
     /// Sparse PostgreSQL row replacements/deletions for the query snapshot.
     overlay: Arc<std::collections::HashMap<Vec<Value>, Option<Row>>>,
+    /// The cluster range-read path, when this deployment has one. `Some` routes
+    /// the scan through the ring at [`DEFAULT_READ_CONSISTENCY`]; `None` (a
+    /// standalone node or a unit test) scans this node's local storage, which
+    /// IS the complete answer there.
+    cluster_read: Option<Arc<dyn RangeRead>>,
+    /// The keyspace's replication strategy, used only by the cluster read. It
+    /// is resolved once here rather than per scan.
+    replication: ferrosa_cluster::ring::strategy::ReplicationStrategy,
+}
+
+/// Open the partition stream for one full-table scan.
+///
+/// The **cluster** range read is used when this deployment has one: it fans out
+/// across the ring at [`DEFAULT_READ_CONSISTENCY`] and refuses (loudly) to serve
+/// a read it cannot complete. Otherwise this node's **local** storage is read —
+/// complete for a standalone node, and the local path unit tests exercise.
+///
+/// A failure here is an `Err` that the caller records into [`ScanFailure`]; it is
+/// **never** downgraded to a local-only scan, because the whole point is that an
+/// under-return must not look like a small table.
+async fn open_partition_stream(ctx: &Arc<ScanContext>) -> Result<PartitionStream, String> {
+    match &ctx.cluster_read {
+        Some(reader) => reader
+            .stream_all(&ctx.table_id, DEFAULT_READ_CONSISTENCY, &ctx.replication)
+            .await
+            .map_err(|error| {
+                format!(
+                    "cluster range read of {}.{} failed: {error}",
+                    ctx.table_id.keyspace, ctx.table_id.table
+                )
+            }),
+        None => {
+            let stream = ctx
+                .engine
+                .range_iter(&ctx.table_id, None, None)
+                .map(|item| item.map_err(|e| e.to_string()).map(Arc::unwrap_or_clone));
+            Ok(Box::pin(stream))
+        }
+    }
 }
 
 /// Drain `range_iter` into `tx`, decoding one partition at a time.
@@ -375,7 +416,16 @@ struct ScanContext {
 /// or the consumer drops its receiver. Nothing is left running behind a
 /// cancelled or short-circuited query.
 async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: ScanFailure) {
-    let mut stream = ctx.engine.range_iter(&ctx.table_id, None, None);
+    let mut stream = match open_partition_stream(&ctx).await {
+        Ok(stream) => stream,
+        Err(message) => {
+            // Fail loud: a cluster read that cannot be served at the consistency
+            // level MUST NOT fall back to a local-only scan, which would return a
+            // short result set that looks like the whole answer.
+            failure.record(message);
+            return;
+        }
+    };
     let mut overlay_seen = std::collections::HashSet::new();
     while let Some(item) = stream.next().await {
         let partition = match item {
@@ -581,6 +631,7 @@ pub async fn load_table(
         failure,
         Default::default(),
         SCAN_BUFFER_ROWS,
+        None,
     )
     .await
 }
@@ -593,6 +644,7 @@ pub(crate) async fn load_table_with_overlay(
     failure: ScanFailure,
     overlay: std::collections::HashMap<Vec<Value>, Option<Row>>,
     scan_buffer_rows: usize,
+    cluster_read: Option<Arc<dyn RangeRead>>,
 ) -> Result<StreamingTable, LoadError> {
     let snapshot = schema.snapshot();
 
@@ -619,6 +671,30 @@ pub(crate) async fn load_table_with_overlay(
     let ck_idx = ck_indices(meta);
     let storage_to_table = storage_to_table_indices(meta);
 
+    // The keyspace replication strategy the cluster read uses to fan out. Only
+    // needed (and only parsed) when this deployment has a cluster read path.
+    let replication = match &cluster_read {
+        Some(_) => {
+            let keyspace_meta = snapshot.keyspaces.get(keyspace).ok_or_else(|| {
+                LoadError::Storage(format!(
+                    "keyspace {keyspace} has no metadata to resolve a replication strategy from"
+                ))
+            })?;
+            ferrosa_cluster::ring::strategy::ReplicationStrategy::try_from(
+                &keyspace_meta.replication,
+            )
+            .map_err(|error| {
+                LoadError::Storage(format!(
+                    "keyspace {keyspace} has an invalid replication strategy: {error}"
+                ))
+            })?
+        }
+        // Unused by the local path; a harmless default keeps the field total.
+        None => ferrosa_cluster::ring::strategy::ReplicationStrategy::Simple {
+            replication_factor: 1,
+        },
+    };
+
     // No scan happens here: the provider reads from storage only when scanned
     // (full-table, no key bounds), one bounded window of rows at a time.
     Ok(StreamingTable {
@@ -632,6 +708,8 @@ pub(crate) async fn load_table_with_overlay(
             ck_idx,
             storage_to_table,
             overlay: Arc::new(overlay),
+            cluster_read,
+            replication,
         }),
         handle: Handle::current(),
         failure,

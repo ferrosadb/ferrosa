@@ -884,6 +884,7 @@ pub async fn execute_query(
     jsonb_limits: &ferrosa_jsonb::Limits,
     txn: Option<&mut TxnWriteSet>,
 ) -> Vec<BackendMessage> {
+    let disabled_cluster_read = crate::ClusterRead::disabled();
     let env = ReadEnv {
         engine,
         schema,
@@ -892,6 +893,7 @@ pub async fn execute_query(
         snapshot: None,
         ddl: None,
         jsonb_limits,
+        cluster_read: &disabled_cluster_read,
     };
     execute_query_with_mvcc(env, sql, txn).await
 }
@@ -1011,6 +1013,10 @@ pub(crate) struct ReadEnv<'a> {
     pub(crate) ddl: Option<&'a dyn crate::ddl::DdlExecutor>,
     /// Tunable jsonb ingest limits (D14b), for text coerced into jsonb columns.
     pub(crate) jsonb_limits: &'a ferrosa_jsonb::Limits,
+    /// The cluster range-read path a table scan consults. Resolved per statement
+    /// from the [`crate`]'s [`crate::ClusterRead`]; `disabled()` keeps the
+    /// local-only path for standalone nodes and unit tests.
+    pub(crate) cluster_read: &'a crate::ClusterRead,
 }
 
 /// Load `select`'s tables and start its executor on a blocking thread, ready to
@@ -1026,6 +1032,7 @@ pub(crate) async fn open_select_stream(
     // PostgreSQL front end, not in the pure engine. A cast that cannot be resolved
     // is an error here, never a value silently left to the executor.
     resolve_casts(&mut select, &params, env.schema, env.default_schema)?;
+    let cluster_read = env.cluster_read.reader();
     let (catalog, failure) = load_catalog_with_mvcc(
         env.engine,
         env.schema,
@@ -1034,6 +1041,7 @@ pub(crate) async fn open_select_stream(
         env.mvcc,
         env.snapshot,
         pending_writes,
+        cluster_read,
     )
     .await?;
     open_stream(
@@ -3969,7 +3977,9 @@ pub(crate) async fn load_catalog(
     stmt: &ferrosa_sql::SelectStmt,
     default_schema: &str,
 ) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
-    load_catalog_with_mvcc(engine, schema, stmt, default_schema, None, None, None).await
+    // The Describe-only path resolves columns without reading rows, so it needs
+    // no cluster range-read handle.
+    load_catalog_with_mvcc(engine, schema, stmt, default_schema, None, None, None, None).await
 }
 
 pub(crate) async fn load_catalog_with_mvcc(
@@ -3980,6 +3990,7 @@ pub(crate) async fn load_catalog_with_mvcc(
     mvcc: Option<&MvccManager>,
     snapshot: Option<&MvccSnapshot>,
     pending_writes: Option<&[PgWrite]>,
+    cluster_read: Option<Arc<dyn crate::RangeRead>>,
 ) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
     let mut catalog = MapCatalog::new();
     if let (Some(mvcc), Some(snapshot)) = (mvcc, snapshot) {
@@ -4059,6 +4070,7 @@ pub(crate) async fn load_catalog_with_mvcc(
             failure.clone(),
             overlay,
             scan_buffer_rows,
+            cluster_read.clone(),
         )
         .await
         {
@@ -6622,6 +6634,7 @@ mod txn_buffer_tests {
         let payload = "x".repeat(1024);
         let mut accepted = 0u32;
         let mut refusal_code = None;
+        let disabled_cluster_read = crate::ClusterRead::disabled();
         for seq in 0..4096u32 {
             let sql = format!("INSERT INTO kv (k, v) VALUES ('mvcc-{seq}', '{payload}')");
             let env = ReadEnv {
@@ -6632,6 +6645,7 @@ mod txn_buffer_tests {
                 snapshot: None,
                 ddl: None,
                 jsonb_limits: &limits,
+                cluster_read: &disabled_cluster_read,
             };
             // txn = None: autocommit, but through the MVCC commit path.
             let msgs = execute_query_with_mvcc(env, &sql, None).await;
@@ -6676,6 +6690,7 @@ mod txn_buffer_tests {
         buffer.push(dummy).expect("stage");
 
         let limits = crate::jsonb_wire::test_limits();
+        let disabled_cluster_read = crate::ClusterRead::disabled();
         let env = ReadEnv {
             engine: &engine,
             schema: &schema,
@@ -6684,6 +6699,7 @@ mod txn_buffer_tests {
             snapshot: None,
             ddl: None,
             jsonb_limits: &limits,
+            cluster_read: &disabled_cluster_read,
         };
         let msgs = execute_query_with_mvcc(
             env,

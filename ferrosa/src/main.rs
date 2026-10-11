@@ -3488,6 +3488,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // PostgreSQL transaction on a real cluster.
         let accord_core = shared_state.core.clone();
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
+            // A `SELECT` must consult the ring, not only this node's local
+            // store: at a replication factor below the node count the local scan
+            // returns a fraction of the committed rows, and an unreachable owner
+            // must make the read FAIL LOUD rather than look like a small table.
+            // A factory, like the committer, because this listener is bound
+            // before the node has formed a cluster.
+            cluster_read: {
+                let write_path = shared_state.write_path.clone();
+                ferrosa_postgres::ClusterRead::live(move || {
+                    Some(std::sync::Arc::new(ferrosa_postgres::ClusterRangeRead::new(
+                        write_path.clone(),
+                    )) as std::sync::Arc<dyn ferrosa_postgres::RangeRead>)
+                })
+            },
             engine: storage.clone(),
             schema: schema.clone(),
             default_schema: "public".into(),

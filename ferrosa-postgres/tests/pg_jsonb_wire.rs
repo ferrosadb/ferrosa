@@ -204,6 +204,7 @@ async fn start_with(jsonb_limits: Limits) -> Fixture {
         engine: engine.clone(),
     }));
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: engine.clone(),
         schema,
         default_schema: "public".into(),
