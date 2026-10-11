@@ -40,6 +40,13 @@ pub enum RemoteFailureKind {
     RequestDecodeFailed,
     /// The encoded response exceeds the frame size limit.
     ResponseTooLarge,
+    /// The handler ran and its operation failed (for example openraft refused
+    /// an `install_snapshot` chunk). Added 2026-10-10; builds before it decode
+    /// code 5 as `Other(5)`.
+    HandlerFailed,
+    /// The handler cannot serve yet (for example Raft is not initialised).
+    /// Added 2026-10-10; builds before it decode code 6 as `Other(6)`.
+    NotReady,
     /// A code this build does not know (sent by a newer peer).
     Other(u8),
 }
@@ -51,6 +58,8 @@ impl RemoteFailureKind {
             Self::ResponseEncodeFailed => 2,
             Self::RequestDecodeFailed => 3,
             Self::ResponseTooLarge => 4,
+            Self::HandlerFailed => 5,
+            Self::NotReady => 6,
             Self::Other(code) => code,
         }
     }
@@ -61,6 +70,8 @@ impl RemoteFailureKind {
             2 => Self::ResponseEncodeFailed,
             3 => Self::RequestDecodeFailed,
             4 => Self::ResponseTooLarge,
+            5 => Self::HandlerFailed,
+            6 => Self::NotReady,
             other => Self::Other(other),
         }
     }
@@ -72,6 +83,8 @@ impl RemoteFailureKind {
             Self::ResponseEncodeFailed => "response_encode_failed",
             Self::RequestDecodeFailed => "request_decode_failed",
             Self::ResponseTooLarge => "response_too_large",
+            Self::HandlerFailed => "handler_failed",
+            Self::NotReady => "not_ready",
             Self::Other(_) => "other",
         }
     }
@@ -146,6 +159,40 @@ mod tests {
         let decoded = RpcErrorReply::decode(&mut buf.freeze()).unwrap();
         assert_eq!(decoded.kind, RemoteFailureKind::Other(200));
         assert_eq!(decoded.kind.code(), 200);
+    }
+
+    /// The decoder exactly as builds before 2026-10-10 shipped it: codes 1-4
+    /// known, everything else `Other`.
+    fn decode_kind_as_previous_build(code: u8) -> RemoteFailureKind {
+        match code {
+            1 => RemoteFailureKind::HandlerPanicked,
+            2 => RemoteFailureKind::ResponseEncodeFailed,
+            3 => RemoteFailureKind::RequestDecodeFailed,
+            4 => RemoteFailureKind::ResponseTooLarge,
+            other => RemoteFailureKind::Other(other),
+        }
+    }
+
+    /// Rolling upgrade: a new server sends `HandlerFailed` / `NotReady` to a
+    /// peer on the previous build. Their codes must be ones that build did not
+    /// know, so it decodes them as `Other` (the request still fails promptly)
+    /// rather than misreading them as an older kind.
+    #[test]
+    fn new_kinds_decode_as_other_on_the_previous_build() {
+        for kind in [RemoteFailureKind::HandlerFailed, RemoteFailureKind::NotReady] {
+            let reply = RpcErrorReply::new(kind, "raft not ready");
+            let mut buf = BytesMut::new();
+            reply.encode(&mut buf).unwrap();
+            let mut body = buf.freeze();
+            let code = body.get_u8();
+            assert_eq!(
+                decode_kind_as_previous_build(code),
+                RemoteFailureKind::Other(code),
+                "{kind:?} reuses a code the previous build already assigned"
+            );
+            assert_eq!(get_string(&mut body).unwrap(), "raft not ready");
+            assert_eq!(RemoteFailureKind::from_code(code), kind, "this build round-trips it");
+        }
     }
 
     #[test]

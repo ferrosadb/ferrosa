@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
 use ferrosa_index::IndexKey;
 use ferrosa_net::message::Message;
-use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_net::rpc::error_reply::RemoteFailureKind;
+use ferrosa_net::rpc::handler::{HandlerOutcome, PeerId, RpcHandler};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -80,6 +81,71 @@ fn encode_reply<T: Serialize>(payload: &T, handler: &'static str) -> Option<Byte
             None
         }
     }
+}
+
+/// The body every Raft RPC handler shares: wait for Raft, decode the request,
+/// run it, encode the response.
+///
+/// Each failure becomes a typed [`HandlerOutcome::Fail`] (outage 2026-10-10,
+/// D2). These handlers used to return no reply at all, so the sender held its
+/// stream slot until its own deadline and retried blind — on the
+/// install-snapshot path that was one full timeout per refused chunk. The
+/// server now logs and counts the failure and, for a peer that understands
+/// error replies, answers at once.
+async fn raft_rpc<Req, Resp, E, F, Fut>(
+    handler: &'static str,
+    lazy: &LazyRaft,
+    bytes: &[u8],
+    call: F,
+    wrap: fn(Bytes) -> Message,
+) -> HandlerOutcome
+where
+    Req: serde::de::DeserializeOwned + Send,
+    Resp: Serialize,
+    E: std::fmt::Display,
+    F: FnOnce(Arc<super::FerrosRaft>, Req) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Resp, E>> + Send,
+{
+    let Some(raft) = lazy.get().await else {
+        return HandlerOutcome::fail(
+            RemoteFailureKind::NotReady,
+            format!("{handler}: Raft is not ready on this node (not initialised)"),
+        );
+    };
+    let req: Req = match bincode::deserialize(bytes) {
+        Ok(req) => req,
+        Err(e) => {
+            return HandlerOutcome::fail(
+                RemoteFailureKind::RequestDecodeFailed,
+                format!("{handler}: request failed to deserialize: {e}"),
+            )
+        }
+    };
+    let resp = match call(raft, req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return HandlerOutcome::fail(
+                RemoteFailureKind::HandlerFailed,
+                format!("{handler}: {e}"),
+            )
+        }
+    };
+    match bincode::serialize(&resp) {
+        Ok(encoded) => HandlerOutcome::Reply(wrap(Bytes::from(encoded))),
+        Err(e) => HandlerOutcome::fail(
+            RemoteFailureKind::ResponseEncodeFailed,
+            format!("{handler}: response failed to serialize: {e}"),
+        ),
+    }
+}
+
+/// A Raft handler was routed a message type it does not handle: a
+/// registration bug, answered rather than left to the sender's deadline.
+fn unexpected_message(handler: &'static str, msg: &Message) -> HandlerOutcome {
+    HandlerOutcome::fail(
+        RemoteFailureKind::HandlerFailed,
+        format!("{handler}: unexpected message type {:?}", msg.msg_type()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -862,48 +928,25 @@ impl RaftAppendHandler {
 
 #[async_trait]
 impl RpcHandler for RaftAppendHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftAppendEntries(b) => b,
-            other => {
-                tracing::error!(msg_type = ?other.msg_type(), "RaftAppendHandler: unexpected message type");
-                return None;
-            }
+            other => return unexpected_message("RaftAppendHandler", &other),
         };
-
-        let raft = match self.raft.get().await {
-            Some(r) => r,
-            None => {
-                tracing::error!(
-                    "RaftAppendHandler: Raft instance not ready (LazyRaft returned None)"
-                );
-                return None;
-            }
-        };
-
-        let req: AppendEntriesRequest<FerrosRaftConfig> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftAppendHandler: deserialize failed: {e}");
-                return None;
-            }
-        };
-
-        let resp = match raft.append_entries(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftAppendHandler: append_entries failed: {e}");
-                return None;
-            }
-        };
-
-        match bincode::serialize(&resp) {
-            Ok(bytes) => Some(Message::RaftAppendResponse(Bytes::from(bytes))),
-            Err(e) => {
-                tracing::error!("RaftAppendHandler: serialize response failed: {e}");
-                None
-            }
-        }
+        raft_rpc(
+            "RaftAppendHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: AppendEntriesRequest<FerrosRaftConfig>| async move {
+                raft.append_entries(req).await.map_err(|e| format!("append_entries failed: {e}"))
+            },
+            Message::RaftAppendResponse,
+        )
+        .await
     }
 }
 
@@ -927,48 +970,28 @@ impl RaftVoteHandler {
 
 #[async_trait]
 impl RpcHandler for RaftVoteHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftVote(b) => b,
-            other => {
-                tracing::error!(msg_type = ?other.msg_type(), "RaftVoteHandler: unexpected message type");
-                return None;
-            }
+            other => return unexpected_message("RaftVoteHandler", &other),
         };
-
-        let raft = match self.raft.get().await {
-            Some(r) => r,
-            None => {
-                tracing::error!(
-                    "RaftVoteHandler: Raft instance not ready (LazyRaft returned None)"
-                );
-                return None;
-            }
-        };
-
-        let req: VoteRequest<u64> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftVoteHandler: deserialize failed: {e}");
-                return None;
-            }
-        };
-
-        let resp: VoteResponse<u64> = match raft.vote(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftVoteHandler: vote failed: {e}");
-                return None;
-            }
-        };
-
-        match bincode::serialize(&resp) {
-            Ok(bytes) => Some(Message::RaftVoteResponse(Bytes::from(bytes))),
-            Err(e) => {
-                tracing::error!("RaftVoteHandler: serialize response failed: {e}");
-                None
-            }
-        }
+        raft_rpc(
+            "RaftVoteHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: VoteRequest<u64>| async move {
+                raft.vote(req)
+                    .await
+                    .map(|resp: VoteResponse<u64>| resp)
+                    .map_err(|e| format!("vote failed: {e}"))
+            },
+            Message::RaftVoteResponse,
+        )
+        .await
     }
 }
 
@@ -1000,48 +1023,28 @@ impl RaftPreVoteHandler {
 
 #[async_trait]
 impl RpcHandler for RaftPreVoteHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftPreVote(b) => b,
-            other => {
-                tracing::error!(msg_type = ?other.msg_type(), "RaftPreVoteHandler: unexpected message type");
-                return None;
-            }
+            other => return unexpected_message("RaftPreVoteHandler", &other),
         };
-
-        let raft = match self.raft.get().await {
-            Some(r) => r,
-            None => {
-                tracing::error!(
-                    "RaftPreVoteHandler: Raft instance not ready (LazyRaft returned None)"
-                );
-                return None;
-            }
-        };
-
-        let req: PreVoteRequest<u64> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftPreVoteHandler: deserialize failed: {e}");
-                return None;
-            }
-        };
-
-        let resp: PreVoteResponse<u64> = match raft.pre_vote(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftPreVoteHandler: pre_vote failed: {e}");
-                return None;
-            }
-        };
-
-        match bincode::serialize(&resp) {
-            Ok(bytes) => Some(Message::RaftPreVoteResponse(Bytes::from(bytes))),
-            Err(e) => {
-                tracing::error!("RaftPreVoteHandler: serialize response failed: {e}");
-                None
-            }
-        }
+        raft_rpc(
+            "RaftPreVoteHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: PreVoteRequest<u64>| async move {
+                raft.pre_vote(req)
+                    .await
+                    .map(|resp: PreVoteResponse<u64>| resp)
+                    .map_err(|e| format!("pre_vote failed: {e}"))
+            },
+            Message::RaftPreVoteResponse,
+        )
+        .await
     }
 }
 
@@ -1066,35 +1069,30 @@ impl RaftSnapshotHandler {
 
 #[async_trait]
 impl RpcHandler for RaftSnapshotHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftInstallSnapshot(b) => b,
-            _ => return None,
+            other => return unexpected_message("RaftSnapshotHandler", &other),
         };
-
-        let raft = self.raft.get().await?;
-
-        let req: InstallSnapshotRequest<FerrosRaftConfig> = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("RaftSnapshotHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
-
-        let resp: InstallSnapshotResponse<u64> = raft
-            .install_snapshot(req)
-            .await
-            .map_err(|e| {
-                tracing::warn!("RaftSnapshotHandler: install_snapshot failed: {e}");
-                e
-            })
-            .ok()?;
-
-        let resp_bytes = encode_reply(&resp, "RaftSnapshotHandler")?;
-
-        // Reuses `RaftAppendResponse` as the snapshot ack wire type, matching
-        // the decode side in `FerrosRaftNetwork::install_snapshot`.
-        Some(Message::RaftAppendResponse(resp_bytes))
+        // The ack reuses `RaftAppendResponse` as its wire type, matching the
+        // decode side in `FerrosRaftNetwork::install_snapshot`.
+        raft_rpc(
+            "RaftSnapshotHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: InstallSnapshotRequest<FerrosRaftConfig>| async move {
+                raft.install_snapshot(req)
+                    .await
+                    .map(|resp: InstallSnapshotResponse<u64>| resp)
+                    .map_err(|e| format!("install_snapshot failed: {e}"))
+            },
+            Message::RaftAppendResponse,
+        )
+        .await
     }
 }
 

@@ -21,7 +21,7 @@ use crate::handshake::{accept_handshake, CAP_RPC_ERROR_REPLY};
 use crate::message::Message;
 use crate::metrics;
 use crate::rpc::error_reply::{RemoteFailureKind, RpcErrorReply};
-use crate::rpc::handler::{HandlerRegistry, PeerId};
+use crate::rpc::handler::{HandlerOutcome, HandlerRegistry, PeerId};
 use crate::task_pool::TaskPool;
 
 /// Callback invoked when the server accepts an inbound peer connection.
@@ -578,12 +578,14 @@ async fn run_handler(registry: Arc<HandlerRegistry>, route: ReplyRoute, msg: Mes
     // state again; we only report it. Shared state the handler left
     // half-updated is no less exposed than it was when tokio caught the same
     // panic at the task boundary.
-    let dispatched = AssertUnwindSafe(registry.dispatch(route.peer_id, route.msg_type, msg))
-        .catch_unwind()
-        .await;
+    let dispatched =
+        AssertUnwindSafe(registry.dispatch_outcome(route.peer_id, route.msg_type, msg))
+            .catch_unwind()
+            .await;
     match dispatched {
-        Ok(Some(response)) => route.respond(response).await,
-        Ok(None) => {}
+        Ok(HandlerOutcome::Reply(response)) => route.respond(response).await,
+        Ok(HandlerOutcome::NoReply) => {}
+        Ok(HandlerOutcome::Fail { kind, detail }) => route.fail(kind, &detail).await,
         Err(payload) => {
             metrics::record_rpc_handler_panic(route.msg_type);
             let detail = panic_message(payload.as_ref());

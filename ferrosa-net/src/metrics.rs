@@ -57,12 +57,14 @@ static RPC_HANDLER_PANICS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256]
 
 /// Inbound RPC requests that got no response, by `RemoteFailureKind` code
 /// (index 0 is unused; unknown codes never originate locally).
-static RPC_HANDLER_FAILURES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-const LOCAL_FAILURE_KINDS: [RemoteFailureKind; 4] = [
+static RPC_HANDLER_FAILURES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const LOCAL_FAILURE_KINDS: [RemoteFailureKind; 6] = [
     RemoteFailureKind::HandlerPanicked,
     RemoteFailureKind::ResponseEncodeFailed,
     RemoteFailureKind::RequestDecodeFailed,
     RemoteFailureKind::ResponseTooLarge,
+    RemoteFailureKind::HandlerFailed,
+    RemoteFailureKind::NotReady,
 ];
 
 /// Handler panics recorded for `msg_type` since process start.
