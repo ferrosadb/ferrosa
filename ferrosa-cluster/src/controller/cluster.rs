@@ -1284,7 +1284,8 @@ impl ModeController {
         let has_recovered_topology_state = state_machine.has_topology_state();
 
         // 3. Create network factory
-        let network_factory = FerrosRaftNetworkFactory::new(peer_manager.clone());
+        let network_factory =
+            FerrosRaftNetworkFactory::new(peer_manager.clone(), self.replication_health.clone());
         let local_node_id = uuid_to_node_id(self.local_host_id);
 
         // Register node mappings for all peers
@@ -1527,6 +1528,7 @@ impl ModeController {
             .chain(peers.iter().map(|(uuid, _)| uuid_to_node_id(*uuid)))
             .collect();
         let cluster_name = self.config.cluster_name.clone();
+        let replication_health_for_pusher = self.replication_health.clone();
         let config_for_promotion = self.config.clone();
         let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
         let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
@@ -2276,12 +2278,14 @@ impl ModeController {
                 use crate::raft::snapshot_pusher::run_snapshot_pusher;
                 let pusher_raft = raft_arc.clone();
                 let pusher_cancel = election_guard_cancel.clone();
+                let pusher_health = replication_health_for_pusher.clone();
                 ferrosa_net::task_pool::TaskPool::current("raft-snapshot-pusher").spawn(async move {
                     run_snapshot_pusher(
                         pusher_raft,
                         pusher_cancel,
                         5_000, // sweep every 5 s
                         10,    // lag_threshold: 10 entries
+                        pusher_health,
                     )
                     .await;
                 });

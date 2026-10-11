@@ -78,6 +78,7 @@ pub async fn get_metrics(
     State(registry): State<Arc<VirtualTableRegistry>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
     State(supervision): State<Arc<crate::supervisor::SupervisionStatus>>,
+    State(mode_controller): State<Arc<ferrosa_cluster::ModeController>>,
 ) -> (
     StatusCode,
     [(axum::http::header::HeaderName, &'static str); 1],
@@ -121,6 +122,11 @@ pub async fn get_metrics(
     // T0.6) asserts the storm counter stays 0 under full-table ALLOW FILTERING
     // load; a non-zero value should alert (P0-17).
     body.push_str(&ferrosa_cluster::raft::consensus_metrics::render_prometheus());
+    // Per-follower replication lag, flat-lag sweeps and consecutive
+    // snapshot-send failures (outage 2026-10-10, D4). Only a leader has rows.
+    mode_controller
+        .replication_health()
+        .render_prometheus(&mut body);
     (
         StatusCode::OK,
         [(
@@ -2327,10 +2333,23 @@ mod tests {
         let state = Arc::new(registry);
         let listeners = Arc::new(crate::listener_status::ListenerStatus::default());
         let supervision = Arc::new(crate::supervisor::SupervisionStatus::default());
-        let (status, headers, body) =
-            get_metrics(State(state), State(listeners), State(supervision)).await;
+        let mode_controller = make_state().mode_controller;
+        mode_controller
+            .replication_health()
+            .observe_sweep(500, 10, &[(2, 120)]);
+        let (status, headers, body) = get_metrics(
+            State(state),
+            State(listeners),
+            State(supervision),
+            State(mode_controller),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(headers[0].1, "text/plain; charset=utf-8");
+        assert!(
+            body.contains("ferrosa_raft_replication_lag_entries{peer=\"2\"} 380\n"),
+            "per-follower replication lag is exported: {body}"
+        );
         assert!(
             body.contains("ferrosa_supervised_task_up{task=\"storage_flush\"} 1\n"),
             "supervised background tasks are exported: {body}"
