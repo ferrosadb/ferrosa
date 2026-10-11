@@ -472,10 +472,7 @@ async fn simultaneous_transactions_each_carry_the_value_they_committed() {
         .await
         .expect("B buffers its update");
 
-    let (out_a, out_b) = tokio::join!(
-        ca.batch_execute("COMMIT"),
-        cb.batch_execute("COMMIT"),
-    );
+    let (out_a, out_b) = tokio::join!(ca.batch_execute("COMMIT"), cb.batch_execute("COMMIT"),);
     let a_ok = out_a.is_ok();
     let b_ok = out_b.is_ok();
     for (peer, outcome) in [("A", &out_a), ("B", &out_b)] {

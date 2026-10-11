@@ -1,0 +1,402 @@
+//! Aggregate results over the real Postgres wire, driven by a real driver
+//! (`tokio-postgres`), holding the invariants the aggregate work must satisfy:
+//!
+//! * **I-EXACT** — `sum(bigint)` and `avg(...)` produce PostgreSQL's EXACT
+//!   result type and value. A sum whose total overflows int8 must come back as
+//!   the exact `numeric`, never a wrapped integer.
+//! * **I-OID** — the type the client is TOLD (`Statement::columns()[i].type_()`,
+//!   the `RowDescription` the driver deserializes against) is the type the
+//!   bytes honour. A numeric-declared column must never carry int/float bytes;
+//!   when the client demands a binary numeric we do not have, the statement is
+//!   refused loud (`0A000`) rather than mislabelled.
+//! * **I-MAPPABLE** — an aggregate ferrosa does not implement is refused BY NAME
+//!   with a real SQLSTATE, with a positive control proving a supported one runs.
+//!
+//! The fixture declares a real `bigint` column so `sum`/`avg` of it take
+//! PostgreSQL's `numeric` result type (`sum(int8) -> numeric`).
+
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ferrosa_common::cell::CellValue;
+use ferrosa_common::key::{DecoratedKey, PartitionKey};
+use ferrosa_postgres::handshake::VerifierStore;
+use ferrosa_postgres::scram::ScramVerifier;
+use ferrosa_postgres::{server, AccordAccess, QueryContext};
+use ferrosa_schema::{
+    AuthContext, AuthMethod, ClusteringOrder, ColumnKind, ColumnMetadata, DeploymentMode,
+    EnvSecretsProvider, KeyspaceMetadata, PasswordHasher, PasswordPolicy, RateLimitConfig,
+    ReplicationParams, Schema, SchemaConfig, TableMetadata, TableParams, TestAuditSink,
+};
+use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row as StorageRow};
+use ferrosa_storage::{
+    CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    TableId,
+};
+use indexmap::IndexMap;
+use tokio::net::TcpListener;
+use tokio_postgres::config::SslMode;
+use tokio_postgres::types::Type;
+use tokio_postgres::{Config, NoTls, SimpleQueryMessage};
+use uuid::Uuid;
+
+/// The seeded rows. `big` values are chosen so their sum OVERFLOWS int8
+/// (`2 * i64::MAX + 1`), which is exactly the case `sum(int8) -> numeric` exists
+/// to cover; `avg(big)` is then a value an f64 cannot represent exactly, so a
+/// float-based average would be observably wrong.
+const BIG: [i64; 4] = [i64::MAX, i64::MAX, 1, 0];
+const SCORE: [i32; 4] = [1, 2, 2, 4];
+
+/// `2 * i64::MAX + 1` = 18446744073709551615, the exact `sum(big)`.
+const SUM_BIG_EXACT: &str = "18446744073709551615";
+/// `SUM_BIG_EXACT / 4` = 4611686018427387903.75, an f64 can NOT hold the .75 at
+/// that magnitude — so a float average would differ in the printed digits.
+const AVG_BIG_EXACT: &str = "4611686018427387903.75";
+
+struct OneRole(ScramVerifier);
+
+impl VerifierStore for OneRole {
+    fn verifier(&self, user: &str) -> Option<ScramVerifier> {
+        (user == "ferrosa_user").then(|| self.0.clone())
+    }
+    fn admit(&self, _user: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn record_failure(&self, _user: &str) {}
+    fn record_success(&self, user: &str) -> Result<AuthContext, String> {
+        Ok(AuthContext {
+            role: user.to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        })
+    }
+}
+
+fn schema_config() -> SchemaConfig {
+    SchemaConfig {
+        hasher: PasswordHasher::Bcrypt { cost: 4 },
+        password_policy: PasswordPolicy::permissive(),
+        auth_method: AuthMethod::Password,
+        rate_limit: RateLimitConfig::default(),
+        audit_sink: Box::new(TestAuditSink::new()),
+        secrets: Box::new(EnvSecretsProvider),
+        mode: DeploymentMode::Development,
+    }
+}
+
+fn column(name: &str, kind: ColumnKind, ty: &str) -> ColumnMetadata {
+    ColumnMetadata {
+        name: name.to_string(),
+        kind,
+        position: 0,
+        column_type: ty.to_string(),
+        clustering_order: ClusteringOrder::None,
+        mask: None,
+    }
+}
+
+/// `ks.t(id text PK, ck int CK, name text, score int, big bigint)`.
+fn schema_with_table() -> Schema {
+    let schema = Schema::new(schema_config()).expect("schema bootstraps");
+    let auth = AuthContext {
+        role: "cassandra".to_string(),
+        is_superuser: true,
+        must_change_password: false,
+    };
+    let mut options = HashMap::new();
+    options.insert("replication_factor".to_string(), "1".to_string());
+    schema
+        .create_keyspace(
+            KeyspaceMetadata {
+                name: "ks".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options,
+                },
+            },
+            &auth,
+        )
+        .expect("create keyspace");
+
+    let mut columns = IndexMap::new();
+    for (name, kind, ty) in [
+        ("id", ColumnKind::PartitionKey, "text"),
+        ("ck", ColumnKind::Clustering, "int"),
+        ("name", ColumnKind::Regular, "text"),
+        ("score", ColumnKind::Regular, "int"),
+        ("big", ColumnKind::Regular, "bigint"),
+    ] {
+        columns.insert(name.to_string(), column(name, kind, ty));
+    }
+    schema
+        .create_table(
+            TableMetadata {
+                keyspace: "ks".to_string(),
+                name: "t".to_string(),
+                id: Uuid::new_v4(),
+                columns,
+                partition_key: vec!["id".to_string()],
+                clustering_key: vec![("ck".to_string(), ClusteringOrder::Asc)],
+                params: TableParams::default(),
+                flags: HashSet::new(),
+                extensions: HashMap::new(),
+                is_system: false,
+            },
+            &auth,
+        )
+        .expect("create table");
+    schema
+}
+
+fn engine_config(dir: &Path) -> StorageEngineConfig {
+    StorageEngineConfig {
+        commit_log: CommitLogConfig {
+            segment_size: 256 * 1024,
+            max_segment_age: Duration::from_secs(60),
+            sync_strategy: SyncStrategyConfig::Periodic {
+                sync_interval: Duration::from_secs(1),
+            },
+            batch: Default::default(),
+            log_dir: dir.join("commitlog"),
+            checkpoint_dir: dir.join("commitlog"),
+            archive: None,
+        },
+        compaction: CompactionConfig::from_env(dir.join("compaction")),
+        object_store: None,
+        local_cache_max_bytes: 1024 * 1024,
+        local_disk_free_reserve_bytes: 0,
+        flush_threshold_bytes: 64 * 1024 * 1024,
+        memtable_backpressure_bytes: u64::MAX,
+        flush_max_age_secs: 3600,
+        data_dir: dir.to_path_buf(),
+        index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+        auth_enabled: false,
+        auth_warn: false,
+        max_pending_replay_mutations_without_schema: 1024,
+        memtable_num_shards: 64,
+        cache_hot_window_secs: 900,
+        write_verify: false,
+    }
+}
+
+fn storage_schema() -> ferrosa_common::schema::TableSchema {
+    use ferrosa_common::schema::{ColumnDefinition, TableSchema};
+    let col = |name: &str, ty: &str| ColumnDefinition {
+        name: name.to_string(),
+        type_name: ty.to_string(),
+    };
+    TableSchema {
+        keyspace: "ks".to_string(),
+        table: "t".to_string(),
+        key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+        clustering_columns: vec![col("ck", "org.apache.cassandra.db.marshal.Int32Type")],
+        static_columns: vec![],
+        regular_columns: vec![
+            col("name", "org.apache.cassandra.db.marshal.UTF8Type"),
+            col("score", "org.apache.cassandra.db.marshal.Int32Type"),
+            col("big", "org.apache.cassandra.db.marshal.LongType"),
+        ],
+        extensions: Default::default(),
+    }
+}
+
+/// One partition per row (`id` = `row{i:08}`, `score`/`big` from the fixtures).
+fn seed(engine: &StorageEngine) {
+    let tid = TableId::new("ks", "t");
+    for i in 0..BIG.len() {
+        let id = format!("row{i:08}");
+        let key = DecoratedKey::new(PartitionKey::new(id.into_bytes()));
+        let ts = 1000 + i as i64;
+        let row = StorageRow {
+            clustering: 1i32.to_be_bytes().to_vec(),
+            cells: vec![
+                (0, CellValue::live(b"x".to_vec(), ts)),
+                (1, CellValue::live(SCORE[i].to_be_bytes().to_vec(), ts)),
+                (2, CellValue::live(BIG[i].to_be_bytes().to_vec(), ts)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(ts),
+        };
+        engine.write(&tid, &key, row, ts).expect("write row");
+    }
+}
+
+async fn start() -> (tokio_postgres::Client, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = StorageEngine::new(engine_config(dir.path()), None).expect("engine");
+    engine.register_table(storage_schema()).expect("register");
+    seed(&engine);
+    let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
+        engine: Arc::new(engine),
+        schema: Arc::new(schema_with_table()),
+        default_schema: "ks".into(),
+        mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
+        accord: AccordAccess::disabled(),
+        ddl: None,
+        jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
+        portals: Default::default(),
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let store = Arc::new(OneRole(ScramVerifier::from_password(
+        "devpass",
+        b"ferrosa-dev-salt",
+        4096,
+    )));
+    tokio::spawn(server::serve(
+        listener,
+        store,
+        ctx,
+        server::PgTls::plaintext(),
+    ));
+    let (client, connection) = Config::new()
+        .host("127.0.0.1")
+        .port(port)
+        .user("ferrosa_user")
+        .password("devpass")
+        .dbname("ferrosa")
+        .ssl_mode(SslMode::Disable)
+        .connect(NoTls)
+        .await
+        .expect("SCRAM handshake succeeds");
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("driver connection ended: {error}");
+        }
+    });
+    (client, dir)
+}
+
+/// The single-cell text value of `sql`, read through the SIMPLE protocol (whose
+/// results are always text format, so a `numeric` cell arrives as its exact
+/// decimal string).
+async fn one_text_cell(client: &tokio_postgres::Client, sql: &str) -> String {
+    let messages = client.simple_query(sql).await.expect("simple query");
+    let rows: Vec<&tokio_postgres::SimpleQueryRow> = messages
+        .iter()
+        .filter_map(|m| match m {
+            SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "expected exactly one result row for `{sql}`");
+    rows[0].get(0).expect("non-null cell").to_string()
+}
+
+/// The advertised type of column `i` of `sql`, as the driver reads it from the
+/// `RowDescription` (`Statement::columns`). This is the type the client is TOLD.
+async fn advertised_type(client: &tokio_postgres::Client, sql: &str, i: usize) -> Type {
+    let stmt = client
+        .prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("prepare `{sql}`: {e}"));
+    stmt.columns()[i].type_().clone()
+}
+
+// --- I-EXACT + I-OID ---------------------------------------------------------
+
+/// `sum(bigint)` is the exact `numeric` for any total, including one that
+/// overflows int8. The client is told `numeric` (OID 1700) and the bytes are
+/// that exact value.
+#[tokio::test]
+async fn sum_bigint_is_exact_numeric_over_the_wire() {
+    let (client, _dir) = start().await;
+    let sql = "SELECT sum(big) FROM t";
+    assert_eq!(
+        advertised_type(&client, sql, 0).await,
+        Type::NUMERIC,
+        "sum(int8) must be advertised as PostgreSQL's numeric (OID 1700)"
+    );
+    assert_eq!(one_text_cell(&client, sql).await, SUM_BIG_EXACT);
+}
+
+/// `avg(bigint)` is exact: the answer (…903.75) is not an f64, so a float
+/// average would show different digits.
+#[tokio::test]
+async fn avg_bigint_is_exact_numeric_over_the_wire() {
+    let (client, _dir) = start().await;
+    let sql = "SELECT avg(big) FROM t";
+    assert_eq!(advertised_type(&client, sql, 0).await, Type::NUMERIC);
+    assert_eq!(one_text_cell(&client, sql).await, AVG_BIG_EXACT);
+}
+
+/// `count(*)` and `sum(int4)` are the exact int8 PostgreSQL types them, read
+/// back by the driver as `i64` on the strength of the advertised OID.
+#[tokio::test]
+async fn count_and_sum_int_are_exact_int8_over_the_wire() {
+    let (client, _dir) = start().await;
+    let sql = "SELECT count(*), sum(score) FROM t";
+    assert_eq!(advertised_type(&client, sql, 0).await, Type::INT8);
+    assert_eq!(advertised_type(&client, sql, 1).await, Type::INT8);
+    let row = client.query_one(sql, &[]).await.expect("count/sum query");
+    assert_eq!(row.get::<_, i64>(0), BIG.len() as i64);
+    assert_eq!(
+        row.get::<_, i64>(1),
+        SCORE.iter().map(|v| i64::from(*v)).sum::<i64>()
+    );
+}
+
+/// `min`/`max(int4)` keep the argument's type. The driver reads them as `i32`.
+#[tokio::test]
+async fn min_max_keep_the_argument_type_over_the_wire() {
+    let (client, _dir) = start().await;
+    let sql = "SELECT min(score), max(score) FROM t";
+    assert_eq!(advertised_type(&client, sql, 0).await, Type::INT4);
+    assert_eq!(advertised_type(&client, sql, 1).await, Type::INT4);
+    let row = client.query_one(sql, &[]).await.expect("min/max query");
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(row.get::<_, i32>(1), 4);
+}
+
+/// I-OID fail-loud control: a `numeric` column has no binary codec, so a client
+/// that demands the BINARY format is refused (`0A000`) rather than handed
+/// int/float bytes under OID 1700. The positive control is the text-format
+/// query above, which returns the exact value — the check can both fire and
+/// pass, and the refusal is a specific SQLSTATE, not a generic error.
+#[tokio::test]
+async fn numeric_result_in_binary_format_is_refused_loud() {
+    let (client, _dir) = start().await;
+    // `tokio-postgres`'s extended `query` requests BINARY result format.
+    let err = client
+        .query("SELECT sum(big) FROM t", &[])
+        .await
+        .expect_err("a binary numeric result must be refused, not mislabelled");
+    let db = err.as_db_error().expect("an ErrorResponse with a SQLSTATE");
+    assert_eq!(
+        db.code().code(),
+        "0A000",
+        "feature_not_supported, not a generic error: {db}"
+    );
+}
+
+// --- I-MAPPABLE --------------------------------------------------------------
+
+/// An aggregate ferrosa does not implement is refused BY NAME with a real
+/// SQLSTATE, never mis-parsed or silently approximated. The positive control —
+/// a supported aggregate over the same table — succeeds, proving the refusal is
+/// specific to the unsupported name.
+#[tokio::test]
+async fn unsupported_aggregate_is_refused_by_name_over_the_wire() {
+    let (client, _dir) = start().await;
+
+    let err = client
+        .simple_query("SELECT string_agg(name) FROM t")
+        .await
+        .expect_err("string_agg is not implemented and must be refused");
+    let db = err.as_db_error().expect("an ErrorResponse with a SQLSTATE");
+    assert_eq!(db.code().code(), "0A000");
+    assert!(
+        db.message().contains("string_agg"),
+        "the refusal must NAME the aggregate: {db}"
+    );
+
+    // Positive control: a supported aggregate over the same table runs.
+    assert_eq!(
+        one_text_cell(&client, "SELECT count(*) FROM t").await,
+        BIG.len().to_string()
+    );
+}
