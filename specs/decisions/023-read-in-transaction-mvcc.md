@@ -1,6 +1,6 @@
 ---
 title: ADR-023 — Read-in-transaction: snapshot reads and a read-set committed through Accord
-status: proposed
+status: accepted
 date: 2026-10-11
 component: transaction-manager
 executive_summary: >
@@ -17,7 +17,11 @@ executive_summary: >
 
 ## Status
 
-Proposed.
+Accepted (2026-10-11). The requester chose **option C**: PostgreSQL MVCC supplies snapshot
+visibility (as already built) and the Accord commit path validates the read-set at the agreed
+commit-`t`. Option A (Accord validation with no MVCC snapshots) and option B (MVCC-only, where a
+read never constrains the Accord commit) were rejected; B is precisely the shape that permits a
+non-serializable result to be reported as success (failure mode RT-6).
 
 ## Context
 

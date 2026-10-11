@@ -17,7 +17,7 @@ executive_summary: >
 
 | Sprint | Outcome (what a user can do after it) | Gate |
 |---|---|---|
-| S1 | Two known concurrency defects are held down by failing-then-passing tests at the real entry point | tests exist and are RED before the fix |
+| S1 | Two known concurrency defects are held down by tests at the level where each reproduces | RT-3's in-process fixture measured GREEN (3/3), so its reproducer MUST be clustered (two processes + wire) - OWED; the live probe holds it meanwhile. RT-2: live probe. |
 | S2 | A transaction can `SELECT` and commit; the read returns the value at the transaction's agreed `t`, validated through Accord | in-repo red at the engine seam, then green |
 | S3 | Transactions with large read/write sets stay bounded in memory | measured flat peak-memory curve at stated N |
 | S4 | Strict-serializability is CERTIFIED, not asserted | Elle `list-append`, `:valid? true`, live RF=3 + nemesis, no assumptions |
