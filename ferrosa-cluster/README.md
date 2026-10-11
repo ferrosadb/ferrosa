@@ -312,6 +312,13 @@ build; the codec's own cost is its delta against `none`.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.
+  Both detectors are pure predicates (`burst_storm`, `rolling_window_storm`) and
+  both take `has_leader`: suppression exists so a LIVE leader can catch a
+  divergent follower up, so the guard never fires while `metrics.current_leader`
+  is `None`. A leaderless node is *always* a `Candidate` with a stalled log, so
+  without that gate every node in a leaderless cluster mutes its own elections at
+  the same instant and the guard holds the outage open instead of shortening it.
+  Pinned by `raft::election_guard::tests`.
 - `consensus_metrics.rs` — Prometheus surface for Raft liveness:
   `ferrosa_raft_current_term` / `_is_leader` / `_has_leader` (fed by
   `run_consensus_metrics_poller`, a per-cluster-node task that derives leadership

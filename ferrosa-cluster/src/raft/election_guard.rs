@@ -140,6 +140,49 @@ const ROLLING_WINDOW_MS: u64 = 30_000;
 const ROLLING_WINDOW_MIN_JUMPS: u64 = 2;
 
 // ---------------------------------------------------------------------------
+// Pure detection decisions
+// ---------------------------------------------------------------------------
+//
+// Extracted from the poll loop so the guard's decisions are testable without a
+// live `Raft` instance.  Both are pure: same inputs, same answer, no I/O.
+//
+// # Invariant — never mute a leaderless cluster
+//
+// Suppression exists so a LIVE leader can catch a divergent follower up.  With
+// no leader there is nothing to catch up from, and every node in the cluster
+// sees the same signature at the same time (a leaderless node is always a
+// `Candidate` with a stalled log).  Muting all of them leaves the cluster with
+// no node willing to call an election, so the guard *prolongs* the outage it
+// was added to shorten.  Neither detector may fire while `has_leader` is false.
+
+/// Fast-path burst detector (P0-17): two or more elections fired and were
+/// rejected inside one poll window while this node was a `Candidate`, with no
+/// log progress.
+pub(crate) fn burst_storm(
+    state: ServerState,
+    term_delta: u64,
+    log_advanced: bool,
+    has_leader: bool,
+) -> bool {
+    has_leader
+        && state == ServerState::Candidate
+        && term_delta > TERM_JUMP_THRESHOLD
+        && !log_advanced
+}
+
+/// Slow-path rolling-window detector (P0-19): every sample in the window was a
+/// `Candidate`, at least [`ROLLING_WINDOW_MIN_JUMPS`] elections fired, and the
+/// log did not advance.
+pub(crate) fn rolling_window_storm(
+    all_candidate: bool,
+    total_jumps: u64,
+    log_stalled: bool,
+    has_leader: bool,
+) -> bool {
+    has_leader && all_candidate && total_jumps >= ROLLING_WINDOW_MIN_JUMPS && log_stalled
+}
+
+// ---------------------------------------------------------------------------
 // Rolling-window sample
 // ---------------------------------------------------------------------------
 
@@ -221,6 +264,11 @@ pub async fn run_election_guard<C>(
         let current_term = metrics.current_term;
         let current_log_index = metrics.last_log_index;
         let state = metrics.state;
+        // A storm can only be ridden out by a LIVE leader catching a divergent
+        // follower up.  With no leader there is nothing to catch up from, and
+        // muting elections on every node at once is exactly what keeps a
+        // leaderless cluster leaderless — so the detectors must not fire.
+        let has_leader = metrics.current_leader.is_some();
 
         // --- Re-enable elections if suppress window expired ---
         if suppressing && tokio::time::Instant::now() >= suppress_until {
@@ -251,8 +299,7 @@ pub async fn run_election_guard<C>(
         // Two or more elections fired and were rejected within a single 1-second
         // poll window.  Catches short election_timeout_min scenarios.
         let log_advancing = current_log_index != prev_log_index;
-        let burst_storm =
-            state == ServerState::Candidate && term_delta > TERM_JUMP_THRESHOLD && !log_advancing;
+        let burst_storm = burst_storm(state, term_delta, log_advancing, has_leader);
 
         if burst_storm {
             fire_suppression(
@@ -311,7 +358,7 @@ pub async fn run_election_guard<C>(
             let log_stalled = window_end.log_index == window_start.log_index;
 
             let slow_storm =
-                all_candidate && total_jumps >= ROLLING_WINDOW_MIN_JUMPS && log_stalled;
+                rolling_window_storm(all_candidate, total_jumps, log_stalled, has_leader);
 
             if slow_storm {
                 fire_suppression(
@@ -381,4 +428,134 @@ fn fire_suppression<C>(
     );
 
     raft.runtime_config().elect(false);
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The exact signature seen on every node during the 2026-10-11 outage: a
+    /// leaderless `Candidate` re-electing itself with no log progress. Both
+    /// detectors must fire for it while a leader exists — the guard's stated
+    /// purpose (let that leader catch the divergent follower up).
+    #[test]
+    fn both_detectors_fire_on_the_observed_storm_shape_while_a_leader_lives() {
+        assert!(
+            burst_storm(ServerState::Candidate, 5, false, true),
+            "burst: term jumped by 5 with no log progress"
+        );
+        assert!(
+            rolling_window_storm(true, 2, true, true),
+            "rolling-window: candidate for the whole window, 2 jumps, log stalled"
+        );
+    }
+
+    // --- Invariant: a leaderless cluster is never muted ---------------------
+
+    /// THE DEFECT. A node with no leader is *always* a `Candidate`; when the
+    /// cluster is leaderless every node sees this same shape at the same
+    /// instant. Muting all of them leaves nobody willing to call an election,
+    /// so the guard holds open the very outage it exists to shorten.
+    #[test]
+    fn neither_detector_mutes_elections_when_the_cluster_has_no_leader() {
+        assert!(
+            !burst_storm(ServerState::Candidate, 5, false, false),
+            "burst detector must not suppress elections with no leader to catch up from"
+        );
+        assert!(
+            !rolling_window_storm(true, 2, true, false),
+            "rolling-window detector must not suppress elections with no leader to catch up from"
+        );
+    }
+
+    /// Every storm shape either detector recognises, driven with
+    /// `has_leader = false`. Each must stay silent: a detector that fires here
+    /// is a detector that can only ever make a leaderless cluster worse.
+    #[test]
+    fn no_storm_shape_suppresses_elections_in_a_leaderless_cluster() {
+        let shapes = [
+            (ServerState::Candidate, 0u64, false),
+            (ServerState::Candidate, 1, false),
+            (ServerState::Candidate, 2, false),
+            (ServerState::Candidate, 99, false),
+            (ServerState::Candidate, 2, true),
+            (ServerState::Follower, 2, false),
+            (ServerState::Leader, 2, false),
+            (ServerState::Learner, 2, false),
+            (ServerState::Shutdown, 2, false),
+        ];
+        for (state, delta, advanced) in shapes {
+            assert!(
+                !burst_storm(state, delta, advanced, false),
+                "burst detector fired with no leader (state={state:?} delta={delta} advanced={advanced})"
+            );
+        }
+        for all_candidate in [false, true] {
+            for jumps in [0u64, 1, 2, 99] {
+                for stalled in [false, true] {
+                    assert!(
+                        !rolling_window_storm(all_candidate, jumps, stalled, false),
+                        "rolling-window detector fired with no leader \
+                         (all_candidate={all_candidate} jumps={jumps} stalled={stalled})"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- The guard must still be a guard -----------------------------------
+
+    /// A single rejected election is a legitimate election, not a storm — the
+    /// gate must not have disabled the detectors outright.
+    #[test]
+    fn a_single_rejected_election_is_not_a_storm() {
+        assert!(
+            !burst_storm(ServerState::Candidate, 1, false, true),
+            "delta of 1 is one election, below TERM_JUMP_THRESHOLD"
+        );
+        assert!(
+            !rolling_window_storm(true, 1, true, true),
+            "one jump is below ROLLING_WINDOW_MIN_JUMPS"
+        );
+    }
+
+    /// Log progress is never a storm, and a node that is not a `Candidate` is
+    /// not storming either.
+    #[test]
+    fn log_progress_or_a_settled_state_is_not_a_storm() {
+        assert!(
+            !burst_storm(ServerState::Candidate, 3, true, true),
+            "an advancing log is catch-up, not a storm"
+        );
+        for state in [
+            ServerState::Follower,
+            ServerState::Leader,
+            ServerState::Learner,
+            ServerState::Shutdown,
+        ] {
+            assert!(
+                !burst_storm(state, 9, false, true),
+                "{state:?} is not a storming candidate"
+            );
+        }
+        assert!(
+            !rolling_window_storm(true, 9, false, true),
+            "an advancing log is catch-up, not a storm"
+        );
+        assert!(
+            !rolling_window_storm(false, 9, true, true),
+            "one non-candidate sample means the window is not all-candidate"
+        );
+    }
+
+    /// The slow-path threshold is inclusive at exactly `ROLLING_WINDOW_MIN_JUMPS`.
+    #[test]
+    fn rolling_window_threshold_is_inclusive_at_two_jumps() {
+        assert!(rolling_window_storm(true, 2, true, true));
+        assert!(!rolling_window_storm(true, 1, true, true));
+    }
 }
