@@ -679,6 +679,46 @@ async fn a_where_on_a_column_with_no_index_falls_back_to_a_filtering_scan() {
     );
 }
 
+/// The DELETE twin of the declared-key UPDATE.
+///
+/// LABEL, honestly: this was written AFTER the implementation landed, so it is a regression
+/// guard and not a red. The behaviour it pins was `0A000` before the change — the UPDATE twin
+/// failed on exactly the same gate (`query.rs:3653` for DELETE, `:3226` for UPDATE), so the
+/// pre-fix outcome is evidenced rather than assumed. To make it a true red, revert the
+/// `execute_delete` half alone and watch this fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_delete_by_the_declared_key_removes_exactly_that_row() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE pbdel (aid integer, abalance integer)")
+        .await
+        .expect("a PK-less CREATE TABLE executes");
+    fx.client
+        .batch_execute("INSERT INTO pbdel (aid, abalance) VALUES (1, 100), (2, 200), (7, 700)")
+        .await
+        .expect("rows land");
+    fx.client
+        .batch_execute("ALTER TABLE pbdel ADD PRIMARY KEY (aid)")
+        .await
+        .expect("ALTER ADD PRIMARY KEY executes");
+    await_index_current(&fx, "pbdel", "pbdel_pkey").await;
+
+    fx.client
+        .execute("DELETE FROM pbdel WHERE aid = 2", &[])
+        .await
+        .unwrap_or_else(|e| panic!("DELETE by the declared key must not be refused: {e}"));
+
+    // Values, not a count: the SURVIVING identities are what a wrong-row delete cannot fake.
+    let survivors = fx
+        .client
+        .query("SELECT aid FROM pbdel", &[])
+        .await
+        .expect("read the survivors");
+    let mut ids: Vec<i32> = survivors.iter().map(|r| r.get::<_, i32>(0)).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![1, 7], "exactly the row the predicate named is gone");
+}
+
 /// A `MakeWriter` that collects everything logged into a shared buffer, so a test can
 /// assert a warning was actually emitted. The same pattern ferrosa-cql's router tests and
 /// ferrosa-storage's engine tests use for their scan/index warnings.
@@ -748,6 +788,16 @@ fn a_scan_fallback_is_logged_loudly() {
                 )
                 .await
                 .expect("UPDATE with no index must not be refused");
+
+            // The scan warning rides the statement path but can land AFTER the UPDATE's
+            // response, so yield until it does instead of racing it. The wait MUST be inside
+            // this subscriber scope: `with_default` is thread-local, so anything logged after
+            // the scope closes is simply never captured. This test passed on one schedule and
+            // failed on the next, so the wait is the fix — a single lucky run was not evidence.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while std::time::Instant::now() < deadline && !logs.text().contains("pbscanlog") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
         });
     });
 
