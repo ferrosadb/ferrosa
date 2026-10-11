@@ -711,6 +711,14 @@ pub struct AccordCoordinatorDriver {
     /// index. `None` keeps every payload resident: the small-write-set path, byte for
     /// byte what it was before.
     write_blobs: Option<Arc<ferrosa_storage::write_set_spill::WriteSetSpill>>,
+    /// How many of the LEADING write-set entries are backed by [`Self::write_blobs`].
+    ///
+    /// A committer that appends protocol markers (barrier/marker keys) AFTER the staged
+    /// payloads makes the staged region an exact PREFIX of `write_set`; entry `i <
+    /// staged_prefix` reads its payload from the spill, and entry `i >= staged_prefix`
+    /// carries its (empty) payload in `write_set[i].mutation`. `None` means "every entry is
+    /// staged" — the shape [`Self::with_spilled_write_set`] alone produces.
+    staged_prefix: Option<usize>,
 }
 
 /// Return the row bytes that at least `quorum` of `reads` agree on, if any.
@@ -986,6 +994,7 @@ impl AccordCoordinatorDriver {
             condition_gate: None,
             per_key_replicas: None,
             write_blobs: None,
+            staged_prefix: None,
         }
     }
 
@@ -1119,7 +1128,42 @@ impl AccordCoordinatorDriver {
         blobs: Arc<ferrosa_storage::write_set_spill::WriteSetSpill>,
     ) -> Self {
         self.write_blobs = Some(blobs);
+        self.staged_prefix = None;
         self
+    }
+
+    /// Mark only the LEADING `staged_prefix` write-set entries as staged in the spill set by
+    /// [`Self::with_spilled_write_set`], leaving entries at/after it to carry their (empty)
+    /// resident payload. Used by `commit_postgres`, which appends the barrier/marker protocol
+    /// keys AFTER the staged payloads, so the two markers are never read back from the spill.
+    pub fn with_staged_prefix(mut self, staged_prefix: usize) -> Self {
+        self.staged_prefix = Some(staged_prefix);
+        self
+    }
+
+    /// The payload for write-set entry `index`: a slice of the spill's memory map for a
+    /// STAGED entry (`index < staged_prefix`), else the entry's resident bytes.
+    ///
+    /// A staged index that is out of range FAILS LOUD; a resident entry at/after the staged
+    /// prefix (a protocol marker, empty by construction) reads its own field. Never a silent
+    /// empty read for a payload that SHOULD have been staged.
+    fn write_set_payload(&self, index: usize) -> Result<&[u8], AccordDriverError> {
+        if let Some(blobs) = &self.write_blobs {
+            if index < self.staged_prefix.unwrap_or(usize::MAX) {
+                return blobs
+                    .entry(index)
+                    .map_err(|e| AccordDriverError::Codec(e.to_string()));
+            }
+        }
+        self.write_set
+            .get(index)
+            .map(|entry| entry.mutation.as_slice())
+            .ok_or_else(|| {
+                AccordDriverError::Codec(format!(
+                    "write-set index {index} is out of range ({} entries)",
+                    self.write_set.len()
+                ))
+            })
     }
 
     /// The encoded mutation payload for write-set entry `index`, as an **owned** copy.
@@ -1148,21 +1192,7 @@ impl AccordCoordinatorDriver {
     /// per-peer fan-out already takes via [`Self::borrowed_write_set_entries`]. No owned
     /// `Vec<u8>` is materialized per entry on that path.
     fn entry_mutation(&self, index: usize) -> Result<Vec<u8>, AccordDriverError> {
-        match &self.write_blobs {
-            Some(blobs) => blobs
-                .mutation(index)
-                .map_err(|e| AccordDriverError::Codec(e.to_string())),
-            None => self
-                .write_set
-                .get(index)
-                .map(|entry| entry.mutation.clone())
-                .ok_or_else(|| {
-                    AccordDriverError::Codec(format!(
-                        "write-set index {index} is out of range ({} entries)",
-                        self.write_set.len()
-                    ))
-                }),
-        }
+        Ok(self.write_set_payload(index)?.to_vec())
     }
 
     /// The representative (first) write-set entry's payload, for the single-key v1
@@ -1170,9 +1200,7 @@ impl AccordCoordinatorDriver {
     /// is staged it is EMPTY, so read entry 0 back from local temp storage instead.
     fn representative_mutation(&self) -> Result<Vec<u8>, AccordDriverError> {
         match &self.write_blobs {
-            Some(blobs) => blobs
-                .mutation(0)
-                .map_err(|e| AccordDriverError::Codec(e.to_string())),
+            Some(_) => Ok(self.write_set_payload(0)?.to_vec()),
             None => Ok(self.mutation.clone()),
         }
     }
@@ -1213,12 +1241,7 @@ impl AccordCoordinatorDriver {
             .enumerate()
             .filter(|(_, e)| own(&e.key))
             .map(|(index, e)| {
-                let mutation: &[u8] = match &self.write_blobs {
-                    Some(blobs) => blobs
-                        .entry(index)
-                        .map_err(|err| AccordDriverError::Codec(err.to_string()))?,
-                    None => e.mutation.as_slice(),
-                };
+                let mutation: &[u8] = self.write_set_payload(index)?;
                 Ok((e.key.as_slice(), mutation))
             })
             .collect()
@@ -2606,9 +2629,17 @@ impl AccordCoordinatorDriver {
                     // become an empty write that applies nothing).
                     Some(blobs) => {
                         let blobs = std::sync::Arc::clone(blobs);
+                        // Entries at/after the staged prefix are the committer's protocol
+                        // markers (barrier/marker keys): resident, empty by construction, and
+                        // never staged — so they must NOT be read back from the spill.
+                        let staged_prefix = self.staged_prefix.unwrap_or(usize::MAX);
                         crate::accord::handlers::on_state_machine(local_sm, move |sm| {
                             let mut writes: Vec<&[u8]> = Vec::with_capacity(owned_indices.len());
                             for &index in &owned_indices {
+                                if index >= staged_prefix {
+                                    writes.push(&[]);
+                                    continue;
+                                }
                                 match blobs.entry(index) {
                                     Ok(bytes) => writes.push(bytes),
                                     Err(err) => {

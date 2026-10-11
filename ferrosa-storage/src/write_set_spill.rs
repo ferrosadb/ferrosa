@@ -90,21 +90,36 @@ pub struct WriteSetSpill {
     /// staging file is zero bytes, which `mmap` refuses; every entry is then empty by
     /// construction.
     map: Option<memmap2::Mmap>,
-    /// Owns the staging directory; dropping the spill removes it.
-    _reservation: TempSortTableReservation,
+    /// Owns the staging directory; dropping the spill removes it. `None` only for a
+    /// spill built entirely within the resident buffer ([`WriteSetSpillBuilder`]),
+    /// where nothing ever reached the filesystem.
+    _reservation: Option<TempSortTableReservation>,
     path: PathBuf,
-    /// Byte offset of each staged payload, by write-set index.
+    /// The resident prefix: entries appended while the buffer was under the threshold
+    /// and never drained to disk. Built by [`WriteSetSpillBuilder`]; EMPTY for a spill
+    /// assembled by [`WriteSetSpill::stage`], whose entries are all spilled.
+    ///
+    /// Declared before the spilled index so a spill with a resident prefix reads entry
+    /// `i` from `resident[i]` for `i < resident.len()`, else from the spilled region at
+    /// `i - resident.len()`.
+    resident: Vec<Vec<u8>>,
+    /// Sum of [`Self::resident`] lengths. Bounded by the staging threshold.
+    resident_bytes: u64,
+    /// Byte offset of each SPILLED payload, in append order (after the resident prefix).
     offsets: Vec<u64>,
-    /// Payload length in bytes, by write-set index.
+    /// Payload length in bytes, by spilled index.
     lens: Vec<u32>,
-    /// Total payload bytes staged (observability + tests).
+    /// Total payload bytes staged ON DISK (observability + tests). The resident prefix
+    /// is reported separately via [`Self::resident_bytes`]; `bytes()` is the disk figure
+    /// the spill exists to bound.
     bytes: u64,
 }
 
 impl std::fmt::Debug for WriteSetSpill {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WriteSetSpill")
-            .field("entries", &self.offsets.len())
+            .field("entries", &self.len())
+            .field("resident", &self.resident.len())
             .field("bytes", &self.bytes)
             .finish_non_exhaustive()
     }
@@ -194,27 +209,52 @@ impl WriteSetSpill {
         drop(file);
         Ok(Self {
             map,
-            _reservation: reservation,
+            _reservation: Some(reservation),
             path,
+            resident: Vec::new(),
+            resident_bytes: 0,
             offsets,
             lens,
             bytes,
         })
     }
 
-    /// Number of staged write-set entries.
+    /// Number of staged write-set entries (resident prefix + spilled).
     pub fn len(&self) -> usize {
-        self.offsets.len()
+        self.resident.len() + self.offsets.len()
     }
 
     /// Whether no payload was staged.
     pub fn is_empty(&self) -> bool {
-        self.offsets.is_empty()
+        self.len() == 0
     }
 
-    /// Total payload bytes staged on disk.
+    /// Total payload bytes staged on disk. See [`WriteSetSpillBuilder::resident_bytes`]
+    /// for the in-memory prefix of a builder-assembled spill.
     pub fn bytes(&self) -> u64 {
         self.bytes
+    }
+
+    /// Whether any payload bytes reached the staging file.
+    ///
+    /// True when this spill owns a staging directory — i.e. its payloads did not all fit the
+    /// resident buffer and were drained to disk. False only for a spill built entirely within
+    /// the resident buffer ([`WriteSetSpillBuilder`]), where nothing ever touched the
+    /// filesystem. This is the finished-spill twin of
+    /// [`WriteSetSpillBuilder::spilled_to_disk`]: where the builder reports "the writer was
+    /// opened", this reports "the staging directory exists", which is the same fact one step
+    /// later. A degenerate all-empty spill still created the file and so reports `true`; there
+    /// is simply no payload bulk to be resident.
+    #[must_use]
+    pub fn spilled_to_disk(&self) -> bool {
+        self._reservation.is_some()
+    }
+
+    /// Payload bytes still held in the resident prefix. Zero for a spill assembled by
+    /// [`Self::stage`] (all entries spilled); bounded by the staging threshold for one
+    /// assembled by [`WriteSetSpillBuilder`].
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
     }
 
     /// Bytes of the resident index (offset + length tables) — the only part of a
@@ -231,14 +271,20 @@ impl WriteSetSpill {
     /// would escape the mapping (a corrupt offset table must never read past the
     /// mapped region).
     pub fn entry(&self, index: usize) -> Result<&[u8]> {
+        // The resident prefix: entries that never reached the filesystem. Read in place.
+        if let Some(resident) = self.resident.get(index) {
+            return Ok(resident);
+        }
+        // Past the prefix, entry `index` is SPILLED entry `index - resident.len()`.
+        let spilled = index - self.resident.len();
         let (&offset, &len) = self
             .offsets
-            .get(index)
-            .zip(self.lens.get(index))
+            .get(spilled)
+            .zip(self.lens.get(spilled))
             .ok_or_else(|| {
                 Error::InvalidData(format!(
                     "write-set spill: index {index} is out of range ({} entries staged)",
-                    self.offsets.len()
+                    self.len()
                 ))
             })?;
         let start = usize::try_from(offset).map_err(|_| {
@@ -275,6 +321,245 @@ impl WriteSetSpill {
     /// twin of [`Self::entry`]; callers that can borrow should use `entry`.
     pub fn mutation(&self, index: usize) -> Result<Vec<u8>> {
         Ok(self.entry(index)?.to_vec())
+    }
+}
+
+/// Build a [`WriteSetSpill`] **one payload at a time**, spilling past a bounded resident
+/// buffer — the STREAMING twin of [`WriteSetSpill::stage`].
+///
+/// [`WriteSetSpill::stage`] takes an already-assembled `&mut [Vec<u8>]`, so it can only
+/// bound the LIFETIME of the payload bulk, never its RESIDENCE: the caller held the
+/// whole write-set to hand it over. This builder removes that prerequisite. [`append`]
+/// accepts one encoded payload as it is produced, keeps a bounded resident prefix, and
+/// drains to disk past the threshold, so a caller driving a decoder can stream a
+/// write-set of any size into a spill without ever holding it.
+///
+/// ## The buffer is a BUFFER, never a cap
+///
+/// The resident limit is the runtime-tunable
+/// [`crate::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV`]
+/// (`FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`, default [`WRITE_SET_SPILL_FLOOR_BYTES`]).
+/// A write-set larger than it SPILLS; it is never refused or truncated. Below the
+/// threshold nothing touches the filesystem, so a small commitment (an LWT, single-row
+/// DML) pays nothing — the staging directory is created lazily on the first spill.
+///
+/// [`append`]: WriteSetSpillBuilder::append
+pub struct WriteSetSpillBuilder {
+    /// Resident buffer size before the builder spills. A BUFFER SIZE, not a cap.
+    threshold_bytes: u64,
+    /// Payloads held in memory while under the threshold. Drained in order on the first
+    /// spill; never re-filled after that, so `resident.len()` freezes once spilling.
+    resident: Vec<Vec<u8>>,
+    /// Sum of `resident` lengths.
+    resident_bytes: u64,
+    /// Owns the staging directory; `None` until the first spill.
+    reservation: Option<TempSortTableReservation>,
+    /// The staging file path; set with the reservation on the first spill.
+    path: PathBuf,
+    /// The spill writer; `None` while fully resident.
+    writer: Option<BufWriter<File>>,
+    /// Byte offset of each SPILLED payload, in append order.
+    offsets: Vec<u64>,
+    /// Length in bytes of each SPILLED payload.
+    lens: Vec<u32>,
+    /// Total payload bytes written to disk.
+    bytes: u64,
+}
+
+impl std::fmt::Debug for WriteSetSpillBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteSetSpillBuilder")
+            .field("entries", &self.len())
+            .field("resident", &self.resident.len())
+            .field("resident_bytes", &self.resident_bytes)
+            .field("spilled_to_disk", &self.spilled_to_disk())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for WriteSetSpillBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WriteSetSpillBuilder {
+    /// A builder keeping `threshold_bytes` resident before spilling. A zero threshold is
+    /// clamped to one byte (spill on the first payload) rather than refused.
+    #[must_use]
+    pub fn with_threshold(threshold_bytes: u64) -> Self {
+        Self {
+            threshold_bytes: threshold_bytes.max(1),
+            resident: Vec::new(),
+            resident_bytes: 0,
+            reservation: None,
+            path: PathBuf::new(),
+            writer: None,
+            offsets: Vec::new(),
+            lens: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    /// A builder using the process-wide
+    /// [`crate::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV`] setting, read once here.
+    #[must_use]
+    pub fn new() -> Self {
+        let threshold = crate::write_set_stage::resolve_spill_threshold(
+            std::env::var(crate::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV)
+                .ok()
+                .as_deref(),
+        );
+        Self::with_threshold(threshold)
+    }
+
+    /// Number of payloads appended so far (resident + spilled).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.resident.len() + self.offsets.len()
+    }
+
+    /// Whether nothing has been appended.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Payload bytes still held in memory. Never exceeds the threshold once spilling.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+    }
+
+    /// Whether anything has reached the disk yet.
+    #[must_use]
+    pub fn spilled_to_disk(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// Append one encoded payload, spilling the resident prefix if this append would push
+    /// the resident buffer past the threshold.
+    ///
+    /// A write error is surfaced, never swallowed: a builder that silently dropped a
+    /// payload would stage a write-set missing rows.
+    ///
+    /// # Errors
+    ///
+    /// A payload longer than `u32::MAX`, or a staging I/O failure.
+    pub fn append(&mut self, payload: &[u8]) -> Result<()> {
+        let len = u32::try_from(payload.len()).map_err(|_| {
+            Error::InvalidFormat(format!(
+                "write-set spill: payload of {} bytes exceeds the u32 staging bound",
+                payload.len()
+            ))
+        })?;
+        if self.writer.is_none() {
+            // Stay resident while the whole prefix still fits the buffer. The comparison
+            // is on `<=` so a payload landing EXACTLY on the threshold stays resident.
+            if self.resident_bytes + u64::from(len) <= self.threshold_bytes {
+                self.resident.push(payload.to_vec());
+                self.resident_bytes += u64::from(len);
+                return Ok(());
+            }
+            self.begin_spill()?;
+        }
+        self.write_spilled(payload, len)
+    }
+
+    /// Create the staging file and drain the resident prefix into it, in order.
+    fn begin_spill(&mut self) -> Result<()> {
+        let reservation = reserve_write_set_stage()?;
+        let path = reservation.path().join("write-set.bin");
+        let file = File::create(&path).map_err(|e| {
+            Error::InvalidFormat(format!("write-set spill: create {}: {e}", path.display()))
+        })?;
+        let mut writer = BufWriter::new(file);
+        // Drain the resident prefix in order. `std::mem::take` frees each payload's memory
+        // as it is written, so the drain's extra residency is one payload, not the prefix.
+        for blob in self.resident.drain(..) {
+            let len = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+            self.offsets.push(self.bytes);
+            self.lens.push(len);
+            writer.write_all(&blob).map_err(|e| {
+                Error::InvalidFormat(format!("write-set spill: write {}: {e}", path.display()))
+            })?;
+            self.bytes += u64::from(len);
+        }
+        self.resident_bytes = 0;
+        self.path = path;
+        self.writer = Some(writer);
+        self.reservation = Some(reservation);
+        Ok(())
+    }
+
+    fn write_spilled(&mut self, payload: &[u8], len: u32) -> Result<()> {
+        let writer = self
+            .writer
+            .as_mut()
+            .expect("write_spilled is only called once the builder is spilling");
+        self.offsets.push(self.bytes);
+        self.lens.push(len);
+        writer
+            .write_all(payload)
+            .map_err(|e| Error::InvalidFormat(format!("write-set spill: write payload: {e}")))?;
+        self.bytes += u64::from(len);
+        Ok(())
+    }
+
+    /// Flush, memory-map the spilled region, and return the finished [`WriteSetSpill`].
+    ///
+    /// A builder that never spilled returns a spill with no mapping and no staging
+    /// directory: every entry is read from the resident prefix.
+    ///
+    /// # Errors
+    ///
+    /// A flush, reopen, or mmap failure is surfaced.
+    pub fn finish(mut self) -> Result<WriteSetSpill> {
+        let (map, reservation) = match self.writer.take() {
+            Some(mut writer) => {
+                writer
+                    .flush()
+                    .map_err(|e| Error::InvalidFormat(format!("write-set spill: flush: {e}")))?;
+                // Drop the writer so the file is closed before mapping.
+                drop(writer);
+                let reservation = self
+                    .reservation
+                    .take()
+                    .expect("a spilling builder always owns its reservation");
+                let file = File::open(&self.path).map_err(|e| {
+                    Error::InvalidFormat(format!(
+                        "write-set spill: reopen {}: {e}",
+                        self.path.display()
+                    ))
+                })?;
+                let map = if self.bytes == 0 {
+                    None
+                } else {
+                    // SAFETY: the staging file is private to this builder — it lives in a
+                    // fresh directory created by `reserve_write_set_stage`, the writer is
+                    // closed above, and no writable handle survives.
+                    Some(unsafe { memmap2::Mmap::map(&file) }.map_err(|e| {
+                        Error::InvalidFormat(format!(
+                            "write-set spill: mmap {}: {e}",
+                            self.path.display()
+                        ))
+                    })?)
+                };
+                drop(file);
+                (map, Some(reservation))
+            }
+            None => (None, None),
+        };
+        Ok(WriteSetSpill {
+            map,
+            _reservation: reservation,
+            path: self.path,
+            resident: self.resident,
+            resident_bytes: self.resident_bytes,
+            offsets: self.offsets,
+            lens: self.lens,
+            bytes: self.bytes,
+        })
     }
 }
 
@@ -426,7 +711,12 @@ mod tests {
     fn dropping_the_spill_removes_the_staging_directory() {
         let mut blobs = vec![b"payload".to_vec()];
         let spill = stage(&mut blobs);
-        let dir = spill._reservation.path().to_path_buf();
+        let dir = spill
+            ._reservation
+            .as_ref()
+            .expect("a staged spill owns its reservation")
+            .path()
+            .to_path_buf();
         assert!(dir.exists());
         drop(spill);
         assert!(
@@ -444,7 +734,12 @@ mod tests {
     fn the_mapped_region_is_released_only_on_the_last_arc_drop() {
         let mut blobs = vec![vec![0x5Au8; 4096]];
         let spill = std::sync::Arc::new(stage(&mut blobs));
-        let dir = spill._reservation.path().to_path_buf();
+        let dir = spill
+            ._reservation
+            .as_ref()
+            .expect("a staged spill owns its reservation")
+            .path()
+            .to_path_buf();
         let first = std::sync::Arc::clone(&spill);
         let last = std::sync::Arc::clone(&spill);
         assert_eq!(std::sync::Arc::strong_count(&spill), 3);
@@ -546,6 +841,192 @@ mod tests {
             control_dirty > 0,
             "negative control: an unsynced mapping must show DIRTY pages, or this \
              assertion cannot detect the defect"
+        );
+    }
+
+    // --- WriteSetSpillBuilder: the STREAMING twin of `stage` ---------------------------------
+    //
+    // These lock the property the builder exists for: a producer can stream a write-set of ANY
+    // size in without ever holding it, because the builder keeps a bounded resident prefix and
+    // spills the rest. `stage` cannot do this — it demands the whole `&mut [Vec<u8>]` first.
+
+    /// Under the threshold the builder never touches disk, and every payload reads back
+    /// byte-identically in append order.
+    #[test]
+    fn builder_stays_resident_below_threshold_and_reads_back_in_order() {
+        let payloads: Vec<Vec<u8>> = (0..64usize).map(|i| vec![i as u8; i + 1]).collect();
+        let mut builder = WriteSetSpillBuilder::with_threshold(u64::MAX);
+        for payload in &payloads {
+            builder.append(payload).unwrap();
+        }
+        assert!(
+            !builder.spilled_to_disk(),
+            "a small set must not touch disk"
+        );
+        let spill = builder.finish().unwrap();
+        assert_eq!(spill.len(), payloads.len());
+        assert_eq!(spill.bytes(), 0, "nothing reached the filesystem");
+        assert_eq!(spill.resident_bytes(), builder_resident_total(&payloads));
+        for (index, expected) in payloads.iter().enumerate() {
+            assert_eq!(
+                spill.entry(index).unwrap(),
+                expected.as_slice(),
+                "entry {index}"
+            );
+        }
+    }
+
+    fn builder_resident_total(payloads: &[Vec<u8>]) -> u64 {
+        payloads.iter().map(|p| p.len() as u64).sum()
+    }
+
+    /// Past the threshold the builder SPILLS, the resident prefix stays within the buffer, and
+    /// every payload still reads back byte-identically in append order.
+    #[test]
+    fn builder_spills_past_threshold_bounded_and_ordered() {
+        let payloads: Vec<Vec<u8>> = (0..512usize).map(|i| vec![(i % 251) as u8; 64]).collect();
+        let threshold = 256u64;
+        let mut builder = WriteSetSpillBuilder::with_threshold(threshold);
+        for payload in &payloads {
+            builder.append(payload).unwrap();
+        }
+        assert!(
+            builder.spilled_to_disk(),
+            "past the buffer the builder spills"
+        );
+        assert!(
+            builder.resident_bytes() <= threshold,
+            "resident payload must stay within the buffer, got {} > {threshold}",
+            builder.resident_bytes()
+        );
+        let spill = builder.finish().unwrap();
+        assert_eq!(spill.len(), payloads.len(), "no entry is dropped");
+        assert!(spill.bytes() > 0, "the bulk reached the filesystem");
+        for (index, expected) in payloads.iter().enumerate() {
+            assert_eq!(
+                spill.entry(index).unwrap(),
+                expected.as_slice(),
+                "append order preserved at {index}"
+            );
+        }
+    }
+
+    /// A builder's output is byte-for-byte identical to `WriteSetSpill::stage`'s over the same
+    /// payloads — the streaming path is a drop-in for the assembled one.
+    #[test]
+    fn builder_matches_stage_byte_for_byte() {
+        let payloads: Vec<Vec<u8>> = (0..300usize)
+            .map(|i| vec![(i % 97) as u8; 40 + i % 13])
+            .collect();
+
+        let mut builder = WriteSetSpillBuilder::with_threshold(128);
+        for payload in &payloads {
+            builder.append(payload).unwrap();
+        }
+        let streamed = builder.finish().unwrap();
+
+        let reservation = reserve_write_set_stage().unwrap();
+        let mut blobs = payloads.clone();
+        let assembled = WriteSetSpill::stage(reservation, &mut blobs).unwrap();
+
+        assert_eq!(streamed.len(), assembled.len());
+        assert_eq!(streamed.bytes(), assembled.bytes());
+        for index in 0..payloads.len() {
+            assert_eq!(
+                streamed.entry(index).unwrap(),
+                assembled.entry(index).unwrap(),
+                "entry {index} differs between the streaming and assembled spills"
+            );
+        }
+    }
+
+    /// NEGATIVE CONTROL for `builder_matches_stage_byte_for_byte` and
+    /// `builder_spills_past_threshold_bounded_and_ordered`: the differential comparison and the
+    /// per-index order assertion are LIVE, not vacuous. Flipping one payload byte and swapping two
+    /// adjacent entries each make the read-back DIFFER from the streamed spill, so a spill that
+    /// returned the wrong bytes — or the right bytes in the wrong order — would fail those tests
+    /// rather than pass silently.
+    #[test]
+    fn a_mutated_or_reordered_set_differs_from_the_streamed_spill() {
+        let payloads: Vec<Vec<u8>> = (0..300usize)
+            .map(|i| vec![(i % 97) as u8; 40 + i % 13])
+            .collect();
+        let spill_over = |input: &[Vec<u8>]| {
+            let mut builder = WriteSetSpillBuilder::with_threshold(128);
+            for payload in input {
+                builder.append(payload).unwrap();
+            }
+            builder.finish().unwrap()
+        };
+
+        let baseline = spill_over(&payloads);
+
+        let mut mutated = payloads.clone();
+        mutated[0][0] ^= 0xFF; // one wrong byte in entry 0
+        let mut swapped = payloads.clone();
+        swapped.swap(0, 1); // the right bytes, adjacent entries transposed
+
+        for (label, variant) in [("mutated", mutated), ("swapped", swapped)] {
+            let other = spill_over(&variant);
+            assert!(
+                (0..payloads.len()).any(|i| other.entry(i).unwrap() != baseline.entry(i).unwrap()),
+                "the {label} control must DIFFER from the streamed spill — if it matched, the \
+                 byte-identity and write-order assertions could never fail"
+            );
+        }
+    }
+
+    /// No cap: a write-set far larger than the buffer is ACCEPTED and spilled, never refused.
+    /// The negative control (below) confirms the assertion is not vacuous.
+    #[test]
+    fn builder_accepts_a_write_set_far_larger_than_its_buffer() {
+        let threshold = 1024u64;
+        let payloads: Vec<Vec<u8>> = (0..4096usize).map(|i| vec![(i % 128) as u8; 256]).collect();
+        let total: u64 = payloads.iter().map(|p| p.len() as u64).sum();
+        assert!(
+            total > threshold * 100,
+            "the fixture must dwarf the buffer to prove there is no cap"
+        );
+
+        let mut builder = WriteSetSpillBuilder::with_threshold(threshold);
+        for payload in &payloads {
+            builder
+                .append(payload)
+                .expect("a large write-set must be accepted, never refused");
+        }
+        let spill = builder.finish().unwrap();
+        assert_eq!(spill.len(), payloads.len(), "every payload is retained");
+        assert!(
+            spill.resident_bytes() <= threshold || spill.resident_bytes() == 0,
+            "resident stays bounded regardless of total size"
+        );
+        assert_eq!(spill.bytes(), total, "the whole set reached disk");
+    }
+
+    /// NEGATIVE CONTROL: a `Vec<Vec<u8>>` accumulator — the shape the builder removes — grows
+    /// without bound, so `builder_spills_past_threshold_bounded_and_ordered`'s bound is measuring
+    /// the streaming, not a constant. This is the control that lets the guard fail.
+    #[test]
+    fn a_collecting_vec_accumulator_grows_without_bound() {
+        let payloads: Vec<Vec<u8>> = (0..512usize).map(|_i| vec![0u8; 64]).collect();
+        let threshold = 256u64;
+        let mut collected: Vec<Vec<u8>> = Vec::new();
+        for payload in &payloads {
+            collected.push(payload.clone());
+        }
+        let collected_bytes: u64 = collected.iter().map(|p| p.len() as u64).sum();
+        assert!(
+            collected_bytes > threshold,
+            "the control must exceed the buffer, else the guard is vacuous"
+        );
+        let mut builder = WriteSetSpillBuilder::with_threshold(threshold);
+        for payload in &payloads {
+            builder.append(payload).unwrap();
+        }
+        assert!(
+            builder.resident_bytes() < collected_bytes,
+            "the streaming builder holds strictly less than the collecting Vec: {} vs {collected_bytes}",
+            builder.resident_bytes()
         );
     }
 }

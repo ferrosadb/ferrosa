@@ -22,7 +22,9 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use ferrosa_common::accord::HybridLogicalClock;
-use ferrosa_storage::accord::{CommitError, CommitOutcome, TransactionCommitter, TransactionWrite};
+use ferrosa_storage::accord::{
+    CommitError, CommitOutcome, StagedAccordWriteSet, TransactionCommitter, TransactionWrite,
+};
 
 use crate::accord::apply::StorageApplier;
 use crate::accord::coordinator::{AccordCoordinatorDriver, AccordDriverError};
@@ -255,48 +257,61 @@ impl TransactionCommitter for AccordTransactionCommitter {
     async fn commit_postgres(
         &self,
         keyspace: &str,
-        mut writes: Vec<TransactionWrite>,
+        writes: StagedAccordWriteSet,
         _tables: Vec<String>,
         snapshot: ferrosa_common::accord::Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         use ferrosa_storage::accord::conflict_index::{
             POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
         };
-        use ferrosa_storage::table_tombstone;
 
-        // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The
-        // per-key Accord commit below would route it to that key's RF replica
-        // set — a proper subset of the ring whenever RF < node count — leaving
-        // the nodes outside it serving the truncated rows (resurrection). So a
-        // tombstone is split out and replicated to EVERY serving node at CL=ALL
-        // instead, failing loud if any node does not acknowledge. The reserved
+        // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The per-key
+        // Accord commit below would route it to that key's RF replica set — a proper subset
+        // of the ring whenever RF < node count — leaving the nodes outside it serving the
+        // truncated rows (resurrection). The staged builder already CARRIED the tombstones
+        // apart (they never entered the payload spill), so here they are replicated to EVERY
+        // serving node at CL=ALL, failing loud if any node does not acknowledge. The reserved
         // key's placement never decides a truncate's scope again.
-        let tombstone_key = table_tombstone::table_tombstone_key();
-        let (tombstones, ordinary): (Vec<TransactionWrite>, Vec<TransactionWrite>) = writes
-            .into_iter()
-            .partition(|w| w.key == tombstone_key.key.as_bytes());
-        if !tombstones.is_empty() {
-            self.replicate_tombstones_all_nodes(&tombstones).await?;
+        if !writes.tombstones().is_empty() {
+            self.replicate_tombstones_all_nodes(writes.tombstones())
+                .await?;
         }
-        writes = ordinary;
 
-        // The barrier key orders all BEGIN/COMMIT barriers. A second commit-only
-        // marker advances only for data transaction completions, so a BEGIN after
-        // our snapshot doesn't invalidate it. Empty mutation bytes participate in
-        // Accord conflicts and Apply finalization, but the storage applier drops
-        // them before applying data mutations.
-        writes.push(TransactionWrite {
-            keyspace: keyspace.to_string(),
-            key: POSTGRES_TRANSACTION_BARRIER_KEY.to_vec(),
-            mutation: Vec::new(),
-        });
-        writes.push(TransactionWrite {
-            keyspace: keyspace.to_string(),
-            key: POSTGRES_TRANSACTION_MARKER_KEY.to_vec(),
-            mutation: Vec::new(),
-        });
+        // Build the driven write-set from the staged ROUTING keys, in order. The write-set
+        // payloads stay on disk in `writes`' spill (only the small per-key index is resident).
+        // The two protocol markers are appended AFTER the staged payloads — the barrier key
+        // orders all BEGIN/COMMIT barriers; the commit-only marker advances only for data
+        // completions. Empty mutation bytes participate in Accord conflicts and Apply
+        // finalization, but the storage applier drops them before applying data mutations. The
+        // staged region is therefore an exact PREFIX of the driven write-set; the driver reads
+        // entries at/after the prefix from their resident (empty) mutation field.
+        let staged_count = writes.len();
+        let mut resolve_inputs: Vec<(String, Vec<u8>)> = Vec::with_capacity(staged_count + 2);
+        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(staged_count + 2);
+        for (keyspace, key) in writes.keys() {
+            resolve_inputs.push((keyspace.clone(), key.clone()));
+            write_set.push((key.clone(), Vec::new()));
+        }
+        for marker in [
+            POSTGRES_TRANSACTION_BARRIER_KEY,
+            POSTGRES_TRANSACTION_MARKER_KEY,
+        ] {
+            resolve_inputs.push((keyspace.to_string(), marker.to_vec()));
+            write_set.push((marker.to_vec(), Vec::new()));
+        }
 
-        match drive_accord(self, writes, ReadPredicate::Always, Some(snapshot)).await {
+        let payloads = writes.payloads_arc();
+        match drive_accord_core(
+            self,
+            resolve_inputs,
+            write_set,
+            Some(payloads),
+            staged_count,
+            ReadPredicate::Always,
+            Some(snapshot),
+        )
+        .await
+        {
             Ok(_) => Ok(CommitOutcome::Committed),
             Err(AccordDriverError::SnapshotStale) => Ok(CommitOutcome::Aborted {
                 reason: "PostgreSQL transaction snapshot is stale".to_string(),
@@ -308,6 +323,10 @@ impl TransactionCommitter for AccordTransactionCommitter {
     }
 }
 
+/// Drive ONE multi-key Accord transaction for a RESIDENT write-set (the small autocommit
+/// batch and the LWT/snapshot-barrier keys). A large PostgreSQL commit does NOT go through
+/// here: it builds an already-staged write-set and calls [`drive_accord_core`] directly, so
+/// its payload bulk is never resident.
 async fn drive_accord(
     committer: &AccordTransactionCommitter,
     mut writes: Vec<TransactionWrite>,
@@ -320,51 +339,19 @@ async fn drive_accord(
         ));
     }
 
-    // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
-    //    commit a write to a guessed/empty replica set).
-    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
-    let t_resolve = profile.then(std::time::Instant::now);
-    let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
-    let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
-    for w in &writes {
-        let replicas = (committer.resolve)(&w.keyspace, &w.key).ok_or_else(|| {
-            AccordDriverError::Network(format!(
-                "no replicas resolved for a key in keyspace '{}' (cluster mode required)",
-                w.keyspace
-            ))
-        })?;
-        if replicas.is_empty() {
-            return Err(AccordDriverError::Network(format!(
-                "empty replica set for a key in keyspace '{}'",
-                w.keyspace
-            )));
-        }
-        for r in &replicas {
-            replica_union.insert(*r);
-        }
-        per_key.insert(w.key.clone(), replicas);
-    }
-    let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
-    let resolve_ns = t_resolve.map(|t| t.elapsed().as_nanos() as u64);
-    if profile {
-        tracing::info!(
-            phase = "drive.resolve_done",
-            keys = per_key.len(),
-            live_mib = ferrosa_common::mem_probe::live_mib(),
-            "accord drive residency"
-        );
-    }
+    let resolve_inputs: Vec<(String, Vec<u8>)> = writes
+        .iter()
+        .map(|w| (w.keyspace.clone(), w.key.clone()))
+        .collect();
 
-    // 2. Build the write-set + the per-key participant resolver for the driver.
-    let t_write_set = profile.then(std::time::Instant::now);
-    // Stage the payloads in local temp storage when the write-set is large enough to
-    // be the commit's memory problem, so the coordinator never holds ~1.1M encoded
-    // mutations resident. The KEYS stay in memory — Accord orders conflicts on them
-    // and the per-shard participant set is derived from them — while the payload
-    // bulk moves to a temp file and is read back on demand at Apply. Small
-    // write-sets stay wholly resident (no filesystem touch).
+    // Stage the payloads in local temp storage when the write-set is large enough to be the
+    // commit's memory problem, so the coordinator never holds ~1.1M encoded mutations
+    // resident. The KEYS stay in memory — Accord orders conflicts on them and the per-shard
+    // participant set is derived from them — while the payload bulk moves to a temp file and
+    // is read back on demand at Apply. Small write-sets stay wholly resident (no filesystem
+    // touch).
     let payload_bytes: u64 = writes.iter().map(|w| w.mutation.len() as u64).sum();
-    let write_blobs =
+    let (write_blobs, staged_prefix) =
         if ferrosa_storage::write_set_spill::WriteSetSpill::should_stage(payload_bytes) {
             let reservation = ferrosa_storage::write_set_spill::reserve_write_set_stage()
                 .map_err(|e| AccordDriverError::Codec(format!("write-set spill: {e}")))?;
@@ -381,12 +368,89 @@ async fn drive_accord(
                 resident_index_bytes = staged.resident_index_bytes(),
                 "accord: staged the write-set payloads in local temp storage"
             );
-            Some(Arc::new(staged))
+            (Some(Arc::new(staged)), writes.len())
         } else {
-            None
+            (None, 0)
         };
+
     let write_set: Vec<(Vec<u8>, Vec<u8>)> =
         writes.into_iter().map(|w| (w.key, w.mutation)).collect();
+    drive_accord_core(
+        committer,
+        resolve_inputs,
+        write_set,
+        write_blobs,
+        staged_prefix,
+        predicate,
+        snapshot_ts,
+    )
+    .await
+}
+
+/// Drive one multi-key Accord transaction from an ALREADY-BUILT write-set.
+///
+/// `resolve_inputs` supplies each key's `(keyspace, partition key)` for replica resolution;
+/// `write_set` is the `(partition key, payload)` the driver fans out. When `write_blobs` holds
+/// a staged spill, `staged_prefix` is the number of LEADING `write_set` entries whose payload
+/// lives in it — the rest carry their resident payload (the committer's barrier/marker keys).
+/// The large PostgreSQL commit calls this directly with the staged write-set, so the payload
+/// bulk is never resident on the coordinator.
+///
+/// # Errors
+///
+/// A key with no resolvable replica set (fail loud, never a guessed placement), or a driver
+/// failure that leaves the commit undecided.
+#[allow(clippy::too_many_arguments)]
+async fn drive_accord_core(
+    committer: &AccordTransactionCommitter,
+    resolve_inputs: Vec<(String, Vec<u8>)>,
+    write_set: Vec<(Vec<u8>, Vec<u8>)>,
+    write_blobs: Option<Arc<ferrosa_storage::write_set_spill::WriteSetSpill>>,
+    staged_prefix: usize,
+    predicate: ReadPredicate,
+    snapshot_ts: Option<ferrosa_common::accord::Timestamp>,
+) -> Result<ferrosa_common::accord::Timestamp, AccordDriverError> {
+    if write_set.is_empty() {
+        return Err(AccordDriverError::Network(
+            "Accord transaction requires at least one conflict key".to_string(),
+        ));
+    }
+
+    // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
+    //    commit a write to a guessed/empty replica set).
+    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+    let t_resolve = profile.then(std::time::Instant::now);
+    let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
+    let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
+    for (keyspace, key) in &resolve_inputs {
+        let replicas = (committer.resolve)(keyspace, key).ok_or_else(|| {
+            AccordDriverError::Network(format!(
+                "no replicas resolved for a key in keyspace '{keyspace}' (cluster mode required)"
+            ))
+        })?;
+        if replicas.is_empty() {
+            return Err(AccordDriverError::Network(format!(
+                "empty replica set for a key in keyspace '{keyspace}'"
+            )));
+        }
+        for r in &replicas {
+            replica_union.insert(*r);
+        }
+        per_key.insert(key.clone(), replicas);
+    }
+    let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
+    let resolve_ns = t_resolve.map(|t| t.elapsed().as_nanos() as u64);
+    if profile {
+        tracing::info!(
+            phase = "drive.resolve_done",
+            keys = per_key.len(),
+            live_mib = ferrosa_common::mem_probe::live_mib(),
+            "accord drive residency"
+        );
+    }
+
+    // 2b. The write-set is already built (the caller staged it); report what it cost.
+    let t_write_set = profile.then(std::time::Instant::now);
     let write_set_len_hint = write_set.len();
     if profile {
         let (staged_entries, staged_bytes, staged_index) = match &write_blobs {
@@ -421,7 +485,9 @@ async fn drive_accord(
     .with_local_applier(committer.applier.clone())
     .with_read_predicate(predicate);
     if let Some(blobs) = write_blobs {
-        driver = driver.with_spilled_write_set(blobs);
+        driver = driver
+            .with_spilled_write_set(blobs)
+            .with_staged_prefix(staged_prefix);
     }
     if let Some(snapshot_ts) = snapshot_ts {
         driver = driver.with_postgres_snapshot(snapshot_ts);
@@ -565,6 +631,19 @@ mod tests {
             key: key.to_vec(),
             mutation: mutation.to_vec(),
         }
+    }
+
+    /// Build a staged Accord write-set from resident writes — the shape
+    /// [`TransactionCommitter::commit_postgres`] now takes. A small set stays wholly
+    /// resident (threshold `u64::MAX`), so the test drives the same routing/index path
+    /// production uses without touching the filesystem.
+    fn staged(writes: Vec<TransactionWrite>) -> StagedAccordWriteSet {
+        let mut builder =
+            ferrosa_storage::accord::StagedAccordWriteSetBuilder::with_threshold_bytes(u64::MAX);
+        for write in writes {
+            builder.accept(write).expect("stage write");
+        }
+        builder.finish().expect("finish staging")
     }
 
     fn committer_with(host: Uuid, applier: Arc<RecordingApplier>) -> AccordTransactionCommitter {
@@ -1181,7 +1260,7 @@ mod tests {
         // Accord and (with no peers) fail, but the tombstone fan-out has already
         // run. The assertion is on the ROUTING, which is decided before Accord.
         let _ = committer
-            .commit_postgres("ks", vec![tombstone_write()], vec![], snapshot())
+            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
             .await;
 
         assert_eq!(
@@ -1213,7 +1292,7 @@ mod tests {
         .with_marker_writer(recorder);
 
         let err = committer
-            .commit_postgres("ks", vec![tombstone_write()], vec![], snapshot())
+            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
             .await
             .expect_err("a truncate that not every serving node acknowledged must be refused");
         let reason = err.reason.to_lowercase();
@@ -1231,7 +1310,7 @@ mod tests {
         let committer = committer_with(Uuid::from_u128(0xAA), Arc::new(RecordingApplier::new()));
 
         let err = committer
-            .commit_postgres("ks", vec![tombstone_write()], vec![], snapshot())
+            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
             .await
             .expect_err("a tombstone with no all-serving writer must be refused");
         assert!(

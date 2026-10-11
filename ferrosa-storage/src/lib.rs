@@ -105,7 +105,7 @@ pub use subscription_observer::{
     SubscriptionConfig, SubscriptionFilter, SubscriptionId, SubscriptionObserver,
 };
 pub use upload::{ObjectStoreConfig, UploadManager};
-pub use write_set_spill::{WriteSetSpill, WRITE_SET_SPILL_FLOOR_BYTES};
+pub use write_set_spill::{WriteSetSpill, WriteSetSpillBuilder, WRITE_SET_SPILL_FLOOR_BYTES};
 
 /// Process-global span collector for tracing tests.
 ///
