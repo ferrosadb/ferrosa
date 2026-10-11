@@ -17,8 +17,16 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 SELECT=(--all-features --workspace --lib --tests
         --exclude ferrosa-jepsen --exclude ferrosa-loadgen)
 
-# Exactly the ci.yml "Run tests" skip list. Keep in sync if that changes.
-SKIP=(--skip ::slow:: --skip accord::perf --skip batch_atomicity --skip pause_resume
+# Exactly the ci.yml "Run tests" exclusion set. Keep in sync if that changes.
+# ci.yml additionally excludes the whole `accord_apply_decode_residency` binary
+# with nextest's `-E 'not binary(...)'`; cargo test cannot express that, so here
+# (and in every libtest arm) that binary's four test NAMES are skipped instead.
+SKIP=(--skip ::slow:: --skip accord::perf
+      --skip apply_writeset_peak_stays_within_the_input_size
+      --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident
+      --skip a_materialized_decoded_batch_trips_the_residency_guard
+      --skip a_retained_input_payload_trips_the_residency_guard
+      --skip batch_atomicity --skip pause_resume
       --skip recovery_coordinator --skip cassandra_reads_compacted
       --skip compaction_end_to_end_pipeline --skip dep_wait_ordering
       --skip lwt_batch_atomicity_all --skip clock_skew_large_preaccept --skip binary_
@@ -65,7 +73,7 @@ nextest_start=$(date +%s)
 # filters, not nextest flags; before `--` nextest exits 2 with
 # "unexpected argument '--skip' found" and runs NOTHING, which silently
 # turns this benchmark into a 0-second nextest measurement.
-cargo nextest run "${SELECT[@]}" -- "${SKIP[@]}" >/tmp/nextest-run.log 2>&1
+cargo nextest run "${SELECT[@]}" -E 'not binary(accord_apply_decode_residency)' -- "${SKIP[@]}" >/tmp/nextest-run.log 2>&1
 nextest_rc=$?
 nextest_end=$(date +%s)
 nextest_secs=$((nextest_end - nextest_start))

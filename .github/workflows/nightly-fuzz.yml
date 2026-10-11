@@ -129,6 +129,10 @@ jobs:
                  --skip ssh_execute_command \
                  --skip ssh_upload_file \
                  --skip accord::perf \
+                 --skip apply_writeset_peak_stays_within_the_input_size \
+                 --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
+                 --skip a_materialized_decoded_batch_trips_the_residency_guard \
+                 --skip a_retained_input_payload_trips_the_residency_guard \
             2>&1 | tee test-output.log
           status=${PIPESTATUS[0]}
           if [ "$status" = "124" ] || [ "$status" = "137" ]; then
@@ -382,10 +386,12 @@ jobs:
         run: docker compose down -v --remove-orphans 2>/dev/null || true
 
   perf-regression:
-    name: Accord perf regression (wall-clock thresholds)
+    name: Accord perf regression (absolute thresholds)
     runs-on: ubuntu-latest
-    # These assertions are ABSOLUTE wall-clock bounds, so they only mean
-    # something when the machine is not competing with the rest of the PR gate.
+    # These assertions are ABSOLUTE bounds — wall-clock for the accord::perf /
+    # accord::perf_regression benchmarks, resident bytes for
+    # tests/accord_apply_decode_residency.rs — so they only mean something when
+    # the machine is not competing with the rest of the PR gate.
     # They were moved out of the per-PR lane (ci.yml `--skip
     # accord::perf_regression`) after a contended merge-group build measured a
     # 1000-message ReorderBuffer drain at 52.8 ms against a 10 ms bound and
@@ -426,3 +432,17 @@ jobs:
         # `conflict_index_does_not_over_reserve_or_store_key_bytes_twice` is a
         # same-run ratio and runs in ci.yml.
         run: cargo test -p ferrosa-storage --all-features --test conflict_index_residency_absolute -- --nocapture
+      - name: Run Accord apply decode residency suite
+        # tests/accord_apply_decode_residency.rs asserts ABSOLUTE resident-byte
+        # bounds: a counting allocator compares the apply path's peak live bytes
+        # against a multiple of the input size, so on a contended runner it
+        # measures the runner (allocator watermarks, the engine's own buffers),
+        # not the decode. ci.yml excludes it — nextest's `-E 'not
+        # binary(accord_apply_decode_residency)'`, plus its four test names in the
+        # `--skip` list for the cargo-test mirrors; it runs HERE, where the machine
+        # is not competing with the rest of the gate. Keep the two in sync: a
+        # resident-byte assertion added to ci.yml's skipped set must run in this
+        # job. --test-threads=1 keeps its process-global allocation windows from
+        # overlapping another test's allocations.
+        # --all-features enables `perf-tests`, which the binary requires.
+        run: cargo test -p ferrosa-cluster --all-features --test accord_apply_decode_residency -- --nocapture --test-threads=1
