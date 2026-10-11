@@ -185,96 +185,6 @@ impl LaggingPeerPolicy {
     }
 }
 
-#[cfg(test)]
-mod lagging_peer_policy_tests {
-    use super::*;
-
-    const MIN: Duration = Duration::from_secs(8);
-    const MAX: Duration = Duration::from_secs(64);
-    const THRESHOLD: u64 = 10;
-
-    fn policy() -> LaggingPeerPolicy {
-        LaggingPeerPolicy::new(THRESHOLD, MIN, MAX)
-    }
-
-    /// The sweep fires every second. A peer frozen at one index while the leader
-    /// commits far ahead must NOT be pushed on every sweep — that is the live
-    /// 39,167-cycle livelock. Pushes must follow the backoff, not the sweep.
-    #[test]
-    fn a_peer_that_never_advances_is_not_pushed_every_sweep() {
-        let mut p = policy();
-        let t0 = tokio::time::Instant::now();
-        let mut pushes = 0;
-        for i in 0..50u64 {
-            if p.should_push(7, 100, 1000, t0 + Duration::from_secs(i)) {
-                pushes += 1;
-            }
-        }
-        assert!(
-            pushes <= 7,
-            "a stuck peer must be pushed on the backoff schedule, not every sweep: \
-             {pushes} pushes in 50 sweeps"
-        );
-    }
-
-    /// A peer that IS advancing must still be pushed immediately — no suppression.
-    #[test]
-    fn a_peer_that_advances_is_pushed_promptly() {
-        let mut p = policy();
-        let t0 = tokio::time::Instant::now();
-        let mut index = 100u64;
-        for i in 0..10u64 {
-            assert!(
-                p.should_push(7, index, 1000, t0 + Duration::from_secs(i)),
-                "an advancing peer must be pushed on sweep {i}"
-            );
-            index += 50;
-        }
-    }
-
-    /// Within the threshold no push is due, and the peer is forgotten so a later
-    /// regression pushes at once instead of waiting out a backoff it earned
-    /// before it had caught up.
-    #[test]
-    fn a_peer_within_threshold_is_never_pushed_and_is_forgotten() {
-        let mut p = policy();
-        let t0 = tokio::time::Instant::now();
-        assert!(
-            p.should_push(7, 100, 1000, t0),
-            "first sight of a lagging peer pushes"
-        );
-        assert!(
-            !p.should_push(7, 995, 1000, t0 + Duration::from_secs(1)),
-            "caught up: no push"
-        );
-        assert!(
-            p.should_push(7, 100, 1000, t0 + Duration::from_secs(2)),
-            "re-lagging pushes at once"
-        );
-    }
-
-    /// The backoff is capped: a long-stuck peer keeps being retried, just rarely.
-    #[test]
-    fn the_backoff_is_capped_so_a_stuck_peer_is_still_retried() {
-        let mut p = policy();
-        let t0 = tokio::time::Instant::now();
-        let mut pushes = 0;
-        for i in 0..600u64 {
-            if p.should_push(7, 100, 1_000_000, t0 + Duration::from_secs(i)) {
-                pushes += 1;
-            }
-        }
-        assert!(
-            pushes >= 5,
-            "a stuck peer must still be retried, got {pushes} pushes in 600s"
-        );
-        assert!(
-            pushes <= 90,
-            "retries must stay capped by max_backoff, got {pushes} in 600s"
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Snapshot pusher task
 // ---------------------------------------------------------------------------
@@ -495,6 +405,96 @@ pub async fn run_snapshot_pusher<C>(
             "snapshot_pusher: triggered snapshot + heartbeat for {} lagging peer(s), {} due (P0-20)",
             lagging_count,
             due_count,
+        );
+    }
+}
+
+#[cfg(test)]
+mod lagging_peer_policy_tests {
+    use super::*;
+
+    const MIN: Duration = Duration::from_secs(8);
+    const MAX: Duration = Duration::from_secs(64);
+    const THRESHOLD: u64 = 10;
+
+    fn policy() -> LaggingPeerPolicy {
+        LaggingPeerPolicy::new(THRESHOLD, MIN, MAX)
+    }
+
+    /// The sweep fires every second. A peer frozen at one index while the leader
+    /// commits far ahead must NOT be pushed on every sweep — that is the live
+    /// 39,167-cycle livelock. Pushes must follow the backoff, not the sweep.
+    #[test]
+    fn a_peer_that_never_advances_is_not_pushed_every_sweep() {
+        let mut p = policy();
+        let t0 = tokio::time::Instant::now();
+        let mut pushes = 0;
+        for i in 0..50u64 {
+            if p.should_push(7, 100, 1000, t0 + Duration::from_secs(i)) {
+                pushes += 1;
+            }
+        }
+        assert!(
+            pushes <= 7,
+            "a stuck peer must be pushed on the backoff schedule, not every sweep: \
+             {pushes} pushes in 50 sweeps"
+        );
+    }
+
+    /// A peer that IS advancing must still be pushed immediately — no suppression.
+    #[test]
+    fn a_peer_that_advances_is_pushed_promptly() {
+        let mut p = policy();
+        let t0 = tokio::time::Instant::now();
+        let mut index = 100u64;
+        for i in 0..10u64 {
+            assert!(
+                p.should_push(7, index, 1000, t0 + Duration::from_secs(i)),
+                "an advancing peer must be pushed on sweep {i}"
+            );
+            index += 50;
+        }
+    }
+
+    /// Within the threshold no push is due, and the peer is forgotten so a later
+    /// regression pushes at once instead of waiting out a backoff it earned
+    /// before it had caught up.
+    #[test]
+    fn a_peer_within_threshold_is_never_pushed_and_is_forgotten() {
+        let mut p = policy();
+        let t0 = tokio::time::Instant::now();
+        assert!(
+            p.should_push(7, 100, 1000, t0),
+            "first sight of a lagging peer pushes"
+        );
+        assert!(
+            !p.should_push(7, 995, 1000, t0 + Duration::from_secs(1)),
+            "caught up: no push"
+        );
+        assert!(
+            p.should_push(7, 100, 1000, t0 + Duration::from_secs(2)),
+            "re-lagging pushes at once"
+        );
+    }
+
+    /// The backoff is capped: a long-stuck peer keeps being retried, just rarely.
+    #[test]
+    fn the_backoff_is_capped_so_a_stuck_peer_is_still_retried() {
+        let mut p = policy();
+        let t0 = tokio::time::Instant::now();
+        let mut pushes = 0;
+        for i in 0..600u64 {
+            if p.should_push(7, 100, 1_000_000, t0 + Duration::from_secs(i)) {
+                pushes += 1;
+            }
+        }
+        assert!(
+            pushes >= 5,
+            "a stuck peer must still be retried, got {pushes} pushes in 600s"
+        );
+        assert!(
+            pushes <= 90,
+            "retries must stay capped by max_backoff, got {pushes} in 600s"
         );
     }
 }

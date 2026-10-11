@@ -66,6 +66,9 @@ fn install_snapshot_timeout_ms(env: &impl Fn(&str) -> Option<String>) -> u64 {
 
 /// Build this node's openraft `Config`. `env` reads an environment variable;
 /// tests pass a closure instead of mutating the process environment.
+///
+/// openraft's `ConfigError` is large by design (dictated by the crate).
+#[allow(clippy::result_large_err)]
 pub(crate) fn build_openraft_config(
     inputs: OpenraftConfigInputs,
     env: impl Fn(&str) -> Option<String>,

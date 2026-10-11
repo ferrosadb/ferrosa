@@ -354,6 +354,9 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
     }
 }
 
+// The bodies of the `RaftNetwork` methods above. openraft's error types are
+// large by design (dictated by the crate), as on the trait methods themselves.
+#[allow(clippy::result_large_err)]
 impl FerrosRaftNetwork {
     async fn send_install_snapshot(
         &mut self,
