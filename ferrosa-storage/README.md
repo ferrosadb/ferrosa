@@ -552,7 +552,18 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
-  backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest.
+  backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest. The local
+  backend classifies each generation (`GenerationState::from_files`) and reads
+  an evicted one by ranged reads exactly as a query does
+  (`flush::prepare_evicted_for_query` + `FileReadAt::open_evicted`); a
+  generation whose object is gone fails with the typed
+  `BuildError::EvictedUnavailable`, recorded by the tracker as
+  `BuildFailureKind::EvictedUnavailable` with its own ERROR line (outage
+  2026-10-10: backfills over evicted generations failed forever with
+  `open data: No such file or directory`). `StorageEngine::open` installs the
+  same read-through as `new` (the ranged evicted-read store and the whole-file
+  rehydration hook), so a generation evicted while an `open`-started node runs
+  stays readable by queries and backfills.
   `LocalBackend` resolves SSTable components under the engine layout
   `<data_dir>/sstables/<keyspace>.<table>` and writes local sidecars beside the
   table's SSTables; legacy flat test layouts are still accepted. Remote build

@@ -3794,6 +3794,39 @@ impl StorageEngine {
         runtime: Option<&tokio::runtime::Handle>,
         max_deferred_absent_table: usize,
     ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
+            Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
+            None => None,
+        };
+        Self::open_with_store(config, runtime, max_deferred_absent_table, object_store)
+    }
+
+    /// [`Self::open`] over an injected object store, so a test can reopen a
+    /// directory against an in-memory store the way a node reopens against S3.
+    #[cfg(test)]
+    pub(crate) fn open_with_upload_store(
+        config: StorageEngineConfig,
+        store: Arc<dyn object_store::ObjectStore>,
+        runtime: &tokio::runtime::Handle,
+    ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
+        assert!(
+            config.object_store.is_some(),
+            "an injected store needs an object-store config for its prefix"
+        );
+        Self::open_with_store(
+            config,
+            Some(runtime),
+            DEFAULT_MAX_DEFERRED_REPLAY_MUTATIONS,
+            Some(store),
+        )
+    }
+
+    fn open_with_store(
+        config: StorageEngineConfig,
+        runtime: Option<&tokio::runtime::Handle>,
+        max_deferred_absent_table: usize,
+        object_store: Option<Arc<dyn object_store::ObjectStore>>,
+    ) -> ferrosa_common::Result<(Self, Vec<Mutation>)> {
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create data dir: {e}"))
         })?;
@@ -3810,11 +3843,6 @@ impl StorageEngine {
             crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
         );
         let compaction_executor = CompactionExecutor::with_reader_pool(Arc::clone(&reader_pool));
-
-        let object_store: Option<Arc<dyn object_store::ObjectStore>> = match &config.object_store {
-            Some(os_config) => Some(Arc::from(os_config.build_object_store()?)),
-            None => None,
-        };
 
         let (upload_manager, compaction_upload_manager) = Self::build_upload_managers(
             config.object_store.as_ref(),
@@ -3844,6 +3872,22 @@ impl StorageEngine {
         let pending_index_uploads = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let (index_scheduler, index_tracker) =
             build_index_scheduler(&config, &tables, &pending_index_uploads);
+        // The same read-through `new` installs (D7, outage 2026-10-10): the
+        // ranged evicted-read store and the whole-file rehydration hook.
+        // Without them, a generation evicted while an `open`-started engine
+        // ran could not be read at all (node1: a plain SELECT on
+        // agent_memory.schema_version failed `NotOwned` / missing Data.db and
+        // quarantined the generation), and a whole-file read of an evicted
+        // component (compaction input, index rebuild) failed with ENOENT.
+        if let (Some(os_config), Some(store)) =
+            (config.object_store.as_ref(), object_store.as_ref())
+        {
+            Self::install_s3_file_read_rehydration_hook(
+                config.data_dir.clone(),
+                os_config.prefix.clone(),
+                Arc::clone(store),
+            );
+        }
         // Evicted SSTables must be back on disk before the tables below are
         // registered; see `restore_evicted_sstables`. This is the constructor
         // a node with commit-log segments starts through.

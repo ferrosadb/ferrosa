@@ -110,6 +110,61 @@ pub trait IndexBuildBackend: Send + Sync {
     /// on failure. Failures are recorded in the `IndexStateTracker` but do
     /// not block compaction.
     fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String>;
+
+    /// [`Self::build`] with a typed error, which the scheduler records so the
+    /// tracker can tell an unavailable evicted generation from a failed build.
+    /// The default wraps `build`'s message as [`BuildError::Failed`].
+    fn build_typed(
+        &self,
+        job: &IndexBuildJob,
+    ) -> std::result::Result<IndexBuildResult, BuildError> {
+        self.build(job).map_err(BuildError::Failed)
+    }
+}
+
+/// Why an index build failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildError {
+    /// The generation is evicted and its object-store copy cannot be read
+    /// (deleted, or no registered store owns it). Retrying cannot help until
+    /// the object is restored.
+    EvictedUnavailable {
+        /// The generation.
+        sstable_id: String,
+        /// What was found missing.
+        detail: String,
+    },
+    /// Any other failure, as a human-readable message.
+    Failed(String),
+}
+
+impl BuildError {
+    /// The tracker's classification of this failure.
+    #[must_use]
+    pub fn kind(&self) -> crate::index::BuildFailureKind {
+        match self {
+            Self::EvictedUnavailable { .. } => crate::index::BuildFailureKind::EvictedUnavailable,
+            Self::Failed(_) => crate::index::BuildFailureKind::Build,
+        }
+    }
+}
+
+impl From<String> for BuildError {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EvictedUnavailable { sstable_id, detail } => write!(
+                f,
+                "evicted generation {sstable_id} is unavailable from the object store: {detail}"
+            ),
+            Self::Failed(message) => f.write_str(message),
+        }
+    }
 }
 
 /// Result of a completed index build for a single SSTable.
@@ -305,8 +360,73 @@ fn read_tuple_f64(value: &[u8], at: usize) -> Option<f64> {
     Some(f64::from_be_bytes(bytes))
 }
 
+/// Open generation `job.sstable_id`'s `Data.db` for a build, classifying the
+/// generation first (D7, outage 2026-10-10). An evicted generation is read by
+/// ranged reads, exactly as a query opens it: its small index components are
+/// fetched and `Data.db` stays in the object store. Opening the evicted
+/// `Data.db` path directly failed every backfill with `No such file or
+/// directory`. A generation whose object is gone is
+/// [`BuildError::EvictedUnavailable`].
+fn open_build_data(
+    data_dir: &Path,
+    job: &IndexBuildJob,
+) -> std::result::Result<ferrosa_sstable::io::FileReadAt, BuildError> {
+    use crate::index::orphan::GenerationState;
+    use ferrosa_sstable::io::FileReadAt;
+
+    let gen = &job.sstable_id;
+    let data_path = sstable_component_path(data_dir, job, "Data.db");
+    let dir = data_path
+        .parent()
+        .expect("an SSTable component path always has a directory");
+    let marker = crate::engine::StorageEngine::evicted_marker_path(
+        crate::flush::eviction_marker_dir(dir, gen),
+        gen,
+    );
+    let state = GenerationState::from_files(
+        data_path.exists(),
+        marker.exists(),
+        dir.join(format!("{gen}-TOC.txt")).exists(),
+    );
+    if state != GenerationState::Evicted {
+        return FileReadAt::open(&data_path)
+            .map_err(|e| BuildError::Failed(format!("open data: {e}")));
+    }
+    match crate::flush::prepare_evicted_for_query(dir, gen) {
+        Ok(true) => Ok(FileReadAt::open_evicted(&data_path)),
+        Ok(false) => Err(BuildError::EvictedUnavailable {
+            sstable_id: gen.clone(),
+            detail: format!(
+                "{} is evicted (marker {}) but no object store serves it: its object is \
+                 missing or no store owns this path",
+                data_path.display(),
+                marker.display()
+            ),
+        }),
+        Err(e) => Err(BuildError::Failed(format!(
+            "prepare evicted generation {gen} for a ranged read: {e}"
+        ))),
+    }
+}
+
 impl IndexBuildBackend for LocalBackend {
     fn build(&self, job: &IndexBuildJob) -> std::result::Result<IndexBuildResult, String> {
+        self.build_typed(job).map_err(|e| e.to_string())
+    }
+
+    fn build_typed(
+        &self,
+        job: &IndexBuildJob,
+    ) -> std::result::Result<IndexBuildResult, BuildError> {
+        self.build_local(job)
+    }
+}
+
+impl LocalBackend {
+    fn build_local(
+        &self,
+        job: &IndexBuildJob,
+    ) -> std::result::Result<IndexBuildResult, BuildError> {
         use ferrosa_index::RowPosition;
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
@@ -326,9 +446,9 @@ impl IndexBuildBackend for LocalBackend {
             });
         }
 
-        // Open SSTable components.
-        let data = FileReadAt::open(sstable_component_path(&self.data_dir, job, "Data.db"))
-            .map_err(|e| format!("open data: {e}"))?;
+        // Open SSTable components. `Data.db` first: for an evicted generation
+        // this also fetches the index components the opens below read.
+        let data = open_build_data(&self.data_dir, job)?;
         let partitions_file =
             FileReadAt::open(sstable_component_path(&self.data_dir, job, "Partitions.db"))
                 .map_err(|e| format!("open partitions: {e}"))?;
@@ -796,7 +916,7 @@ impl IndexBuildScheduler {
             match job {
                 Ok(job) => {
                     let (keyspace, table) = &job.table;
-                    match backend.build(&job) {
+                    match backend.build_typed(&job) {
                         Ok(_result) => {
                             tracker.mark_indexed(keyspace, table, &job.index_name, &job.sstable_id);
                         }
@@ -829,7 +949,7 @@ impl IndexBuildScheduler {
             match job {
                 Ok(job) => {
                     let (keyspace, table) = &job.table;
-                    match backend.build(&job) {
+                    match backend.build_typed(&job) {
                         Ok(result) => {
                             // Write sidecar files locally unless the backend
                             // already wrote them to S3 (e.g. RemoteBackend), and
@@ -853,7 +973,9 @@ impl IndexBuildScheduler {
                                     record_build_failure(
                                         tracker,
                                         &job,
-                                        format!("sidecar built but not published: {err}"),
+                                        BuildError::Failed(format!(
+                                            "sidecar built but not published: {err}"
+                                        )),
                                     );
                                 }
                             }
@@ -882,21 +1004,39 @@ pub const BUILD_RETRY_DELAY: std::time::Duration = std::time::Duration::from_sec
 pub(crate) fn record_build_failure(
     tracker: &IndexStateTracker,
     job: &IndexBuildJob,
-    error: String,
+    failure: BuildError,
 ) -> crate::index::BuildFailure {
     use crate::index::BuildFailure;
 
     let (keyspace, table) = &job.table;
     crate::metrics::index_backfill_build_failed();
-    let outcome = tracker.mark_failed(
+    let kind = failure.kind();
+    let error = failure.to_string();
+    let outcome = tracker.mark_failed_as(
         keyspace,
         table,
         &job.index_name,
         &job.sstable_id,
         error.clone(),
         BUILD_RETRY_DELAY,
+        kind,
     );
     match outcome {
+        BuildFailure::FirstFailure
+            if kind == crate::index::BuildFailureKind::EvictedUnavailable =>
+        {
+            tracing::error!(
+                %error,
+                keyspace = %keyspace,
+                table = %table,
+                index_name = %job.index_name,
+                sstable = %job.sstable_id,
+                retry_secs = BUILD_RETRY_DELAY.as_secs(),
+                "index backfill FAILED: an evicted generation's object is unavailable from the \
+                 object store, so the index cannot cover its rows; reads through the index are \
+                 refused, and retries cannot succeed until the object is restored"
+            )
+        }
         BuildFailure::FirstFailure => tracing::error!(
             %error,
             keyspace = %keyspace,

@@ -1885,7 +1885,7 @@ struct FileComponentPaths {
 /// open fails as "missing Data.db", and the read path quarantines a healthy,
 /// uploaded generation as corrupt. Every open path that gates on the marker
 /// must use this.
-fn eviction_marker_dir<'a>(dir: &'a Path, gen: &str) -> &'a Path {
+pub(crate) fn eviction_marker_dir<'a>(dir: &'a Path, gen: &str) -> &'a Path {
     match dir.file_name() {
         Some(name) if name == gen => dir.parent().unwrap_or(dir),
         _ => dir,

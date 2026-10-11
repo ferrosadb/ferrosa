@@ -256,3 +256,310 @@ fn stalled_startup_registration_fails_loudly() {
     assert!(err.contains("elapsed"), "{err}");
     assert!(err.contains("last progress"), "{err}");
 }
+
+// ---- F6: backfill over evicted generations after `open` -------------------
+
+/// Wait (bounded) until `index_name` is current or failed; return its state.
+/// The bound is a hang guard: a backfill over a few tiny SSTables takes
+/// milliseconds.
+fn wait_for_index_settled(
+    engine: &StorageEngine,
+    tid: &TableId,
+    index_name: &str,
+) -> crate::index::IndexState {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let state = engine
+            .index_tracker()
+            .get_state(tid.keyspace(), tid.table(), index_name)
+            .expect("index is tracked");
+        let settled = matches!(
+            state.status,
+            crate::index::IndexStatus::Current | crate::index::IndexStatus::Failed { .. }
+        ) && (state.pending_sstables.is_empty()
+            || matches!(state.status, crate::index::IndexStatus::Failed { .. }));
+        if settled || std::time::Instant::now() >= deadline {
+            return state;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A node directory as the 2026-10-10 restart found it: one generation
+/// flushed, uploaded and evicted (`k0`..`k4`), and two rows (`k5`, `k6`) only
+/// in commit-log segments. The engine is dropped, not shut down, so the
+/// segments survive. Returns the evicted generation.
+fn evicted_generation_with_commit_log(
+    runtime: &tokio::runtime::Runtime,
+    dir: &std::path::Path,
+    store: &Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> String {
+    let engine = StorageEngine::new_with_upload_store(
+        outage_evicting_config(dir, prefix),
+        Arc::clone(store),
+        prefix.to_string(),
+        runtime.handle(),
+    )
+    .unwrap();
+    engine.register_table(test_schema()).unwrap();
+    let tid = table_id();
+    for i in 0..5 {
+        engine
+            .write(&tid, &make_key(&format!("k{i}")), make_row(b"shared", 1000), 1000)
+            .unwrap();
+    }
+    engine.flush(&tid).unwrap();
+    assert!(runtime.block_on(engine.sync_sstables_to_s3()).unwrap() >= 1);
+    assert!(
+        StorageEngine::list_generations_in_dir(&engine.table_sstable_dir(&tid)).is_empty(),
+        "precondition: the flushed generation is evicted"
+    );
+    for key in ["k5", "k6"] {
+        engine
+            .write(&tid, &make_key(key), make_row(b"shared", 1000), 1000)
+            .unwrap();
+    }
+    drop(engine);
+    let evicted: Vec<String> = StorageEngine::evicted_generations(&dir.join("sstables"))
+        .into_values()
+        .flatten()
+        .collect();
+    assert_eq!(evicted.len(), 1);
+    evicted[0].clone()
+}
+
+/// Reopen `dir` through [`StorageEngine::open`] against `store`, the
+/// constructor a node with commit-log segments starts through.
+fn try_reopen_engine(
+    runtime: &tokio::runtime::Runtime,
+    dir: &std::path::Path,
+    store: &Arc<dyn object_store::ObjectStore>,
+    prefix: &str,
+) -> ferrosa_common::Result<StorageEngine> {
+    let (engine, _pending) = StorageEngine::open_with_upload_store(
+        outage_evicting_config(dir, prefix),
+        Arc::clone(store),
+        runtime.handle(),
+    )?;
+    Ok(engine)
+}
+
+fn partition_keys_and_values(partitions: &[Partition]) -> std::collections::BTreeSet<(Vec<u8>, Vec<u8>)> {
+    partitions
+        .iter()
+        .map(|p| {
+            (
+                p.key.key.as_bytes().to_vec(),
+                p.rows[0].cells[0].1.value.clone().expect("live cell"),
+            )
+        })
+        .collect()
+}
+
+/// T-F6-1 (2026-10-10): after the restart, several secondary indexes stayed
+/// failed with `open data: No such file or directory`: the backfill opened
+/// `Data.db` of an evicted generation directly. Reopened through `open` with
+/// commit-log segments and an evicted generation, a backfill must make the
+/// index current, the rows read through the index must equal the base rows,
+/// and the evicted `Data.db` must be read by ranged reads (not downloaded),
+/// as queries read it.
+#[test]
+fn backfill_after_open_builds_index_from_evicted_generation() {
+    use ferrosa_index::IndexKey;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _context = runtime.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let gen = evicted_generation_with_commit_log(&runtime, dir.path(), &store, "t-f6-1");
+    let engine = try_reopen_engine(&runtime, dir.path(), &store, "t-f6-1").unwrap();
+    let tid = table_id();
+    assert!(
+        engine.read(&tid, &make_key("k5")).unwrap().is_some(),
+        "the commit log replays the unflushed rows"
+    );
+
+    engine
+        .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+        .unwrap();
+    let state = wait_for_index_settled(&engine, &tid, "val_idx");
+
+    assert!(
+        matches!(state.status, crate::index::IndexStatus::Current),
+        "the backfill must make the index current: {state:?}"
+    );
+    let through_index =
+        collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"shared".to_vec())).unwrap();
+    let base = engine.read_range(&tid, None, None, 100).unwrap();
+    assert_eq!(base.len(), 7, "k0..k4 evicted plus k5, k6 replayed");
+    assert_eq!(
+        partition_keys_and_values(&through_index),
+        partition_keys_and_values(&base),
+        "rows through the index equal the base rows"
+    );
+    let table_dir = engine.table_sstable_dir(&tid);
+    assert!(
+        !table_dir.join(format!("{gen}-Data.db")).exists(),
+        "the backfill reads the evicted Data.db by ranged reads, as queries do"
+    );
+    assert!(StorageEngine::evicted_marker_path(&table_dir, &gen).exists());
+    engine.shutdown().unwrap();
+}
+
+/// T-F6-2: when the evicted generation's object is gone from the store, the
+/// backfill must record a distinct, typed "evicted generation unavailable"
+/// failure, not the generic `open data: No such file or directory`.
+#[test]
+fn backfill_of_deleted_object_reports_evicted_unavailable() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _context = runtime.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let gen = evicted_generation_with_commit_log(&runtime, dir.path(), &store, "t-f6-2");
+    let engine = try_reopen_engine(&runtime, dir.path(), &store, "t-f6-2").unwrap();
+    let tid = table_id();
+    let key = crate::upload::manager::sstable_object_key(
+        "t-f6-2",
+        &crate::upload::manager::hex_prefix_for(&gen),
+        &tid.to_string(),
+        &gen,
+        "Data.db",
+    );
+    runtime.block_on(store.delete(&key)).unwrap();
+
+    engine
+        .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+        .unwrap();
+    let state = wait_for_index_settled(&engine, &tid, "val_idx");
+
+    let crate::index::IndexStatus::Failed { error, kind, .. } = &state.status else {
+        panic!("a backfill over a deleted object must fail: {state:?}");
+    };
+    assert_eq!(
+        *kind,
+        crate::index::BuildFailureKind::EvictedUnavailable,
+        "the tracker records the typed kind: {error}"
+    );
+    assert!(
+        error.contains("evicted generation") && error.contains("unavailable"),
+        "the failure must say the evicted generation is unavailable: {error}"
+    );
+    assert!(error.contains(&gen), "{error}");
+    assert!(
+        !error.contains("No such file or directory"),
+        "not the generic I/O error: {error}"
+    );
+    engine.shutdown().unwrap();
+}
+
+/// T-F6-3: `StorageEngine::new` installs the whole-file rehydration hook;
+/// `open` did not, so a whole-file read of an evicted component after `open`
+/// failed instead of rehydrating from the store.
+#[test]
+fn open_installs_the_rehydration_hook() {
+    use object_store::ObjectStore;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _context = runtime.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let gen = evicted_generation_with_commit_log(&runtime, dir.path(), &store, "t-f6-3");
+    let engine = try_reopen_engine(&runtime, dir.path(), &store, "t-f6-3").unwrap();
+    let tid = table_id();
+    let local = engine.table_sstable_dir(&tid).join(format!("{gen}-Data.db"));
+    assert!(!local.exists(), "precondition: Data.db is evicted");
+
+    let restored = ferrosa_sstable::io::rehydrate_file(&local).unwrap();
+
+    assert!(restored, "a whole-file read after open must rehydrate");
+    let key = crate::upload::manager::sstable_object_key(
+        "t-f6-3",
+        &crate::upload::manager::hex_prefix_for(&gen),
+        &tid.to_string(),
+        &gen,
+        "Data.db",
+    );
+    let object = runtime
+        .block_on(async { store.get(&key).await.unwrap().bytes().await })
+        .unwrap();
+    assert_eq!(std::fs::read(&local).unwrap(), object.to_vec());
+    engine.shutdown().unwrap();
+}
+
+/// Coordinator follow-up to T-F6 (2026-10-10 node1): started through `open`
+/// with nothing evicted, the engine evicted `agent_memory.schema_version` at
+/// runtime, and a plain single-partition SELECT then failed with
+/// `outcome=NotOwned` / `missing required Data.db`: only `new` (or boot-time
+/// registration of already-evicted generations) registered the evicted-read
+/// store. A generation evicted after an `open` start must stay readable by an
+/// ordinary query (values asserted) and buildable by an index backfill.
+#[test]
+fn open_engine_reads_and_backfills_a_generation_evicted_at_runtime() {
+    use ferrosa_index::IndexKey;
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _context = runtime.enter();
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn object_store::ObjectStore> =
+        Arc::new(object_store::memory::InMemory::new());
+    let engine = try_reopen_engine(&runtime, dir.path(), &store, "t-f6-runtime").unwrap();
+    assert!(
+        StorageEngine::evicted_generations(&dir.path().join("sstables")).is_empty(),
+        "precondition: nothing is evicted at startup"
+    );
+    engine.register_table(test_schema()).unwrap();
+    let tid = table_id();
+    for i in 0..5 {
+        engine
+            .write(
+                &tid,
+                &make_key(&format!("k{i}")),
+                make_row(format!("v{i}").as_bytes(), 1000),
+                1000,
+            )
+            .unwrap();
+    }
+    engine.flush(&tid).unwrap();
+    assert!(runtime.block_on(engine.sync_sstables_to_s3()).unwrap() >= 1);
+    let table_dir = engine.table_sstable_dir(&tid);
+    let gen = StorageEngine::evicted_generations(&dir.path().join("sstables"))
+        .into_values()
+        .flatten()
+        .next()
+        .expect("the sync evicted the generation at runtime");
+    assert!(!table_dir.join(format!("{gen}-Data.db")).exists());
+    // Drop the pooled reader and fd so the next read reopens the evicted
+    // generation, as a read long after the eviction does.
+    engine.evict_pooled_reader_for_test(&tid, gen.parse().unwrap());
+    ferrosa_sstable::io::evict_global_fd_for_test(table_dir.join(format!("{gen}-Data.db")));
+
+    for i in 0..5 {
+        let partition = engine
+            .read(&tid, &make_key(&format!("k{i}")))
+            .unwrap_or_else(|e| panic!("k{i}: a plain read of the evicted generation failed: {e}"))
+            .unwrap_or_else(|| panic!("k{i} vanished"));
+        assert_eq!(
+            partition.rows[0].cells[0].1.value.as_deref(),
+            Some(format!("v{i}").as_bytes()),
+            "k{i} reads back its value"
+        );
+    }
+
+    engine
+        .add_index(&tid, "val_idx", 0, ferrosa_index::IndexType::BTree)
+        .unwrap();
+    let state = wait_for_index_settled(&engine, &tid, "val_idx");
+    assert!(
+        matches!(state.status, crate::index::IndexStatus::Current),
+        "the backfill over the runtime-evicted generation must complete: {state:?}"
+    );
+    let through_index =
+        collect_index_results(&engine, &tid, "val_idx", &IndexKey(b"v3".to_vec())).unwrap();
+    assert_eq!(
+        partition_keys_and_values(&through_index),
+        partition_keys_and_values(&[engine.read(&tid, &make_key("k3")).unwrap().unwrap()]),
+        "the index finds k3 by its value"
+    );
+    engine.shutdown().unwrap();
+}
