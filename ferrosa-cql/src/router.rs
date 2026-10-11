@@ -9768,7 +9768,9 @@ async fn route_update(
         // map-key remove) become per-element cells and skip the whole-value RMW.
         // Ops that need a read (counter, list remove-by-value, positional) build
         // nothing here and fall through to the RMW match below.
-        if let Assignment::Add { column, value } | Assignment::Sub { column, value } = assignment {
+        if let Assignment::Add { column, value, .. } | Assignment::Sub { column, value, .. } =
+            assignment
+        {
             let col_meta = table_meta
                 .columns
                 .get(column)
@@ -9838,7 +9840,7 @@ async fn route_update(
                 let val = bridge::term_to_cql_value(value, &cql_type)?;
                 (column.as_str(), val)
             }
-            Assignment::Add { column, value } => {
+            Assignment::Add { column, value, .. } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
@@ -9936,7 +9938,7 @@ async fn route_update(
                     }
                 }
             }
-            Assignment::Sub { column, value } => {
+            Assignment::Sub { column, value, .. } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
@@ -10776,7 +10778,7 @@ fn materialize_update(
                     regular_cells.push((col_idx, val));
                 }
             }
-            Assignment::Add { column, value } | Assignment::Sub { column, value } => {
+            Assignment::Add { column, value, .. } | Assignment::Sub { column, value, .. } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
@@ -17927,9 +17929,27 @@ mod tests {
             bindings[0].stmt_index < statements.len(),
             "the binding must point at the read inside this block"
         );
-        assert!(
-            matches!(statements.last(), Some(Statement::Update(_))),
-            "the UPDATE that consumes the bound value must be in the block"
+        let update = statements
+            .iter()
+            .find_map(|s| match s {
+                Statement::Update(u) => Some(u),
+                _ => None,
+            })
+            .expect("the block contains the UPDATE");
+        let operand = update
+            .assignments
+            .iter()
+            .find_map(|a| match a {
+                Assignment::Add { lhs, .. } => Some(lhs.clone()),
+                _ => None,
+            })
+            .expect("`SET v = cur + 1` parses as an Add");
+        assert_eq!(
+            operand,
+            Some("cur".to_string()),
+            "the operand must be the BOUND NAME `cur`, not the column `v`: this is the difference \
+             between a read-modify-write and a plain self-increment, and it is what a transaction \
+             resolves to the value it read"
         );
     }
 

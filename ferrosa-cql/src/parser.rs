@@ -551,6 +551,15 @@ impl<'input> Parser<'input> {
                 });
             } else {
                 self.lexer.expect(&TokenKind::Eq)?;
+                // Keep the name on the LEFT of the operator. `v = v + 1` names the column itself;
+                // `v = cur + 1` names a value a LET block bound. Dropping it (as this did) makes the
+                // two forms indistinguishable, and a transaction can then no longer resolve the read
+                // it must carry into the write.
+                let lhs = match &self.lexer.peek()?.kind {
+                    TokenKind::Ident(name) => Some((*name).to_string()),
+                    TokenKind::QuotedIdent(name) => Some(name.clone()),
+                    _ => None,
+                };
                 let value = self.parse_term()?;
 
                 // Check for: col = col + term  or  col = col - term
@@ -559,12 +568,14 @@ impl<'input> Parser<'input> {
                     assignments.push(Assignment::Add {
                         column: col,
                         value: rhs,
+                        lhs,
                     });
                 } else if self.lexer.eat(&TokenKind::Minus)? {
                     let rhs = self.parse_term()?;
                     assignments.push(Assignment::Sub {
                         column: col,
                         value: rhs,
+                        lhs,
                     });
                 } else {
                     assignments.push(Assignment::Simple { column: col, value });
@@ -3806,7 +3817,7 @@ mod tests {
                 assert_eq!(s.table, "t");
                 assert_eq!(s.assignments.len(), 1);
                 match &s.assignments[0] {
-                    Assignment::Add { column, value } => {
+                    Assignment::Add { column, value, .. } => {
                         assert_eq!(column, "tags");
                         assert!(
                             matches!(value, Term::SetLiteral(elems) if elems.len() == 1),
@@ -3828,7 +3839,7 @@ mod tests {
             Statement::Update(s) => {
                 assert_eq!(s.assignments.len(), 1);
                 match &s.assignments[0] {
-                    Assignment::Sub { column, value } => {
+                    Assignment::Sub { column, value, .. } => {
                         assert_eq!(column, "items");
                         assert!(
                             matches!(value, Term::ListLiteral(elems) if elems.len() == 1),

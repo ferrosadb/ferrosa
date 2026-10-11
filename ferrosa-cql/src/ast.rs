@@ -486,10 +486,23 @@ pub struct InsertStatement {
 pub enum Assignment {
     /// Simple: `col = term`
     Simple { column: String, value: Term },
-    /// Addition: `col = col + term` (counter increment or collection append)
-    Add { column: String, value: Term },
-    /// Subtraction: `col = col - term` (counter decrement or collection subtract)
-    Sub { column: String, value: Term },
+    /// Addition: `col = <lhs> + term` (counter increment or collection append).
+    ///
+    /// `lhs` is the name on the left of the operator — the column itself for a plain
+    /// self-increment (`v = v + 1`), or the name a `LET` block bound (`v = cur + 1`). It is kept
+    /// rather than dropped because a transaction must RESOLVE it to the value it read; without it
+    /// the two forms are indistinguishable and the read inside the transaction is lost.
+    Add {
+        column: String,
+        value: Term,
+        lhs: Option<String>,
+    },
+    /// Subtraction: `col = <lhs> - term` (counter decrement or collection subtract). See [`Add`].
+    Sub {
+        column: String,
+        value: Term,
+        lhs: Option<String>,
+    },
     /// Map/list element: `col[key] = term`
     Element {
         column: String,

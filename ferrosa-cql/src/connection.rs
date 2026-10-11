@@ -2453,6 +2453,7 @@ pub(crate) fn analyze_prepared_columns(
                     Assignment::Add {
                         column,
                         value: Term::BindMarker(_),
+                        ..
                     } => {
                         if let Some(cql_type) = resolve(column) {
                             bound_columns.push((column.clone(), cql_type));
@@ -2461,6 +2462,7 @@ pub(crate) fn analyze_prepared_columns(
                     Assignment::Sub {
                         column,
                         value: Term::BindMarker(_),
+                        ..
                     } => {
                         if let Some(cql_type) = resolve(column) {
                             bound_columns.push((column.clone(), cql_type));
