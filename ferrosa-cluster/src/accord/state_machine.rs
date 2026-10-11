@@ -1169,8 +1169,56 @@ impl AccordStateMachine {
             self.finalized.advance_horizon(now);
         }
 
+        // The applier's idempotency set is pruned in LOCKSTEP, on the SAME floor:
+        // an entry at or below it belongs to a transaction this replica has
+        // applied and can no longer be asked to re-apply, so its record can never
+        // be consulted again (see `EngineStorageApplier::prune_applied_below`).
+        // This is the counterpart the applied-transaction prune was missing — the
+        // set used to grow with the lifetime transaction count while the volatile
+        // `TxnState`s did not.
+        self.prune_applied_idempotency();
+
+        // The dep-wait graph's own `applied`/`aborted` records are forgotten on
+        // the SAME state watermark, by exact id: the transactions whose `TxnState`
+        // this prune just dropped. Its `prune(max_age)` is test-only, so without
+        // this those sets also grew for the life of the process.
+        self.apply_engine.forget_graph_applied(&applied_ids);
+
         let after = self.txn_states.len() + self.committed_txns.len();
         before - after
+    }
+
+    /// Drop the apply engine's idempotency records at or below the
+    /// decided-transaction retention floor, returning how many were dropped.
+    ///
+    /// The floor ([`Self::finalized_floor`]) is the watermark past which a
+    /// record can no longer be replayed: the state machine refuses a late
+    /// PreAccept for a floored id (so the id can never regain a `TxnState`), and
+    /// [`Self::handle_apply_writeset_borrowed`] returns *before* the applier
+    /// whenever the id has no live `TxnState`. Called by [`Self::prune_applied`]
+    /// so the two prunes share one watermark; exposed so a test can drive it
+    /// with synthetic time instead of sleeping.
+    pub fn prune_applied_idempotency(&mut self) -> usize {
+        match self.finalized.floor() {
+            Some(floor) => self.apply_engine.prune_applied_below(floor),
+            // No floor yet (no clock wired and no restart floor): there is no
+            // watermark, so there is nothing provably unreplayable to drop.
+            None => 0,
+        }
+    }
+
+    /// The decided-transaction retention floor, if any — the watermark past
+    /// which a transaction is provably beyond replay (see
+    /// [`crate::accord::finalized`]).
+    pub fn finalized_floor(&self) -> Option<Timestamp> {
+        self.finalized.floor()
+    }
+
+    /// Resident byte footprint of the apply engine's idempotency record, for the
+    /// maintenance memory check (the set used to grow with the lifetime
+    /// transaction count; it now tracks the replay window).
+    pub fn applied_idempotency_footprint(&self) -> usize {
+        self.apply_engine.applied_footprint_bytes()
     }
 
     /// Log a PreAccept refused because its transaction is already decided.
@@ -1655,6 +1703,122 @@ mod tests {
         let writer = Arc::new(MockSyncWriter::new());
         let sm = AccordStateMachine::new(node_id, writer.clone());
         (sm, writer)
+    }
+
+    /// An applier that models `EngineStorageApplier`'s idempotency record and
+    /// records the WATERMARK it is pruned at, so a test can assert the state
+    /// machine drives that prune in lockstep with its own decided-txn prune
+    /// instead of leaving the set unbounded.
+    #[derive(Default)]
+    struct WatermarkApplier {
+        applied: Mutex<HashSet<TxnId>>,
+        pruned_at: Mutex<Vec<Timestamp>>,
+    }
+
+    impl WatermarkApplier {
+        fn applied_count(&self) -> usize {
+            self.applied.lock().len()
+        }
+
+        fn contains(&self, id: &TxnId) -> bool {
+            self.applied.lock().contains(id)
+        }
+
+        fn pruned_at(&self) -> Vec<Timestamp> {
+            self.pruned_at.lock().clone()
+        }
+    }
+
+    impl StorageApplier for WatermarkApplier {
+        fn apply(&self, txn_id: TxnId, _mutation: ApplyMutation) -> Result<(), ApplyError> {
+            self.applied.lock().insert(txn_id);
+            Ok(())
+        }
+
+        fn prune_applied_below(&self, watermark: Timestamp) -> usize {
+            self.pruned_at.lock().push(watermark);
+            let mut applied = self.applied.lock();
+            let before = applied.len();
+            applied.retain(|id| id.0 > watermark);
+            before - applied.len()
+        }
+
+        fn applied_footprint_bytes(&self) -> usize {
+            self.applied.lock().len() * std::mem::size_of::<TxnId>()
+        }
+    }
+
+    /// `prune_applied` drops the apply engine's idempotency records on the SAME
+    /// watermark it advances for the decided-txn tombstones. That lockstep is what
+    /// bounds the set to the replay window: before it, the set grew with the
+    /// lifetime transaction count while the volatile `TxnState`s did not.
+    #[test]
+    fn prune_applied_drops_the_idempotency_record_on_the_same_watermark() {
+        const SEC: u64 = 1_000_000_000;
+        let applier = Arc::new(WatermarkApplier::default());
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer, applier.clone());
+
+        let old = txn(2, 100 * SEC);
+        let young = txn(3, 250 * SEC);
+        for (id, key, value) in [
+            (old, &b"k-old"[..], &b"old"[..]),
+            (young, &b"k-young"[..], &b"young"[..]),
+        ] {
+            sm.handle_preaccept(id, id.0, key, BallotNumber(0), 0);
+            sm.handle_accept(id, id.0, id.0, vec![], BallotNumber(1));
+            sm.handle_commit(id, id.0, id.0, vec![]);
+            sm.handle_apply_writeset(id, vec![value.to_vec()]);
+        }
+        assert_eq!(
+            applier.applied_count(),
+            2,
+            "both transactions applied through the real apply entry point"
+        );
+        assert_eq!(
+            sm.applied_count_for_test(),
+            2,
+            "precondition: the dep-wait graph holds both as applied too"
+        );
+
+        // The maintenance prune's horizon: now - FINALIZED_RETENTION, now = 200 s.
+        sm.advance_finalized_horizon(ts(200 * SEC));
+        assert_eq!(
+            sm.finalized_floor().map(|floor| floor.time),
+            Some(140 * SEC),
+            "the floor is now - FINALIZED_RETENTION"
+        );
+
+        sm.prune_applied();
+
+        assert_eq!(
+            applier
+                .pruned_at()
+                .iter()
+                .map(|watermark| watermark.time)
+                .collect::<Vec<_>>(),
+            vec![140 * SEC],
+            "the applier is pruned on the SAME floor the tombstones use"
+        );
+        assert!(
+            !applier.contains(&old),
+            "a record at or below the floor is dropped"
+        );
+        assert!(
+            applier.contains(&young),
+            "a record inside the replay window survives — the guard is not weakened"
+        );
+        assert_eq!(
+            sm.applied_idempotency_footprint(),
+            std::mem::size_of::<TxnId>()
+        );
+        assert_eq!(
+            sm.applied_count_for_test(),
+            0,
+            "the dep-wait graph's own applied records are forgotten on the SAME state \
+             watermark — THIS tick pruned both transactions' states, so it forgets both \
+             (the forget is keyed on the state prune, not on the floor)"
+        );
     }
 
     // =======================================================================

@@ -782,7 +782,17 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   `StorageApplier::apply_writeset` commits all of a txn's partitions in ONE atomic
   all-or-nothing batch (a failure on any key persists none); idempotency
   is keyed by `(txn_id, partition_key, t)` so writes 2..N of one transaction are
-  never deduped/dropped. **The decoded batch is never materialized:** the apply
+  never deduped/dropped. **The idempotency record is bounded by the replay
+  window, not by the lifetime transaction count:** entries at or below the
+  decided-transaction retention floor are dropped by
+  `StorageApplier::prune_applied_below`, which `AccordStateMachine::prune_applied`
+  drives in lockstep with its own applied-txn prune (the same maintenance step
+  that logs `maintenance: pruned applied Accord transactions`). An entry below the
+  floor can never be consulted again — `handle_apply_writeset_borrowed` returns
+  *before* the applier whenever the transaction has no live `TxnState`, and a
+  floored id cannot regain one (a late PreAccept for it is refused) — so this is a
+  correctness-derived watermark, **never a size cap** (FMEA `CL-60`). **The decoded
+  batch is never materialized:** the apply
   resolves the survivors (idempotency + PostgreSQL MVCC metadata) in a pass that
   decodes each partition, keeps only its `(txn,key,t)` triple and view index, and
   drops its rows; the survivors then STREAM through ONE atomic `write_atomic_batch`
@@ -795,7 +805,13 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   the resident-vs-staged split. An unresolvable park (a dependency that never
   arrives) is reclaimed by time (`FERROSA_ACCORD_PARKED_APPLY_RECLAIM_SECS`) and
   every release is reported at ERROR — never a silent drop — with its graph waits
-  cleared so a late dependency cannot wake it into a false `Applied`.
+  cleared so a late dependency cannot wake it into a false `Applied`. **The
+  dep-wait graph's own `applied`/`aborted` sets are forgotten the same way:**
+  `prune_applied` passes the ids it just removed to `DepWaitGraph::forget`, which
+  drops those records by exact id — its age-based `prune(max_age)` is test-only, so
+  without this those sets also grew for the life of the process. An age bound is
+  deliberately NOT used there: it can forget a dependency whose `TxnState` is still
+  live, and the waiter that then registers on it is never woken (CL-60).
 - `wire.rs` — bincode payloads for each protocol message. **Multi-key:**
   `WriteSetEntry` + `ApplyV2Payload` back the additive `AccordPreAcceptV2`/
   `AccordApplyV2` wire codes; `AccordCoordinatorDriver::new_multi(write_set)` is

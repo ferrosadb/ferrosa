@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-10-10
+last_updated: 2026-10-11
 ---
 
 # ferrosa-cluster — Roadmap
@@ -220,6 +220,21 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   bytes must outlive the call — materializes them.
   (`staged_writeset_apply_hands_the_applier_the_spill_mapping_not_a_copy`, whose
   negative control drives the owned path through the same probe.)
+- **Every apply-path idempotency structure is now bounded by the replay window
+  (CL-61).** `EngineStorageApplier::applied` (an owned partition key per applied
+  mutation), `NoopStorageApplier`'s `applied` + `payloads` logs, and the dep-wait
+  graph's own `applied`/`aborted` sets all grew for the life of the process. All
+  now prune in the SAME maintenance step as the applied-txn prune: the applier
+  sets on the decided-transaction retention FLOOR
+  (`StorageApplier::prune_applied_below`), the graph by EXACT pruned id
+  (`DepWaitGraph::forget`). No size cap anywhere. Measured: three identical
+  rounds hold **400 entries / 29 090 B each** where the pre-fix set grew
+  **400 → 800 → 1 200 entries** (29 090 → 58 180 → 87 270 B); the negative control
+  (`a_watermark_past_a_live_transaction_drops_the_guard_and_double_applies`) shows
+  an over-eager prune double-applying a replay. Residual: a late
+  `Accept`/`Commit`/`Recover` for an already-applied, floor-covered id (those
+  handlers do not consult `finalized.decided`) is bounded only by the same 60 s
+  replay horizon the finalized floor already assumes.
 - **Cluster-wide `fts_match` scatter-gather (BUG-F-007 / t_0d08aa43).** `fts_match`
   carries no partition key, so its hits span every token range, but the served
   path consulted only the coordinator's local FTI — returning 0/1

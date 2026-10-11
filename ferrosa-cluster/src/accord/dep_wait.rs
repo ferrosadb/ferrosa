@@ -317,6 +317,33 @@ impl DepWaitGraph {
         before - after
     }
 
+    /// Forget the `applied`/`aborted` record of the given transactions by EXACT
+    /// id, returning how many `applied` entries were dropped.
+    ///
+    /// This is the bound the graph's own bookkeeping needs in production, and it
+    /// is deliberately NOT `prune(max_age)`: an AGE bound applied to the graph
+    /// alone can forget a dependency whose `TxnState` is still live (the apply
+    /// path keeps such a dependency in the waiter's set), so the waiter registers
+    /// on it, is never woken (it was already marked applied), and parks until its
+    /// own bound expires and is abandoned — the liveness failure the apply path
+    /// already fixed once. The state is the right key, not the clock.
+    ///
+    /// Called in lockstep with the state machine's applied-txn prune, on the ids
+    /// it just forgot: once a transaction's `TxnState` is gone no live waiter can
+    /// name it (the apply path filters out dependencies with no live state), and
+    /// every waiter it had was woken when it was marked applied — so its record
+    /// can never be read again.
+    pub fn forget(&mut self, txns: &[TxnId]) -> usize {
+        let mut forgotten = 0;
+        for txn in txns {
+            if self.applied.remove(txn).is_some() {
+                forgotten += 1;
+            }
+            self.aborted.remove(txn);
+        }
+        forgotten
+    }
+
     /// Check if a transaction is currently waiting.
     pub fn is_waiting(&self, txn_id: &TxnId) -> bool {
         self.waiting_on.contains_key(txn_id)
@@ -755,6 +782,31 @@ mod tests {
         let pruned = graph.prune(Duration::ZERO);
         assert_eq!(pruned, 1000);
         assert_eq!(graph.applied_count(), 0);
+    }
+
+    /// `forget` drops the record of EXACTLY the named ids — the state machine's
+    /// applied-txn prune tells it which — and leaves every other transaction's
+    /// `applied` record intact so a waiter can still see it.
+    #[test]
+    fn forget_drops_only_the_named_ids_and_leaves_the_rest_applied() {
+        let mut graph = DepWaitGraph::new();
+        graph.mark_applied(txn(1));
+        graph.mark_applied(txn(2));
+        graph.mark_applied(txn(3));
+        assert_eq!(graph.applied_count(), 3);
+
+        let forgotten = graph.forget(&[txn(1), txn(3)]);
+        assert_eq!(forgotten, 2, "both named ids were applied here");
+        assert!(!graph.is_applied(&txn(1)));
+        assert!(!graph.is_applied(&txn(3)));
+        assert!(
+            graph.is_applied(&txn(2)),
+            "a still-live transaction's record is untouched — the waiter still resolves"
+        );
+
+        // Forgetting an id that was never applied is a no-op, not a panic.
+        assert_eq!(graph.forget(&[txn(99)]), 0);
+        assert_eq!(graph.applied_count(), 1);
     }
 
     #[test]

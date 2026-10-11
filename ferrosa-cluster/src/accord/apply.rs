@@ -453,6 +453,29 @@ pub trait StorageApplier: Send + Sync + 'static {
             .collect();
         self.apply_writeset(txn_id, owned)
     }
+
+    /// Forget the idempotency record of every transaction at or below `watermark`,
+    /// returning how many records were dropped.
+    ///
+    /// The idempotency record exists so a replayed Apply of an already-applied
+    /// transaction is a no-op (see [`EngineStorageApplier`]). A record may be
+    /// dropped exactly when its transaction can no longer be replayed — when it
+    /// is at or below the decided-transaction retention floor the state machine's
+    /// maintenance prune advances ([`crate::accord::finalized`]). This seam is
+    /// deliberately WATERMARK-driven, never a size cap: a cap would either drop a
+    /// still-replayable record (⇒ silent double-apply) or fail to bound the set.
+    ///
+    /// The default implementation drops nothing — an applier that keeps no
+    /// idempotency record has nothing to prune.
+    fn prune_applied_below(&self, _watermark: Timestamp) -> usize {
+        0
+    }
+
+    /// Resident byte footprint of this applier's idempotency record, for the
+    /// maintenance memory check (0 when the applier keeps none).
+    fn applied_footprint_bytes(&self) -> usize {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -737,6 +760,52 @@ impl NoopStorageApplier {
             .find(|(id, _)| id == txn_id)
             .map(|(_, d)| d.clone())
     }
+
+    /// Drop every recorded apply at or below `watermark` from BOTH logs,
+    /// returning how many apply records were dropped.
+    ///
+    /// Same watermark, same argument as
+    /// [`EngineStorageApplier::prune_applied_below`]: a transaction past the
+    /// decided-txn retention floor can no longer be replayed, so its record can
+    /// never be consulted again. Both logs are append-only and were never pruned;
+    /// the payload log holds a whole owned mutation per apply — the same
+    /// materialization shape as the primary idempotency set, at a LARGER per-entry
+    /// cost. They are pruned together so a surviving record always has its payload
+    /// (an idempotent retry must still find the data it recorded).
+    pub fn prune_applied_below(&self, watermark: Timestamp) -> usize {
+        let dropped = {
+            let mut applied = self.applied.lock();
+            let before = applied.len();
+            applied.retain(|(txn, _)| txn.0 > watermark);
+            before - applied.len()
+        };
+        // Separate lock scope: never hold both logs at once (see `apply`).
+        self.payloads.lock().retain(|(txn, _)| txn.0 > watermark);
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                floor = ?watermark,
+                "accord apply: pruned the noop applier's apply + payload logs"
+            );
+        }
+        dropped
+    }
+
+    /// Resident byte footprint of both logs, for the memory gate.
+    pub fn applied_footprint_bytes(&self) -> usize {
+        let records = {
+            let applied = self.applied.lock();
+            applied.len() * std::mem::size_of::<(TxnId, Timestamp)>()
+        };
+        let payloads = {
+            let payloads = self.payloads.lock();
+            payloads
+                .iter()
+                .map(|(_, data)| std::mem::size_of::<(TxnId, Vec<u8>)>() + data.len())
+                .sum::<usize>()
+        };
+        records + payloads
+    }
 }
 
 impl Default for NoopStorageApplier {
@@ -750,6 +819,17 @@ impl StorageApplier for NoopStorageApplier {
         self.applied.lock().push((txn_id, mutation.t));
         self.payloads.lock().push((txn_id, mutation.data));
         Ok(())
+    }
+
+    /// Drop the logs the decided-transaction retention floor now covers — see
+    /// [`NoopStorageApplier::prune_applied_below`].
+    fn prune_applied_below(&self, watermark: Timestamp) -> usize {
+        NoopStorageApplier::prune_applied_below(self, watermark)
+    }
+
+    /// See [`NoopStorageApplier::applied_footprint_bytes`].
+    fn applied_footprint_bytes(&self) -> usize {
+        NoopStorageApplier::applied_footprint_bytes(self)
     }
 }
 
@@ -812,6 +892,21 @@ fn restamp_row(row: &mut ferrosa_sstable::types::Row, cell_ts: i64) {
 /// re-write apart from the first). Tracking applied transactions makes re-apply
 /// a true no-op.
 ///
+/// # Bound — pruned on a watermark, never a size cap
+///
+/// The record does not grow with the lifetime transaction count: entries at or
+/// below the decided-transaction retention floor are dropped by
+/// [`StorageApplier::prune_applied_below`], driven in lockstep with the state
+/// machine's maintenance prune of the volatile `TxnState`s and the `finalized`
+/// tombstones (see [`crate::accord::finalized`]). The floor is the instant past
+/// which no Apply replay can arrive, so an entry below it can never be consulted
+/// again: `AccordStateMachine::handle_apply_writeset_borrowed` returns *before*
+/// this applier whenever the transaction has no live `TxnState` (applied and
+/// pruned, or never registered), and a floored id cannot regain one (a late
+/// PreAccept for it is refused). The footprint therefore tracks the live replay
+/// window (≈ the last [`crate::accord::finalized::FINALIZED_RETENTION`]), not the
+/// lifetime total.
+///
 /// # Last-write-wins vs the Accord total order
 ///
 /// Cell timestamps are re-stamped to the agreed `t` at apply time, never the
@@ -844,6 +939,50 @@ impl EngineStorageApplier {
     pub fn applied_count(&self) -> usize {
         self.applied.lock().len()
     }
+
+    /// Drop every idempotency entry for a transaction at or below `watermark`,
+    /// returning how many were dropped.
+    ///
+    /// `watermark` is the decided-transaction retention floor
+    /// ([`crate::accord::finalized`]): the instant past which a transaction can
+    /// no longer be replayed, so its `(txn_id, partition-key, t.time)` record can
+    /// never be consulted again. The comparison is the SAME one the decided-txn
+    /// record uses (`TxnId.0 <= floor`), so this set and the tombstones agree on
+    /// exactly which ids are beyond replay. There is no size argument — a
+    /// truncating cap would drop a still-replayable record (silent double-apply).
+    pub fn prune_applied_below(&self, watermark: Timestamp) -> usize {
+        let mut applied = self.applied.lock();
+        let before = applied.len();
+        applied.retain(|(txn, _, _)| txn.0 > watermark);
+        let dropped = before - applied.len();
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                floor = ?watermark,
+                "accord apply: pruned applied idempotency entries below the replay floor"
+            );
+        }
+        dropped
+    }
+
+    /// Resident byte footprint of the idempotency set: the per-entry fixed size
+    /// plus the owned partition-key bytes. Used by the memory gate and the
+    /// before/after measurement; the hash-table's slack is excluded.
+    pub fn applied_footprint_bytes(&self) -> usize {
+        let applied = self.applied.lock();
+        let fixed = std::mem::size_of::<(TxnId, Vec<u8>, u64)>();
+        applied.iter().map(|(_, key, _)| fixed + key.len()).sum()
+    }
+
+    /// Whether the set still holds the exact `(txn, key, t.time)` idempotency
+    /// record — a VALUE probe for tests, so a prune is asserted on membership
+    /// rather than on a total count alone.
+    pub fn applied_contains(&self, txn: TxnId, key: &[u8], t_time: u64) -> bool {
+        self.applied
+            .lock()
+            .iter()
+            .any(|(t, k, time)| *t == txn && k.as_slice() == key && *time == t_time)
+    }
 }
 
 impl StorageApplier for EngineStorageApplier {
@@ -865,6 +1004,17 @@ impl StorageApplier for EngineStorageApplier {
         // The single-key apply is the degenerate one-entry writeset, so it
         // shares the exact persistence + idempotency path (atomic batch of one).
         self.apply_writeset(txn_id, vec![mutation])
+    }
+
+    /// Drop the idempotency records the decided-transaction retention floor now
+    /// covers — see [`EngineStorageApplier::prune_applied_below`].
+    fn prune_applied_below(&self, watermark: Timestamp) -> usize {
+        EngineStorageApplier::prune_applied_below(self, watermark)
+    }
+
+    /// See [`EngineStorageApplier::applied_footprint_bytes`].
+    fn applied_footprint_bytes(&self) -> usize {
+        EngineStorageApplier::applied_footprint_bytes(self)
     }
 
     /// Apply every partition of a multi-key transaction **atomically**, decoding
@@ -1431,6 +1581,30 @@ impl DepWaitApplier {
         observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
     ) -> Result<(), String> {
         self.applier.register_postgres_mvcc_observer(observer)
+    }
+
+    /// Forget the inner applier's idempotency records for every transaction at or
+    /// below `watermark` — the decided-transaction retention floor the state
+    /// machine's maintenance prune advances (see
+    /// [`StorageApplier::prune_applied_below`]). Delegated so the state machine,
+    /// which holds this engine, can drive the prune in lockstep with its own.
+    pub fn prune_applied_below(&self, watermark: Timestamp) -> usize {
+        self.applier.prune_applied_below(watermark)
+    }
+
+    /// Resident byte footprint of the inner applier's idempotency record (see
+    /// [`StorageApplier::applied_footprint_bytes`]).
+    pub fn applied_footprint_bytes(&self) -> usize {
+        self.applier.applied_footprint_bytes()
+    }
+
+    /// Forget the dep-wait graph's `applied`/`aborted` record of the given
+    /// transactions by exact id — see [`DepWaitGraph::forget`]. Called in lockstep
+    /// with the state machine's applied-txn prune so the graph's own bookkeeping
+    /// is bounded by the same state watermark (its `prune(max_age)` had no
+    /// production caller, so these sets grew for the life of the process).
+    pub fn forget_graph_applied(&self, txns: &[TxnId]) -> usize {
+        self.graph.lock().forget(txns)
     }
 
     /// Attempt to apply a committed transaction.
@@ -3388,6 +3562,240 @@ mod engine_applier_tests {
             t,
             deps: vec![],
         }
+    }
+
+    // =======================================================================
+    // Idempotency-set bound — the set is pruned on a WATERMARK (the decided-txn
+    // retention floor), never a size cap.
+    //
+    // Before this, `EngineStorageApplier::applied` grew with the LIFETIME
+    // transaction count: it held an owned partition key per applied mutation and
+    // was never pruned (2.74 GB anonymous heap ⇒ the node OOM-killed, exit 137).
+    // The set's job is to make a replayed Apply a no-op, so a record may be
+    // dropped exactly when its transaction can no longer be replayed — at or
+    // below the floor the state machine's maintenance prune advances.
+    // =======================================================================
+
+    /// A record is dropped EXACTLY when its transaction is at or below the replay
+    /// watermark; records above it survive, which is what keeps a replay of a
+    /// still-live transaction a no-op. Asserted on MEMBERSHIP (the `(txn, key, t)`
+    /// triple), not on a total count.
+    #[test]
+    fn applied_idempotency_record_is_dropped_only_below_the_replay_watermark() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        // Milliseconds→seconds: `accord_ts` takes micros, and the id / agreed `t`
+        // of each transaction is its own timestamp.
+        let secs = |s: u64| s * 1_000_000;
+        let a = txn(1, secs(100));
+        let b = txn(2, secs(200));
+        let c = txn(3, secs(300));
+        let (ka, kb, kc) = (make_key("pk-100"), make_key("pk-200"), make_key("pk-300"));
+        for (id, key) in [(a, &ka), (b, &kb), (c, &kc)] {
+            applier
+                .apply(
+                    id,
+                    encoded_mutation(key.clone(), b"v", id.0.time as i64, id.0, vec![]),
+                )
+                .unwrap();
+        }
+        let entry = std::mem::size_of::<(TxnId, Vec<u8>, u64)>();
+        assert_eq!(applier.applied_count(), 3, "three applied transactions");
+        assert!(applier.applied_contains(a, b"pk-100", a.0.time));
+        assert!(applier.applied_contains(b, b"pk-200", b.0.time));
+        assert!(applier.applied_contains(c, b"pk-300", c.0.time));
+        assert_eq!(
+            applier.applied_footprint_bytes(),
+            3 * entry + b"pk-100".len() + b"pk-200".len() + b"pk-300".len()
+        );
+
+        // The watermark is 240 s: past a and b, short of c.
+        let dropped = applier.prune_applied_below(accord_ts(secs(240)));
+        assert_eq!(dropped, 2, "the two floored records are dropped");
+        assert_eq!(applier.applied_count(), 1);
+        assert!(
+            !applier.applied_contains(a, b"pk-100", a.0.time),
+            "a record at or below the floor is gone"
+        );
+        assert!(!applier.applied_contains(b, b"pk-200", b.0.time));
+        assert!(
+            applier.applied_contains(c, b"pk-300", c.0.time),
+            "a record ABOVE the floor survives — the replay window is preserved"
+        );
+        assert_eq!(
+            applier.applied_footprint_bytes(),
+            entry + b"pk-300".len(),
+            "the footprint drops with the records, not with a cap"
+        );
+
+        // VALUE: the surviving record still guards its transaction — a replayed
+        // Apply writes nothing (the commit log does not move) and the row is
+        // unchanged.
+        let before = engine.commit_log_position();
+        applier
+            .apply(
+                c,
+                encoded_mutation(kc.clone(), b"v", c.0.time as i64, c.0, vec![]),
+            )
+            .unwrap();
+        let after = engine.commit_log_position();
+        assert_eq!(
+            (before.segment_id, before.offset),
+            (after.segment_id, after.offset),
+            "a replay inside the window must be a no-op — the guard is intact"
+        );
+        assert_eq!(
+            applier.applied_count(),
+            1,
+            "the replay recorded nothing new"
+        );
+        assert_eq!(read_cell0(&engine, &kc).as_deref(), Some(b"v".as_slice()));
+    }
+
+    /// NEGATIVE CONTROL, SHOWN TO FAIL: prune with a watermark ABOVE a
+    /// still-live transaction (an over-eager prune — exactly what a size cap
+    /// would do) and the guard goes red — the replay is no longer a no-op and
+    /// the commit log advances. This is the double-apply the watermark exists to
+    /// prevent, and it is what makes the test above non-vacuous.
+    #[test]
+    fn a_watermark_past_a_live_transaction_drops_the_guard_and_double_applies() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        let live = txn(7, 300_000_000); // 300 s
+        let key = make_key("pk-live");
+        let reapply = || {
+            applier
+                .apply(
+                    live,
+                    encoded_mutation(key.clone(), b"v", live.0.time as i64, live.0, vec![]),
+                )
+                .unwrap();
+        };
+
+        reapply();
+        let guarded_before = engine.commit_log_position();
+        reapply();
+        let guarded_after = engine.commit_log_position();
+        assert_eq!(
+            (guarded_before.segment_id, guarded_before.offset),
+            (guarded_after.segment_id, guarded_after.offset),
+            "precondition: WITH the guard, a replay writes nothing"
+        );
+
+        // The unsafe prune: 400 s, past the still-live 300 s transaction.
+        let dropped = applier.prune_applied_below(accord_ts(400_000_000));
+        assert_eq!(
+            dropped, 1,
+            "the over-eager prune dropped a live transaction's guard"
+        );
+        assert!(!applier.applied_contains(live, b"pk-live", live.0.time));
+
+        let unsafe_before = engine.commit_log_position();
+        reapply();
+        let unsafe_after = engine.commit_log_position();
+        assert!(
+            (unsafe_before.segment_id, unsafe_before.offset)
+                != (unsafe_after.segment_id, unsafe_after.offset),
+            "NEGATIVE CONTROL: with the guard pruned past the safe watermark the replay \
+             DOUBLE-APPLIES (the commit log advances) — the guard is not vacuous"
+        );
+    }
+
+    /// The footprint tracks the REPLAY WINDOW, never the cumulative transaction
+    /// count: three rounds of identical size each prune back to the same bounded
+    /// footprint, instead of growing monotonically with N. This is the before/after
+    /// the OOM fix is credited with.
+    #[test]
+    fn applied_idempotency_footprint_tracks_the_replay_window_not_the_lifetime_count() {
+        let (engine, _dir) = make_engine();
+        let applier = EngineStorageApplier::new(engine.clone());
+
+        const PER_ROUND: u64 = 400;
+        let mut peaks = Vec::new();
+        for round in 0..3u64 {
+            // Rounds are 100 s apart, so a watermark just past a round prunes
+            // exactly that round and never a later one.
+            let base = (round + 1) * 100_000_000;
+            for i in 0..PER_ROUND {
+                let id = txn(1, base + i);
+                applier
+                    .apply(
+                        id,
+                        encoded_mutation(
+                            make_key(&format!("pk-r{round}-{i}")),
+                            b"v",
+                            id.0.time as i64,
+                            id.0,
+                            vec![],
+                        ),
+                    )
+                    .unwrap();
+            }
+            let peak = (applier.applied_count(), applier.applied_footprint_bytes());
+            let watermark = accord_ts(base + PER_ROUND);
+            let dropped = applier.prune_applied_below(watermark);
+            assert_eq!(dropped, PER_ROUND as usize, "exactly this round's records");
+            assert_eq!(applier.applied_count(), 0, "pruned to the empty window");
+            assert_eq!(applier.applied_footprint_bytes(), 0);
+            peaks.push(peak);
+        }
+
+        eprintln!(
+            "applied idempotency footprint per round (entries, bytes): {peaks:?} \
+             — bounded by the round, not by 2× or 3× PER_ROUND"
+        );
+        assert_eq!(
+            peaks[0], peaks[1],
+            "round 2 does not add to round 1: the set tracks the window, not N"
+        );
+        assert_eq!(
+            peaks[0], peaks[2],
+            "round 3 likewise — the footprint is invariant across the cumulative total"
+        );
+    }
+
+    /// The twin: `NoopStorageApplier` keeps TWO append-only logs (the apply record
+    /// and the payload it was applied with) and neither was ever pruned. Both are
+    /// dropped on the SAME watermark, together, so a surviving record always keeps
+    /// its payload for an idempotent retry.
+    #[test]
+    fn noop_applier_apply_and_payload_logs_are_bounded_by_the_same_watermark() {
+        let noop = NoopStorageApplier::new();
+        let secs = |s: u64| s * 1_000_000;
+        let old = txn(1, secs(100));
+        let young = txn(2, secs(300));
+        for (id, payload) in [(old, &b"old-payload"[..]), (young, &b"young-payload"[..])] {
+            noop.apply(
+                id,
+                ApplyMutation {
+                    data: payload.to_vec(),
+                    t: id.0,
+                    deps: vec![],
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(noop.apply_count(), 2);
+        assert!(noop.was_applied(&old) && noop.was_applied(&young));
+
+        let dropped = noop.prune_applied_below(accord_ts(secs(240)));
+        assert_eq!(dropped, 1, "only the floored transaction is dropped");
+        assert_eq!(noop.apply_count(), 1);
+        // VALUE: the record and its payload go together; the live transaction keeps
+        // BOTH, so a replay still finds the data it recorded.
+        assert!(!noop.was_applied(&old));
+        assert_eq!(
+            noop.applied_data(&old),
+            None,
+            "the floored transaction's payload is pruned with its record"
+        );
+        assert!(noop.was_applied(&young));
+        assert_eq!(
+            noop.applied_data(&young).as_deref(),
+            Some(b"young-payload".as_slice())
+        );
     }
 
     // =======================================================================
