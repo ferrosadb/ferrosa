@@ -440,6 +440,21 @@ fn transaction_write(mutation: &Mutation) -> ferrosa_storage::accord::Transactio
     }
 }
 
+/// Build the staged Accord write-set `commit_postgres` now takes from resident writes. A
+/// multi-row INSERT is a handful of keys, so the set stays wholly resident (threshold
+/// `u64::MAX`) and never touches the filesystem — the multi-key APPLY path is what this file
+/// pins; the spill has its own tests.
+fn staged_write_set(
+    writes: Vec<ferrosa_storage::accord::TransactionWrite>,
+) -> ferrosa_storage::accord::StagedAccordWriteSet {
+    let mut builder =
+        ferrosa_storage::accord::StagedAccordWriteSetBuilder::with_threshold_bytes(u64::MAX);
+    for write in writes {
+        builder.accept(write).expect("stage write");
+    }
+    builder.finish().expect("finish staging")
+}
+
 /// The `name` cell persisted for `id` in this engine, if any — read straight
 /// from storage (independent of the PG MVCC overlay).
 fn stored_name(engine: &StorageEngine, id: i32) -> Option<String> {
@@ -544,7 +559,7 @@ async fn multi_key_commit_persists_every_key_on_every_node_rf3() {
     let outcome = committer
         .commit_postgres(
             "public",
-            vec![transaction_write(&m1), transaction_write(&m2)],
+            staged_write_set(vec![transaction_write(&m1), transaction_write(&m2)]),
             vec!["public.users".to_string()],
             snapshot,
         )
@@ -607,7 +622,7 @@ async fn multi_key_commit_persists_each_key_on_its_owner_rf1() {
     let outcome = committer
         .commit_postgres(
             "public",
-            vec![transaction_write(&m1), transaction_write(&m2)],
+            staged_write_set(vec![transaction_write(&m1), transaction_write(&m2)]),
             vec!["public.users".to_string()],
             snapshot,
         )

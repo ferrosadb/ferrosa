@@ -1655,11 +1655,17 @@ mod tests {
                 .push(change);
         }
 
-        // Batched path (4096-row prefetch windows).
-        let writes = crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations)
+        // Batched path (4096-row prefetch windows). The TEST sink collects the streamed
+        // writes; production streams them into the disk-backed staged set.
+        let mut writes = Vec::new();
+        let count =
+            crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations, &mut |w| {
+                writes.push(w);
+                Ok(())
+            })
             .expect("the batched path must build row versions");
         assert_eq!(
-            writes.len(),
+            count,
             mutations.len(),
             "one Accord write per mutation, in order"
         );
@@ -1760,8 +1766,14 @@ mod tests {
             "the request set must vary in serialized size, else it proves nothing"
         );
 
-        let writes = crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations)
+        let mut writes = Vec::new();
+        let count =
+            crate::query::prepare_accord_writes_streaming(&engine, &schema, &mutations, &mut |w| {
+                writes.push(w);
+                Ok(())
+            })
             .expect("the batched path builds row versions");
+        assert_eq!(count, widths.len());
         assert_eq!(writes.len(), widths.len());
 
         for (index, write) in writes.iter().enumerate() {
@@ -1782,6 +1794,116 @@ mod tests {
                  one would (a stale tail from the previous mutation would show here)"
             );
         }
+
+        engine.shutdown().unwrap();
+    }
+
+    /// The PostgreSQL COMMIT write-set must NEVER be materialized.
+    ///
+    /// `prepare_accord_writes_streaming` used to RETURN a `Vec<TransactionWrite>` holding every
+    /// encoded payload — the single P0 OOM finding (`stream-returns-vec`). It now drives a caller
+    /// sink, and the production sink (`StagedAccordWriteSetBuilder`) keeps the payload bulk on
+    /// disk behind a bounded, tunable buffer. This test pins the four invariants:
+    ///
+    /// - **Data preserved** — the staged read-back is byte-identical to the collecting oracle.
+    /// - **Complete** — every mutation yields exactly one write; none is dropped.
+    /// - **Ordered** — keys follow mutation order.
+    /// - **Capacity** — a write-set far larger than the buffer is accepted and spilled, never
+    ///   refused or truncated.
+    ///
+    /// Residency is asserted STRUCTURALLY (resident bytes ≤ buffer; the bulk spilled), which is
+    /// load-independent and safe for the per-PR gate. An absolute byte bound is deliberately
+    /// NOT here — that measures the runner, not the code; it lives behind the nightly perf gate.
+    ///
+    /// The negative control at the end reproduces the REMOVED shape (a collecting sink) and shows
+    /// it holds the whole write-set, so the bounded-residency assertion is not vacuous.
+    #[test]
+    fn accord_write_set_is_never_materialized_and_preserves_every_write() {
+        const TS: i64 = 9_000;
+        const TOTAL: usize = 5_000;
+        const BUFFER: u64 = 1024;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = StorageEngine::new(engine_config(dir.path()), None).unwrap();
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+
+        let mutations: Vec<ferrosa_storage::Mutation> = (0..TOTAL)
+            .map(|i| ferrosa_storage::Mutation {
+                mutation_id: [0x33u8; 16],
+                keyspace: "ks".to_string(),
+                table: "t".to_string(),
+                key: DecoratedKey::new(PartitionKey::new(format!("k{i:08}").into_bytes())),
+                rows: vec![storage_row(1, &"v".repeat(1 + i % 64), i as i32, TS)],
+                timestamp: TS,
+            })
+            .collect();
+
+        // Production sink: a bounded, disk-backed staged write-set builder.
+        let mut builder =
+            ferrosa_storage::accord::StagedAccordWriteSetBuilder::with_threshold_bytes(BUFFER);
+        let count = crate::query::prepare_accord_writes_streaming(
+            &engine,
+            &schema,
+            &mutations,
+            &mut |write| builder.accept(write),
+        )
+        .expect("the streaming build must succeed");
+        let staged = builder.finish().expect("staging must finish");
+
+        // Complete: one write per mutation, none dropped.
+        assert_eq!(count, TOTAL, "one Accord write per mutation");
+        assert_eq!(staged.len(), TOTAL, "no write is dropped");
+
+        // Ordered: keys follow mutation order.
+        for (index, (keyspace, key)) in staged.keys().iter().enumerate() {
+            assert_eq!(keyspace, "ks");
+            assert_eq!(
+                key.as_slice(),
+                format!("k{index:08}").as_bytes(),
+                "write order must follow mutation order"
+            );
+        }
+
+        // Residency (structural): the payload bulk left memory; the resident buffer is bounded.
+        assert!(
+            staged.payloads_arc().resident_bytes() <= BUFFER,
+            "resident payload must stay within the tunable buffer"
+        );
+        assert!(
+            staged.payloads_arc().spilled_to_disk(),
+            "a write-set far larger than the buffer must spill, not stay resident"
+        );
+
+        // Data preserved: differential against the collecting oracle over the same input.
+        let mut collected: Vec<ferrosa_storage::accord::TransactionWrite> = Vec::new();
+        let collected_count = crate::query::prepare_accord_writes_streaming(
+            &engine,
+            &schema,
+            &mutations,
+            &mut |write| {
+                collected.push(write);
+                Ok(())
+            },
+        )
+        .expect("the collecting build must succeed");
+        assert_eq!(collected_count, count);
+        assert_eq!(
+            staged.to_resident().expect("materialize the staged set"),
+            collected,
+            "the staged path must deliver byte-identical writes to the collecting path"
+        );
+
+        // NEGATIVE CONTROL: the collecting sink holds the whole write-set — the removed shape — so
+        // the bounded-residency assertion above is measuring the streaming, not a constant.
+        let collected_bytes: usize = collected
+            .iter()
+            .map(|write| write.key.len() + write.mutation.len())
+            .sum();
+        assert!(
+            collected_bytes as u64 > BUFFER,
+            "the control must exceed the buffer, else the guard is vacuous: {collected_bytes} bytes"
+        );
 
         engine.shutdown().unwrap();
     }

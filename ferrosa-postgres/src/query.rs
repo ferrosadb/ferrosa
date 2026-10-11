@@ -1936,47 +1936,55 @@ impl TableKeyCache {
     }
 }
 
-/// Build a PostgreSQL `COMMIT`'s Accord write-set in **ONE streaming pass**,
-/// without materializing whole-table row images.
+/// Build a PostgreSQL `COMMIT`'s Accord write-set in **ONE streaming pass** and hand each
+/// encoded write to `sink` as it is produced — nothing accumulates the whole write-set.
 ///
-/// The former shape called [`prepare_row_changes`], which built whole-table
-/// images (`table_rows`, a duplicated `before_rows`, a global `partition_keys`)
-/// and returned them as a `Vec<RowChange>` — one entry per row, each carrying its
-/// before *and* after image — which the caller then re-grouped into a
-/// `changes_by_partition` map. For the `pgbench -i --scale 10` shape (1.1M rows in
-/// one transaction) that is four to five simultaneous full copies of the write-set
-/// on the coordinator's COMMIT peak, which is what OOM-killed the node. None of
-/// them is required: a `Mutation` **is** one storage partition, so its row
-/// versions belong to that partition alone and can be encoded and handed to the
-/// committer as the mutation is visited.
+/// The former shape built a `Vec<TransactionWrite>` — one encoded mutation per key, every
+/// payload resident — and returned it, which is the COMMIT's memory problem for
+/// `pgbench -i --scale 10` (1.1M rows in one transaction). The name said *streaming* but the
+/// return type was a materialized `Vec`; this drives a sink instead, so the producer's
+/// residency is one prefetch chunk plus the sink's own bounded buffer, never O(rows x
+/// copies). The sink is where backpressure lives: an `Err` aborts the build and propagates
+/// unchanged, never a silent drop.
 ///
-/// The only cross-mutation state that must survive is the per-table overlay —
-/// and only because a transaction may write the same SQL key twice, in which case
-/// its later write must build on its earlier one. The resident row-image count is
-/// therefore O(one mutation + the overlay), never O(rows x copies).
+/// The former shape called [`prepare_row_changes`], which built whole-table images
+/// (`table_rows`, a duplicated `before_rows`, a global `partition_keys`) and returned them
+/// as a `Vec<RowChange>` — one entry per row, each carrying its before *and* after image —
+/// which the caller then re-grouped into a `changes_by_partition` map. For the
+/// `pgbench -i --scale 10` shape (1.1M rows in one transaction) that is four to five
+/// simultaneous full copies of the write-set on the coordinator's COMMIT peak, which is
+/// what OOM-killed the node. None of them is required: a `Mutation` **is** one storage
+/// partition, so its row versions belong to that partition alone and can be encoded and
+/// handed to the committer as the mutation is visited.
+///
+/// The only cross-mutation state that must survive is the per-table overlay — and only
+/// because a transaction may write the same SQL key twice, in which case its later write
+/// must build on its earlier one. The resident row-image count is therefore O(one mutation
+/// + the overlay), never O(rows x copies).
 ///
 /// The emitted `TransactionWrite` order matches the input mutation order, and the
-/// per-partition metadata is identical to
-/// `prepare_row_changes`-then-group for a write-set whose SQL keys are distinct —
-/// the transactional `COPY` case, and every case except a transaction that writes
-/// one key twice, where this streams each intermediate row image rather than only
-/// the final one (a duplicate-key write-set is last-write-wins at the MVCC apply
-/// anyway; see `record_applied_accord_commit`).
+/// per-partition metadata is identical to `prepare_row_changes`-then-group for a write-set
+/// whose SQL keys are distinct — the transactional `COPY` case, and every case except a
+/// transaction that writes one key twice, where this streams each intermediate row image
+/// rather than only the final one (a duplicate-key write-set is last-write-wins at the MVCC
+/// apply anyway; see `record_applied_accord_commit`).
 ///
 /// The source is a [`ferrosa_storage::write_set_stage::WriteSetSource`] — a resident
-/// `Vec<Mutation>` (the small autocommit batch) or a spilled `StagedWriteSet`
-/// (a large transactional `COPY`) — and is read one mutation at a time, so the
-/// write-set is NEVER materialized into a second resident `Vec<Mutation>`. This
-/// buffers at most [`AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK`] mutations
-/// at once; the build's residency is one prefetch chunk, not the whole write-set.
-/// At `pgbench -i --scale 10` the whole-set clone was the `mutations_cloned` phase:
-/// a resident `Vec<Mutation>` holding a deep clone of every staged frame (~690 MB
-/// at 1.1M rows).
+/// `Vec<Mutation>` (the small autocommit batch) or a spilled `StagedWriteSet` (a large
+/// transactional `COPY`) — and is read one mutation at a time, so the write-set is NEVER
+/// materialized into a resident `Vec<Mutation>`. This buffers at most
+/// [`AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK`] mutations at once; the build's
+/// residency is one prefetch chunk, not the whole write-set. At `pgbench -i --scale 10` the
+/// whole-set clone was the `mutations_cloned` phase: a resident `Vec<Mutation>` holding a
+/// deep clone of every staged frame (~690 MB at 1.1M rows).
+///
+/// Returns the number of writes emitted (a bounded count, not the set).
 pub(crate) fn prepare_accord_writes_streaming<S>(
     engine: &StorageEngine,
     schema: &Schema,
     source: &S,
-) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError>
+    sink: &mut dyn FnMut(ferrosa_storage::accord::TransactionWrite) -> ferrosa_common::Result<()>,
+) -> Result<usize, MvccCommitError>
 where
     S: ferrosa_storage::write_set_stage::WriteSetSource + ?Sized,
 {
@@ -1987,17 +1995,17 @@ where
         .for_each_owned_mutation(&mut |mutation| {
             pending.push(mutation);
             if pending.len() >= AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK {
-                builder.process_chunk(&mut pending)?;
+                builder.process_chunk(&mut pending, sink)?;
             }
             Ok(())
         })
         .map_err(MvccCommitError::Storage)?;
     if !pending.is_empty() {
         builder
-            .process_chunk(&mut pending)
+            .process_chunk(&mut pending, sink)
             .map_err(MvccCommitError::Storage)?;
     }
-    builder.finish()
+    Ok(builder.finish())
 }
 
 /// The mutable state of one streaming Accord write-set build, factored out so the
@@ -2009,7 +2017,9 @@ struct AccordWriteSetBuilder<'a> {
     codecs: std::collections::HashMap<TableKey, TableCodec>,
     overlays:
         std::collections::HashMap<TableKey, std::collections::HashMap<Vec<SqlValue>, Option<Row>>>,
-    writes: Vec<ferrosa_storage::accord::TransactionWrite>,
+    /// Number of `TransactionWrite`s emitted to the sink so far (a bounded count, not the
+    /// set — the writes leave via the sink, so nothing holds the whole write-set).
+    count: usize,
     /// ONE serialization buffer for the whole write-set, reused per mutation
     /// instead of a fresh `vec![0; n]` allocation each time. A mutation is consumed
     /// by the iteration that serializes it, so nothing needs the buffer to outlive
@@ -2039,7 +2049,7 @@ impl<'a> AccordWriteSetBuilder<'a> {
             schema,
             codecs: std::collections::HashMap::new(),
             overlays: std::collections::HashMap::new(),
-            writes: Vec::new(),
+            count: 0,
             bytes: Vec::new(),
             table_keys: TableKeyCache { current: None },
             profile: std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some(),
@@ -2049,9 +2059,17 @@ impl<'a> AccordWriteSetBuilder<'a> {
         }
     }
 
-    /// Encode every mutation buffered in `pending` as one `TransactionWrite`,
-    /// draining `pending` and dropping each mutation as it is consumed.
-    fn process_chunk(&mut self, pending: &mut Vec<Mutation>) -> ferrosa_common::Result<()> {
+    /// Encode every mutation buffered in `pending` as one `TransactionWrite`, handing each
+    /// to `sink` as it is produced and dropping the mutation as it is consumed. Nothing here
+    /// accumulates the write-set: the writes leave through `sink`, which is also the
+    /// backpressure point (its `Err` aborts the build).
+    fn process_chunk(
+        &mut self,
+        pending: &mut Vec<Mutation>,
+        sink: &mut dyn FnMut(
+            ferrosa_storage::accord::TransactionWrite,
+        ) -> ferrosa_common::Result<()>,
+    ) -> ferrosa_common::Result<()> {
         use ferrosa_storage::accord::TransactionWrite;
         let engine = self.engine;
         let schema = self.schema;
@@ -2113,14 +2131,15 @@ impl<'a> AccordWriteSetBuilder<'a> {
             // A table tombstone (`TRUNCATE`) marker carries no row image; the cluster
             // committer routes it to every serving node at CL=ALL from its own bytes.
             if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
-                self.writes.push(TransactionWrite {
+                sink(TransactionWrite {
                     keyspace: mutation.keyspace,
                     // MOVED out of the consumed mutation, never copied.
                     key: mutation.key.key.into_bytes(),
                     // The shared buffer lives on, so a tombstone takes a copy. A
                     // tombstone is ONE entry per TRUNCATE, not one per row.
                     mutation: self.bytes.clone(),
-                });
+                })?;
+                self.count += 1;
                 continue;
             }
 
@@ -2195,20 +2214,23 @@ impl<'a> AccordWriteSetBuilder<'a> {
                     .map_err(ferrosa_common::Error::InvalidData)?
             };
 
-            self.writes.push(TransactionWrite {
+            sink(TransactionWrite {
                 keyspace: mutation.keyspace,
                 key: partition_key,
                 mutation: mutation_bytes,
-            });
+            })?;
+            self.count += 1;
         }
         Ok(())
     }
 
-    fn finish(self) -> Result<Vec<ferrosa_storage::accord::TransactionWrite>, MvccCommitError> {
+    /// Return the number of writes emitted. The writes themselves left through the sink, so
+    /// there is nothing else to hand back.
+    fn finish(self) -> usize {
         if self.profile {
             use std::sync::atomic::Ordering;
             tracing::info!(
-                mutations = self.writes.len(),
+                mutations = self.count,
                 pending_ms = self.pending_ns as f64 / 1_000_000.0,
                 serialize_ms = self.serialize_ns as f64 / 1_000_000.0,
                 metadata_kib = self.metadata_bytes / 1024,
@@ -2220,7 +2242,7 @@ impl<'a> AccordWriteSetBuilder<'a> {
                 "prepare_accord_writes attribution"
             );
         }
-        Ok(self.writes)
+        self.count
     }
 }
 

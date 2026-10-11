@@ -991,29 +991,46 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                     "pg commit residency"
                 );
             }
-            // Stream the staged write-set STRAIGHT into the Accord write-set builder.
-            // The former shape deep-cloned every staged frame into a resident
-            // `Vec<Mutation>` (the `mutations_cloned` phase, ~690 MB at 1.1M rows)
-            // solely to hand it to the builder; the builder now consumes the source
-            // one OWNED mutation at a time and holds at most one bounded prefetch
-            // chunk. The `TransactionWrite` bytes it produces ARE the apply payload
-            // the coordinator hands to Accord. `staged` is BORROWED, not consumed —
-            // the non-Accord commit path below still needs it.
-            let accord_writes =
-                match query::prepare_accord_writes_streaming(&ctx.engine, &ctx.schema, &staged) {
-                    Ok(writes) => writes,
-                    Err(error) => {
-                        session.end_txn();
-                        return vec![query::error_response(
-                            "58000",
-                            &format!("transaction commit failed: {error:?}"),
-                        )];
-                    }
-                };
+            // Stream the staged write-set STRAIGHT into a bounded, disk-backed Accord
+            // write-set builder. The former shape deep-cloned every staged frame into a
+            // resident `Vec<Mutation>` (the `mutations_cloned` phase, ~690 MB at 1.1M rows)
+            // AND returned a materialized `Vec<TransactionWrite>`; now the builder consumes
+            // the source one OWNED mutation at a time, and each encoded write leaves through
+            // the sink into `StagedAccordWriteSetBuilder`, which keeps only the per-key
+            // routing index resident and streams the payload bulk past a bounded, tunable
+            // buffer. `staged` is BORROWED, not consumed — the non-Accord commit path below
+            // still needs it.
+            let mut staged_writes = ferrosa_storage::accord::StagedAccordWriteSetBuilder::new();
+            let prepare_result = query::prepare_accord_writes_streaming(
+                &ctx.engine,
+                &ctx.schema,
+                &staged,
+                &mut |write| staged_writes.accept(write),
+            );
+            let accord_write_count = match prepare_result {
+                Ok(count) => count,
+                Err(error) => {
+                    session.end_txn();
+                    return vec![query::error_response(
+                        "58000",
+                        &format!("transaction commit failed: {error:?}"),
+                    )];
+                }
+            };
+            let accord_writes = match staged_writes.finish() {
+                Ok(set) => set,
+                Err(error) => {
+                    session.end_txn();
+                    return vec![query::error_response(
+                        "58000",
+                        &format!("transaction commit failed: {error:?}"),
+                    )];
+                }
+            };
             if residency_profile {
                 tracing::info!(
                     phase = "accord_writes_built",
-                    writes = accord_writes.len(),
+                    writes = accord_write_count,
                     live_mib = ferrosa_common::mem_probe::live_mib(),
                     "pg commit residency"
                 );
@@ -3120,11 +3137,22 @@ pub(crate) mod txn_atomicity_tests {
                 .push(change);
         }
 
-        // New path: one streaming pass, no whole-table map.
-        let writes =
-            query::prepare_accord_writes_streaming(&ctx.engine, &ctx.schema, &mutations).unwrap();
+        // New path: one streaming pass, no whole-table map. The streamed writes are
+        // collected by the TEST sink only — production streams them straight into the
+        // disk-backed staged set, never a resident Vec.
+        let mut writes = Vec::new();
+        let count = query::prepare_accord_writes_streaming(
+            &ctx.engine,
+            &ctx.schema,
+            &mutations,
+            &mut |writes_here| {
+                writes.push(writes_here);
+                Ok(())
+            },
+        )
+        .unwrap();
         assert_eq!(
-            writes.len(),
+            count,
             mutations.len(),
             "one Accord write per buffered mutation, in order"
         );
