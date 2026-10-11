@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use ferrosa_sql::exec::{
-    dedup, hash_aggregate, hash_join, sort, AggFunc, SortDir, SortKey, TryRowStream,
+    dedup, hash_aggregate, hash_join, sort, AggFunc, AggSpec, SortDir, SortKey, TryRowStream,
 };
 use ferrosa_sql::spill::{DirReserver, SpillCtx};
 use ferrosa_sql::types::{Row, Value};
@@ -191,7 +191,10 @@ fn hash_aggregate_returns_every_group_when_forced_to_spill() {
         hash_aggregate(
             stream(rows),
             &[0],
-            &[(AggFunc::Count, None), (AggFunc::Sum, Some(1))],
+            &[
+                AggSpec::new(AggFunc::Count, None),
+                AggSpec::typed(AggFunc::Sum, Some(1), ferrosa_sql::ColumnType::Int),
+            ],
             &ctx,
         )
         .unwrap(),
@@ -230,7 +233,15 @@ fn hash_aggregate_keeps_distinct_group_keys_of_different_types_apart() {
         row(vec![Value::Null]),
         row(vec![Value::Int(1)]),
     ];
-    let out = drain(hash_aggregate(stream(rows), &[0], &[(AggFunc::Count, None)], &ctx).unwrap());
+    let out = drain(
+        hash_aggregate(
+            stream(rows),
+            &[0],
+            &[AggSpec::new(AggFunc::Count, None)],
+            &ctx,
+        )
+        .unwrap(),
+    );
 
     assert_eq!(
         out.len(),

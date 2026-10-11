@@ -19,7 +19,7 @@ use crate::ast::{
 use crate::catalog::Catalog;
 use crate::exec::{
     dedup, fallible, hash_aggregate, hash_join, limit_offset, seq_scan, sort, try_project, AggFunc,
-    CmpOp, SortKey, TryRowStream,
+    AggSpec, AggregateError, CmpOp, SortKey, TryRowStream,
 };
 use crate::provider::TableProvider;
 use crate::spill::{SpillCtx, SpillError};
@@ -104,6 +104,11 @@ pub enum ExecError {
     /// cast that never passed through the front end. Refuse loudly rather than
     /// compare an unresolved cast.
     UnresolvedCast(CastTarget),
+    /// An exact aggregate total does not fit the type PostgreSQL gives it
+    /// (`sum(int2|int4)` is int8, so a total outside int8 is `bigint out of
+    /// range`, 22003). Never wrapped: a silently wrong total is the one
+    /// unacceptable outcome (invariant I-EXACT).
+    AggregateOutOfRange(String),
 }
 
 impl fmt::Display for ExecError {
@@ -138,6 +143,7 @@ impl fmt::Display for ExecError {
                  resolves casts; this statement did not pass through it)",
                 ty.name()
             ),
+            ExecError::AggregateOutOfRange(m) => write!(f, "{m}"),
         }
     }
 }
@@ -827,8 +833,24 @@ fn plan_aggregate(
     // Compute the internal layout `[group values..., union agg values...]`.
     // Spilling, sort-based: one accumulator set is resident whatever the GROUP BY
     // cardinality, and first-seen group order is preserved.
+    //
+    // Each aggregate carries its argument's DECLARED type, so the accumulator
+    // returns a `Value` whose type is exactly the one `aggregate_column` derived
+    // for the output (I-OID): `sum(bigint)` is a numeric, `sum(int)` an int8.
+    let agg_specs: Vec<AggSpec> = agg_defs
+        .iter()
+        .map(|(func, arg)| match arg {
+            Some(c) => AggSpec::typed(*func, Some(*c), combined_schema.columns[*c].ty),
+            None => AggSpec::new(*func, None),
+        })
+        .collect();
     let internal_rows =
-        hash_aggregate(rows, &group_cols, &agg_defs, ctx).map_err(ExecError::Spill)?;
+        hash_aggregate(rows, &group_cols, &agg_specs, ctx).map_err(|e| match e {
+            // A spill failure is an operator failure (58030); an exact total that
+            // does not fit its derived type is a range failure (22003).
+            AggregateError::Spill(s) => ExecError::Spill(s),
+            AggregateError::OutOfRange(m) => ExecError::AggregateOutOfRange(m),
+        })?;
 
     // HAVING filter over the internal layout (Kleene; keep Some(true)).
     let group_len = group_cols.len();
@@ -1214,6 +1236,7 @@ mod tests {
     use crate::parser::parse;
     use crate::provider::InMemoryTable;
     use crate::types::{Column, ColumnType, RelSchema, Row, Value};
+    use num_bigint::BigInt;
     use std::sync::Arc;
 
     fn catalog() -> MapCatalog {
@@ -1588,21 +1611,23 @@ mod tests {
     }
 
     #[test]
-    fn avg_ungrouped_gives_fractional_float() {
-        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 11.666... The
-        // derived column type is PostgreSQL's `numeric` (avg(int4) -> numeric);
-        // the engine's VALUE representation is still an f64, which the PG front
-        // end refuses to encode as numeric rather than mislabel the bytes (see
-        // `ferrosa_postgres::query::encode_value`). An exact numeric accumulator
-        // is tracked as FMEA SQL-6.
+    fn avg_ungrouped_is_exact_numeric_not_float() {
+        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 35/3 =
+        // 11.6666666666666667. The derived column type is PostgreSQL's `numeric`
+        // (avg(int4) -> numeric), and the accumulator now produces the EXACT
+        // decimal at PostgreSQL's 16-digit scale — no float rounding, and the
+        // value's type matches the advertised column (I-EXACT, I-OID).
         let r = run_sales("SELECT AVG(amount) FROM sales");
         assert_eq!(r.columns.len(), 1);
         assert_eq!(r.columns[0].name, "avg");
         assert_eq!(r.columns[0].ty, ColumnType::Numeric);
-        let Value::Float(of) = &r.rows[0].0[0] else {
-            panic!("expected float avg");
-        };
-        assert!((of.0 - 35.0 / 3.0).abs() < 1e-9);
+        assert_eq!(
+            r.rows[0].0,
+            vec![Value::numeric(
+                BigInt::from(116_666_666_666_666_667i128),
+                16
+            )]
+        );
     }
 
     #[test]
@@ -1615,14 +1640,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("region", ColumnType::Text), ("avg", ColumnType::Numeric)]
         );
-        // east: (10+20)/2 = 15.0; west: 5/1 = 5.0 (NULL ignored).
+        // east: (10+20)/2 = 15; west: 5/1 = 5 (NULL ignored), exact numeric.
         assert_eq!(
             r.rows[0].0,
-            vec![Value::Text("east".into()), Value::float(15.0)]
+            vec![
+                Value::Text("east".into()),
+                Value::numeric(BigInt::from(15), 0)
+            ]
         );
         assert_eq!(
             r.rows[1].0,
-            vec![Value::Text("west".into()), Value::float(5.0)]
+            vec![
+                Value::Text("west".into()),
+                Value::numeric(BigInt::from(5), 0)
+            ]
         );
     }
 

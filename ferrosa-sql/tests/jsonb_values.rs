@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use ferrosa_jsonb::{parse_text, JsonbValue, Limits, LimitsConfig};
 use ferrosa_sql::exec::{
-    dedup, hash_aggregate, hash_join, sort, AggFunc, SortDir, SortKey, TryRowStream,
+    dedup, hash_aggregate, hash_join, sort, AggFunc, AggSpec, SortDir, SortKey, TryRowStream,
 };
 use ferrosa_sql::spill::{row_bytes, DirReserver, SpillCtx};
 use ferrosa_sql::types::{ColumnType, Row, Value};
@@ -50,8 +50,15 @@ fn sql_group_by_jsonb_scale_insensitive() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = ctx_for(dir.path(), spill);
         let rows = one_col(vec![jv("1"), jv("1.0"), jv("1.00"), jv("2")]);
-        let out =
-            drain(hash_aggregate(stream(rows), &[0], &[(AggFunc::Count, None)], &ctx).unwrap());
+        let out = drain(
+            hash_aggregate(
+                stream(rows),
+                &[0],
+                &[AggSpec::new(AggFunc::Count, None)],
+                &ctx,
+            )
+            .unwrap(),
+        );
         assert_eq!(
             out.len(),
             2,

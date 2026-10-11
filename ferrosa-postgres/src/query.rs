@@ -816,12 +816,16 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         ExecError::InvalidOrderBy(_) => ("42P10", err.to_string()),
         // A `$N` with no bound value: undefined_parameter.
         ExecError::MissingParameter(_) => ("42P02", err.to_string()),
-        // A blocking operator could not read or write its spilled state. This
-        // is an operator failure, not bad SQL, so it maps to Class 58
+        // A blocking operator could not read or write its spilled state. This is
+        // an operator failure, not bad SQL, so it maps to Class 58
         // (system_error) — and it is reported rather than being papered over
         // with a short result the client could not distinguish from a complete
         // one (forge t_50d99192).
         ExecError::Spill(_) => ("58030", err.to_string()),
+        // An exact aggregate total that does not fit its PostgreSQL result type
+        // (sum(int2|int4) is int8). numeric_value_out_of_range, matching
+        // PostgreSQL's `bigint out of range`.
+        ExecError::AggregateOutOfRange(_) => ("22003", err.to_string()),
         // A `::` cast the front end failed to resolve before planning. The front
         // end resolves every cast, so this is a caller that drove the engine
         // directly with an unresolved cast; refused as an unsupported feature
@@ -932,7 +936,8 @@ pub(crate) fn parse_error_sqlstate(error: &ferrosa_sql::ParseError) -> &'static 
         | ParseError::UnsupportedStorageParameter(_)
         | ParseError::UnsupportedSelectExpr(_)
         | ParseError::UnsupportedCast(_)
-        | ParseError::UnsupportedCastExpr => "0A000",
+        | ParseError::UnsupportedCastExpr
+        | ParseError::UnsupportedAggregate(_) => "0A000",
         ParseError::UnknownType(_) => "42704",
         ParseError::DuplicateColumn(_) => "42701",
         ParseError::MultiplePrimaryKeys => "42P16",

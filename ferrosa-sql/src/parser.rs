@@ -53,6 +53,13 @@ pub enum ParseError {
     /// A `CAST(x AS t)` call, which ferrosa does not implement. Refused by name
     /// rather than mis-parsed as a column named `CAST`. (Use the `::` form.)
     UnsupportedCastExpr,
+    /// An aggregate function the parser RECOGNISES but does not implement,
+    /// named (I-MAPPABLE). ferrosa implements only the aggregates whose
+    /// semantics map exactly onto a constant-space streaming accumulator
+    /// (`count`, `sum`, `avg`, `min`, `max`); every other PostgreSQL aggregate
+    /// is refused by name here rather than mis-parsed as a column or silently
+    /// approximated with an accumulator that cannot be exact.
+    UnsupportedAggregate(String),
     /// `CREATE TABLE` declares more than one primary key.
     MultiplePrimaryKeys,
     /// `CREATE TABLE` declares no primary key.
@@ -100,6 +107,9 @@ impl fmt::Display for ParseError {
             }
             ParseError::UnsupportedCastExpr => {
                 write!(f, "CAST(x AS t) is not supported; use the `::` form")
+            }
+            ParseError::UnsupportedAggregate(name) => {
+                write!(f, "aggregate function `{name}` is not supported")
             }
             ParseError::MultiplePrimaryKeys => write!(f, "multiple primary keys defined"),
             ParseError::MissingPrimaryKey => write!(f, "table has no PRIMARY KEY"),
@@ -485,16 +495,83 @@ fn lex_quoted_ident(chars: &[char], start: usize) -> Result<(String, usize), Par
     }
 }
 
-/// Whether an identifier names an aggregate function (used to decide whether a
-/// `FUNC(` is an aggregate call).
+/// PostgreSQL aggregate function names the parser RECOGNISES but does not
+/// implement (I-MAPPABLE). ferrosa implements only the aggregates whose
+/// semantics map exactly onto a constant-space streaming accumulator:
+/// `count`, `sum`, `avg`, `min`, `max`. Everything here is refused BY NAME
+/// (`0A000`), because the alternative — parsing it as an ordinary column or
+/// approximating it — would return a wrong or unbounded-memory answer for a
+/// query PostgreSQL answers exactly.
+///
+/// The list covers two kinds of refusal, and both are correct:
+///   * INHERENTLY ACCUMULATING (`string_agg`, `array_agg`, `json_agg`, …):
+///     these collect every value into one result, so a constant-space
+///     accumulator for them is impossible by definition.
+///   * NOT MAPPED YET (`stddev`, `variance`, `bool_and`, `percentile_*`, …):
+///     mappable in principle but not implemented; refusing is honest, whereas
+///     a silently-wrong implementation is not.
+const UNSUPPORTED_AGGREGATES: &[&str] = &[
+    // Inherently accumulating (unbounded result).
+    "STRING_AGG",
+    "ARRAY_AGG",
+    "JSON_AGG",
+    "JSONB_AGG",
+    "JSON_OBJECT_AGG",
+    "JSONB_OBJECT_AGG",
+    "XMLAGG",
+    // Ordering-sensitive (need the whole ordered input, not a running fold).
+    "MODE",
+    "PERCENTILE_CONT",
+    "PERCENTILE_DISC",
+    // Statistical / distinct-accumulating: not mapped yet.
+    "STDDEV",
+    "STDDEV_POP",
+    "STDDEV_SAMP",
+    "VARIANCE",
+    "VAR_POP",
+    "VAR_SAMP",
+    "CORR",
+    "COVAR_POP",
+    "COVAR_SAMP",
+    "REGR_SLOPE",
+    "REGR_INTERCEPT",
+    "REGR_COUNT",
+    "REGR_R2",
+    // Boolean / bitwise folds: not mapped yet.
+    "BOOL_AND",
+    "BOOL_OR",
+    "EVERY",
+    "BIT_AND",
+    "BIT_OR",
+    "BIT_XOR",
+    // Other built-ins with no exact constant-space mapping here.
+    "ANY_VALUE",
+    "GROUPING",
+    "RANGE_AGG",
+    "RANGE_INTERSECT_AGG",
+    // Window-style / ordered-set names, refused rather than mis-parsed.
+    "RANK",
+    "DENSE_RANK",
+    "ROW_NUMBER",
+    "NTILE",
+    "LAG",
+    "LEAD",
+    "FIRST_VALUE",
+    "LAST_VALUE",
+    "NTH_VALUE",
+];
+
+/// Whether an identifier names an aggregate function the parser recognises —
+/// implemented OR refused-by-name. Used to decide whether `FUNC(` is an
+/// aggregate call rather than a column reference followed by a stray `(`.
 fn is_aggregate_name(word: &str) -> bool {
-    matches!(
-        word.to_ascii_uppercase().as_str(),
-        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
-    )
+    let up = word.to_ascii_uppercase();
+    matches!(up.as_str(), "COUNT" | "SUM" | "MIN" | "MAX" | "AVG")
+        || UNSUPPORTED_AGGREGATES.contains(&up.as_str())
 }
 
-/// Map an aggregate identifier to its [`AggFunc`].
+/// Map an aggregate identifier to its [`AggFunc`]; `None` for a recognised but
+/// unimplemented aggregate (the caller refuses it by name).
 fn aggregate_func(word: &str) -> Option<AggFunc> {
     match word.to_ascii_uppercase().as_str() {
         "COUNT" => Some(AggFunc::Count),
@@ -1228,10 +1305,13 @@ impl Parser {
                 let raw = word.clone();
                 self.next(); // function name
                 self.next(); // (
-                let func = aggregate_func(&raw).ok_or(ParseError::Unexpected {
-                    expected: "supported aggregate",
-                    found: raw,
-                })?;
+                let func = match aggregate_func(&raw) {
+                    Some(f) => f,
+                    // Recognised-but-unimplemented aggregate (I-MAPPABLE):
+                    // refuse it BY NAME rather than mis-parse it as a column or
+                    // approximate it.
+                    None => return Err(ParseError::UnsupportedAggregate(raw)),
+                };
                 let arg = if matches!(self.peek(), Some(Tok::Star)) {
                     self.next();
                     AggArg::Star
@@ -1490,10 +1570,13 @@ impl Parser {
                 let raw = word.clone();
                 self.next(); // function name
                 self.next(); // (
-                let func = aggregate_func(&raw).ok_or(ParseError::Unexpected {
-                    expected: "supported aggregate",
-                    found: raw,
-                })?;
+                let func = match aggregate_func(&raw) {
+                    Some(f) => f,
+                    // Recognised-but-unimplemented aggregate (I-MAPPABLE):
+                    // refuse it BY NAME rather than mis-parse it as a column or
+                    // approximate it.
+                    None => return Err(ParseError::UnsupportedAggregate(raw)),
+                };
                 let arg = if matches!(self.peek(), Some(Tok::Star)) {
                     self.next();
                     AggArg::Star
@@ -1915,6 +1998,32 @@ mod tests {
             }
             other => panic!("expected items, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn unsupported_aggregate_is_refused_by_name() {
+        // I-MAPPABLE: an aggregate ferrosa does not implement is refused BY NAME
+        // (0A000), never mis-parsed as a column or silently approximated. The
+        // refusal fires during item parsing, before its argument is read, so the
+        // argument's shape is irrelevant.
+        let err = parse("SELECT string_agg(name) FROM users").unwrap_err();
+        match err {
+            ParseError::UnsupportedAggregate(name) => assert_eq!(name, "string_agg"),
+            other => panic!("expected UnsupportedAggregate, got {other:?}"),
+        }
+        // An ordered-set / accumulating aggregate in HAVING is refused the same
+        // way (the `parse_operand` path).
+        let err =
+            parse("SELECT count(*) FROM t GROUP BY k HAVING percentile_cont(0.5) > 1").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnsupportedAggregate(_)),
+            "{err:?}"
+        );
+
+        // Positive control: a SUPPORTED aggregate still parses, proving the
+        // refusal is not simply refusing every `FUNC(` in a select list.
+        assert!(parse("SELECT sum(amount) FROM users").is_ok());
+        assert!(parse("SELECT count(*) FROM users").is_ok());
     }
 
     #[test]
