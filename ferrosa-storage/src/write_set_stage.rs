@@ -341,6 +341,12 @@ impl WriteSetStage {
                 writer
                     .flush()
                     .map_err(|e| Error::InvalidFormat(format!("write-set stage: flush: {e}")))?;
+                // `flush` only drains `BufWriter`'s buffer into the kernel; the payload
+                // is still DIRTY in the page cache and would be mapped in dirty. Write
+                // it back before mapping so the mapped pages are CLEAN and reclaimable.
+                // See `crate::staged_pages`.
+                crate::staged_pages::flush_staged_pages(writer.get_ref())
+                    .map_err(|e| Error::InvalidFormat(format!("write-set stage: sync: {e}")))?;
                 // Drop the writer so the file is closed before mapping.
                 drop(writer);
                 let reservation = self
@@ -1028,6 +1034,61 @@ mod tests {
         assert!(
             error.to_string().contains("not a decodable mutation frame"),
             "clear error, never a silent empty mutation: {error}"
+        );
+    }
+
+    /// The same invariant as `write_set_spill`'s cleanliness test, for the streaming
+    /// stage's `finish()` mapping: after a stage spills and is mapped, its MAPPED
+    /// pages are CLEAN (kernel-reported `/proc/self/smaps` `Private_Dirty` == 0), so
+    /// the kernel can reclaim them. A dirty mapped page is unreleasable until
+    /// writeback, which is what OOMs a memory-limited node.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_mapped_stage_pages_are_clean_and_reclaimable() {
+        use crate::staged_pages::probe::{
+            mapping_private_dirty_bytes, staging_fs_has_writeback, touch_every_page,
+        };
+
+        // An EXACT stated N: 8 MiB in one payload (past a 4 KiB threshold, so it
+        // spills), a whole number of 4 KiB pages.
+        const N: usize = 8 * 1024 * 1024;
+
+        let root = temp_root("clean-pages");
+        let mut stage = WriteSetStage::with_threshold(&root, 4096);
+        stage.append(&vec![0xABu8; N]).expect("append");
+        assert!(stage.spilled_to_disk(), "the payload must have spilled");
+        let staged = stage.finish().expect("finish");
+        let dir = staged
+            ._reservation
+            .as_ref()
+            .expect("a spilled stage owns its reservation")
+            .path()
+            .to_path_buf();
+        if !staging_fs_has_writeback(&dir) {
+            eprintln!(
+                "skipping: {} is on a filesystem with no writeback (tmpfs/ramfs)",
+                dir.display()
+            );
+            return;
+        }
+        let staged_path = dir.join("write-set.bin");
+
+        // Fault every mapped page so the kernel has resident pages to account.
+        let mut touched = 0u64;
+        for index in 0..staged.len() {
+            touched += touch_every_page(staged.entry(index).expect("entry"));
+        }
+        assert!(
+            touched > 0,
+            "the payload must read back through the mapping"
+        );
+
+        let dirty = mapping_private_dirty_bytes(&staged_path)
+            .expect("the staging file must be mapped into this process");
+        assert_eq!(
+            dirty, 0,
+            "the mapped staging pages must be CLEAN: {dirty} bytes are DIRTY, and a \
+             dirty mapped file-backed page cannot be reclaimed until writeback"
         );
     }
 }

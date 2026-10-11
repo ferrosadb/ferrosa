@@ -58,6 +58,7 @@ pub mod snapshot;
 pub mod spill_budget;
 pub mod spilling_dedup;
 pub(crate) mod sstable_health;
+pub(crate) mod staged_pages;
 #[cfg(test)]
 mod static_column_flush_tests;
 pub mod store;

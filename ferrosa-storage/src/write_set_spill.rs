@@ -164,6 +164,14 @@ impl WriteSetSpill {
             writer.flush().map_err(|e| {
                 Error::InvalidFormat(format!("write-set spill: flush {}: {e}", path.display()))
             })?;
+            // `flush` only drains `BufWriter`'s buffer into the kernel (`File::flush`
+            // is a no-op), so the payload is still DIRTY in the page cache. Write it
+            // back now, before the mapping exists, so the mapped pages are CLEAN and
+            // reclaimable — a dirty mapped file-backed page cannot be reclaimed until
+            // writeback, which is what drives the OOM. See `crate::staged_pages`.
+            crate::staged_pages::flush_staged_pages(writer.get_ref()).map_err(|e| {
+                Error::InvalidFormat(format!("write-set spill: sync {}: {e}", path.display()))
+            })?;
         }
         let file = File::open(&path).map_err(|e| {
             Error::InvalidFormat(format!("write-set spill: reopen {}: {e}", path.display()))
@@ -467,5 +475,77 @@ mod tests {
             WRITE_SET_SPILL_FLOOR_BYTES - 1
         ));
         assert!(WriteSetSpill::should_stage(WRITE_SET_SPILL_FLOOR_BYTES));
+    }
+
+    /// INVARIANT (the owner's): after the staging file is written and mapped, its
+    /// MAPPED pages are CLEAN — the kernel's own dirty, file-backed count for the
+    /// mapping is ZERO — so they can be reclaimed under pressure. A dirty mapped
+    /// file-backed page cannot be evicted until writeback, so on a memory-limited
+    /// node the staged write-set is unreleasable and drives the OOM. Measured with
+    /// `/proc/self/smaps`, the kernel's accounting, not our instrumentation.
+    ///
+    /// The negative control (an unsynced file mapped the same way) proves the
+    /// assertion detects the defect and is not vacuously true.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_mapped_staging_pages_are_clean_and_reclaimable() {
+        use crate::staged_pages::probe::{
+            mapping_private_dirty_bytes, staging_fs_has_writeback, touch_every_page,
+        };
+
+        // An EXACT stated N: 8 MiB in a single payload — over the staging floor,
+        // and a whole number of 4 KiB pages.
+        const N: usize = 8 * 1024 * 1024;
+
+        let reservation = reserve_write_set_stage().expect("stage dir");
+        let dir = reservation.path().to_path_buf();
+        if !staging_fs_has_writeback(&dir) {
+            eprintln!(
+                "skipping: {} is on a filesystem with no writeback (tmpfs/ramfs)",
+                dir.display()
+            );
+            return;
+        }
+
+        let mut blobs = vec![vec![0xABu8; N]];
+        let spill = WriteSetSpill::stage(reservation, &mut blobs).expect("stage blobs");
+        let staged_path = spill._reservation.path().join("write-set.bin");
+
+        // Fault every mapped page so the kernel has resident pages to account.
+        let touched = touch_every_page(spill.entry(0).expect("entry"));
+        assert!(
+            touched > 0,
+            "the payload must read back through the mapping"
+        );
+
+        let dirty = mapping_private_dirty_bytes(&staged_path)
+            .expect("the staging file must be mapped into this process");
+        assert_eq!(
+            dirty, 0,
+            "the mapped staging pages must be CLEAN: {dirty} bytes are DIRTY, and a \
+             dirty mapped file-backed page cannot be reclaimed until writeback"
+        );
+
+        // NEGATIVE CONTROL: the same measurement, on a file written but NOT synced
+        // before it is mapped, must be NON-ZERO.
+        let control_path = dir.join("control.bin");
+        {
+            let mut writer = BufWriter::new(File::create(&control_path).expect("control create"));
+            writer.write_all(&vec![0xCDu8; N]).expect("control write");
+            writer.flush().expect("control flush");
+        }
+        let control_file = File::open(&control_path).expect("control reopen");
+        // SAFETY: `control_path` is private to this test, closed for writing, and
+        // never mutated under the mapping.
+        let control_map = unsafe { memmap2::Mmap::map(&control_file) }.expect("control map");
+        let control_touched = touch_every_page(&control_map[..]);
+        assert!(control_touched > 0);
+        let control_dirty =
+            mapping_private_dirty_bytes(&control_path).expect("control must be mapped");
+        assert!(
+            control_dirty > 0,
+            "negative control: an unsynced mapping must show DIRTY pages, or this \
+             assertion cannot detect the defect"
+        );
     }
 }
