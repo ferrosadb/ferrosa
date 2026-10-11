@@ -1203,11 +1203,20 @@ impl Parser {
     /// have (its projection is column indices, not computed cells), so a `||`
     /// that follows an item is a named refusal rather than a token mismatch.
     fn parse_select_item(&mut self) -> Result<SelectItem, ParseError> {
-        let item = self.parse_select_item_primary()?;
+        let mut item = self.parse_select_item_primary()?;
         if matches!(self.peek(), Some(Tok::Concat)) {
             return Err(ParseError::UnsupportedSelectExpr(
                 "`||` concatenation over a FROM relation",
             ));
+        }
+        // An optional output alias (`AS name`, or a bare `name`) names this item's
+        // result column. Consumed after the concatenation refusal so `col || 'x'`
+        // is still refused by name rather than mistaken for an alias.
+        let alias = self.parse_optional_alias()?;
+        match &mut item {
+            SelectItem::Column { alias: a, .. } | SelectItem::Aggregate { alias: a, .. } => {
+                *a = alias;
+            }
         }
         Ok(item)
     }
@@ -1230,10 +1239,17 @@ impl Parser {
                     AggArg::Column(self.parse_column_ref()?)
                 };
                 self.expect(&Tok::RParen, ")")?;
-                return Ok(SelectItem::Aggregate { func, arg });
+                return Ok(SelectItem::Aggregate {
+                    func,
+                    arg,
+                    alias: None,
+                });
             }
         }
-        Ok(SelectItem::Column(self.parse_column_ref()?))
+        Ok(SelectItem::Column {
+            col: self.parse_column_ref()?,
+            alias: None,
+        })
     }
 
     fn parse_column_list(&mut self) -> Result<Vec<ColumnRef>, ParseError> {
@@ -1671,7 +1687,7 @@ mod tests {
             Projection::Items(items) => {
                 assert_eq!(items.len(), 1);
                 match &items[0] {
-                    SelectItem::Column(c) => {
+                    SelectItem::Column { col: c, .. } => {
                         assert_eq!(c.name, "id");
                         assert!(c.qualifier.is_none());
                     }
@@ -1689,17 +1705,23 @@ mod tests {
             Projection::Items(items) => {
                 assert_eq!(
                     items[0],
-                    SelectItem::Column(ColumnRef {
-                        qualifier: Some("u".into()),
-                        name: "name".into()
-                    })
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: Some("u".into()),
+                            name: "name".into()
+                        },
+                        alias: None
+                    }
                 );
                 assert_eq!(
                     items[1],
-                    SelectItem::Column(ColumnRef {
-                        qualifier: Some("o".into()),
-                        name: "oid".into()
-                    })
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: Some("o".into()),
+                            name: "oid".into()
+                        },
+                        alias: None
+                    }
                 );
             }
             other => panic!("expected items, got {other:?}"),
@@ -1863,16 +1885,20 @@ mod tests {
                 assert_eq!(items.len(), 3);
                 assert_eq!(
                     items[0],
-                    SelectItem::Column(ColumnRef {
-                        qualifier: None,
-                        name: "region".into()
-                    })
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: None,
+                            name: "region".into()
+                        },
+                        alias: None
+                    }
                 );
                 assert_eq!(
                     items[1],
                     SelectItem::Aggregate {
                         func: AggFunc::Count,
-                        arg: AggArg::Star
+                        arg: AggArg::Star,
+                        alias: None
                     }
                 );
                 assert_eq!(
@@ -1882,7 +1908,8 @@ mod tests {
                         arg: AggArg::Column(ColumnRef {
                             qualifier: None,
                             name: "amount".into()
-                        })
+                        }),
+                        alias: None
                     }
                 );
             }
@@ -1896,10 +1923,13 @@ mod tests {
         match stmt.projection {
             Projection::Items(items) => assert_eq!(
                 items[0],
-                SelectItem::Column(ColumnRef {
-                    qualifier: None,
-                    name: "count".into()
-                })
+                SelectItem::Column {
+                    col: ColumnRef {
+                        qualifier: None,
+                        name: "count".into()
+                    },
+                    alias: None
+                }
             ),
             other => panic!("expected items, got {other:?}"),
         }
@@ -1916,11 +1946,81 @@ mod tests {
                     arg: AggArg::Column(ColumnRef {
                         qualifier: None,
                         name: "amount".into()
-                    })
+                    }),
+                    alias: None
                 }
             ),
             other => panic!("expected items, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_as_alias_on_an_aggregate_and_a_column() {
+        // `AS n` names the output column of an aggregate; `AS label` of a plain
+        // column. The alias attaches to the ITEM, not to the source column.
+        let stmt = parse("SELECT count(*) AS n, pad AS label FROM t").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(
+                    items[0],
+                    SelectItem::Aggregate {
+                        func: AggFunc::Count,
+                        arg: AggArg::Star,
+                        alias: Some("n".into())
+                    }
+                );
+                assert_eq!(
+                    items[1],
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: None,
+                            name: "pad".into()
+                        },
+                        alias: Some("label".into())
+                    }
+                );
+                assert_eq!(items[0].alias(), Some("n"));
+                assert_eq!(items[1].alias(), Some("label"));
+            }
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_a_bare_alias_without_as_and_leaves_unaliased_items_none() {
+        // PostgreSQL accepts `expr name` as well as `expr AS name`; an item with no
+        // trailing identifier keeps `alias: None`.
+        let stmt = parse("SELECT pad label, count(*) FROM t").unwrap();
+        match stmt.projection {
+            Projection::Items(items) => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].alias(), Some("label"));
+                assert_eq!(
+                    items[0],
+                    SelectItem::Column {
+                        col: ColumnRef {
+                            qualifier: None,
+                            name: "pad".into()
+                        },
+                        alias: Some("label".into())
+                    }
+                );
+                assert_eq!(items[1].alias(), None, "a bare `count(*)` is unaliased");
+            }
+            other => panic!("expected items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn concatenation_is_refused_by_name_and_not_read_as_an_alias() {
+        // The alias is consumed AFTER the `||` refusal, so `pad || 'x'` is still a
+        // named UnsupportedSelectExpr and is never reinterpreted as `pad AS ||`.
+        let err = parse("SELECT pad || 'x' FROM t").unwrap_err();
+        assert!(
+            matches!(err, ParseError::UnsupportedSelectExpr(_)),
+            "expected the named concatenation refusal, got {err:?}"
+        );
     }
 
     #[test]
@@ -3799,7 +3899,7 @@ mod tests {
                     if items.len() == 1
                         && matches!(
                             &items[0],
-                            SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star }
+                            SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star, alias: None }
                         )
             ),
             "expected `count(*)`, got {:?}",

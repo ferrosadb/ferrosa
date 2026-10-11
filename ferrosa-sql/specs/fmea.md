@@ -15,7 +15,7 @@ correct behavior, but each is a coverage gap a consumer may hit.
 
 ## Supported surface (for reference)
 
-`SELECT [DISTINCT]`, `*` / column / aggregate projection, one `INNER JOIN ... ON
+`SELECT [DISTINCT]`, `*` / column / aggregate `[AS alias]` projection, one `INNER JOIN ... ON
 a=b`, `WHERE`/`HAVING` with `AND`/`OR`/`NOT` + `= != <> < <= > >=`, `GROUP BY`,
 `ORDER BY [ASC|DESC]` (column, output name, or ordinal), `LIMIT`/`OFFSET`,
 `COUNT/SUM/MIN/MAX/AVG`, `$N` params, typed literals

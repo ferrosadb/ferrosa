@@ -28,7 +28,7 @@ in-memory table in tests and by Ferrosa storage in production.
   recurses per level, so an unbounded depth overflows the worker stack and
   aborts the process (`tests/parser_depth.rs`).
 
-- `SELECT [DISTINCT] <* | items> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
+- `SELECT [DISTINCT] <* | items [AS alias]> FROM t [alias] [INNER JOIN t2 [alias] ON a.x = b.y]
   [WHERE <bool-expr>] [GROUP BY ...] [HAVING <bool-expr>]
   [ORDER BY ... [ASC|DESC]] [LIMIT n] [OFFSET m]` — one inner equi-join only.
 - No-`FROM` scalar selects: `SELECT 1`, `SELECT version()` (zero-arg func),
@@ -47,6 +47,16 @@ in-memory table in tests and by Ferrosa storage in production.
   (`SELECT (1)`), and every other select-list expression form is refused by name
   (`ParseError::UnsupportedSelectExpr`). A subquery outside the no-`FROM` select
   list (a `FROM` relation's projection, `WHERE`, `VALUES`) is not parsed.
+- **SELECT-list output alias** (`item [AS] name`): an item of a `FROM` relation's
+  projection may be named with `AS <name>` or a bare trailing `<name>`. The alias
+  renames only the OUTPUT column — it sets the `RowDescription` column name and
+  changes nothing about which cell is read (`SELECT pad AS label FROM t` returns
+  the same `pad` values under the name `label`). It is applied to the output
+  `Column.name` in all three projection derivations — `simple_projection`, the
+  aggregate plan (`plan_aggregate`), and `aggregate_output_columns` — so `describe`
+  advertises the same names `execute` produces. It is consumed AFTER the `||`
+  refusal, so `col || 'x'` is still refused by name and is never mis-read as
+  `col AS ||`. The accessor is `SelectItem::alias()`.
 - DML (single-row, key-equality WHERE): `INSERT INTO t (cols) VALUES (...)`,
   `DELETE FROM t WHERE k = v [AND ...]`, and
   `UPDATE t SET <col> = <set-expr> [, ...] WHERE k = v [AND ...]`. A SET right-hand
@@ -221,7 +231,7 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 | Area | Items |
 |------|-------|
 | Parse | `parse`, `parse_statement`, `ParseError` |
-| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `CastTarget`, `Projection`, `SelectItem`, `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
+| AST | `Statement`, `SelectStmt`, `InsertStmt`, `UpdateStmt`, `DeleteStmt`, `CreateTableStmt`, `DropTableStatement`, `TruncateStatement`, `VacuumStmt`, `AnalyzeStmt`, `Expr`, `Operand`, `Term`, `CastTarget`, `Projection`, `SelectItem` (with `SelectItem::alias()`), `OrderItem`, `ScalarItem`, `ScalarValue`, `AggArg` |
 | Plan | `execute_streaming`, `RowSink`, `open_cursor`, `RowCursor`, `execute`, `execute_with`, `describe`, `infer_param_types`, `QueryResult`, `ExecError` |
 | Operators | `seq_scan`, `filter`, `project`, `hash_join`, `sort`, `hash_aggregate`, `dedup`, `limit_offset`, `fallible`, `try_filter`, `try_project`, `Predicate`, `CmpOp`, `AggFunc`, `SortKey`, `SortDir`, `RowStream`, `TryRowStream` |
 | Spill | `SpillCtx`, `SpillReserver`, `DirReserver`, `SpillStats`, `SpillError`, `default_temp_root`, `sweep_orphaned_temp_dirs` |
@@ -254,9 +264,10 @@ operators and serves results over the Postgres wire.
 ## Tests
 
 In-crate unit tests (no `#[ignore]`, no live-infra): `exec.rs`, `parser.rs`,
-`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 218 total. They cover
+`plan.rs`, `types.rs`, `catalog.rs`, `spill.rs` — 223 total. They cover
 NULL/Kleene logic, sort NULL placement, aggregate edge cases, numeric
-normalization, join key resolution, binder fail-loud paths, the `TRUNCATE` /
+normalization, join key resolution, binder fail-loud paths, the SELECT-list
+`AS` output alias (parser and `describe`), the `TRUNCATE` /
 `VACUUM` / `ANALYZE` grammar (including the named refusals), and the spill
 module's orders, replay buffer and orphan sweep.
 

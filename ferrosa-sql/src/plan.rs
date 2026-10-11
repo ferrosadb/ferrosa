@@ -665,13 +665,18 @@ fn simple_projection(
             let mut indices = Vec::with_capacity(items.len());
             for item in items {
                 match item {
-                    SelectItem::Column(cr) => {
+                    SelectItem::Column { col: cr, .. } => {
                         let gi = resolve_column(scope, cr)?;
                         indices.push(gi);
                         columns.push(combined_schema.columns[gi].clone());
                     }
                     // Unreachable: an aggregate item forces aggregate mode.
                     SelectItem::Aggregate { .. } => unreachable!("aggregate in simple plan"),
+                }
+                // An output alias renames only the RESULT column: the cell read is
+                // unchanged, so it is applied after the source column is resolved.
+                if let Some(alias) = item.alias() {
+                    columns.last_mut().expect("just pushed").name = alias.to_string();
                 }
             }
             Ok((columns, indices))
@@ -766,7 +771,7 @@ fn plan_aggregate(
     // SELECT list: plain columns must be grouped; aggregates feed the union.
     for item in items {
         match item {
-            SelectItem::Column(cr) => {
+            SelectItem::Column { col: cr, .. } => {
                 let gi = resolve_column(scope, cr)?;
                 let pos = group_cols
                     .iter()
@@ -775,12 +780,17 @@ fn plan_aggregate(
                 slots.push(Slot::Group(pos));
                 out_columns.push(combined_schema.columns[gi].clone());
             }
-            SelectItem::Aggregate { func, arg } => {
+            SelectItem::Aggregate { func, arg, .. } => {
                 let arg_col = resolve_agg_arg(arg, scope)?;
                 let agg_index = intern_agg(*func, arg_col, &mut agg_defs, &mut agg_keys);
                 slots.push(Slot::Agg(agg_index));
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
             }
+        }
+        // An output alias renames the RESULT column only; the aggregate or group
+        // slot it projects is unchanged.
+        if let Some(alias) = item.alias() {
+            out_columns.last_mut().expect("just pushed").name = alias.to_string();
         }
     }
 
@@ -894,17 +904,22 @@ fn aggregate_output_columns(
     let mut out_columns = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            SelectItem::Column(cr) => {
+            SelectItem::Column { col: cr, .. } => {
                 let gi = resolve_column(scope, cr)?;
                 if !group_cols.contains(&gi) {
                     return Err(ExecError::NotGrouped(cr.qualified_name()));
                 }
                 out_columns.push(combined_schema.columns[gi].clone());
             }
-            SelectItem::Aggregate { func, arg } => {
+            SelectItem::Aggregate { func, arg, .. } => {
                 let arg_col = resolve_agg_arg(arg, scope)?;
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
             }
+        }
+        // `describe` must advertise the same names `execute` produces, so the alias
+        // is applied here identically.
+        if let Some(alias) = item.alias() {
+            out_columns.last_mut().expect("just pushed").name = alias.to_string();
         }
     }
     Ok(out_columns)
@@ -1331,6 +1346,44 @@ mod tests {
             .unwrap()
             .columns;
         assert_eq!(described, executed);
+    }
+
+    #[test]
+    fn describe_reports_the_output_alias_names() {
+        // `AS` names the output column in BOTH the `describe` shape and the executed
+        // columns — the group column `r` and the aggregate `n`.
+        let stmt = parse("SELECT region AS r, COUNT(*) AS n FROM sales GROUP BY region").unwrap();
+        let described = describe(&stmt, &sales_catalog(), "public").unwrap();
+        assert_eq!(
+            described
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["r", "n"],
+            "describe must advertise the alias, not `region`/`count`"
+        );
+        let executed = execute(&stmt, &sales_catalog(), "public", &[])
+            .unwrap()
+            .columns;
+        assert_eq!(
+            described, executed,
+            "describe and execute must agree on the aliased names"
+        );
+    }
+
+    #[test]
+    fn describe_reports_a_plain_column_alias_and_keeps_its_type() {
+        // The simple (non-aggregate) projection path applies the alias too, and the
+        // alias renames the column WITHOUT changing its type.
+        let stmt = parse("SELECT name AS n FROM users").unwrap();
+        let described = describe(&stmt, &catalog(), "public").unwrap();
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].name, "n");
+        assert_eq!(
+            described[0].ty,
+            ColumnType::Text,
+            "the alias keeps the source column's type"
+        );
     }
 
     #[test]

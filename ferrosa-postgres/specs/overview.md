@@ -104,7 +104,9 @@ O(batch). A fetch never waits on the client, so a query waiting for its client
 after 10 ms and holds none either (ferrosa-storage ST-82). Extended `Execute`
 honours `max_rows` with `PortalSuspended`; suspended portals are capped per
 connection and per node (`53000` past either) and closed after an idle
-timeout (`portal_limits`, PG-14/PG-15). → `RowDescription`
+timeout (`portal_limits`, PG-14/PG-15). Each projection item's output alias
+(`expr AS name`, or a bare `expr name`) becomes its `RowDescription` field name
+while the row cells are unchanged. → `RowDescription`
 + streamed `DataRow`s + `CommandComplete "SELECT n"`. The caller appends one
 `ReadyForQuery`.
 

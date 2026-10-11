@@ -675,11 +675,32 @@ pub enum Projection {
     Items(Vec<SelectItem>),
 }
 
-/// One entry in a non-star SELECT list: a plain column or an aggregate.
+/// One entry in a non-star SELECT list: a plain column or an aggregate, with an
+/// optional output alias (`expr AS name`). The alias only names the OUTPUT
+/// column — it does not change which cell is read, so `SELECT pad AS label FROM t`
+/// returns the same `pad` values under a different `RowDescription` name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SelectItem {
-    Column(ColumnRef),
-    Aggregate { func: AggFunc, arg: AggArg },
+    Column {
+        col: ColumnRef,
+        alias: Option<String>,
+    },
+    Aggregate {
+        func: AggFunc,
+        arg: AggArg,
+        alias: Option<String>,
+    },
+}
+
+impl SelectItem {
+    /// The output alias, if the item names one.
+    pub fn alias(&self) -> Option<&str> {
+        match self {
+            SelectItem::Column { alias, .. } | SelectItem::Aggregate { alias, .. } => {
+                alias.as_deref()
+            }
+        }
+    }
 }
 
 /// The argument to an aggregate: `COUNT(*)` vs `FUNC(col)`.

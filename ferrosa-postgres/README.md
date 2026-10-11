@@ -70,7 +70,10 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   no-`FROM` scalar selects (`SELECT 1`, `SELECT version()`, `current_database()`,
   `'a' || 'b'`, and a scalar subquery `( SELECT ... )` as an operand — incl.
   pgbench's `select (select count(*) from a)||'|'||…` census line), and single-row
-  `INSERT` / `UPDATE` / `DELETE`.
+  `INSERT` / `UPDATE` / `DELETE`. A projection item may carry an output alias
+  (`expr AS name`, or a bare `expr name`) that names its `RowDescription` column
+  without changing which cell is read, so `select count(*) as n from t` is served
+  rather than refused `42601 expected FROM`.
 - **Extended query protocol** — `Parse`/`Bind`/`Describe`/`Execute`/`Sync`/`Close`
   with a per-connection [`Session`] (prepared statements + portals), `$N`
   parameter type inference (`ParameterDescription`), text + binary parameter and

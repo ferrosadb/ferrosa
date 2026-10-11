@@ -8441,6 +8441,19 @@ mod scalar_subquery_tests {
         fields[0].type_oid
     }
 
+    /// The output column names of the leading `RowDescription`, in order.
+    fn row_description_names(messages: &[BackendMessage]) -> Vec<String> {
+        messages
+            .iter()
+            .find_map(|m| match m {
+                BackendMessage::RowDescription { fields } => {
+                    Some(fields.iter().map(|f| f.name.clone()).collect())
+                }
+                _ => None,
+            })
+            .expect("a SELECT leads with a RowDescription")
+    }
+
     fn error_sqlstate(messages: &[BackendMessage]) -> Option<String> {
         messages.iter().find_map(|m| match m {
             BackendMessage::ErrorResponse { fields } => Some(fields[1].1.clone()),
@@ -8605,6 +8618,190 @@ mod scalar_subquery_tests {
             Some("42P01"),
             "the R15 guard reaches the inner query too: {msgs:?}"
         );
+        engine.shutdown().unwrap();
+    }
+
+    /// `AS <name>` names the output column on the wire — for an aggregate and for
+    /// a plain column. RED before the change: `SELECT count(*) AS n FROM t` died at
+    /// parse time with `expected FROM, found \`As\``, so the column could not be
+    /// named at all.
+    #[tokio::test]
+    async fn output_alias_names_the_row_description_column() {
+        let (_dir, engine, schema) = new_engine();
+        seed(&engine, &schema, "pgbench_accounts", 3).await;
+
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT count(*) AS rows_after_insert FROM pgbench_accounts",
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "an aliased aggregate must parse and execute: {msgs:?}"
+        );
+        assert_eq!(
+            row_description_names(&msgs),
+            vec!["rows_after_insert".to_string()],
+            "the alias is the output column name, not `count`: {msgs:?}"
+        );
+        assert_eq!(
+            single_text(&msgs).as_deref(),
+            Some("3"),
+            "the aliased aggregate still returns its value: {msgs:?}"
+        );
+
+        let msgs = run(
+            &engine,
+            &schema,
+            "SELECT pad AS label FROM pgbench_accounts LIMIT 1",
+        )
+        .await;
+        assert_eq!(
+            row_description_names(&msgs),
+            vec!["label".to_string()],
+            "a plain column's alias names the output column, not `pad`: {msgs:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// The probe's step-2 block, pinned statement by statement through the SAME
+    /// `execute_query` entry point the wire front end serves. The block died on
+    /// statement 4 (`select count(*) as rows_after_insert ...`) — `42601 expected FROM,
+    /// found \"As\"` — so no later statement had ever run.
+    ///
+    /// Statements 1-2 (`DROP`/`CREATE TABLE`) are set up by the harness instead:
+    /// `execute_query` carries no `DdlExecutor` (`ddl: None`), so DDL on the live path is
+    /// driven by the session layer, not this function. The `(a,b,c)` columns of the
+    /// probe's `fprobe` are mirrored on this module's pgbench shape `(k,pad)`.
+    #[tokio::test]
+    async fn probe_alias_block_runs_statement_by_statement() {
+        let (_dir, engine, schema) = new_engine();
+        let limits = crate::jsonb_wire::test_limits();
+
+        /// The first `DataRow`'s cells as text, for a multi-column SELECT.
+        fn first_row_text(messages: &[BackendMessage]) -> Vec<String> {
+            let row = messages
+                .iter()
+                .find_map(|m| match m {
+                    BackendMessage::DataRow { columns } => Some(columns),
+                    _ => None,
+                })
+                .expect("a row");
+            row.iter()
+                .map(|c| String::from_utf8_lossy(c.as_deref().unwrap_or_default()).into_owned())
+                .collect()
+        }
+
+        // Statement 3: a multi-row INSERT.
+        let msgs = run(
+            &engine,
+            &schema,
+            "insert into pgbench_accounts (k, pad) values ('1','x'),('2','y')",
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "statement 3 (multi-row INSERT) must run: {msgs:?}"
+        );
+
+        // Statement 4 — the one that used to die `expected FROM, found As`.
+        let msgs = run(
+            &engine,
+            &schema,
+            "select count(*) as rows_after_insert from pgbench_accounts",
+        )
+        .await;
+        assert_eq!(
+            row_description_names(&msgs),
+            vec!["rows_after_insert".to_string()],
+            "statement 4 must name its column via the alias: {msgs:?}"
+        );
+        assert_eq!(single_text(&msgs).as_deref(), Some("2"));
+
+        // Statement 5: `begin; insert; commit;` — buffer the INSERT, then apply the
+        // write-set the way COMMIT does (see `applying_a_buffered_write_set_makes_it_visible`).
+        let mut txn = TxnWriteSet::default();
+        let msgs = execute_query(
+            &engine,
+            &schema,
+            "insert into pgbench_accounts (k, pad) values ('3','z')",
+            "public",
+            &limits,
+            Some(&mut txn),
+        )
+        .await;
+        assert!(
+            matches!(&msgs[..], [BackendMessage::CommandComplete { tag }] if tag == "INSERT 0 1"),
+            "statement 5 buffers inside the transaction: {msgs:?}"
+        );
+        let staged = std::mem::take(&mut txn)
+            .into_staged()
+            .expect("finish the staged write-set");
+        engine.write_atomic_batch(staged).expect("COMMIT applies");
+
+        // Statement 6: the post-commit count, again through an alias.
+        let msgs = run(
+            &engine,
+            &schema,
+            "select count(*) as rows_after_commit from pgbench_accounts",
+        )
+        .await;
+        assert_eq!(
+            row_description_names(&msgs),
+            vec!["rows_after_commit".to_string()],
+            "statement 6 must name its column via the alias: {msgs:?}"
+        );
+        assert_eq!(single_text(&msgs).as_deref(), Some("3"));
+
+        // Statement 7: UPDATE.
+        let msgs = run(
+            &engine,
+            &schema,
+            "update pgbench_accounts set pad='yy' where k='2'",
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "statement 7 (UPDATE) must run: {msgs:?}"
+        );
+
+        // Statement 8: a filtered, multi-column SELECT.
+        let msgs = run(
+            &engine,
+            &schema,
+            "select k, pad from pgbench_accounts where k='2'",
+        )
+        .await;
+        assert_eq!(
+            row_description_names(&msgs),
+            vec!["k".to_string(), "pad".to_string()]
+        );
+        assert_eq!(
+            first_row_text(&msgs),
+            vec!["2".to_string(), "yy".to_string()],
+            "statement 8 reads back the updated row: {msgs:?}"
+        );
+
+        // Statement 9: an ORDER BY SELECT.
+        let msgs = run(
+            &engine,
+            &schema,
+            "select k, pad from pgbench_accounts order by k",
+        )
+        .await;
+        assert_eq!(
+            first_row_text(&msgs),
+            vec!["1".to_string(), "x".to_string()],
+            "statement 9 orders by k, so '1' is first: {msgs:?}"
+        );
+
         engine.shutdown().unwrap();
     }
 }
