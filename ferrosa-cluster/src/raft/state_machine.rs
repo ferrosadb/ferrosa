@@ -345,6 +345,9 @@ impl std::fmt::Display for RecoveryError {
 
 impl std::error::Error for RecoveryError {}
 
+/// The current-snapshot slot one live state machine shares with its builders.
+type SharedSnapshotSlot = Arc<parking_lot::RwLock<Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>>>;
+
 /// Openraft state machine for Ferrosa.
 ///
 /// Applies [`RaftCommand`] entries to [`RaftState`] and optionally propagates
@@ -354,8 +357,17 @@ pub struct FerrosStateMachine {
     state: RaftState,
     last_applied: Option<LogId<u64>>,
     last_membership: StoredMembership<u64, BasicNode>,
-    /// Current snapshot data + metadata (kept in memory for `get_current_snapshot`).
-    current_snapshot: Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>,
+    /// Current snapshot data + metadata, served by `get_current_snapshot`.
+    ///
+    /// Shared with every snapshot builder this machine hands out (outage
+    /// 2026-10-10, F1/D1). openraft builds snapshots on the builder in a
+    /// detached task, then serves followers from the LIVE machine's
+    /// `get_current_snapshot`. When the builder cached its result on a private
+    /// clone, the live machine kept offering an older snapshot while the log
+    /// store purged past it, and a lagging follower could never catch up.
+    /// Written only through [`Self::publish_snapshot`], which never moves the
+    /// slot backwards.
+    current_snapshot: SharedSnapshotSlot,
     /// Optional local schema for DDL side effects.
     schema: Option<Arc<Schema>>,
     /// Optional local storage engine for table registration side effects.
@@ -379,8 +391,36 @@ pub struct FerrosStateMachine {
 }
 
 impl FerrosStateMachine {
+    /// Publish `meta`/`bytes` as the snapshot replication serves, unless the
+    /// slot already holds a newer one. Returns whether the slot changed.
+    ///
+    /// Monotonic by `last_log_id` (D1): a builder that started before an
+    /// install and finishes after it must not roll the slot back, or the log
+    /// store (which purges up to `durable_applied`) could outrun the snapshot
+    /// a lagging follower is offered. Equal ids replace, so a membership
+    /// refresh at the same index takes effect.
+    fn publish_snapshot(&self, meta: SnapshotMeta<u64, BasicNode>, bytes: Vec<u8>) -> bool {
+        let mut slot = self.current_snapshot.write();
+        if let Some((current, _)) = slot.as_ref() {
+            if meta.last_log_id < current.last_log_id {
+                tracing::info!(
+                    stale = ?meta.last_log_id,
+                    current = ?current.last_log_id,
+                    "raft snapshot not published: a newer snapshot already serves replication"
+                );
+                return false;
+            }
+        }
+        *slot = Some((meta, bytes));
+        true
+    }
+
+    fn current_snapshot_cloned(&self) -> Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)> {
+        self.current_snapshot.read().clone()
+    }
+
     fn refresh_current_snapshot_membership(&mut self) {
-        let Some((meta, bytes)) = self.current_snapshot.clone() else {
+        let Some((meta, bytes)) = self.current_snapshot_cloned() else {
             return;
         };
 
@@ -407,7 +447,9 @@ impl FerrosStateMachine {
             last_membership: self.last_membership.clone(),
             snapshot_id: meta.snapshot_id,
         };
-        self.current_snapshot = Some((refreshed_meta.clone(), refreshed_bytes.clone()));
+        if !self.publish_snapshot(refreshed_meta.clone(), refreshed_bytes.clone()) {
+            return;
+        }
 
         if let Some(path) = self.snapshot_path.as_ref() {
             if let Err(e) = Self::persist_snapshot_to_disk(path, &refreshed_meta, &refreshed_bytes)
@@ -427,7 +469,7 @@ impl FerrosStateMachine {
             state,
             last_applied: None,
             last_membership: StoredMembership::default(),
-            current_snapshot: None,
+            current_snapshot: Arc::new(parking_lot::RwLock::new(None)),
             schema: None,
             engine: None,
             ring: None,
@@ -611,7 +653,7 @@ impl FerrosStateMachine {
             state: RaftState::default(),
             last_applied: None,
             last_membership: StoredMembership::default(),
-            current_snapshot: None,
+            current_snapshot: Arc::new(parking_lot::RwLock::new(None)),
             schema: Some(schema),
             engine: Some(engine),
             ring: None,
@@ -699,7 +741,7 @@ impl FerrosStateMachine {
         self.state = data.state;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
-        self.current_snapshot = Some((meta, bytes));
+        self.publish_snapshot(meta, bytes);
         self.sync_ring();
         self.sync_schema_and_engine_from_state("Raft snapshot");
         self.unregister_tables_dropped_by_snapshot(&dropped);
@@ -1993,8 +2035,13 @@ impl RaftSnapshotBuilder<FerrosRaftConfig> for FerrosStateMachine {
             snapshot_id,
         };
 
-        // Cache the snapshot for get_current_snapshot.
-        self.current_snapshot = Some((meta.clone(), bytes.clone()));
+        // Publish to the slot this builder shares with the live state machine
+        // BEFORE persisting and before `mark_durably_applied` lets the log
+        // store purge up to this index (D1): replication must already be able
+        // to serve a snapshot covering anything that may be purged. If a newer
+        // snapshot was installed meanwhile, the slot keeps it, and the
+        // watermark below is monotonic, so it never exceeds the slot either.
+        self.publish_snapshot(meta.clone(), bytes.clone());
         if let Some(path) = self.snapshot_path.clone() {
             let meta_for_disk = meta.clone();
             let bytes_for_disk = bytes.clone();
@@ -2100,14 +2147,15 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        // Return a clone of ourselves as the snapshot builder.
-        // This is the simplest approach — the builder has a consistent view
-        // of state at this point in time.
+        // The builder is a point-in-time copy of the state (openraft runs it in
+        // a detached task while apply continues), but it SHARES the
+        // current-snapshot slot: what it builds is what the live machine's
+        // `get_current_snapshot` serves (D1).
         FerrosStateMachine {
             state: self.state.clone(),
             last_applied: self.last_applied,
             last_membership: self.last_membership.clone(),
-            current_snapshot: self.current_snapshot.clone(),
+            current_snapshot: Arc::clone(&self.current_snapshot),
             schema: None, // snapshot builder doesn't need side effects
             engine: None,
             ring: None,          // snapshot builder doesn't need live ring
@@ -2149,13 +2197,12 @@ impl RaftStateMachine<FerrosRaftConfig> for FerrosStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<FerrosRaftConfig>>, StorageError<u64>> {
-        match &self.current_snapshot {
-            Some((meta, bytes)) => Ok(Some(Snapshot {
-                meta: meta.clone(),
-                snapshot: Box::new(Cursor::new(bytes.clone())),
-            })),
-            None => Ok(None),
-        }
+        Ok(self
+            .current_snapshot_cloned()
+            .map(|(meta, bytes)| Snapshot {
+                meta,
+                snapshot: Box::new(Cursor::new(bytes)),
+            }))
     }
 }
 
@@ -3539,7 +3586,7 @@ mod tests {
         .unwrap();
         let _snapshot = sm.build_snapshot().await.unwrap();
         sm.last_membership = StoredMembership::default();
-        if let Some((meta, bytes)) = sm.current_snapshot.as_mut() {
+        if let Some((meta, bytes)) = sm.current_snapshot.write().as_mut() {
             meta.last_membership = StoredMembership::default();
             let mut data: SnapshotData = bincode::deserialize(bytes).unwrap();
             data.last_membership = StoredMembership::default();
@@ -3746,18 +3793,192 @@ mod tests {
         assert!(snap.is_none());
     }
 
+    fn blank_entry(index: u64) -> Entry<FerrosRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 0), index),
+            payload: EntryPayload::Blank,
+        }
+    }
+
+    /// A snapshot at exactly `index`, built on a scratch state machine, ready
+    /// to hand to `install_snapshot` as a leader would.
+    async fn snapshot_at(index: u64) -> (SnapshotMeta<u64, BasicNode>, Vec<u8>) {
+        let mut source = FerrosStateMachine::new();
+        source
+            .apply((1..=index).map(blank_entry).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        let snapshot = source.build_snapshot().await.unwrap();
+        (snapshot.meta, snapshot.snapshot.into_inner())
+    }
+
+    fn current_snapshot_index(snapshot: &Option<Snapshot<FerrosRaftConfig>>) -> Option<u64> {
+        snapshot
+            .as_ref()
+            .and_then(|s| s.meta.last_log_id)
+            .map(|id| id.index)
+    }
+
+    /// T-F1-1 (F1, D1). openraft builds snapshots on the builder that
+    /// `get_snapshot_builder` returns, in a detached task, and then serves
+    /// followers from the LIVE state machine's `get_current_snapshot`. The
+    /// built snapshot must therefore be visible on the live machine.
+    ///
+    /// Replaces `get_current_snapshot_after_build`, which built on the live
+    /// state machine itself and so never exercised the path openraft uses.
     #[tokio::test]
-    async fn get_current_snapshot_after_build() {
+    async fn get_current_snapshot_reflects_builder_built_snapshot() {
         let mut sm = FerrosStateMachine::new();
-        let entry = make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks1")));
-        sm.apply(vec![entry]).await.unwrap();
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("ks1"))),
+            make_entry(1, 2, RaftOp::CreateKeyspace(simple_keyspace("ks2"))),
+            blank_entry(3),
+        ])
+        .await
+        .unwrap();
 
-        // Build snapshot.
-        sm.build_snapshot().await.unwrap();
+        let mut builder = sm.get_snapshot_builder().await;
+        let built = builder.build_snapshot().await.unwrap();
+        assert_eq!(built.meta.last_log_id.map(|id| id.index), Some(3));
 
-        // Now get_current_snapshot should return Some.
-        let snap = sm.get_current_snapshot().await.unwrap();
-        assert!(snap.is_some());
+        let live = sm
+            .get_current_snapshot()
+            .await
+            .unwrap()
+            .expect("live state machine must serve the snapshot its builder built");
+        assert_eq!(live.meta.last_log_id, built.meta.last_log_id);
+        assert_eq!(live.meta.snapshot_id, built.meta.snapshot_id);
+        let data: SnapshotData = decode_snapshot(&live.snapshot.into_inner()).unwrap();
+        assert_eq!(
+            data.state.keyspaces.keys().cloned().collect::<Vec<_>>(),
+            vec!["ks1".to_string(), "ks2".to_string()],
+            "served snapshot must carry the state as of index 3"
+        );
+    }
+
+    /// T-F1-2 (F1, D1). A builder taken at index 5 that finishes after the
+    /// live machine installed a snapshot at index 10 must not roll the
+    /// shared slot back to 5.
+    #[tokio::test]
+    async fn snapshot_builder_does_not_overwrite_newer_installed_snapshot() {
+        let mut sm = FerrosStateMachine::new();
+        sm.apply((1..=5).map(blank_entry).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        let mut slow_builder = sm.get_snapshot_builder().await;
+
+        let (meta10, bytes10) = snapshot_at(10).await;
+        sm.install_snapshot(&meta10, Box::new(Cursor::new(bytes10)))
+            .await
+            .unwrap();
+
+        let built5 = slow_builder.build_snapshot().await.unwrap();
+        assert_eq!(built5.meta.last_log_id.map(|id| id.index), Some(5));
+
+        let current = sm.get_current_snapshot().await.unwrap();
+        assert_eq!(
+            current_snapshot_index(&current),
+            Some(10),
+            "a slow build at 5 must not replace the installed snapshot at 10"
+        );
+        assert_eq!(
+            current.unwrap().meta.snapshot_id,
+            meta10.snapshot_id,
+            "the installed snapshot itself must still be the one served"
+        );
+    }
+
+    /// Steps for T-F1-3's interleavings.
+    #[derive(Clone, Debug)]
+    enum SnapshotStep {
+        /// Apply this many blank entries on the live state machine.
+        Apply(u64),
+        /// Take a builder and build at once (openraft's normal path).
+        Build,
+        /// Take a builder now and hold it unbuilt.
+        BeginBuild,
+        /// Finish the oldest held builder.
+        FinishBuild,
+        /// Install a leader snapshot this many entries past `last_applied`.
+        Install(u64),
+    }
+
+    fn snapshot_step() -> impl proptest::strategy::Strategy<Value = SnapshotStep> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (1u64..5).prop_map(SnapshotStep::Apply),
+            Just(SnapshotStep::Build),
+            Just(SnapshotStep::BeginBuild),
+            Just(SnapshotStep::FinishBuild),
+            (1u64..10).prop_map(SnapshotStep::Install),
+        ]
+    }
+
+    /// Run `steps` and return the first violation of
+    /// `durable_applied <= live current snapshot index`, if any.
+    async fn run_snapshot_steps(steps: Vec<SnapshotStep>) -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let mut sm = FerrosStateMachine::with_snapshot_path(dir.path().join("sm.snapshot.bin"));
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        sm.set_durable_applied_handle(Arc::clone(&durable));
+        let mut held = std::collections::VecDeque::new();
+
+        for (i, step) in steps.iter().enumerate() {
+            let next = sm.last_applied_index().unwrap_or(0) + 1;
+            match step {
+                SnapshotStep::Apply(n) => {
+                    sm.apply((next..next + n).map(blank_entry).collect::<Vec<_>>())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+                SnapshotStep::Build => {
+                    let mut builder = sm.get_snapshot_builder().await;
+                    builder.build_snapshot().await.map_err(|e| e.to_string())?;
+                }
+                SnapshotStep::BeginBuild => held.push_back(sm.get_snapshot_builder().await),
+                SnapshotStep::FinishBuild => {
+                    if let Some(mut builder) = held.pop_front() {
+                        builder.build_snapshot().await.map_err(|e| e.to_string())?;
+                    }
+                }
+                SnapshotStep::Install(k) => {
+                    let (meta, bytes) = snapshot_at(next - 1 + k).await;
+                    sm.install_snapshot(&meta, Box::new(Cursor::new(bytes)))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            let durable_now = durable.load(std::sync::atomic::Ordering::Acquire);
+            let live = sm.get_current_snapshot().await.map_err(|e| e.to_string())?;
+            let live_index = current_snapshot_index(&live).unwrap_or(0);
+            if durable_now > live_index {
+                return Err(format!(
+                    "after step {i} ({step:?}): durable_applied={durable_now} exceeds the live \
+                     current snapshot index {live_index}; steps={steps:?}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// T-F1-3 (F1, D1). The log store purges up to `durable_applied`, and
+        /// replication serves the live `get_current_snapshot`. If the first
+        /// ever exceeds the second, a follower behind the purge point is
+        /// offered a snapshot that cannot reach it -- the 2026-10-10 loop.
+        #[test]
+        fn durable_applied_never_exceeds_live_current_snapshot_index(
+            steps in proptest::collection::vec(snapshot_step(), 1..24)
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime");
+            let outcome = runtime.block_on(run_snapshot_steps(steps));
+            proptest::prop_assert!(outcome.is_ok(), "{}", outcome.unwrap_err());
+        }
     }
 
     #[tokio::test]
