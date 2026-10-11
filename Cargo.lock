@@ -2398,6 +2398,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
+ "scylla-cql",
  "serde",
  "serde_json",
  "serial_test",

@@ -327,6 +327,45 @@ impl From<ferrosa_common::Error> for CqlError {
             ferrosa_common::Error::Overloaded { reason, table } => {
                 return Self::Overloaded(format!("table={table} reason={reason}"));
             }
+            // A coordinator's timeouts and unavailability arrive typed through
+            // `WritePath` and leave as the protocol's own errors, so drivers
+            // classify them (outage 2026-10-10, t_43f70b3a).
+            ferrosa_common::Error::ReadTimeout {
+                consistency,
+                received,
+                required,
+                data_present,
+            } => {
+                return Self::ReadTimeout {
+                    consistency: parse_consistency(&consistency),
+                    received,
+                    required,
+                    data_present,
+                };
+            }
+            ferrosa_common::Error::WriteTimeout {
+                consistency,
+                received,
+                required,
+            } => {
+                return Self::WriteTimeout {
+                    consistency: parse_consistency(&consistency),
+                    received,
+                    required,
+                    write_type: "SIMPLE",
+                };
+            }
+            ferrosa_common::Error::Unavailable {
+                consistency,
+                required,
+                alive,
+            } => {
+                return Self::Unavailable {
+                    consistency: parse_consistency(&consistency),
+                    required,
+                    alive,
+                };
+            }
             other => other,
         };
         if err.is_backpressure() {
@@ -422,6 +461,11 @@ impl From<ferrosa_cluster::ClusterError> for CqlError {
             ClusterError::Storage(ferrosa_common::Error::Overloaded { reason, table }) => {
                 Self::Overloaded(format!("table={table} reason={reason}"))
             }
+            ClusterError::Storage(
+                e @ (ferrosa_common::Error::ReadTimeout { .. }
+                | ferrosa_common::Error::WriteTimeout { .. }
+                | ferrosa_common::Error::Unavailable { .. }),
+            ) => Self::from(e),
             ClusterError::Storage(e) if e.is_backpressure() => {
                 tracing::warn!(error = %e, "legacy string-matched cluster storage backpressure error");
                 Self::Overloaded(format!("storage backpressure: {e}"))

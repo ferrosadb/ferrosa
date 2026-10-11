@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-common
 doc: fmea
-last_updated: 2026-06-19
+last_updated: 2026-10-10
 ---
 
 # ferrosa-common — FMEA / Known Issues
@@ -12,6 +12,7 @@ every crate above it — severities are correspondingly high.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
+| FC-10 | **Consistency-level failures had no typed form in `Error`** (outage 2026-10-10, t_43f70b3a). A coordinator's read/write timeout or unavailability crossed the storage-typed boundary as `InvalidData(String)`. | CQL clients got ServerError instead of Read_timeout / Write_timeout / Unavailable, so retry policies and transient-error classifiers missed them. | 7 | 7 | 6 | 294 → 14 | **Fixed:** `Error::ReadTimeout`, `Error::WriteTimeout`, `Error::Unavailable` carry the consistency and counts; `Display` matches the coordinator's text. `ferrosa-cluster` `WritePath` produces them, `ferrosa-cql` maps them to the protocol errors (CQL-29). |
 | FC-9 | **Legacy nanosecond cell timestamps** (t_cf637b6e). Before the fix Accord stamped cells, liveness and deletions with the HLC's `t.time` (ns, ~1.8e18) while every other write used µs; those values are on disk and in flight. | Any raw comparison lets a legacy stamp win: no later plain write, UPDATE or DELETE beats an LWT row, and #532's µs read-at-`t` bound filtered legacy rows out so every CAS on them failed. | 9 | 9 | 7 | 567 → 9 | **Fixed:** `cell_ts::normalize_cell_ts` (`raw / 1000` iff `1e18 <= raw < i64::MAX`, sentinels untouched) and `normalize_timestamp_bounds` (ns-only exact; mixed or unknown max widens to `[1e15, i64::MAX]`). Applied at every decode site (ferrosa-sstable ST-20, ferrosa-storage ST-88). Counter `legacy_ns_timestamps_normalised_total{source}`. Tests: `cell_ts::tests::*` (sentinels, idempotence, monotonicity, bounds). **Residual:** remove the shim once the counter reads zero on every node after a full compaction. |
 | FC-1 | `HybridLogicalClock::wall_clock_ns()` panics via `.expect("system clock before Unix epoch")` | A clock anomaly (NTP step before epoch / VM clock glitch) panics the thread on **every** `now()`/`merge()` — i.e. on the Accord hot path. Violates "check all returns" (no `Result`) | 8 | 2 | 5 | 80 | **Open.** `now()`/`merge()` return owned values, not `Result`; the only failure path is a hard panic. Should saturate-to-0 or surface a typed clock error. See roadmap Now. |
 | FC-2 | Murmur3 drift from Cassandra (e.g. tail sign-extension "fixed") | Every key re-tokenizes → silent, total misplacement vs. existing SSTables and ring | 10 | 1 | 4 | 40 | Characterization vectors from Cassandra source (`murmur3::tests`, `tools/generate_murmur3_vectors.java`); the sign-extension asymmetry is documented as intentional. |
