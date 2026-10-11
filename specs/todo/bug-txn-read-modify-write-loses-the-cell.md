@@ -267,6 +267,40 @@ Consequences:
 3. So "green on both front ends" for PG means: rebuild with the write-set fix, deploy, and re-run the
    live isolation probe. Anything short of that is a claim without evidence.
 
+### The PG write-set path, mapped from code (2026-10-11)
+
+Reconnaissance done while a rebuild/deploy/probe round runs, because the probe MEASURES and this is
+what a fix will need. All four are read off the code, not inferred from the symptom.
+
+1. **The PostgreSQL write-set is an ENVELOPE**, not a plain mutation:
+   `encode_mutation(storage_mutation: &[u8], mvcc_metadata: &[u8])` at
+   `ferrosa-storage/src/accord/postgres_mvcc.rs:10` frames magic + length + mvcc_metadata + storage
+   mutation. So a PG transaction travels as two payloads, and the second one (the row images) is the
+   part a read-modify-write depends on.
+
+2. **An EMPTY metadata SILENTLY skips the whole PostgreSQL apply** —
+   `ferrosa-cluster/src/accord/apply.rs:1300`: `if !postgres_mvcc_metadata.is_empty() { ... }`. No
+   error, no log, no counter. A transaction that wrote PG rows but whose metadata never got built
+   leaves no PG-visible history at all, and the front end reads through MVCC, so it sees nothing
+   where it should see the write. This is a fail-SILENT on the one path where a committed write can
+   vanish, in a repo whose stated rule is fail-loud.
+
+3. **The metadata is built on the PG side** (ferrosa-postgres) and applied by
+   `MvccManager::prepare_postgres_apply` (`ferrosa-postgres/src/mvcc.rs:636`), which
+   `decode_row_changes(metadata)?` and inserts history at the transaction's `t`.
+
+4. **This is the same CLASS as the CQL bug just fixed** (3a49ac1d): a value that depends on a read
+   inside the transaction fails to reach the write that must carry it. The CQL front end at least
+   refused the form BY NAME; the PG front end does it silently.
+
+The rule this touches, already standing: hot-path serialization must be capnp, and JSON row images
+riding inside the Accord write-set are a bug. Point 1 is exactly where those row images live.
+
+**Next, when the probe speaks:** read the metadata builder on the PG side and assert that a
+read-modify-write's computed value is IN the metadata before the commit is proposed. If it is not,
+the fix is the PG mirror of 3a49ac1d. If it is, the loss is downstream of it and the probe's V1 line
+says where.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
