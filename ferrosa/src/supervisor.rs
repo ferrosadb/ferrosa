@@ -470,8 +470,10 @@ impl EscalationPolicy {
         match self {
             EscalationPolicy::AbortProcess { engine } => {
                 let synced = sync_commit_log_bounded(engine);
-                eprintln!(
-                    "FATAL: supervised task exceeded its restart intensity; aborting so the \
+                // Flushes the buffered log and writes the line synchronously
+                // before `abort()`, which would otherwise drop both.
+                crate::lifecycle::fatal_abort(&format!(
+                    "supervised task exceeded its restart intensity; aborting so the \
 process supervisor restarts the node from the commit log. task={} failures_in_period={} \
 max_restarts={} period_secs={} commit_log_sync={synced} last_failure={}",
                     report.child.label(),
@@ -479,8 +481,7 @@ max_restarts={} period_secs={} commit_log_sync={synced} last_failure={}",
                     report.intensity.max_restarts,
                     report.intensity.period.as_secs(),
                     report.last_failure
-                );
-                std::process::abort();
+                ));
             }
             #[cfg(test)]
             EscalationPolicy::Record(count) => {

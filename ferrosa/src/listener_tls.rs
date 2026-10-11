@@ -104,7 +104,7 @@ pub fn resolve_node_tls(file_config: &toml::Value) -> Result<NodeTls, String> {
 pub fn resolve_node_tls_or_exit(file_config: &toml::Value) -> NodeTls {
     resolve_node_tls(file_config).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
-        std::process::exit(1);
+        crate::lifecycle::fatal_exit(1, &error);
     })
 }
 
@@ -147,7 +147,7 @@ pub fn resolve_listener_tls_or_exit(
 ) -> ListenerTlsConfig {
     resolve_listener_tls(file_config, section, env_prefix, node).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
-        std::process::exit(1);
+        crate::lifecycle::fatal_exit(1, &error);
     })
 }
 
