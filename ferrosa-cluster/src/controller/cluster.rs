@@ -1801,20 +1801,28 @@ impl ModeController {
                     let prune_ticks = (60_000u64 / urgent_flush_interval_millis).max(1);
                     if ticks.is_multiple_of(prune_ticks) {
                         // Prune applied Accord transactions to prevent unbounded
-                        // memory growth in txn_states and committed_txns.
+                        // memory growth in txn_states and committed_txns. The SAME
+                        // call drops the apply engine's idempotency records at or
+                        // below the decided-transaction retention floor it just
+                        // advanced (`prune_applied_idempotency`), so that set is
+                        // bounded by the replay window, not the lifetime
+                        // transaction count — it used to hold an owned partition
+                        // key per applied mutation forever.
                         // On the blocking pool: the mutex may be held through a
                         // protocol-log fsync (see `on_state_machine`).
                         let counts =
                             crate::accord::handlers::on_state_machine(&accord_state, |sm| {
-                                (sm.prune_applied(), sm.txn_count())
+                                let pruned = sm.prune_applied();
+                                (pruned, sm.txn_count(), sm.applied_idempotency_footprint())
                             })
                             .await;
-                        let Some((pruned, accord_txns)) = counts else {
+                        let Some((pruned, accord_txns, applied_idem_bytes)) = counts else {
                             continue;
                         };
                         if pruned > 0 {
                             tracing::info!(
                                 pruned,
+                                applied_idem_bytes,
                                 "maintenance: pruned applied Accord transactions"
                             );
                         }
@@ -1844,6 +1852,7 @@ impl ModeController {
                             table_count,
                             closed_buf_bytes,
                             accord_txns,
+                            applied_idem_bytes,
                             "maintenance: periodic memory check"
                         );
                     }
