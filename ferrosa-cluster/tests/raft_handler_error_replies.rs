@@ -175,29 +175,42 @@ async fn send_to_handler(
     (result, started.elapsed())
 }
 
-fn expect_remote_failure(
+/// The error reply's detail, or why the response was not the expected one.
+fn check_remote_failure(
     result: &Result<Message, NetError>,
     elapsed: Duration,
     want_type: MsgType,
     want_kind: RemoteFailureKind,
-) -> String {
+) -> Result<String, String> {
     match result {
         Err(NetError::RemoteHandlerFailed {
             msg_type,
             kind,
             detail,
         }) if *msg_type == want_type && *kind == want_kind => {
-            assert!(
-                elapsed < REQUEST_DEADLINE / 2,
-                "the error reply took {elapsed:?}; it must not wait out the deadline"
-            );
-            detail.clone()
+            if elapsed < REQUEST_DEADLINE / 2 {
+                Ok(detail.clone())
+            } else {
+                Err(format!(
+                    "{want_type:?}: the error reply took {elapsed:?}; it must not wait out the deadline"
+                ))
+            }
         }
-        other => panic!(
+        other => Err(format!(
             "{want_type:?}: expected an error reply RemoteHandlerFailed({want_kind:?}) after a \
              failed request, got {other:?} after {elapsed:?}"
-        ),
+        )),
     }
+}
+
+fn expect_remote_failure(
+    result: &Result<Message, NetError>,
+    elapsed: Duration,
+    want_type: MsgType,
+    want_kind: RemoteFailureKind,
+) -> String {
+    check_remote_failure(result, elapsed, want_type, want_kind)
+        .unwrap_or_else(|why| panic!("{why}"))
 }
 
 const RAFT_REQUESTS: [MsgType; 4] = [
@@ -207,30 +220,58 @@ const RAFT_REQUESTS: [MsgType; 4] = [
     MsgType::RaftPreVote,
 ];
 
+/// Send `body` to every Raft handler at once and require each to answer with a
+/// `want_kind` error reply whose detail contains `want_detail`. Every handler
+/// is checked and every miss reported, so one failing handler cannot hide
+/// another.
+async fn every_raft_handler_replies(
+    lazy: LazyRaft,
+    body: &'static [u8],
+    want_kind: RemoteFailureKind,
+    want_detail: &'static str,
+) {
+    let mut checks = Vec::new();
+    for msg_type in RAFT_REQUESTS {
+        let lazy = lazy.clone();
+        checks.push(tokio::spawn(async move {
+            let (result, elapsed) = send_to_handler(
+                msg_type,
+                handler_for(msg_type, lazy),
+                request(msg_type, Bytes::from_static(body)),
+            )
+            .await;
+            check_remote_failure(&result, elapsed, msg_type, want_kind).and_then(|detail| {
+                if detail.contains(want_detail) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "{msg_type:?}: detail does not contain {want_detail:?}: {detail}"
+                    ))
+                }
+            })
+        }));
+    }
+    let mut misses = Vec::new();
+    for check in checks {
+        if let Err(why) = check.await.expect("handler check task panicked") {
+            misses.push(why);
+        }
+    }
+    assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
 /// T-F2-3, plus the matching append, vote and pre-vote cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_handler_decode_failure_sends_error_reply() {
     let dir = tempfile::tempdir().unwrap();
     let (lazy, _raft) = ready_lazy_raft(&dir).await;
-    for msg_type in RAFT_REQUESTS {
-        let malformed = Bytes::from_static(&[0xff, 0x01]);
-        let (result, elapsed) = send_to_handler(
-            msg_type,
-            handler_for(msg_type, lazy.clone()),
-            request(msg_type, malformed),
-        )
-        .await;
-        let detail = expect_remote_failure(
-            &result,
-            elapsed,
-            msg_type,
-            RemoteFailureKind::RequestDecodeFailed,
-        );
-        assert!(
-            detail.contains("deserialize"),
-            "{msg_type:?}: detail must name the decode failure: {detail}"
-        );
-    }
+    every_raft_handler_replies(
+        lazy,
+        &[0xff, 0x01],
+        RemoteFailureKind::RequestDecodeFailed,
+        "deserialize",
+    )
+    .await;
 }
 
 /// T-F2-4. openraft refuses the chunk (an offset into a snapshot this node
@@ -272,17 +313,11 @@ async fn snapshot_handler_install_error_sends_error_reply() {
 /// T-F2-5, plus the matching append, vote and pre-vote cases.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_handler_raft_not_ready_sends_error_reply() {
-    for msg_type in RAFT_REQUESTS {
-        let (result, elapsed) = send_to_handler(
-            msg_type,
-            handler_for(msg_type, never_ready_lazy_raft()),
-            request(msg_type, Bytes::from_static(b"unread")),
-        )
-        .await;
-        let detail = expect_remote_failure(&result, elapsed, msg_type, RemoteFailureKind::NotReady);
-        assert!(
-            detail.contains("not ready"),
-            "{msg_type:?}: detail must say Raft is not ready: {detail}"
-        );
-    }
+    every_raft_handler_replies(
+        never_ready_lazy_raft(),
+        b"unread",
+        RemoteFailureKind::NotReady,
+        "not ready",
+    )
+    .await;
 }
