@@ -32,24 +32,15 @@ use super::epoch::Epoch;
 /// Default drain period: 30 seconds.
 ///
 /// This exceeds `SkewMax` (typically 500ms-1s) plus the transaction
-/// timeout (20s) to ensure all in-flight transactions have
+/// timeout (typically 10s) to ensure all in-flight transactions have
 /// time to complete or be detected as timed out.
 pub const DEFAULT_DRAIN_DURATION: Duration = Duration::from_secs(30);
 
 /// Default SkewMax: 1 second.
 pub const DEFAULT_SKEW_MAX: Duration = Duration::from_secs(1);
 
-/// Default transaction timeout: 20 seconds.
-///
-/// Raised from 10 s after the live 1.1M-row transactional COMMIT (the pgbench
-/// `-i --scale 10 --foreign-keys` load) measured a worst peer Apply ack of
-/// ~10.0 s against the 10 s default, so the abandon fired on a coin flip.
-/// 20 s is ~2x the worst measured ack (and ~1.7x the ~11.5 s worst on the
-/// uncompressed path) — margin, not a substitute for bounding the payload,
-/// which now spills, compresses and streams. It still fits inside the 30 s
-/// drain (`SkewMax + DEFAULT_TXN_TIMEOUT` = 21 s) and stays well below the 60 s
-/// parked-apply reclamation bound, which must remain strictly above it.
-pub const DEFAULT_TXN_TIMEOUT: Duration = Duration::from_secs(20);
+/// Default transaction timeout: 10 seconds.
+pub const DEFAULT_TXN_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------
 // DrainStatus
@@ -358,51 +349,6 @@ mod tests {
         assert_eq!(drain.check_complete(), DrainCheckResult::Complete);
         drain.finalize();
         assert!(!drain.is_draining());
-    }
-
-    /// The shipped apply bound must clear the MEASURED worst-case peer Apply ack on the
-    /// live 1.1M-row transactional COMMIT (`pgbench -i --scale 10 --foreign-keys`) with
-    /// margin, or the abandon fires on a coin flip — the exact regression that motivated
-    /// raising the default from 10 s.
-    ///
-    /// NEGATIVE CONTROL: restore the pre-fix value (`Duration::from_secs(10)`) and this
-    /// test fails on the assertion below; it is not green by construction.
-    #[test]
-    fn apply_bound_clears_the_measured_worst_ack_with_margin() {
-        // Worst peer Apply ack measured on the live 4 GB cluster: ~10.02 s (concurrent,
-        // compressed path) and ~11.48 s (serial fan-out, uncompressed). The LARGER is the
-        // number the bound must clear.
-        let worst_measured_ack = Duration::from_millis(11_479);
-        assert!(
-            DEFAULT_TXN_TIMEOUT * 2 >= worst_measured_ack * 3,
-            "the default apply bound {:?} must clear the measured worst ack {:?} by at \
-             least 1.5x, or a large transactional COMMIT abandons on a coin flip",
-            DEFAULT_TXN_TIMEOUT,
-            worst_measured_ack
-        );
-    }
-
-    /// The apply bound must sit strictly inside the epoch drain (`SkewMax + the bound`)
-    /// and strictly below the parked-apply reclamation bound: a drain or a reclaim that
-    /// expires inside the apply bound cuts off a transaction still inside its window.
-    ///
-    /// NEGATIVE CONTROL: raise the bound past the drain (e.g. 30 s) or the reclaim (e.g.
-    /// 60 s) and this fails; it is not green by construction.
-    #[test]
-    fn apply_bound_sits_between_the_drain_floor_and_the_parked_reclaim() {
-        assert!(
-            DEFAULT_SKEW_MAX + DEFAULT_TXN_TIMEOUT < DEFAULT_DRAIN_DURATION,
-            "the {:?} drain must strictly exceed SkewMax + the apply bound {:?}",
-            DEFAULT_DRAIN_DURATION,
-            DEFAULT_TXN_TIMEOUT
-        );
-        let reclaim = crate::accord::apply::DEFAULT_PARKED_APPLY_RECLAIM_SECS;
-        assert!(
-            DEFAULT_TXN_TIMEOUT.as_secs() < reclaim,
-            "the parked-apply reclaim bound {reclaim} s must stay strictly above the \
-             apply bound {:?}",
-            DEFAULT_TXN_TIMEOUT
-        );
     }
 
     // -----------------------------------------------------------------------

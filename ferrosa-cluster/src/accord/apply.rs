@@ -43,11 +43,11 @@ use crate::accord::dep_wait::DepWaitGraph;
 /// A park whose dependency NEVER arrives — an abandoned dependency, a lost
 /// Apply, a dead coordinator — would otherwise retain its whole write-set in
 /// RAM forever (the graph prunes its own bookkeeping; the payloads had no
-/// Must stay **strictly greater** than the coordinator's
+/// counterpart). Must stay **strictly greater** than the coordinator's
 /// dependency-wait bound ([`crate::accord::state_machine::DEFAULT_TXN_TIMEOUT`],
-/// 20 s) so a park that is about to resolve is never reclaimed out from under
-/// it. 60 s is three times that bound, still matching the decided-txn retention
-/// horizon the state machine already uses.
+/// 10 s) so a park that is about to resolve is never reclaimed out from under
+/// it. 60 s is six times that bound, matching the decided-txn retention horizon
+/// the state machine already uses.
 ///
 /// Externalized tunable; override with
 /// [`PARKED_APPLY_RECLAIM_ENV`]. This is a TIME bound on residency, never a hard

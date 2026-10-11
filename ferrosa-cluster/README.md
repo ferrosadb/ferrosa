@@ -692,7 +692,7 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   false `Applied` with nothing left to persist.
   The wait is **bounded and operator-tunable**: `FERROSA_ACCORD_TXN_TIMEOUT_SECS`
   (config `[accord] txn_timeout_secs`), defaulting to
-  `epoch_drain::DEFAULT_TXN_TIMEOUT` (20 s, single-sourced so the drain that must
+  `epoch_drain::DEFAULT_TXN_TIMEOUT` (10 s, single-sourced so the drain that must
   exceed it cannot drift) and read on the hot path through a lock-free atomic —
   no state lock, no blocking-pool hop, no allocation per RPC. When the bound
   expires the coordinator **abandons** the transaction: it finalizes it as a

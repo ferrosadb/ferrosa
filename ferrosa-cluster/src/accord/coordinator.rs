@@ -2541,7 +2541,7 @@ impl AccordCoordinatorDriver {
     ///
     /// The bound is a parameter so the abandon path is testable:
     /// `configured_txn_timeout` resolves the environment once and caches it
-    /// process-wide, so a test cannot move the production 20 s bound.
+    /// process-wide, so a test cannot move the production 10 s bound.
     async fn apply_phase_within(
         &mut self,
         commit_t: Timestamp,
