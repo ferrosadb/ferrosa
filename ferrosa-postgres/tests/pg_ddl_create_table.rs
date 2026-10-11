@@ -96,6 +96,9 @@ fn engine_config(dir: &Path) -> StorageEngineConfig {
 struct Fixture {
     client: tokio_postgres::Client,
     schema: Arc<Schema>,
+    /// The live storage engine, so a test can wait on engine-side state (e.g. that an
+    /// `ALTER`'s asynchronous index backfill has completed before issuing the workload).
+    engine: Arc<StorageEngine>,
     _dir: tempfile::TempDir,
 }
 
@@ -109,6 +112,13 @@ async fn start() -> Fixture {
 async fn start_with(with_public: bool) -> Fixture {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).expect("engine"));
+    // Production registers the catalog tables at boot (`ferrosa/src/main.rs:2242`). Without
+    // them an `ALTER ... ADD PRIMARY KEY` cannot record its index and fails loud with
+    // E58000 "table not registered: system_schema.indexes", which is a fixture gap rather
+    // than a product failure.
+    engine
+        .register_system_tables()
+        .expect("system tables register");
     let schema = Arc::new(Schema::new(schema_config()).expect("schema bootstraps"));
     let auth = AuthContext {
         role: "cassandra".to_string(),
@@ -138,7 +148,7 @@ async fn start_with(with_public: bool) -> Fixture {
     }));
     let ctx = Arc::new(QueryContext {
         cluster_read: Default::default(),
-        engine,
+        engine: engine.clone(),
         schema: schema.clone(),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
@@ -178,8 +188,28 @@ async fn start_with(with_public: bool) -> Fixture {
     Fixture {
         client,
         schema,
+        engine,
         _dir: dir,
     }
+}
+
+/// Wait until the `<table>_pkey` secondary index is CURRENT — its backfill has completed.
+///
+/// `ALTER ... ADD PRIMARY KEY` records the key and builds the index over the rows it
+/// flushes; that backfill runs on the engine's index-build scheduler and is therefore
+/// asynchronous, so the index is briefly NOT current after the `ALTER` returns. A
+/// production `pgbench` issues its workload after that backfill has finished; this makes
+/// the test wait for the same condition instead of racing it (deterministically, with a
+/// bounded budget rather than a fixed sleep).
+async fn await_index_current(fx: &Fixture, table: &str, index: &str) {
+    let table_id = ferrosa_storage::TableId::new("public", table);
+    for _ in 0..500 {
+        if fx.engine.index_is_current(&table_id, index) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the {table}.{index} index never became current within the wait budget");
 }
 
 /// The SQLSTATE of a failed statement.
@@ -485,4 +515,251 @@ async fn pg_ddl_create_table_inside_a_transaction_block_is_refused() {
         .snapshot()
         .tables
         .contains_key(&("public".to_string(), "t".to_string())));
+}
+
+// ---------------------------------------------------------------------------
+// Test list: rows -> index -> the index must be USED by the queries.
+//
+// A PG table with no PRIMARY KEY gets the synthetic `_sys_ck_` storage key, so a later
+// `ALTER TABLE ... ADD PRIMARY KEY (aid)` cannot become the storage key: it records the
+// DECLARED key and, because the storage key is shadowed, must build a SECONDARY index over
+// `aid`. From that point the row the client names is reachable only through that index —
+// `aid` cannot address a partition by itself.
+//
+// - [x] rows land in a PK-less table
+// - [x] ALTER ADD PRIMARY KEY indexes the rows already written (not just future ones)
+// - [x] SELECT by the declared key finds the row (asserted by VALUE)
+// - [x] UPDATE by the declared key hits exactly that row (VALUE + untouched sibling)
+// - [ ] DELETE by the declared key removes exactly that row
+// - [ ] rows inserted AFTER the index exists are findable too (index maintained on write)
+// - [x] a WHERE on a column with NO index still WORKS: fall back to a scan, never refuse
+//       (user ruling 2026-10-11). The scan must still APPLY the predicate — a scan that
+//       skipped it would rewrite every row — so the sibling row is asserted unchanged.
+//       This REVERSES the earlier "refuse a non-key column rather than scan" decision
+//       recorded at ddl.rs:449-452 for the FK check and in this feature item's own
+//       decision section; both need updating in the same change.
+// - [x] a scan fallback is LOGGED LOUDLY (user ruling 2026-10-11) — never silent. Nothing in
+//       ferrosa-postgres/src logs a scan today (zero matches), so the SELECT scan and the DML
+//       fallback are both silent right now. Copy the precedent already in the tree:
+//       ferrosa-sparql/src/executor.rs:641-646 warns on its scan fallback, naming the index it
+//       could not use and that it is streaming a full scan with filtering.
+// ---------------------------------------------------------------------------
+
+/// `pgbench -i`'s shape, end to end: rows first, the primary key afterwards.
+///
+/// RED as written: `ALTER` reports success and the index machinery exists, but nothing in
+/// the PG front-end consults it — `query.rs` has no `_pkey` and no `pg_key::of` — so
+/// tpcb's row statements cannot address the row the client names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_primary_key_becomes_a_secondary_index_the_queries_then_use() {
+    let fx = start().await;
+
+    // No PRIMARY KEY at CREATE — exactly what `pgbench -i` issues, so the storage key is
+    // the synthetic uuid the client never sees.
+    fx.client
+        .batch_execute("CREATE TABLE pbalter (aid integer, abalance integer)")
+        .await
+        .expect("a PK-less CREATE TABLE executes");
+
+    // Rows land BEFORE the key exists, so the index has to cover them.
+    fx.client
+        .batch_execute("INSERT INTO pbalter (aid, abalance) VALUES (1, 100), (2, 200), (7, 700)")
+        .await
+        .expect("rows land in a PK-less table");
+
+    // `pgbench -i` then adds the key: for us a secondary index over `aid`.
+    fx.client
+        .batch_execute("ALTER TABLE pbalter ADD PRIMARY KEY (aid)")
+        .await
+        .expect("ALTER ADD PRIMARY KEY executes");
+
+    // The ALTER returns before its backfill lands: the index is briefly NOT current, and a
+    // read through it fails LOUD ("58000 ... not current; refusing to return incomplete
+    // results while index backfill is pending") rather than answering incompletely. pgbench
+    // issues its workload after that backfill; wait for the same condition, deterministically.
+    //
+    // OPEN ITEM, not papered over: a client that queries by the declared key without waiting
+    // gets that 58000 straight after a successful ALTER. Either ALTER should await its own
+    // backfill, or the front-end should retry — worth deciding before this ships.
+    await_index_current(&fx, "pbalter", "pbalter_pkey").await;
+
+    // tpcb command 1: SELECT by the declared key.
+    let selected = fx
+        .client
+        .query("SELECT abalance FROM pbalter WHERE aid = 2", &[])
+        .await
+        .unwrap_or_else(|e| panic!("SELECT by the declared key must be served: {e}"));
+    assert_eq!(selected.len(), 1, "exactly one row is named by aid = 2");
+    let balance: i32 = selected[0].get(0);
+    assert_eq!(balance, 200, "the index over aid must find the row");
+
+    // tpcb command 5: UPDATE by the declared key.
+    fx.client
+        .execute(
+            "UPDATE pbalter SET abalance = abalance + 5 WHERE aid = 2",
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("UPDATE by the declared key must not be refused: {e}"));
+
+    let after = fx
+        .client
+        .query("SELECT abalance FROM pbalter WHERE aid = 2", &[])
+        .await
+        .expect("read back after the update");
+    assert_eq!(
+        after[0].get::<_, i32>(0),
+        205,
+        "the UPDATE must hit the row the index names"
+    );
+
+    // The rows the predicate did NOT name are untouched — values, not counts.
+    let sibling = fx
+        .client
+        .query("SELECT abalance FROM pbalter WHERE aid = 7", &[])
+        .await
+        .expect("read the sibling row");
+    assert_eq!(
+        sibling[0].get::<_, i32>(0),
+        700,
+        "the row not named by the predicate must not change"
+    );
+}
+
+/// User ruling (2026-10-11): a WHERE on a column with NO index still WORKS — it falls back
+/// to a scan rather than being refused. The scan must also still APPLY the predicate: one
+/// that skipped it would rewrite every row, so the sibling row is asserted here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_where_on_a_column_with_no_index_falls_back_to_a_filtering_scan() {
+    let fx = start().await;
+    fx.client
+        .batch_execute("CREATE TABLE pbscan (aid integer, abalance integer)")
+        .await
+        .expect("a PK-less CREATE TABLE executes");
+    fx.client
+        .batch_execute("INSERT INTO pbscan (aid, abalance) VALUES (1, 100), (2, 200)")
+        .await
+        .expect("rows land");
+
+    // No ALTER: `aid` has no index at all, so nothing can address the row but a scan.
+    let selected = fx
+        .client
+        .query("SELECT abalance FROM pbscan WHERE aid = 2", &[])
+        .await
+        .unwrap_or_else(|e| panic!("SELECT with no index must be served by a scan: {e}"));
+    assert_eq!(
+        selected.len(),
+        1,
+        "the scan must apply the predicate, not return every row"
+    );
+    assert_eq!(
+        selected[0].get::<_, i32>(0),
+        200,
+        "the scanned row is the one named"
+    );
+
+    // The same fallback must serve DML — a refusal is not an option.
+    fx.client
+        .execute(
+            "UPDATE pbscan SET abalance = abalance + 5 WHERE aid = 2",
+            &[],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("UPDATE with no index must not be refused: {e}"));
+
+    let sibling = fx
+        .client
+        .query("SELECT abalance FROM pbscan WHERE aid = 1", &[])
+        .await
+        .expect("read the sibling");
+    assert_eq!(
+        sibling[0].get::<_, i32>(0),
+        100,
+        "a non-indexed UPDATE must not touch rows the predicate did not name"
+    );
+}
+
+/// A `MakeWriter` that collects everything logged into a shared buffer, so a test can
+/// assert a warning was actually emitted. The same pattern ferrosa-cql's router tests and
+/// ferrosa-storage's engine tests use for their scan/index warnings.
+#[derive(Clone, Default)]
+struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// User ruling (2026-10-11): the scan fallback that serves the previous test must be
+/// LOGGED LOUDLY, never silent. A silent fallback hides a missing or unusable index
+/// behind a result that looks the same, so this pins the warning on the real statement
+/// path: it boots a server under a capturing subscriber and asserts that an UPDATE whose
+/// WHERE names no indexed column emits a warning that names the table.
+///
+/// Deliberately NOT `tokio::test`: the runtime is built INSIDE the subscriber scope so
+/// every task the server spawns — including the connection handler that logs — polls on
+/// the same thread as the capturing subscriber.
+#[test]
+fn a_scan_fallback_is_logged_loudly() {
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            let fx = start().await;
+            fx.client
+                .batch_execute("CREATE TABLE pbscanlog (aid integer, abalance integer)")
+                .await
+                .expect("a PK-less CREATE TABLE executes");
+            fx.client
+                .batch_execute("INSERT INTO pbscanlog (aid, abalance) VALUES (1, 100), (2, 200)")
+                .await
+                .expect("rows land");
+            // No ALTER: `aid` has no index, so this must scan — and say so.
+            fx.client
+                .execute(
+                    "UPDATE pbscanlog SET abalance = abalance + 5 WHERE aid = 2",
+                    &[],
+                )
+                .await
+                .expect("UPDATE with no index must not be refused");
+        });
+    });
+
+    let captured = logs.text();
+    assert!(
+        captured.contains("pbscanlog"),
+        "the scan fallback must be logged LOUDLY and name the table it scanned. \
+         --- captured warnings ---\n{captured}"
+    );
+    assert!(
+        captured.contains("full scan"),
+        "the warning must say the statement is streaming a full scan with filtering. \
+         --- captured warnings ---\n{captured}"
+    );
 }

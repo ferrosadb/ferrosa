@@ -82,3 +82,7 @@ tempfile = "3"
 parking_lot = "0.12"
 # Pins the scan-pool size in `pg_stalled_consumer_liveness.rs`.
 ferrosa-sched = { path = "../ferrosa-sched" }
+# Captures the DML scan-fallback warning so `pg_ddl_create_table.rs` can pin that it is
+# LOUD, not silent (the same `CapturedLogs` MakeWriter pattern as ferrosa-cql and
+# ferrosa-storage).
+tracing-subscriber = { version = "0.3", features = ["fmt"] }

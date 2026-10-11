@@ -3137,31 +3137,604 @@ fn resolve_dml_value<'a>(
     Ok((col_meta, sql_value, value))
 }
 
-/// Execute a single-row `UPDATE`: a Cassandra-style upsert. The equality `WHERE`
-/// supplies the full primary key (which identifies the row); `SET` supplies the
-/// regular/static cells. Returns `CommandComplete "UPDATE 1"` — the engine write
-/// is a blind upsert, so the affected-row count is reported as 1 when the write
-/// lands (Cassandra has no match count; this is the documented semantic).
+/// One row a non-storage-key DML `WHERE` names: the storage key it is written by
+/// (partition + clustering) and the current value of every declared column.
+struct ResolvedRow {
+    /// Partition-key values, in key order.
+    pk_values: Vec<CqlValue>,
+    /// Clustering-key values, in clustering order.
+    ck_values: Vec<CqlValue>,
+    /// Declared column name -> current value. Read by the SET expression
+    /// (`c = c + 1`) and, on DELETE, by the parent-side FOREIGN KEY check.
+    values: std::collections::HashMap<String, CqlValue>,
+}
+
+/// How a DML `WHERE` that does not name the storage key reaches its rows.
+enum WherePlan {
+    /// The declared key's `<table>_pkey` secondary index: resolve by this column.
+    Index { index_name: String, column: String },
+    /// No index can address the WHERE: scan the table, applying the predicate.
+    Scan,
+}
+
+/// The context a resolved-row `UPDATE` write runs against.
+struct UpdateTarget<'a> {
+    engine: &'a StorageEngine,
+    schema: &'a Schema,
+    mvcc: Option<&'a MvccManager>,
+    meta: &'a ferrosa_schema::TableMetadata,
+    ks: &'a str,
+    table: &'a str,
+    upd: &'a UpdateStmt,
+    params: &'a [SqlValue],
+    jsonb_limits: &'a ferrosa_jsonb::Limits,
+}
+
+/// The context a resolved-row `DELETE` write runs against.
+struct DeleteTarget<'a> {
+    engine: &'a StorageEngine,
+    schema: &'a Schema,
+    mvcc: Option<&'a MvccManager>,
+    meta: &'a ferrosa_schema::TableMetadata,
+    snapshot: &'a ferrosa_schema::SchemaSnapshot,
+    ks: &'a str,
+    table: &'a str,
+}
+
+/// Whether the `WHERE` names EVERY storage-key column (partition + clustering), so it
+/// identifies exactly one row by the primary structure.
+fn storage_key_complete(
+    meta: &ferrosa_schema::TableMetadata,
+    where_values: &std::collections::HashMap<String, CqlValue>,
+) -> bool {
+    meta.partition_key
+        .iter()
+        .all(|name| where_values.contains_key(name))
+        && meta
+            .clustering_key
+            .iter()
+            .all(|(name, _)| where_values.contains_key(name))
+}
+
+/// Apply every equality in `predicate` to a row's decoded values.
 ///
-/// # A `SET` value that reads a column is a READ-MODIFY-WRITE
+/// A predicate value of SQL NULL matches NOTHING (`col = NULL` is UNKNOWN in
+/// PostgreSQL, never true), so a NULL can never widen a scan into rewriting a row the
+/// statement did not name.
+fn predicate_matches(
+    values: &std::collections::HashMap<String, CqlValue>,
+    predicate: &std::collections::HashMap<String, CqlValue>,
+) -> bool {
+    predicate.iter().all(|(column, want)| {
+        !matches!(want, CqlValue::Null) && values.get(column).is_some_and(|got| got == want)
+    })
+}
+
+/// Decode one storage partition into the rows a DML `WHERE` names, values in DECLARED
+/// column order, paired with the storage key each is written by. The predicate is
+/// applied HERE, so a scan that reaches this never rewrites a row the WHERE did not name.
 ///
-/// `SET c = c + 1` is not a constant: it reads the row's CURRENT value of `c` and
-/// writes `current + 1` — pgbench's `abalance = abalance + :delta`, and the reason
-/// every pgbench workload (`-N`, `tpcb-like`) was impossible before this. Such an
-/// `UPDATE` reads the row FIRST: the committed storage image, with the open
-/// transaction's own buffered writes overlaid so an earlier statement in the same
-/// transaction is visible (read-your-own-writes), then evaluates the arithmetic and
-/// writes the result. A constant `SET` (`SET b = 'yy'`) keeps the original
-/// blind-upsert path and reads nothing.
+/// Streaming by construction: one partition is handed in at a time, so peak memory is
+/// that partition's matching rows, never the table's.
+fn candidate_rows_from_partition(
+    partition: &ferrosa_sstable::types::Partition,
+    codec: &TableCodec,
+    predicate: &std::collections::HashMap<String, CqlValue>,
+) -> Result<Vec<ResolvedRow>, String> {
+    let pk_parts = ferrosa_row_bridge::decode_pk(&partition.key, codec.pk().len());
+    let pk_values: Vec<CqlValue> = codec
+        .pk()
+        .iter()
+        .zip(pk_parts.iter())
+        .map(|(index, bytes)| {
+            ferrosa_row_bridge::decode_value(&codec.types()[*index], bytes)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    let decoded = ferrosa_row_bridge::partition_to_rows_with_clustering(
+        partition,
+        codec.names(),
+        codec.types(),
+        codec.pk(),
+        codec.ck(),
+        codec.storage_to_table(),
+    )
+    .map_err(|error| error.to_string())?;
+    let mut out = Vec::new();
+    for (_clustering, declared) in decoded {
+        let mut values: std::collections::HashMap<String, CqlValue> =
+            std::collections::HashMap::with_capacity(codec.names().len());
+        for (name, value) in codec.names().iter().zip(declared) {
+            values.insert(name.clone(), value.unwrap_or(CqlValue::Null));
+        }
+        if !predicate_matches(&values, predicate) {
+            continue;
+        }
+        let ck_values: Vec<CqlValue> = codec
+            .ck()
+            .iter()
+            .map(|index| values[&codec.names()[*index]].clone())
+            .collect();
+        out.push(ResolvedRow {
+            pk_values: pk_values.clone(),
+            ck_values,
+            values,
+        });
+    }
+    Ok(out)
+}
+
+/// Choose how a DML `WHERE` reaches its rows. The declared key's secondary index is
+/// used when the WHERE names the (single-column) declared key and the engine declares
+/// `<table>_pkey`; anything else is a filtering scan.
+fn plan_dml_where(
+    engine: &StorageEngine,
+    meta: &ferrosa_schema::TableMetadata,
+    ks: &str,
+    table: &str,
+    where_values: &std::collections::HashMap<String, CqlValue>,
+) -> WherePlan {
+    let index_name = format!("{table}_pkey");
+    if let Some(columns) = crate::pg_key::recorded(meta) {
+        // ferrosa secondary indexes are single-column, so only a single-column declared
+        // key has one to consult.
+        if let [column] = columns.as_slice() {
+            if where_values.contains_key(column)
+                && engine.declares_index(&ferrosa_storage::TableId::new(ks, table), &index_name)
+            {
+                return WherePlan::Index {
+                    index_name,
+                    column: column.clone(),
+                };
+            }
+        }
+    }
+    WherePlan::Scan
+}
+
+/// Every row the `<table>_pkey` index names for the WHERE's declared-key value, filtered
+/// by the FULL predicate (an extra `AND` on a non-indexed column still constrains the
+/// rows). Fails loud if the index is missing or stale — never a silent empty result.
+///
+/// Bounded by the matching posting count; a declared key is unique, so this is O(1) in
+/// the ordinary case.
+fn index_rows_for_dml(
+    engine: &StorageEngine,
+    table_id: &ferrosa_storage::TableId,
+    index_name: &str,
+    column: &str,
+    where_values: &std::collections::HashMap<String, CqlValue>,
+    codec: &TableCodec,
+) -> Result<Vec<ResolvedRow>, BackendMessage> {
+    let value = where_values
+        .get(column)
+        .expect("plan_dml_where only selects an indexed column present in the WHERE");
+    let key_bytes = ferrosa_row_bridge::encode_value(value);
+    let mut rows = Vec::new();
+    let mut decode_error: Option<String> = None;
+    let visited =
+        engine.read_by_index_each_bytes(table_id, index_name, &key_bytes, &mut |partition| {
+            match candidate_rows_from_partition(&partition, codec, where_values) {
+                Ok(mut found) => {
+                    rows.append(&mut found);
+                    std::ops::ControlFlow::Continue(())
+                }
+                Err(error) => {
+                    decode_error = Some(error);
+                    std::ops::ControlFlow::Break(())
+                }
+            }
+        });
+    if let Err(error) = visited {
+        return Err(error_response(
+            "58000",
+            &format!(
+                "could not consult index \"{index_name}\" for the {column} predicate: {error}"
+            ),
+        ));
+    }
+    if let Some(error) = decode_error {
+        return Err(error_response(
+            "58000",
+            &format!("could not decode a row reached through index \"{index_name}\": {error}"),
+        ));
+    }
+    Ok(rows)
+}
+
+/// Log the SCAN fallback for a DML `WHERE` no index can address.
+///
+/// LOUD by rule (user ruling 2026-10-11): a filtering scan is correct but slow, and a
+/// silent fallback hides a missing or unusable index behind a result that looks the
+/// same. Mirrors the SPARQL executor's `ObjectScan` warning
+/// (`ferrosa-sparql/src/executor.rs`).
+fn warn_scan_fallback(
+    statement: &str,
+    ks: &str,
+    table: &str,
+    where_values: &std::collections::HashMap<String, CqlValue>,
+) {
+    let columns: Vec<&str> = where_values.keys().map(String::as_str).collect();
+    tracing::warn!(
+        statement,
+        table = %format!("{ks}.{table}"),
+        columns = ?columns,
+        "DML WHERE names no indexed column; streaming a full scan with filtering"
+    );
+}
+
+/// `CommandComplete` for a multi-row DML statement.
+fn complete_tag(command: &str, rows: usize) -> Vec<BackendMessage> {
+    vec![BackendMessage::CommandComplete {
+        tag: format!("{command} {rows}"),
+    }]
+}
+
+/// The current-micros timestamp a DML mutation is stamped with.
+fn dml_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
+/// Collect the column name of every `SetExpr::Column` a SET reads.
+fn collect_set_columns(expr: &SetExpr, out: &mut Vec<String>) {
+    match expr {
+        SetExpr::Column(column) => out.push(column.name.clone()),
+        SetExpr::Value(_) => {}
+        SetExpr::Binary { left, right, .. } => {
+            collect_set_columns(left, out);
+            collect_set_columns(right, out);
+        }
+    }
+}
+
+/// The row image a resolved-row `UPDATE`'s SET expressions read, built for ONLY the
+/// columns they name — so an unsupported stored type in a column the statement never
+/// touches cannot fail the UPDATE.
+fn current_image_for_set(
+    row: &ResolvedRow,
+    upd: &UpdateStmt,
+) -> Result<std::collections::HashMap<String, SqlValue>, BackendMessage> {
+    let mut referenced = Vec::new();
+    for (_, expr) in &upd.assignments {
+        collect_set_columns(expr, &mut referenced);
+    }
+    let mut image = std::collections::HashMap::new();
+    for name in referenced {
+        let cql = row.values.get(&name).cloned().unwrap_or(CqlValue::Null);
+        let sql = crate::storage_provider::cql_to_value(&cql).map_err(|error| {
+            error_response(
+                "58000",
+                &format!("UPDATE cannot represent stored column \"{name}\": {error}"),
+            )
+        })?;
+        image.insert(name, sql);
+    }
+    Ok(image)
+}
+
+/// Build the storage mutation a resolved-row `UPDATE` writes for ONE row. `current` is
+/// the row image the SET expressions evaluate against (the resolved row for the
+/// index/scan path, the committed row for the storage-key path).
+fn build_update_mutation(
+    ctx: &UpdateTarget<'_>,
+    pk_values: &[CqlValue],
+    ck_values: &[CqlValue],
+    current: Option<&std::collections::HashMap<String, SqlValue>>,
+) -> Result<Mutation, BackendMessage> {
+    let meta = ctx.meta;
+    // SET assignments -> regular/static cells (by storage index).
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // The assigned values, keyed by column, so a FOREIGN KEY column that is being SET can
+    // be re-checked against its parent before the write (a foreign key on a column the
+    // UPDATE does not touch keeps its already-valid old value and needs no check).
+    let mut assigned: std::collections::HashMap<String, CqlValue> =
+        std::collections::HashMap::new();
+    for (col_name, expr) in &ctx.upd.assignments {
+        let col_meta = meta.columns.get(col_name).ok_or_else(|| {
+            error_response(
+                "42703",
+                &format!(
+                    "column \"{col_name}\" of relation \"{}\" does not exist",
+                    ctx.table
+                ),
+            )
+        })?;
+        let cql_type = ferrosa_row_bridge::parse_cql_type_in_keyspace(
+            &col_meta.column_type,
+            ctx.ks,
+            ctx.schema,
+        )
+        .map_err(|error| error_response("42704", &error.to_string()))?;
+        let sql_value = eval_set_expr(expr, current, ctx.params)?;
+        let value = value_to_cql(&sql_value, &cql_type, ctx.jsonb_limits)?;
+        if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+            return Err(error_response(
+                "0A000",
+                &format!("cannot UPDATE key column \"{col_name}\" in SET"),
+            ));
+        }
+        assigned.insert(col_name.clone(), value.clone());
+        match meta.storage_column_index(col_name) {
+            Some(index) => regular_cells.push((index, value)),
+            None => {
+                return Err(error_response(
+                    "42703",
+                    &format!("column \"{col_name}\" not found in storage schema"),
+                ))
+            }
+        }
+    }
+    // Enforce every FOREIGN KEY on a column this UPDATE assigns, before the write.
+    if let Err((code, message)) =
+        crate::pg_fk::check_child_row(ctx.engine, ctx.schema, meta, &assigned)
+    {
+        return Err(error_response(&code, &message));
+    }
+    let timestamp = dml_timestamp();
+    let key = ferrosa_row_bridge::build_decorated_key(pk_values, &[])
+        .map_err(|error| error_response("22000", &error.to_string()))?;
+    let row = ferrosa_row_bridge::build_row(&regular_cells, ck_values, timestamp, None);
+    Ok(Mutation::new(
+        ctx.ks.to_string(),
+        ctx.table.to_string(),
+        key,
+        vec![row],
+        timestamp,
+    ))
+}
+
+/// Write ONE resolved-row `UPDATE`; `Err` carries the error response(s) to send.
+async fn apply_update_row(
+    ctx: &UpdateTarget<'_>,
+    txn: Option<&mut TxnWriteSet>,
+    row: &ResolvedRow,
+) -> Result<(), Vec<BackendMessage>> {
+    let image = current_image_for_set(row, ctx.upd).map_err(|message| vec![message])?;
+    let mutation = build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
+        .map_err(|message| vec![message])?;
+    apply_or_buffer_silent(ctx.engine, ctx.schema, ctx.mvcc, txn, mutation).await
+}
+
+/// Serve an `UPDATE` whose `WHERE` does not name the storage key: resolve the rows it
+/// names through the declared key's `<table>_pkey` index when it can, otherwise through a
+/// filtering SCAN (logged loudly), and write each resolved row.
+///
+/// FAIL LOUD: an index that cannot be consulted (missing or stale) is an error, never a
+/// silent empty result; a storage or decode failure aborts the whole statement rather
+/// than writing a subset.
+async fn update_rows_by_predicate(
+    ctx: &UpdateTarget<'_>,
+    mut txn: Option<&mut TxnWriteSet>,
+    where_values: &std::collections::HashMap<String, CqlValue>,
+) -> Vec<BackendMessage> {
+    use futures::StreamExt as _;
+
+    let table_id = ferrosa_storage::TableId::new(ctx.ks, ctx.table);
+    let codec = match TableCodec::build(ctx.ks, ctx.table, ctx.schema) {
+        Ok(codec) => codec,
+        Err(error) => {
+            return vec![error_response(
+                "58000",
+                &format!(
+                    "cannot decode {}.{} for the UPDATE: {error}",
+                    ctx.ks, ctx.table
+                ),
+            )]
+        }
+    };
+    let mut written = 0usize;
+    match plan_dml_where(ctx.engine, ctx.meta, ctx.ks, ctx.table, where_values) {
+        WherePlan::Index { index_name, column } => {
+            let rows = match index_rows_for_dml(
+                ctx.engine,
+                &table_id,
+                &index_name,
+                &column,
+                where_values,
+                &codec,
+            ) {
+                Ok(rows) => rows,
+                Err(message) => return vec![message],
+            };
+            for row in &rows {
+                if let Err(messages) = apply_update_row(ctx, txn.as_deref_mut(), row).await {
+                    return messages;
+                }
+                written += 1;
+            }
+        }
+        WherePlan::Scan => {
+            warn_scan_fallback("UPDATE", ctx.ks, ctx.table, where_values);
+            let mut stream = ctx.engine.range_iter(&table_id, None, None);
+            while let Some(item) = stream.next().await {
+                let partition = match item {
+                    Ok(partition) => partition,
+                    Err(error) => {
+                        return vec![error_response(
+                            "58000",
+                            &format!(
+                                "UPDATE of {}.{} failed during the scan: {error}",
+                                ctx.ks, ctx.table
+                            ),
+                        )]
+                    }
+                };
+                let rows = match candidate_rows_from_partition(&partition, &codec, where_values) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        return vec![error_response(
+                            "58000",
+                            &format!(
+                                "UPDATE of {}.{} could not decode a scanned row: {error}",
+                                ctx.ks, ctx.table
+                            ),
+                        )]
+                    }
+                };
+                for row in &rows {
+                    if let Err(messages) = apply_update_row(ctx, txn.as_deref_mut(), row).await {
+                        return messages;
+                    }
+                    written += 1;
+                }
+            }
+        }
+    }
+    complete_tag("UPDATE", written)
+}
+
+/// Build the storage mutation a resolved-row `DELETE` writes for ONE row.
+fn build_delete_mutation(
+    ks: &str,
+    table: &str,
+    pk_values: &[CqlValue],
+    ck_values: &[CqlValue],
+) -> Result<Mutation, BackendMessage> {
+    let timestamp = dml_timestamp();
+    let key = ferrosa_row_bridge::build_decorated_key(pk_values, &[])
+        .map_err(|error| error_response("22000", &error.to_string()))?;
+    // Empty delete-columns => row-level tombstone.
+    let row = ferrosa_row_bridge::build_delete_row(&[], ck_values, timestamp);
+    Ok(Mutation::new(
+        ks.to_string(),
+        table.to_string(),
+        key,
+        vec![row],
+        timestamp,
+    ))
+}
+
+/// Write ONE resolved-row `DELETE`; `Err` carries the error response(s) to send.
+async fn apply_delete_row(
+    ctx: &DeleteTarget<'_>,
+    txn: Option<&mut TxnWriteSet>,
+    row: &ResolvedRow,
+) -> Result<(), Vec<BackendMessage>> {
+    // Parent-side enforcement: refuse while any child still references this row.
+    if let Err((code, message)) =
+        crate::pg_fk::check_parent_row(ctx.engine, ctx.snapshot, ctx.meta, &row.values)
+    {
+        return Err(vec![error_response(&code, &message)]);
+    }
+    let mutation = build_delete_mutation(ctx.ks, ctx.table, &row.pk_values, &row.ck_values)
+        .map_err(|message| vec![message])?;
+    apply_or_buffer_silent(ctx.engine, ctx.schema, ctx.mvcc, txn, mutation).await
+}
+
+/// Serve a `DELETE` whose `WHERE` does not name the storage key: resolve the rows it
+/// names through the declared key's `<table>_pkey` index when it can, otherwise through a
+/// filtering SCAN (logged loudly), and delete each resolved row.
+async fn delete_rows_by_predicate(
+    ctx: &DeleteTarget<'_>,
+    mut txn: Option<&mut TxnWriteSet>,
+    where_values: &std::collections::HashMap<String, CqlValue>,
+) -> Vec<BackendMessage> {
+    use futures::StreamExt as _;
+
+    let table_id = ferrosa_storage::TableId::new(ctx.ks, ctx.table);
+    let codec = match TableCodec::build(ctx.ks, ctx.table, ctx.schema) {
+        Ok(codec) => codec,
+        Err(error) => {
+            return vec![error_response(
+                "58000",
+                &format!(
+                    "cannot decode {}.{} for the DELETE: {error}",
+                    ctx.ks, ctx.table
+                ),
+            )]
+        }
+    };
+    let mut written = 0usize;
+    match plan_dml_where(ctx.engine, ctx.meta, ctx.ks, ctx.table, where_values) {
+        WherePlan::Index { index_name, column } => {
+            let rows = match index_rows_for_dml(
+                ctx.engine,
+                &table_id,
+                &index_name,
+                &column,
+                where_values,
+                &codec,
+            ) {
+                Ok(rows) => rows,
+                Err(message) => return vec![message],
+            };
+            for row in &rows {
+                if let Err(messages) = apply_delete_row(ctx, txn.as_deref_mut(), row).await {
+                    return messages;
+                }
+                written += 1;
+            }
+        }
+        WherePlan::Scan => {
+            warn_scan_fallback("DELETE", ctx.ks, ctx.table, where_values);
+            let mut stream = ctx.engine.range_iter(&table_id, None, None);
+            while let Some(item) = stream.next().await {
+                let partition = match item {
+                    Ok(partition) => partition,
+                    Err(error) => {
+                        return vec![error_response(
+                            "58000",
+                            &format!(
+                                "DELETE of {}.{} failed during the scan: {error}",
+                                ctx.ks, ctx.table
+                            ),
+                        )]
+                    }
+                };
+                let rows = match candidate_rows_from_partition(&partition, &codec, where_values) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        return vec![error_response(
+                            "58000",
+                            &format!(
+                                "DELETE of {}.{} could not decode a scanned row: {error}",
+                                ctx.ks, ctx.table
+                            ),
+                        )]
+                    }
+                };
+                for row in &rows {
+                    if let Err(messages) = apply_delete_row(ctx, txn.as_deref_mut(), row).await {
+                        return messages;
+                    }
+                    written += 1;
+                }
+            }
+        }
+    }
+    complete_tag("DELETE", written)
+}
+
+/// Execute an `UPDATE`. The `WHERE` decides which rows are targeted, in one of three
+/// ways:
+///
+/// - it names every **storage-key** column (partition + clustering) — the historical
+///   path — and the `SET` is a blind upsert of that one row;
+/// - it names the **declared** primary key (recorded by `ALTER TABLE ... ADD PRIMARY
+///   KEY`), whose `ADD PRIMARY KEY` built a secondary index named `<table>_pkey` — the
+///   rows are resolved through that index, so `pgbench`'s `UPDATE ... WHERE aid = $1` is
+///   a lookup, not a scan;
+/// - it names neither — no index addresses it — and the statement falls back to a
+///   **filtering scan** that still APPLIES the predicate, logged loudly (user ruling
+///   2026-10-11). A scan never rewrites a row the `WHERE` did not name.
+///
+/// `SET` supplies the regular/static cells. `SET c = c + 1` is a read-modify-write: the
+/// row's current value is read (committed storage with the open transaction's own
+/// buffered writes overlaid, so read-your-own-writes holds) and the arithmetic is
+/// evaluated against it. A constant `SET` reads nothing. Returns
+/// `CommandComplete "UPDATE N"`.
 ///
 /// # NULL semantics (pinned)
 ///
-/// `NULL <op> x` is NULL, exactly as in PostgreSQL, so `SET c = c + 1` on a row
-/// whose `c` is NULL leaves `c` NULL. When the `WHERE` matches no live row, ferrosa
-/// is an upsert: every column reads SQL NULL, so `c = c + 1` writes NULL (PostgreSQL
-/// would have matched no row and written nothing — the documented divergence of an
-/// upsert engine). Neither case arises for pgbench, whose rows always exist with a
-/// non-NULL balance.
+/// `NULL <op> x` is NULL, exactly as in PostgreSQL, so `SET c = c + 1` on a row whose `c`
+/// is NULL leaves `c` NULL. On the storage-key path, a `WHERE` that matches no live row
+/// is still an upsert: every read column is SQL NULL, so `c = c + 1` writes NULL
+/// (PostgreSQL would have matched no row and written nothing — the documented divergence
+/// of an upsert engine). On the index/scan path there is no upsert: a row that does not
+/// exist is simply not written.
 pub(crate) async fn execute_update(
     context: DmlContext<'_>,
     upd: &UpdateStmt,
@@ -3200,11 +3773,14 @@ pub(crate) async fn execute_update(
         }
     };
 
-    // WHERE equality -> key values (must be key columns). Resolved FIRST: an
-    // arithmetic SET needs the key before it can read the row it is updating.
-    let mut key_values: HashMap<String, CqlValue> = HashMap::new();
+    // Resolve every WHERE equality to its CQL value FIRST: an arithmetic SET needs the
+    // key before it can read the row it updates. A WHERE that does not name the storage
+    // key is still ANSWERED — through the declared key's secondary index, or (loudly)
+    // through a filtering scan (user ruling 2026-10-11). Refusing it was the pgbench
+    // blocker: tpcb's `UPDATE ... WHERE aid = $1` names the declared key, not `_sys_ck_`.
+    let mut where_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &upd.where_eq {
-        let (col_meta, _sql_value, value) = match resolve_dml_value(
+        let (_col_meta, _sql_value, value) = match resolve_dml_value(
             meta,
             schema,
             ks,
@@ -3219,17 +3795,26 @@ pub(crate) async fn execute_update(
             Ok(r) => r,
             Err(msg) => return vec![msg],
         };
-        if !matches!(
-            col_meta.kind,
-            ColumnKind::PartitionKey | ColumnKind::Clustering
-        ) {
-            return vec![error_response(
-                "0A000",
-                &format!("UPDATE WHERE supports only key columns; \"{col_name}\" is not a key"),
-            )];
-        }
-        key_values.insert(col_name.clone(), value);
+        where_values.insert(col_name.clone(), value);
     }
+
+    // A WHERE naming every storage-key column identifies exactly one row, as it always
+    // has. Anything else is resolved to its rows — by lookup, or by a scan.
+    if !storage_key_complete(meta, &where_values) {
+        let target = UpdateTarget {
+            engine,
+            schema,
+            mvcc,
+            meta,
+            ks,
+            table,
+            upd,
+            params,
+            jsonb_limits,
+        };
+        return update_rows_by_predicate(&target, txn, &where_values).await;
+    }
+    let key_values = where_values;
 
     let mut pk_values = Vec::with_capacity(meta.partition_key.len());
     for name in &meta.partition_key {
@@ -3281,76 +3866,21 @@ pub(crate) async fn execute_update(
         None
     };
 
-    // SET assignments -> regular/static cells (by storage index).
-    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    // The assigned values, keyed by column, so a FOREIGN KEY column that is being
-    // SET can be re-checked against its parent before the write (a foreign key on a
-    // column the UPDATE does not touch keeps its already-valid old value and needs
-    // no check).
-    let mut assigned: HashMap<String, CqlValue> = HashMap::new();
-    for (col_name, expr) in &upd.assignments {
-        let col_meta = match meta.columns.get(col_name) {
-            Some(c) => c,
-            None => {
-                return vec![error_response(
-                    "42703",
-                    &format!("column \"{col_name}\" of relation \"{table}\" does not exist"),
-                )]
-            }
-        };
-        let cql_type =
-            match ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
-            {
-                Ok(t) => t,
-                Err(e) => return vec![error_response("42704", &e.to_string())],
-            };
-        let sql_value = match eval_set_expr(expr, current.as_ref(), params) {
-            Ok(v) => v,
-            Err(msg) => return vec![msg],
-        };
-        let value = match value_to_cql(&sql_value, &cql_type, jsonb_limits) {
-            Ok(v) => v,
-            Err(msg) => return vec![msg],
-        };
-        if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
-            return vec![error_response(
-                "0A000",
-                &format!("cannot UPDATE key column \"{col_name}\" in SET"),
-            )];
-        }
-        assigned.insert(col_name.clone(), value.clone());
-        match meta.storage_column_index(col_name) {
-            Some(idx) => regular_cells.push((idx, value)),
-            None => {
-                return vec![error_response(
-                    "42703",
-                    &format!("column \"{col_name}\" not found in storage schema"),
-                )]
-            }
-        }
-    }
-
-    // Enforce every FOREIGN KEY on a column this UPDATE assigns, before the write.
-    if let Err((code, message)) = crate::pg_fk::check_child_row(engine, schema, meta, &assigned) {
-        return vec![error_response(&code, &message)];
-    }
-
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
-        Ok(k) => k,
-        Err(e) => return vec![error_response("22000", &e.to_string())],
+    let target = UpdateTarget {
+        engine,
+        schema,
+        mvcc,
+        meta,
+        ks,
+        table,
+        upd,
+        params,
+        jsonb_limits,
     };
-    let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
-    let mutation = Mutation::new(
-        ks.to_string(),
-        table.to_string(),
-        key.clone(),
-        vec![row],
-        timestamp,
-    );
+    let mutation = match build_update_mutation(&target, &pk_values, &ck_values, current.as_ref()) {
+        Ok(mutation) => mutation,
+        Err(msg) => return vec![msg],
+    };
     apply_or_buffer(engine, schema, mvcc, txn, mutation, "UPDATE 1").await
 }
 
@@ -3629,9 +4159,12 @@ pub(crate) async fn execute_delete(
         }
     };
 
-    let mut key_values: HashMap<String, CqlValue> = HashMap::new();
+    // Resolve every WHERE equality to its CQL value. A WHERE that does not name the
+    // storage key is still ANSWERED — through the declared key's secondary index, or
+    // (loudly) through a filtering scan (user ruling 2026-10-11).
+    let mut where_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &del.where_eq {
-        let (col_meta, _sql_value, value) = match resolve_dml_value(
+        let (_col_meta, _sql_value, value) = match resolve_dml_value(
             meta,
             schema,
             ks,
@@ -3646,17 +4179,24 @@ pub(crate) async fn execute_delete(
             Ok(r) => r,
             Err(msg) => return vec![msg],
         };
-        if !matches!(
-            col_meta.kind,
-            ColumnKind::PartitionKey | ColumnKind::Clustering
-        ) {
-            return vec![error_response(
-                "0A000",
-                &format!("DELETE WHERE supports only key columns; \"{col_name}\" is not a key"),
-            )];
-        }
-        key_values.insert(col_name.clone(), value);
+        where_values.insert(col_name.clone(), value);
     }
+
+    // A WHERE naming every storage-key column identifies exactly one row, as it always
+    // has. Anything else is resolved to its rows — by lookup, or by a scan.
+    if !storage_key_complete(meta, &where_values) {
+        let target = DeleteTarget {
+            engine,
+            schema,
+            mvcc,
+            meta,
+            snapshot: &snap,
+            ks,
+            table,
+        };
+        return delete_rows_by_predicate(&target, txn, &where_values).await;
+    }
+    let key_values = where_values;
 
     // Parent-side enforcement: refuse the DELETE while any child still references this row. The
     // probe is an index lookup on the child's FK index (built by `ADD FOREIGN KEY`), and it is a
@@ -3690,23 +4230,10 @@ pub(crate) async fn execute_delete(
         }
     }
 
-    let timestamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    let key = match ferrosa_row_bridge::build_decorated_key(&pk_values, &[]) {
-        Ok(k) => k,
-        Err(e) => return vec![error_response("22000", &e.to_string())],
+    let mutation = match build_delete_mutation(ks, table, &pk_values, &ck_values) {
+        Ok(mutation) => mutation,
+        Err(msg) => return vec![msg],
     };
-    // Empty delete-columns => row-level tombstone.
-    let row = ferrosa_row_bridge::build_delete_row(&[], &ck_values, timestamp);
-    let mutation = Mutation::new(
-        ks.to_string(),
-        table.to_string(),
-        key.clone(),
-        vec![row],
-        timestamp,
-    );
     apply_or_buffer(engine, schema, mvcc, txn, mutation, "DELETE 1").await
 }
 

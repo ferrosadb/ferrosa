@@ -306,6 +306,31 @@ impl TableCodec {
             storage_to_table: storage_to_table_indices(meta),
         })
     }
+
+    /// Declared column names, in declared order.
+    pub(crate) fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Parsed CQL type per declared column, in declared order.
+    pub(crate) fn types(&self) -> &[CqlType] {
+        &self.types
+    }
+
+    /// Declared-index positions of the partition key, in key order.
+    pub(crate) fn pk(&self) -> &[usize] {
+        &self.pk
+    }
+
+    /// Declared-index positions of the clustering key, in clustering order.
+    pub(crate) fn ck(&self) -> &[usize] {
+        &self.ck
+    }
+
+    /// Storage ordinal -> declared-index map for regular/static columns.
+    pub(crate) fn storage_to_table(&self) -> &[usize] {
+        &self.storage_to_table
+    }
 }
 
 /// How many decoded rows may sit between the async producer and the sync

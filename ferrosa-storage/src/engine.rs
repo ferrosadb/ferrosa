@@ -10195,6 +10195,25 @@ impl StorageEngine {
         Ok(found)
     }
 
+    /// Visit every partition a secondary-index result names, by RAW encoded key bytes.
+    ///
+    /// The multi-partition sibling of [`Self::read_by_index_exists`]: the same
+    /// `ferrosa-index`-free convenience for a caller that holds only the encoded value
+    /// bytes (a front end that must enumerate the rows an indexed value reaches, not
+    /// merely test for one). The visitor runs in row order and may stop early. A missing
+    /// or stale index is refused loudly by [`Self::read_by_index_each_after`] — it never
+    /// answers "no rows" for an index it could not consult.
+    pub fn read_by_index_each_bytes(
+        &self,
+        table_id: &TableId,
+        index_name: &str,
+        key_bytes: &[u8],
+        visitor: &mut dyn FnMut(Partition) -> std::ops::ControlFlow<()>,
+    ) -> ferrosa_common::Result<()> {
+        let key = ferrosa_index::IndexKey(key_bytes.to_vec());
+        self.read_by_index_each(table_id, index_name, &key, visitor)
+    }
+
     /// Declare an ordered (BTree) secondary index over the column at `column_position`.
     ///
     /// The declaration half of the pair whose read half is [`Self::read_by_index_exists`]: a

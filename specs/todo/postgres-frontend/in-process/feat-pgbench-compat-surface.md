@@ -182,21 +182,37 @@ unchanged) and carry its hidden-ness **in the Postgres front end by a reserved n
 INSERT arity all filter it in one place, and no schema-metadata change is needed.
 Only if CQL clients must also not see it does the metadata field become necessary.
 
-**Status 2026-10-11: this is BUILD, not to-build — the paragraph that used to sit here was
-stale.** The column synthesis exists (`ferrosa-common/src/timeuuid.rs`: `_sys_ck_`, a v1
-TimeUUID, with `is_reserved_column_name`), `AddPrimaryKey(Vec<String>)` exists in the AST
-(`ferrosa-sql/src/ast.rs:207`), and `ALTER … ADD PRIMARY KEY` is parsed, recorded AND indexed:
-`execute_add_primary_key` (`ferrosa-postgres/src/ddl.rs:302`) stores the declared key as
-`pg_key::PRIMARY_KEY_EXTENSION`/`encode(columns)` and builds a **secondary index over it when
-that key is not the storage key** (ddl.rs:159-163). The live init proves it end-to-end —
-`pgbench -i`'s "creating primary keys…" phase succeeds on the bench cluster.
+**Status 2026-10-11 (later, corrected): the gap is bigger than the predicate — it is the whole
+read path that is missing.** The column synthesis exists (`ferrosa-common/src/timeuuid.rs`:
+`_sys_ck_`, a v1 TimeUUID, with `is_reserved_column_name`), `AddPrimaryKey(Vec<String>)` exists in
+the AST (`ferrosa-sql/src/ast.rs:207`), and `ALTER … ADD PRIMARY KEY` is parsed, recorded AND
+indexed: `execute_add_primary_key` (`ferrosa-postgres/src/ddl.rs:302`) stores the declared key as
+`pg_key::PRIMARY_KEY_EXTENSION`/`encode(columns)` and builds the **`{table}_pkey`** secondary index
+over it when that key is not the storage key (ddl.rs:343-346). The live init proves the machinery
+works — `pgbench -i`'s "creating primary keys…" phase succeeds on the bench cluster.
 
-What is actually missing is ONE consumer: the UPDATE/DELETE gate
-(`ferrosa-postgres/src/query.rs:3222-3230`, DELETE twin at `:3652`) matches only
-`ColumnKind::PartitionKey | Clustering` — i.e. the STORAGE key — so a WHERE on the *declared*
-key is refused even though the index for it exists. `crate::pg_key::of(&meta)` is the predicate
-it should consult, and the row-find should go through the secondary index that ADD PRIMARY KEY
-already built. Scoped as t_c83ed1f2.
+What is missing is any **reader** of that index. `ferrosa-postgres/src/query.rs` contains ZERO
+references to `_pkey` and ZERO to `pg_key::of`, so the declared key cannot be resolved by index
+anywhere at runtime. Consequences, all from the same root: the UPDATE/DELETE gate
+(`query.rs:3222-3230`, DELETE twin `:3652`) refuses the WHERE outright (`0A000 UPDATE WHERE supports
+only key columns; "aid" is not a key` — reproduced live on the bench cluster and now in-process by
+`update_and_select_by_a_primary_key_added_by_alter_match_the_row_they_name` in
+`ferrosa-postgres/src/server.rs`), and tpcb command 1's `SELECT … WHERE aid = ?` has no index to use
+either.
+
+An earlier draft of this paragraph claimed the gap was "ONE consumer" — the gate consulting
+`pg_key::of`. That was wrong in scope: consulting the declared key without an index read would trade
+a loud `0A000` for a silent full-table rewrite, which is exactly the outcome the item's own decision
+section forbids. **The shape to copy already exists in the repo**, at `ddl.rs:449-452` (the FK child
+check): *"a point read when it is the storage key, otherwise the `<parent>_pkey` secondary index. A
+non-key column would need a per-check scan, which is not a lookup and is refused by name rather than
+recorded."* The fix is to resolve the declared key through `{table}_pkey` into the storage key, then
+let the existing DML path run unchanged — never to widen the gate. Scoped as t_c83ed1f2 (the read
+half also touches t_6fa292c5).
+
+Fixture note for the green: the recorded extension is the **bare column name** (query.rs:5813-5816
+asserts `Some(&"v".to_string())`), not an encoded form, so a test fixture must set the extension to
+`"aid"` rather than `pg_key::encode([...])`.
 
 ### Seeing the system columns: PG's own model beats a bespoke options table
 
