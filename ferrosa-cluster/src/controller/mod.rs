@@ -161,6 +161,39 @@ impl Default for ContentionMetrics {
     }
 }
 
+/// Boot-state consensus gate (2026-10-10 outage hardening).
+///
+/// The internode RPC listener binds *before* the boot-time object-store work
+/// (`validate_object_store_access` / `probe_s3_cas` / `replay_pending_uploads` /
+/// `bootstrap_from_s3`), so a node becomes reachable on the internode lane in a
+/// bounded time even when the object store is slow or black-holed. This gate is
+/// what keeps that reordering from sacrificing correctness: consensus (starting
+/// Raft) must not begin until the node holds the state it is required to hold.
+///
+/// `main` arms the gate ([`ModeController::defer_consensus_until_boot_state`])
+/// before the listener binds and opens it
+/// ([`ModeController::mark_boot_state_loaded`]) once the object-store boot work
+/// has completed. So the ordering the old code enforced by *blocking the
+/// listener* — "consensus starts only after the object-store boot work" — is
+/// preserved, while *reachability* is decoupled from object-store health.
+///
+/// Default-**open** (`loaded = true`): a controller that is never armed behaves
+/// exactly as before, so unit tests and any non-boot construction are unchanged.
+pub(super) struct ConsensusBootGate {
+    loaded: AtomicBool,
+    /// A transition requested while the gate was closed, re-driven when it opens.
+    deferred: Mutex<Option<Vec<(Uuid, SocketAddr)>>>,
+}
+
+impl Default for ConsensusBootGate {
+    fn default() -> Self {
+        Self {
+            loaded: AtomicBool::new(true),
+            deferred: Mutex::new(None),
+        }
+    }
+}
+
 /// Manages deployment mode transitions at runtime.
 ///
 /// Created at startup with standalone mode. When peers connect/disconnect,
@@ -312,6 +345,9 @@ pub struct ModeController {
     /// True while a departure from standalone is being refused because jsonb
     /// columns exist (T-300). Only the edges are logged: refused, recovered.
     pub(super) jsonb_gate_refusing: AtomicBool,
+    /// Boot-state consensus gate — consensus must not start until the node's
+    /// required state is loaded. See [`ConsensusBootGate`]. Default-open.
+    pub(super) consensus_boot_gate: ConsensusBootGate,
 }
 
 /// Handles returned from ModeController::new() for wiring into SharedState.
@@ -489,6 +525,7 @@ impl ModeController {
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
             jsonb_gate_refusing: AtomicBool::new(false),
+            consensus_boot_gate: ConsensusBootGate::default(),
         });
 
         let handles = ModeControllerHandles {
@@ -610,6 +647,7 @@ impl ModeController {
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
             jsonb_gate_refusing: AtomicBool::new(false),
+            consensus_boot_gate: ConsensusBootGate::default(),
         })
     }
 
@@ -683,6 +721,7 @@ impl ModeController {
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
             jsonb_gate_refusing: AtomicBool::new(false),
+            consensus_boot_gate: ConsensusBootGate::default(),
         })
     }
 
@@ -1047,6 +1086,99 @@ impl ModeController {
     /// Why this node must not start Raft, if it must not (t_47bbeb66).
     pub fn raft_start_refusal(&self) -> Option<String> {
         self.dissolution.load().raft_refusal()
+    }
+
+    /// Arm the boot-state consensus gate: no Raft may start until
+    /// [`Self::mark_boot_state_loaded`] is called. `main` calls this before the
+    /// internode listener binds so the listener can come up ahead of the
+    /// boot-time object-store work without letting a peer's reconnect start
+    /// consensus against state the node does not yet hold.
+    pub fn defer_consensus_until_boot_state(&self) {
+        self.consensus_boot_gate
+            .loaded
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the boot-state gate is open (the node holds its required state).
+    /// **Test helper** — production code opens the gate via
+    /// [`Self::mark_boot_state_loaded`].
+    pub fn consensus_boot_ready(&self) -> bool {
+        self.consensus_boot_gate
+            .loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The transition deferred while the boot-state gate was closed, if any.
+    /// **Test helper.** Returns the exact peer list recorded, so a test can
+    /// assert the VALUE preserved, not merely that something was stored.
+    #[cfg(test)]
+    pub(super) fn deferred_boot_transition_for_test(&self) -> Option<Vec<(Uuid, SocketAddr)>> {
+        self.consensus_boot_gate.deferred.lock().clone()
+    }
+
+    /// Open the boot-state gate and re-drive any cluster transition that was
+    /// requested while it was closed.
+    ///
+    /// Called by `main` once the boot-time object-store work has completed (the
+    /// local replay, and for a cold start the object-store restore). Idempotent.
+    /// The deferred transition is re-driven on the Raft runtime so opening the
+    /// gate never blocks the caller.
+    pub fn mark_boot_state_loaded(self: &Arc<Self>) {
+        self.consensus_boot_gate
+            .loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+        let deferred = self.consensus_boot_gate.deferred.lock().take();
+        if let Some(peers) = deferred {
+            tracing::info!(
+                peer_count = peers.len(),
+                "boot state loaded — re-driving the cluster transition deferred while \
+                 the object-store boot work ran"
+            );
+            let this = Arc::clone(self);
+            let run = async move {
+                let _guard = this.transition_guard.lock();
+                // Re-check under the guard, exactly as the peer-event path does:
+                // a peer that reconnected after the gate opened may already have
+                // driven this transition, in which case there is nothing to
+                // re-drive and a second Raft init must not be started.
+                if matches!(this.mode(), DeploymentMode::Cluster) {
+                    tracing::debug!(
+                        "boot-state re-drive skipped: this node already reached Cluster"
+                    );
+                    return;
+                }
+                this.transition_to_cluster(peers);
+            };
+            match self.raft_runtime.get() {
+                Some(rt) => {
+                    rt.spawn(run);
+                }
+                None => {
+                    tokio::spawn(run);
+                }
+            }
+        }
+    }
+
+    /// If the boot-state gate is still closed, record the requested transition
+    /// and return `true` (the caller must not start Raft). Returns `false` when
+    /// the gate is open and the transition may proceed.
+    fn defer_transition_if_boot_loading(&self, peers: &[(Uuid, SocketAddr)]) -> bool {
+        if self
+            .consensus_boot_gate
+            .loaded
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        tracing::warn!(
+            peer_count = peers.len(),
+            "cluster transition requested before boot state is loaded — deferring until the \
+             node holds its required state; the internode lane is up but consensus (Raft) has \
+             not started"
+        );
+        *self.consensus_boot_gate.deferred.lock() = Some(peers.to_vec());
+        true
     }
 
     /// The peers this node currently tracks as connected. **Test helper.**

@@ -520,6 +520,19 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
 - `DeploymentMode` + `ModeController` — the `Standalone → Pair → Forming →
   Cluster` state machine with degraded states; `ClusterStateHolder` dispatches
   `SingleNode` / `Pair` / `Raft` cluster state.
+- **Boot-state consensus gate** (2026-10-10, `ferrosa` FMEA FE-18).
+  `ModeController::defer_consensus_until_boot_state()` /
+  `mark_boot_state_loaded()` let `main` bind the internode listener *before* the
+  boot-time object-store work while keeping `transition_to_cluster` (and
+  `transition_to_forming`) from starting Raft until the node holds its required
+  state. A transition requested while the gate is closed is recorded and
+  re-driven when it opens, so consensus still starts only *after* the
+  object-store work completes — the ordering the old code enforced by blocking
+  the listener — while the node's *reachability* is decoupled from object-store
+  health. Default-**open**: a controller that is never armed behaves as before.
+  Tests: `boot_gate_defers_cluster_transition_until_state_loaded`,
+  `cluster_transition_proceeds_when_boot_gate_is_open`,
+  `mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transition`.
 - `ModeController::expected_cluster_size()` (the operator's
   `FERROSA_EXPECTED_CLUSTER_SIZE` declaration) and `committed_cluster_size()`
   (the membership the node has actually committed to — itself plus the peers it
