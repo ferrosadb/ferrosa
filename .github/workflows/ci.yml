@@ -245,10 +245,22 @@ jobs:
           # compares the apply path's peak live bytes against a multiple of the
           # input size, so it measures the runner's allocator watermarks and the
           # engine's own buffers as much as the decode — it failed this job on an
-          # unchanged tree. It is skipped here and runs in the SAME
+          # unchanged tree. It is excluded here and runs in the SAME
           # `perf-regression` job. Its load-independent replacement — the live
           # entry-sized buffer budget in tests/accord_apply_decode_streaming_budget.rs
           # — stays HERE, on every PR.
+          #
+          # Excluding it takes BOTH forms below, because the runners differ. A
+          # positional `--skip` matches the TEST name, never the binary name, so
+          # the old skip written as the bare binary name filtered NOTHING (the
+          # gate ran 4 tests, 0 skipped, and kept measuring the host). The `-E
+          # 'not binary(...)'` filterset is nextest's whole-binary exclusion. The
+          # `--skip` list still carries that binary's four test NAMES so the
+          # cargo-test lists that cannot express a binary filter
+          # (scripts/pre-push-mirror-ci.sh, nightly-fuzz.yml's fuzz session,
+          # bench-test-runners.sh's libtest arm) exclude the SAME tests — and
+          # tests/ci/test_cluster_data_loss_workflow.py's enforced ci-⇔-mirror
+          # `--skip` set equality holds.
           # `--skip ::slow::` excludes the tests under the `slow-tests` feature
           # (compiled here under --all-features, but too slow for per-PR CI);
           # they run nightly in nightly-slow-tests.yml.
@@ -270,8 +282,12 @@ jobs:
           # values in both runners. The `--` separator is the only difference.
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+            -E 'not binary(accord_apply_decode_residency)' \
             -- --skip ::slow:: --skip accord::perf \
-               --skip accord_apply_decode_residency \
+               --skip apply_writeset_peak_stays_within_the_input_size \
+               --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
+               --skip a_materialized_decoded_batch_trips_the_residency_guard \
+               --skip a_retained_input_payload_trips_the_residency_guard \
                --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                --skip dep_wait_ordering \
