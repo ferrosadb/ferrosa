@@ -22,7 +22,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Memtable** — sharded write buffer behind the `Memtable` trait. Default build
   uses `SkipListMemtable` (crossbeam skiplist, feature `skiplist-memtable`);
   `ShardedBTreeMemtable` (64 `parking_lot::RwLock` shards) is the alternative.
-  Per-partition merge-on-write (cell-level LWW, tombstone merge). Two
+  Per-partition merge-on-write (cell-level LWW, tombstone merge). A write's
+  size accounting comes from the rows the merge touched, never a walk of the
+  whole partition, so a write costs the same at any partition size
+  (`tests/memtable_write_cost_scale.rs`, t_32b6670b). Two
   empty-clustering marker rows carry partition-level state through the row
   write path (and so the commit log and `Mutation`): no cells + non-LIVE
   deletion is the partition deletion, and cells on a clustered table is the
