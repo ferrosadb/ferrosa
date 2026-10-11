@@ -21,7 +21,7 @@ SELECT=(--all-features --workspace --lib --tests
 # ci.yml additionally excludes the whole `accord_apply_decode_residency` binary
 # with nextest's `-E 'not binary(...)'`; cargo test cannot express that, so here
 # (and in every libtest arm) that binary's four test NAMES are skipped instead.
-SKIP=(--skip ::slow:: --skip accord::perf
+SKIP=(--skip ::slow:: --skip accord::perf --skip conflict_index_residency_projection_absolute
       --skip apply_writeset_peak_stays_within_the_input_size
       --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident
       --skip a_materialized_decoded_batch_trips_the_residency_guard

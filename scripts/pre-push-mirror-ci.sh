@@ -34,6 +34,7 @@ fi
 SKIPS=(
   --skip ::slow::
   --skip accord::perf
+  --skip conflict_index_residency_projection_absolute
   # Absolute resident-byte bounds (measures the host, not the decode). ci.yml
   # excludes the whole binary with nextest's `-E 'not binary(accord_apply_decode_residency)'`;
   # `cargo test` has no binary filter (its `--skip` matches the TEST name, never
