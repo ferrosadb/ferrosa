@@ -162,6 +162,34 @@ PostgreSQL-side fixture already uses.
 recording `MockTransactionCommitter`, then write the red - a `LET` block whose bound read must feed
 the value that reaches the committer.
 
+### CORRECTION: the committer is NOT installable — the fixture must run CLUSTER mode (2026-10-11)
+
+My previous note named `AccordAccess::fixed(committer)` as the seam. **That is wrong for this path**
+and I am retracting it: it is the PostgreSQL front-end seam. On the session/CQL side the committer is
+not stored anywhere — `SessionCore::accord_transaction_committer()`
+(`ferrosa-session/src/lib.rs:112`) **builds it on demand** from the live `write_path` + `peer_manager`
++ `accord_clock`, deliberately, so every front-end obtains it the same way and nothing is threaded
+through `SharedState`.
+
+Consequences for the I2 red:
+
+1. **A recording mock cannot be installed here.** `MockTransactionCommitter` is reachable in
+   `ferrosa-session`'s type space but nothing stores it; the accessor ignores any such field because
+   there is none.
+2. **The fixture must run `DeploymentMode::Cluster`** — `ferrosa-session`'s own
+   `core(DeploymentMode::Cluster, true)` shows the shape, and that accessor's tests
+   (`cluster_node_still_yields_an_accord_committer`) assert a real committer is produced. The CQL
+   fixture's `setup()` is Standalone, which is exactly why the sibling test is named
+   `..._fails_commit_in_standalone`.
+3. **So the assertion must be the EFFECT, not a recording**: after the block commits, read the row
+   back and assert the value. That is a stronger assertion than the recorded-call version would have
+   been, and it is the same shape I3 uses — the difference is only the level (local cluster-mode
+   process vs live cross-host cluster).
+
+This also matches the requester's requirement directly: the CQL front end must run the same
+cluster-mode commit path the PostgreSQL front end does, so that transactions behave the same way from
+either front end.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
