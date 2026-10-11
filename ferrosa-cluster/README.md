@@ -61,14 +61,18 @@ never becomes a per-entry copy; small write-sets stay wholly resident. See FMEA
 
 When the write-set is the **same for every peer** — no per-key resolver, or every
 key resolving to the same replica set (the `RF == node count` shape) — the payload
-is built and CAPNP-encoded ONCE (`borrowed_write_set_entries` borrows `(key, mutation)`
+is built and CAPNP-encoded ONCE (`encode_peer_apply_frame` borrows `(key, mutation)`
 slices straight out of the resident write-set, or out of the spill's mmap, so not even
 one clone is materialized) and the resulting frame is handed to each peer by refcount.
 The Apply frame is capnproto (`encode_accord_apply_v2`), not bincode; a peer that has
 not advertised `CAP_ACCORD_CAPNP` still receives the legacy bincode frame. That removes N-1 write-set copies, N-1 staged-payload re-reads and N-1
 whole-frame serializations from Apply. A genuinely per-peer write-set (a token-aware
 ring with `RF < node count`) still gets its OWN scoped frame and never a shared one —
-sharing a frame across scopes would put a key on a peer that does not own it. The
+sharing a frame across scopes would put a key on a peer that does not own it. Every
+peer's frame — shared or scoped — is built in its OWN task, so one peer's
+compression and transfer overlap the next peer's instead of running one after another;
+the fan-out still holds at most `APPLY_FANOUT_WINDOW` frames in flight, so resident
+payload bytes stay bounded the same way. The
 `FERROSA_PG_COMMIT_PROFILE` fan-out line reports `frame_bytes` (the largest frame on
 the wire, which is what the Data-lane wait bound is spent on) and `shared_frame`.
 
@@ -127,7 +131,7 @@ regions laid end to end:
   no length field is required and the capnp word-padding costs nothing extra.
 
 **Coordinator — no copy into the arena.** `encode_accord_apply_v2_region` walks the
-borrowed `(key, mutation)` slices from `borrowed_write_set_entries` (each `mutation`
+borrowed `(key, mutation)` slices from `encode_peer_apply_frame` (each `mutation`
 is a slice of the spill's mmap, `WriteSetSpill::entry`) and appends them to the region
 buffer. Each entry's bytes are copied exactly ONCE, as a bulk `extend_from_slice`,
 never into a capnp struct; the header holds only the index. The whole body
