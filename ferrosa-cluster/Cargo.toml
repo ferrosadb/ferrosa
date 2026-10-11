@@ -72,10 +72,14 @@ live-infra-tests = []
 # Absolute-measurement test binaries. Gated so a plain `cargo test -p
 # ferrosa-cluster` never runs a measurement of the host, exactly like the
 # `accord::perf` benchmarks the `perf-tests` feature covers above. Under
-# `--all-features` the gate is open, so ci.yml additionally skips each of these
-# BY NAME (`Run tests`) and nightly-fuzz.yml's `perf-regression` job runs them
-# where the machine is not competing with the rest of the PR gate. Add a new
-# absolute assertion to BOTH lists.
+# `--all-features` the gate is open, so ci.yml's `Run tests` additionally
+# excludes each of these: the nextest arm by whole binary (`-E 'not
+# binary(<name>)'`), the cargo-test arms by their test names, because a
+# positional `--skip` matches the TEST name and never the binary name.
+# nightly-fuzz.yml's `perf-regression` job runs them where the machine is not
+# competing with the rest of the PR gate. Adding a new absolute assertion to
+# this binary: the nextest `-E` already covers it, but add its name to the
+# `--skip` lists too so the cargo-test mirrors exclude it.
 #
 # `tests/accord_apply_decode_residency.rs`: the apply path's peak live bytes
 # against a multiple of the input size (input residency, decoded-output

@@ -897,8 +897,10 @@ impl StorageApplier for EngineStorageApplier {
     /// live AT ONCE (an allocation count, not a byte watermark or a wall clock), so it
     /// cannot measure the runner, and asserts the apply holds at most one per input
     /// entry with a non-vacuous negative control. The resident-byte bounds above are
-    /// ABSOLUTE, so they moved to nightly-fuzz.yml's `perf-regression` job and ci.yml
-    /// skips them by name (`--skip accord_apply_decode_residency`).
+    /// ABSOLUTE, so they moved to nightly-fuzz.yml's `perf-regression` job; ci.yml
+    /// excludes that whole binary (nextest `-E 'not binary(accord_apply_decode_residency)'`,
+    /// plus its four test names in the cargo-test mirrors' `--skip` lists — a
+    /// positional `--skip` matches the TEST name, never the binary name).
     ///
     /// The proof needs a real write-set and a real commit-log flush, so it costs
     /// seconds — which is why it lives in that integration test and NOT here. A

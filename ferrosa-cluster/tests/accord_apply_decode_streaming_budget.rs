@@ -6,8 +6,10 @@
 //! contended runner moves the allocator's watermark and the engine's own buffers —
 //! and the two input-residency tests were observed failing the per-PR
 //! `Test + Coverage` job on a tree whose code had not changed. They now run nightly
-//! in `nightly-fuzz.yml`'s `perf-regression` job, and `ci.yml` skips that binary by
-//! name (`--skip accord_apply_decode_residency`).
+//! in `nightly-fuzz.yml`'s `perf-regression` job, and `ci.yml` excludes that whole
+//! binary (nextest `-E 'not binary(accord_apply_decode_residency)'`, plus its four
+//! test names in the cargo-test mirrors' `--skip` lists — a positional `--skip`
+//! matches the TEST name, never the binary name).
 //!
 //! The claim those bounds are a proxy for IS load-independent, so this file asserts
 //! it directly:
