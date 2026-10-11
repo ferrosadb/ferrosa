@@ -2493,7 +2493,8 @@ where
     let try_compress = !cfg.is_none() && region_len > 0 && region_len >= cfg.min_bytes;
     let (compression, block_bytes, compressed) = if try_compress {
         // A codec needs the region contiguous to block-compress it, so this path
-        // still materializes it once (compression is opt-in and off by default).
+        // still materializes it once (the codec is operator-tunable via
+        // `FERROSA_ACCORD_COMPRESSION`; the shipped default is `zstd`).
         let mut region: Vec<u8> = Vec::with_capacity(region_len);
         for entry in &entries {
             region.extend_from_slice(entry);
