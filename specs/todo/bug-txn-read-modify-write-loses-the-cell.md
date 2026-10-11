@@ -367,6 +367,41 @@ leading hypothesis — stated as a hypothesis, not as a measurement.
 `scripts/` (`scripts/txn-iso-probe.sh` currently carries the mislabelled V1/V2). Until that lands, any
 run of the old probe's V1/V2 lines is not evidence in either direction.
 
+### RT-2 FIX — the design, the ONE decision it needs, and the exact first step (2026-10-11)
+
+The fix is small at its core, because the machinery already exists. `State.versions` is a per-ROW
+`BTreeMap<commit_seq, Row>` (`ferrosa-postgres/src/mvcc.rs`), already pruned by `prune_versions`. So
+the row-granular predicate is:
+
+    conflict  <=>  some row in THIS transaction's read-set has a latest version sequence
+                   (state.versions[key] or state.distributed_versions[key], .keys().next_back())
+                   greater than snapshot.read_ts
+
+Today's predicate compares the TABLE instead — `table_epochs: HashMap<String, u64>`, bumped on every
+apply — which is exactly why disjoint rows collide.
+
+**The one decision it needs: what a SCAN's read-set is.** A point read knows its key; a scan does not
+enumerate its rows. Dropping the table-level check outright would silently LOSE phantom protection (a
+row inserted into a scanned range must still conflict). PostgreSQL answers this with predicate/SIREAD
+locks. The real options are:
+
+  (a) row-level for point reads, table-level RETAINED for scans — fixes this red, keeps the false
+      conflict for scan readers (an honest increment with a named residual);
+  (b) SIREAD-style range predicates — correct, and feature-sized;
+  (c) row-level only — fast, and silently drops phantom protection.
+
+This is an unmade DESIGN decision, not a fixture gap, so it is not something to guess at.
+
+**First step for whoever lands it** (six call sites, all listed so no recon is needed): change the
+read-set to carry rows — `txn_read_tables: HashSet<String>` at `extended.rs:94`, filled at
+`server.rs:715-722`, taken at `server.rs:883`, consumed at `query.rs:1789/1796` and
+`mvcc.rs:460/463/524/528` — to also carry the `RowKey` of each point read; apply the predicate above;
+and keep the table check for scans only, per whichever option is chosen.
+
+The red `transactions_on_disjoint_keys_do_not_conflict` is parked as `rt2-disjoint-keys.patch` and
+turns GREEN under (a) or (b). Under (a) it is green while scan-readers still collide — say so when it
+lands.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
