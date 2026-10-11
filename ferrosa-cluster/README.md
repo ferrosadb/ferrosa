@@ -313,12 +313,17 @@ build; the codec's own cost is its delta against `none`.
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.
   Both detectors are pure predicates (`burst_storm`, `rolling_window_storm`) and
-  both take `has_leader`: suppression exists so a LIVE leader can catch a
-  divergent follower up, so the guard never fires while `metrics.current_leader`
-  is `None`. A leaderless node is *always* a `Candidate` with a stalled log, so
-  without that gate every node in a leaderless cluster mutes its own elections at
-  the same instant and the guard holds the outage open instead of shortening it.
-  Pinned by `raft::election_guard::tests`.
+  both gate on `leader_recently` — whether this node observed a leader within
+  `LEADER_CONTACT_WINDOW_MS` (60 s = `STORM_SUPPRESS_MS`), seeded at guard start
+  (`leader_contact_is_recent`). Suppression exists so a LIVE leader can catch a
+  divergent follower up, but `metrics.current_leader` is `None` both in a
+  leaderless cluster AND on a divergent follower isolated from a live leader, so it
+  cannot gate the guard directly: gating on it (the first fix, `736fb0b4`) silenced
+  the detectors in the very case they exist for. The only node-local separator is
+  the *age* of the last leader observation — a divergent follower saw its leader
+  seconds ago → suppress; a leaderless outage has seen none for minutes → do not,
+  so the cluster re-elects and the 2026-10-11 outage cannot recur. Pinned by
+  `raft::election_guard::tests` and `tests/raft_election_storm.rs`.
 - `consensus_metrics.rs` — Prometheus surface for Raft liveness:
   `ferrosa_raft_current_term` / `_is_leader` / `_has_leader` (fed by
   `run_consensus_metrics_poller`, a per-cluster-node task that derives leadership
@@ -520,6 +525,19 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
 - `DeploymentMode` + `ModeController` — the `Standalone → Pair → Forming →
   Cluster` state machine with degraded states; `ClusterStateHolder` dispatches
   `SingleNode` / `Pair` / `Raft` cluster state.
+- **Boot-state consensus gate** (2026-10-10, `ferrosa` FMEA FE-18).
+  `ModeController::defer_consensus_until_boot_state()` /
+  `mark_boot_state_loaded()` let `main` bind the internode listener *before* the
+  boot-time object-store work while keeping `transition_to_cluster` (and
+  `transition_to_forming`) from starting Raft until the node holds its required
+  state. A transition requested while the gate is closed is recorded and
+  re-driven when it opens, so consensus still starts only *after* the
+  object-store work completes — the ordering the old code enforced by blocking
+  the listener — while the node's *reachability* is decoupled from object-store
+  health. Default-**open**: a controller that is never armed behaves as before.
+  Tests: `boot_gate_defers_cluster_transition_until_state_loaded`,
+  `cluster_transition_proceeds_when_boot_gate_is_open`,
+  `mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transition`.
 - `ModeController::expected_cluster_size()` (the operator's
   `FERROSA_EXPECTED_CLUSTER_SIZE` declaration) and `committed_cluster_size()`
   (the membership the node has actually committed to — itself plus the peers it

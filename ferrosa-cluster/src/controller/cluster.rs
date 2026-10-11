@@ -815,6 +815,12 @@ impl ModeController {
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
     pub(super) fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // Boot-state gate: must precede `try_transition_mode(Forming)` so a
+        // deferred transition never leaves the node labelled Forming with no
+        // Raft behind it. See [`ModeController::defer_consensus_until_boot_state`].
+        if self.defer_transition_if_boot_loading(&peers) {
+            return;
+        }
         if self.peer_manager.load().is_none() {
             tracing::error!("cannot transition to forming: peer_manager not set");
             return;
@@ -867,6 +873,14 @@ impl ModeController {
         // old group beside the pair.
         if let Some(reason) = self.raft_start_refusal() {
             tracing::error!(%reason, "refusing to start Raft");
+            return;
+        }
+        // Boot-state gate: the internode listener binds before the boot-time
+        // object-store work, so a peer can reconnect while that work is still
+        // running. Do not start Raft (elections) until the node holds the state
+        // it is required to hold; the request is re-driven once boot completes.
+        // See [`ModeController::defer_consensus_until_boot_state`].
+        if self.defer_transition_if_boot_loading(&peers) {
             return;
         }
         // `peers` are internode addresses as tracked in `connected_peers`: the

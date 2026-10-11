@@ -1578,6 +1578,11 @@ async fn bootstrap_from_s3(
     // so register_table() finds them and opens readers.
     let snap = schema.snapshot();
     let mut downloaded_total = 0usize;
+    // A partial bootstrap must be LOUD and must not be reported as success: a
+    // table whose SSTables failed to download must not be registered as if it
+    // held its data (a silently-empty table serves wrong results). Collect the
+    // failures and fail the whole bootstrap below, naming them.
+    let mut failed_tables: Vec<String> = Vec::new();
     for ((_ks, _tbl), table_meta) in &snap.tables {
         if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
             continue;
@@ -1594,6 +1599,11 @@ async fn bootstrap_from_s3(
                     ks = %table_meta.keyspace,
                     "failed to download SSTables from S3: {e}"
                 );
+                failed_tables.push(format!(
+                    "{}.{} (download: {e})",
+                    table_meta.keyspace, table_meta.name
+                ));
+                continue;
             }
         }
     }
@@ -1603,6 +1613,13 @@ async fn bootstrap_from_s3(
         if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
             continue;
         }
+        if failed_tables
+            .iter()
+            .any(|f| f.starts_with(&format!("{}.{} (", table_meta.keyspace, table_meta.name)))
+        {
+            // Do not register a table whose data did not come down.
+            continue;
+        }
         let storage_schema = table_meta.to_storage_schema();
         if let Err(e) = storage.register_table(storage_schema) {
             tracing::warn!(
@@ -1610,7 +1627,36 @@ async fn bootstrap_from_s3(
                 ks = %table_meta.keyspace,
                 "failed to register table from S3 bootstrap: {e}"
             );
+            failed_tables.push(format!(
+                "{}.{} (register: {e})",
+                table_meta.keyspace, table_meta.name
+            ));
         }
+    }
+
+    if !failed_tables.is_empty() {
+        // Loud and terminal for this bootstrap: the node must not be told the
+        // restore succeeded. The caller treats an error as "starting fresh" and
+        // does NOT persist the schema, so a later restart retries.
+        tracing::error!(
+            ks_count,
+            table_count,
+            sstable_count,
+            downloaded_total,
+            failed = failed_tables.len(),
+            failed_tables = ?failed_tables,
+            "S3 bootstrap INCOMPLETE: {} of {} tables failed to restore; their data is \
+             NOT on this node. Reporting the bootstrap as failed.",
+            failed_tables.len(),
+            table_count,
+        );
+        return Err(format!(
+            "S3 bootstrap restored only {}/{} tables; failed: {}",
+            table_count - failed_tables.len(),
+            table_count,
+            failed_tables.join(", ")
+        )
+        .into());
     }
 
     tracing::info!(
@@ -2164,18 +2210,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ferrosa_storage::StorageEngine::new(storage_config, Some(&storage_upload_handle))?;
         (engine, Vec::new())
     };
-    // Verify the S3 bucket is reachable and writable. With FERROSA_S3_REQUIRED an
-    // access failure (bad credentials, wrong bucket, no route) stops startup
-    // instead of surfacing later as upload warnings.
+    // Object-store access validation and the CAS probe used to be awaited here,
+    // before the internode listener bound. A slow or black-holed object store
+    // then held a restarting node off the internode lane for up to
+    // FERROSA_S3_REQUEST_TIMEOUT_SECS (default 900 s) — which turned a brief
+    // leaderless window into the 2026-10-10 35-minute outage (t_boot_lane).
+    //
+    // The listener now binds first (below), the object-store work runs after it,
+    // and the boot-state consensus gate keeps Raft from starting until that work
+    // completes. `FERROSA_S3_REQUIRED=true` still fails fast here: it is an
+    // explicit operator opt-in that S3 be healthy for THIS node, in which case
+    // coming up is the wrong outcome.
     let s3_required = ferrosa_storage::upload::config::s3_required_from_env()
         .map_err(|e| format!("invalid FERROSA_S3_REQUIRED: {e}"))?;
-    storage.validate_object_store_access(s3_required).await?;
-    // Probe object store for conditional put support (CAS).
-    // RustFS/MinIO may not support etag-based conditional writes — log a
-    // warning but continue. The manifest CAS retry loop will still attempt
-    // conditional puts and fall back gracefully.
-    if let Err(e) = storage.probe_s3_cas().await {
-        tracing::warn!("S3 CAS probe failed (non-fatal): {e}");
+    if s3_required {
+        storage.validate_object_store_access(true).await?;
     }
     let storage = Arc::new(storage);
 
@@ -2201,8 +2250,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // for the verified-healthy-replica ClusterView and the repair executor).
     // See `repair_wiring` + the "automatic repair" block below.
 
-    // Replay any pending S3 uploads that were interrupted by a crash.
-    storage.replay_pending_uploads().await;
+    // Replay of pending S3 uploads (crash recovery) is deferred to after the
+    // internode listener binds — see the "deferred object-store boot work" block
+    // below. It is a side effect only (its result is discarded) and is not part
+    // of the state consensus needs before it may start.
 
     // 4. Create Schema
     //
@@ -2335,14 +2386,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         register_user_tables_with_storage(&storage, &schema)?;
     }
 
-    if !schema_restored && storage.has_s3() {
-        tracing::info!("no local schema — attempting S3 bootstrap");
-        if let Err(e) = bootstrap_from_s3(&storage, &schema).await {
-            tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
-        } else {
-            // Persist the S3 schema locally so future restarts don't need S3
-            persist_schema_locally(data_path, &schema)?;
-        }
+    // The S3 schema/SSTable bootstrap for a cold start (no local schema.json) is
+    // deferred to after the internode listener binds — see the "deferred
+    // object-store boot work" block below. It mutates `schema` and the engine, so
+    // the boot-state consensus gate keeps Raft from starting until it completes.
+    let needs_s3_bootstrap = !schema_restored && storage.has_s3();
+    if needs_s3_bootstrap {
+        tracing::info!(
+            "no local schema — S3 bootstrap deferred until after the internode listener binds"
+        );
     }
 
     // Replay the commit log before reconstructing indexes, types, functions,
@@ -2550,12 +2602,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     }
-    enforce_production_requirements(
-        storage_auth_enabled,
-        &listener_tls_inputs,
-        net_config.require_tls,
-        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
-    );
+    // SEC: `enforce_production_requirements` now runs after the internode
+    // listener binds (see the "deferred object-store boot work" block below), so
+    // that it evaluates the schema *after* a cold-start S3 bootstrap has restored
+    // roles. A production node that fails it still exits before it serves data or
+    // starts Raft; only the internode lane binds first, which is what makes the
+    // node reachable when the object store is unhealthy.
 
     // Build handler registry — shared between RPC server and ModeController.
     // Catch-up handler is always available; pair write/role-swap handlers are
@@ -2626,15 +2678,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         registry.clone(),
     );
 
-    // T-300 (D24, D15a): jsonb columns are allowed on a standalone node only
-    // until the capability ledger lands. A node that will not stay standalone
-    // (seeds configured, or a former cluster member) and whose persisted
-    // schema holds jsonb must not start: FATAL, naming the tables. There is
-    // no flag to bypass this.
-    if let Err(refused) = mode_controller.check_startup_jsonb() {
-        tracing::error!(%refused, "FATAL: persisted schema holds jsonb columns outside standalone mode");
-        return Err(refused.into());
-    }
+    // T-300 (D24, D15a) jsonb startup refusal and the production security gate
+    // now run after the internode listener binds, once a cold-start S3 bootstrap
+    // has restored the schema (see the "deferred object-store boot work" block
+    // below). They are still checked before the node serves data or starts Raft.
 
     // OpenRaft starts only after the controller exists. Install supervision
     // now so a panic can atomically close readiness and CQL data admission
@@ -2678,7 +2725,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // quarantine on peer LIVENESS, not on a peer proven to hold a good copy
     // (FMEA #1).
 
-    // 7. Start internode RPC server with inbound peer callback
+    // 7. Start internode RPC server with inbound peer callback.
+    //
+    // Arm the boot-state consensus gate BEFORE the listener binds: the listener
+    // comes up ahead of the boot-time object-store work, so a peer can connect
+    // while that work is still running. Until `mark_boot_state_loaded` opens the
+    // gate (below), a peer's reconnect defers the cluster transition instead of
+    // starting Raft against state the node does not yet hold.
+    mode_controller.defer_consensus_until_boot_state();
     let rpc_server = Arc::new(
         ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
             .with_inbound_callback(mode_controller.clone())
@@ -2687,6 +2741,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");
+
+    // ── Deferred object-store boot work ───────────────────────────────────────
+    //
+    // The internode listener is up: this node is reachable on the internode lane
+    // in bounded time even when the object store is slow or black-holed. Raft is
+    // gated above, so the ordering the old code enforced by *blocking the
+    // listener* — "consensus starts only after the object-store boot work" — is
+    // preserved, while reachability is decoupled from object-store health.
+
+    // 7a. Cold-start restore (no local schema.json). It mutates `schema` and the
+    // engine, so it must complete before the gate opens: the node must not vote
+    // or serve before it holds this state. A partial restore is now loud and
+    // reported as failed (see `bootstrap_from_s3`).
+    if needs_s3_bootstrap {
+        tracing::info!("no local schema — attempting S3 bootstrap");
+        match bootstrap_from_s3(&storage, &schema).await {
+            Ok(()) => {
+                // Persist the S3 schema locally so future restarts don't need S3.
+                persist_schema_locally(data_path, &schema)?;
+            }
+            Err(e) => {
+                tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
+            }
+        }
+    }
+
+    // 7b. Security gates — evaluated on the FINAL schema (post-bootstrap) and
+    // before the node serves data or starts Raft. A failure still stops startup;
+    // it just no longer delays the internode lane.
+    enforce_production_requirements(
+        storage_auth_enabled,
+        &listener_tls_inputs,
+        net_config.require_tls,
+        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
+    );
+    if let Err(refused) = mode_controller.check_startup_jsonb() {
+        tracing::error!(%refused, "FATAL: persisted schema holds jsonb columns outside standalone mode");
+        return Err(refused.into());
+    }
+
+    // 7c. The node now holds the state it is required to hold. Open the gate and
+    // re-drive any transition a peer requested while it was closed.
+    mode_controller.mark_boot_state_loaded();
+
+    // 7d. Object-store hygiene, off the boot path. These results are never
+    // consumed on the boot path; a failure degrades THIS node's S3 durability,
+    // never cluster-wide consensus availability. `probe_s3_cas` precedes
+    // `replay_pending_uploads` (the latter reads the CAS flag); the CAS atomic
+    // defaults to "supported", so a manifest saved before this completes still
+    // falls back gracefully.
+    {
+        let storage_for_sync = storage.clone();
+        runtimes.background.spawn(async move {
+            if !s3_required {
+                match storage_for_sync.validate_object_store_access(false).await {
+                    Ok(warnings) if !warnings.is_empty() => {
+                        tracing::warn!(
+                            ?warnings,
+                            "object-store access validation failed (non-fatal)"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("object-store access validation failed (non-fatal): {e}")
+                    }
+                }
+            }
+            if let Err(e) = storage_for_sync.probe_s3_cas().await {
+                tracing::warn!("S3 CAS probe failed (non-fatal): {e}");
+            }
+            storage_for_sync.replay_pending_uploads().await;
+        });
+    }
 
     // Initialize the cluster-wide paging HMAC key BEFORE the CQL server serves a
     // query, so every coordinator signs/verifies paging cursors with the SAME
