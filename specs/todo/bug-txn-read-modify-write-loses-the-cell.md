@@ -129,6 +129,19 @@ judge the lost cell - and the reason this work exists.
 **THEN — phase 2:** MVCC with strict ordering and PostgreSQL conflict-resolution semantics, so
 transactions behave from the front end the way PostgreSQL's do.
 
+## I2 status correction (2026-10-11)
+
+My first I2 test was WRONG and is relabelled. I assumed the grammar refuses a bound name as the
+UPDATE operand; it does not. `SET v = cur + 1` parses today — the counter-increment path takes the
+assignment target from the column and discards the left-hand term, and a bare word is accepted as a
+term. So that test was green on arrival and could not fail on I2; keeping it as an "I2 red" would
+have been a green test implying coverage.
+
+**I2's real red is at RUNTIME, not at parse time.** `route_transaction_block` iterates the block
+through `route_in_transaction` and ignores `bindings`, so the bound name resolves to nothing when
+the write is staged: the value that reaches the committer is not the value this transaction read.
+Witnessing that requires an engine-backed fixture (the SELECT must actually read), and it is OWED.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the

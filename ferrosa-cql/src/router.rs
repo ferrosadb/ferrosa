@@ -17894,6 +17894,45 @@ mod tests {
         );
     }
 
+    /// PARSE-CONTRACT GUARD, and it is GREEN ON ARRIVAL — say so, because a green test that looks
+    /// like it holds I2 down is worse than no test.
+    ///
+    /// Measured, not assumed: `SET v = cur + 1` parses today. The counter-increment path takes the
+    /// assignment target from the column and DISCARDS the left-hand term, and a bare word is
+    /// accepted as a term, so a bound name is accepted as the operand without being resolved.
+    /// Therefore this test does NOT reproduce I2 and CANNOT fail on it.
+    ///
+    /// I2's real red is at RUNTIME: `route_transaction_block` ignores `bindings`, so the bound name
+    /// resolves to nothing when the write is staged, and the value that reaches the committer is not
+    /// the value this transaction read. That red needs an engine-backed fixture and is still OWED.
+    #[test]
+    fn a_let_binding_is_accepted_as_the_update_operand_at_parse_time() {
+        let sql = "BEGIN TRANSACTION; \
+                   LET cur = SELECT v FROM ks.t WHERE aid = 7; \
+                   UPDATE ks.t SET v = cur + 1 WHERE aid = 7; \
+                   COMMIT TRANSACTION";
+        let stmt = crate::parser::parse(sql)
+            .expect("the bound name must be usable as the UPDATE operand, not refused");
+        let Statement::TransactionBlock {
+            statements,
+            bindings,
+            ..
+        } = stmt
+        else {
+            panic!("a LET block must parse as a transaction block");
+        };
+        assert_eq!(bindings.len(), 1, "exactly one LET binding");
+        assert_eq!(bindings[0].name, "cur");
+        assert!(
+            bindings[0].stmt_index < statements.len(),
+            "the binding must point at the read inside this block"
+        );
+        assert!(
+            matches!(statements.last(), Some(Statement::Update(_))),
+            "the UPDATE that consumes the bound value must be in the block"
+        );
+    }
+
     #[tokio::test]
     async fn route_transactional_handles_begin_rollback_and_fails_commit_in_standalone() {
         let (state, _dir) = setup();
