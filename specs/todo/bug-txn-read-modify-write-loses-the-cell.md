@@ -142,6 +142,26 @@ through `route_in_transaction` and ignores `bindings`, so the bound name resolve
 the write is staged: the value that reaches the committer is not the value this transaction read.
 Witnessing that requires an engine-backed fixture (the SELECT must actually read), and it is OWED.
 
+### I2 red: the fixture gap it is blocked on (2026-10-11)
+
+The red belongs at `route_transaction_block` and needs a committer that RECORDS what it is handed.
+The instrument exists: `MockTransactionCommitter::committed() -> Vec<Vec<TransactionWrite>>` and
+`.reads() -> Vec<Vec<TransactionRead>>`
+(`ferrosa-storage/src/accord/transaction_committer.rs:446` and `:453`). For THIS claim the mock is
+the right instrument - the question is what value reached the committer, not whether a cell survives
+(latter is I3, live only).
+
+What blocks it is a FIXTURE gap, not a product mystery: the CQL router takes its committer from
+`state.accord_transaction_committer()` (`ferrosa-cql/src/router.rs:3202`) and **no CQL-side fixture
+installs one** - `setup()` and `setup_with_engine_overrides` do not expose it, and no test in
+`ferrosa-cql` references `MockTransactionCommitter`. The seam for installing one is
+`AccordAccess::fixed(committer)` (`ferrosa-postgres/src/accord_access.rs:65`), the same shape the
+PostgreSQL-side fixture already uses.
+
+**Next increment:** add a CQL-side fixture whose `SharedState` carries an `AccordAccess` with a
+recording `MockTransactionCommitter`, then write the red - a `LET` block whose bound read must feed
+the value that reaches the committer.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
