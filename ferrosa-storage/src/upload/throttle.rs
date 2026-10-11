@@ -8,25 +8,61 @@
 //! [`ThrottledStore`] wraps the one object store every path shares (uploads,
 //! compaction uploads, deletes, rehydration, restore): a [`RequestPacer`]
 //! spaces requests to a configured rate, and a request answered 429 is
-//! retried with bounded exponential backoff. Concurrency is capped separately
-//! by `object_store::limit::LimitStore` (see `ObjectStoreConfig`).
+//! retried with bounded exponential backoff.
+//!
+//! It also caps requests in flight (`FERROSA_S3_MAX_CONCURRENT_REQUESTS`) with
+//! its own permits rather than `object_store::limit::LimitStore`, for two
+//! reasons from the 2026-10-10 outage:
+//! - the time a request spends waiting for the pacer and a permit is
+//!   measured, and a wait over [`DEFAULT_WAIT_WARN_AFTER`] is reported (edges
+//!   only: the start of a waiting streak and its recovery with a count), so
+//!   a queue behind the client-side limits no longer reads as a hang;
+//! - a GET body holds its permit only while it keeps sending: a body that
+//!   yields nothing for `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS` fails with a
+//!   retryable error and releases the permit, instead of holding it for the
+//!   900 s request timeout. `get_range` and `get_ranges` go through `get_opts`
+//!   (the trait defaults), so every body consumer gets the same bound.
 
 use std::fmt;
 use std::future::Future;
-use std::ops::Range;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOpts,
-    PutOptions, PutPayload, PutResult, Result,
+    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UploadPart,
 };
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
+
+/// A wait for the pacer and a permit longer than this is reported.
+pub const DEFAULT_WAIT_WARN_AFTER: Duration = Duration::from_secs(5);
+
+/// The client-side limits a [`ThrottledStore`] enforces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThrottleLimits {
+    /// `FERROSA_S3_MAX_REQUESTS_PER_SECOND`; `None` is unpaced.
+    pub requests_per_second: Option<u32>,
+    /// `FERROSA_S3_MAX_CONCURRENT_REQUESTS` (or its default).
+    pub max_in_flight: usize,
+    /// `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS`: longest silence a GET body may keep.
+    pub body_idle_timeout: Duration,
+    /// Waits for the pacer and a permit longer than this are reported.
+    pub wait_warn_after: Duration,
+}
+
+impl ThrottleLimits {
+    fn rate_text(&self) -> String {
+        self.requests_per_second
+            .map_or_else(|| "unset".to_owned(), |rps| rps.to_string())
+    }
+}
 
 /// Spaces requests evenly at no more than `per_second`, with no burst.
 ///
@@ -104,44 +140,98 @@ pub fn rate_limit_events() -> u64 {
     RATE_LIMIT_EVENTS.load(Ordering::Relaxed)
 }
 
-/// An [`ObjectStore`] that paces requests and retries rate-limited ones.
+/// An [`ObjectStore`] that caps requests in flight, paces them, retries
+/// rate-limited ones, and bounds how long a GET body may stay silent.
 pub struct ThrottledStore {
     inner: Arc<dyn ObjectStore>,
     pacer: Option<RequestPacer>,
     retry: RateLimitRetry,
+    limits: ThrottleLimits,
+    /// One permit per request in flight; a GET body keeps its permit.
+    permits: Arc<Semaphore>,
     /// Set while requests are being rate-limited, so the log reports the
     /// start and end of an episode rather than every 429.
     throttled: AtomicBool,
+    /// Set while requests wait longer than `limits.wait_warn_after` for the
+    /// pacer and a permit; the log reports the streak's start and end.
+    waiting: AtomicBool,
+    /// Slow waits in the current streak, reported when it ends.
+    slow_waits: AtomicU64,
 }
 
 impl ThrottledStore {
-    /// Wrap `inner`, pacing to `requests_per_second` when set.
-    pub fn new(
-        inner: Arc<dyn ObjectStore>,
-        requests_per_second: Option<u32>,
-        retry: RateLimitRetry,
-    ) -> Self {
+    /// Wrap `inner` with `limits`.
+    pub fn new(inner: Arc<dyn ObjectStore>, limits: ThrottleLimits, retry: RateLimitRetry) -> Self {
+        assert!(
+            limits.max_in_flight > 0,
+            "the in-flight limit must be positive"
+        );
+        assert!(
+            !limits.body_idle_timeout.is_zero(),
+            "the body idle timeout must be positive"
+        );
         Self {
             inner,
-            pacer: requests_per_second.map(RequestPacer::new),
+            pacer: limits.requests_per_second.map(RequestPacer::new),
             retry,
+            limits,
+            permits: Arc::new(Semaphore::new(limits.max_in_flight)),
             throttled: AtomicBool::new(false),
+            waiting: AtomicBool::new(false),
+            slow_waits: AtomicU64::new(0),
         }
     }
 
-    async fn pace(&self) {
+    /// Wait for the pacer, then for a permit, and report a long wait.
+    async fn admit(&self, op: &'static str) -> OwnedSemaphorePermit {
+        let started = Instant::now();
         if let Some(pacer) = &self.pacer {
             pacer.acquire().await;
         }
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("the request semaphore is never closed");
+        self.note_wait(op, started.elapsed());
+        permit
     }
 
-    /// Run one request, pacing each attempt and retrying a 429.
+    /// Report the edges of a streak of waits longer than the threshold: the
+    /// first slow wait, and the first prompt admission after it, with the
+    /// count. One line per request would flood the log in exactly the
+    /// conditions it describes.
+    fn note_wait(&self, op: &'static str, waited: Duration) {
+        if waited > self.limits.wait_warn_after {
+            self.slow_waits.fetch_add(1, Ordering::Relaxed);
+            if !self.waiting.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    op,
+                    waited_ms = waited.as_millis() as u64,
+                    "object-store requests waited {waited:?} for the client-side limits \
+                     (FERROSA_S3_MAX_CONCURRENT_REQUESTS={}, FERROSA_S3_MAX_REQUESTS_PER_SECOND={}); \
+                     the limits, not the store, are the bottleneck",
+                    self.limits.max_in_flight,
+                    self.limits.rate_text(),
+                );
+            }
+        } else if self.waiting.swap(false, Ordering::Relaxed) {
+            let slow_waits = self.slow_waits.swap(0, Ordering::Relaxed);
+            tracing::info!(
+                op,
+                slow_waits,
+                "object-store requests are no longer waiting for the client-side limits"
+            );
+        }
+    }
+
+    /// Run one request, pacing each attempt and retrying a 429. The permit
+    /// that admitted the successful attempt is returned with its result.
     async fn request<T, F, Fut>(
         &self,
         op: &'static str,
         location: &Path,
         mut attempt: F,
-    ) -> Result<T>
+    ) -> Result<(T, OwnedSemaphorePermit)>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T>>,
@@ -149,10 +239,11 @@ impl ThrottledStore {
         let mut backoff = self.retry.base_backoff;
         let mut tries = 0u32;
         loop {
-            self.pace().await;
+            let permit = self.admit(op).await;
             tries += 1;
             match attempt().await {
                 Err(e) if is_rate_limited(&e) && tries < self.retry.max_attempts => {
+                    drop(permit);
                     RATE_LIMIT_EVENTS.fetch_add(1, Ordering::Relaxed);
                     super::stats::record_retry(op);
                     if !self.throttled.swap(true, Ordering::Relaxed) {
@@ -161,7 +252,9 @@ impl ThrottledStore {
                             %location,
                             error = %e,
                             "object store is rate-limiting requests (429); backing off and retrying. \
-                             Lower FERROSA_S3_MAX_REQUESTS_PER_SECOND / FERROSA_S3_MAX_CONCURRENT_REQUESTS if this persists"
+                             If 429s persist, cap the request rate below the bucket's limit with \
+                             FERROSA_S3_MAX_REQUESTS_PER_SECOND. Slow responses (latency) are not \
+                             a rate problem: do not lower the limits for them"
                         );
                     }
                     tokio::time::sleep(backoff).await;
@@ -185,10 +278,104 @@ impl ThrottledStore {
                             "object store rate-limiting cleared; requests succeeding again"
                         );
                     }
-                    return result;
+                    return result.map(|value| (value, permit));
                 }
             }
         }
+    }
+
+    /// Run one request whose result holds no body: its permit is released.
+    async fn call<T, F, Fut>(&self, op: &'static str, location: &Path, attempt: F) -> Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T>>,
+    {
+        let (value, _permit) = self.request(op, location, attempt).await?;
+        Ok(value)
+    }
+}
+
+/// The error a GET body fails with when it stays silent past the idle timeout.
+fn idle_timeout_error(location: &Path, idle: Duration) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "S3",
+        source: format!(
+            "response body of {location} sent nothing for {idle:?} \
+             (FERROSA_S3_BODY_IDLE_TIMEOUT_SECS); abandoning it so the request can be retried"
+        )
+        .into(),
+    }
+}
+
+/// `stream`, holding `permit` until it ends, failing (and releasing the permit)
+/// when it yields nothing for `idle`.
+fn idle_bounded(
+    stream: BoxStream<'static, Result<Bytes>>,
+    permit: OwnedSemaphorePermit,
+    idle: Duration,
+    location: Path,
+) -> BoxStream<'static, Result<Bytes>> {
+    futures::stream::unfold(Some((stream, permit)), move |state| {
+        let location = location.clone();
+        async move {
+            let (mut stream, permit) = state?;
+            match tokio::time::timeout(idle, stream.next()).await {
+                Ok(Some(item)) => Some((item, Some((stream, permit)))),
+                Ok(None) => None,
+                Err(_) => {
+                    drop(stream);
+                    drop(permit);
+                    super::stats::record_retry("get_body_idle");
+                    tracing::warn!(
+                        %location,
+                        idle_secs = idle.as_secs_f64(),
+                        "object-store response body stalled past FERROSA_S3_BODY_IDLE_TIMEOUT_SECS; \
+                         failing it as retryable and releasing its request slot"
+                    );
+                    Some((Err(idle_timeout_error(&location, idle)), None))
+                }
+            }
+        }
+    })
+    .boxed()
+}
+
+/// A multipart upload whose part, complete and abort requests each take one
+/// of the store's permits, as `object_store::limit::LimitUpload` does.
+#[derive(Debug)]
+struct LimitedUpload {
+    upload: Box<dyn MultipartUpload>,
+    permits: Arc<Semaphore>,
+}
+
+#[async_trait]
+impl MultipartUpload for LimitedUpload {
+    fn put_part(&mut self, data: PutPayload) -> UploadPart {
+        let part = self.upload.put_part(data);
+        let permits = Arc::clone(&self.permits);
+        Box::pin(async move {
+            let _permit = permits
+                .acquire_owned()
+                .await
+                .expect("the request semaphore is never closed");
+            part.await
+        })
+    }
+
+    async fn complete(&mut self) -> Result<PutResult> {
+        let _permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("the request semaphore is never closed");
+        self.upload.complete().await
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        let _permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("the request semaphore is never closed");
+        self.upload.abort().await
     }
 }
 
@@ -196,6 +383,7 @@ impl fmt::Debug for ThrottledStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ThrottledStore")
             .field("pacer", &self.pacer)
+            .field("limits", &self.limits)
             .field("retry", &self.retry)
             .finish_non_exhaustive()
     }
@@ -203,7 +391,11 @@ impl fmt::Debug for ThrottledStore {
 
 impl fmt::Display for ThrottledStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ThrottledStore({})", self.inner)
+        write!(
+            f,
+            "ThrottledStore(max_in_flight={}, {})",
+            self.limits.max_in_flight, self.inner
+        )
     }
 }
 
@@ -215,7 +407,7 @@ impl ObjectStore for ThrottledStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        self.request("put", location, || {
+        self.call("put", location, || {
             self.inner.put_opts(location, payload.clone(), opts.clone())
         })
         .await
@@ -226,61 +418,78 @@ impl ObjectStore for ThrottledStore {
         location: &Path,
         opts: PutMultipartOpts,
     ) -> Result<Box<dyn MultipartUpload>> {
-        self.request("put_multipart", location, || {
-            self.inner.put_multipart_opts(location, opts.clone())
-        })
-        .await
+        let upload = self
+            .call("put_multipart", location, || {
+                self.inner.put_multipart_opts(location, opts.clone())
+            })
+            .await?;
+        Ok(Box::new(LimitedUpload {
+            upload,
+            permits: Arc::clone(&self.permits),
+        }))
     }
 
+    /// `get`, `get_range` and `get_ranges` are the trait defaults, which all
+    /// come here, so every body is idle-bounded and holds its permit.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        self.request("get", location, || {
-            self.inner.get_opts(location, options.clone())
-        })
-        .await
-    }
-
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
-        self.request("get_range", location, || {
-            self.inner.get_range(location, range.clone())
-        })
-        .await
-    }
-
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
-        self.request("get_ranges", location, || {
-            self.inner.get_ranges(location, ranges)
-        })
-        .await
+        let (result, permit) = self
+            .request("get", location, || {
+                self.inner.get_opts(location, options.clone())
+            })
+            .await?;
+        let payload = match result.payload {
+            GetResultPayload::Stream(stream) => GetResultPayload::Stream(idle_bounded(
+                stream,
+                permit,
+                self.limits.body_idle_timeout,
+                location.clone(),
+            )),
+            file @ GetResultPayload::File(..) => file,
+        };
+        Ok(GetResult { payload, ..result })
     }
 
     async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.request("head", location, || self.inner.head(location))
+        self.call("head", location, || self.inner.head(location))
             .await
     }
 
     async fn delete(&self, location: &Path) -> Result<()> {
-        self.request("delete", location, || self.inner.delete(location))
+        self.call("delete", location, || self.inner.delete(location))
             .await
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
-        // A listing is a paged stream; pacing covers only its first page.
-        self.inner.list(prefix)
+        // A listing is a paged stream; it holds one permit while it runs and
+        // pacing covers only its first page.
+        let prefix = prefix.cloned();
+        self.admit("list")
+            .map(move |permit| {
+                self.inner
+                    .list(prefix.as_ref())
+                    .map(move |item| {
+                        let _held = &permit;
+                        item
+                    })
+                    .boxed()
+            })
+            .into_stream()
+            .flatten()
+            .boxed()
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         let location = prefix.cloned().unwrap_or_default();
-        self.request("list", &location, || self.inner.list_with_delimiter(prefix))
+        self.call("list", &location, || self.inner.list_with_delimiter(prefix))
             .await
     }
 
     async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.request("copy", from, || self.inner.copy(from, to))
-            .await
+        self.call("copy", from, || self.inner.copy(from, to)).await
     }
 
     async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.request("copy_if_not_exists", from, || {
+        self.call("copy_if_not_exists", from, || {
             self.inner.copy_if_not_exists(from, to)
         })
         .await
@@ -388,6 +597,16 @@ mod tests {
         }
     }
 
+    /// Unpaced limits with `max_in_flight` permits and production timeouts.
+    fn limits(max_in_flight: usize) -> ThrottleLimits {
+        ThrottleLimits {
+            requests_per_second: None,
+            max_in_flight,
+            body_idle_timeout: Duration::from_secs(30),
+            wait_warn_after: DEFAULT_WAIT_WARN_AFTER,
+        }
+    }
+
     async fn store_rate_limiting(times: u32) -> (Arc<dyn ObjectStore>, Path) {
         let inner = RateLimitingStore {
             inner: object_store::memory::InMemory::new(),
@@ -408,11 +627,94 @@ mod tests {
     #[tokio::test]
     async fn a_rate_limited_read_is_retried_until_it_succeeds() {
         let (inner, path) = store_rate_limiting(2).await;
-        let store = ThrottledStore::new(inner, None, fast_retry(5));
+        let store = ThrottledStore::new(inner, limits(64), fast_retry(5));
 
         let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
 
         assert_eq!(bytes.as_ref(), b"rows");
+    }
+
+    /// T-F5-3 (2026-10-10): requests queued for minutes behind four permits
+    /// and nothing said so, so the stall read as a hang. With one request in
+    /// flight and the permit held by a gated request for 300 ms, the next
+    /// request waits longer than the (test) threshold of 100 ms and the wait
+    /// is logged, naming both limits; a following request that does not wait
+    /// reports the recovery with the count of slow waits.
+    #[tokio::test]
+    async fn a_long_permit_wait_is_logged() {
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let path = Path::from("prefix/sstables/1-Index.db");
+        let inner = object_store::memory::InMemory::new();
+        inner
+            .put(&path, PutPayload::from_static(b"rows"))
+            .await
+            .unwrap();
+        let store = Arc::new(ThrottledStore::new(
+            Arc::new(inner),
+            ThrottleLimits {
+                wait_warn_after: Duration::from_millis(100),
+                ..limits(1)
+            },
+            fast_retry(3),
+        ));
+
+        // The gated request: its unread body holds the only permit.
+        let held = store.get(&path).await.unwrap();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            drop(held);
+        });
+        let waited = store.get(&path).await.unwrap().bytes().await.unwrap();
+        release.await.unwrap();
+        assert_eq!(waited.as_ref(), b"rows");
+        let prompt = store.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(prompt.as_ref(), b"rows");
+
+        let text = logs.text();
+        let warning = text
+            .lines()
+            .find(|l| l.contains("WARN") && l.contains("waited"))
+            .unwrap_or_else(|| panic!("no permit-wait warning was logged:\n{text}"));
+        assert!(
+            warning.contains("FERROSA_S3_MAX_CONCURRENT_REQUESTS=1")
+                && warning.contains("FERROSA_S3_MAX_REQUESTS_PER_SECOND=unset"),
+            "{warning}"
+        );
+        let recovered = text
+            .lines()
+            .find(|l| l.contains("INFO") && l.contains("no longer waiting"))
+            .unwrap_or_else(|| panic!("no recovery line was logged:\n{text}"));
+        assert!(recovered.contains("slow_waits=1"), "{recovered}");
+    }
+
+    /// 2026-10-10: the 429 warning told operators to lower both limits "if this
+    /// persists", and they lowered in-flight to 4 when the real cause was
+    /// latency. The warning names the rate cap as the remedy for a 429 and
+    /// must not advise lowering the in-flight limit.
+    #[tokio::test]
+    async fn the_429_warning_does_not_advise_lowering_the_in_flight_limit() {
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let (inner, path) = store_rate_limiting(1).await;
+        let store = ThrottledStore::new(inner, limits(64), fast_retry(5));
+
+        store.get(&path).await.unwrap().bytes().await.unwrap();
+
+        let text = logs.text();
+        let warning = text
+            .lines()
+            .find(|l| l.contains("WARN") && l.contains("429"))
+            .unwrap_or_else(|| panic!("no 429 warning:\n{text}"));
+        assert!(
+            warning.contains("FERROSA_S3_MAX_REQUESTS_PER_SECOND"),
+            "{warning}"
+        );
+        assert!(
+            !warning.contains("FERROSA_S3_MAX_CONCURRENT_REQUESTS"),
+            "a 429 is a rate problem; lowering in-flight does not fix it: {warning}"
+        );
+        assert!(warning.contains("latency"), "{warning}");
     }
 
     /// Retrying is bounded: a bucket that never stops rate-limiting surfaces
@@ -420,7 +722,7 @@ mod tests {
     #[tokio::test]
     async fn a_read_rate_limited_past_its_attempts_fails_with_the_429() {
         let (inner, path) = store_rate_limiting(u32::MAX).await;
-        let store = ThrottledStore::new(inner, None, fast_retry(3));
+        let store = ThrottledStore::new(inner, limits(64), fast_retry(3));
 
         let err = store.get(&path).await.unwrap_err();
 

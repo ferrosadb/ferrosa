@@ -389,12 +389,22 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   **Request throttling (`upload/throttle.rs`):** every path shares one object
   store, wrapped in `ThrottledStore`. `FERROSA_S3_MAX_REQUESTS_PER_SECOND` paces
   requests evenly (no burst) and `FERROSA_S3_MAX_CONCURRENT_REQUESTS` caps them
-  in flight (`object_store::limit::LimitStore`); unset means the WAN default of 64, and a
+  in flight (the store's own permits; a GET body keeps its permit until it ends);
+  unset means the WAN default of 64 and no rate cap, and a
   non-positive or non-integer value stops startup naming the variable. A request
   answered `429 Too Many Requests` is retried with exponential backoff (10
   attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
-  log reports the start and end of a throttling episode, not every 429. Set both
-  when recovering from Cloudflare R2.
+  log reports the start and end of a throttling episode, not every 429; the
+  warning names the rate cap as the remedy and says latency is not a reason to
+  lower the limits. Since the 2026-10-10 outage: a GET body that sends nothing
+  for `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS` (default 30) fails as retryable and
+  releases its permit instead of holding it for the 900 s request timeout (every
+  body consumer: whole downloads, ranged parts, `get_range`, `.bytes()`); a wait
+  of more than 5 s for the pacer and a permit is logged as an edge (first slow
+  wait naming both limits, then the recovery with a count); and building the
+  store warns (`validate_limits`) when `rps x 0.3 s` is below the in-flight
+  limit, when the in-flight limit is below the startup fetch concurrency (16),
+  or when it is below 8 against a remote endpoint.
   **Downloads and pooling (`upload/download.rs`):** a component above
   `FERROSA_S3_DOWNLOAD_PART_BYTES` (16 MiB) is fetched as ranged GETs
   (`FERROSA_S3_DOWNLOAD_PART_CONCURRENCY`, default 4, through the same shared

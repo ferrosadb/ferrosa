@@ -14609,7 +14609,9 @@ impl StorageEngine {
         store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
     ) -> ferrosa_common::Result<usize> {
         use futures::StreamExt;
-        const FETCH_CONCURRENCY: usize = 16;
+        // Shared with `ObjectStoreConfig::build_object_store`, which warns
+        // when the in-flight limit is below it.
+        const FETCH_CONCURRENCY: usize = crate::upload::config::STARTUP_FETCH_CONCURRENCY;
         const LISTED_FAILURES: usize = 10;
 
         let evicted = Self::evicted_generations(&data_dir.join("sstables"));
