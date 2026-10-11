@@ -804,7 +804,15 @@ mod tests {
 
         let mut blobs = vec![vec![0xABu8; N]];
         let spill = WriteSetSpill::stage(reservation, &mut blobs).expect("stage blobs");
-        let staged_path = spill._reservation.path().join("write-set.bin");
+        let staged_path = spill
+            ._reservation
+            .as_ref()
+            .expect(
+                "the staged spill must own a reservation — the payload must exceed the \
+                 staging floor and the filesystem must have writeback",
+            )
+            .path()
+            .join("write-set.bin");
 
         // Fault every mapped page so the kernel has resident pages to account.
         let touched = touch_every_page(spill.entry(0).expect("entry"));
