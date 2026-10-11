@@ -190,6 +190,31 @@ This also matches the requester's requirement directly: the CQL front end must r
 cluster-mode commit path the PostgreSQL front end does, so that transactions behave the same way from
 either front end.
 
+### I2 effect-level fixture: attempted, REVERTED, and the exact gaps (2026-10-11)
+
+I built the cluster-mode CQL fixture. The structure was right: `SessionCore`'s twelve fields are all
+public and `SharedState.core` is public, so a CQL test CAN construct a cluster core (one-node ring →
+`WritePath::cluster` + peer manager + clock) and install it on the state, which is what makes a real
+commit reachable from this crate.
+
+The type paths were not, and I **reverted it** rather than leave a non-compiling test carrying a
+placeholder assertion in the tree. Behaviour unchanged.
+
+What the compiler rejected — this is the worklist for the next attempt, and resolving it is
+mechanical:
+
+1. `ferrosa_cluster::PeerManager`, `NetConfig`, `HybridLogicalClock`, `NoopListener` do NOT live in
+   `ferrosa_cluster`; `ferrosa-session`'s own test helper imports them, so read its import block.
+2. `ferrosa_common::NodeConfig` is not the right path for `NodeConfig`.
+3. The row read-back is not `StorageEngine::read_row` with `RowKey` / `CellValue` / `Timestamp`;
+   those names are not in `ferrosa_storage`. Find the engine's actual point-read API.
+4. `route_select_raw`'s call shape did not match (E0308) for a non-transactional SELECT.
+
+Next attempt: take those four from `ferrosa-session/src/lib.rs`'s test module imports and the
+engine's read API, then the fixture is a copy of that helper. The assertion stays the EFFECT: the
+value in the row after the block commits — never a mock recording, because the committer here is
+built on demand and cannot be replaced.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
