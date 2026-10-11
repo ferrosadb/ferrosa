@@ -462,7 +462,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   marked generation's index components (16 at a time) and the table loader
   registers it remote-backed (`remote_backed_generations`; the Data.db walk and
   smoke test are skipped, since reads verify checksums). A marked generation
-  missing from the manifest or the store fails startup. The pre-ST-51 behaviour
+  missing from the manifest or the store fails startup. Registration logs a
+  progress line every 10 s (done/total generations, index bytes, rate, elapsed,
+  failures, in flight) and fails with a stall error naming the requests in
+  flight, the elapsed time and the last progress when no generation finishes
+  for `FERROSA_STARTUP_REGISTRATION_STALL_SECS` (default 300) while fetches are
+  in flight, instead of hanging (outage 2026-10-10). The pre-ST-51 behaviour
   is `FERROSA_RESTORE_EVICTED_MODE=full` or `restore_evicted_sstables()`. After
   each sync, `restore_hot_evicted_sstables` fully restores hot tables'
   generations (8 per pass, only while free disk stays above the eviction target

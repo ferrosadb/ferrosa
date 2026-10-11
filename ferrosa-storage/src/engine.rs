@@ -20,7 +20,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use ferrosa_common::task_pool::TaskPool;
@@ -1999,6 +1999,140 @@ fn restore_work(
         work.tables += usize::from(in_table > 0);
     }
     work
+}
+
+/// Default for `FERROSA_STARTUP_REGISTRATION_STALL_SECS`. A single fetch can
+/// legitimately take a body idle timeout (30 s) plus its retries, so a stall
+/// is declared only after five minutes in which no generation finished.
+const DEFAULT_REGISTRATION_STALL_SECS: u64 = 300;
+
+/// How startup registration of evicted generations reports progress and
+/// decides it has stalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RegistrationWatch {
+    /// A progress line at most this often.
+    progress_every: Duration,
+    /// Fail when no generation has finished for this long with fetches in
+    /// flight.
+    stall_after: Duration,
+}
+
+impl RegistrationWatch {
+    /// Progress every 10 s; the stall interval from
+    /// `FERROSA_STARTUP_REGISTRATION_STALL_SECS` (default 300), rejected
+    /// naming the variable when it is not a positive whole number.
+    fn from_env() -> ferrosa_common::Result<Self> {
+        let stall_secs = crate::upload::config::parse_request_limit::<u64>(
+            "FERROSA_STARTUP_REGISTRATION_STALL_SECS",
+            std::env::var("FERROSA_STARTUP_REGISTRATION_STALL_SECS")
+                .ok()
+                .as_deref(),
+        )?
+        .unwrap_or(DEFAULT_REGISTRATION_STALL_SECS);
+        Ok(Self {
+            progress_every: Duration::from_secs(10),
+            stall_after: Duration::from_secs(stall_secs),
+        })
+    }
+
+    /// The check interval: often enough for both the progress line and the
+    /// stall check.
+    fn tick(&self) -> Duration {
+        assert!(
+            !self.progress_every.is_zero() && !self.stall_after.is_zero(),
+            "registration watch intervals must be positive"
+        );
+        self.progress_every
+            .min(self.stall_after / 2)
+            .max(Duration::from_millis(1))
+    }
+}
+
+/// Startup registration's progress: what is done, and when it last moved.
+#[derive(Debug)]
+struct RegistrationProgress {
+    total: usize,
+    done: usize,
+    /// Most fetches that run at once.
+    concurrency: usize,
+    /// The read store's byte counter when registration began.
+    bytes_at_start: u64,
+    started: Instant,
+    last_advance: Instant,
+    last_report: Instant,
+}
+
+impl RegistrationProgress {
+    fn new(total: usize, concurrency: usize, bytes_at_start: u64, started: Instant) -> Self {
+        assert!(
+            concurrency > 0,
+            "registration needs at least one fetch slot"
+        );
+        Self {
+            total,
+            done: 0,
+            concurrency,
+            bytes_at_start,
+            started,
+            last_advance: started,
+            last_report: started,
+        }
+    }
+
+    fn finished_one(&mut self, now: Instant) {
+        self.done += 1;
+        assert!(
+            self.done <= self.total,
+            "finished more generations than queued"
+        );
+        self.last_advance = now;
+    }
+
+    /// Fetches still running: every unfinished generation up to the fetch
+    /// concurrency.
+    fn in_flight(&self) -> usize {
+        (self.total - self.done).min(self.concurrency)
+    }
+
+    fn report_due(&self, now: Instant, every: Duration) -> bool {
+        now.duration_since(self.last_report) >= every
+    }
+
+    fn log(&mut self, now: Instant, bytes_now: u64, failures: usize) {
+        self.last_report = now;
+        let elapsed = now.duration_since(self.started);
+        let rate = self.done as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
+        tracing::info!(
+            done = self.done,
+            total = self.total,
+            bytes = bytes_now.saturating_sub(self.bytes_at_start),
+            rate_per_sec = %format_args!("{rate:.1}"),
+            elapsed_ms = elapsed.as_millis() as u64,
+            failures,
+            in_flight = self.in_flight(),
+            "storage-engine: registering evicted SSTables: progress"
+        );
+    }
+
+    /// The stall error, when no generation has finished for `stall_after`
+    /// while fetches are in flight.
+    fn stalled(&self, now: Instant, stall_after: Duration) -> Option<String> {
+        let quiet = now.duration_since(self.last_advance);
+        let in_flight = self.in_flight();
+        if quiet < stall_after || in_flight == 0 {
+            return None;
+        }
+        Some(format!(
+            "startup registration of evicted SSTables stalled: no generation finished for \
+             {quiet:?} with {in_flight} request(s) in flight; {}/{} generations done, elapsed \
+             {:?}, last progress {quiet:?} ago (FERROSA_STARTUP_REGISTRATION_STALL_SECS={}). \
+             Check object-store reachability and the FERROSA_S3_* limits",
+            self.done,
+            self.total,
+            now.duration_since(self.started),
+            stall_after.as_secs()
+        ))
+    }
 }
 
 /// Test seam between a rehydrated component's temp file being complete and its
@@ -14608,6 +14742,23 @@ impl StorageEngine {
         data_dir: &std::path::Path,
         store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
     ) -> ferrosa_common::Result<usize> {
+        if Self::evicted_generations(&data_dir.join("sstables")).is_empty() {
+            return Ok(0);
+        }
+        let watch = RegistrationWatch::from_env()?;
+        Self::register_evicted_sstables_remote_with(data_dir, store, watch).await
+    }
+
+    /// [`Self::register_evicted_sstables_remote_in`] with an explicit
+    /// [`RegistrationWatch`]: a progress line every `progress_every`, and a
+    /// stall error when no generation finishes for `stall_after` while
+    /// fetches are in flight (outage 2026-10-10: node1 registered silently
+    /// for minutes and was restarted as hung).
+    async fn register_evicted_sstables_remote_with(
+        data_dir: &std::path::Path,
+        store: Option<(Arc<dyn object_store::ObjectStore>, String)>,
+        watch: RegistrationWatch,
+    ) -> ferrosa_common::Result<usize> {
         use futures::StreamExt;
         // Shared with `ObjectStoreConfig::build_object_store`, which warns
         // when the in-flight limit is below it.
@@ -14681,6 +14832,15 @@ impl StorageEngine {
             }
         }
         let mut registered = 0usize;
+        let mut progress = RegistrationProgress::new(
+            jobs.len(),
+            FETCH_CONCURRENCY,
+            reads.index_bytes_fetched(),
+            started,
+        );
+        let mut ticker = tokio::time::interval(watch.tick());
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await; // the first tick is immediate
         let mut results = futures::stream::iter(jobs)
             .map(|(dir_name, gen, table_dir)| {
                 let reads = Arc::clone(&reads);
@@ -14690,7 +14850,32 @@ impl StorageEngine {
                 }
             })
             .buffer_unordered(FETCH_CONCURRENCY);
-        while let Some((dir_name, gen, outcome)) = results.next().await {
+        loop {
+            let next = tokio::select! {
+                next = results.next() => next,
+                _ = ticker.tick() => {
+                    let now = Instant::now();
+                    let bytes = reads.index_bytes_fetched();
+                    if progress.report_due(now, watch.progress_every) {
+                        progress.log(now, bytes, failure_count);
+                    }
+                    if let Some(stall) = progress.stalled(now, watch.stall_after) {
+                        tracing::error!("storage-engine: {stall}");
+                        return Err(ferrosa_common::Error::InvalidFormat(stall));
+                    }
+                    continue;
+                }
+            };
+            let Some((dir_name, gen, outcome)) = next else {
+                break;
+            };
+            let now = Instant::now();
+            progress.finished_one(now);
+            // Also report here: the fetches write and fsync components on
+            // this thread, which can hold the ticker off for seconds.
+            if progress.report_due(now, watch.progress_every) {
+                progress.log(now, reads.index_bytes_fetched(), failure_count);
+            }
             match outcome {
                 Ok(crate::evicted_read::QueryFetch::Ready) => registered += 1,
                 Ok(crate::evicted_read::QueryFetch::IndexArtifactsLost(message)) => note_failure(
@@ -14724,6 +14909,9 @@ impl StorageEngine {
         }
         tracing::info!(
             registered,
+            bytes = reads
+                .index_bytes_fetched()
+                .saturating_sub(progress.bytes_at_start),
             elapsed_ms = started.elapsed().as_millis() as u64,
             "storage-engine: evicted SSTables registered as remote-backed"
         );
@@ -16170,6 +16358,7 @@ mod flush_panic_recovery;
 mod tests {
     include!("engine_wiring_tests.rs");
     include!("engine_evicted_ranged_tests.rs");
+    include!("engine_outage_tests.rs");
     include!("engine_finalize_offload_tests.rs");
 
     use super::*;

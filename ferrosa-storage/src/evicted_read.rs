@@ -392,8 +392,8 @@ impl EvictedReadStore {
         self.gets.load(Ordering::Relaxed)
     }
 
-    /// Bytes of index components downloaded for ranged opens.
-    #[cfg(test)]
+    /// Bytes of index components downloaded for ranged opens (startup
+    /// registration reports its progress in these).
     pub(crate) fn index_bytes_fetched(&self) -> u64 {
         self.index_bytes_fetched.load(Ordering::Relaxed)
     }
