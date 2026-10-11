@@ -2798,6 +2798,7 @@ dependencies = [
  "chrono",
  "ferrosa-jsonb",
  "ferrosa-storage",
+ "libc",
  "num-bigint",
  "ordered-float",
  "serde",

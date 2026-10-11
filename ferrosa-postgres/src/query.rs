@@ -36,9 +36,9 @@ use ferrosa_common::timeuuid::is_synthetic_key_column;
 use ferrosa_common::{CqlType, CqlValue};
 use ferrosa_schema::{ColumnKind, Schema};
 use ferrosa_sql::{
-    parse_statement, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr, InsertStmt,
-    MapCatalog, QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt, Statement, Term,
-    UpdateStmt, Value as SqlValue,
+    parse_statement, ArithOp, CastTarget, Column, ColumnType, DeleteStmt, ExecError, Expr,
+    InsertStmt, MapCatalog, QueryResult, Returning, Row, ScalarItem, ScalarValue, SelectStmt,
+    SetExpr, Statement, Term, UpdateStmt, Value as SqlValue,
 };
 use ferrosa_storage::{Mutation, StorageEngine};
 
@@ -2850,11 +2850,16 @@ pub(crate) fn insert_placeholders(ins: &InsertStmt) -> Vec<usize> {
 
 /// Collect the `$N` placeholder indices referenced by an `UPDATE` (SET + WHERE).
 pub(crate) fn update_placeholders(upd: &UpdateStmt) -> Vec<usize> {
-    upd.assignments
-        .iter()
-        .chain(upd.where_eq.iter())
-        .filter_map(|(_, sv)| scalar_param_index(sv))
-        .collect()
+    let mut out = Vec::new();
+    for (_, expr) in &upd.assignments {
+        expr.collect_params(&mut out);
+    }
+    out.extend(
+        upd.where_eq
+            .iter()
+            .filter_map(|(_, sv)| scalar_param_index(sv)),
+    );
+    out
 }
 
 /// Collect the `$N` placeholder indices referenced by a `DELETE`'s WHERE.
@@ -2884,13 +2889,24 @@ fn insert_param_targets(ins: &InsertStmt) -> Vec<(usize, &str)> {
 }
 
 /// `(placeholder index, target column name)` pairs for an `UPDATE`: SET and
-/// WHERE `$N`s are bound to the column on the left of each `=`.
+/// WHERE `$N`s are bound to the column on the left of each `=`. A `$N` inside an
+/// arithmetic SET value (`c = c + $1`) is bound to the SET target column, whose
+/// type then drives its OID — the same column the value is assigned to.
 fn update_param_targets(upd: &UpdateStmt) -> Vec<(usize, &str)> {
-    upd.assignments
-        .iter()
-        .chain(upd.where_eq.iter())
-        .filter_map(|(col, sv)| scalar_param_index(sv).map(|n| (n, col.as_str())))
-        .collect()
+    let mut out: Vec<(usize, &str)> = Vec::new();
+    for (col, expr) in &upd.assignments {
+        let mut params = Vec::new();
+        expr.collect_params(&mut params);
+        for n in params {
+            out.push((n, col.as_str()));
+        }
+    }
+    for (col, sv) in &upd.where_eq {
+        if let Some(n) = scalar_param_index(sv) {
+            out.push((n, col.as_str()));
+        }
+    }
+    out
 }
 
 /// `(placeholder index, target column name)` pairs for a `DELETE` WHERE.
@@ -3118,6 +3134,26 @@ fn resolve_dml_value<'a>(
 /// regular/static cells. Returns `CommandComplete "UPDATE 1"` — the engine write
 /// is a blind upsert, so the affected-row count is reported as 1 when the write
 /// lands (Cassandra has no match count; this is the documented semantic).
+///
+/// # A `SET` value that reads a column is a READ-MODIFY-WRITE
+///
+/// `SET c = c + 1` is not a constant: it reads the row's CURRENT value of `c` and
+/// writes `current + 1` — pgbench's `abalance = abalance + :delta`, and the reason
+/// every pgbench workload (`-N`, `tpcb-like`) was impossible before this. Such an
+/// `UPDATE` reads the row FIRST: the committed storage image, with the open
+/// transaction's own buffered writes overlaid so an earlier statement in the same
+/// transaction is visible (read-your-own-writes), then evaluates the arithmetic and
+/// writes the result. A constant `SET` (`SET b = 'yy'`) keeps the original
+/// blind-upsert path and reads nothing.
+///
+/// # NULL semantics (pinned)
+///
+/// `NULL <op> x` is NULL, exactly as in PostgreSQL, so `SET c = c + 1` on a row
+/// whose `c` is NULL leaves `c` NULL. When the `WHERE` matches no live row, ferrosa
+/// is an upsert: every column reads SQL NULL, so `c = c + 1` writes NULL (PostgreSQL
+/// would have matched no row and written nothing — the documented divergence of an
+/// upsert engine). Neither case arises for pgbench, whose rows always exist with a
+/// non-NULL balance.
 pub(crate) async fn execute_update(
     context: DmlContext<'_>,
     upd: &UpdateStmt,
@@ -3130,7 +3166,7 @@ pub(crate) async fn execute_update(
         mvcc,
         schema,
         default_schema,
-        txn,
+        mut txn,
         jsonb_limits,
     } = context;
 
@@ -3156,47 +3192,8 @@ pub(crate) async fn execute_update(
         }
     };
 
-    // SET assignments -> regular/static cells (by storage index).
-    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
-    // The assigned values, keyed by column, so a FOREIGN KEY column that is being SET can be
-    // re-checked against its parent before the write (a foreign key on a column the UPDATE does
-    // not touch keeps its already-valid old value and needs no check).
-    let mut assigned: HashMap<String, CqlValue> = HashMap::new();
-    for (col_name, sv) in &upd.assignments {
-        let (col_meta, _sql_value, value) = match resolve_dml_value(
-            meta,
-            schema,
-            ks,
-            table,
-            col_name,
-            sv,
-            ParamCtx {
-                params,
-                jsonb_limits,
-            },
-        ) {
-            Ok(r) => r,
-            Err(msg) => return vec![msg],
-        };
-        if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
-            return vec![error_response(
-                "0A000",
-                &format!("cannot UPDATE key column \"{col_name}\" in SET"),
-            )];
-        }
-        assigned.insert(col_name.clone(), value.clone());
-        match meta.storage_column_index(col_name) {
-            Some(idx) => regular_cells.push((idx, value)),
-            None => {
-                return vec![error_response(
-                    "42703",
-                    &format!("column \"{col_name}\" not found in storage schema"),
-                )]
-            }
-        }
-    }
-
-    // WHERE equality -> key values (must be key columns).
+    // WHERE equality -> key values (must be key columns). Resolved FIRST: an
+    // arithmetic SET needs the key before it can read the row it is updating.
     let mut key_values: HashMap<String, CqlValue> = HashMap::new();
     for (col_name, sv) in &upd.where_eq {
         let (col_meta, _sql_value, value) = match resolve_dml_value(
@@ -3226,11 +3223,6 @@ pub(crate) async fn execute_update(
         key_values.insert(col_name.clone(), value);
     }
 
-    // Enforce every FOREIGN KEY on a column this UPDATE assigns, before the write.
-    if let Err((code, message)) = crate::pg_fk::check_child_row(engine, schema, meta, &assigned) {
-        return vec![error_response(&code, &message)];
-    }
-
     let mut pk_values = Vec::with_capacity(meta.partition_key.len());
     for name in &meta.partition_key {
         match key_values.get(name) {
@@ -3256,6 +3248,85 @@ pub(crate) async fn execute_update(
         }
     }
 
+    // Does any SET value read a column of the row being updated? Only then is the
+    // row read (a read-modify-write); a constant SET never touches storage here.
+    let needs_read = upd
+        .assignments
+        .iter()
+        .any(|(_, expr)| expr.references_column());
+    let current: Option<HashMap<String, SqlValue>> = if needs_read {
+        match read_current_row_for_update(
+            engine,
+            schema,
+            ks,
+            table,
+            &pk_values,
+            &ck_values,
+            txn.as_deref_mut(),
+        ) {
+            // The row image is in DECLARED column order; pair it with the declared names
+            // so `eval_set_expr` can resolve a `SetExpr::Column` by name.
+            Ok(row) => row.map(|row| meta.columns.keys().cloned().zip(row.0).collect()),
+            Err(msg) => return vec![msg],
+        }
+    } else {
+        None
+    };
+
+    // SET assignments -> regular/static cells (by storage index).
+    let mut regular_cells: Vec<(u16, CqlValue)> = Vec::new();
+    // The assigned values, keyed by column, so a FOREIGN KEY column that is being
+    // SET can be re-checked against its parent before the write (a foreign key on a
+    // column the UPDATE does not touch keeps its already-valid old value and needs
+    // no check).
+    let mut assigned: HashMap<String, CqlValue> = HashMap::new();
+    for (col_name, expr) in &upd.assignments {
+        let col_meta = match meta.columns.get(col_name) {
+            Some(c) => c,
+            None => {
+                return vec![error_response(
+                    "42703",
+                    &format!("column \"{col_name}\" of relation \"{table}\" does not exist"),
+                )]
+            }
+        };
+        let cql_type =
+            match ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
+            {
+                Ok(t) => t,
+                Err(e) => return vec![error_response("42704", &e.to_string())],
+            };
+        let sql_value = match eval_set_expr(expr, current.as_ref(), params) {
+            Ok(v) => v,
+            Err(msg) => return vec![msg],
+        };
+        let value = match value_to_cql(&sql_value, &cql_type, jsonb_limits) {
+            Ok(v) => v,
+            Err(msg) => return vec![msg],
+        };
+        if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
+            return vec![error_response(
+                "0A000",
+                &format!("cannot UPDATE key column \"{col_name}\" in SET"),
+            )];
+        }
+        assigned.insert(col_name.clone(), value.clone());
+        match meta.storage_column_index(col_name) {
+            Some(idx) => regular_cells.push((idx, value)),
+            None => {
+                return vec![error_response(
+                    "42703",
+                    &format!("column \"{col_name}\" not found in storage schema"),
+                )]
+            }
+        }
+    }
+
+    // Enforce every FOREIGN KEY on a column this UPDATE assigns, before the write.
+    if let Err((code, message)) = crate::pg_fk::check_child_row(engine, schema, meta, &assigned) {
+        return vec![error_response(&code, &message)];
+    }
+
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -3273,6 +3344,240 @@ pub(crate) async fn execute_update(
         timestamp,
     );
     apply_or_buffer(engine, schema, mvcc, txn, mutation, "UPDATE 1").await
+}
+
+/// Read the CURRENT row an arithmetic `UPDATE`'s `SET` expression must evaluate
+/// against, keyed by the `WHERE`-supplied primary key.
+///
+/// The image is the committed storage row with the open transaction's own buffered
+/// writes overlaid, so an earlier statement in the same transaction is visible
+/// (read-your-own-writes); `Ok(None)` means there is no live row (every column then
+/// reads SQL NULL). The caller pairs the returned [`Row`] with the table's declared
+/// column names (the codec decodes storage ordinals back to declared positions, so the
+/// image is in declared order).
+///
+/// The read is a normal point read of the row's storage, so the engine records it in
+/// the read set a serializable COMMIT validates — a concurrent writer of the same row
+/// fails that commit rather than silently losing this update.
+fn read_current_row_for_update(
+    engine: &StorageEngine,
+    schema: &Schema,
+    ks: &str,
+    table: &str,
+    pk_values: &[CqlValue],
+    ck_values: &[CqlValue],
+    txn: Option<&mut TxnWriteSet>,
+) -> Result<Option<Row>, BackendMessage> {
+    use std::collections::HashMap;
+
+    // The SQL key tuple the write-set overlay is keyed by: pk ++ ck, in key order.
+    let mut key: Vec<SqlValue> = Vec::with_capacity(pk_values.len() + ck_values.len());
+    for v in pk_values.iter().chain(ck_values.iter()) {
+        key.push(
+            crate::storage_provider::cql_to_value(v).map_err(|e| error_response("22000", &e))?,
+        );
+    }
+
+    // Rows this transaction has already written, merged over their committed base —
+    // so an earlier `UPDATE` in the same transaction is seen, not the stale base.
+    let mut overlay: HashMap<Vec<SqlValue>, Option<Row>> = HashMap::new();
+    if let Some(buffer) = txn {
+        let writes = buffer.pending_writes().map_err(|e| {
+            error_response(
+                "58000",
+                &format!("transaction write-set could not be read back: {e}"),
+            )
+        })?;
+        crate::storage_provider::apply_pending_writes(
+            engine,
+            schema,
+            ks,
+            table,
+            &mut overlay,
+            &writes,
+        )
+        .map_err(|e| {
+            error_response(
+                "58000",
+                &format!("transaction write-set could not be decoded: {e}"),
+            )
+        })?;
+    }
+
+    let row: Option<Row> = if let Some(found) = overlay.get(&key) {
+        found.clone()
+    } else {
+        // Not written by this transaction: read the committed row from storage.
+        let decorated = ferrosa_row_bridge::build_decorated_key(pk_values, &[])
+            .map_err(|e| error_response("22000", &e.to_string()))?;
+        let clustering = ferrosa_row_bridge::encode_clustering(ck_values);
+        let table_id = ferrosa_storage::TableId::new(ks, table);
+        let partition = engine
+            .read_clustering_row(&table_id, &decorated, &clustering)
+            .map_err(|e| error_response("58000", &e.to_string()))?;
+        match partition {
+            Some(partition) => {
+                let codec = TableCodec::build(ks, table, schema)
+                    .map_err(|e| error_response("58000", &e))?;
+                crate::storage_provider::partition_row_image(&codec, ks, table, &partition)
+                    .map_err(|e| error_response("58000", &e))?
+                    .map(|(_, row)| row)
+            }
+            None => None,
+        }
+    };
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    // The image is in DECLARED column order (the codec decodes storage ordinals back to
+    // declared positions); the caller pairs it with the declared names.
+    Ok(Some(row))
+}
+
+/// Evaluate one `SET` right-hand side to a concrete SQL value.
+///
+/// [`SetExpr::Value`] substitutes a bound `$N` (or passes a literal / refuses a
+/// function) exactly as the DML value path always has. [`SetExpr::Column`] reads the
+/// CURRENT value of that column from `current` (the row image
+/// [`read_current_row_for_update`] built); when there is no live row the column reads
+/// SQL NULL, so `c + 1` is NULL. [`SetExpr::Binary`] evaluates both sides and applies
+/// [`apply_arith`].
+fn eval_set_expr(
+    expr: &SetExpr,
+    current: Option<&std::collections::HashMap<String, SqlValue>>,
+    params: &[SqlValue],
+) -> Result<SqlValue, BackendMessage> {
+    match expr {
+        SetExpr::Value(sv) => substitute_param(sv, params),
+        SetExpr::Column(cr) => Ok(current
+            .and_then(|row| row.get(&cr.name))
+            .cloned()
+            .unwrap_or(SqlValue::Null)),
+        SetExpr::Binary { op, left, right } => {
+            let l = eval_set_expr(left, current, params)?;
+            let r = eval_set_expr(right, current, params)?;
+            apply_arith(*op, &l, &r)
+        }
+    }
+}
+
+/// Apply one arithmetic operator to two SQL values, with PostgreSQL semantics.
+///
+/// - `NULL <op> x` and `x <op> NULL` are NULL (three-valued logic);
+/// - `integer` arithmetic is exact and fails loud (`22003`) on overflow;
+/// - `numeric` arithmetic (and a `numeric` with an `integer`) is exact arbitrary
+///   precision;
+/// - `double precision` wins over `numeric` (`numeric + float8 = float8`, as in
+///   PostgreSQL), so an f64 literal makes the result `f64`;
+/// - any other operand type is refused by name (`42883`), never coerced silently.
+fn apply_arith(op: ArithOp, left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMessage> {
+    if left.is_null() || right.is_null() {
+        return Ok(SqlValue::Null);
+    }
+
+    // Only the numeric domain has arithmetic here; anything else is refused by name,
+    // never coerced (so `text + integer` is `42883`, not a concatenation).
+    let numeric_domain = |v: &SqlValue| {
+        matches!(
+            v,
+            SqlValue::Int(_) | SqlValue::Float(_) | SqlValue::Numeric { .. }
+        )
+    };
+    if !numeric_domain(left) || !numeric_domain(right) {
+        return Err(error_response(
+            "42883",
+            &format!(
+                "operator does not exist: {} {} {}",
+                value_type_name(left),
+                op.symbol(),
+                value_type_name(right)
+            ),
+        ));
+    }
+
+    // `double precision` wins over `numeric`, matching PostgreSQL's operator
+    // resolution (`numeric + float8` is `float8`). A decimal LITERAL arrives as an
+    // f64, so `SET p = p + 0.25` against a `numeric` column takes THIS arm.
+    if matches!(left, SqlValue::Float(_)) || matches!(right, SqlValue::Float(_)) {
+        let a = as_f64(left);
+        let b = as_f64(right);
+        let r = match op {
+            ArithOp::Add => a + b,
+            ArithOp::Sub => a - b,
+            ArithOp::Mul => a * b,
+        };
+        return Ok(SqlValue::float(r));
+    }
+
+    // numeric: exact arbitrary precision. Also pulls integer operands into the decimal
+    // domain, as PostgreSQL does (`numeric + int` is `numeric`).
+    if matches!(left, SqlValue::Numeric { .. }) || matches!(right, SqlValue::Numeric { .. }) {
+        let (a, sa) = numeric_parts(left)?;
+        let (b, sb) = numeric_parts(right)?;
+        return Ok(match op {
+            ArithOp::Mul => SqlValue::numeric(a * b, sa + sb),
+            ArithOp::Add | ArithOp::Sub => {
+                let scale = sa.max(sb);
+                let a = scale_pow10(a, scale - sa);
+                let b = scale_pow10(b, scale - sb);
+                let r = if op == ArithOp::Add { a + b } else { a - b };
+                SqlValue::numeric(r, scale)
+            }
+        });
+    }
+
+    // Integer, exact, failing loud on overflow rather than wrapping into a wrong value.
+    let (SqlValue::Int(a), SqlValue::Int(b)) = (left, right) else {
+        unreachable!("both operands are Int and neither is Float or Numeric");
+    };
+    let r = match op {
+        ArithOp::Add => a.checked_add(*b),
+        ArithOp::Sub => a.checked_sub(*b),
+        ArithOp::Mul => a.checked_mul(*b),
+    };
+    r.map(SqlValue::Int)
+        .ok_or_else(|| error_response("22003", "integer out of range"))
+}
+
+/// The `(unscaled, scale)` of a value in the `numeric` domain, widening an integer.
+fn numeric_parts(value: &SqlValue) -> Result<(num_bigint::BigInt, i32), BackendMessage> {
+    match value {
+        SqlValue::Numeric { unscaled, scale } => Ok((unscaled.clone(), *scale)),
+        SqlValue::Int(i) => Ok((num_bigint::BigInt::from(*i), 0)),
+        other => Err(error_response(
+            "42883",
+            &format!(
+                "operator does not exist: {} in numeric arithmetic",
+                value_type_name(other)
+            ),
+        )),
+    }
+}
+
+/// Multiply `n` by `10^power` (a non-positive `power` is a no-op), aligning a
+/// decimal's scale. Exact integer math.
+fn scale_pow10(mut n: num_bigint::BigInt, power: i32) -> num_bigint::BigInt {
+    if power > 0 {
+        n *= num_bigint::BigInt::from(10).pow(power as u32);
+    }
+    n
+}
+
+/// A numeric-domain operand as `f64`. `Int` and `Float` are exact-to-`f64`; a `Numeric`
+/// is only reached for `numeric <op> double precision`, whose PostgreSQL result is
+/// `double precision`, so the decimal is promoted (lossily) here just as PostgreSQL
+/// does at that operator's resolution.
+fn as_f64(value: &SqlValue) -> f64 {
+    match value {
+        SqlValue::Int(i) => *i as f64,
+        SqlValue::Float(f) => f.0,
+        SqlValue::Numeric { unscaled, scale } => {
+            let digits = unscaled.to_string();
+            digits.parse::<f64>().unwrap_or(f64::NAN) * 10f64.powi(-*scale)
+        }
+        _ => unreachable!("as_f64 is only called on a numeric-domain operand"),
+    }
 }
 
 /// Execute a single-row `DELETE`: a row-level tombstone. The equality `WHERE`
@@ -7372,6 +7677,469 @@ mod txn_buffer_tests {
         assert!(
             message.contains("still referenced from table \"c\""),
             "{message}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // `UPDATE ... SET <expr>`: a SET value that READS a column is a real
+    // read-modify-write. Every assertion below is on the VALUE read back
+    // through the wire SELECT path — never a row count, which a no-op that
+    // writes nothing would satisfy.
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// The declared metadata of `public.t(id int PK, c int, p decimal, b text)` —
+    /// the table the arithmetic-`UPDATE` tests read their results back from.
+    fn arith_table_metadata() -> TableMetadata {
+        let mut cols = IndexMap::new();
+        cols.insert(
+            "id".to_string(),
+            column("id", ColumnKind::PartitionKey, "int"),
+        );
+        cols.insert("c".to_string(), column("c", ColumnKind::Regular, "int"));
+        cols.insert("p".to_string(), column("p", ColumnKind::Regular, "decimal"));
+        cols.insert("b".to_string(), column("b", ColumnKind::Regular, "text"));
+        TableMetadata {
+            keyspace: "public".to_string(),
+            name: "t".to_string(),
+            id: Uuid::new_v4(),
+            columns: cols,
+            partition_key: vec!["id".to_string()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        }
+    }
+
+    fn schema_with_arith_table() -> Schema {
+        let schema = Schema::new(schema_config()).expect("schema bootstraps");
+        let auth = superuser();
+        schema
+            .create_keyspace(
+                KeyspaceMetadata {
+                    name: "public".to_string(),
+                    durable_writes: true,
+                    replication: ReplicationParams {
+                        strategy: "SimpleStrategy".to_string(),
+                        options: {
+                            let mut o = HashMap::new();
+                            o.insert("replication_factor".to_string(), "1".to_string());
+                            o
+                        },
+                    },
+                },
+                &auth,
+            )
+            .expect("create keyspace public");
+        schema
+            .create_table(arith_table_metadata(), &auth)
+            .expect("create table t");
+        schema
+    }
+
+    fn new_engine_with_arith_table() -> (tempfile::TempDir, Arc<StorageEngine>, Schema) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        // The storage schema MUST come from `to_storage_schema()`: it orders the regular
+        // columns by Cassandra's name comparator, so a hand-written order silently
+        // disagrees with the metadata's `storage_column_index` and corrupts any
+        // multi-column write. Here that order is `b, c, p`.
+        engine
+            .register_table(arith_table_metadata().to_storage_schema())
+            .unwrap();
+        let schema = schema_with_arith_table();
+        (dir, engine, schema)
+    }
+
+    /// Run one statement that must succeed, failing loud with the messages.
+    async fn exec_ok(engine: &Arc<StorageEngine>, schema: &Schema, sql: &str) {
+        let msgs = run_sql(engine, schema, sql).await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "statement must succeed: {sql}\n{msgs:?}"
+        );
+    }
+
+    /// Every `(id, c, p, b)` cell of `t`, read back through the wire SELECT path in
+    /// `id` order. A `None` cell is SQL NULL; a `String` is the cell's rendered value.
+    async fn read_arith_rows(
+        engine: &Arc<StorageEngine>,
+        schema: &Schema,
+    ) -> Vec<[Option<String>; 4]> {
+        let msgs = run_sql(engine, schema, "SELECT id, c, p, b FROM t ORDER BY id").await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "read-back SELECT of t failed: {msgs:?}"
+        );
+        fn cell(columns: &[Option<Vec<u8>>], i: usize) -> Option<String> {
+            columns
+                .get(i)
+                .and_then(|c| c.as_ref())
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+        }
+        msgs.iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns } => Some([
+                    cell(columns, 0),
+                    cell(columns, 1),
+                    cell(columns, 2),
+                    cell(columns, 3),
+                ]),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Read the single cell `col` of the row whose `id` is `key`, through the wire
+    /// SELECT path inside the OPEN transaction `txn` (so the buffered write-set is
+    /// overlaid).
+    async fn read_cell_in_txn(
+        engine: &Arc<StorageEngine>,
+        schema: &Schema,
+        txn: &mut TxnWriteSet,
+        col: &str,
+        key: i32,
+    ) -> Option<String> {
+        let msgs = execute_query(
+            engine,
+            schema,
+            &format!("SELECT {col} FROM t WHERE id = {key}"),
+            "public",
+            &crate::jsonb_wire::test_limits(),
+            Some(txn),
+        )
+        .await;
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "in-transaction read-back of t.{col} failed: {msgs:?}"
+        );
+        msgs.iter().find_map(|m| match m {
+            BackendMessage::DataRow { columns } => Some(
+                String::from_utf8_lossy(columns[0].as_deref().unwrap_or_default()).into_owned(),
+            ),
+            _ => None,
+        })
+    }
+
+    /// THE point of the change: `UPDATE t SET c = c + 1` must READ the stored row,
+    /// add one, and write the RESULT. The assertion is on the VALUE read back.
+    ///
+    /// RED before this change: the statement died at LEX time (`bad token: +`), so
+    /// pgbench's `abalance = abalance + :delta` could not run at all.
+    #[tokio::test]
+    async fn update_set_column_plus_one_reads_the_stored_value() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, c) VALUES (1, 10)").await;
+
+        let msgs = run_sql(&engine, &schema, "UPDATE t SET c = c + 1 WHERE id = 1").await;
+        assert_completed(&msgs, "UPDATE 1");
+
+        let rows = read_arith_rows(&engine, &schema).await;
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly the addressed row must exist: {rows:?}"
+        );
+        assert_eq!(
+            rows[0][0].as_deref(),
+            Some("1"),
+            "the key must be unchanged: {rows:?}"
+        );
+        assert_eq!(
+            rows[0][1].as_deref(),
+            Some("11"),
+            "c must be old + 1 — neither the old value (a no-op) nor NULL (an unread column): {rows:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// No lost update: two `c = c + 1` in ONE open transaction must yield `base + 2`.
+    ///
+    /// The writes are BUFFERED (never applied before COMMIT), so the second UPDATE must
+    /// read the FIRST update's own staged value through the write-set overlay. Without
+    /// read-your-own-writes both reads see the committed base and the result is
+    /// `base + 1` — one increment lost. Both the pre-COMMIT storage read and the
+    /// in-transaction read go back through the wire SELECT path.
+    #[tokio::test]
+    async fn two_arithmetic_updates_in_one_transaction_do_not_lose_the_first() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, c) VALUES (1, 100)").await;
+
+        let mut buffer = TxnWriteSet::default();
+        let limits = crate::jsonb_wire::test_limits();
+        for _ in 0..2 {
+            let msgs = execute_query(
+                &engine,
+                &schema,
+                "UPDATE t SET c = c + 1 WHERE id = 1",
+                "public",
+                &limits,
+                Some(&mut buffer),
+            )
+            .await;
+            assert_completed(&msgs, "UPDATE 1");
+        }
+
+        // Nothing is applied before COMMIT: storage still holds the committed base.
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][1].as_deref(),
+            Some("100"),
+            "a buffered write must not be visible in storage before COMMIT"
+        );
+
+        // Read back through the SAME open transaction: base + 2, not base + 1.
+        assert_eq!(
+            read_cell_in_txn(&engine, &schema, &mut buffer, "c", 1)
+                .await
+                .as_deref(),
+            Some("102"),
+            "base + 1 twice must be base + 2 (no lost update)"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// `WHERE` still bounds the rows touched: a sibling row's `c` must be unchanged.
+    #[tokio::test]
+    async fn arithmetic_update_touches_only_the_where_row() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, c) VALUES (1, 10)").await;
+        exec_ok(&engine, &schema, "INSERT INTO t (id, c) VALUES (2, 20)").await;
+
+        exec_ok(&engine, &schema, "UPDATE t SET c = c + 5 WHERE id = 2").await;
+
+        let rows = read_arith_rows(&engine, &schema).await;
+        assert_eq!(rows.len(), 2, "both rows must still exist: {rows:?}");
+        assert_eq!(
+            (rows[0][0].as_deref(), rows[0][1].as_deref()),
+            (Some("1"), Some("10")),
+            "the unaddressed sibling must be untouched: {rows:?}"
+        );
+        assert_eq!(
+            (rows[1][0].as_deref(), rows[1][1].as_deref()),
+            (Some("2"), Some("25")),
+            "only the addressed row changes: {rows:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// NULL semantics (PINNED): `NULL + 1` is NULL — PostgreSQL three-valued logic —
+    /// so a row whose `c` is NULL keeps `c` NULL. Chosen over \"treat an absent value as
+    /// 0\" because the latter would silently invent data: a client reading back 1 could
+    /// not tell a real zero from a missing cell.
+    #[tokio::test]
+    async fn null_plus_one_stays_null() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id) VALUES (1)").await;
+        exec_ok(&engine, &schema, "UPDATE t SET c = c + 1 WHERE id = 1").await;
+
+        let rows = read_arith_rows(&engine, &schema).await;
+        assert_eq!(rows.len(), 1, "the addressed row must exist: {rows:?}");
+        assert_eq!(rows[0][1], None, "NULL + 1 must be NULL, not 1: {rows:?}");
+        engine.shutdown().unwrap();
+    }
+
+    /// The fix must be GENERAL, not the one pgbench string: `+`, `-`, `*` and
+    /// parentheses, with SQL precedence (`*` binds tighter; `(` overrides).
+    #[tokio::test]
+    async fn arithmetic_update_supports_plus_minus_star_and_parentheses() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, c) VALUES (1, 10)").await;
+
+        // c = 10; `c + 2 * 3` → 10 + 6 = 16 (`*` before `+`).
+        exec_ok(&engine, &schema, "UPDATE t SET c = c + 2 * 3 WHERE id = 1").await;
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][1].as_deref(),
+            Some("16"),
+            "`*` must bind tighter than `+`"
+        );
+
+        // c = 16; `c - 4` → 12.
+        exec_ok(&engine, &schema, "UPDATE t SET c = c - 4 WHERE id = 1").await;
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][1].as_deref(),
+            Some("12"),
+            "`-` must subtract"
+        );
+
+        // c = 12; `(c + 2) * 3` → 14 * 3 = 42 (parentheses override precedence).
+        exec_ok(
+            &engine,
+            &schema,
+            "UPDATE t SET c = (c + 2) * 3 WHERE id = 1",
+        )
+        .await;
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][1].as_deref(),
+            Some("42"),
+            "parentheses must override precedence"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// `numeric` arithmetic in a SET expression is EXACT (arbitrary precision), and it
+    /// widens an integer operand into the decimal domain — PostgreSQL's `numeric + int
+    /// = numeric`.
+    #[tokio::test]
+    async fn numeric_arithmetic_in_a_set_expression_is_exact() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, p) VALUES (1, 1.5)").await;
+
+        // 1.5 + 1 → 2.5 (exact; a float approximation would render differently).
+        exec_ok(&engine, &schema, "UPDATE t SET p = p + 1 WHERE id = 1").await;
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][2].as_deref(),
+            Some("2.5"),
+            "numeric + int must be exact numeric"
+        );
+
+        // 2.5 * 2 → 5.
+        exec_ok(&engine, &schema, "UPDATE t SET p = p * 2 WHERE id = 1").await;
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][2].as_deref(),
+            Some("5"),
+            "numeric * int must be exact numeric"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// Integer arithmetic is exact and fails LOUD on overflow (`22003`) — it must never
+    /// wrap into a wrong value.
+    #[tokio::test]
+    async fn integer_overflow_in_a_set_expression_is_refused_22003() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(
+            &engine,
+            &schema,
+            "INSERT INTO t (id, c) VALUES (1, 2147483647)",
+        )
+        .await;
+
+        let msgs = run_sql(&engine, &schema, "UPDATE t SET c = c + 1 WHERE id = 1").await;
+        assert_eq!(
+            error_code_and_message(&msgs).map(|(c, _)| c).as_deref(),
+            Some("22003"),
+            "integer overflow must be refused: {msgs:?}"
+        );
+        // And the row is untouched — no wrapped value.
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][1].as_deref(),
+            Some("2147483647"),
+            "a refused UPDATE must write nothing: {msgs:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// Negative control for the arithmetic TYPE guard: `text + integer` has no operator
+    /// and must be refused by name (`42883`), never coerced.
+    #[tokio::test]
+    async fn arithmetic_update_of_an_incompatible_type_is_refused_42883() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, b) VALUES (1, 'x')").await;
+
+        let msgs = run_sql(&engine, &schema, "UPDATE t SET b = b + 1 WHERE id = 1").await;
+        assert_eq!(
+            error_code_and_message(&msgs).map(|(c, _)| c).as_deref(),
+            Some("42883"),
+            "text + integer has no operator: {msgs:?}"
+        );
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][3].as_deref(),
+            Some("x"),
+            "a refused UPDATE must write nothing: {msgs:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// Negative control for the READ path: a CONSTANT `SET` reads nothing and keeps the
+    /// historical semantics — a blind upsert of the addressed key.
+    #[tokio::test]
+    async fn constant_set_keeps_the_blind_upsert_and_reads_nothing() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(
+            &engine,
+            &schema,
+            "INSERT INTO t (id, c, b) VALUES (1, 10, 'x')",
+        )
+        .await;
+
+        exec_ok(&engine, &schema, "UPDATE t SET b = 'yy' WHERE id = 1").await;
+        let rows = read_arith_rows(&engine, &schema).await;
+        assert_eq!(
+            rows[0][3].as_deref(),
+            Some("yy"),
+            "the constant must land: {rows:?}"
+        );
+        assert_eq!(
+            rows[0][1].as_deref(),
+            Some("10"),
+            "a column the SET does not name must be untouched: {rows:?}"
+        );
+
+        // The documented upsert divergence is unchanged: a constant SET on a key with no
+        // live row still writes the row.
+        exec_ok(&engine, &schema, "UPDATE t SET b = 'new' WHERE id = 99").await;
+        let rows = read_arith_rows(&engine, &schema).await;
+        assert_eq!(rows.len(), 2, "a constant SET still upserts: {rows:?}");
+        assert_eq!(rows[1][0].as_deref(), Some("99"), "{rows:?}");
+        assert_eq!(rows[1][3].as_deref(), Some("new"), "{rows:?}");
+        engine.shutdown().unwrap();
+    }
+
+    /// A multi-assignment `SET` mixing an arithmetic read-modify-write with a constant
+    /// must land BOTH cells in one statement — the SET list's capacity, not the single
+    /// pgbench string.
+    #[tokio::test]
+    async fn arithmetic_and_constant_assignments_land_together() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(
+            &engine,
+            &schema,
+            "INSERT INTO t (id, c, b) VALUES (1, 10, 'x')",
+        )
+        .await;
+
+        exec_ok(
+            &engine,
+            &schema,
+            "UPDATE t SET c = c + 1, b = 'y' WHERE id = 1",
+        )
+        .await;
+        let rows = read_arith_rows(&engine, &schema).await;
+        assert_eq!(rows.len(), 1, "the addressed row must exist: {rows:?}");
+        assert_eq!(
+            rows[0][1].as_deref(),
+            Some("11"),
+            "the arithmetic cell must land: {rows:?}"
+        );
+        assert_eq!(
+            rows[0][3].as_deref(),
+            Some("y"),
+            "the constant cell must land in the same statement: {rows:?}"
+        );
+        engine.shutdown().unwrap();
+    }
+
+    /// `numeric <op> double precision` is `double precision` per PostgreSQL's operator
+    /// resolution table, so a decimal LITERAL mixed with a `numeric` column resolves to
+    /// the float domain rather than being refused.
+    #[tokio::test]
+    async fn numeric_mixed_with_a_float_literal_resolves_to_double_precision() {
+        let (_dir, engine, schema) = new_engine_with_arith_table();
+        exec_ok(&engine, &schema, "INSERT INTO t (id, p) VALUES (1, 1.5)").await;
+
+        exec_ok(&engine, &schema, "UPDATE t SET p = p + 0.25 WHERE id = 1").await;
+        assert_eq!(
+            read_arith_rows(&engine, &schema).await[0][2].as_deref(),
+            Some("1.75"),
+            "numeric + float8 must resolve to float8 and be exact here"
         );
         engine.shutdown().unwrap();
     }
