@@ -1162,7 +1162,7 @@ fn note_lane_outcome<T>(
         tracing::warn!(
             ?lane,
             peer = %peer,
-            "lane failing repeatedly within the window; probing the connection before declaring \
+            "lane failing repeatedly with no success in between; probing the connection before declaring \
              it dead — a half-open socket never signals its own death, so the alive watcher \
              cannot fire and every RPC would otherwise time out forever"
         );
