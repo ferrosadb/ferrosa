@@ -662,7 +662,19 @@ impl<'input> Parser<'input> {
 
     fn parse_transaction_block(&mut self, timeout_ms: Option<u64>) -> Result<Statement, CqlError> {
         let mut statements = Vec::new();
+        let mut bindings: Vec<crate::ast::LetBinding> = Vec::new();
         loop {
+            // The parse-time form of a transactional read: the read is explicit in the
+            // statement rather than inferred from the open transaction.
+            if self.peek_is_soft_keyword("let")? {
+                let name = self.parse_let_binding(&mut statements)?;
+                bindings.push(crate::ast::LetBinding {
+                    name,
+                    stmt_index: statements.len() - 1,
+                });
+                self.lexer.expect(&TokenKind::Semicolon)?;
+                continue;
+            }
             let statement = self.parse_statement()?;
             match statement {
                 Statement::Commit { txn_id: None } => {
@@ -670,6 +682,7 @@ impl<'input> Parser<'input> {
                         timeout_ms,
                         statements,
                         rollback: false,
+                        bindings,
                     });
                 }
                 Statement::Rollback { txn_id: None } => {
@@ -677,6 +690,7 @@ impl<'input> Parser<'input> {
                         timeout_ms,
                         statements,
                         rollback: true,
+                        bindings,
                     });
                 }
                 Statement::BeginTransaction { .. } | Statement::TransactionBlock { .. } => {
@@ -704,6 +718,48 @@ impl<'input> Parser<'input> {
             }
             self.lexer.expect(&TokenKind::Semicolon)?;
         }
+    }
+
+    /// Whether the next token is the given SOFT keyword — a bare or quoted identifier, matched
+    /// case-insensitively — WITHOUT consuming it. Soft keywords stay usable as table or column
+    /// names, the same contract `TIMEOUT` has in `parse_transaction_timeout_ms`.
+    fn peek_is_soft_keyword(&mut self, word: &str) -> Result<bool, CqlError> {
+        let tok = self.lexer.peek()?;
+        Ok(match &tok.kind {
+            TokenKind::Ident(s) => s.eq_ignore_ascii_case(word),
+            TokenKind::QuotedIdent(s) => s.eq_ignore_ascii_case(word),
+            _ => false,
+        })
+    }
+
+    /// Parse `<name> = <statement>` after `LET` has been recognised, push the read into the
+    /// block's statements, and return the bound name. The read becomes an explicit,
+    /// parse-time binding rather than something inferred from an open transaction.
+    fn parse_let_binding(&mut self, statements: &mut Vec<Statement>) -> Result<String, CqlError> {
+        self.lexer.next_token()?; // consume LET
+        let name = match self.lexer.next_token()?.kind {
+            TokenKind::Ident(s) => s.to_string(),
+            TokenKind::QuotedIdent(s) => s,
+            other => {
+                return Err(CqlError::SyntaxError(format!(
+                    "expected a variable name after LET, got {other:?}"
+                )))
+            }
+        };
+        if !self.lexer.eat(&TokenKind::Eq)? {
+            return Err(CqlError::SyntaxError(
+                "expected an equals sign after the LET variable name".to_string(),
+            ));
+        }
+        let read = self.parse_statement()?;
+        if !matches!(read, Statement::Select(_)) {
+            return Err(CqlError::SyntaxError(
+                "LET may only bind a SELECT: a transactional read is declared at parse time"
+                    .to_string(),
+            ));
+        }
+        statements.push(read);
+        Ok(name)
     }
 
     fn parse_commit(&mut self) -> Result<Statement, CqlError> {
@@ -6020,6 +6076,7 @@ mod tests {
             timeout_ms,
             statements,
             rollback,
+            bindings: _,
         } = statement
         else {
             panic!("expected transaction block, got {statement:?}");

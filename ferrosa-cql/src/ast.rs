@@ -167,6 +167,9 @@ pub enum Statement {
         timeout_ms: Option<u64>,
         statements: Vec<Statement>,
         rollback: bool,
+        /// `LET` bindings declared in this block, in declaration order. Each names a read
+        /// that is explicit at parse time (see [`LetBinding`]).
+        bindings: Vec<LetBinding>,
     },
     /// `COMMIT [TRANSACTION [<id>]]` — commits a transaction. `txn_id = Some(id)`
     /// targets a connection-independent transaction by id; `None` resolves via the
@@ -185,6 +188,18 @@ pub enum Statement {
         txn_id: String,
         inner: Box<Statement>,
     },
+}
+
+/// A `LET <name> = SELECT ...` binding inside a transaction block.
+///
+/// The read is DECLARED in the statement, so the transaction's read-set is known at PARSE
+/// time rather than inferred from an open transaction. `stmt_index` points at the SELECT this
+/// binding names inside `TransactionBlock::statements`; later statements in the same block may
+/// reference `name` instead of re-reading storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LetBinding {
+    pub name: String,
+    pub stmt_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

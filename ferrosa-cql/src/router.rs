@@ -3053,6 +3053,9 @@ pub async fn route_transactional(
             timeout_ms,
             statements,
             rollback,
+            // Parsed and carried on the block; feeding these into the transaction's read-set is
+            // the next slice (see specs/todo/bug-txn-read-modify-write-loses-the-cell.md).
+            bindings: _,
         } => Some(
             route_transaction_block(state, ctx, shim, now, *timeout_ms, statements, *rollback)
                 .await,
@@ -17851,6 +17854,44 @@ mod tests {
     fn keyspace_rf_returns_1_when_keyspace_not_found() {
         let (state, _dir) = setup();
         assert_eq!(keyspace_rf(&state.schema, "nonexistent"), 1);
+    }
+
+    /// The parse-time form: Cassandra's `LET` block declares its read IN the statement, so the
+    /// transaction's read-set is known at PARSE time rather than inferred from an open
+    /// transaction. That is the simpler half of read-in-transaction, and the half the
+    /// read-modify-write defect needs first (see
+    /// `specs/todo/bug-txn-read-modify-write-loses-the-cell.md`).
+    ///
+    /// RED as written: no `LET` keyword exists in the lexer or AST, so this statement is
+    /// REFUSED at parse time today. It fails on that refusal - the behaviour - and not on a
+    /// missing internal symbol: every variant it inspects (`TransactionBlock`, `Select`,
+    /// `Update`) already exists, so removing the fix cannot make it fail to compile.
+    #[test]
+    fn a_let_block_declares_its_read_at_parse_time() {
+        let sql = "BEGIN TRANSACTION; \
+                   LET cur = SELECT v FROM ks.t WHERE aid = 7; \
+                   UPDATE ks.t SET v = cur + 1 WHERE aid = 7; \
+                   COMMIT TRANSACTION";
+        let stmt = crate::parser::parse(sql)
+            .expect("a LET block must parse into a transaction block, not be refused");
+        let (statements, rollback) = match stmt {
+            Statement::TransactionBlock {
+                statements,
+                rollback,
+                ..
+            } => (statements, rollback),
+            other => panic!("a LET block must parse as a transaction block, got {other:?}"),
+        };
+        assert!(!rollback, "a LET block is not a rollback block");
+        assert!(
+            statements.iter().any(|s| matches!(s, Statement::Select(_))),
+            "the LET read must appear in the block as a SELECT, so the read-set is explicit at \
+             parse time: {statements:?}"
+        );
+        assert!(
+            statements.iter().any(|s| matches!(s, Statement::Update(_))),
+            "the UPDATE that consumes the bound value must appear in the block: {statements:?}"
+        );
     }
 
     #[tokio::test]
