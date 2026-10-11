@@ -301,6 +301,39 @@ read-modify-write's computed value is IN the metadata before the commit is propo
 the fix is the PG mirror of 3a49ac1d. If it is, the loss is downstream of it and the probe's V1 line
 says where.
 
+### RT-2 ROOT CAUSE — the conflict predicate is per TABLE, not per KEY (2026-10-11)
+
+`validate_snapshot` (`ferrosa-postgres/src/mvcc.rs:725`) decides a serialization conflict from the
+TABLE's write epoch alone:
+
+    if read_tables.iter().any(|table| {
+        state.table_epochs.get(table).is_some_and(|epoch| *epoch > snapshot.read_ts)
+    }) { return Err(MvccCommitError::SerializationFailure); }
+
+`read_tables` is a `HashSet<String>` of table NAMES. So ANY concurrent write to a table this
+transaction read from refuses it, however unrelated the rows are. PostgreSQL raises a serialization
+failure on read-set / write-set OVERLAP, never on table identity — which is why every concurrent pair
+on one table loses a side.
+
+**A deterministic IN-PROCESS reproducer exists** (RT-3 never had one):
+`transactions_on_disjoint_keys_do_not_conflict` — two serializable snapshots, A writes `d1`, B writes
+`d2`, B is refused `40001` in 0.05 s with no cluster. Verbatim:
+
+    [ErrorResponse { fields: [(83,"ERROR"), (67,"40001"), (77,"could not serialize PostgreSQL transaction")] }]
+
+Its negative control runs FIRST: two transactions writing the SAME key must have exactly one refused.
+That case PASSES today, so the control is non-vacuous and a "fix" that simply never reports a conflict
+cannot go green.
+
+**The fix is feature-shaped. This half is NOT done:** the read-set must record the ROWS (or key
+ranges) a transaction read, not only the tables, and the conflict test must intersect that set with
+the concurrent commit's write set. The signature IS the defect — `read_tables: &HashSet<String>` cannot
+express a disjoint-key pair, so no honest unit red exists against it, which is why the red above is
+taken through the commit path instead.
+
+Red held out as `rt2-disjoint-keys.patch` in the scratch dir: a red inside a module cannot park its
+file, so the patch is the breadcrumb. It lands with its green.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
