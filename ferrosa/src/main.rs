@@ -3626,7 +3626,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ferrosa_postgres::ClusterRead::live(move || {
                     Some(std::sync::Arc::new(ferrosa_postgres::ClusterRangeRead::new(
                         write_path.clone(),
-                    )) as std::sync::Arc<dyn ferrosa_postgres::RangeRead>)
+                    ))
+                        as std::sync::Arc<dyn ferrosa_postgres::RangeRead>)
                 })
             },
             engine: storage.clone(),

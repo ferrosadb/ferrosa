@@ -40,8 +40,8 @@ mod txn_write_set;
 
 mod accord_access;
 
-pub use connection::{ConnError, Connection, TlsPolicy};
 pub use cluster_read::{ClusterRangeRead, ClusterRead, RangeRead};
+pub use connection::{ConnError, Connection, TlsPolicy};
 pub use ddl::{ClusterDdl, DdlExecutor};
 pub use handshake::{Handshake, HandshakeError, VerifierStore};
 pub use store::SchemaVerifierStore;

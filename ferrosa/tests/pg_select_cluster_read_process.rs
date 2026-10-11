@@ -432,10 +432,10 @@ async fn pg_select_consults_the_cluster_or_fails_loud() {
     wait_ready(&nodes[0], Duration::from_secs(90));
 
     // Then the other two seed off it, forming the star.
-    for i in 1..N_NODES {
+    for (i, port) in all_ports.iter().enumerate().skip(1) {
         nodes.push(spawn_node(
             tempfile::tempdir().expect("node data dir"),
-            all_ports[i],
+            *port,
             host_id(i),
             &cluster_name,
             Some(seed_hub.as_str()),
@@ -534,7 +534,8 @@ async fn pg_select_consults_the_cluster_or_fails_loud() {
                 .unwrap_or_else(|e| panic!("SELECT on node {i} failed: {e}"));
         }
         assert_eq!(
-            got, want,
+            got,
+            want,
             "node {i} returned {} of the {} committed rows. The PostgreSQL front end \
              must read the CLUSTER, not only this node's local store: with `public` \
              below the node count, a local scan is a silent subset. Values, not \
@@ -554,7 +555,8 @@ async fn pg_select_consults_the_cluster_or_fails_loud() {
 
     match read_rows(&client0).await {
         Ok(rows) => assert_eq!(
-            rows, want,
+            rows,
+            want,
             "with an owner stopped, node 0 returned {} of the {} committed rows as a \
              SUCCESSFUL result. An under-return must be indistinguishable from nothing: \
              it must fail loud, because a subset looks exactly like a smaller table. \

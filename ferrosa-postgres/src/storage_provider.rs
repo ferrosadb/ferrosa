@@ -636,6 +636,10 @@ pub async fn load_table(
     .await
 }
 
+// Context pass-through for the scan: engine, schema, table identity, the scan
+// failure accumulator, the uncommitted-write overlay, the bounded read buffer
+// and the cluster reader. See the note on `load_catalog_with_mvcc`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn load_table_with_overlay(
     engine: &Arc<StorageEngine>,
     schema: &Schema,

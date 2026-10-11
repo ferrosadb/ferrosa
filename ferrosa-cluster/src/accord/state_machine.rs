@@ -236,10 +236,7 @@ pub fn execute_apply_durability(work: ApplyDurableWork) -> ApplyDurableOutcome {
             deps: &work.deps,
         })
         .collect();
-    match work
-        .engine
-        .try_apply_writeset_borrowed(work.txn_id, &views)
-    {
+    match work.engine.try_apply_writeset_borrowed(work.txn_id, &views) {
         Ok(applied) => ApplyDurableOutcome {
             applied,
             storage_ok: true,
@@ -1130,7 +1127,8 @@ impl AccordStateMachine {
                     // Serialize with the lock-free path: the engine's park/cascade
                     // decision is a check-then-act the state lock no longer covers.
                     let _gate = self.apply_gate.lock();
-                    self.apply_engine.try_apply_writeset_borrowed(txn_id, &views)
+                    self.apply_engine
+                        .try_apply_writeset_borrowed(txn_id, &views)
                 };
                 let applied = match applied {
                     Ok(applied) => applied,
@@ -1159,7 +1157,7 @@ impl AccordStateMachine {
     /// hand back the durable work to run outside it.
     ///
     /// [`Self::handle_apply_writeset_borrowed`] split at the blocking storage step.
-    /// It shares [`Self::plan_apply`] with that method, so the two cannot drift on
+    /// It shares `Self::plan_apply` with that method, so the two cannot drift on
     /// the decision; the no-write finalizes have no storage batch to move out and
     /// delegate to it directly.
     ///

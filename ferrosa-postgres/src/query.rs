@@ -3982,6 +3982,12 @@ pub(crate) async fn load_catalog(
     load_catalog_with_mvcc(engine, schema, stmt, default_schema, None, None, None, None).await
 }
 
+// The read path threads its whole context through here: engine, schema, the
+// statement, the default schema, the MVCC view, pending writes and the cluster
+// reader. Bundling them would obscure which are read sources and which are
+// identity; the repo already allows this shape where it is genuinely a context
+// pass-through (e.g. extended.rs, copy_stdin.rs).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn load_catalog_with_mvcc(
     engine: &Arc<StorageEngine>,
     schema: &Schema,

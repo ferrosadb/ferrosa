@@ -183,8 +183,8 @@ impl AccordHandler {
         txn_id: TxnId,
         writes: Vec<Vec<u8>>,
     ) -> Option<SmResponse> {
-        let step = on_state_machine(&self.state, move |sm| sm.begin_apply_owned(txn_id, writes))
-            .await?;
+        let step =
+            on_state_machine(&self.state, move |sm| sm.begin_apply_owned(txn_id, writes)).await?;
         match step {
             ApplyStep::Done(resp) => Some(resp),
             ApplyStep::Durable(work) => {
