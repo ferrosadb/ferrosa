@@ -712,7 +712,11 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   vote collector stops once F+1 matching votes decide the predicate, without
   waiting for an unavailable minority. PostgreSQL snapshot barriers use the
   committed slow quorum plus a local dependency/apply check and do not fan out
-  remote read-votes. The replica apply path is **dep-ordered**: `handle_apply`
+  remote read-votes; that check decides on EVIDENCE OF PROGRESS (the dependency
+  set, each dependency's protocol phase, and the engine's completed-resolution
+  watermark) and its bound is a no-progress STALL BACKSTOP, never a total wait
+  budget, so a live-but-behind engine cannot make a barrier abstain (CL-63). The
+  replica apply path is **dep-ordered**: `handle_apply`
   routes every real write
   through `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of
   its dependencies have applied locally (otherwise it parks and the cascade

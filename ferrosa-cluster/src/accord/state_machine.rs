@@ -156,6 +156,20 @@ pub struct AccordStateMachine {
     /// always re-checks the unapplied-conflict condition under the lock after a
     /// wake — a spurious or coalesced wake just costs one extra re-check.
     applied_notify: Arc<Notify>,
+    /// Monotone count of dependency RESOLUTIONS this replica's apply path has
+    /// performed: advanced once per transaction advanced to `Applied`, and once
+    /// per transaction finalized without state (a dep resolved without a write).
+    ///
+    /// This is the **progress watermark** a dependency wait reads — the engine
+    /// ADVANCING it is the evidence that a wait is making progress. A read that
+    /// is merely behind a live engine (its dependencies still draining) sees the
+    /// watermark advance on every poll and keeps waiting; a read whose
+    /// dependencies have genuinely stalled sees it frozen for the whole interval
+    /// and abstains. It is deliberately a completion count, not a wall clock: the
+    /// engine advances it exactly when it finishes work, so the wait tracks the
+    /// engine's progress rather than elapsed time (see
+    /// [`crate::accord::handlers::await_conflicting_deps_applied`]).
+    applied_epoch: u64,
     /// The node's shared hybrid logical clock (the same `Arc` the transaction
     /// committer mints `t0` from). When set, every timestamp this replica
     /// observes through consensus — a PreAccept's proposed/bumped `t`, a
@@ -331,6 +345,7 @@ impl AccordStateMachine {
             applying: HashSet::new(),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            applied_epoch: 0,
             clock: None,
             finalized: FinalizedTxns::default(),
             refusing_by_floor: false,
@@ -360,6 +375,7 @@ impl AccordStateMachine {
             applying: HashSet::new(),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            applied_epoch: 0,
             clock: None,
             finalized: FinalizedTxns::default(),
             refusing_by_floor: false,
@@ -392,6 +408,7 @@ impl AccordStateMachine {
             applying: HashSet::new(),
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
+            applied_epoch: 0,
             clock: None,
             finalized: FinalizedTxns::default(),
             refusing_by_floor: false,
@@ -465,6 +482,16 @@ impl AccordStateMachine {
         Arc::clone(&self.applied_notify)
     }
 
+    /// The dependency-resolution progress watermark (see the `applied_epoch`
+    /// field): a monotone count advanced every time this replica advances a
+    /// transaction to `Applied` or finalizes one without state. Two reads that
+    /// are equal bracket an interval in which the apply path resolved nothing —
+    /// the only condition under which a dependency wait may abstain.
+    #[inline]
+    pub fn applied_epoch(&self) -> u64 {
+        self.applied_epoch
+    }
+
     /// Conflicting transactions on `key` that a linearizable read-at-`t` must
     /// wait for before reading: those that are **`Committed`** (their final
     /// execution timestamp is locked) ordered **before** `t` (`t_committed < t`)
@@ -514,6 +541,44 @@ impl AccordStateMachine {
             }
         }
         pending
+    }
+
+    /// A stable, order-independent signature of the conflicting dependencies a
+    /// linearizable read at `t` is still waiting on, carrying each one's PHASE.
+    ///
+    /// This is the per-read half of the dependency wait's progress evidence. Two
+    /// signatures that compare equal bracket an interval in which neither the SET
+    /// of dependencies nor any dependency's PROTOCOL PROGRESS changed — a
+    /// dependency advancing `PreAccepted → Accepted → Committed` is making
+    /// progress even before it applies, so a wait on it must not abstain. The
+    /// engine-wide [`Self::applied_epoch`] is the other half: it catches the case
+    /// where a dependency sits in `Committed` while the apply path is still
+    /// draining other work. A wait may abstain only when BOTH are frozen for its
+    /// whole bound — a genuinely stuck dependency.
+    pub fn dependency_wait_signature(&self, key: &[u8], t: &Timestamp) -> Vec<(TxnId, u8)> {
+        let mut signature: Vec<(TxnId, u8)> = self
+            .unapplied_conflicts_before(key, t)
+            .into_iter()
+            .map(|dep_id| {
+                // Phases advance forward only, so the rank is a monotone tag: any
+                // change is real progress, never a regression.
+                let phase = self
+                    .txn_states
+                    .get(&dep_id)
+                    .map_or(0, |state| match state.phase {
+                        TxnPhase::PreAccepted => 1,
+                        TxnPhase::Accepted => 2,
+                        TxnPhase::Committed => 3,
+                        TxnPhase::Applied => 4,
+                    });
+                (dep_id, phase)
+            })
+            .collect();
+        // `sort_unstable` on `(TxnId, u8)` is a total order, so the signature is
+        // independent of the `HashSet` iteration order the pending set is built
+        // from.
+        signature.sort_unstable();
+        signature
     }
 
     /// Diagnostic detail for every conflicting transaction a read at `t` is
@@ -1100,6 +1165,9 @@ impl AccordStateMachine {
                 // PreAccept may still be queued behind this finalize (CL-36).
                 self.finalized.record(txn_id);
                 self.conflict_index.remove(&txn_id);
+                // A dependency resolved without a write is still progress for any
+                // read waiting on it: advance the same watermark.
+                self.applied_epoch = self.applied_epoch.wrapping_add(1);
                 let woken = {
                     let _gate = self.apply_gate.lock();
                     self.apply_engine.notify_applied(txn_id)
@@ -1333,6 +1401,9 @@ impl AccordStateMachine {
             state.apply(result_data);
         }
         self.conflict_index.mark_applied(&txn_id);
+        // A completed dependency resolution: advance the progress watermark the
+        // dependency wait reads. See the `applied_epoch` field.
+        self.applied_epoch = self.applied_epoch.wrapping_add(1);
 
         // Wake any ReadVote dep-wait parked on a conflicting transaction reaching
         // Applied. Broadcast (all parked reads re-check their own condition under

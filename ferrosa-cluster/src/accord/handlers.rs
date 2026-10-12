@@ -251,14 +251,45 @@ where
 }
 
 /// Block until every conflicting transaction ordered before `t` (`t0 < t`) has
-/// reached `Applied` on the replica behind `state`, or until
-/// `READ_DEP_WAIT_TIMEOUT` elapses.
+/// reached `Applied` on the replica behind `state`.
 ///
 /// Returns `true` if all conflicts applied (a read-at-`t` may now proceed
-/// linearizably), `false` on timeout (the caller MUST ABSTAIN — never read
-/// stale). Shared by the inbound `AccordRead` handler (remote replicas) and by
-/// the coordinator's own local read-vote (its self-send Apply is unreachable, so
-/// it reads its local state machine directly).
+/// linearizably), `false` if the pending set stayed FROZEN for `timeout` (the
+/// caller MUST ABSTAIN — never read stale). Shared by the inbound `AccordRead`
+/// handler (remote replicas) and by the coordinator's own local read-vote (its
+/// self-send Apply is unreachable, so it reads its local state machine directly).
+///
+/// # The bound is a stall backstop, not a wait budget
+///
+/// `timeout` does not bound how long this read may wait for a dependency that is
+/// still being resolved; it bounds how long the wait may make NO PROGRESS. The
+/// wait decides on EVIDENCE OF PROGRESS — the read's dependency set *and each
+/// dependency's protocol phase* ([`AccordStateMachine::dependency_wait_signature`])
+/// plus the local engine's completed-resolution watermark
+/// ([`AccordStateMachine::applied_epoch`]) — and restarts the backstop clock
+/// every time either moves. A snapshot barrier queued behind a live,
+/// merely-behind engine (the PostgreSQL `SERIALIZABLE` batch on the one global
+/// barrier key, where each predecessor's apply drains the set) therefore keeps
+/// extending its clock instead of abstaining, however long the total drain
+/// takes. The bound fires only when the set, every dependency's phase, AND the
+/// engine watermark are all frozen for a full interval — the signature of a
+/// genuinely stuck dependency, from which the read can make no further progress
+/// and must fail loud rather than hang or read stale. Widening the budget is
+/// therefore never the fix; the engine's own progress is.
+///
+/// # Why this still terminates
+///
+/// Every reset requires a completed resolution or a forward phase advance. The
+/// dependency set can only be added to by a transaction with an even-earlier
+/// `t0`, and every dependency is either `Committed` (its execution timestamp is
+/// locked in the commit log, so the engine's idempotent Apply retry drives it to
+/// `Applied`) or is finalized out of the set by the protocol; the set therefore
+/// drains. A wait that is *not* draining has, by construction, no reset source,
+/// so the backstop fires within `timeout`. The only way to wait indefinitely is
+/// for the engine to keep resolving unrelated work forever while never resolving
+/// this dependency — and a dependency that a live engine cannot resolve is
+/// exactly the poisoned/absent case the phase detail log names, which the
+/// protocol's finalize paths (CL-23/CL-36) exist to clear.
 ///
 /// # Deadlock safety
 ///
@@ -288,7 +319,15 @@ pub(crate) async fn await_conflicting_deps_applied_within(
     t: Timestamp,
     timeout: std::time::Duration,
 ) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
+    // The evidence of progress: the dependency-set SIGNATURE (what the read is
+    // waiting on, and each dependency's protocol phase) and the engine's
+    // `applied_epoch` (the local apply path completed a resolution). Both are
+    // `None` until the first poll; `stall_deadline` is the BACKSTOP — pushed
+    // forward whenever either moved, reached only when BOTH have been frozen for
+    // the whole `timeout`.
+    let mut last_signature: Option<Vec<(TxnId, u8)>> = None;
+    let mut last_epoch: Option<u64> = None;
+    let mut stall_deadline = tokio::time::Instant::now() + timeout;
     loop {
         // Compute the pending set and grab the notify UNDER the lock, then drop
         // the lock before awaiting. The future only enrolls on first poll, so a
@@ -297,42 +336,53 @@ pub(crate) async fn await_conflicting_deps_applied_within(
         // re-checks the condition under the lock) rather than a hang.
         let owned_key = key.to_vec();
         let pending = on_state_machine(state, move |sm| {
-            if sm.unapplied_conflicts_before(&owned_key, &t).is_empty() {
+            let signature = sm.dependency_wait_signature(&owned_key, &t);
+            if signature.is_empty() {
                 None
             } else {
-                Some(sm.applied_notify())
+                Some((signature, sm.applied_epoch(), sm.applied_notify()))
             }
         })
         .await;
-        let notify = match pending {
+        let (signature, epoch, notify) = match pending {
             Some(None) => return true,
-            Some(Some(notify)) => notify,
+            Some(Some(sample)) => sample,
             // Cancelled at shutdown (already logged): abstain.
             None => return false,
         };
 
         let now = tokio::time::Instant::now();
-        if now >= deadline {
-            // Name the poison. The bare timeout says only "dependencies were not
-            // applied locally"; without each stuck transaction's phase and agreed
-            // t, a PreAccepted orphan and a Committed-but-unapplied txn look the
-            // same from the log, and they need different fixes.
+        if last_signature.as_ref() != Some(&signature) || last_epoch != Some(epoch) {
+            // A dependency advanced (or the set changed), or the local engine
+            // completed a resolution since the last poll: real progress toward
+            // this read. Restart the stall clock so a live-but-behind engine is
+            // never mistaken for a stuck dependency.
+            last_signature = Some(signature);
+            last_epoch = Some(epoch);
+            stall_deadline = now + timeout;
+        } else if now >= stall_deadline {
+            // Frozen for the whole backstop: neither the dependency set (with its
+            // phases) nor the apply path moved. Name the poison. The bare timeout
+            // says only "dependencies were not applied locally"; without each
+            // stuck transaction's phase and agreed t, a PreAccepted orphan and a
+            // Committed-but-unapplied txn look the same from the log, and they
+            // need different fixes.
             let owned_key = key.to_vec();
             let stuck =
                 on_state_machine(state, move |sm| sm.pending_conflicts_detail(&owned_key, &t))
                     .await;
             tracing::error!(
                 pending = ?stuck,
-                "accord: ReadVote dep-wait timed out after {:?} waiting for conflicting \
-                 transactions to apply — abstaining (fail-loud)",
+                "accord: ReadVote dep-wait stalled for {:?} with the dependency set and the \
+                 apply watermark both frozen — abstaining (fail-loud)",
                 timeout
             );
             return false;
         }
 
         // Wait for the next apply (broadcast) or the per-iteration poll cap,
-        // whichever comes first, but never past the overall deadline.
-        let wait = READ_DEP_WAIT_POLL.min(deadline - now);
+        // whichever comes first, but never past the current stall deadline.
+        let wait = READ_DEP_WAIT_POLL.min(stall_deadline.saturating_duration_since(now));
         let _ = tokio::time::timeout(wait, notify.notified()).await;
         // Loop: re-check the pending set under the lock.
     }
@@ -940,6 +990,154 @@ mod tests {
         assert!(
             !await_txn_applied_within(&state, never, std::time::Duration::from_millis(30)).await,
             "an id this replica never applied must still be refused"
+        );
+    }
+
+    /// Register a committed transaction on an explicit `key` (drives
+    /// PreAccept→Accept→Commit so both the conflict index and `txn_states` know
+    /// it). Used to build a dependency set a read must wait on.
+    fn commit_on(
+        state: &AccordState,
+        key: &[u8],
+        txn_id: TxnId,
+        t0: u64,
+        t: u64,
+        deps: Vec<TxnId>,
+    ) {
+        let mut sm = state.lock();
+        sm.handle_preaccept(txn_id, ts(t0), key, BallotNumber(0), 0);
+        sm.handle_accept(txn_id, ts(t0), ts(t), deps.clone(), BallotNumber(1));
+        sm.handle_commit(txn_id, ts(t0), ts(t), deps);
+    }
+
+    /// RED-FIRST: a dep-wait must keep waiting while the engine DRAINS its
+    /// dependency set, even when the TOTAL wait outlasts the bound.
+    ///
+    /// This is the invariant the PostgreSQL snapshot barrier got wrong: on the
+    /// single cluster-global barrier key a barrier queues behind every earlier
+    /// transaction, so its total wait is the whole queue's drain time — often
+    /// longer than the barrier budget. Before the fix the wait was decided by a
+    /// wall clock and abstained at `timeout` ("dependencies were not applied
+    /// locally") while the engine was applying the queue one predecessor at a
+    /// time; the client saw a live quorum fail a transaction the engine was still
+    /// resolving. The wait must decide on the PROGRESS of its dependency set, so
+    /// each predecessor that applies restarts the backstop clock.
+    #[tokio::test]
+    async fn dep_wait_keeps_waiting_while_the_engine_drains_the_dependency_queue() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let key = b"bounded-wait-key";
+        let read_t = ts(10_000);
+
+        // Three conflicting dependencies ordered before the read, none applied.
+        let d0 = TxnId::new(1, ts(1000));
+        let d1 = TxnId::new(1, ts(2000));
+        let d2 = TxnId::new(1, ts(3000));
+        commit_on(&state, key, d0, 1000, 1001, vec![]);
+        commit_on(&state, key, d1, 2000, 2001, vec![]);
+        commit_on(&state, key, d2, 3000, 3001, vec![]);
+
+        let bound = std::time::Duration::from_millis(300);
+        // The engine drains the queue over 400 ms — each apply < the bound apart,
+        // but the WHOLE drain longer than the bound.
+        let engine = state.clone();
+        let drain = tokio::spawn(async move {
+            for (id, wait_ms) in [(d0, 100u64), (d1, 100), (d2, 200)] {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                engine.lock().handle_apply(id, b"row".to_vec());
+            }
+        });
+
+        let started = std::time::Instant::now();
+        let applied = await_conflicting_deps_applied_within(&state, key, read_t, bound).await;
+        drain.await.expect("drain task panicked");
+
+        assert!(
+            applied,
+            "a dependency set the engine is actively draining must not abstain on a wall \
+             clock; abstained after {:?} with the queue still draining",
+            started.elapsed()
+        );
+    }
+
+    /// The other half of the evidence: the engine can be resolving OTHER work
+    /// while a dependency sits in `Committed`, and that is still progress.
+    ///
+    /// A dependency that is committed but waiting its turn behind the apply path
+    /// does not change the read's dependency SET between polls, so a set-only
+    /// signal would abstain. The engine's `applied_epoch` covers it: advancing it
+    /// is a completed resolution, and the wait must restart on it.
+    #[tokio::test]
+    async fn dep_wait_keeps_waiting_while_the_engine_completes_unrelated_resolutions() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let key = b"bounded-wait-key";
+        let other_key = b"unrelated-key";
+        let read_t = ts(10_000);
+
+        // The read's one dependency — committed, and slow to apply.
+        let dep = TxnId::new(1, ts(1000));
+        commit_on(&state, key, dep, 1000, 1001, vec![]);
+        // Unrelated transactions on a DIFFERENT key: applying them moves the
+        // engine watermark but never the read's dependency set.
+        let p0 = TxnId::new(1, ts(2000));
+        let p1 = TxnId::new(1, ts(3000));
+        let p2 = TxnId::new(1, ts(4000));
+        commit_on(&state, other_key, p0, 2000, 2001, vec![]);
+        commit_on(&state, other_key, p1, 3000, 3001, vec![]);
+        commit_on(&state, other_key, p2, 4000, 4001, vec![]);
+
+        let bound = std::time::Duration::from_millis(300);
+        let engine = state.clone();
+        let drain = tokio::spawn(async move {
+            // Unrelated resolutions keep the engine watermark moving, each well
+            // inside the bound; the read's own dependency applies last.
+            for (id, wait_ms) in [(p0, 100u64), (p1, 100), (p2, 200), (dep, 100)] {
+                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+                engine.lock().handle_apply(id, b"row".to_vec());
+            }
+        });
+
+        let applied = await_conflicting_deps_applied_within(&state, key, read_t, bound).await;
+        drain.await.expect("drain task panicked");
+
+        assert!(
+            applied,
+            "an engine completing unrelated resolutions is alive; the wait must not abstain"
+        );
+    }
+
+    /// The BACKSTOP: if neither the dependency set (or its phases) nor the engine
+    /// watermark moves for the whole bound, the dependency is genuinely stuck and
+    /// the wait must abstain — promptly, not hang.
+    #[tokio::test]
+    async fn dep_wait_abstains_when_neither_the_set_nor_the_engine_moves() {
+        let sm = AccordStateMachine::new(1, std::sync::Arc::new(MockSyncWriter::new()));
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let key = b"bounded-wait-key";
+
+        // One committed dependency that NOTHING ever applies — the stall the
+        // backstop exists for.
+        let dep = TxnId::new(1, ts(1000));
+        commit_on(&state, key, dep, 1000, 1001, vec![]);
+
+        let started = std::time::Instant::now();
+        let applied = await_conflicting_deps_applied_within(
+            &state,
+            key,
+            ts(10_000),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            !applied,
+            "a frozen dependency set and a frozen engine watermark must abstain"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the backstop must fire at its bound, not hang (took {elapsed:?})"
         );
     }
 
