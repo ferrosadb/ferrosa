@@ -497,7 +497,8 @@ pub enum Assignment {
         value: Term,
         lhs: Option<String>,
     },
-    /// Subtraction: `col = <lhs> - term` (counter decrement or collection subtract). See [`Add`].
+    /// Subtraction: `col = <lhs> - term` (counter decrement or collection subtract). See
+    /// [`Self::Add`], which carries the same `lhs`.
     Sub {
         column: String,
         value: Term,
