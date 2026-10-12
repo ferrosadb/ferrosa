@@ -423,6 +423,38 @@ turn-ending increment, and I did not start it — the red stays parked and the t
 decision went to the user and timed out unanswered; the recommendation stands at (a), the conservative
 increment, which keeps phantom protection for scans and names its residual.
 
+### DECISION TAKEN: option (a) — implementation spec, ready to land (2026-10-11)
+
+The requestor chose the recommendation: **(a) row-level for point reads; the table check is RETAINED
+for scans.** The blocking decision is resolved. Residual to state when it lands: a transaction that
+read by SCAN still collides on table identity — only (b)/SIREAD removes that.
+
+The predicate, checked against BOTH cases the red asserts, so no further design is needed:
+
+    conflict  <=>  some key in (rows this txn READ by key) has
+                   latest_seq(key) > snapshot.read_ts
+
+    latest_seq(key) = max over state.versions[key]            (HashMap<RowKey, BTreeMap<u64, Option<Row>>>,
+                                                              keyed by commit_seq, already pruned)
+                             and state.distributed_versions[key]  (BTreeMap<Timestamp, ...>, the
+                                                              Accord-applied history — the live case
+                                                              runs through THIS map)
+
+Why it satisfies both. DISJOINT keys: neither transaction's read row is touched by the other, so both
+commit. SAME key: A commits first, which inserts a version for that row, so B's read-set then sees a
+sequence greater than B's snapshot and exactly ONE is refused. That second property comes from the
+ASYMMETRY of comparing against COMMITTED versions rather than against the other transaction's reads —
+which is why no symmetric read-read machinery is needed.
+
+Remaining recon is two lookups and nothing else: `struct RowKey` is NOT `pub struct` (a
+visibility-qualified grep finds it nowhere `pub`), so its path and key type come from its definition;
+and `MvccSnapshot.read_ts`'s type — already used against a u64 commit_seq by the current comparison, so
+it is sequence-comparable as it stands.
+
+Then: carry the point-read RowKey in the read-set (`extended.rs:94` + `server.rs:709/715/883` +
+`query.rs:1789` + `mvcc.rs:460/463/524/528`), apply the predicate above, and keep the table check for
+scans. The parked red `transactions_on_disjoint_keys_do_not_conflict` goes GREEN, control included.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
