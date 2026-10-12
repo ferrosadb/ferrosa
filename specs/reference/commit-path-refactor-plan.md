@@ -105,6 +105,25 @@ uncounted-ack / RPC-error occurred.
 **Acceptance:** a test that the same failure condition always produces the same client-visible message,
 and that no timeout path can return `TxnAbandoned`.
 
+
+### R6a — the abandon decision must be evidence-based (now forced by the reproducer)
+
+The reproducer proves a partial apply: after an abandoned COMMIT, two remote shards were readable
+while the coordinator's own shard was not. So the rule "an abandon is truthful because no replica has
+applied" is false in practice — the remotes apply before they ack, and a lost/slow ack is
+indistinguishable from no ack inside the bound.
+
+Required outcome split: zero apply acks -> the retryable abandon is truthful and stays; ANY evidence
+that a replica applied -> the transaction is committed, the outcome is a non-retryable
+committed-and-converging error, and recovery completes it. The client contract "safe to retry" must
+never be emitted for a partially applied transaction.
+
+**Acceptance:** `scripts/abandon-damage-repro.sh` returns PASS (every key absent, or every key present
+and the client told it committed — never a mix), across two consecutive runs.
+
+**Note:** R0 (`c085d5ad`) does not close this gate; the reproduce agent's expectation that it would
+was wrong and is corrected in the ground-truth note.
+
 ## The canonical experiment (must be run before and after R0-R2)
 
 ```

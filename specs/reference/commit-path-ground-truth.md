@@ -174,6 +174,47 @@ its share of the affected table, which shortens every scan by that share and can
 outright. "An abort that leaves data" is the right intuition about the *harm*; the mechanism may be a
 missing fragment or an unreachable one, and the code as written cannot yet tell you which.
 
+## REPRODUCER RESULT — the abandon is a lie whenever ANY replica applied (measured)
+
+`scripts/abandon-damage-repro.sh` (committed `c23618d2`, note `specs/reference/abandon-damage-repro.md`)
+reduces the defect to an enumerable size. Two consecutive runs, identical verdict:
+
+```
+the client was told: transaction was abandoned and NOT committed ... safe to retry
+key 1: absent on node1, node2, node3      <- the coordinator's own shard (CL-60's ordering fix working)
+key 2: READABLE on node2                  <- a REMOTE shard
+key 3: READABLE on node3                  <- a REMOTE shard
+VERDICT: FAIL -- DAMAGE REPRODUCED (per-node union non-empty; a retry would double-apply)
+```
+
+**The mechanism, and it is not G1.** The apply fan-out sends Apply to the remotes, and each remote
+applies durably BEFORE it acks — that ordering is inherent, a replica cannot ack a write it has not
+made. When those acks do not arrive inside the bound, the coordinator takes the `!apply_ok` branch and
+reports the retryable abandon, while the remotes that did apply hold durable, readable rows. CL-60
+deferred the coordinator's OWN apply until the remote quorum is secured; that is why key 1 is absent
+and exactly why keys 2 and 3 survive. The defect was displaced onto the remote shards, not removed.
+
+**Size law (measured, not inferred).** 3 keys x 8 MB (24 MB) commits clean; the SAME 3 keys x 40 MB
+(120 MB) abandons. Separately 300 000 rows (4.3 MB) and 1 000 000 rows (14.8 MB) both commit clean. So
+the bound responds to BYTE VOLUME, not key count, and the million-row `pgbench -i` abandon is
+consistent with that (its accounts COPY is ~100 MB), not with its row count. Bracket `(24 MB, 120 MB]`,
+not bisected. The 10 s bound was never touched.
+
+**Named mechanisms refuted by measurement:** SIGSTOP of both remote engines, and of either single
+remote engine, both fail at the CONSENSUS stage (`Accord quorum unavailable`, ~2.7 s) without reaching
+Apply, leaving no rows — and SIGSTOP wedges the node's inter-node lanes, requiring a machine recycle.
+Mechanism (ii) (stopping machines) is a strictly stronger form of the same freeze and cannot do better.
+
+**Consequences.**
+1. R6's design is now forced by evidence: once ANY replica has applied, the transaction is committed
+   and the outcome must NOT be the retryable abandon. Only a zero-apply abandon is truthful. A
+   partial-apply outcome must be committed-and-converging and non-retryable.
+2. **R0 (`c085d5ad`, the marker/ack fix) does NOT close this reproducer.** The surviving rows belong to
+   the apply fan-out's write-before-decision ordering, not to the withheld ack. The gate expectation
+   recorded by the reproducing agent ("FAIL -> PASS across deploying c085d5ad") is WRONG and is
+   corrected here: deploying it should still FAIL, and that is the prediction to test.
+3. The script is the standing gate for any change to the apply path.
+
 ## Unresolved (needs a probe or an owner decision, not more reading)
 
 - **U1 — The 669,315 surviving rows are unexplained by any path found.** In-txn COPY commits
