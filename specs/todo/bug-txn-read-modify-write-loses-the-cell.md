@@ -455,6 +455,29 @@ Then: carry the point-read RowKey in the read-set (`extended.rs:94` + `server.rs
 `query.rs:1789` + `mvcc.rs:460/463/524/528`), apply the predicate above, and keep the table check for
 scans. The parked red `transactions_on_disjoint_keys_do_not_conflict` goes GREEN, control included.
 
+### RT-2 spec COMPLETE — both last unknowns resolved (2026-10-11)
+
+    struct RowKey { .. }   ferrosa-postgres/src/mvcc.rs:233   — private to mvcc.rs, which is why a
+                                                                `pub struct RowKey` grep found nothing.
+                                                                Becomes `pub(crate)` so the read set in
+                                                                extended.rs/server.rs can hold one.
+    read_ts: u64           mvcc.rs:249 (and 283). Decisive: mvcc.rs:430 is `let read_ts =
+                           state.commit_seq;` — so read_ts IS a commit_seq, and comparing it against
+                           the BTreeMap<u64> keys of `versions` is sequence-correct by construction.
+    mvcc.rs:511            already reads history as `versions.range(..=snapshot.read_ts).next_back()`
+                           — the exact idiom the new row predicate uses, inverted: a row conflicts
+                           when a version exists with key > read_ts.
+
+So the predicate is now fully determined, and the ONE piece still requiring a judgement call is the
+point-read key: `track_select_reads` (server.rs:709) is handed the SelectStmt, so the key COULD be
+derived from its WHERE clause — but that would be a second implementation of key resolution, and the
+engine already resolves that exact key to execute the read. The fix must record the key the read
+resolved, not re-derive it. Locating that resolution is the first step of the next pass; everything
+after it is mechanical (the six call sites are listed, the predicate is written above).
+
+NOT landed: the code. This pass resolved the design and both remaining unknowns; the change itself did
+not land, and the parked red stays parked.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
