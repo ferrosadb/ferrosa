@@ -1,0 +1,110 @@
+# Commit Path — Ground Truth (code-inferred)
+
+> Last updated: 2026-10-12
+> Status: Ground truth (verified); supersedes the mechanisms in the review of the same date
+> Raw evidence: `ground-truth/lane-a-commit-path.md`, `lane-b-abandon-depwait.md`,
+> `lane-c-pg-transaction-buffer.md` (parallel recon; every claim cited `file:line`)
+
+## What this is
+
+Code-inferred ground truth for the Accord commit path and the PostgreSQL front-end transaction
+boundary, produced so the path can be simplified and refactored for testability and provable
+correctness. It records what the code DOES, not what it should do. Contradictions between comments and
+code are recorded as contradictions. Where the truth could not be established it is listed under
+Unresolved rather than inferred.
+
+## Retractions (my earlier review of this date)
+
+Three mechanisms in `commit-path-and-transaction-boundary-review.md` were WRONG and are retracted here.
+Each was a plausible reading that a cited source read refutes.
+
+- **F1 retracted** ("the statement path bypasses the buffer"). The opposite is true: DML in an open
+  transaction is buffered — `copy_stdin.rs:276-289` ("Buffer into the SAME write-set INSERT/TRUNCATE
+  use, so COMMIT applies it and ROLLBACK discards it"; "an open transaction must never be committed
+  mid-statement"), `query.rs:1561-1573`, `server.rs:854-862`. A plain `BEGIN` opens a TRACKED
+  transaction with the buffer engaged (`extended.rs:331-335`, `server.rs:701`); isolation `None` means
+  session default, not untracked.
+- **F1's COPY lead retracted.** In-transaction COPY buffers; the `FLUSH_EVERY=1000` autocommit batching
+  is the `else` branch only. `pgbench -i`'s accounts COPY is inside one `begin`…`commit`, so no path
+  applies that load early.
+- **F2 retracted** ("one constant governs three waits, all deciding outcomes"). Three 10 s constants
+  exist (`dep_wait.rs:25`, `state_machine.rs:1537`, `pool.rs:707`) plus a 5 s barrier bound, but only
+  ONE is client-visible. The graph's own timer (`check_timeouts`/`abort_timeout`) and `break_cycle`
+  have NO production caller — dead code.
+- **F3 retracted** ("live age-keyed prune located at apply.rs:1468"). That call is
+  `#[cfg(test)] prune_graph_for_test`, whose own doc says "Test-only: production prunes the graph from
+  its maintenance loop." Production uses identity-keyed `forget_graph_applied` (`apply.rs:1606`,
+  `state_machine.rs:1419`) in lockstep with the `TxnState` prune.
+
+## Confirmed findings
+
+- **G1 — An abandon can be a lie about durability.** `bookkeep_applied` returns `Err(())` when the
+  protocol-log `Applied` marker's fsync fails (`state_machine.rs:1300-1310`, logging "txn stays
+  Committed until its Apply is retried"), and `apply_writeset_and_ack` returns `None` — withholding
+  `ApplyOK` — when `await_txn_applied` is false (`handlers.rs:157-161`). A replica that durably wrote
+  its rows but failed that marker therefore holds a READABLE row while its ack is withheld, so the
+  coordinator can report `TxnAbandoned` with data already durable. This is the "abort that leaves
+  data" mechanism; the client contract "NOT committed; safe to retry" does not hold on that path.
+- **G2 — `mark_applied` is asymmetric (`dep_wait.rs:214-224`).** It removes the reverse edges of the
+  deps it just applied, then does `waiting_on.remove(txn_id)` + `wait_start.remove(txn_id)` — without
+  clearing `waited_by` entries pointing AT `txn_id`. Production-reachable through the cascade. This is
+  the concrete "tracking its data correctly" defect: one of two maps maintained by hand is not updated.
+- **G3 — The intended concurrency buffer is not where the code buffers.** The owner's stated design is
+  that MVCC IS the concurrency buffer (tracking a transaction's changes until COMMIT, empty otherwise).
+  In the code the in-flight changes live in the FRONT END's spilling `TxnWriteSet` (`extended.rs:103`,
+  `txn_write_set.rs:47-52`, `query.rs:1561-1572`); MVCC holds COMMITTED version history
+  (`mvcc.rs:259-260`). The intent is therefore a design gap, not a description of the system.
+- **G4 — One 10 s constant is client-visible and misnamed.** `TxnAbandoned` has exactly one production
+  construction site, `coordinator.rs:2799` inside `if !apply_ok` (`:2783`); the message text at
+  `:577-582` says "dependency-wait bound". The governing wait is the Apply fan-out RPC bound
+  (`configured_txn_timeout()` → `:2745/:2751`). The message cannot distinguish RPC-timeout,
+  uncounted-ack and RPC-error (a bare `bool` at `:3205/:3269`).
+- **G5 — Ownership hop-by-hop** (lane A): `TxnWriteSet`/`WriteSetStage` (session) → `StagedWriteSet` →
+  `StagedAccordWriteSet{p: Arc<WriteSetSpill>}` → driver `write_set: Vec<WriteSetEntry>` +
+  `write_blobs: Option<Arc<WriteSetSpill>>` → borrowed `(&[u8],&[u8])` → applier
+  `AccordWriteSet<'s,'v>`. Spill floor 8 MiB (`WRITE_SET_SPILL_FLOOR_BYTES`, `write_set_spill.rs:77`),
+  explicitly a buffer size and never a cap.
+- **G6 — The durability instant.** Consensus: `FileSyncWriter` append + `sync_all`
+  (`sync_writer.rs:112-145`). The row: `write_atomic_batch` forces the commit-log sync (`engine.rs:9658`)
+  BEFORE the memtable's Phase 2 (`engine.rs:9660-9669`). A row becomes observable strictly after the
+  fsync; readers see it only at Phase 2.
+- **G7 — Apply fan-out** is per-peer key-scoped capnp frames, residency bounded by
+  `APPLY_FANOUT_WINDOW = 4` (`coordinator.rs:52`), all-or-nothing per replica.
+- **G8 — 18 failure-after-durable points** enumerated in lane A, each with what it leaves behind.
+- **G9 — Hot-path serialization rule violation (flag).** Multi-key Apply is capnp, but
+  PreAccept/Accept/Commit/ReadVote, the single-key Apply and the `AccordApplyV2` fallback are bincode
+  (`accord/wire.rs`, `ferrosa-net/src/protocol.rs`). By the repo's rule — per-message hot-path
+  serialization must be capnp — this is a defect, not a preference.
+- **G10 — Comment-versus-code contradictions: 8 (lane A) + 4 (lane B) + 8 (lane C)** recorded
+  unresolved, including applier "StorageEngine::write" vs `write_atomic_batch`, a protocol.log whose
+  ASCII-text writer has a binary reader, and "one replica at a time" / "bincode frame" docs that no
+  longer match the fan-out.
+
+## Unresolved (needs a probe or an owner decision, not more reading)
+
+- **U1 — The 669,315 surviving rows are unexplained by any path found.** In-txn COPY commits
+  atomically, the autocommit branch is not taken, and 669,315 is not a multiple of 1000. Decisive
+  experiment: `BEGIN; COPY (3 rows); <force the COMMIT to fail>;` then a POINT LOOKUP of a known key
+  asserted absent — never a count. (G1 is a candidate mechanism but is not yet connected to this
+  observation.)
+- **U2 — Whether the fsync-failed-marker path (G1) is the actual cause of U1**, and how often it
+  occurs in practice. Requires the experiment plus an instrumented node.
+- **U3 — Which sub-cause produced the million-row abandon.** The code cannot distinguish; the message
+  is a legacy misnomer (G4).
+- **U4 — Whether the capnp path is taken at runtime** (capability negotiation is dynamic); no explicit
+  Apply-frame byte ceiling was found.
+- **U5 — RT-3's mechanism** remains unknown; the discriminator holds (read-modify-write loses the cell,
+  blind write keeps it). Read-set recording is gated on `in_txn && SERIALIZABLE` (`server.rs:715-740`)
+  and the row check is inert on the Accord commit path (only two `record_point_read` call sites), so
+  default-isolation clients record nothing.
+- **U6 — `mark_applied`'s asymmetry (G2): is it reachable in a live schedule, and what does it break?**
+  Needs a test, per the review's own rule that a claim without a probe stays a hypothesis.
+
+## Why this matters for the refactor
+
+Every confirmed finding above is a case of the same shape: **correctness carried by state that is
+duplicated, hand-synchronised, or keyed on the wrong thing** — two edge maps updated by hand (G2), a
+durability guarantee that depends on a marker write succeeding on a peer (G1), two serialization
+regimes on one wire (G9), one clock for several waits with one message for all of them (G4). The
+simplification target is a single identity-keyed transaction record with one owner per hop, so the
+tests can assert invariants rather than reconstruct behaviour from distributed bookkeeping.
