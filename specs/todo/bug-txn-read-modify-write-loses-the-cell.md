@@ -715,6 +715,35 @@ same run. RT-3 is the remaining transaction defect.
   while this tree's parser accepts it in-process. The image was mid-roll at that moment, so this is
   UNRESOLVED and needs one clean re-run on a settled 77cdf369.
 
+### RT-2 DONE — verified from a real client on a SETTLED cluster (2026-10-12)
+
+Formal acceptance run, `reprobe.sh` on pgwire-77cdf369, cluster settled (V0-a PASS ⇒ admissible):
+
+    V0-control-a: PASS V0 single-txn RMW took effect (v=105)
+    V0-control-b: PASS V0 single-txn blind write took effect (v=777)
+    V1:  A: (no error)  B: (no error)   refused A=0 B=0
+         after: aid=1 v='778' (want 778)   aid=2 v='<empty>' (want 202)
+         FAIL V1   ← RT-3, not RT-2: B SUCCEEDED and its value was lost
+    V2:  A: (no error)  B: (no error)   refused A=0 B=0
+         after: aid=1 v='111'   aid=2 v='222'   PASS V2
+    VERDICT: checks=3 passed, 1 failed
+
+**NO 40001 on either pair, and the "RT-2 false conflict" NOTE is ABSENT from both** — the acceptance
+criterion. A cluster-global lock (one shared POSTGRES_TRANSACTION_MARKER_KEY HWM consulted by the Accord
+pre-accept check) was refusing every concurrent transaction regardless of its rows; 77cdf369 judges
+staleness on the transaction's own written keys instead. RT-2 is closed at the client-observable level.
+
+**RT-3 is now the only transaction defect left, and it is cleanly isolated on the SAME run:** V1 (a
+read-modify-write, which READS) loses B's committed value, while V2 (a blind write, no read) keeps its
+value. The read inside the transaction is still the trigger.
+
+**Still owed:**
+- `ferrosa-cluster` README/specs are NOT updated for the 77cdf369 behaviour change — AGENTS.md treats
+  crate docs as part of done, so this is a must-fix before that change is reviewable.
+- The CQL self-increment (`SET v = v + N`) inside a transaction is still refused by the binding lookup
+  (board row t_239a4ec5), and the LIVE LET rejection seen while the image was mid-roll is unresolved.
+- Then: the commit-path stall, scale-100 `pgbench -i`, and the tps comparison against 821.372006.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
