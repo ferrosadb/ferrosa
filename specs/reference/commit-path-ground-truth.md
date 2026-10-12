@@ -117,6 +117,46 @@ fsync-failed-marker path is the leading candidate for *why* the fragment never a
 experiment does not yet connect them; that needs the small forced-failure case plus an instrumented
 node.
 
+## U1 REVISED — the 2/3 census is a partial READ, and it is the same defect as the failed scan
+
+The owner observed that 669,315 of 1,000,000 is 2/3, i.e. "one server is not returning". Arithmetic
+confirms it: 669315/1000000 = 0.669315 against 2/3 = 0.666667, a ratio of 1.00397 — two of three nodes
+answered. This is the failure my own runbook already names: *a census reading roughly 1/N of the
+expected rows is not lost data, it is the read path serving local data; read the keys per node and take
+the union before believing a short census.*
+
+Per-node measurement (runner env exposes F1_CONN and F3_CONN):
+
+```
+node1 (F1_CONN)  ERROR: scan of public.pgbench_accounts failed: read timeout:
+                 CL=ONE, received=0, required=1, data_present=false
+```
+
+and the scan-level failure from the same table:
+
+```
+ERROR: 58000: scan of public.pgbench_accounts failed: internal: streaming range read:
+  a fragment-merge source produced no fragment within 30000ms; failing loudly rather than waiting
+  forever (one silent source must not stall the scan)
+```
+
+**One defect, stated precisely:** after the abandoned commit, ONE node does not return its share of
+this table. The engine's own message names it — *one silent source* — and `required=1` with
+`data_present=false` says the node expected one replica of that key and found no data. The census's
+2/3 and the scan's 30 s abort are the same condition observed two ways.
+
+**What is NOT established:** whether that node's share is *absent* (loss) or *unreachable* (a read-path
+or locality defect with the data still present). The message is ambiguous — "read timeout" is a
+reachability statement, `data_present=false` is an absence statement, and both appear in one line. The
+union test that would separate them cannot complete while that node's own read fails, which is itself
+the observation. Distinguishing them needs a direct per-node key read *and* a storage-level check on
+the node that is silent — or the small forced-failure case below, where the state is enumerable.
+
+**So the corrected statement of the defect:** an abandoned commit leaves one replica unable to serve
+its share of the affected table, which shortens every scan by that share and can abort a scan
+outright. "An abort that leaves data" is the right intuition about the *harm*; the mechanism may be a
+missing fragment or an unreachable one, and the code as written cannot yet tell you which.
+
 ## Unresolved (needs a probe or an owner decision, not more reading)
 
 - **U1 — The 669,315 surviving rows are unexplained by any path found.** In-txn COPY commits
