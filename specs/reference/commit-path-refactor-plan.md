@@ -30,6 +30,14 @@ point, so the marker write and the ack decision are one function under one test.
 **Acceptance:** a test that fails the marker fsync for one replica and asserts the coordinator cannot
 report `TxnAbandoned` while that replica holds a readable row. This test does not exist today.
 
+> **Status (slice 1 landed):** the replica-side half is done —
+> `handlers::tests::apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails` pins it (red
+> first), with the marker write and the ack decision behind the one journal entry point
+> (`applied_journal::record_applied_marker`). The remaining R0 work is the module split proper: the
+> consensus core, the read-path/MVCC surface, recovery and the observability hook are all still in
+> `state_machine.rs`. The coordinator-side assertion (that no timeout path can *report* the abandon)
+> is R6, not this slice.
+
 ### R1 — One transaction record, in `ferrosa-common`
 
 Today "a transaction" is spread across `waiting_on`, `waited_by`, `wait_start`, `applied`, `aborted`,

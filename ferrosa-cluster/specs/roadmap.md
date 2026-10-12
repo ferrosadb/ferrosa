@@ -182,7 +182,17 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   (`bookkeep_applied`: protocol-log marker → `Applied` flag → conflict-index GC →
   ReadVote wake) for exactly those. The storage write precedes the marker and the
   applier is idempotent on `(txn_id, t)`, so a crash between them is recovered by
-  the per-txn Apply retry — never a falsely-`Applied` txn. This is the single-key
+  the per-txn Apply retry — never a falsely-`Applied` txn.
+  **Correction (R0 journal slice, 2026-10-12):** that sentence must not be read as
+  "a marker fsync failure leaves the txn Committed". The marker is the journal's
+  *record*; the storage write is the durability instant, so `bookkeep_applied` now
+  decides the marker write and the ack together through
+  `applied_journal::record_applied_marker` (`AppliedAck::Ack` / `Withhold`). It
+  advances the txn to `Applied` — which is what the ack gate waits for — whenever
+  the rows are durable, and withholds the ack only for a no-write finalize, where
+  the marker really is the sole durable record. Withholding an ack on a durable row
+  is finding G1: the coordinator reports `TxnAbandoned` while the row is readable
+  (`apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails`). This is the single-key
   prerequisite for the multi-key/multi-partition transaction work (Phases 1+).
   Regression test: `sm_apply_is_dep_ordered_parks_until_dependency_applies`.
 - **Dep-wait cascade replayed queued txns with empty data — fixed (PR #159).**

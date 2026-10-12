@@ -45,6 +45,23 @@ Each was a plausible reading that a cited source read refutes.
   its rows but failed that marker therefore holds a READABLE row while its ack is withheld, so the
   coordinator can report `TxnAbandoned` with data already durable. This is the "abort that leaves
   data" mechanism; the client contract "NOT committed; safe to retry" does not hold on that path.
+
+  > **Update (R0 slice 1, committed on this branch):** the replica-side gate is closed. The marker
+  > write and the ack decision are now one entry point, `applied_journal::record_applied_marker`,
+  > called from `AccordStateMachine::bookkeep_applied`; it returns `AppliedAck::{Ack,Withhold}` and
+  > keeps "the rows are on disk" apart from "the journal recorded the decision". A marker fsync
+  > failure with durable rows now advances the txn to `Applied` — the phase the ack gate waits for —
+  > so the replica acks a row it durably wrote instead of denying it. Red-first, at the smallest
+  > reachable level (one inbound Apply, in process):
+  > `handlers::tests::apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails` (observed
+  > RED: `got None` after the 10 s dep-wait bound, with the applier already holding the row).
+  > Negative controls: `a_failed_marker_withholds_when_nothing_durable_was_written` (a no-write
+  > finalize has no durable row, so its marker failure still withholds) and
+  > `sm_storage_apply_failure_does_not_advance`. **Still open:** whether G1 was the mechanism behind
+  > the live 2/3 census (U2) — this slice removes the lie at the replica, it does not connect it to
+  > that measurement; the coordinator side (R6) still turns a missing ack into the legacy
+  > `abandoned:` message; and the metadata/fragment mismatch the experiment measured is not
+  > addressed here.
 - **G2 — `mark_applied` is asymmetric (`dep_wait.rs:214-224`).** It removes the reverse edges of the
   deps it just applied, then does `waiting_on.remove(txn_id)` + `wait_start.remove(txn_id)` — without
   clearing `waited_by` entries pointing AT `txn_id`. Production-reachable through the cascade. This is

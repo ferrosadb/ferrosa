@@ -37,6 +37,7 @@ use ferrosa_storage::accord::conflict_index::{
 use ferrosa_storage::accord::sync_writer::{SyncWriteResult, SyncWriter};
 use tokio::sync::Notify;
 
+use crate::accord::applied_journal::{record_applied_marker, AppliedAck};
 use crate::accord::apply::{
     DepWaitApplier, MutationView, NoopStorageApplier, StorageApplier, StorageReader,
 };
@@ -1103,22 +1104,25 @@ impl AccordStateMachine {
                     let _gate = self.apply_gate.lock();
                     self.apply_engine.notify_applied(txn_id)
                 };
-                self.bookkeep_applied_dedup(woken);
+                // Every woken waiter was persisted by the engine, so its rows are durable.
+                self.bookkeep_applied_dedup(woken, true);
                 SmResponse::NoWriteFinalized
             }
             ApplyDecision::NoWriteFinalize => {
                 // No-write finalize: nothing to persist and no dependency ordering
                 // to respect. Advance to Applied, then advance any waiters it
-                // unblocks.
-                if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
-                    // Marker fsync failed — fail loud, leave Committed; Apply retries.
+                // unblocks. NO durable row was written, so the marker is this
+                // transaction's only durable record: `rows_durable = false`.
+                if self.bookkeep_applied(txn_id, Vec::new(), false) == AppliedAck::Withhold {
+                    // Marker fsync failed and there is no durable row behind it —
+                    // fail loud, leave Committed; Apply retries.
                     return SmResponse::None;
                 }
                 let woken = {
                     let _gate = self.apply_gate.lock();
                     self.apply_engine.notify_applied(txn_id)
                 };
-                self.bookkeep_applied_dedup(woken);
+                self.bookkeep_applied_dedup(woken, true);
                 SmResponse::None
             }
             ApplyDecision::Persist { t, deps } => {
@@ -1170,7 +1174,9 @@ impl AccordStateMachine {
                 }
                 // Persisted: the primary's writes plus any cascade-woken waiters.
                 // Dedup by TxnId so each txn is marked Applied / fsynced exactly once.
-                self.bookkeep_applied_dedup(applied);
+                // The engine returned these only after its own commit-log fsync, so
+                // every one of them has durable rows.
+                self.bookkeep_applied_dedup(applied, true);
                 SmResponse::None
             }
         }
@@ -1233,7 +1239,9 @@ impl AccordStateMachine {
         for (id, _) in &outcome.applied {
             self.applying.remove(id);
         }
-        self.bookkeep_applied_dedup(outcome.applied);
+        // `storage_ok` was required above, so the engine's own commit-log fsync has
+        // already returned for every id here: their rows are durable.
+        self.bookkeep_applied_dedup(outcome.applied, true);
         SmResponse::None
     }
 
@@ -1263,7 +1271,9 @@ impl AccordStateMachine {
                 released.extend(self.apply_engine.waive_dependency(waiter, dep));
             }
         }
-        self.bookkeep_applied_dedup(released);
+        // Each released waiter's parked write-set was applied by `waive_dependency`
+        // (or it would not be in the list), so its rows are durable.
+        self.bookkeep_applied_dedup(released, true);
     }
 
     /// Run [`bookkeep_applied`] **once per distinct `TxnId`** in `applied`.
@@ -1273,39 +1283,50 @@ impl AccordStateMachine {
     /// `Applied` advance, conflict-index GC, dep-wait wake — is a per-transaction
     /// action and must fire exactly once. The first entry's data is used; later
     /// same-txn entries are skipped (their write is already durable). Each is
-    /// best-effort: a fsync failure leaves that txn `Committed` for its Apply
-    /// retry to re-drive (storage apply is idempotent), never falsely `Applied`.
-    fn bookkeep_applied_dedup(&mut self, applied: Vec<(TxnId, Vec<u8>)>) {
+    /// best-effort: a fsync failure with durable rows still advances (see
+    /// [`bookkeep_applied`]); without them it leaves that txn `Committed` for its
+    /// Apply retry to re-drive (storage apply is idempotent), never falsely
+    /// `Applied`.
+    ///
+    /// `rows_durable` is the caller's knowledge of the storage half, and is uniform
+    /// for one call because every entry here was returned *by* a storage apply that
+    /// returned `Ok`.
+    fn bookkeep_applied_dedup(&mut self, applied: Vec<(TxnId, Vec<u8>)>, rows_durable: bool) {
         let mut bookkept: HashSet<TxnId> = HashSet::new();
         for (applied_id, applied_data) in applied {
             if bookkept.insert(applied_id) {
-                let _ = self.bookkeep_applied(applied_id, applied_data);
+                // The decision is consumed by the phase advance inside; only the
+                // no-write path has a reply to withhold, and it calls
+                // `bookkeep_applied` directly.
+                let _ = self.bookkeep_applied(applied_id, applied_data, rows_durable);
             }
         }
     }
 
     /// Post-apply bookkeeping for a transaction the apply engine has **already
-    /// persisted** (or a no-write finalize): persist the protocol-log marker,
-    /// advance the in-memory state to `Applied`, GC the conflict index, and wake
-    /// any `ReadVote` dep-wait parked on this transaction.
+    /// persisted** (or a no-write finalize): record the protocol-log `Applied`
+    /// marker and, from that one decision, advance the in-memory state to
+    /// `Applied`, GC the conflict index, and wake any `ReadVote` dep-wait parked on
+    /// this transaction.
     ///
-    /// Returns `Err(())` if the marker fsync fails — the caller must then leave
-    /// the txn `Committed` (never falsely `Applied`); the per-txn Apply retry
-    /// re-drives it, and because the storage applier is idempotent on
-    /// `(txn_id, t)` the re-driven apply is a no-op on storage.
-    fn bookkeep_applied(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> Result<(), ()> {
-        // Persist the protocol-log marker. Fail loud (return Err) on fsync
-        // failure so the caller does not advance a non-durable apply.
-        let data = format!("Applied:{}", txn_id.0.time);
-        if let SyncWriteResult::FsyncFailed(e) = self.sync_writer.write_and_sync(data.as_bytes()) {
-            // Logged here because several callers (the cascade in
-            // `bookkeep_applied_dedup`, the no-write finalize) have no reply to
-            // withhold: without this line the txn silently stays Committed.
-            tracing::error!(
-                txn_id = ?txn_id, error = %e,
-                "accord: Applied marker fsync failed — txn stays Committed until its Apply is retried"
-            );
-            return Err(());
+    /// The marker write and the ack decision are this ONE function — the journal
+    /// seam (see [`crate::accord::applied_journal`]). It returns the journal's
+    /// [`AppliedAck`], and the returned `Ack` is exactly what the ack gate reads,
+    /// because `Applied` is the phase [`crate::accord::handlers::await_txn_applied`]
+    /// waits for. `rows_durable` keeps "the rows are on disk" apart from "the
+    /// journal recorded the decision", so a marker fsync failure cannot withhold an
+    /// ack for a transaction whose rows are already durable and readable (G1).
+    fn bookkeep_applied(
+        &mut self,
+        txn_id: TxnId,
+        result_data: Vec<u8>,
+        rows_durable: bool,
+    ) -> AppliedAck {
+        let ack = record_applied_marker(&*self.sync_writer, txn_id, rows_durable);
+        if ack == AppliedAck::Withhold {
+            // Nothing durable records the apply: leave the txn undecided so the
+            // per-txn Apply retry re-drives it.
+            return AppliedAck::Withhold;
         }
 
         if let Some(state) = self.txn_states.get_mut(&txn_id) {
@@ -1318,7 +1339,7 @@ impl AccordStateMachine {
         // the lock); see [`Self::applied_notify`].
         self.applied_notify.notify_waiters();
 
-        Ok(())
+        AppliedAck::Ack
     }
 
     // -----------------------------------------------------------------------
@@ -3484,41 +3505,102 @@ mod tests {
         assert_eq!(state.phase, TxnPhase::Applied);
     }
 
-    /// Crash after persist but before flag = safe (replay recovers).
+    /// The durability instant for the DATA is the storage write: the engine fsyncs
+    /// its commit log before `apply` returns `Ok`, so any row the applier accepted is
+    /// durable and readable. The protocol-log `Applied` marker is the journal's
+    /// *record* of that decision, and crash replay re-drives it idempotently on
+    /// `(txn_id, t)`.
+    ///
+    /// So a marker fsync failure AFTER a durable row write must not withhold the
+    /// apply — withholding it is finding G1: the coordinator loses this replica's ack
+    /// and reports the transaction abandoned while the row is on disk.
+    ///
+    /// Replaces the former `sm_crash_between_persist_and_flag`, whose assertion ("phase
+    /// must still be Committed when fsync fails during apply") made the redundant
+    /// marker the durability gate and thereby encoded the defect. The assertion here is
+    /// STRENGTHENED, not relaxed: the fsync-failed path is proven to have run, and the
+    /// retry is proven idempotent.
     #[test]
-    fn sm_crash_between_persist_and_flag() {
+    fn sm_marker_fsync_failure_after_a_durable_row_write_still_applies() {
         let (mut sm, writer) = make_sm(1);
         let txn_id = txn(1, 1000);
         let t0 = ts(1000);
 
-        // Set up committed state.
         sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
         sm.handle_accept(txn_id, t0, ts(1001), vec![], BallotNumber(1));
         sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        writer.call_log.lock().unwrap().clear();
 
-        // Simulate crash: fsync succeeds for persist but we "crash" before
-        // setting the applied flag by making fsync fail on the apply call.
+        // Only the marker's fsync fails; the storage applier's own write — the
+        // durability instant — still returns Ok, so the row is durable.
         writer.set_fsync_failure(true);
-
         sm.handle_apply(txn_id, vec![42]);
 
-        // Applied flag must NOT be set because fsync "failed" (simulated crash).
-        let state = sm.get_state(&txn_id).unwrap();
+        assert!(
+            writer.calls().contains(&SyncWriteCall::FsyncFailed),
+            "precondition: the marker fsync must have been attempted and failed, so this \
+             test is not vacuous; got {:?}",
+            writer.calls()
+        );
         assert_eq!(
-            state.phase,
-            TxnPhase::Committed,
-            "phase must still be Committed when fsync fails during apply"
+            sm.get_state(&txn_id).unwrap().phase,
+            TxnPhase::Applied,
+            "a durably written row must be Applied even when the redundant marker fsync \
+             failed — the row is readable, so denying the apply is the G1 lie"
         );
 
-        // On recovery: re-enable fsync and retry apply.
+        // A retry after the disk heals is idempotent: already Applied, so it writes no
+        // second marker (N markers per txn would corrupt the protocol log).
         writer.set_fsync_failure(false);
+        writer.call_log.lock().unwrap().clear();
+        sm.handle_apply(txn_id, vec![42]);
+        assert!(
+            !writer.calls().contains(&SyncWriteCall::Fsync),
+            "a retried Apply for an already-Applied txn must not write a second marker; \
+             got {:?}",
+            writer.calls()
+        );
+    }
+
+    /// NEGATIVE CONTROL for the corrected apply contract: when the STORAGE write
+    /// itself fails there is no durable row at all, so the transaction must stay
+    /// Committed and no `Applied` marker may be written — the replica must never claim
+    /// an apply it did not durably perform. Without this, "advanced to Applied" would
+    /// be satisfied by a journal that acked unconditionally.
+    #[test]
+    fn sm_storage_apply_failure_does_not_advance() {
+        struct FailingApplier;
+
+        impl StorageApplier for FailingApplier {
+            fn apply(&self, txn_id: TxnId, _mutation: ApplyMutation) -> Result<(), ApplyError> {
+                Err(ApplyError {
+                    txn_id,
+                    reason: "simulated storage write failure".to_owned(),
+                })
+            }
+        }
+
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer.clone(), Arc::new(FailingApplier));
+
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_accept(txn_id, t0, ts(1001), vec![], BallotNumber(1));
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        writer.call_log.lock().unwrap().clear();
+
         sm.handle_apply(txn_id, vec![42]);
 
-        let state = sm.get_state(&txn_id).unwrap();
         assert_eq!(
-            state.phase,
-            TxnPhase::Applied,
-            "replay after crash must successfully apply"
+            sm.get_state(&txn_id).unwrap().phase,
+            TxnPhase::Committed,
+            "a failed storage write leaves nothing durable, so the txn must stay Committed"
+        );
+        assert!(
+            writer.calls().is_empty(),
+            "no durable row means no Applied marker may be written; got {:?}",
+            writer.calls()
         );
     }
 

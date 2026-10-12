@@ -757,8 +757,24 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   a quorum and is never reported as abandoned: a coordinator whose own replica
   then fails to converge fails loud with a non-retryable durability error instead
   (`coordinator local Apply did not reach Applied ... (NOT an abandon)`), because
-  "safe to retry" would invite a double-apply. The residual boundary — a remote
-  that persists a write before its `ApplyOK` is lost — is inherent to Accord's
+  "safe to retry" would invite a double-apply.
+  **A replica that wrote its rows durably always acks.** The protocol-log `Applied`
+  marker is the journal's *record* of the apply; it is written after the storage
+  write, whose own commit-log fsync is the durability instant for the row, and the
+  two are decided together by `applied_journal::record_applied_marker` — the one
+  entry point that owns the marker write and the ack decision. A marker fsync
+  failure with the rows already durable therefore still acknowledges
+  (`bookkeep_applied` advances the txn to `Applied`, which is the phase the ack gate
+  waits for) instead of withholding `ApplyOK` on a row that is already readable and
+  letting the coordinator report an abandon over durable data (finding G1). A
+  **no-write finalize** has no durable row, so there the marker *is* the durability
+  and a failed fsync still withholds the ack. Tests:
+  `apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails`,
+  `sm_marker_fsync_failure_after_a_durable_row_write_still_applies`, with
+  `a_failed_marker_withholds_when_nothing_durable_was_written` and
+  `sm_storage_apply_failure_does_not_advance` as the negative controls.
+  The residual boundary — a remote that acks and then loses its `ApplyOK` on the
+  wire, or whose own Apply retry never arrives — is inherent to Accord's
   at-least-once apply and is not closed here.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)

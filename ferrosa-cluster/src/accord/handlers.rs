@@ -1498,4 +1498,100 @@ mod tests {
             "the apply still acks after its durable write completes, got {ack:?}"
         );
     }
+
+    /// A `StorageApplier` that records which transactions it has durably applied,
+    /// so a test can observe the STORAGE half of a replica's apply independently of
+    /// the state machine's phase. `apply` returning `Ok` models the production applier
+    /// returning from its commit-log fsync — the durability instant for the rows.
+    struct DurableApplier {
+        applied: std::sync::Mutex<Vec<TxnId>>,
+    }
+
+    impl DurableApplier {
+        fn new() -> Self {
+            Self {
+                applied: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn durably_applied(&self, txn_id: &TxnId) -> bool {
+            self.applied.lock().unwrap().contains(txn_id)
+        }
+    }
+
+    impl crate::accord::apply::StorageApplier for DurableApplier {
+        fn apply(
+            &self,
+            txn_id: TxnId,
+            _mutation: crate::accord::apply::ApplyMutation,
+        ) -> Result<(), crate::accord::apply::ApplyError> {
+            self.applied.lock().unwrap().push(txn_id);
+            Ok(())
+        }
+    }
+
+    /// G1, at the smallest level it is reachable: ONE inbound Apply, in process.
+    ///
+    /// A replica that durably wrote a transaction's rows must not withhold
+    /// `ApplyOK`. The protocol-log `Applied` marker is the journal's *record* of
+    /// the apply; the durability instant for the DATA is the storage write, whose
+    /// commit-log fsync has already succeeded by the time the marker is written.
+    /// When the marker's own fsync fails and that failure is allowed to withhold
+    /// the ack, the coordinator loses this replica's acknowledgment, reports
+    /// `TxnAbandoned`, and the client is told "NOT committed; safe to retry" while
+    /// the row is durable and readable here — finding G1.
+    ///
+    /// RED as written: the marker fsync fails, so the transaction never advances to
+    /// `Applied`, `await_txn_applied` returns `false`, and the handler answers `None`.
+    /// The value assertion on `AccordApplyOK` therefore fails on the ACK GATE's
+    /// behaviour, not on a missing symbol. The row itself IS durable — the first
+    /// assertion (the precondition) passes today and is what makes the failure a
+    /// lie about durability rather than a missing write.
+    #[tokio::test]
+    async fn apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails() {
+        let writer = std::sync::Arc::new(MockSyncWriter::new());
+        let applier = std::sync::Arc::new(DurableApplier::new());
+        let sm = AccordStateMachine::with_applier(1, writer.clone(), applier.clone());
+        let state: AccordState = std::sync::Arc::new(parking_lot::Mutex::new(sm));
+        let handler = AccordHandler::new(state.clone(), 1);
+
+        let txn_id = TxnId::new(1, ts(1000));
+        {
+            let mut sm = state.lock();
+            sm.handle_preaccept(txn_id, ts(1000), b"g1-key", BallotNumber(0), 0);
+            sm.handle_commit(txn_id, ts(1000), ts(1001), vec![]);
+        }
+
+        // Only the protocol-log marker's fsync fails; the storage write (the
+        // durability instant) still succeeds on the applier.
+        writer.set_fsync_failure(true);
+
+        let payload = ApplyV2Payload {
+            txn_id,
+            writes: vec![WriteSetEntry {
+                key: b"g1-key".to_vec(),
+                mutation: b"durable-row".to_vec(),
+            }],
+        };
+        let bytes = bincode::serialize(&payload).unwrap();
+        let peer: PeerId = (
+            uuid::Uuid::from_u128(2),
+            "127.0.0.1:0".parse().expect("valid socket addr"),
+        );
+        let resp = handler
+            .handle(peer, Message::AccordApplyV2(Bytes::from(bytes)))
+            .await;
+
+        assert!(
+            applier.durably_applied(&txn_id),
+            "precondition: the storage write must have durably applied the rows, so the \
+             withheld ack below is a lie about durability"
+        );
+        assert!(
+            matches!(resp, Some(Message::AccordApplyOK(_))),
+            "a replica holding a DURABLY WRITTEN row must not withhold ApplyOK because the \
+             protocol-log Applied marker's fsync failed — that is the abandon-with-durable-data \
+             hazard (G1); got {resp:?}"
+        );
+    }
 }
