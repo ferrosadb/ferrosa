@@ -112,8 +112,10 @@ pub trait RepairStore: Send + Sync {
 
     /// Build a Merkle tree summarising this store's content for the
     /// token range `[range_start, range_end)`. The Merkle leaf
-    /// hashes are an order-independent XOR of per-partition
-    /// content hashes — see `repair::partition_merkle_hash`.
+    /// hashes are the wrapping sum of per-partition content hashes,
+    /// so equal-hash partitions do not cancel — see
+    /// `repair::partition_merkle_hash` and `repair::merkle`'s note on
+    /// collisions.
     ///
     /// The executor uses Merkle exchange to identify the divergent
     /// leaf ranges between two replicas BEFORE fetching any

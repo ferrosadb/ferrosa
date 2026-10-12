@@ -1,15 +1,15 @@
 //! Merkle tree for anti-entropy repair.
 //!
 //! A binary hash tree where each leaf covers a sub-range of the token space.
-//! Internal nodes contain the XOR of their children's hashes.
+//! Internal nodes hold the wrapping sum of their children's hashes.
 
 use serde::{Deserialize, Serialize};
 
 /// Binary Merkle tree over a token range.
 ///
-/// The tree has `2^depth` leaves. Each leaf accumulates the XOR of all
-/// partition hashes whose tokens fall in that leaf's sub-range. Internal
-/// nodes are the XOR of their children.
+/// The tree has `2^depth` leaves. Each leaf accumulates the wrapping sum
+/// (`u64::wrapping_add`) of every partition hash whose token falls in that
+/// leaf's sub-range. Internal nodes are the wrapping sum of their children.
 ///
 /// Serializable so it can be exchanged between nodes.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,12 +151,14 @@ impl MerkleTree {
     /// otherwise the entire range is returned as "divergent" because we can't
     /// align leaves.
     ///
-    /// Note on XOR collisions: because leaves accumulate hashes via XOR, two
-    /// trees that hold strictly different content but whose XORs happen to
-    /// cancel will report no divergence. This matches Cassandra's classic
-    /// Merkle behaviour for `nodetool repair`; the false-negative probability
-    /// is ~ 2^-64 per leaf with a 64-bit partition hash. Use a deeper tree
-    /// (more leaves) to reduce false-negatives at the cost of more memory.
+    /// Note on collisions: leaves accumulate by `u64::wrapping_add`, and the
+    /// per-partition digest is a 32-bit CRC widened bijectively to 64 bits, so
+    /// two replicas report "no divergence" only when every leaf's summed digest
+    /// coincides — a false negative requires a ~2^-32 modular coincidence for a
+    /// differing leaf, never a structural one (no duplicate or equal-hash pair
+    /// cancels; see the tests below). Compare with Cassandra's classic Merkle,
+    /// which accepts the same trade-off. The comparison is leaf-by-leaf, so this
+    /// is per-leaf, not per-root.
     pub fn divergent_leaf_ranges(&self, other: &Self) -> Vec<(i64, i64)> {
         if self.depth != other.depth
             || self.range_start != other.range_start
@@ -183,11 +185,13 @@ mod tests {
     /// A replica missing an EVEN number of equal-hash partitions must still be
     /// detected as divergent.
     ///
-    /// Leaves are combined with XOR (`nodes[i] ^= hash`), and XOR is
-    /// self-inverse: two partitions whose content hashes are equal cancel to
-    /// zero. So a leaf holding both hashes to exactly the same value as a leaf
-    /// holding neither, and `divergent_leaf_ranges` reports no divergence while
-    /// one replica is short two rows.
+    /// This is the regression guard for the combiner the fixture reproduces:
+    /// leaves used to combine with XOR (`nodes[i] ^= hash`), and XOR is
+    /// self-inverse, so two partitions whose content hashes are equal cancelled
+    /// to zero — a leaf holding both hashed exactly like a leaf holding neither,
+    /// and `divergent_leaf_ranges` reported no divergence while one replica was
+    /// short two rows. The current wrapping sum does not cancel, so the fixture
+    /// (which still builds the two equal-hash partitions) must now be detected.
     ///
     /// Observed on the host cluster 2026-08-17: node1 held 78,492 distinct
     /// entity ids against node3's 78,499 -- strictly missing 7, with zero rows
@@ -212,8 +216,8 @@ mod tests {
 
         assert!(
             !complete.divergent_leaf_ranges(&short).is_empty(),
-            "a replica missing two equal-hash partitions must be reported as divergent; \
-             XOR cancels them and hides the gap"
+            "a replica missing two equal-hash partitions must be reported as divergent; XOR \
+             cancelled them and hid the gap until 2026-08-17"
         );
     }
 
@@ -230,8 +234,8 @@ mod tests {
         assert_ne!(
             tree.root_hash(),
             0,
-            "two equal-hash partitions XOR to zero, making a populated range \
-             indistinguishable from an empty one"
+            "two equal-hash partitions must not combine to zero, which would make a populated \
+             range indistinguishable from an empty one (the XOR behaviour this replaced)"
         );
     }
 

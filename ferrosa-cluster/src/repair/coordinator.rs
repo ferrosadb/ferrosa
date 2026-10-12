@@ -51,6 +51,22 @@ pub struct SessionResult {
     pub result: Result<SessionStats, String>,
 }
 
+/// What one table's *initiated* repair produced: the per-`(range, peer)`
+/// sessions, plus how many of this node's own ranges had a live peer at all.
+///
+/// The second field exists so an EMPTY session list is not reported as "nothing
+/// was verified" for every replica. An empty list means one of two benign
+/// things, and only the caller that sees this count can tell them apart — see
+/// `NoSessionsReason` in [`super::scheduler`].
+#[derive(Debug)]
+pub struct InitiatedRepair {
+    /// One entry per `(range, peer)` session attempted.
+    pub results: Vec<SessionResult>,
+    /// Ranges this node owns that have at least one live peer. `0` means there
+    /// is no replica to compare against, so no session was possible.
+    pub ranges_with_live_peers: usize,
+}
+
 /// Executes a single repair session between the local node and one peer
 /// over one token range of one table.
 ///
@@ -174,14 +190,23 @@ impl RepairCoordinator {
         local_node_id: u64,
         rf: usize,
         table: &TableId,
-    ) -> Vec<SessionResult> {
+    ) -> InitiatedRepair {
+        // How many of this node's own ranges had a peer to compare against at
+        // all. Returned beside the sessions so a caller reporting an empty cycle
+        // can say WHICH benign situation it is in rather than calling every
+        // replica unverified (`NoSessionsReason`).
+        let ranges_with_live_peers =
+            super::scheduler::owned_ranges_with_live_peers(ring, local_node_id, rf);
         let mut tasks: Vec<(i64, i64, u64)> = Vec::new();
         for r in super::scheduler::select_initiated_ranges(ring, local_node_id, rf) {
             for peer in r.peers {
                 tasks.push((r.start, r.end, peer));
             }
         }
-        self.run_session_tasks(executor, table, tasks).await
+        InitiatedRepair {
+            results: self.run_session_tasks(executor, table, tasks).await,
+            ranges_with_live_peers,
+        }
     }
 
     /// Fan out one repair session per `(range_start, range_end, peer)` task,
@@ -481,7 +506,9 @@ mod tests {
     /// FMEA #1 at the coordinator level: when every node runs `repair_initiated`
     /// (the automatic path), each token range is repaired by exactly ONE
     /// initiator — not RF times. So exactly one of the three nodes schedules
-    /// sessions; the other two schedule none.
+    /// sessions; the other two schedule none, and each of them reports a
+    /// non-zero `ranges_with_live_peers`, which is what lets the scheduler say
+    /// "another replica is the initiator" instead of "nothing was verified".
     #[tokio::test]
     async fn repair_initiated_runs_each_range_once_across_all_nodes() {
         let ring = three_node_ring();
@@ -493,13 +520,18 @@ mod tests {
         let mut total = 0usize;
         for node in [1u64, 2, 3] {
             let exec = Arc::new(MockExecutor::new());
-            let results = coord
+            let initiated = coord
                 .repair_initiated(exec.clone(), &ring, node, 3, &table)
                 .await;
-            if !results.is_empty() {
+            assert!(
+                initiated.ranges_with_live_peers > 0,
+                "node {node} owns ranges with live peers, so `not an initiator` is the honest \
+                 report for the nodes that schedule nothing"
+            );
+            if !initiated.results.is_empty() {
                 nonempty += 1;
             }
-            total += results.len();
+            total += initiated.results.len();
         }
         assert_eq!(
             nonempty, 1,
