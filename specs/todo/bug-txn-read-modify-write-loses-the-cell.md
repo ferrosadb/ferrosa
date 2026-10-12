@@ -524,6 +524,30 @@ Then re-apply `rt2-disjoint-keys.patch` and the red goes GREEN with its control.
 RESIDUAL, to state when it lands: a transaction that read by SCAN keeps the table-level check, so scan
 readers still collide on table identity. Only (b)/SIREAD removes that.
 
+### RT-2 (a): predicate + plumbing WRITTEN, saved as a patch; not landed (2026-10-11)
+
+Written and nearly compiling, saved as `rt2-predicate-inprogress.patch` (121 lines) rather than
+committed, because the piece that makes the red GREEN was not reached:
+
+- `RowKey` -> `pub(crate)` (struct + both fields).
+- `validate_snapshot` gains `read_rows: &HashSet<RowKey>` and checks ROW-granular FIRST: local
+  (`state.versions`, `BTreeMap<u64>` against `snapshot.read_ts`) and distributed
+  (`state.distributed_versions`, `BTreeMap<Timestamp>` against `snapshot.cluster_ts` — `ActiveSnapshot`
+  carries it as `Option<Timestamp>`). The TABLE-granular check is RETAINED for scans, per option (a).
+- `validate_commit`, `MvccManager::commit` and `query::commit_mutations` thread `read_rows` through.
+
+The compiler listed the remaining callers as SEVEN one-line updates: `copy_stdin.rs:489`;
+`query.rs:1577`, `:1663`, `:4556`; `server.rs:893`, `:983`, `:1091`.
+
+NOT reached — step 5, the piece that turns the red green: the point-read branch in
+`track_select_reads` (`server.rs:709`), which needs the PK column of the read table. The metadata type
+is `ferrosa-schema/src/metadata/table.rs:23` (`partition_key: Vec<String>`) and `jsonb_rules.rs:234`
+already performs exactly the needed check (`table.partition_key.contains(&col.name)`); what is NOT yet
+resolved is the accessor by which the front end reaches that table metadata from `ctx.schema`.
+
+Tree: GREEN and verified (`cargo build -p ferrosa-postgres` -> `Finished`) after the revert, which is
+why the partial work was parked as a patch rather than committed. Nothing semi-landed.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
