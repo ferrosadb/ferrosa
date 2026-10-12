@@ -596,6 +596,50 @@ Consequences:
 The parked `rt2-predicate-inprogress.patch` already contains the predicate itself; its parameter-based
 plumbing should be REPLACED by this lookup rather than extended.
 
+### RT-2 (a) LANDED — row-granular point reads, table-granular scans (2026-10-11)
+
+The parked red `transactions_on_disjoint_keys_do_not_conflict` is GREEN with its negative control,
+committed together with the fix. Verbatim before (red, 0.05 s, no cluster):
+
+    B writes d2 only - a DISJOINT key - so refusing it is the false conflict:
+    [ErrorResponse { fields: [(83,"ERROR"), (67,"40001"), (77,"could not serialize PostgreSQL transaction")] }]
+
+After: `ok` — both transactions COMMIT and both written VALUES read back.
+
+**Read side (the design as given).** `State` gains `read_rows: HashMap<u64 /*snapshot id*/,
+HashSet<RowKey>>` (`mvcc.rs`), pruned in `prune_versions` — which every site that removes a snapshot
+(`SnapshotLease::drop`, `expire_snapshots_before`) already calls, so nothing leaks.
+`MvccManager::record_point_read(&snapshot, RowKey)` inserts under the live snapshot;
+`validate_snapshot` reads it ROW-granular FIRST (local `versions` keyed by `commit_seq` against
+`read_ts`; distributed `distributed_versions` against `cluster_ts` when present) then falls through to
+the EXISTING table check, signature unchanged. `RowKey` and both fields are `pub(crate)`.
+`track_select_reads` (`server.rs`) records a `WHERE <partition-key> = <literal>` read as its ROW and
+does NOT record the table; the PK column is read from `ctx.schema.snapshot().tables`
+(`TableMetadata::partition_key`).
+
+**Write side — the design's "three `server.rs` sites are NOT touched" was wrong, and the red proved
+it.** `commit_txn` folded every WRITTEN table into the set handed to `validate_commit`, so a
+transaction was still refused on the table epoch of a table it merely WROTE (the instrumentation
+showed the false refusal came from `tables={"public.kv"}` / `epochs={"public.kv": 6}`, not the read
+set). `commit_txn` now validates the SCANNED tables only; a write is judged by the ROWS it wrote,
+recorded in `commit_mutations` (`query.rs`) through the same `record_point_read` — so same-key
+write-write still conflicts while disjoint writes do not.
+
+**Two pre-statement liveness probes had to stop using `validate_commit`.** `expired_transaction_error`
+(`server.rs`) and `load_catalog_with_mvcc` (`query.rs`) called `validate_commit(snapshot, &empty)` as
+an "is the snapshot usable" check. With an empty read set that could only ever return
+`SnapshotExpired`; once `validate_snapshot` also checks read rows, a live snapshot with a changed read
+row was mis-reported EXPIRED and a transaction could no longer read its own BEGIN snapshot. Both now
+call the new `MvccManager::snapshot_is_active`: only EXPIRY aborts a later statement, and a read-set
+conflict stays a COMMIT-time decision.
+
+RESIDUAL (unchanged): a transaction that read by SCAN keeps the table-level check, so scan readers
+still collide on table identity — only (b)/SIREAD removes that.
+
+Gates: `cargo fmt --all` clean; `cargo clippy -p ferrosa-postgres --all-targets -- -D warnings`
+clean; `cargo test -p ferrosa-postgres` green — lib 361 passed / 0 failed (360 + the new red), every
+integration target green.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the

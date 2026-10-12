@@ -230,9 +230,9 @@ fn parse_positive_duration(
 pub struct PgWrite(pub(crate) Mutation);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RowKey {
-    table: String,
-    key: Vec<Value>,
+pub(crate) struct RowKey {
+    pub(crate) table: String,
+    pub(crate) key: Vec<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -258,6 +258,10 @@ struct State {
     active_snapshots: HashMap<u64, ActiveSnapshot>,
     versions: HashMap<RowKey, BTreeMap<u64, Option<Row>>>,
     distributed_versions: HashMap<RowKey, BTreeMap<Timestamp, Option<Row>>>,
+    /// Rows read BY KEY by each live snapshot. A point read is judged by the row
+    /// it named, never by table identity (RT-2). Entries are pruned with the
+    /// snapshot they belong to, in [`prune_versions`].
+    read_rows: HashMap<u64, HashSet<RowKey>>,
     applied_accord_txns: HashSet<(TxnId, Timestamp)>,
     table_epochs: HashMap<String, u64>,
 }
@@ -461,6 +465,27 @@ impl MvccManager {
     ) -> Result<(), MvccCommitError> {
         let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
         validate_snapshot(&state, snapshot, read_tables)
+    }
+
+    /// Whether `snapshot` is still live in this manager. The pre-statement
+    /// liveness probe uses this, NOT [`Self::validate_commit`]: a read-set
+    /// conflict is a COMMIT-time decision, and must not abort a later read on a
+    /// still-valid snapshot (which must keep reading from its BEGIN snapshot).
+    pub(crate) fn snapshot_is_active(&self, snapshot: &MvccSnapshot) -> bool {
+        let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        state.active_snapshots.contains_key(&snapshot.id)
+    }
+
+    /// Record a row read BY KEY under `snapshot`, so commit judges that read at
+    /// row granularity instead of by table identity. A snapshot that has already
+    /// left `active_snapshots` records nothing: its transaction is over and the
+    /// entry would be pruned anyway. Called only for an exact-key point read on
+    /// a table's partition key (see `server::track_select_reads`).
+    pub(crate) fn record_point_read(&self, snapshot: &MvccSnapshot, row: RowKey) {
+        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        if state.active_snapshots.contains_key(&snapshot.id) {
+            state.read_rows.entry(snapshot.id).or_default().insert(row);
+        }
     }
 
     /// Returns the versioned rows for one table at a snapshot. The storage scan
@@ -730,6 +755,37 @@ fn validate_snapshot(
     if !state.active_snapshots.contains_key(&snapshot.id) {
         return Err(MvccCommitError::SnapshotExpired);
     }
+    // ROW-granular FIRST: a row this transaction read BY KEY that has since been
+    // written conflicts. Two transactions touching DISJOINT keys of one table
+    // are independent — PostgreSQL conflicts on read-set/write-set overlap, never
+    // on table identity — so refusing one on table identity alone is a false
+    // conflict (RT-2). `versions` is keyed by commit sequence (`u64`), compared
+    // against `snapshot.read_ts`; `distributed_versions` is keyed by Accord
+    // timestamp, compared against `snapshot.cluster_ts` when the snapshot has one.
+    if let Some(read_rows) = state.read_rows.get(&snapshot.id) {
+        for row in read_rows {
+            if state
+                .versions
+                .get(row)
+                .is_some_and(|versions| versions.keys().any(|seq| *seq > snapshot.read_ts))
+            {
+                return Err(MvccCommitError::SerializationFailure);
+            }
+            if let Some(cluster_ts) = snapshot.cluster_ts {
+                if state
+                    .distributed_versions
+                    .get(row)
+                    .is_some_and(|versions| versions.keys().any(|ts| *ts > cluster_ts))
+                {
+                    return Err(MvccCommitError::SerializationFailure);
+                }
+            }
+        }
+    }
+    // TABLE-granular, retained for SCANS: a scan does not enumerate its rows, so
+    // a phantom written into the scanned table must still conflict. A read
+    // recorded as an exact-key point read records its ROW and not its table, so
+    // it no longer reaches this check.
     if read_tables.iter().any(|table| {
         state
             .table_epochs
@@ -826,6 +882,14 @@ fn prune_versions(state: &mut State) {
     state
         .distributed_versions
         .retain(|_, versions| retain_snapshot_history(versions, oldest_cluster));
+
+    // Drop the read set of every snapshot that has left `active_snapshots`, so a
+    // finished transaction's point reads do not accumulate. Both removal sites
+    // (`SnapshotLease::drop` and `expire_snapshots_before`) call this.
+    let live_snapshots = &state.active_snapshots;
+    state
+        .read_rows
+        .retain(|id, _| live_snapshots.contains_key(id));
 }
 
 /// Keep the version visible at the oldest active snapshot and every later
