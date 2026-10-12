@@ -80,6 +80,43 @@ Each was a plausible reading that a cited source read refutes.
   ASCII-text writer has a binary reader, and "one replica at a time" / "bincode frame" docs that no
   longer match the fan-out.
 
+## EXPERIMENT RESULT — measured 2026-10-12 (supersedes U1's "unexplained")
+
+Two clean, consecutive measurements on the live 3-node cluster, after which the client was killed and
+confirmed gone (`pgrep` = 0) before each read. Trigger: `pgbench -i --scale 10 --foreign-keys`.
+
+1. **The abandon is reproducible on demand.** Run: COPY reached `1000000 of 1000000 tuples
+   (elapsed 4.74 s)`, then `pgbench: error: query failed: ERROR: transaction was abandoned and NOT
+   committed: ... exceeded the 10s dependency-wait bound`. So the rows existed when the abort was
+   reported.
+2. **The table is then unreadable — reproducibly.** A point lookup (`select abalance from
+   pgbench_accounts where aid = 1`) is *served as a scan*, and fails after 30 s, twice, cleanly:
+
+   ```
+   ERROR: 58000: scan of public.pgbench_accounts failed: internal: streaming range read:
+     a fragment-merge source produced no fragment within 30000ms; failing loudly rather than waiting
+     forever (one silent source must not stall the scan) (query aborted; result discarded)
+   ```
+
+**What this establishes.** The defect is not "an abandon leaks rows". It is that **an abandoned
+commit leaves table state that references data whose fragments never arrived** — a dangling
+reference — and the read path correctly fails loud rather than returning a wrong answer. The earlier
+669,315-row census was a different moment in the same broken state (metadata pointing at a partial
+set). Two distinct harms, one cause: the transaction's *metadata* and its *fragments* do not share a
+fate.
+
+**Consequences for the design.** (a) The abandoned transaction's effect on storage metadata is not
+rolled back by `finalize_no_write`, which addresses the row half and not the metadata half. (b) The
+read path's fail-loud detector is doing its job and must be kept. (c) The decisive next probe is a
+**forced-failure small case**: `BEGIN; COPY (3 rows); <fail the commit>;`, then a point lookup — to
+reproduce the dangling reference at a size where the storage state is fully enumerable, rather than
+inferring it from a million-row table.
+
+**U1 is now answered at the level of observable behaviour, and U2 remains open:** G1's
+fsync-failed-marker path is the leading candidate for *why* the fragment never arrived, but this
+experiment does not yet connect them; that needs the small forced-failure case plus an instrumented
+node.
+
 ## Unresolved (needs a probe or an owner decision, not more reading)
 
 - **U1 — The 669,315 surviving rows are unexplained by any path found.** In-txn COPY commits
