@@ -660,6 +660,16 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   members taken down can never re-form the old cluster (CL-42, CL-45).
 
 ### Accord transactions (`accord/`)
+- **A PostgreSQL snapshot's staleness is judged on the transaction's OWN keys, never on a
+  cluster-global marker.** Every PostgreSQL commit bumps one shared
+  `POSTGRES_TRANSACTION_MARKER_KEY` high-water mark, and the pre-accept stale check used to refuse any
+  transaction whose snapshot predated that mark — regardless of which rows it touched. Since every PG
+  transaction touches that one protocol key, this serialized the entire front end: two concurrent
+  transactions on DISJOINT keys conflicted, one side refused `40001`, and four concurrent clients
+  measured 0 tps. Staleness is now computed from the keys the transaction itself wrote, excluding the
+  two shared protocol keys (the data-commit marker and the BEGIN/COMMIT barrier). Verified from a real
+  client on a settled 3-node cluster (two concurrent pairs, `refused A=0 B=0`, no `40001`). See FMEA
+  CL-62; the read-set half of the same family is CL-28 (`t_1ba6ccc8`).
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
   Accept is dependency-monotonic: replicas retain dependencies seen locally
