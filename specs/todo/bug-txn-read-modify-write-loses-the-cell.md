@@ -640,6 +640,37 @@ Gates: `cargo fmt --all` clean; `cargo clippy -p ferrosa-postgres --all-targets 
 clean; `cargo test -p ferrosa-postgres` green — lib 361 passed / 0 failed (360 + the new red), every
 integration target green.
 
+### LAYER 2 DIAGNOSIS: the row check is INERT on the live path (cluster_ts) — 2026-10-12
+
+Settled re-run (V0-a PASS, so the cluster was healthy): V1 and V2 both still report "one side refused
+40001 on DISJOINT keys". The fix does not reach the live path. Cause, read off the code:
+
+1. The live commit goes through Accord — `server.rs:1026`, `if let Some(committer) = ctx.accord.committer()`
+   — so its writes are recorded by `record_applied_accord_commit` into `state.distributed_versions`,
+   NOT into `state.versions`.
+2. The new row check's distributed arm runs only `if let Some(cluster_ts) = snapshot.cluster_ts`.
+3. The live snapshot comes from `ctx.mvcc.snapshot()` (`server.rs:926`), which carries NO cluster
+   timestamp; `snapshot_with_cluster_ts(..)` is used only by tests.
+
+=> Live, the row check examines `versions` (empty — nothing writes it on the Accord path) and SKIPS
+   `distributed_versions` (no cluster_ts). It can NEVER detect a row conflict. So the TABLE check still
+   decides and the false conflict persists, exactly as observed.
+
+Corroboration from the node logs: no `40001`, no abandon, no "serialize" line. The Accord abandon path
+DOES log ("abandoning the transaction (NOT committed; safe to retry)"), so its absence rules
+`TxnAbandoned` out; the MVCC path maps `SerializationFailure` to the wire silently, which is why the
+emitter leaves no trace.
+
+**THE FIX (not done):** make the row check see the distributed map on the Accord path — either give the
+commit-path snapshot the transaction's Accord timestamp, or compare `distributed_versions` against the
+timestamp the commit already holds (`prepare_postgres_apply` receives `apply_t`).
+
+**Residual, unchanged:** scans keep the table check, and this machinery still REFUSES where PostgreSQL
+would WAIT — at the default isolation level that is the deeper gap.
+
+Also confirmed on a settled cluster: V1's B value EMPTY, V2's B value KEPT (222) — RT-3's
+read-discriminator still holds.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
