@@ -402,6 +402,27 @@ The red `transactions_on_disjoint_keys_do_not_conflict` is parked as `rt2-disjoi
 turns GREEN under (a) or (b). Under (a) it is green while scan-readers still collide — say so when it
 lands.
 
+### RT-2 fix: the read site, and why this is deeper than "the predicate is small" (2026-10-11)
+
+Recon for option (a). The read-set is filled in **`track_select_reads`** (`ferrosa-postgres/src/server.rs:709`),
+which is called with the whole `ferrosa_sql::SelectStmt` — so the WHERE predicate IS in scope, and the
+function currently records only the table name from `select.from` / `select.join`.
+
+What that means for sizing: option (a) needs the **RowKey of a point read**, and obtaining it means
+deriving the storage key from the predicate — a real piece of work, not a one-liner alongside the
+predicate change. The engine already resolves exactly that key in order to execute the read, so the
+fix should REUSE that resolution (record the key it resolved) rather than re-deriving it from the
+`SelectStmt`; deriving it a second time would be a second implementation of key resolution that can
+disagree with the first.
+
+So the honest size is: predicate change (~15 lines) + read-set type change across the six call sites
+already listed + reuse of the engine's key resolution at the read site + the gate. That is not a
+turn-ending increment, and I did not start it — the red stays parked and the tree stays clean.
+
+**Status: OWED, blocked on the one design decision (scan read-sets) plus this key-resolution reuse.** The
+decision went to the user and timed out unanswered; the recommendation stands at (a), the conservative
+increment, which keeps phantom protection for scans and names its residual.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
