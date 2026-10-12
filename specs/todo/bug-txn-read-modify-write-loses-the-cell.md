@@ -671,6 +671,50 @@ would WAIT — at the default isolation level that is the deeper gap.
 Also confirmed on a settled cluster: V1's B value EMPTY, V2's B value KEPT (222) — RT-3's
 read-discriminator still holds.
 
+### ROOT CAUSE CORRECTED — it was a CLUSTER-GLOBAL LOCK, not the table check (2026-10-12)
+
+**My layer-2 diagnosis was WRONG, and the evidence that refutes it is simple.** For these transactions
+`read_tables` AND `read_rows` are BOTH EMPTY — a plain `BEGIN` stores isolation `None`, and the
+non-serializable path records nothing — so `mvcc::validate_snapshot` always returned `Ok`. It was never
+the emitter. (The row check being inert on the Accord path is still true; it was just irrelevant here.)
+
+**The real cause:** every PostgreSQL commit bumps a single cluster-global
+`POSTGRES_TRANSACTION_MARKER_KEY` high-water mark, and the Accord pre-accept snapshot-stale check
+refused ANY transaction whose snapshot predated that mark — regardless of which rows it touched. That is
+a CLUSTER-GLOBAL LOCK: every concurrent pair conflicts on a shared protocol key, which is the
+"4 clients = 0 tps".
+
+**The fix: `77cdf369`** — "judge PostgreSQL snapshot staleness on the transaction's own keys, not the
+global marker" (`ferrosa-cluster/src/accord/state_machine.rs`, +106/-13): staleness is now judged
+against the keys the transaction itself WROTE, excluding the two shared protocol keys (the data-commit
+marker and the BEGIN/COMMIT barrier). Two new tests plus the reworked stale test; 1463 ferrosa-cluster
+lib tests pass; fmt/clippy clean.
+
+**Verified live on pgwire-77cdf369** — probe output verbatim:
+
+    V1:  A: (no error)  B: (no error)   after: aid=1 v='778'  aid=2 v='<empty>'
+         FAIL V1: aid=2 got '<empty>' want '202'   (refused A=0 B=0)
+    V2:  A: (no error)  B: (no error)   after: aid=1 v='111'  aid=2 v='222'
+         PASS V2: no value lost                    (refused A=0 B=0)
+
+`refused A=0 B=0` on BOTH pairs: no 40001 anywhere. A cold cluster can make failures APPEAR; it cannot
+make a refusal DISAPPEAR, so the global lock is gone. Caveat recorded honestly: V0-a FAILED with the
+post-deploy cold-read timeout, so this run is inadmissible for a formal pass and a CLEAN SETTLED
+RE-RUN IS OWED before calling RT-2 done.
+
+**RT-3 is now cleanly separated from RT-2**: V1's B value reads back EMPTY (a successful transaction
+losing its value) while V2's blind B KEEPS its value (222) — the read-discriminator still holds, on the
+same run. RT-3 is the remaining transaction defect.
+
+**Also found on the CQL side (needs recording/follow-up):**
+- `UPDATE ... SET v = v + N` inside a CQL transaction is refused with 0x2200 ("unsupported collection
+  assignment: Add of a non-collection value ... inside a transaction"). This is the KNOWN gap: the CQL
+  fix resolves a BOUND operand (`v = cur + N`); a self-increment names the column, so it fails the
+  binding lookup. NOT yet recorded anywhere else.
+- The LIVE node rejected the documented LET block (`unexpected token Ident("LET") at position 19`)
+  while this tree's parser accepts it in-process. The image was mid-roll at that moment, so this is
+  UNRESOLVED and needs one clean re-run on a settled 77cdf369.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
