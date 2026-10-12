@@ -124,6 +124,20 @@ and the client told it committed — never a mix), across two consecutive runs.
 **Note:** R0 (`c085d5ad`) does not close this gate; the reproduce agent's expectation that it would
 was wrong and is corrected in the ground-truth note.
 
+> **Status (slice 1 landed, 2026-10-12):** the decision is now evidence-based, at the
+> smallest reachable level. The apply fan-out returns `ApplyFanout { quorum_reached,
+> peer_acks }` (distinct remote verified `ApplyOK`s; the coordinator's deferred self-ack is
+> NOT counted), and `apply_phase_within` splits `!apply_ok` into **zero acks** (the truthful
+> retryable abandon, unchanged) and **any ack** (a non-retryable committed-and-converging
+> error that names the commit and does NOT call `finalize_no_write`). Red first, in process:
+> `coordinator::tests::a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon`
+> (observed RED `Err(TxnAbandoned { timeout: 200ms })` on one verified ack of the two
+> required), with `the_multi_key_apply_fan_out_reports_the_partial_apply_evidence` and the
+> negative control `zero_apply_acks_still_abandon_truthfully`. **Not closed:** the live
+> reproducer gate itself (`scripts/abandon-damage-repro.sh` must PASS on the cluster, two
+> runs), and the zero-ack lie when a replica applies and ALL acks are lost — that needs a
+> durable abandon decision the apply path consults, i.e. the rest of R6.
+
 ## The canonical experiment (must be run before and after R0-R2)
 
 ```

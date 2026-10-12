@@ -215,6 +215,16 @@ Mechanism (ii) (stopping machines) is a strictly stronger form of the same freez
    corrected here: deploying it should still FAIL, and that is the prediction to test.
 3. The script is the standing gate for any change to the apply path.
 
+> **Update (R6a slice 1, 2026-10-12):** the outcome split is now implemented in process.
+> `apply_phase_within` decides on EVIDENCE: the apply fan-out returns `ApplyFanout {
+> quorum_reached, peer_acks }`, the abandon is emitted only at `peer_acks == 0`, and any
+> verified ack yields a non-retryable committed-and-converging error that never calls
+> `finalize_no_write`. Red first:
+> `coordinator::tests::a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon`
+> (RED `Err(TxnAbandoned { timeout: 200ms })`). **Still open:** the live reproducer was not
+> re-run against this build (expect FAIL → PASS on the two-run gate), and the zero-ack case
+> remains a lie whenever every ack is lost.
+
 ## Unresolved (needs a probe or an owner decision, not more reading)
 
 - **U1 — The 669,315 surviving rows are unexplained by any path found.** In-txn COPY commits

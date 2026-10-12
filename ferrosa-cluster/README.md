@@ -747,17 +747,29 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   transaction did not commit and may retry: the PostgreSQL front end maps the
   `abandoned:` reason to SQLSTATE 40001 (serialization failure) and the CQL
   router to a retryable server error.
-  **The abandon is decided before the coordinator writes anything.** The
+  **The abandon is decided by EVIDENCE, never by the clock alone.** The
   coordinator's own-shard apply is deferred until the remote Apply quorum is
-  secured; before that point NO replica has applied, so the "NOT committed"
-  report is the truth and leaves no row readable (pinned by
+  secured, so at the decision point the only durable applies are the remote
+  replicas that ACKED — and a replica writes its rows durably *before* it acks.
+  The apply fan-out therefore reports two facts, not one: `ApplyFanout {
+  quorum_reached, peer_acks }` (the per-shard quorum verdict, and the count of
+  distinct remote `ApplyOK`s — the coordinator's own deferred self-ack is NOT
+  counted). The abandon is reserved for **zero verified Apply acks**: no replica
+  is known to have applied, so the "NOT committed" report is the truth and leaves
+  no row readable (pinned by
   `abandon_durability::an_abandoned_transaction_leaves_no_row_readable_across_restart`,
-  a point lookup of a known key that must survive a restart as absent). If the
-  Apply quorum *is* secured, the transaction is committed and durably applied on
-  a quorum and is never reported as abandoned: a coordinator whose own replica
-  then fails to converge fails loud with a non-retryable durability error instead
-  (`coordinator local Apply did not reach Applied ... (NOT an abandon)`), because
-  "safe to retry" would invite a double-apply.
+  a point lookup of a known key that must survive a restart as absent, and by
+  `coordinator::tests::zero_apply_acks_still_abandon_truthfully`). **Any**
+  verified Apply ack — even one, below quorum — means the transaction is
+  COMMITTED and durably applied on that replica and MUST NOT be abandoned: the
+  coordinator fails loud with a non-retryable durability error that names the
+  commit, never the retryable 40001
+  (`coordinator::tests::a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon`;
+  the fan-out's evidence is pinned directly by
+  `coordinator::tests::the_multi_key_apply_fan_out_reports_the_partial_apply_evidence`).
+  The same non-retryable error covers the case where the Apply quorum *is*
+  secured but the coordinator's own replica then fails to converge
+  (`coordinator local Apply did not reach Applied ... (NOT an abandon)`).
   **A replica that wrote its rows durably always acks.** The protocol-log `Applied`
   marker is the journal's *record* of the apply; it is written after the storage
   write, whose own commit-log fsync is the durability instant for the row, and the
@@ -773,9 +785,12 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   `sm_marker_fsync_failure_after_a_durable_row_write_still_applies`, with
   `a_failed_marker_withholds_when_nothing_durable_was_written` and
   `sm_storage_apply_failure_does_not_advance` as the negative controls.
-  The residual boundary — a remote that acks and then loses its `ApplyOK` on the
-  wire, or whose own Apply retry never arrives — is inherent to Accord's
-  at-least-once apply and is not closed here.
+  The residual boundary — a remote replica that applies durably and then loses
+  its `ApplyOK` before ANY ack reaches the coordinator, so the coordinator sees
+  zero acks and abandons a partially applied transaction — is inherent to
+  Accord's at-least-once apply and is NOT closed here. Closing it needs a durable
+  abandon decision the apply path consults (R6 of the commit-path refactor plan),
+  not a bigger wait: the 10 s bound is a detector, never a knob.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write

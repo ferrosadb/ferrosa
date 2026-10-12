@@ -195,6 +195,14 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   (`apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails`). This is the single-key
   prerequisite for the multi-key/multi-partition transaction work (Phases 1+).
   Regression test: `sm_apply_is_dep_ordered_parks_until_dependency_applies`.
+  **R6a abandon-decision split (2026-10-12):** the retryable `TxnAbandoned` is now
+  reserved for a transaction with **zero verified Apply acks**. The apply fan-out
+  reports `ApplyFanout { quorum_reached, peer_acks }` (distinct remote verified
+  `ApplyOK`s; the coordinator's deferred self-ack is excluded), and ANY verified ack
+  — a replica writes its rows durably before it acks — turns an unmet quorum into a
+  non-retryable committed-and-converging error instead of the abandon, because a
+  retry would double-apply. See `specs/reference/commit-path-refactor-plan.md` R6a and
+  `coordinator::tests::a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon`.
 - **Dep-wait cascade replayed queued txns with empty data — fixed (PR #159).**
   `DepWaitApplier` parked dependency waiters but never stored their mutation, so
   when the last dependency resolved the cascade re-applied each waiter with
