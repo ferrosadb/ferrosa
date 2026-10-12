@@ -4,6 +4,16 @@
 > Script: `scripts/abandon-damage-repro.sh` (one command, prints a PASS/FAIL verdict)
 > Grounding: `commit-path-ground-truth.md` (G1, the experiment result, U1), `commit-path-refactor-plan.md`
 
+> **SUPERSEDED (2026-10-12, later the same day).** Three claims below are wrong or unverified and are
+> corrected in "Gate hardening and corrected measurements" at the end of this file. (1) The
+> 3 × 40 MB shape never exercised the apply path: its entries exceed the 32 MiB commit-log segment
+> cap, so its COMMIT was **refused at the storage preflight**. (2) The "size law / the bound responds
+> to BYTE VOLUME" is **not supported**: an accepted 12 × 10 MB (120 MB) write-set commits clean.
+> (3) The FAIL verdicts recorded below were taken from an **unverified, contaminated start state** —
+> a `drop table`/`create table` on this engine does not clear stored rows. The gate at
+> `scripts/abandon-damage-repro.sh` is now hardened (verified pre-condition; deterministic capacity
+> control) and no longer returns a damage verdict from an unverified start.
+
 ## What it is for
 
 The ground-truth note's decisive next probe was:
@@ -160,3 +170,46 @@ the recorded string rather than by crashing a live node. Every other guard fired
   distinguish an absent fragment from an unreachable one (U1 in the ground truth).
 - A point lookup on a *large* table is served as a scan on this front end and can hang; the reproducer
   avoids that by keeping the table at three rows.
+
+## Gate hardening and corrected measurements (2026-10-12, supersedes the sections above)
+
+Script now at `7bd38149`. Full evidence, raw logs and the verbatim verdict blocks:
+`~/.hermes/cache/scratch/gate-hardening.md`.
+
+**The gate no longer claims a verdict from an unverified start.** A `drop table` + `create table` on
+this engine does **not** clear stored rows: the rows de-register with the table and are readable
+again the moment the table is recreated under the same name (measured: `key 2` readable on node2 and
+`key 3` on node3, both **40 000 000 B**, straight through a drop/create). So every key is now
+point-looked-up on all three nodes AFTER the drop/create and BEFORE the transaction; a readable key
+is `NO-VERDICT` (exit 5). The recorded FAILs above all predate that check and started from a
+contaminated table, so they cannot be attributed to their own transaction.
+
+**The preflight outcome is now stated deterministically.** The entries in the 3 × 40 MB shape are
+over the 32 MiB commit-log segment cap (`commit_log_segment_size = 33554432`), so the storage
+preflight in `write_atomic_batch` refuses the whole set before appending anything. Measured
+directly: an **autocommit** COPY of ONE 40 MB row (the committing path) is refused with
+`write failed: invalid data: batch entry (40000127 bytes) exceeds commit-log segment capacity
+(33554399 bytes usable)` and leaves nothing on any node. A write-set in that shape therefore
+**cannot ever be applied by the normal path**, and a run at that size is not evidence of a partial
+apply. The gate establishes this with a single-row capacity control whose refusal the front end
+returns verbatim — NOT from the engine log, whose buffer is small and rotates (an intermediate
+revision of the hardening counted refusals there and mis-reported a refused shape as `ACCTED`).
+
+**The size law is falsified.** Entries must stay under the cap and the volume must be reached with
+many of them; the default shape is now **12 rows × 10 MB = 120 MB**, every entry
+`entry_est ≈ 10000129 B`. Measured twice (`S3`/`S4`): `PREFLIGHT: ACCTED`, `txn_rc=0 elapsed=52s` —
+**it commits clean**. So the 10 s bound does not respond to byte volume as claimed: the only
+abandons observed at any size were capacity refusals wearing the abandon message.
+
+**What is actually true, and not an artifact of the instrument.** On two FRESH tables (never
+written; keys verified absent on all three nodes), the 3 × 40 MB transaction was abandoned after
+the peers refused the apply (`not advancing to Applied … batch entry (40000132 bytes) exceeds
+commit-log segment capacity`) — and the rows were readable afterwards anyway: `key 2` on node2,
+`key 3` on node3, 40 000 000 B each (`F1`, `F2`, identical). A refused apply appends nothing, and a
+never-written control table returns empty, so a path **other than the normal apply** makes the
+write-set readable on the peer that refused it and the abandon does not roll it back. That path is
+not yet identified (candidates: a peer-side write-set staging/overlay that is never discarded; the
+multi-key capnp blob handoff; the `AccordApplyV2` fallback). Whether the row is **durable** or only
+**readable** is not established. Either way the client contract "NOT committed; safe to retry" does
+not hold.
+
