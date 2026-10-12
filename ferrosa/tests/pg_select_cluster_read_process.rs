@@ -273,26 +273,118 @@ fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-/// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
-/// every listener up). Panics with the node log if it never does.
-fn wait_ready(node: &Node, timeout: Duration) {
+/// The host UUID for node `i` — distinct in BOTH Raft's `bytes[8..16]` and Accord's
+/// `bytes[0..8]`: repeating one byte across all sixteen is distinct in both, matching
+/// `tests/docker-compose.cluster.yml`.
+fn node_host_id(i: usize) -> String {
+    let d = 0x11u8 * (i as u8 + 1);
+    format!(
+        "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
+         {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
+    )
+}
+
+/// The node's message when one of its eight listeners cannot bind.
+const PORT_IN_USE: &str = "Address already in use";
+
+/// Why a node did not reach readiness.
+///
+/// A listener that cannot bind is a HARNESS accident, not a product failure: [`free_port`]
+/// hands out a port that is free at that instant, and between then and the node's `bind` a
+/// concurrently running test target can take it — `cargo-nextest` runs many targets at once,
+/// all drawing from the same ephemeral range. The node then never reports ready, and
+/// reporting THAT as a red would be a false failure about the product. It is re-drawn and
+/// retried instead (see [`start_node_with`]).
+enum NotReady {
+    /// The node log shows a listener that could not bind: its port was taken by another
+    /// process after allocation.
+    PortCollision,
+    /// Nothing in the log says the node failed to bind; it is simply not ready.
+    Timeout,
+}
+
+/// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and every
+/// listener up). A bind collision is reported as soon as the node logs it, so the caller can
+/// re-draw the band and restart instead of waiting out the whole budget.
+fn wait_ready(node: &Node, timeout: Duration) -> Result<(), NotReady> {
     let deadline = Instant::now() + timeout;
+    let mut polls: u32 = 0;
     loop {
         if let Some(body) = http_get(node.ports.web, "/readyz", "") {
             if body.contains("\"ready\":true") {
-                return;
+                return Ok(());
             }
         }
+        // Re-read the node log once a second (5 x 200 ms). A failed bind is fatal to
+        // readiness, so seeing it early is what makes the retry cheap.
+        polls += 1;
+        if polls.is_multiple_of(5) && node.log().contains(PORT_IN_USE) {
+            return Err(NotReady::PortCollision);
+        }
         if Instant::now() >= deadline {
-            panic!(
-                "node {} did not become ready within {timeout:?}; web={} log tail:\n{}",
-                node.host_id,
-                node.ports.web,
-                tail(&node.log(), 40)
-            );
+            return Err(if node.log().contains(PORT_IN_USE) {
+                NotReady::PortCollision
+            } else {
+                NotReady::Timeout
+            });
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Bring ONE node up, re-drawing its whole port band and restarting it if any listener lost
+/// its port to a concurrent process. A node that never becomes ready for any other reason is
+/// reported with its log, exactly as before.
+fn start_node(
+    taken: &mut HashSet<u16>,
+    host_id: &str,
+    cluster_name: &str,
+    seed: Option<&str>,
+) -> Node {
+    start_node_with(taken, host_id, cluster_name, seed, alloc_ports)
+}
+
+/// [`start_node`] with the band allocator injected, so a test can hand the first attempt a
+/// band that is already taken and prove the retry rather than assert it.
+fn start_node_with(
+    taken: &mut HashSet<u16>,
+    host_id: &str,
+    cluster_name: &str,
+    seed: Option<&str>,
+    mut allocate: impl FnMut(&mut HashSet<u16>) -> Ports,
+) -> Node {
+    const ATTEMPTS: usize = 5;
+    let mut last_log = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let dir = tempfile::tempdir().expect("node data dir");
+        let node = spawn_node(
+            dir,
+            allocate(taken),
+            host_id.to_string(),
+            cluster_name,
+            seed,
+        );
+        match wait_ready(&node, Duration::from_secs(90)) {
+            Ok(()) => return node,
+            Err(NotReady::PortCollision) => {
+                eprintln!(
+                    "node {host_id} lost a listener port to a concurrent process; re-drawing \
+                     its band and restarting (attempt {attempt}/{ATTEMPTS})"
+                );
+                last_log = node.log();
+            }
+            Err(NotReady::Timeout) => panic!(
+                "node {host_id} did not become ready within 90s; web={} log tail:\n{}",
+                node.ports.web,
+                tail(&node.log(), 40)
+            ),
+        }
+    }
+    panic!(
+        "node {host_id} never became ready: every one of {ATTEMPTS} attempts lost a listener \
+         port to a concurrent process. Log tail:\n{}",
+        tail(&last_log, 40)
+    );
 }
 
 /// Every node's log tail, labelled — the evidence a failing harness must show.
@@ -403,46 +495,30 @@ fn expected_rows() -> Vec<(i32, String)> {
 async fn pg_select_consults_the_cluster_or_fails_loud() {
     let cluster_name = format!("pgread-proc-{}", std::process::id());
     let mut taken: HashSet<u16> = HashSet::new();
-    let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(&mut taken)).collect();
-    let seed_hub = format!("127.0.0.1:{}", all_ports[0].internode);
-
-    let host_id = |i: usize| {
-        // Distinct in BOTH Raft's bytes[8..16] and Accord's bytes[0..8]: repeating
-        // one byte across all sixteen is distinct in both, matching
-        // `tests/docker-compose.cluster.yml`.
-        let d = 0x11u8 * (i as u8 + 1);
-        format!(
-            "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
-             {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
-        )
-    };
 
     let mut nodes: Vec<Node> = Vec::new();
 
     // Node 0 FIRST, alone: it is the seed node of the star and creates its
     // default keyspace once the cluster's DDL path is live, at a factor below the
-    // node count — the shape a local-only scan gets wrong.
-    nodes.push(spawn_node(
-        tempfile::tempdir().expect("node data dir"),
-        all_ports[0],
-        host_id(0),
+    // node count — the shape a local-only scan gets wrong. It must be ready before the
+    // others join it, and each node is brought up through `start_node`, which re-draws its
+    // band and restarts it if a listener lost its port to a concurrent test target.
+    nodes.push(start_node(
+        &mut taken,
+        &node_host_id(0),
         &cluster_name,
         None,
     ));
-    wait_ready(&nodes[0], Duration::from_secs(90));
+    let seed_hub = format!("127.0.0.1:{}", nodes[0].ports.internode);
 
     // Then the other two seed off it, forming the star.
-    for (i, port) in all_ports.iter().enumerate().skip(1) {
-        nodes.push(spawn_node(
-            tempfile::tempdir().expect("node data dir"),
-            *port,
-            host_id(i),
+    for i in 1..N_NODES {
+        nodes.push(start_node(
+            &mut taken,
+            &node_host_id(i),
             &cluster_name,
             Some(seed_hub.as_str()),
         ));
-    }
-    for node in &nodes {
-        wait_ready(node, Duration::from_secs(90));
     }
     for node in &nodes {
         let log = node.log();
