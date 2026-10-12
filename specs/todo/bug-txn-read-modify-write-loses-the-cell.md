@@ -478,6 +478,52 @@ after it is mechanical (the six call sites are listed, the predicate is written 
 NOT landed: the code. This pass resolved the design and both remaining unknowns; the change itself did
 not land, and the parked red stays parked.
 
+### RT-2 (a) — COMPLETE implementation spec; every shape resolved (2026-10-11)
+
+Nothing below requires further recon.
+
+1. `mvcc.rs:233`  `struct RowKey { table: String, key: Vec<Value> }` — private. Make the struct AND both
+   fields `pub(crate)`. `key` is `Vec<Value>` — COLUMN VALUES, not storage bytes — so a point read's
+   key is directly expressible from the predicate, with no storage-key encoding involved.
+
+2. `mvcc.rs:725`  `validate_snapshot(state, snapshot, read_tables)` gains a 4th param
+   `read_rows: &HashSet<RowKey>`, and the row check runs BESIDE the existing table check:
+
+       if read_rows.iter().any(|row| {
+           state.versions.get(row).or_else(|| state.distributed_versions.get(row))
+               .is_some_and(|versions| {
+                   versions.range((Excluded(snapshot.read_ts), Unbounded)).next().is_some()
+               })
+       }) { return Err(MvccCommitError::SerializationFailure); }
+
+   `read_ts` is `u64` and `mvcc.rs:430` sets it from `state.commit_seq`, so comparing it against the
+   version maps' keys is sequence-correct by construction. `mvcc.rs:511` already uses this range idiom.
+
+3. `mvcc.rs:460/463` and `:524/528`  the two callers pass the new set through;
+   `MvccManager::commit` (`mvcc.rs:521`) gains `read_rows` too.
+
+4. `extended.rs:94`  add `txn_read_rows: HashSet<RowKey>` beside `txn_read_tables`, with
+   `txn_read_rows_mut()` / `take_txn_read_rows()` mirroring `:411`/`:415`.
+
+5. `server.rs:709` `track_select_reads` — after the table insert, add the point-read branch:
+
+       if let Some(ferrosa_sql::Expr::Compare { left: Operand::Column(col), op: CmpOp::Eq,
+                                                  value: Term::Literal(v) }) = &select.filter
+           && <col.name is select.from.table's partition key column>
+       { session.txn_read_rows_mut().insert(RowKey { table: "schema.table", key: vec![v.clone()] });
+         return; }   // a point read is row-granular: do NOT also record the table
+
+   `CmpOp` is at `ferrosa-sql/src/exec.rs:626` (NOT ast.rs). The PK column comes from table metadata the
+   front end already holds — `server.rs:1952` shows `partition_key: vec!["k".to_string()]`.
+
+6. `server.rs:883` `take_txn_read_rows()` beside `take_txn_read_tables()`;
+   `query.rs:1789/1796` pass it into the mvcc commit.
+
+Then re-apply `rt2-disjoint-keys.patch` and the red goes GREEN with its control.
+
+RESIDUAL, to state when it lands: a transaction that read by SCAN keeps the table-level check, so scan
+readers still collide on table identity. Only (b)/SIREAD removes that.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
