@@ -194,11 +194,31 @@ reports the retryable abandon, while the remotes that did apply hold durable, re
 deferred the coordinator's OWN apply until the remote quorum is secured; that is why key 1 is absent
 and exactly why keys 2 and 3 survive. The defect was displaced onto the remote shards, not removed.
 
-**Size law (measured, not inferred).** 3 keys x 8 MB (24 MB) commits clean; the SAME 3 keys x 40 MB
-(120 MB) abandons. Separately 300 000 rows (4.3 MB) and 1 000 000 rows (14.8 MB) both commit clean. So
-the bound responds to BYTE VOLUME, not key count, and the million-row `pgbench -i` abandon is
-consistent with that (its accounts COPY is ~100 MB), not with its row count. Bracket `(24 MB, 120 MB]`,
-not bisected. The 10 s bound was never touched.
+**Per-entry cap, NOT byte volume (measured; this replaces an earlier law of mine that was wrong).** An
+earlier version of this note recorded a "size law": 3 keys x 8 MB (24 MB) commits clean, the SAME 3 keys
+x 40 MB (120 MB) abandons, therefore the bound "responds to BYTE VOLUME" — and inferred that the
+million-row `pgbench -i` abandon fits that. **Retracted.** Corrected measurement (gate hardening,
+`7bd38149`, two consecutive runs): a write-set whose every entry is UNDER the commit-log segment
+capacity commits clean however large its total — 12 x 10 MB = 120 MB, `txn_rc=0`, 52 s, twice — while a
+write-set containing an entry OVER the cap is REFUSED AT THE PREFLIGHT and never applied:
+`batch entry (40000127 bytes) exceeds commit-log segment capacity (33554399 bytes usable)`, nothing left
+on any node. So the 3 x 40 MB shape is a refusal — fail-loud and correct — and its `unmet=3` counted
+refusals, not partial applies. The gate now classifies the preflight deterministically with a single-row
+capacity control and returns NO-VERDICT (exit 6) when the shape cannot be applied; the earlier
+log-grep classification was unreliable because the node's log buffer rotates.
+
+**And the anomaly survives that hardening.** On two FRESH tables — never written, with all three keys
+verified ABSENT on every node first — the refused abandon still left key 2 readable on node2 and key 3
+on node3 (40 000 000 B each), with key 1 absent everywhere. A refused apply appends nothing, so a path
+OTHER than the normal apply is making the write-set readable and the abandon does not roll it back.
+Candidates named but not pinned: peer-side write-set staging/overlay, the capnp blob handoff, the
+`AccordApplyV2` fallback. **Durable vs merely READABLE is not established** — that is the next
+measurement, and it decides between data loss and a phantom read.
+
+**Instrument defect found while proving the above:** `drop table` + `create table` does NOT clear stored
+rows — they de-register and then RESURRECT on recreate, so every pre-existing FAIL verdict above started
+from a contaminated state. A reset must verify the keys' absence on every node; dropping a table is not a
+reset. Recorded separately, since it also changes what "clean table" means for every future run.
 
 **Named mechanisms refuted by measurement:** SIGSTOP of both remote engines, and of either single
 remote engine, both fail at the CONSENSUS stage (`Accord quorum unavailable`, ~2.7 s) without reaching
