@@ -548,6 +548,29 @@ resolved is the accessor by which the front end reaches that table metadata from
 Tree: GREEN and verified (`cargo build -p ferrosa-postgres` -> `Finished`) after the revert, which is
 why the partial work was parked as a patch rather than committed. Nothing semi-landed.
 
+### RT-2 (a): the change is SMALLER than "seven sites" — three, not seven (2026-10-11)
+
+Re-applied the parked predicate patch and finished the call-site recon. Two findings shrink the job:
+
+1. **`TableMetadata` is `ferrosa_schema::TableMetadata`** (imported at the crate root —
+   `ferrosa-postgres/src/catalog.rs:34`), carrying `partition_key: Vec<String>`.
+
+2. **Five of the seven "call sites" need NO change at all.** `query.rs:1577` and `:1663` pass
+   `&std::collections::HashSet::new()` for the read set TODAY, because they are the **autocommit
+   path** (`None => match mvcc` — not inside a transaction). A transaction-less write has no read-set
+   by definition, so an empty rows set is CORRECT there, not a placeholder. `copy_stdin.rs:489` and
+   `query.rs:4556` are the same shape. Only the three sites that run the TRANSACTION path need the
+   real rows: **`server.rs:893` and `:983` (which call `validate_commit`) and `server.rs:1091` (which
+   calls `commit_mutations`)** — and those are exactly the sites the red exercises.
+
+So the remaining work is: the `ctx.schema` -> `TableMetadata` accessor (still unlocated; the
+`Schema`/`SchemaSnapshot` types are both imported at catalog.rs:34, so it is a snapshot lookup), the
+`extended.rs` read-rows field plus its two accessors, the point-read branch in `track_select_reads`,
+and the three `server.rs` sites. `read_rows` defaults to empty everywhere else, which is correct.
+
+Tree restored and verified green after the revert (`cargo build -p ferrosa-postgres` -> Finished);
+behaviour unchanged.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
