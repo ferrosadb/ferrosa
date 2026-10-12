@@ -36,6 +36,21 @@ findings force.
   halves of that pairing are present, which is the definition of an architectural risk rather than a
   maintenance annoyance.
 
+## Stated design intent (owner-supplied — distinct evidence class)
+
+The owner states the intended architecture for the transaction buffer, and it is **not** a
+front-end buffer:
+
+- **The MVCC system IS the concurrency buffer.** It is intended to track the changes a transaction
+  will apply, and to be **empty when no transaction is in flight**.
+- **It is the spill-to-disk for transactions.** Large transactional write-sets belong *inside* this
+  buffer (which spills), not in a separate structure beside it.
+- **Changes are applied at COMMIT time**, from that buffer.
+
+This is the intent the implementation is measured against below. Where the code diverges, the
+finding is recorded against this intent — the buffer layer is intended to be MVCC, so a fix that
+adds buffering somewhere else is a second implementation of an existing design, not a repair of it.
+
 ## Findings
 
 Evidence classes: **proven** = readable from source as written; **observed** = seen in live runs;
@@ -66,6 +81,14 @@ Two source facts explain which path:
 still a cluster operation whose outcome is decided later. A failed COMMIT therefore cannot roll back
 what is already durable, and "NOT committed; safe to retry" is not true of the data. This is the
 reported "an abort that leaves data".
+
+**Stated against the intended design.** The MVCC layer was intended to be the concurrency buffer —
+holding a transaction's changes until COMMIT and empty otherwise. The statement path **bypasses that
+buffer** and applies immediately, so the buffer is never the owner of an in-flight transaction's
+changes. The repair is therefore to **route a transaction's writes into the MVCC concurrency buffer
+and apply from it at COMMIT** — reusing the layer designed for the purpose (and its transactional
+spill) rather than adding a second buffer elsewhere. The CQL path's existing behaviour (buffering
+`INSERT`/`UPDATE`/`DELETE` until COMMIT) is the precedent inside this same codebase.
 
 ### F2 — One wall-clock constant decides outcomes for three distinct waits (proven)
 
