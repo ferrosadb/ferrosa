@@ -697,10 +697,33 @@ impl AccordStateMachine {
 
         // Check before registering this transaction, so an aborted stale
         // snapshot never becomes a dependency that can block subsequent reads.
+        //
+        // Staleness is judged against the keys THIS transaction actually WROTE,
+        // never against the global data-commit marker. The marker's high-water
+        // mark advances on EVERY PostgreSQL data commit, so consulting it here
+        // refused any transaction whose snapshot predated ANY other commit in the
+        // cluster — two transactions on DISJOINT keys of one table collided on
+        // the marker alone (RT-2), which is the write-side throughput collapse:
+        // every concurrent transaction is refused 40001 however unrelated its
+        // rows are. PostgreSQL raises a serialization failure on read-set /
+        // write-set OVERLAP; a write-only transaction's overlap is exactly the
+        // keys it wrote, and each already carries its own execution high-water
+        // mark (kept past GC). The two protocol keys — the data-commit marker and
+        // the BEGIN/COMMIT barrier — are SHARED BOOKKEEPING, not user data, so
+        // they are excluded: a same-key collision still refuses LOUD (the written
+        // key's own HWM is past the snapshot) while disjoint keys commit
+        // concurrently.
         if let Some(snapshot_ts) = snapshot_ts {
-            let latest = self.conflict_index.max_conflicting_timestamp(
-                ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY,
-            );
+            let latest = keys
+                .iter()
+                .copied()
+                .filter(|key| {
+                    *key != ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY
+                        && *key
+                            != ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_BARRIER_KEY
+                })
+                .filter_map(|key| self.conflict_index.max_conflicting_timestamp(key))
+                .max();
             if latest.is_some_and(|latest| latest > snapshot_ts) {
                 return SmResponse::SnapshotStale;
             }
@@ -2682,18 +2705,12 @@ mod tests {
 
     #[test]
     fn stale_postgres_snapshot_is_rejected_before_conflict_registration() {
-        use ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY;
-
         let (mut sm, _) = make_sm(1);
         let earlier = txn(1, 100);
         let latest = ts(100);
-        sm.handle_preaccept(
-            earlier,
-            latest,
-            POSTGRES_TRANSACTION_MARKER_KEY,
-            BallotNumber(0),
-            0,
-        );
+        // The conflicting commit is on a DATA key the stale txn also writes: a
+        // same-key collision must still refuse LOUD (RT-2 keeps this case).
+        sm.handle_preaccept(earlier, latest, b"d1", BallotNumber(0), 0);
         sm.handle_commit(earlier, latest, latest, vec![]);
         sm.handle_apply(earlier, vec![]);
         let conflicts_before_stale_attempt = sm.conflict_index().len();
@@ -2702,7 +2719,7 @@ mod tests {
         let response = sm.handle_preaccept_multi_with_snapshot(
             stale,
             ts(200),
-            &[POSTGRES_TRANSACTION_MARKER_KEY],
+            &[b"d1"],
             BallotNumber(0),
             0,
             Some(ts(99)),
@@ -2717,6 +2734,82 @@ mod tests {
             sm.conflict_index().len(),
             conflicts_before_stale_attempt,
             "stale txn leaves no conflict entry"
+        );
+    }
+
+    /// RT-2 at the Accord layer: a snapshot older than a commit on a DIFFERENT
+    /// key is NOT stale. The global data-commit marker advanced, but it is shared
+    /// bookkeeping, not data this transaction touched — refusing here is the
+    /// false conflict that collapses concurrent write throughput.
+    #[test]
+    fn a_snapshot_stale_only_against_a_disjoint_key_is_not_rejected() {
+        let (mut sm, _) = make_sm(1);
+        let earlier = txn(1, 100);
+        let latest = ts(100);
+        sm.handle_preaccept(earlier, latest, b"d1", BallotNumber(0), 0);
+        sm.handle_commit(earlier, latest, latest, vec![]);
+        sm.handle_apply(earlier, vec![]);
+
+        // A later txn writes only d2, with a snapshot older than d1's commit.
+        let disjoint = txn(2, 200);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            disjoint,
+            ts(200),
+            &[b"d2"],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "a disjoint key must not be vetoed by another key's commit: {response:?}"
+        );
+        assert!(
+            sm.get_state(&disjoint).is_some(),
+            "the disjoint txn must register"
+        );
+    }
+
+    /// The two shared protocol keys are bookkeeping, not data: a snapshot older
+    /// than a data commit does not make a marker/barrier-only txn stale.
+    #[test]
+    fn a_snapshot_older_than_a_data_commit_does_not_veto_a_protocol_key_txn() {
+        use ferrosa_storage::accord::conflict_index::{
+            POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
+        };
+        let (mut sm, _) = make_sm(1);
+        let earlier = txn(1, 100);
+        let latest = ts(100);
+        sm.handle_preaccept(earlier, latest, b"d1", BallotNumber(0), 0);
+        sm.handle_commit(earlier, latest, latest, vec![]);
+        sm.handle_apply(earlier, vec![]);
+
+        let barrier_only = txn(2, 200);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            barrier_only,
+            ts(200),
+            &[POSTGRES_TRANSACTION_BARRIER_KEY],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "a BEGIN barrier must not be vetoed by a data commit: {response:?}"
+        );
+
+        let marker_only = txn(3, 300);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            marker_only,
+            ts(300),
+            &[POSTGRES_TRANSACTION_MARKER_KEY],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "the data-commit marker must not veto itself: {response:?}"
         );
     }
 
