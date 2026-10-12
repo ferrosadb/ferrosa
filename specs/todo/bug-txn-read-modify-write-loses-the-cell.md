@@ -571,6 +571,31 @@ and the three `server.rs` sites. `read_rows` defaults to empty everywhere else, 
 Tree restored and verified green after the revert (`cargo build -p ferrosa-postgres` -> Finished);
 behaviour unchanged.
 
+### RT-2 (a): the shape with NO signature ripple — record the read row on the MANAGER (2026-10-11)
+
+Every attempt so far was blocked by the same thing: threading `read_rows` as a PARAMETER ripples through
+~10 coupled call sites. It does not need a parameter. The manager already owns the per-snapshot
+lifecycle (`active_snapshots: HashMap<u64, ActiveSnapshot>`), so the read set belongs THERE:
+
+    State:            read_rows: HashMap<u64 /*snapshot id*/, HashSet<RowKey>>
+
+    new method:       MvccManager::record_point_read(&self, snapshot: &MvccSnapshot, row: RowKey)
+                      -> inserts into state.read_rows[snapshot.id] after confirming the snapshot is
+                         still active
+
+    validate_snapshot: reads state.read_rows.get(&snapshot.id) — SIGNATURE UNCHANGED
+
+    the read site:    track_select_reads (server.rs:709) calls ctx.mvcc.record_point_read(snapshot, row)
+
+Consequences:
+- No ripple: 1 file (`mvcc.rs`) + the new method + the point-read branch + 1 call site. The three
+  `server.rs` sites and the two `validate_commit`/`commit` signatures are NOT touched at all.
+- The set is keyed by snapshot id, so it is bounded by ACTIVE transactions and dropped with the
+  snapshot — which satisfies the standing rule that nothing unbounded is added on this path.
+
+The parked `rt2-predicate-inprogress.patch` already contains the predicate itself; its parameter-based
+plumbing should be REPLACED by this lookup rather than extended.
+
 ## Notes
 
 - The statement-level red is legitimate for a new syntax: the operation is refused today, and the
