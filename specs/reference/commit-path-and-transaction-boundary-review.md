@@ -56,7 +56,36 @@ adds buffering somewhere else is a second implementation of an existing design, 
 Evidence classes: **proven** = readable from source as written; **observed** = seen in live runs;
 **hypothesis** = plausible, not yet confirmed by probe.
 
-### F1 — The wire transaction boundary is not the engine's durability boundary (proven + observed)
+### F1 — RETRACTED AND REPLACED. The buffer IS engaged; the surviving rows move to the COPY path
+
+**This finding as first published was WRONG and is retracted.** It claimed the statement path bypasses
+the concurrency buffer and applies immediately. The code says the opposite, and says it precisely:
+
+- `ferrosa-postgres/src/server.rs:669-671` — "In an open transaction, DML is BUFFERED into the session
+  write-set instead of applied; autocommit (no open txn) applies immediately."
+- `server.rs:661-663` — `ROLLBACK` "discards the buffered write-set — those writes were never applied".
+- `server.rs:688-689` — a plain `BEGIN` **does** take a snapshot through the Accord committer.
+- The tests assert the buffer directly: `query.rs:6780` "the write was buffered as a PostgreSQL MVCC
+  mutation"; `query.rs:6786` "a BUFFERED write must NOT be visible in storage"; `server.rs:2898`
+  "ROLLBACK discards the buffer — the write is NEVER applied". All assert `row_count == 0`.
+
+So the MVCC concurrency buffer described in the stated design intent is **implemented and engaged**.
+The tests that read "an autocommit write IS applied immediately" (`query.rs:6806`, `server.rs:2912`)
+are correct statements about *autocommit* — an untracked statement — and must NOT be changed.
+
+**What therefore remains open is narrower and sharper.** The observed fact stands: a run whose `commit`
+was reported abandoned left 669,315 of 1,000,000 rows readable. If DML is buffered and rollback
+discards, that is not explained by the statement path. The lead is the **bulk path**:
+
+- `ferrosa-postgres/src/copy_stdin.rs:1115` — `autocommit_copy_into_a_pkless_table_still_works`.
+- `pgbench -i`'s entire load is `COPY` inside one `BEGIN … COMMIT`.
+
+**Hypothesis (not proven, marked as the decisive experiment):** `COPY` does not participate in the
+session write-set buffer the way single-statement DML does, so a bulk load is applied while the
+enclosing transaction's fate is still undecided. The experiment is a `BEGIN; COPY (3 rows); <force the
+COMMIT to fail>;` with a **point lookup** of a known key asserted absent — a count proves nothing.
+
+### F1 (superseded — original text retained for audit) — the wire boundary claim
 
 `accord/coordinator.rs:2783-2799` returns `TxnAbandoned` only when the Apply quorum was **not** met.
 The code comments are explicit that before that quorum "NO replica has applied, so an abandon is
@@ -183,6 +212,21 @@ flowchart TB
     Q -.->|"same 10s bound as the dependency wait"| T["DepWaitGraph timeouts"]
     T -.->|"time-keyed 'applied' set, prune(max_age)"| A
 ```
+
+## Tests audited (and NOT changed)
+
+The instruction was to fix tests derived from anything incorrect. Audited and left alone, because they
+are correct as written:
+
+| Site | Assertion | Verdict |
+|------|-----------|---------|
+| `query.rs:6780/6786` | a DML in an open txn is buffered; not visible in storage | correct — asserts the intended design |
+| `query.rs:6806`, `server.rs:2912` | an *autocommit* write IS applied immediately | correct — autocommit is not a tracked txn |
+| `server.rs:2898` | ROLLBACK discards the buffer; the write is NEVER applied | correct — the discard half of the buffer contract |
+| `abandon_durability.rs:200` | an abandoned txn leaves no row readable across restart | correct but INCOMPLETE: it drives the coordinator directly and cannot observe the front-end boundary, so it passes while the live run left rows. Its scope, not its assertion, is the gap. |
+
+No test was found that encodes an incorrect design as required behaviour. The incorrect artefact was
+this review's own F1, and it is retracted above rather than propagated into the tests.
 
 ## Open questions
 
