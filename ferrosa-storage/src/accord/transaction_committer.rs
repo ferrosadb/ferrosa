@@ -352,9 +352,12 @@ pub trait TransactionCommitter: Send + Sync {
     /// every table the transaction READ (scanned). Implementations must put the
     /// read set into the DISTRIBUTED commit order, so a table the transaction read
     /// and another transaction wrote after that snapshot is refused loudly. Write
-    /// tables are NOT passed here: a transaction's writes are already ordered by
-    /// their row-level keys, so registering a write table would re-serialize two
-    /// transactions on DISJOINT keys of one table (RT-2). The default fails closed.
+    /// tables are passed separately as `written_tables`: a transaction's writes are
+    /// already ordered by their row-level keys, so registering a write table as a
+    /// conflict key would re-serialize two transactions on DISJOINT keys of one
+    /// table (RT-2). The write table instead contributes a per-table WRITE
+    /// WATERMARK that a SCANNER of that table reads — so a stale scan is refused
+    /// even when the writer never read the table. The default fails closed.
     ///
     /// `writes` is a [`StagedAccordWriteSet`]: the payload bulk may live on disk behind a
     /// bounded buffer, so the committer must read payloads through it rather than assume a
@@ -364,6 +367,7 @@ pub trait TransactionCommitter: Send + Sync {
         _keyspace: &str,
         _writes: StagedAccordWriteSet,
         _tables: Vec<String>,
+        _written_tables: Vec<String>,
         _snapshot: Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         Err(CommitError {
@@ -494,6 +498,7 @@ impl TransactionCommitter for MockTransactionCommitter {
         _keyspace: &str,
         writes: StagedAccordWriteSet,
         _tables: Vec<String>,
+        _written_tables: Vec<String>,
         _snapshot: Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         // A test double: materialize the staged set so `committed()` can assert on it. This

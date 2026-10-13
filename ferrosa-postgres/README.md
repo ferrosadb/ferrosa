@@ -101,10 +101,14 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   overlays to restore versions changed after that timestamp; in-transaction
   inserts, updates, and deletes are visible to their own reads. Commit validates
   the transaction's read and write tables against local PostgreSQL MVCC epochs
-  in standalone mode. In cluster mode, a global PostgreSQL commit marker checks
-  the snapshot against every intervening PostgreSQL data commit; the table set
-  is not yet used for per-table Accord validation, so unrelated transactions can
-  cause conservative `40001` aborts. Accord atomically applies the buffered
+  in standalone mode. In cluster mode the read set joins the DISTRIBUTED Accord
+  ordering: the tables the transaction SCANNED each drive a synthetic
+  `POSTGRES_READ_TABLE_KEY_PREFIX` conflict key, and the tables it WROTE each
+  contribute a `POSTGRES_WRITE_TABLE_KEY_PREFIX` WRITE watermark that a scanner
+  reads as a namespaced READ registration — so a phantom inserted into a scanned
+  table is refused even when the writer never scanned it, while two readers never
+  conflict and two writers of DISJOINT rows still commit (RT-2). Accord atomically
+  applies the buffered
   mutation batch. Row versions are staged before replica storage
   apply and made visible after the atomic batch succeeds. Conflicts return
   `40001`; rollback and failed transactions

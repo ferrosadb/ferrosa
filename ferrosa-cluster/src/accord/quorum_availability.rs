@@ -431,7 +431,7 @@ async fn run_postgres_transaction(
             // table-level read participates in the Accord ordering, a shared
             // placeholder would make every actor conflict on one table and starve
             // the queue — which is not what this quorum-availability test measures.
-            .commit_postgres("ks", staged(vec![write]), Vec::new(), snapshot)
+            .commit_postgres("ks", staged(vec![write]), Vec::new(), Vec::new(), snapshot)
             .await
         {
             Ok(CommitOutcome::Committed) => return Ok(()),
@@ -622,7 +622,13 @@ async fn a_snapshot_barrier_and_a_commit_whose_preaccepts_cross_do_not_deadlock(
     };
     let commit = tokio::spawn(async move {
         commit_node
-            .commit_postgres("ks", staged(vec![write]), vec!["t".to_string()], snapshot)
+            .commit_postgres(
+                "ks",
+                staged(vec![write]),
+                vec!["t".to_string()],
+                Vec::new(),
+                snapshot,
+            )
             .await
     });
     let barrier = barrier.await.expect("barrier task panicked");
@@ -671,12 +677,16 @@ async fn a_late_disjoint_writer_serializes_against_a_table_the_earlier_writer_ch
     // Both SELECT the table: doctor-a = 1, doctor-b = 1 — so both decide to move
     // their own doctor off call.
     let read_tables = vec!["public.doctors".to_string()];
+    // Both WRITE the table too, so each registers its whole-table WRITE watermark —
+    // the evidence a scanner of the table consults.
+    let written_tables = vec!["public.doctors".to_string()];
 
     let first = cluster.committers[0]
         .commit_postgres(
             "public",
             staged(vec![write("public", "doctor-a", "doctor-a=0")]),
             read_tables.clone(),
+            written_tables.clone(),
             first_snapshot,
         )
         .await
@@ -694,6 +704,7 @@ async fn a_late_disjoint_writer_serializes_against_a_table_the_earlier_writer_ch
             "public",
             staged(vec![write("public", "doctor-b", "doctor-b=0")]),
             read_tables.clone(),
+            written_tables.clone(),
             second_snapshot,
         )
         .await
@@ -734,15 +745,18 @@ async fn two_simultaneous_write_skew_writers_never_both_go_off_call() {
     cluster.arm_preaccept_crossing();
 
     let read_tables = vec!["public.doctors".to_string()];
+    let written_tables = vec!["public.doctors".to_string()];
     let first = tokio::spawn({
         let committer = Arc::clone(&cluster.committers[0]);
         let tables = read_tables.clone();
+        let written = written_tables.clone();
         async move {
             committer
                 .commit_postgres(
                     "public",
                     staged(vec![write("public", "doctor-a", "doctor-a=0")]),
                     tables,
+                    written,
                     first_snapshot,
                 )
                 .await
@@ -751,12 +765,14 @@ async fn two_simultaneous_write_skew_writers_never_both_go_off_call() {
     let second = tokio::spawn({
         let committer = Arc::clone(&cluster.committers[1]);
         let tables = read_tables.clone();
+        let written = written_tables.clone();
         async move {
             committer
                 .commit_postgres(
                     "public",
                     staged(vec![write("public", "doctor-b", "doctor-b=0")]),
                     tables,
+                    written,
                     second_snapshot,
                 )
                 .await
@@ -824,7 +840,13 @@ async fn a_slow_apply_ack_does_not_decide_an_oversized_commits_fate() {
 
     let started = Instant::now();
     let outcome = committer
-        .commit_postgres("ks", staged(writes), vec!["t".to_string()], snapshot)
+        .commit_postgres(
+            "ks",
+            staged(writes),
+            vec!["t".to_string()],
+            Vec::new(),
+            snapshot,
+        )
         .await;
     assert!(
         matches!(outcome, Ok(CommitOutcome::Committed)),
@@ -876,7 +898,13 @@ async fn a_lost_apply_ack_still_converges_the_coordinators_own_shard() {
         .collect();
 
     let outcome = committer
-        .commit_postgres("ks", staged(writes), vec!["t".to_string()], snapshot)
+        .commit_postgres(
+            "ks",
+            staged(writes),
+            vec!["t".to_string()],
+            Vec::new(),
+            snapshot,
+        )
         .await;
     let error = outcome.expect_err("an unreachable apply quorum must fail loud, never ack");
     assert!(
@@ -941,6 +969,7 @@ async fn an_insert_into_a_table_a_scanner_read_is_refused() {
             "public",
             staged(vec![write("public", "doctor-c", "doctor-c=1")]),
             Vec::new(),
+            vec!["public.doctors".to_string()],
             inserter_snapshot,
         )
         .await
@@ -957,6 +986,7 @@ async fn an_insert_into_a_table_a_scanner_read_is_refused() {
         .commit_postgres(
             "public",
             staged(vec![write("public", "doctor-d", "doctor-d=1")]),
+            vec!["public.doctors".to_string()],
             vec!["public.doctors".to_string()],
             reader_snapshot,
         )

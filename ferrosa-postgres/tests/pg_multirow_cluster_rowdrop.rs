@@ -562,6 +562,7 @@ async fn multi_key_commit_persists_every_key_on_every_node_rf3() {
             "public",
             staged_write_set(vec![transaction_write(&m1), transaction_write(&m2)]),
             vec!["public.users".to_string()],
+            vec!["public.users".to_string()],
             snapshot,
         )
         .await
@@ -624,6 +625,7 @@ async fn multi_key_commit_persists_each_key_on_its_owner_rf1() {
         .commit_postgres(
             "public",
             staged_write_set(vec![transaction_write(&m1), transaction_write(&m2)]),
+            vec!["public.users".to_string()],
             vec!["public.users".to_string()],
             snapshot,
         )

@@ -908,6 +908,11 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         }];
     }
 
+    // The tables this transaction WROTE contribute a per-table WRITE WATERMARK to
+    // the distributed commit, so a transaction that SCANNED one of them sees that
+    // write even when the writer never read the table itself (FMEA CL-72). Read
+    // BEFORE the staging is consumed; it is one entry per TABLE, never per row.
+    let written_tables = session.txn_writes_mut().written_tables();
     let staged = match session.take_txn_stage() {
         Ok(staged) => staged,
         Err(error) => {
@@ -1084,9 +1089,16 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                 )];
             };
             let tables = scanned_tables.iter().cloned().collect();
+            let written = written_tables.clone();
             let accord_started = std::time::Instant::now();
             let accord_result = match committer
-                .commit_postgres(&ctx.default_schema, accord_writes, tables, cluster_snapshot)
+                .commit_postgres(
+                    &ctx.default_schema,
+                    accord_writes,
+                    tables,
+                    written,
+                    cluster_snapshot,
+                )
                 .await
             {
                 Ok(ferrosa_storage::accord::CommitOutcome::Committed) => {

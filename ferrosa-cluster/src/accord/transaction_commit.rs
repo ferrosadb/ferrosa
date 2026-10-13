@@ -259,11 +259,12 @@ impl TransactionCommitter for AccordTransactionCommitter {
         keyspace: &str,
         writes: StagedAccordWriteSet,
         tables: Vec<String>,
+        written_tables: Vec<String>,
         snapshot: ferrosa_common::accord::Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         use ferrosa_storage::accord::conflict_index::{
-            postgres_read_table_key, POSTGRES_TRANSACTION_BARRIER_KEY,
-            POSTGRES_TRANSACTION_MARKER_KEY,
+            postgres_read_key, postgres_read_table_key, postgres_write_table_key,
+            POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
         };
 
         // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The per-key
@@ -300,15 +301,41 @@ impl TransactionCommitter for AccordTransactionCommitter {
             .iter()
             .map(|table| postgres_read_table_key(table))
             .collect();
-        let mut resolve_inputs: Vec<(String, Vec<u8>)> =
-            Vec::with_capacity(staged_count + read_table_keys.len() + 2);
-        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(staged_count + read_table_keys.len() + 2);
+        // The coarse table-level read catches a later SCANNER of the same table.
+        // It cannot catch a WRITER that never read the table, which registers no
+        // read-table key. So a scan ALSO reads each scanned table's WRITE WATERMARK
+        // (`postgres_read_key(postgres_write_table_key(t))`), and every table this
+        // transaction WROTE registers that watermark (`postgres_write_table_key(t)`,
+        // below). A scanner therefore sees a write to the table it scanned however
+        // that writer's own read set looked — the phantom/absence evidence the
+        // read-side key alone cannot supply. The read registration is namespaced, so
+        // two scanners of one table never conflict on the watermark; the watermark is
+        // skipped in a WRITER's own staleness check, so two writers of DISJOINT rows
+        // still commit concurrently (RT-2).
+        let read_watermark_keys: Vec<Vec<u8>> = tables
+            .iter()
+            .map(|table| postgres_read_key(&postgres_write_table_key(table)))
+            .collect();
+        let write_table_keys: Vec<Vec<u8>> = written_tables
+            .iter()
+            .map(|table| postgres_write_table_key(table))
+            .collect();
+        let extra = read_table_keys.len() + read_watermark_keys.len() + write_table_keys.len() + 2;
+        let mut resolve_inputs: Vec<(String, Vec<u8>)> = Vec::with_capacity(staged_count + extra);
+        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(staged_count + extra);
         for (keyspace, key) in writes.keys() {
             resolve_inputs.push((keyspace.clone(), key.clone()));
             write_set.push((key.clone(), Vec::new()));
         }
         for key in read_table_keys {
+            resolve_inputs.push((keyspace.to_string(), key.clone()));
+            write_set.push((key, Vec::new()));
+        }
+        for key in read_watermark_keys {
+            resolve_inputs.push((keyspace.to_string(), key.clone()));
+            write_set.push((key, Vec::new()));
+        }
+        for key in write_table_keys {
             resolve_inputs.push((keyspace.to_string(), key.clone()));
             write_set.push((key, Vec::new()));
         }
@@ -443,7 +470,14 @@ async fn drive_accord_core(
     let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
     let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
     for (keyspace, key) in &resolve_inputs {
-        let replicas = (committer.resolve)(keyspace, key).ok_or_else(|| {
+        // A READ registration is ROUTED by the key it READ, not by the read key's
+        // own bytes: the reader's registration must land on the SAME replicas as a
+        // writer's registration of that key, or the staleness check that consults
+        // the read key would run on a shard that never saw the write — and a missed
+        // conflict is silent. `per_key` stays keyed by the DRIVEN key so the
+        // participant resolver finds it.
+        let resolve_key = ferrosa_storage::accord::conflict_index::postgres_read_lookup_key(key);
+        let replicas = (committer.resolve)(keyspace, resolve_key).ok_or_else(|| {
             AccordDriverError::Network(format!(
                 "no replicas resolved for a key in keyspace '{keyspace}' (cluster mode required)"
             ))
@@ -1280,7 +1314,13 @@ mod tests {
         // Accord and (with no peers) fail, but the tombstone fan-out has already
         // run. The assertion is on the ROUTING, which is decided before Accord.
         let _ = committer
-            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .commit_postgres(
+                "ks",
+                staged(vec![tombstone_write()]),
+                vec![],
+                vec![],
+                snapshot(),
+            )
             .await;
 
         assert_eq!(
@@ -1312,7 +1352,13 @@ mod tests {
         .with_marker_writer(recorder);
 
         let err = committer
-            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .commit_postgres(
+                "ks",
+                staged(vec![tombstone_write()]),
+                vec![],
+                vec![],
+                snapshot(),
+            )
             .await
             .expect_err("a truncate that not every serving node acknowledged must be refused");
         let reason = err.reason.to_lowercase();
@@ -1330,7 +1376,13 @@ mod tests {
         let committer = committer_with(Uuid::from_u128(0xAA), Arc::new(RecordingApplier::new()));
 
         let err = committer
-            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .commit_postgres(
+                "ks",
+                staged(vec![tombstone_write()]),
+                vec![],
+                vec![],
+                snapshot(),
+            )
             .await
             .expect_err("a tombstone with no all-serving writer must be refused");
         assert!(

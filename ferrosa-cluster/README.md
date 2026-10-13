@@ -680,6 +680,23 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   once the table was written after the reader's snapshot — the write-skew the engine used to commit
   (EPIC t_27672375, FMEA CL-72). Row-level point reads are judged by the row they named and register
   no table key, so two disjoint-key writers still commit concurrently (RT-2).
+- **A scan also reads each scanned table's WRITE WATERMARK, so a PHANTOM is caught even when the
+  writer never scanned the table.** The table-level read key above is only ever registered *by*
+  scanners, so a transaction that WROTE the table without reading it was invisible to it and the
+  stale scan committed on the strength of a row it never saw (the residual CL-72 named). Now every
+  table a transaction WROTE contributes `postgres_write_table_key(t)`
+  (`POSTGRES_WRITE_TABLE_KEY_PREFIX`) — its whole-table WRITE watermark — and every table it SCANNED
+  contributes a READ registration of that watermark (`postgres_read_key(...)`,
+  `POSTGRES_READ_KEY_PREFIX`). A READ registration CONSULTS the key it read
+  (`postgres_read_lookup_key`) and is never itself consulted, so **read-read never conflicts** while
+  read-write does: two scanners of one table do not collide on the watermark, but a scanner is
+  refused as soon as any writer of that table committed after its snapshot. The watermark is a
+  watermark, not a data key — a plain watermark key is SKIPPED in a writer's own staleness check, so
+  two transactions writing DISJOINT rows of one table still commit concurrently (RT-2). A READ
+  registration is also ROUTED by the key it read, so its registration lands on the same replicas as
+  the writer's and the check cannot silently miss. Test (red first):
+  `quorum_availability::an_insert_into_a_table_a_scanner_read_is_refused`; the negative control — a
+  writer that registers no watermark — leaves the stale scan committing (`got Committed`).
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
   Accept is dependency-monotonic: replicas retain dependencies seen locally

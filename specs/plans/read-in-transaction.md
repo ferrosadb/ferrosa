@@ -32,6 +32,21 @@ executive_summary: >
 | W4 PG front end: snapshot read inside a txn uses the same read path | implementer | W2 | W3 |
 | W5 Elle list-append harness + certification run | verifier (distinct from W2's author) | W2, W3 | - |
 
+## Progress
+
+- **W2 (partial, landed): the absence-evidence half of the read set.** A transaction's scanned
+  tables register a READ of each table's whole-table WRITE watermark
+  (`POSTGRES_WRITE_TABLE_KEY_PREFIX`), and every table it WROTE registers that watermark, so a
+  phantom INSERT by a writer that never scanned the table is refused instead of committed. A READ
+  registration is distinguishable from a WRITE (`POSTGRES_READ_KEY_PREFIX` + `postgres_read_lookup_key`):
+  read-read never conflicts, read-write does. Engine-seam red first:
+  `quorum_availability::an_insert_into_a_table_a_scanner_read_is_refused`.
+- **W2 (NOT DONE): ROW granularity for a scan** (board t_b880d105). The unit is still the TABLE.
+  A scan in this engine reads every row of the table, so a visited-ROW LIST read set would be
+  unbounded — forbidden, node RAM is fixed at 4 GB — and bounding it to the rows a predicate MATCHES
+  needs a predicate→range push-down the planner does not have. The remaining work is a bounded
+  range / segment marker at the scanned boundaries, not a row list.
+
 ## Sequence diagram (intended commit path)
 
 ```mermaid

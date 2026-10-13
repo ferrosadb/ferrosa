@@ -925,7 +925,14 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   N = 1,000,112 keys by a measured 366 B/key (~573 MiB -> ~224 MiB, a ~349 MiB
   cut); guarded by `tests/conflict_index_residency.rs` (per-PR, structural/ratio)
   and `tests/conflict_index_residency_absolute.rs` (the absolute projection, run
-  nightly like `accord::perf`).
+  nightly like `accord::perf`). The index treats every key as opaque bytes, so a
+  PostgreSQL transaction's READ set is carried in the SAME index by reserved
+  namespaces rather than a parallel structure: `POSTGRES_READ_TABLE_KEY_PREFIX`
+  (a scanned table), `POSTGRES_WRITE_TABLE_KEY_PREFIX` (a whole-table WRITE
+  watermark, so a scanner sees a writer that never scanned) and
+  `POSTGRES_READ_KEY_PREFIX` (a READ registration, which the staleness check
+  resolves to the key it READ — `postgres_read_lookup_key` — so two readers never
+  conflict while a reader still sees a writer of the key it read).
 - **Time-series** (`timeseries/`) — ring-buffer aggregation, late-data handling,
   WASM aggregate execution, materialization queues.
 - **Virtual tables / observability** (`virtual_tables.rs`, `metrics.rs`) —

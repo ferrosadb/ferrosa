@@ -49,6 +49,12 @@ pub struct TxnWriteSet {
     /// Number of writes staged. Tracked apart from the stage so `len` is O(1)
     /// and independent of residency.
     count: usize,
+    /// The qualified `schema.table` of every table staged into this write-set.
+    /// A per-TABLE set, so it is bounded by the schema's table count, never by the
+    /// row count — it stays resident while the rows spill. `COMMIT` hands it to the
+    /// distributed commit so each written table contributes its WRITE WATERMARK,
+    /// which a transaction that SCANNED the table reads (FMEA CL-72).
+    tables: std::collections::BTreeSet<String>,
 }
 
 impl std::fmt::Debug for TxnWriteSet {
@@ -74,6 +80,7 @@ impl TxnWriteSet {
         Self {
             stage: WriteSetStage::new(root),
             count: 0,
+            tables: std::collections::BTreeSet::new(),
         }
     }
 
@@ -87,11 +94,20 @@ impl TxnWriteSet {
     /// silently dropped a row would commit a transaction missing writes.
     pub(crate) fn push(&mut self, write: PgWrite) -> Result<()> {
         let mutation = write.0;
+        self.tables
+            .insert(format!("{}.{}", mutation.keyspace, mutation.table));
         let mut frame = vec![0u8; mutation.serialized_size()];
         mutation.serialize_into(&mut frame);
         self.stage.append(&frame)?;
         self.count += 1;
         Ok(())
+    }
+
+    /// The qualified `schema.table` of every table written, in sorted order. One
+    /// entry per TABLE, so this is bounded by the schema, not the row count.
+    #[must_use]
+    pub(crate) fn written_tables(&self) -> Vec<String> {
+        self.tables.iter().cloned().collect()
     }
 
     /// Number of writes staged so far.
