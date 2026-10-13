@@ -906,3 +906,66 @@ async fn a_lost_apply_ack_still_converges_the_coordinators_own_shard() {
         "the acked replica's shard must be readable; got {acked_read:?}"
     );
 }
+
+/// The absent-row half of a scan's read set: a transaction that INSERTs a row into
+/// a table a SERIALIZABLE transaction READ must still be refused, even though the
+/// INSERTer never scanned the table and so registers no table-level read key.
+///
+/// A scan's read set is not only the rows it SAW. Strict serializability must also
+/// catch a PHANTOM — a row INSERTED into the scanned range after the snapshot — and
+/// no set of visited rows can observe it. The table-level read key cannot either:
+/// only a SCANNER registers it, so a writer that never scanned is invisible to it,
+/// and the stale scan commits on the strength of a row it never saw (the FMEA CL-72 /
+/// PG-17 residual). The writer must instead leave EVIDENCE the scanner consults.
+///
+/// Both transactions write DISJOINT rows of `public.doctors`, and the reader's scan
+/// saw NEITHER. The reader BEGINs first, so its snapshot predates the insert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insert_into_a_table_a_scanner_read_is_refused() {
+    let cluster = Cluster::three_nodes();
+
+    // The reader BEGINs first: its snapshot predates the insert.
+    let reader_snapshot = cluster.committers[0]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("reader BEGIN");
+
+    // A DISJOINT writer inserts one row of the SAME table. It never scans, so it
+    // carries no table-level read key.
+    let inserter_snapshot = cluster.committers[1]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("inserter BEGIN");
+    let inserted = cluster.committers[1]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "doctor-c", "doctor-c=1")]),
+            Vec::new(),
+            inserter_snapshot,
+        )
+        .await
+        .expect("inserter commit");
+    assert_eq!(
+        inserted,
+        CommitOutcome::Committed,
+        "the inserter reads nothing, so nothing it did can conflict"
+    );
+
+    // The reader COMMITs after the insert, having read the table at its earlier
+    // snapshot. The row it never saw is a phantom its snapshot is stale against.
+    let scanned = cluster.committers[0]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "doctor-d", "doctor-d=1")]),
+            vec!["public.doctors".to_string()],
+            reader_snapshot,
+        )
+        .await
+        .expect("reader commit");
+    assert!(
+        matches!(scanned, CommitOutcome::Aborted { .. }),
+        "a transaction that read a table a later INSERT wrote into must be refused as a \
+         retryable serialization failure, not committed on the strength of a row it never \
+         saw; got {scanned:?}"
+    );
+}
