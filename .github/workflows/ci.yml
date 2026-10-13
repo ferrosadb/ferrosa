@@ -681,7 +681,7 @@ jobs:
         env:
           FERROSA_NIGHTLY_IMAGE: ferrosa-test-node:latest
           FERROSA_TEST_CQL_URLS: 127.0.0.1:29042;127.0.0.1:29043;127.0.0.1:29044
-          FERROSA_TEST_POSTGRES_URLS: postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29052/postgres;postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29053/postgres;postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29054/postgres
+          FERROSA_TEST_POSTGRES_URLS: postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:29052/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:29053/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:29054/postgres
           FERROSA_TEST_POSTGRES_CLIENT_NODE_COUNT: "2"
           FERROSA_TEST_POSTGRES_FAULT_READY_FILE: /tmp/pg-fault-ready
           FERROSA_TEST_POSTGRES_FAULT_ACTIVE_FILE: /tmp/pg-fault-active

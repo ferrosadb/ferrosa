@@ -137,7 +137,7 @@ docker compose -f tests/docker/jepsen-cluster.yml up -d --no-build
 docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 29042 \
   -e "CREATE ROLE ferrosa_pg_jepsen WITH PASSWORD = 'ferrosa-jepsen-test' AND LOGIN = true AND SUPERUSER = true;"
 
-FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29052/postgres;postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29053/postgres;postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29054/postgres' \
+FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:29052/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:29053/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:29054/postgres' \
   cargo test -p ferrosa-jepsen --features postgres-jepsen \
   --test postgres_strict_serializable -- --nocapture
 ```

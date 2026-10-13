@@ -288,3 +288,64 @@ fn multi_dc_nightly_preflights_each_node_directly_over_cql_and_http() {
         "pre-DDL schema UUIDs are process-local and must not gate topology readiness; step was:\n{step}"
     );
 }
+
+/// A redacted credential is not a redaction: it is the three-character string
+/// `***` used AS the password, and SCRAM answers it with `ProofMismatch`.
+///
+/// Observed 2026-10-13 on PR #557's first CI run. Moving these URLs' PORTS sent
+/// the credential back through a tool output that had redacted it, so the
+/// fault-schedule job reached every node and then died in
+/// "Run native PostgreSQL history while node 3 is paused":
+///
+/// ```text
+/// ferrosa_postgres::store: PostgreSQL login failed user=ferrosa_pg_jepsen
+/// ferrosa_postgres::server: PostgreSQL connection refused during startup
+///   error=Handshake(Scram(ProofMismatch))
+/// ```
+///
+/// The ports are a moving target; the credential is not. A URL with no `@` is
+/// not asserting a credential and is skipped; a URL that DOES carry userinfo
+/// must carry a real password.
+#[test]
+fn no_harness_credential_is_a_redaction_placeholder() {
+    let mut checked = 0usize;
+    for (path, label) in [
+        (ci_yaml_path(), "the CI workflow"),
+        (
+            repo_root().join("ferrosa-jepsen/README.md"),
+            "the harness README",
+        ),
+    ] {
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        for token in text.split(|c: char| c.is_whitespace() || c == '\'' || c == ';' || c == '\\') {
+            let Some(rest) = token.strip_prefix("postgresql://") else {
+                continue;
+            };
+            let Some(userinfo) = rest.split('@').next() else {
+                continue;
+            };
+            if !rest.contains('@') {
+                continue;
+            }
+            let password = userinfo
+                .split_once(':')
+                .map(|(_, password)| password)
+                .unwrap_or_else(|| {
+                    panic!("{label}: {token} dials a role with no password; it has no `user:password@` userinfo")
+                });
+            checked += 1;
+            assert!(
+                !password.is_empty() && password != "***",
+                "{label} ({path:?}) dials {rest:.40}... with a redaction placeholder instead of a \
+                 credential; SCRAM answers `***` with ProofMismatch and the job fails at the \
+                 workload step, not at the cluster. Ports move; credentials must not be rewritten."
+            );
+        }
+    }
+    assert!(
+        checked >= 6,
+        "expected the workflow's three PostgreSQL URLs and the README's three, found {checked}: \
+         this guard is measuring nothing, so its silence means nothing either"
+    );
+}
