@@ -39,23 +39,68 @@ const SUBJECT_CHARS: usize = 120;
 /// because resolving each one means deciding which row is canonical, which is a
 /// judgement about the incidents themselves. A NEW collision fails, and an id here
 /// that stops colliding must be deleted from this list (the test says so).
-const KNOWN_COLLISIONS: &[(&str,
+const KNOWN_COLLISIONS: &[(
+    &str,
     // two colliding rows in the main table
     &str,
     // and the second row that shares it, if there is one
     &str,
 )] = &[
-    ("CL-17", "line 44 (keyed secondary-index reads)", "line 61 (unbounded single-partition scans)"),
-    ("CL-18", "line 41 (replicated CREATE INDEX never built)", "line 42 (BYTE-IDENTICAL duplicate of line 41) and line 63"),
-    ("CL-19", "line 40 (cold start did not reconstruct system_auth.roles)", "line 62 (unguarded merge source stalled the scan)"),
-    ("CL-22", "line 33 (formation dialled peers at the receiver's port)", "lines 35 and 43 (snapshot install inferred drops; peer pooled under a bad identity)"),
-    ("CL-23", "line 34 (QUORUM range scan read only the first remote)", "line 38 (doomed transaction held keys for the full RPC timeout)"),
-    ("CL-24", "line 32 (non-replica coordinator voted on its row)", "line 36 (SAME defect text as CL-22 line 33, under a different id)"),
-    ("CL-32", "line 143 (RowWire could not carry a complex cell path)", "line 148 (byte-identical duplicate of line 143)"),
-    ("CL-46", "line 18 (F+1 read-vote agreement compared raw bytes)", "line 151 (schema replay said retry later and never retried)"),
-    ("CL-47", "line 19 (refused DropTable reported as success)", "line 152 (Accord apply skew gauge read 1000x high)"),
-    ("CL-48", "line 153 (empty-body AccordApplyOK satisfied the quorum)", "line 154 (TRUNCATE applied node-locally)"),
-    ("CL-61", "line 13 (consensus start gated on boot-time object-store work)", "line 164 (apply-path idempotency structures never pruned)"),
+    (
+        "CL-17",
+        "line 44 (keyed secondary-index reads)",
+        "line 61 (unbounded single-partition scans)",
+    ),
+    (
+        "CL-18",
+        "line 41 (replicated CREATE INDEX never built)",
+        "line 42 (BYTE-IDENTICAL duplicate of line 41) and line 63",
+    ),
+    (
+        "CL-19",
+        "line 40 (cold start did not reconstruct system_auth.roles)",
+        "line 62 (unguarded merge source stalled the scan)",
+    ),
+    (
+        "CL-22",
+        "line 33 (formation dialled peers at the receiver's port)",
+        "lines 35 and 43 (snapshot install inferred drops; peer pooled under a bad identity)",
+    ),
+    (
+        "CL-23",
+        "line 34 (QUORUM range scan read only the first remote)",
+        "line 38 (doomed transaction held keys for the full RPC timeout)",
+    ),
+    (
+        "CL-24",
+        "line 32 (non-replica coordinator voted on its row)",
+        "line 36 (SAME defect text as CL-22 line 33, under a different id)",
+    ),
+    (
+        "CL-32",
+        "line 143 (RowWire could not carry a complex cell path)",
+        "line 148 (byte-identical duplicate of line 143)",
+    ),
+    (
+        "CL-46",
+        "line 18 (F+1 read-vote agreement compared raw bytes)",
+        "line 151 (schema replay said retry later and never retried)",
+    ),
+    (
+        "CL-47",
+        "line 19 (refused DropTable reported as success)",
+        "line 152 (Accord apply skew gauge read 1000x high)",
+    ),
+    (
+        "CL-48",
+        "line 153 (empty-body AccordApplyOK satisfied the quorum)",
+        "line 154 (TRUNCATE applied node-locally)",
+    ),
+    (
+        "CL-61",
+        "line 13 (consensus start gated on boot-time object-store work)",
+        "line 164 (apply-path idempotency structures never pruned)",
+    ),
 ];
 
 fn crate_dir() -> PathBuf {
@@ -93,7 +138,9 @@ fn parse_rows(text: &str) -> Vec<Row> {
         }
         let mut cells = line.split('|');
         cells.next();
-        let Some(id_cell) = cells.next() else { continue };
+        let Some(id_cell) = cells.next() else {
+            continue;
+        };
         let Some(id) = id_cell.split_whitespace().next() else {
             continue;
         };
@@ -117,8 +164,15 @@ fn parse_rows(text: &str) -> Vec<Row> {
 }
 
 fn normalize(text: &str) -> String {
-    let stripped: String = text.chars().filter(|c| !matches!(c, '*' | '`' | '_')).collect();
-    stripped.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+    let stripped: String = text
+        .chars()
+        .filter(|c| !matches!(c, '*' | '`' | '_'))
+        .collect();
+    stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// The part of a row that says WHICH defect it is. Stable across a residual being
@@ -149,7 +203,10 @@ fn subjects_by_id(rows: &[Row]) -> BTreeMap<String, String> {
         .map(|(id, mut group)| {
             // A colliding id registers both rows, sorted, so a baseline entry cannot
             // depend on row order.
-            let mut subjects: Vec<String> = group.drain(..).map(|row| subject_of(&row.subject)).collect();
+            let mut subjects: Vec<String> = group
+                .drain(..)
+                .map(|row| subject_of(&row.subject))
+                .collect();
             subjects.sort();
             (id, fingerprint(&subjects.join("\n")))
         })
@@ -167,7 +224,10 @@ fn read_baseline(text: &str) -> BTreeMap<String, (String, String)> {
         let (Some(id), Some(fp)) = (fields.next(), fields.next()) else {
             panic!("specs/fmea-ids.txt line is not `<id> <fingerprint> <subject>`: {line:?}");
         };
-        entries.insert(id.to_string(), (fp.to_string(), fields.next().unwrap_or("").to_string()));
+        entries.insert(
+            id.to_string(),
+            (fp.to_string(), fields.next().unwrap_or("").to_string()),
+        );
     }
     assert!(
         entries.len() >= 70,
@@ -207,7 +267,10 @@ fn maybe_write_baseline(rows: &[Row]) {
          #   FERROSA_FMEA_BASELINE=write cargo test -p ferrosa-cluster --test fmea_table\n",
     );
     for (id, fp) in subjects {
-        text.push_str(&format!("{id} {fp} {}\n", previews.get(&id).cloned().unwrap_or_default()));
+        text.push_str(&format!(
+            "{id} {fp} {}\n",
+            previews.get(&id).cloned().unwrap_or_default()
+        ));
     }
     std::fs::write(baseline_path(), text).expect("write the baseline");
 }
@@ -235,7 +298,11 @@ fn every_fmea_id_names_exactly_one_defect() {
         if !KNOWN_COLLISIONS.iter().any(|(known, _, _)| known == id) {
             new_collisions.push(format!(
                 "  {id} is on lines {}: {}",
-                group.iter().map(|row| row.line.to_string()).collect::<Vec<_>>().join(" and "),
+                group
+                    .iter()
+                    .map(|row| row.line.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" and "),
                 group
                     .iter()
                     .map(|row| format!("line {} = {:?}", row.line, subject_preview(&row.subject)))
@@ -272,9 +339,8 @@ fn every_fmea_id_names_exactly_one_defect() {
 fn fmea_rows_keep_the_defect_their_id_recorded() {
     let (_, rows) = table_rows();
     maybe_write_baseline(&rows);
-    let registered = read_baseline(
-        &std::fs::read_to_string(baseline_path()).expect("read specs/fmea-ids.txt"),
-    );
+    let registered =
+        read_baseline(&std::fs::read_to_string(baseline_path()).expect("read specs/fmea-ids.txt"));
     let current = subjects_by_id(&rows);
     let previews: BTreeMap<&str, &str> = rows
         .iter()
@@ -289,10 +355,12 @@ fn fmea_rows_keep_the_defect_their_id_recorded() {
                  defect's record was removed or renumbered. Restore the row, or - if the \
                  renumbering is intended - regenerate the baseline in the same commit."
             )),
-            Some(fp) if fp != baseline_fp => problems.push(format!(
+            Some(fp) if fp != baseline_fp => {
+                problems.push(format!(
                 "  {id} now names a different defect. Registered: {baseline_subject:?}. Now: {:?}.",
                 previews.get(id.as_str()).map(|s| subject_preview(s)).unwrap_or_default()
-            )),
+            ))
+            }
             Some(_) => {}
         }
     }
@@ -332,16 +400,20 @@ fn fmea_references_resolve_to_a_row() {
     for path in docs {
         let text = std::fs::read_to_string(&path).expect("read a crate doc");
         for (index, line) in text.lines().enumerate() {
-            for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_')) {
+            for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            {
                 if !is_fmea_id(token) {
                     continue;
                 }
                 citations += 1;
                 if !known.contains(token) {
-                    dangling.push(format!("  {}:{} cites {token}, which is not a row of specs/fmea.md", path
-                        .strip_prefix(crate_dir())
-                        .unwrap_or(Path::new("?"))
-                        .display(), index + 1));
+                    dangling.push(format!(
+                        "  {}:{} cites {token}, which is not a row of specs/fmea.md",
+                        path.strip_prefix(crate_dir())
+                            .unwrap_or(Path::new("?"))
+                            .display(),
+                        index + 1
+                    ));
                 }
             }
         }
