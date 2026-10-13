@@ -3571,17 +3571,27 @@ fn bootstrap_attempts_sstable_bulk_before_range_materialization() {
         .split("starting bootstrap streaming to new token owners")
         .nth(1)
         .expect("bootstrap streaming block exists");
-    let first_read_range = bootstrap
-        .find("read_range(")
-        .expect("bootstrap block still has a row fallback read_range");
+    // The block must still attempt flush/SSTable bulk FIRST...
     let first_flush = bootstrap
         .find("flush_all()")
         .expect("bootstrap block should flush before SSTable streaming");
+    // ...and its row fallback must be the STREAMING one, which walks every partition
+    // one at a time. The previous assertion required a `read_range(` call to still be
+    // present; that is exactly the materializing path this guards against, so it is
+    // inverted here rather than dropped: the call must be ABSENT, and the streaming
+    // replacement must be PRESENT and must come after the flush attempt.
+    let first_fallback = bootstrap
+        .find("stream_row_fallback_into(")
+        .expect("bootstrap block must fall back to the STREAMING row walk");
 
     assert!(
-        first_flush < first_read_range,
-        "bootstrap must try flush/SSTable bulk streaming before read_range; \
-         read_range materializes all SSTable partitions before applying its limit and can OOM"
+        !bootstrap.contains("read_range("),
+        "bootstrap must not call read_range: it materializes all SSTable partitions \
+         before applying its limit and can OOM; use the streaming row fallback instead"
+    );
+    assert!(
+        first_flush < first_fallback,
+        "bootstrap must try flush/SSTable bulk streaming before the streaming row fallback"
     );
 }
 
@@ -5066,4 +5076,142 @@ async fn switchover_converges_the_peer_schema_before_swapping_roles() {
     );
     assert_eq!(**peer.role.load(), PairRole::Primary);
     assert_eq!(controller.role(), Some(PairRole::Secondary));
+}
+
+// ── boot-state consensus gate (2026-10-10 boot decoupling) ────────────────────
+//
+// The internode listener now binds before the boot-time object-store work, so a
+// node is reachable on the internode lane while the object store is slow or
+// black-holed. These tests pin the correctness half of that reordering: while
+// the gate is closed, a cluster transition must NOT start Raft; when the gate
+// opens it must re-drive exactly the transition that was deferred.
+//
+// The behavioural red for the reachability half lives at the real entry point:
+// `ferrosa/tests/boot_object_store_decouple.rs` spawns a real node against a
+// black-holed S3 endpoint and asserts the internode port opens in bounded time.
+// The pre-decoupling binary never binds within the cap.
+
+/// Build a controller wired to a peer manager, ready to transition, and return
+/// it with the peer ids/addresses a transition will name.
+async fn boot_gate_controller(dir: &std::path::Path) -> (Arc<ModeController>, Uuid, SocketAddr) {
+    let storage = test_storage(dir);
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer_id = Uuid::new_v4();
+    let peer_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+    (controller, peer_id, peer_addr)
+}
+
+fn write_path_is_cluster(controller: &ModeController) -> bool {
+    matches!(
+        &**controller.write_path.load(),
+        crate::write_path::WritePath::Cluster(_)
+    )
+}
+
+#[tokio::test]
+async fn boot_gate_defers_cluster_transition_until_state_loaded() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+
+    // `main` arms the gate before the internode listener binds.
+    controller.defer_consensus_until_boot_state();
+    assert!(
+        !controller.consensus_boot_ready(),
+        "the gate must be closed once armed"
+    );
+
+    // A peer reconnect while the gate is closed must NOT start Raft.
+    controller.transition_to_cluster(vec![(peer_id, peer_addr)]);
+
+    assert!(
+        !write_path_is_cluster(&controller),
+        "a cluster transition requested before boot state is loaded must not enter \
+         cluster mode (Raft must not start)"
+    );
+    assert_eq!(
+        controller.deferred_boot_transition_for_test(),
+        Some(vec![(peer_id, peer_addr)]),
+        "the deferred transition must record the exact peers that asked to join"
+    );
+    assert!(
+        !controller.consensus_boot_ready(),
+        "the gate is still closed after a deferred transition"
+    );
+}
+
+/// POSITIVE control for the test above: the same path, gate never armed (the
+/// default), must still reach cluster mode. Without this, the absence assertion
+/// above would pass even if `transition_to_cluster` could never run in a test at
+/// all — a property of the harness, not of the gate.
+#[tokio::test]
+async fn cluster_transition_proceeds_when_boot_gate_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+
+    assert!(
+        controller.consensus_boot_ready(),
+        "the gate defaults to open so non-boot construction is unchanged"
+    );
+
+    controller.transition_to_cluster(vec![(peer_id, peer_addr)]);
+
+    assert!(
+        write_path_is_cluster(&controller),
+        "with the gate open a cluster transition must still enter cluster mode"
+    );
+    assert_eq!(
+        controller.deferred_boot_transition_for_test(),
+        None,
+        "nothing is deferred when the gate is open"
+    );
+}
+
+#[tokio::test]
+async fn mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+
+    controller.defer_consensus_until_boot_state();
+    controller.transition_to_cluster(vec![(peer_id, peer_addr)]);
+    assert!(!write_path_is_cluster(&controller));
+
+    controller.mark_boot_state_loaded();
+    assert!(controller.consensus_boot_ready(), "the gate opens");
+    assert_eq!(
+        controller.deferred_boot_transition_for_test(),
+        None,
+        "the deferred transition is claimed exactly once"
+    );
+
+    // The re-drive runs on a spawned task; wait for it to enter cluster mode.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !write_path_is_cluster(&controller) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "mark_boot_state_loaded must re-drive the deferred transition into cluster mode"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

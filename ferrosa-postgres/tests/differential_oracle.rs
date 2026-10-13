@@ -1085,6 +1085,7 @@ async fn start_ferrosa() -> (tokio_postgres::Client, tempfile::TempDir) {
     let schema = create_schema();
     let engine = seed_engine(dir.path(), &schema);
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),

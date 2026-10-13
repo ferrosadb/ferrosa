@@ -34,6 +34,18 @@ fi
 SKIPS=(
   --skip ::slow::
   --skip accord::perf
+  --skip conflict_index_residency_projection_absolute
+  # Absolute resident-byte bounds (measures the host, not the decode). ci.yml
+  # excludes the whole binary with nextest's `-E 'not binary(accord_apply_decode_residency)'`;
+  # `cargo test` has no binary filter (its `--skip` matches the TEST name, never
+  # the binary name), so the mirror skips that binary's four test names instead —
+  # the only form that filters under BOTH runners. This keeps this set EQUAL to
+  # ci.yml's (tests/ci/test_cluster_data_loss_workflow.py pins that). The
+  # load-independent replacement runs on every PR and is NOT skipped.
+  --skip apply_writeset_peak_stays_within_the_input_size
+  --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident
+  --skip a_materialized_decoded_batch_trips_the_residency_guard
+  --skip a_retained_input_payload_trips_the_residency_guard
   --skip batch_atomicity
   --skip pause_resume
   --skip recovery_coordinator

@@ -322,6 +322,7 @@ async fn m1_join_returns_rows_to_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -416,6 +417,7 @@ async fn extended_query_error_recovers_after_sync() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -467,6 +469,7 @@ async fn extended_parameterized_join_over_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -526,6 +529,7 @@ async fn group_by_order_by_limit_over_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -595,6 +599,7 @@ async fn where_having_distinct_over_a_real_driver() {
     let engine = seed_engine(dir.path());
     let schema = create_schema();
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -713,6 +718,7 @@ async fn dml_client_with_committer(
         None => AccordAccess::disabled(),
     };
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema),
         default_schema: "public".into(),
@@ -792,6 +798,7 @@ async fn dml_client_with_local_accord() -> (
     );
     let query_committer: Arc<dyn TransactionCommitter> = committer;
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine,
         schema,
         default_schema: "public".into(),
@@ -920,6 +927,7 @@ async fn dml_clients_on_two_accord_nodes() -> (
         );
         let query_committer: Arc<dyn TransactionCommitter> = committer;
         let ctx = Arc::new(QueryContext {
+            cluster_read: Default::default(),
             engine,
             schema,
             default_schema: "public".into(),
@@ -1210,6 +1218,107 @@ async fn native_drivers_commit_serializable_transactions_through_accord() {
         .await
         .expect("read the committed row through the second native client");
     assert_eq!(final_row.get::<_, &str>(0), "ivan");
+}
+
+/// In-process regression guard for failure mode RT-3: a commit that reports success carries
+/// the value it wrote.
+///
+/// IT IS GREEN TODAY, AND THAT IS THE FINDING. Measured: 3/3 green against the in-process
+/// two-node Accord fixture. So this fixture does NOT reproduce the defect - a value assertion
+/// that passes here while the live cluster reads the committed cell back NULL means the defect
+/// lives at the clustered/wire level, and only a two-process reproducer can hold it down.
+/// The live reproducer is the transaction probe (scratch pgbench-campaign/txn-iso-probe.sh,
+/// invariant I-B, measured v_aid2=NULL after a COMMIT that returned success). An in-repo
+/// CLUSTERED reproducer is OWED - do not read this test as holding RT-3 down.
+///
+/// Stated without assuming an ordering: the commit race decides which peer is refused, and
+/// every peer that reports success must have its value readable afterwards.
+#[tokio::test]
+async fn a_disjoint_peer_still_applies_its_value_when_the_other_peer_is_refused_first() {
+    let (client_a, client_b, _dir) = dml_client_with_local_accord().await;
+
+    client_a
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin first serializable transaction");
+    client_b
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("begin second serializable transaction");
+
+    // Both transactions read the same predicate row; then they write DISJOINT rows.
+    client_a
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("first transaction reads");
+    client_b
+        .query("SELECT name FROM users WHERE id = $1", &[&1i32])
+        .await
+        .expect("second transaction reads");
+
+    client_a
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"a-wrote", &1i32],
+        )
+        .await
+        .expect("first transaction buffers its update");
+    client_b
+        .execute(
+            "UPDATE users SET name = $1 WHERE id = $2",
+            &[&"b-wrote", &2i32],
+        )
+        .await
+        .expect("second transaction buffers its disjoint update");
+
+    // Both COMMITs go in flight together, because which peer the commit path refuses is
+    // decided by the race, not by who called first. So the assertions below are stated
+    // WITHOUT assuming an ordering: every peer that reports success must have its value.
+    let (out_a, out_b) = tokio::join!(
+        client_a.batch_execute("COMMIT"),
+        client_b.batch_execute("COMMIT"),
+    );
+
+    // A refusal must be loud and named - never a silent non-commit.
+    for (peer, outcome) in [("A", &out_a), ("B", &out_b)] {
+        if let Err(err) = outcome {
+            assert_eq!(
+                err.code().map(|code| code.code()),
+                Some("40001"),
+                "peer {peer} was refused, so the refusal must be the named serialization failure"
+            );
+        }
+    }
+    assert!(
+        out_a.is_ok() || out_b.is_ok(),
+        "two disjoint writers must not BOTH be refused - that is no progress at all"
+    );
+
+    // THE INVARIANT (RT-3): a commit that reports success carries the value it wrote.
+    // This is the assertion the live cluster fails: the survivor's row reads back present
+    // with its cell NULL.
+    if out_a.is_ok() {
+        let row_a = client_a
+            .query_one("SELECT name FROM users WHERE id = $1", &[&1i32])
+            .await
+            .expect("read the row A committed");
+        assert_eq!(
+            row_a.get::<_, &str>(0),
+            "a-wrote",
+            "A reported commit success and must carry the value it wrote"
+        );
+    }
+    if out_b.is_ok() {
+        let row_b = client_b
+            .query_one("SELECT name FROM users WHERE id = $1", &[&2i32])
+            .await
+            .expect("read the row B committed");
+        assert_eq!(
+            row_b.get::<_, &str>(0),
+            "b-wrote",
+            "B reported commit success and must carry the value it wrote"
+        );
+    }
 }
 
 #[tokio::test]

@@ -27,8 +27,18 @@ use ferrosa_sstable::statistics::SerializationHeader;
 use ferrosa_sstable::types::Partition;
 use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles};
 
-/// SSTable components that must exist before a generation can be opened or
-/// published to remote storage.
+/// SSTable components a generation must have to be opened, published, or
+/// restored.
+///
+/// The writer emits every one of these for a live generation, so an absent one
+/// means it was lost. `Rows.db` is an EMPTY placeholder for a generation whose
+/// partitions are all simple (no clustering → no row index needed), which is why
+/// `sstable_health::CRITICAL_COMPONENTS` does not treat a zero-byte Rows.db as
+/// corruption — but a row index for a wide partition is real data, so an ABSENT
+/// Rows.db is still a defect: the S3 download path requires it, the reader needs
+/// it to resolve a partition that advertises one, and it is healed on disk by
+/// `StorageEngine::repair_missing_empty_row_index_placeholder`, never silently
+/// accepted (FMEA ST-91).
 pub(crate) const REQUIRED_SSTABLE_COMPONENTS: [&str; 4] =
     ["Data.db", "Partitions.db", "Rows.db", "Filter.db"];
 
@@ -2009,9 +2019,9 @@ pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
 /// startup/load path so on-demand reopens go through one code path.
 ///
 /// Required components (`Data.db`, `Partitions.db`, `Rows.db`, `Filter.db`) must
-/// exist — `Filter.db` is always written for a live SSTable, so its absence while
-/// `Data.db` is present means a concurrent compaction/eviction deleted it and we
-/// fail loud (see the inline comment at the read). Genuinely-optional components
+/// exist. The writer emits all four for a live generation; `Rows.db` is an empty
+/// placeholder for a simple generation and a real row index for a wide one, so its
+/// absence is a defect, not an optional omission. Genuinely-optional components
 /// (`Statistics.db`, `CompressionInfo.db`) default to empty/absent when missing.
 pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
     let remote_data = prepare_evicted_for_query(dir, gen)?;
@@ -2035,6 +2045,11 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
         FileReadAt::open(required(data_component)?)?
     };
     let partitions = FileReadAt::open(required(partitions_component)?)?;
+    // Rows.db is required to OPEN: the writer emits it for every live generation
+    // (an empty placeholder for a simple generation, a real row index for a wide
+    // one). An absent file is healed on disk before this runs
+    // (`repair_missing_empty_row_index_placeholder`); failing loud here if it is
+    // still gone is correct, because a wide partition needs it to resolve.
     let rows = FileReadAt::open(required(rows_component)?)?;
 
     // `Filter.db` is ALWAYS written for a live SSTable (flush and compaction

@@ -47,6 +47,7 @@ use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use ferrosa_common::timeuuid::is_reserved_column_name;
 use ferrosa_sql::{Catalog, Column, ColumnType, ExecError, Row, RowCursor, SelectStmt, SpillCtx};
 use tokio::task::JoinHandle;
 
@@ -160,6 +161,15 @@ enum Batch {
 /// A running query whose rows are pulled on demand.
 pub(crate) struct ResultStream {
     columns: Vec<Column>,
+    /// Output columns the client must not see, as indices into the executor's own rows.
+    ///
+    /// Non-empty only for a `SELECT *` over a table carrying a reserved `_sys_` column: a
+    /// star is "every column of the combined schema", which would otherwise expose ferrosa's
+    /// synthetic key. Naming the column explicitly still returns it, which is how Postgres
+    /// exposes `ctid` — hidden from `*`, reachable by name.
+    ///
+    /// Empty for every other query, so nothing changes for them.
+    hidden: Vec<usize>,
     exec: Exec,
     /// Unsent remainder of the last batch received.
     buffered: VecDeque<Row>,
@@ -189,6 +199,8 @@ pub(crate) async fn open_stream<C>(
 where
     C: Catalog + Send + 'static,
 {
+    // Captured before `stmt` moves into the executor thread; needs no clone.
+    let is_star = matches!(stmt.projection, ferrosa_sql::Projection::Star);
     let opened = tokio::task::spawn_blocking(move || {
         ferrosa_sql::open_cursor(
             &stmt,
@@ -207,8 +219,30 @@ where
         Err(join_error) => return Err(executor_died(join_error)),
     };
     let cancel = Arc::new(AtomicBool::new(false));
+    let mut columns = cursor.columns().to_vec();
+    // A `SELECT *` must not reveal ferrosa's synthetic key column; an explicit column list
+    // naming it must still return it.
+    let hidden: Vec<usize> = if is_star {
+        columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| is_reserved_column_name(&c.name))
+            .map(|(i, _)| i)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !hidden.is_empty() {
+        columns = columns
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !hidden.contains(i))
+            .map(|(_, c)| c)
+            .collect();
+    }
     Ok(ResultStream {
-        columns: cursor.columns().to_vec(),
+        columns,
+        hidden,
         exec: Exec::Fetching(spawn_fetch(cursor, &cancel)),
         buffered: VecDeque::new(),
         failure,
@@ -238,6 +272,25 @@ impl ResultStream {
     /// The output columns, known before the first row.
     pub(crate) fn columns(&self) -> &[Column] {
         &self.columns
+    }
+
+    /// Pull the next output row as raw values, or `None` at the end of the
+    /// result. For an internal nested query (a scalar subquery) that needs the
+    /// values, not the client encoding; the client path pulls through [`pump`].
+    ///
+    /// # Errors
+    ///
+    /// The `ErrorResponse` for a failure that interrupts the result (a storage
+    /// error mid-scan, or a cancelled executor).
+    pub(crate) async fn next_row(&mut self) -> Result<Option<Row>, BackendMessage> {
+        if self.buffered.is_empty() {
+            match self.next_batch().await {
+                Batch::Rows => {}
+                Batch::End => return Ok(None),
+                Batch::Failed(error) => return Err(error),
+            }
+        }
+        Ok(self.buffered.pop_front())
     }
 
     /// Wait for the in-flight fetch and buffer its rows, starting the next
@@ -285,7 +338,23 @@ impl ResultStream {
                 FetchEnd::Cancelled => Exec::Abandoned,
             };
             if !fetched.rows.is_empty() {
-                self.buffered.extend(fetched.rows);
+                if self.hidden.is_empty() {
+                    self.buffered.extend(fetched.rows);
+                } else {
+                    // Drop the hidden cells from every row, keeping the rest in order, so the
+                    // rows stay aligned with the filtered column list and its type OIDs.
+                    let hidden = std::mem::take(&mut self.hidden);
+                    self.buffered.extend(fetched.rows.into_iter().map(|row| {
+                        Row(row
+                            .0
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(i, _)| !hidden.contains(i))
+                            .map(|(_, v)| v)
+                            .collect())
+                    }));
+                    self.hidden = hidden;
+                }
                 return Batch::Rows;
             }
         }

@@ -1,8 +1,45 @@
+---
+title: Read-in-transaction — SELECT inside an Accord BEGIN ... COMMIT
+status: proposed
+date: 2026-10-11
+component: transaction-manager
+executive_summary: >
+  A SELECT inside BEGIN...COMMIT must read at the transaction's snapshot and its read-set must
+  constrain the Accord commit, so a transaction both reads and writes and returns its reads.
+  Partly landed: CQL read staging, the commit_with_reads seam, CommitReads, and PostgreSQL MVCC
+  all exist; the gap is the engine-side multi-key read-at-t through Accord, plus bounded and
+  non-materializing read-set and write-set handling. Certified by Elle list-append
+  strict-serializability on a live RF=3 cluster, with no inference assumptions.
+---
+
 # Read-in-transaction: `SELECT` inside an Accord `BEGIN … COMMIT`
 
 **Status:** Proposed. Motivated by strict-serializability validation (Elle
 `list-append`), which requires transactions that both read and write and return
 the reads.
+
+> **As-built update (2026-10-11).** Slices below are partly landed and this doc is the
+> architecture spec for the feature; see `specs/decisions/023-read-in-transaction-mvcc.md`
+> for the decision, `specs/proposed/read-in-accord-transaction-fmea.md` for failure modes,
+> and `specs/plans/read-in-transaction.md` for the plan.
+>
+> - **Slice 1 (CQL plumbing): BUILT.** `session.rs` stages reads (`stage_read`, read-set
+>   positionally aligned to returned rows) and calls `commit_with_reads`;
+>   `transaction_keys.rs` is no longer dead code; `MockTransactionCommitter` echoes canned rows.
+> - **The seam is BUILT as designed:** `commit_with_reads` exists on the trait with a default
+>   that REFUSES a non-empty read-set (never fabricate absence), and `CommitReads` carries the
+>   positional row bytes.
+> - **Slice 2 (engine multi-key read-at-`t` through Accord): NOT BUILT.** This is the gap.
+>   The only impls today are the refusing default and the mock.
+> - **Slice 3 (Elle `list-append`): PENDING** (t_5a3a12e3).
+> - **PostgreSQL MVCC already exists** (`MvccManager`/`MvccSnapshot`, commit gate, apply
+>   observer on the Accord apply path) and supplies visibility; the Unified Transaction
+>   Manager's as-built note records that MVCC isolation was deferred to a later phase.
+> - **Measured on the live cluster (two simultaneous transactions):** single-txn effect and
+>   rollback are CORRECT, same-key serialization is CORRECT (loser refused `40001`), but a
+>   DISJOINT-key pair did not both survive - one peer was refused `40001` and the other's
+>   successful commit read back a NULL cell (row present, value lost). Those two are
+>   acceptance gates for this feature, not side notes.
 
 ## Problem
 

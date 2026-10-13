@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 status: implemented
-last_updated: 2026-08-07
+last_updated: 2026-10-10
 executive_summary: >
   The distribution layer that turns single-node ferrosa-storage engines into a
   cluster: Raft metadata consensus (openraft 0.9 fork with CheckQuorum; a PreVote
@@ -173,6 +173,18 @@ dependency/apply check, without remote read-vote fanout. See
     grandfathered: they need no record. `downgrade_to_pair` is accepted only
     after a node was taken down, and stops this node's Raft before pairing
     (CL-42).
+
+12. **No hard bound on the size of data the engine accepts or returns.** A cap that
+    refuses (`stream: mutation/byte budget exceeded`) or silently truncates
+    (`read_range(.., 10_000)` on cold-start system tables; the 1 000-partition
+    bootstrap row fallback) is gone. The only bounding structure is a **buffer**, and
+    exceeding one SPILLS: the row-stream receiver stages every mutation into a
+    resident buffer (`FERROSA_STREAM_RESIDENT_BUFFER_BYTES`, default 4 MiB, `0` = hold
+    nothing) that spills to its staging file; the system-table loaders and the
+    bootstrap row fallback stream every partition through `StorageEngine::walk_token_range`,
+    one resident at a time. Resource bounds (fan-out windows, repair chunks, hint byte
+    budget, peer-count maps, backoff, net lane capacities) remain and are census'd in
+    the crate README (CL-56/57/58).
 
 ## Correctness evidence (be honest)
 

@@ -254,7 +254,7 @@ impl CrossShardCoordinator {
                 accord_ts: None,
                 status: TxnStatus::PreAccepted,
             };
-            let _ = sm.conflict_index_mut().register(key, entry);
+            sm.conflict_index_mut().register(key, entry);
         }
     }
 

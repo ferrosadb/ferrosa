@@ -111,12 +111,12 @@ cluster view, the `SharedState` before the CQL/Flight servers). See
 2. **Config** — load `FERROSA_CONFIG` TOML (default `/etc/ferrosa/ferrosa.toml`); file values win over environment values, which win over built-in defaults.
 3. **Schema preflight** — load the size-bounded, discriminated local `schema.json` before storage or any listener. Legacy arrays, corrupt/oversized documents, and unknown formats are quarantined and abort startup; they never become an empty registry.
 4. **host_id** — load/generate/validate `{data_dir}/host_id` (`classify_host_id_state`: loaded / override / empty-regenerated / invalid-regenerated / generated-new — each path logs a breadcrumb, BUG-008).
-5. **StorageEngine** — `open()` (replay commit log) if segments exist, else `new()`; probe S3 CAS; **attach `CdcBus`** (capacity 1024) to the commit log; register system tables; replay pending S3 uploads. Storage-only recovery metadata lives in `storage-schema.json`, never `schema.json`.
-6. **Schema** — `Schema::new` (composes audit sinks); apply the preflighted local snapshot or use S3 bootstrap/fresh startup; replay pending commit-log mutations; restore roles before seeding only missing defaults; then reconstruct secondary indexes, UDTs, UDFs, and role permissions from the system tables.
-7. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); preserve `[internode].broadcast` as both the resolved local address and the raw peer-handshake advertisement; build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode. Then `check_startup_jsonb` (T-300, D24): a node that will not stay standalone (seeds configured, or a former cluster member) and whose restored schema holds jsonb columns exits non-zero with the table names and D15a; there is no bypass.
+5. **StorageEngine** — `open()` (replay commit log) if segments exist, else `new()`; **attach `CdcBus`** (capacity 1024) to the commit log; register system tables. Storage-only recovery metadata lives in `storage-schema.json`, never `schema.json`. The S3 CAS probe and the pending-upload replay are **deferred until after the internode listener binds** (step 10) so they cannot hold the node off the internode lane.
+6. **Schema** — `Schema::new` (composes audit sinks); apply the preflighted local snapshot; replay pending commit-log mutations; restore roles before seeding only missing defaults; then reconstruct secondary indexes, UDTs, UDFs, and role permissions from the system tables. The **S3 schema/SSTable bootstrap** for a cold start (no local `schema.json`) is deferred until after the internode listener binds (step 10).
+7. **ModeController** — `ClusterConfig`/`NetConfig` (with TOML overrides, BUG-006); preserve `[internode].broadcast` as both the resolved local address and the raw peer-handshake advertisement; build the `HandlerRegistry` (ping, pair-catchup, mutation/truncate forward, three repair handlers); construct controller in standalone mode. The `check_startup_jsonb` refusal (T-300, D24) now runs after the internode listener binds, on the final (post-bootstrap) schema — see step 10.
 8. **PeerManager** — wire as `ModeController`'s `PeerEventListener`; start the heartbeat loop; spawn the self-heal controller with a **live** peer-health probe.
-9. **Production gate** — resolve every listener's TLS settings, load each configured certificate, and run `enforce_production_requirements` (auth, listener + internode TLS, default admin password); exit 1 on a blocking violation.
-10. **Internode RPC** (`:17000`) — `RpcServer::start_and_get_addr`.
+9. **Internode RPC** (`:17000`) — arm the **boot-state consensus gate** (`ModeController::defer_consensus_until_boot_state`), then `RpcServer::start_and_get_addr`. From here the node is reachable on the internode lane in bounded time **regardless of object-store health**. Before the 2026-10-10 outage fix the listener was started only *after* the object-store calls in step 10, each of which could block for `FERROSA_S3_REQUEST_TIMEOUT_SECS` (default **900 s**); a restarting node was unreachable for that window, so a brief leaderless spell could not re-form quorum and became a 35-minute cluster outage.
+10. **Deferred object-store boot work + security gates** (after the listener) — a cold-start S3 schema/SSTable bootstrap (only when there is no local `schema.json`); then `enforce_production_requirements` (auth, listener + internode TLS, default admin password; exit 1 on a blocking violation) and `check_startup_jsonb` (T-300, D24; exit non-zero naming the tables), both evaluated on the **final** schema; then `ModeController::mark_boot_state_loaded` opens the gate and re-drives any cluster transition a peer requested while it was closed. The CAS probe and the pending-upload replay then run on the **background** runtime. **The safety invariant:** consensus (Raft) never starts before the object-store boot work completes — the gate — while the node's *reachability* no longer waits for it. A partial bootstrap is now loud and reported as a failure (it does not persist the schema and never registers a table whose data did not come down).
 11. **CQL server** (`:9042`) — build `SharedState` (`SessionCore` + Accord HLC + prepared cache + observability trackers + virtual tables) and `start_background`.
 12. **Arrow Flight** (`:8815`, `flight` feature, after the listener-status registry so a bind or TLS failure shows in `/readyz` as `flight`) — signing key from `FERROSA_FLIGHT_SIGNING_KEY` (ephemeral if unset — warns); `FERROSA_FLIGHT_TOKEN_TTL_SECS` must be a positive integer (a typo is fatal, it used to fall back to 3600 silently); TLS when `[flight] tls_cert/tls_key` are set.
 13. **Web console** (`:9090`).
@@ -247,3 +247,90 @@ zero owned ranges. The controller now also resumes the Promote phase on the
 recovered-topology path (it previously skipped promotion on every restart, so a
 mid-join node stayed `Joining` forever). Invariants and boundaries are pinned in
 `ferrosa-cluster/tests/joining_node_health.rs`.
+
+### DROP TABLE replica-atomicity (real-process)
+
+`tests/drop_table_replica_process.rs` is the process-level guard for
+t_c8625592 — a refused `DROP TABLE` must fail loud and never resurrect its rows.
+It spawns **three real `ferrosa` binaries**, forms a real
+cluster (a Raft leader elected, `DdlPath::Cluster` installed on every
+node), and drives the DROP over the **PostgreSQL wire**: the client must receive
+an ERROR (SQLSTATE 58000), no node may serve the seeded rows afterwards, and
+they must stay gone after **restarting the node that applied the drop**.
+
+Two harness traps are load-bearing and easy to re-derive wrongly:
+
+- **Host ids must be distinct in BOTH halves.** Raft's
+  `ferrosa_cluster::raft::uuid_to_node_id` reads `bytes[8..16]` (little-endian)
+  while Accord reads `bytes[0..8]` (big-endian). Host ids that differ only in
+  the leading groups collapse to one Raft node id and no leader is ever elected;
+  host ids that differ only in the trailing group collide on one Accord node id
+  and every write fails `unknown peer`. The test repeats `0x11/0x22/0x33` across
+  all sixteen bytes, as `tests/docker-compose.cluster.yml` does.
+- **`public` must cover the cluster; this harness gets that from a full mesh.**
+  Every node here seeds off the other two, so the auto-created `public` keyspace
+  is RF=3 and an Accord write has two remote replicas to reach a quorum from. The
+  factor is `max(seeds + 1, FERROSA_EXPECTED_CLUSTER_SIZE, committed cluster
+  size)` (never below 1) — sizing it from the seed list ALONE was the live defect
+  described in the next subsection.
+
+### PostgreSQL default-keyspace replication (real-process)
+
+`tests/pg_public_keyspace_rf_process.rs` is the process-level red for the
+PostgreSQL-wire **read** defect behind the reported `INSERT 0 2` / one-row
+SELECT. It spawns three real `ferrosa` binaries in a **star** (node 0 carries no
+seed; nodes 1 and 2 seed off it), gives every node
+`FERROSA_EXPECTED_CLUSTER_SIZE=3`, and drives `INSERT … VALUES (…),(…)` then
+`SELECT` over the wire **from the node with no seed**.
+
+The PostgreSQL front end **used to** answer every `SELECT` from this node's LOCAL
+`TableStore` (`storage_provider::produce_scan` fanned out over no ring), so
+`public` had to be replicated to every node the scan was served from — otherwise a
+committed row was invisible on a non-owner node. `main` sized it from the
+`[internode] seed` list alone (`seeds + 1`), so a node with no seed — the seed
+node of a star, and every node of the live `maas-loadtest` cluster — got **RF=1**:
+one owner per partition, a scan that returns its own third. The write is complete;
+the read is not. It is not data loss.
+
+The red asserts the **values** of every seeded row, never a count (a count check
+passes the defect: the INSERT reported all of them). PRE-change the star's node 0
+returned one of five rows; FIXED it returns all five, because the derivation is
+`max(seeds, expected, committed)`.
+
+**The read now consults the ring, not only local storage.** Every `SELECT` opens
+the deployment's range-read path through a new `ferrosa-postgres::ClusterRead`
+seam (`cluster_read.rs`), wired by the binary to the live
+`ferrosa_cluster::write_path::WritePath`, at `ConsistencyLevel::Quorum`
+(`ClusterRangeRead`). A `QUORUM` read paired with the `QUORUM` Accord write gives
+`W + R > RF`, so a read on any node sees every committed row; and a read that
+cannot reach the replicas the level requires **fails loud** (the coordinator
+refuses to serve a partial fan-out; `ScanFailure` → `58000`) instead of returning
+a short result set that looks like a small table. A standalone node — or an
+in-process unit test with `ClusterRead::disabled()` — keeps the local
+`StorageEngine::range_iter` path, which IS complete there. Because reads no longer
+assume `RF == node_count`, the replication factor is free to be a **quorum**
+rather than the whole cluster: `RF = quorum` with `CL = QUORUM` is coherent
+(`W + R = 2q > q` for `RF = q = floor(N/2)+1`).
+
+`tests/pg_select_cluster_read_process.rs` is the process-level red for that read
+path: three real nodes in a star whose `public` is at `RF < 3` (node 0 boots alone
+with no seed, so the boot guard's "replicated to FEWER nodes" ERROR is the proven
+precondition). It asserts that a `SELECT` served by **each** of the three nodes
+returns the full committed row set by value and order, and that once an owner is
+stopped the same `SELECT` either returns every committed row or fails loud —
+never a silent subset.
+
+Two operational consequences are load-bearing:
+
+- **`FERROSA_EXPECTED_CLUSTER_SIZE` (or a full-mesh seed list) must be set so the
+  factor is right on the FIRST creation.** An existing `public` cannot be repaired
+  in place — there is no `ALTER KEYSPACE` — so a cluster that already created it at
+  RF=1 must **re-create the keyspace while it runs**. A boot guard
+  (`postgres_default_keyspace_is_undersized`, driven by `undersized_guard_sweep`)
+  re-verifies the factor on a bounded schedule and logs one actionable ERROR per
+  distinct under-sized condition; it clears once the keyspace is re-created.
+- **A larger factor raises the cost of every write, but a read no longer needs it
+  to be the whole cluster.** At RF=1 a write lands on one owner; at RF=3 the same
+  write fans out to all three nodes. With the cluster read in place a **quorum**
+  factor is sufficient for a `QUORUM` read, so the write cost can be held at
+  `floor(N/2)+1` rather than `N`.

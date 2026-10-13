@@ -26,9 +26,58 @@
 //! Last revised: 2026-08-27
 //! Last changed: Kept the process alive but fail-closed after Raft failure.
 
-#[cfg(not(target_env = "msvc"))]
+#[cfg(all(not(target_env = "msvc"), not(feature = "alloc-probe")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+/// A counting wrapper around jemalloc, installed only with the `alloc-probe`
+/// cargo feature. It keeps `ferrosa_common::mem_probe` fed with live-heap
+/// bytes so a phase boundary can log the residency it caused, which is how a
+/// COMMIT's memory peak is attributed to a structure rather than guessed at
+/// (see `PROFILE.md`, `FERROSA_PG_COMMIT_PROFILE`). A production build does not
+/// enable the feature and uses [`tikv_jemallocator::Jemalloc`] directly.
+#[cfg(all(not(target_env = "msvc"), feature = "alloc-probe"))]
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout};
+
+    pub struct CountingJemalloc;
+
+    unsafe impl GlobalAlloc for CountingJemalloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = tikv_jemallocator::Jemalloc.alloc(layout);
+            if !ptr.is_null() {
+                ferrosa_common::mem_probe::record_alloc(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            ferrosa_common::mem_probe::record_dealloc(layout.size());
+            tikv_jemallocator::Jemalloc.dealloc(ptr, layout);
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let ptr = tikv_jemallocator::Jemalloc.alloc_zeroed(layout);
+            if !ptr.is_null() {
+                ferrosa_common::mem_probe::record_alloc(layout.size());
+            }
+            ptr
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = tikv_jemallocator::Jemalloc.realloc(ptr, layout, new_size);
+            if !new_ptr.is_null() {
+                ferrosa_common::mem_probe::record_dealloc(layout.size());
+                ferrosa_common::mem_probe::record_alloc(new_size);
+            }
+            new_ptr
+        }
+    }
+}
+
+#[cfg(all(not(target_env = "msvc"), feature = "alloc-probe"))]
+#[global_allocator]
+static GLOBAL: counting_alloc::CountingJemalloc = counting_alloc::CountingJemalloc;
 
 /// jemalloc tuning: release dirty + muzzy pages back to the OS
 /// immediately on free instead of caching them for ~10 s of reuse.
@@ -542,6 +591,274 @@ fn resolve_postgres_bind(file_config: &toml::Value) -> std::net::SocketAddr {
         DEFAULT_POSTGRES_BIND,
     );
     parse_bind_addr("Postgres", "FERROSA_POSTGRES_BIND", &postgres_bind)
+}
+
+/// The keyspace the PostgreSQL listener points every session at.
+///
+/// `[postgres]` has no `keyspace` key; the listener is constructed with
+/// `default_schema: "public"` (see step 11b), so this name must exist for any
+/// unqualified `CREATE TABLE`/DML/SELECT to resolve.
+const POSTGRES_DEFAULT_KEYSPACE: &str = "public";
+
+/// Ensure `[postgres]`'s default keyspace exists.
+///
+/// A fresh node has no `public` keyspace, so the PostgreSQL listener comes up
+/// advertising `current_schema = public` while every table statement fails —
+/// `CREATE TABLE public.x` with `schema "public" does not exist`, and SELECT/DML
+/// with `Accord network error: no replicas resolved for a key in keyspace
+/// 'public' (cluster mode required)` (the per-key replica resolver only knows
+/// keyspaces that exist). The listener is not usable until `public` exists, and
+/// no wire statement can create it (`CREATE SCHEMA`/`CREATE DATABASE`/
+/// `CREATE KEYSPACE` are unsupported; the only DDL verb is `CREATE TABLE`).
+///
+/// The creation goes through the cluster DDL path (the async
+/// [`ensure_postgres_default_keyspace`] below is the driver) so every node
+/// agrees the keyspace exists; a local-only insert leaves PostgreSQL writes
+/// failing `Accord quorum unavailable`.
+///
+/// The replication factor the PostgreSQL default keyspace must use so the
+/// PostgreSQL-wire front end can serve a key from ANY node.
+///
+/// `storage_provider::produce_scan` answers a query from this node's LOCAL
+/// `TableStore` and never fans a range read across the ring, so a full-table scan
+/// is complete only when the backing keyspace is replicated to every node — the
+/// same `RF == node_count` case the CQL range-read path special-cases. A keyspace
+/// created at RF=1 places each partition on a single owner, so a keyed
+/// `SELECT ... WHERE id = $1` on any other node scans past it and returns zero
+/// rows (`query_one`: "query returned an unexpected number of rows") — a
+/// committed row, invisible.
+///
+/// The node cannot read the fully-formed ring at boot: it creates this keyspace
+/// on the transient standalone path, ~0.5s before the `standalone -> pair ->
+/// cluster` transition (observed in the Jepsen node log at 2026-10-10), while the
+/// ring is still self-only. So it seeds the factor from the cluster it is
+/// CONFIGURED to join: itself plus every configured seed. In the supported
+/// topology (every node seeds every other) that IS the cluster size. A genuinely
+/// standalone node (no seeds) keeps RF=1.
+fn postgres_default_keyspace_replication_factor(configured_seeds: usize) -> usize {
+    configured_seeds.saturating_add(1)
+}
+
+/// The replication factor the PostgreSQL default keyspace must carry so this
+/// node's LOCAL-only scan is complete, given everything the node actually knows
+/// about its cluster.
+///
+/// [`postgres_default_keyspace_replication_factor`] sizes the keyspace from the
+/// `[internode] seed` list alone. That is only sufficient when the operator
+/// configured every node to seed every other. A cluster formed by the controller
+/// (invite/mesh formation) configures **no** seeds — the live `maas-loadtest`
+/// nodes run with an empty seed list — so the seed-derived factor was `1`, every
+/// partition was placed on a single owner, and a 3-node `SELECT` returned one
+/// third of the rows that had committed. That is the `INSERT 0 2` / one-row
+/// visible defect: the write is complete, the read is not.
+///
+/// The factor therefore also takes the two sizes the node learns from its own
+/// cluster: the operator declaration ([`expected`]) and, decisively, the
+/// membership the node has actually committed to ([`committed`]) — both of which
+/// are non-zero by the time the ensure runs on a real cluster. `max` of the three
+/// (never below 1) so a larger cluster never gets a smaller keyspace.
+///
+/// [`expected`]: ferrosa_cluster::ModeController::expected_cluster_size
+/// [`committed`]: ferrosa_cluster::ModeController::committed_cluster_size
+#[must_use]
+fn postgres_default_keyspace_replication_factor_for_cluster(
+    configured_seeds: usize,
+    expected_cluster_size: usize,
+    committed_cluster_size: usize,
+) -> usize {
+    postgres_default_keyspace_replication_factor(configured_seeds)
+        .max(expected_cluster_size)
+        .max(committed_cluster_size)
+        .max(1)
+}
+
+/// The replication factor already carried by the PostgreSQL default keyspace, or
+/// `None` when the keyspace does not exist.
+fn postgres_default_keyspace_replication_of(schema: &ferrosa_schema::Schema) -> Option<usize> {
+    let snapshot = schema.snapshot();
+    let keyspace = snapshot.keyspaces.get(POSTGRES_DEFAULT_KEYSPACE)?;
+    Some(
+        keyspace
+            .replication
+            .options
+            .get("replication_factor")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1),
+    )
+}
+
+/// A `public` keyspace that EXISTS but cannot serve a complete scan from this
+/// node: it reports the too-small factor it carries.
+///
+/// The factor of an existing keyspace cannot be changed in place (there is no
+/// `ALTER KEYSPACE`); the repair is to re-create the keyspace while the cluster
+/// runs. This exists so the condition is LOUD at boot instead of surfacing as a
+/// scan that quietly returns fewer rows than were committed — the whole point of
+/// `postgres_default_keyspace_replication_factor_for_cluster` is that this state
+/// must never be reached.
+fn postgres_default_keyspace_is_undersized(
+    schema: &ferrosa_schema::Schema,
+    needed_replication_factor: usize,
+) -> Option<usize> {
+    let actual = postgres_default_keyspace_replication_of(schema)?;
+    (needed_replication_factor > 1 && actual < needed_replication_factor).then_some(actual)
+}
+
+/// One sweep of the under-sized-keyspace guard: decide whether to WARN now, and
+/// what to remember as already-reported.
+///
+/// Returns `(warn_now, next_reported)`. The rule is the whole point of the guard
+/// being a guard rather than a nag or a latch:
+///
+/// * **Once per distinct condition.** A condition is the pair
+///   `(actual_factor, required_factor)`. The same pair is reported once, however
+///   many sweeps it persists for.
+/// * **Re-verify, never latch.** A healed (or never under-sized) keyspace clears
+///   `next_reported`, so a *later* recurrence of the same pair warns again — the
+///   guard tracks the CURRENT state, not the first one it ever saw.
+/// * **Silent when the scan is complete.** `required < 2` is a genuine standalone
+///   node (or a cluster size not yet known): the local-only PostgreSQL scan IS
+///   complete there, and the guard must not cry wolf.
+///
+/// Pure and total, so this behaviour is unit-testable without a live cluster or a
+/// sleeping task.
+fn undersized_guard_sweep(
+    is_undersized: Option<usize>,
+    required: usize,
+    last_reported: Option<(usize, usize)>,
+) -> (bool, Option<(usize, usize)>) {
+    match is_undersized {
+        Some(actual) if required >= 2 => {
+            let now = (actual, required);
+            if last_reported == Some(now) {
+                (false, last_reported)
+            } else {
+                (true, Some(now))
+            }
+        }
+        _ => (false, None),
+    }
+}
+
+/// The action a boot-time ensure should take for a keyspace, given the keyspace
+/// is absent and the current DDL path kind. `Some(op)` means "create it through
+/// this DDL operation"; `None` means "wait" (the path cannot complete a creation).
+///
+/// The created keyspace carries `replication_factor` — the caller's
+/// [`postgres_default_keyspace_replication_factor`], NEVER a hardcoded single-node
+/// factor, so every node holds every partition and the local-only PostgreSQL scan
+/// is complete.
+///
+/// Kept pure and total so the decision is unit-testable without a live cluster.
+/// `Forming` (buffers) and `Unavailable` (rejects) map to "wait" instead of
+/// "create": the operation would be swallowed, and since `Direct::execute` falls
+/// back to a local insert the node would report the keyspace while the cluster
+/// never learns of it — the exact divergence seen as `Accord quorum unavailable`
+/// on PostgreSQL writes.
+fn default_keyspace_boot_action(
+    kind: &str,
+    replication_factor: usize,
+) -> Option<ferrosa_cluster::pair::ddl::DdlOperation> {
+    if !ddl_path_kind_can_create_keyspace(kind) {
+        return None;
+    }
+    Some(ferrosa_cluster::pair::ddl::DdlOperation::CreateKeyspace(
+        ferrosa_schema::KeyspaceMetadata {
+            name: POSTGRES_DEFAULT_KEYSPACE.into(),
+            replication: ferrosa_schema::ReplicationParams {
+                strategy: "SimpleStrategy".into(),
+                options: [("replication_factor".into(), replication_factor.to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            durable_writes: true,
+        },
+    ))
+}
+
+/// Whether a DDL path whose [`ferrosa_cluster::DdlPath::kind`] is `kind` can
+/// create a keyspace right now.
+///
+/// `Direct` (standalone) applies locally, `Pair` through the coordinator, and
+/// `Cluster` proposes through Raft — all three complete the creation. `Forming`
+/// *buffers* the operation and `Unavailable` *rejects* it, so a boot-time ensure
+/// that ran on either would report success while the keyspace never became
+/// creatable — which is exactly the cluster-divergence bug seen as
+/// `Accord quorum unavailable` on PostgreSQL writes. The boot-time ensure must
+/// therefore wait for an applicable path rather than fire once and forget.
+fn ddl_path_kind_can_create_keyspace(kind: &str) -> bool {
+    matches!(kind, "direct" | "pair" | "cluster")
+}
+
+/// Create the PostgreSQL listener's `public` keyspace through the active DDL
+/// path, so the creation is Raft-replicated in cluster mode and every node
+/// agrees the keyspace exists (a local-only insert makes PostgreSQL writes fail
+/// `Accord quorum unavailable`).
+///
+/// Waits for an applicable path (bounded) because at boot the path is briefly
+/// `Forming`/`Unavailable`; the PostgreSQL listener binds immediately at step
+/// 11b while the cluster forms later, so a fire-once ensure would be swallowed.
+/// Idempotent: returns `Ok(false)` when the keyspace already exists.
+async fn ensure_postgres_default_keyspace(
+    schema: &std::sync::Arc<ferrosa_schema::Schema>,
+    ddl_path: &std::sync::Arc<arc_swap::ArcSwap<ferrosa_cluster::DdlPath>>,
+    replication_factor: impl Fn() -> usize,
+) -> std::result::Result<bool, ferrosa_cluster::ClusterError> {
+    // Nothing to do once the keyspace exists (any prior ensure, or a cluster DDL).
+    if schema
+        .snapshot()
+        .keyspaces
+        .contains_key(POSTGRES_DEFAULT_KEYSPACE)
+    {
+        return Ok(false);
+    }
+
+    // Wait for a path that can actually complete the creation. The bound is
+    // generous but finite: if the cluster never becomes DDL-capable the node
+    // keeps serving; the keyspace is then created on the next restart instead
+    // of blocking startup forever.
+    let mut op = None;
+    for attempt in 0..180u32 {
+        let kind = {
+            let guard = ddl_path.load();
+            guard.kind()
+        };
+        if let Some(action) = default_keyspace_boot_action(kind, replication_factor()) {
+            op = Some(action);
+            break;
+        }
+        if attempt == 0 || attempt % 30 == 0 {
+            tracing::info!(
+                keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                ddl_path = kind,
+                "waiting for a DDL path that can create the PostgreSQL default keyspace"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let Some(op) = op else {
+        return Err(ferrosa_cluster::ClusterError::Internal(format!(
+            "DDL path never became applicable; keyspace `{POSTGRES_DEFAULT_KEYSPACE}` was not created"
+        )));
+    };
+
+    // Re-check under the DDL path: another ensure (or a racing client DDL) may
+    // have created it while we waited or while the operation was in flight.
+    if schema
+        .snapshot()
+        .keyspaces
+        .contains_key(POSTGRES_DEFAULT_KEYSPACE)
+    {
+        return Ok(false);
+    }
+
+    let guard = ddl_path.load();
+    guard.execute(op).await?;
+    tracing::info!(
+        keyspace = POSTGRES_DEFAULT_KEYSPACE,
+        "created the PostgreSQL default keyspace"
+    );
+    Ok(true)
 }
 
 /// Apply TOML `[internode]` overrides to a `NetConfig`.
@@ -1263,6 +1580,11 @@ async fn bootstrap_from_s3(
     // so register_table() finds them and opens readers.
     let snap = schema.snapshot();
     let mut downloaded_total = 0usize;
+    // A partial bootstrap must be LOUD and must not be reported as success: a
+    // table whose SSTables failed to download must not be registered as if it
+    // held its data (a silently-empty table serves wrong results). Collect the
+    // failures and fail the whole bootstrap below, naming them.
+    let mut failed_tables: Vec<String> = Vec::new();
     for ((_ks, _tbl), table_meta) in &snap.tables {
         if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
             continue;
@@ -1279,6 +1601,11 @@ async fn bootstrap_from_s3(
                     ks = %table_meta.keyspace,
                     "failed to download SSTables from S3: {e}"
                 );
+                failed_tables.push(format!(
+                    "{}.{} (download: {e})",
+                    table_meta.keyspace, table_meta.name
+                ));
+                continue;
             }
         }
     }
@@ -1288,6 +1615,13 @@ async fn bootstrap_from_s3(
         if ferrosa_schema::is_system_keyspace(&table_meta.keyspace) {
             continue;
         }
+        if failed_tables
+            .iter()
+            .any(|f| f.starts_with(&format!("{}.{} (", table_meta.keyspace, table_meta.name)))
+        {
+            // Do not register a table whose data did not come down.
+            continue;
+        }
         let storage_schema = table_meta.to_storage_schema();
         if let Err(e) = storage.register_table(storage_schema) {
             tracing::warn!(
@@ -1295,7 +1629,36 @@ async fn bootstrap_from_s3(
                 ks = %table_meta.keyspace,
                 "failed to register table from S3 bootstrap: {e}"
             );
+            failed_tables.push(format!(
+                "{}.{} (register: {e})",
+                table_meta.keyspace, table_meta.name
+            ));
         }
+    }
+
+    if !failed_tables.is_empty() {
+        // Loud and terminal for this bootstrap: the node must not be told the
+        // restore succeeded. The caller treats an error as "starting fresh" and
+        // does NOT persist the schema, so a later restart retries.
+        tracing::error!(
+            ks_count,
+            table_count,
+            sstable_count,
+            downloaded_total,
+            failed = failed_tables.len(),
+            failed_tables = ?failed_tables,
+            "S3 bootstrap INCOMPLETE: {} of {} tables failed to restore; their data is \
+             NOT on this node. Reporting the bootstrap as failed.",
+            failed_tables.len(),
+            table_count,
+        );
+        return Err(format!(
+            "S3 bootstrap restored only {}/{} tables; failed: {}",
+            table_count - failed_tables.len(),
+            table_count,
+            failed_tables.join(", ")
+        )
+        .into());
     }
 
     tracing::info!(
@@ -1906,18 +2269,21 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             ferrosa_storage::StorageEngine::new(storage_config, Some(&storage_upload_handle))?;
         (engine, Vec::new())
     };
-    // Verify the S3 bucket is reachable and writable. With FERROSA_S3_REQUIRED an
-    // access failure (bad credentials, wrong bucket, no route) stops startup
-    // instead of surfacing later as upload warnings.
+    // Object-store access validation and the CAS probe used to be awaited here,
+    // before the internode listener bound. A slow or black-holed object store
+    // then held a restarting node off the internode lane for up to
+    // FERROSA_S3_REQUEST_TIMEOUT_SECS (default 900 s) — which turned a brief
+    // leaderless window into the 2026-10-10 35-minute outage (t_boot_lane).
+    //
+    // The listener now binds first (below), the object-store work runs after it,
+    // and the boot-state consensus gate keeps Raft from starting until that work
+    // completes. `FERROSA_S3_REQUIRED=true` still fails fast here: it is an
+    // explicit operator opt-in that S3 be healthy for THIS node, in which case
+    // coming up is the wrong outcome.
     let s3_required = ferrosa_storage::upload::config::s3_required_from_env()
         .map_err(|e| format!("invalid FERROSA_S3_REQUIRED: {e}"))?;
-    storage.validate_object_store_access(s3_required).await?;
-    // Probe object store for conditional put support (CAS).
-    // RustFS/MinIO may not support etag-based conditional writes — log a
-    // warning but continue. The manifest CAS retry loop will still attempt
-    // conditional puts and fall back gracefully.
-    if let Err(e) = storage.probe_s3_cas().await {
-        tracing::warn!("S3 CAS probe failed (non-fatal): {e}");
+    if s3_required {
+        storage.validate_object_store_access(true).await?;
     }
     let storage = Arc::new(storage);
 
@@ -1943,8 +2309,10 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // for the verified-healthy-replica ClusterView and the repair executor).
     // See `repair_wiring` + the "automatic repair" block below.
 
-    // Replay any pending S3 uploads that were interrupted by a crash.
-    storage.replay_pending_uploads().await;
+    // Replay of pending S3 uploads (crash recovery) is deferred to after the
+    // internode listener binds — see the "deferred object-store boot work" block
+    // below. It is a side effect only (its result is discarded) and is not part
+    // of the state consensus needs before it may start.
 
     // 4. Create Schema
     //
@@ -2077,14 +2445,15 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         register_user_tables_with_storage(&storage, &schema)?;
     }
 
-    if !schema_restored && storage.has_s3() {
-        tracing::info!("no local schema — attempting S3 bootstrap");
-        if let Err(e) = bootstrap_from_s3(&storage, &schema).await {
-            tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
-        } else {
-            // Persist the S3 schema locally so future restarts don't need S3
-            persist_schema_locally(data_path, &schema)?;
-        }
+    // The S3 schema/SSTable bootstrap for a cold start (no local schema.json) is
+    // deferred to after the internode listener binds — see the "deferred
+    // object-store boot work" block below. It mutates `schema` and the engine, so
+    // the boot-state consensus gate keeps Raft from starting until it completes.
+    let needs_s3_bootstrap = !schema_restored && storage.has_s3();
+    if needs_s3_bootstrap {
+        tracing::info!(
+            "no local schema — S3 bootstrap deferred until after the internode listener binds"
+        );
     }
 
     // Replay the commit log before reconstructing indexes, types, functions,
@@ -2292,12 +2661,12 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         eprintln!("FATAL: {error}");
         lifecycle::fatal_exit(1, &error);
     }
-    enforce_production_requirements(
-        storage_auth_enabled,
-        &listener_tls_inputs,
-        net_config.require_tls,
-        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
-    );
+    // SEC: `enforce_production_requirements` now runs after the internode
+    // listener binds (see the "deferred object-store boot work" block below), so
+    // that it evaluates the schema *after* a cold-start S3 bootstrap has restored
+    // roles. A production node that fails it still exits before it serves data or
+    // starts Raft; only the internode lane binds first, which is what makes the
+    // node reachable when the object store is unhealthy.
 
     // Build handler registry — shared between RPC server and ModeController.
     // Catch-up handler is always available; pair write/role-swap handlers are
@@ -2368,15 +2737,10 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         registry.clone(),
     );
 
-    // T-300 (D24, D15a): jsonb columns are allowed on a standalone node only
-    // until the capability ledger lands. A node that will not stay standalone
-    // (seeds configured, or a former cluster member) and whose persisted
-    // schema holds jsonb must not start: FATAL, naming the tables. There is
-    // no flag to bypass this.
-    if let Err(refused) = mode_controller.check_startup_jsonb() {
-        tracing::error!(%refused, "FATAL: persisted schema holds jsonb columns outside standalone mode");
-        return Err(refused.into());
-    }
+    // T-300 (D24, D15a) jsonb startup refusal and the production security gate
+    // now run after the internode listener binds, once a cold-start S3 bootstrap
+    // has restored the schema (see the "deferred object-store boot work" block
+    // below). They are still checked before the node serves data or starts Raft.
 
     // OpenRaft starts only after the controller exists. Install supervision
     // now so a panic can atomically close readiness and CQL data admission
@@ -2420,7 +2784,14 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // quarantine on peer LIVENESS, not on a peer proven to hold a good copy
     // (FMEA #1).
 
-    // 7. Start internode RPC server with inbound peer callback
+    // 7. Start internode RPC server with inbound peer callback.
+    //
+    // Arm the boot-state consensus gate BEFORE the listener binds: the listener
+    // comes up ahead of the boot-time object-store work, so a peer can connect
+    // while that work is still running. Until `mark_boot_state_loaded` opens the
+    // gate (below), a peer's reconnect defers the cluster transition instead of
+    // starting Raft against state the node does not yet hold.
+    mode_controller.defer_consensus_until_boot_state();
     let rpc_server = Arc::new(
         ferrosa_net::rpc::server::RpcServer::new((*net_config).clone(), host_id, registry)
             .with_inbound_callback(mode_controller.clone())
@@ -2429,6 +2800,79 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     );
     let internode_addr = rpc_server.start_and_get_addr().await?;
     tracing::info!(%internode_addr, %host_id, "internode server listening");
+
+    // ── Deferred object-store boot work ───────────────────────────────────────
+    //
+    // The internode listener is up: this node is reachable on the internode lane
+    // in bounded time even when the object store is slow or black-holed. Raft is
+    // gated above, so the ordering the old code enforced by *blocking the
+    // listener* — "consensus starts only after the object-store boot work" — is
+    // preserved, while reachability is decoupled from object-store health.
+
+    // 7a. Cold-start restore (no local schema.json). It mutates `schema` and the
+    // engine, so it must complete before the gate opens: the node must not vote
+    // or serve before it holds this state. A partial restore is now loud and
+    // reported as failed (see `bootstrap_from_s3`).
+    if needs_s3_bootstrap {
+        tracing::info!("no local schema — attempting S3 bootstrap");
+        match bootstrap_from_s3(&storage, &schema).await {
+            Ok(()) => {
+                // Persist the S3 schema locally so future restarts don't need S3.
+                persist_schema_locally(data_path, &schema)?;
+            }
+            Err(e) => {
+                tracing::warn!("S3 bootstrap failed (non-fatal, starting fresh): {e}");
+            }
+        }
+    }
+
+    // 7b. Security gates — evaluated on the FINAL schema (post-bootstrap) and
+    // before the node serves data or starts Raft. A failure still stops startup;
+    // it just no longer delays the internode lane.
+    enforce_production_requirements(
+        storage_auth_enabled,
+        &listener_tls_inputs,
+        net_config.require_tls,
+        !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
+    );
+    if let Err(refused) = mode_controller.check_startup_jsonb() {
+        tracing::error!(%refused, "FATAL: persisted schema holds jsonb columns outside standalone mode");
+        return Err(refused.into());
+    }
+
+    // 7c. The node now holds the state it is required to hold. Open the gate and
+    // re-drive any transition a peer requested while it was closed.
+    mode_controller.mark_boot_state_loaded();
+
+    // 7d. Object-store hygiene, off the boot path. These results are never
+    // consumed on the boot path; a failure degrades THIS node's S3 durability,
+    // never cluster-wide consensus availability. `probe_s3_cas` precedes
+    // `replay_pending_uploads` (the latter reads the CAS flag); the CAS atomic
+    // defaults to "supported", so a manifest saved before this completes still
+    // falls back gracefully.
+    {
+        let storage_for_sync = storage.clone();
+        runtimes.background.spawn(async move {
+            if !s3_required {
+                match storage_for_sync.validate_object_store_access(false).await {
+                    Ok(warnings) if !warnings.is_empty() => {
+                        tracing::warn!(
+                            ?warnings,
+                            "object-store access validation failed (non-fatal)"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("object-store access validation failed (non-fatal): {e}")
+                    }
+                }
+            }
+            if let Err(e) = storage_for_sync.probe_s3_cas().await {
+                tracing::warn!("S3 CAS probe failed (non-fatal): {e}");
+            }
+            storage_for_sync.replay_pending_uploads().await;
+        });
+    }
 
     // Initialize the cluster-wide paging HMAC key BEFORE the CQL server serves a
     // query, so every coordinator signs/verifies paging cursors with the SAME
@@ -3127,6 +3571,82 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // model, and negotiates TLS from `[postgres] tls_cert/tls_key/require_tls`
     // (t_e1c819ad).
     {
+        // The listener points every session at keyspace `public`
+        // (default_schema below); ensure it exists through the DDL path so the
+        // creation is Raft-replicated in cluster mode. Spawned, not awaited: the
+        // listener must bind immediately, and the path is still `Forming` at
+        // boot — the ensure waits for an applicable path internally.
+        {
+            let schema = schema.clone();
+            let ddl_path = shared_state.ddl_path.clone();
+            // The PostgreSQL front end scans only THIS node's local storage, so
+            // its default keyspace must be replicated to EVERY node this node can
+            // be read from — otherwise a committed row is invisible on every
+            // non-owner node. The seed list is only ONE of the three sizes the node
+            // knows; a controller-formed cluster (the live `maas-loadtest` nodes)
+            // configures no seeds at all, and sizing the keyspace from seeds alone
+            // created `public` at RF=1 — one owner per partition, so a 3-node scan
+            // returned a third of the committed rows. See
+            // `postgres_default_keyspace_replication_factor_for_cluster`.
+            let configured_seeds = parse_seed_list(&config_val(
+                "FERROSA_SEED",
+                &file_config,
+                "internode",
+                "seed",
+                "",
+            ))
+            .len();
+            let cluster_state = shared_state.core.mode_controller.clone();
+            runtimes.background.spawn(async move {
+                let needed_rf = || {
+                    postgres_default_keyspace_replication_factor_for_cluster(
+                        configured_seeds,
+                        cluster_state.expected_cluster_size(),
+                        cluster_state.committed_cluster_size(),
+                    )
+                };
+                match ensure_postgres_default_keyspace(&schema, &ddl_path, &needed_rf).await {
+                    Ok(_) => {}
+                    Err(error) => tracing::error!(
+                        %error,
+                        keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                        "could not create the PostgreSQL default keyspace; \
+                         PostgreSQL DDL/DML will fail until it exists"
+                    ),
+                }
+                // An already-under-replicated `public` cannot be repaired in place
+                // (there is no `ALTER KEYSPACE`): the only fix is to re-create the
+                // keyspace while the cluster runs. So this is a GUARD, not a
+                // retry. Re-verify on a bounded schedule and emit ONE actionable
+                // ERROR per distinct condition — never a per-tick flood, never a
+                // latch, so re-creating the keyspace clears it on the next sweep.
+                // A genuine standalone node is silent: its local-only scan IS
+                // complete. The schedule (30 s x 60 = 30 min) spans formation,
+                // which is a minute or two in practice.
+                let mut last_reported: Option<(usize, usize)> = None;
+                for _ in 0..60u32 {
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    let required = needed_rf();
+                    let undersized = postgres_default_keyspace_is_undersized(&schema, required);
+                    let (warn_now, next_reported) =
+                        undersized_guard_sweep(undersized, required, last_reported);
+                    last_reported = next_reported;
+                    if let (true, Some(actual)) = (warn_now, undersized) {
+                        tracing::error!(
+                            keyspace = POSTGRES_DEFAULT_KEYSPACE,
+                            actual_replication_factor = actual,
+                            required_replication_factor = required,
+                            "the PostgreSQL default keyspace is replicated to FEWER nodes than \
+                             this node's cluster. PostgreSQL answers every SELECT from LOCAL \
+                             storage only, so scans and keyed reads served by a non-owner node \
+                             SILENTLY return fewer rows than were committed. Re-create keyspace \
+                             `public` while the cluster is running to repair it (there is no \
+                             ALTER KEYSPACE); this warning clears once it is re-created."
+                        );
+                    }
+                }
+            });
+        }
         let pg_bind = resolve_postgres_bind(&file_config);
         let pg_tls_config = &listener_tls_inputs.postgres;
         let pg_tls = match ferrosa_postgres::PgTls::from_pem(
@@ -3154,6 +3674,21 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         // PostgreSQL transaction on a real cluster.
         let accord_core = shared_state.core.clone();
         let query_ctx = std::sync::Arc::new(ferrosa_postgres::QueryContext {
+            // A `SELECT` must consult the ring, not only this node's local
+            // store: at a replication factor below the node count the local scan
+            // returns a fraction of the committed rows, and an unreachable owner
+            // must make the read FAIL LOUD rather than look like a small table.
+            // A factory, like the committer, because this listener is bound
+            // before the node has formed a cluster.
+            cluster_read: {
+                let write_path = shared_state.write_path.clone();
+                ferrosa_postgres::ClusterRead::live(move || {
+                    Some(std::sync::Arc::new(ferrosa_postgres::ClusterRangeRead::new(
+                        write_path.clone(),
+                    ))
+                        as std::sync::Arc<dyn ferrosa_postgres::RangeRead>)
+                })
+            },
             engine: storage.clone(),
             schema: schema.clone(),
             default_schema: "public".into(),
@@ -3570,6 +4105,277 @@ mod tests {
     }
 
     const SEGMENT_32_MIB: u64 = 32 * 1024 * 1024;
+
+    #[test]
+    fn postgres_default_keyspace_replicates_across_the_configured_cluster() {
+        // The PostgreSQL-wire front end answers a query from THIS node's local
+        // `TableStore` and never fans a range read across the ring, so a scan is
+        // complete only when the backing keyspace is replicated to every node it
+        // is configured to cluster with. Created at RF=1, each partition lands on
+        // a single owner and a keyed `SELECT ... WHERE id = $1` on any other node
+        // scans past it, returning zero rows — the `query returned an unexpected
+        // number of rows` data-loss seen by the strict-serializability workload.
+        assert_eq!(
+            postgres_default_keyspace_replication_factor(2),
+            3,
+            "a node seeding two peers must replicate its default keyspace across all three"
+        );
+        assert_eq!(
+            postgres_default_keyspace_replication_factor(1),
+            2,
+            "a two-node pair must replicate to both nodes"
+        );
+        assert_eq!(
+            postgres_default_keyspace_replication_factor(0),
+            1,
+            "a standalone node (no seeds) replicates to itself alone"
+        );
+    }
+
+    #[test]
+    fn postgres_default_keyspace_boot_action_creates_on_an_applicable_ddl_path() {
+        use ferrosa_cluster::pair::ddl::DdlOperation;
+        // Direct (standalone), Pair and Cluster all complete a keyspace creation.
+        for kind in ["direct", "pair", "cluster"] {
+            let action = default_keyspace_boot_action(kind, 3)
+                .unwrap_or_else(|| panic!("{kind} must be able to create the keyspace"));
+            match action {
+                DdlOperation::CreateKeyspace(ks) => {
+                    assert_eq!(
+                        ks.name, POSTGRES_DEFAULT_KEYSPACE,
+                        "{kind}: must create the PostgreSQL default keyspace, not another"
+                    );
+                    assert_eq!(
+                        ks.replication
+                            .options
+                            .get("replication_factor")
+                            .map(String::as_str),
+                        Some("3"),
+                        "{kind}: the created keyspace must carry the caller's replication \
+                         factor so every node holds every partition, never a hardcoded \
+                         single-node one"
+                    );
+                }
+                _ => panic!("{kind}: expected a CreateKeyspace operation"),
+            }
+        }
+    }
+
+    /// A schema carrying ONLY the PostgreSQL default keyspace at `replication_factor`
+    /// — the fixture for the boot-time completeness guard.
+    fn postgres_default_keyspace_schema_at(replication_factor: usize) -> ferrosa_schema::Schema {
+        let schema = ferrosa_schema::Schema::new(test_schema_config()).unwrap();
+        schema
+            .create_keyspace_internal(ferrosa_schema::KeyspaceMetadata {
+                name: POSTGRES_DEFAULT_KEYSPACE.into(),
+                replication: ferrosa_schema::ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: [("replication_factor".into(), replication_factor.to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+                durable_writes: true,
+            })
+            .unwrap();
+        schema
+    }
+
+    /// The LIVE defect, pinned at the boot decision.
+    ///
+    /// The `maas-loadtest` nodes carry NO `[internode] seed` at all — they are
+    /// formed by the controller — yet they commit a THREE-node cluster. Sizing the
+    /// PostgreSQL default keyspace from the seed list alone therefore produced
+    /// `RF=1`: one owner per partition, and since the PostgreSQL front end answers
+    /// every `SELECT` from LOCAL storage, a 3-node scan returned a THIRD of the
+    /// committed rows. That is why `INSERT ... VALUES (1,'x'),(2,'y')` reported
+    /// `INSERT 0 2` while the coordinator saw one row: the write was complete and
+    /// the read was not.
+    ///
+    /// This asserts the FACTOR the boot path derives, not a row count — a count
+    /// assertion is satisfied by the defect.
+    #[test]
+    fn postgres_default_keyspace_covers_a_cluster_formed_without_configured_seeds() {
+        // The live cluster's inputs, verbatim.
+        let configured_seeds = parse_seed_list(&config_val(
+            "FERROSA_SEED",
+            &toml::Value::Table(Default::default()),
+            "internode",
+            "seed",
+            "",
+        ))
+        .len();
+        assert_eq!(
+            configured_seeds, 0,
+            "a controller-formed cluster configures no [internode] seed"
+        );
+        let expected_cluster_size = 0; // no FERROSA_EXPECTED_CLUSTER_SIZE either
+        let committed_cluster_size = 3; // node1 + node2 + node3
+
+        assert_eq!(
+            postgres_default_keyspace_replication_factor_for_cluster(
+                configured_seeds,
+                expected_cluster_size,
+                committed_cluster_size,
+            ),
+            3,
+            "the PostgreSQL default keyspace must cover the cluster the node ACTUALLY \
+             committed to, or its local-only scan silently returns fewer rows than \
+             were committed"
+        );
+
+        // NEGATIVE CONTROL — the seed-only rule the defect ran on. It must NOT
+        // already satisfy the invariant, or the assertion above would be vacuous.
+        let seed_only = postgres_default_keyspace_replication_factor(configured_seeds);
+        assert_eq!(
+            seed_only, 1,
+            "the seed-only rule produced RF=1 on the live 3-node cluster"
+        );
+        assert_ne!(
+            seed_only, 3,
+            "control: if the seed-only rule already covered the cluster there would be \
+             no defect to fix"
+        );
+
+        // And the boot action must carry the corrected factor, not a hardcoded 1.
+        match default_keyspace_boot_action(
+            "cluster",
+            postgres_default_keyspace_replication_factor_for_cluster(
+                configured_seeds,
+                expected_cluster_size,
+                committed_cluster_size,
+            ),
+        ) {
+            Some(ferrosa_cluster::pair::ddl::DdlOperation::CreateKeyspace(ks)) => assert_eq!(
+                ks.replication
+                    .options
+                    .get("replication_factor")
+                    .map(String::as_str),
+                Some("3"),
+                "the created keyspace must be replicated to all three nodes"
+            ),
+            other => panic!("expected a CreateKeyspace operation, got {other:?}"),
+        }
+
+        // Larger declarations never shrink the factor.
+        assert_eq!(
+            postgres_default_keyspace_replication_factor_for_cluster(0, 5, 3),
+            5
+        );
+        // A genuine standalone node (nothing committed, nothing declared, no seeds)
+        // keeps RF=1 — the fix must not inflate a single node into a cluster.
+        assert_eq!(
+            postgres_default_keyspace_replication_factor_for_cluster(0, 0, 0),
+            1
+        );
+    }
+
+    /// The guard that makes an ALREADY under-replicated `public` loud instead of
+    /// silent. The live `public` carries RF=1 on a 3-node cluster; it cannot be
+    /// repaired in place (there is no `ALTER KEYSPACE`), so the only correct
+    /// behaviour is to say so.
+    #[test]
+    fn postgres_default_keyspace_undersized_is_reported_only_when_it_is() {
+        let at_rf_one = postgres_default_keyspace_schema_at(1);
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&at_rf_one, 3),
+            Some(1),
+            "a 3-node cluster reading `public` at RF=1 must be reported as under-sized"
+        );
+
+        // NEGATIVE CONTROL: correctly sized is never reported.
+        let at_rf_three = postgres_default_keyspace_schema_at(3);
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&at_rf_three, 3),
+            None,
+            "control: a keyspace already covering the cluster must not be reported"
+        );
+
+        // NEGATIVE CONTROL: a genuine standalone node (needs 1) is never reported,
+        // even at RF=1 — the guard must not cry wolf where the scan IS complete.
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&at_rf_one, 1),
+            None,
+            "control: RF=1 is complete for a standalone node"
+        );
+
+        // NEGATIVE CONTROL: an absent keyspace has nothing to report (the ensure
+        // creates it instead).
+        let empty = ferrosa_schema::Schema::new(test_schema_config()).unwrap();
+        assert_eq!(
+            postgres_default_keyspace_is_undersized(&empty, 3),
+            None,
+            "control: no keyspace yet means nothing is under-sized"
+        );
+    }
+
+    /// The guard is a GUARD: it warns once per distinct condition, it re-verifies
+    /// rather than latching, and it stays silent where the local scan is actually
+    /// complete. Each of those is a separate way the naive shape goes wrong — a
+    /// per-tick flood, a latch that never re-arms after a repair, or a cry-wolf on
+    /// a standalone node — so each gets a control.
+    #[test]
+    fn undersized_guard_reports_once_per_distinct_condition_and_clears_on_heal() {
+        // A fresh under-sized 3-node condition warns, and remembers what it said.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 3, None),
+            (true, Some((1, 3))),
+            "an RF=1 `public` on a 3-node cluster is the condition the guard exists for"
+        );
+        // The SAME condition on the next sweep is NOT re-warned — no per-tick flood.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 3, Some((1, 3))),
+            (false, Some((1, 3))),
+            "the identical condition must not be re-reported on every sweep"
+        );
+        // A DIFFERENT condition (the cluster grew to 5) is distinct, so it warns.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 5, Some((1, 3))),
+            (true, Some((1, 5))),
+            "a new (actual, required) pair is a new condition and must be reported"
+        );
+
+        // HEAL: a complete keyspace produces no warning AND clears the memory, so
+        // the guard is not latched — a later recurrence warns again.
+        assert_eq!(
+            undersized_guard_sweep(None, 3, Some((1, 3))),
+            (false, None),
+            "a healed keyspace must clear the reported condition (do not latch)"
+        );
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 3, None),
+            (true, Some((1, 3))),
+            "after the memory is cleared, a recurrence of the condition warns again"
+        );
+
+        // NO CRY WOLF: a genuine standalone node (nothing declared, nothing
+        // committed, no seeds ⇒ required 1) never warns, even though its `public`
+        // reports RF=1 — its local-only scan IS complete.
+        assert_eq!(
+            undersized_guard_sweep(None, 1, None),
+            (false, None),
+            "control: nothing to guard while required < 2"
+        );
+        // Defensive: even handed a spurious Some for required == 1, the guard is
+        // silent — `required < 2` is complete by definition.
+        assert_eq!(
+            undersized_guard_sweep(Some(1), 1, None),
+            (false, None),
+            "control: required < 2 is never an under-sized condition"
+        );
+    }
+
+    #[test]
+    fn postgres_default_keyspace_boot_action_waits_while_the_ddl_path_cannot_create() {
+        // Forming buffers the operation and Unavailable rejects it. Acting on
+        // either would report a keyspace the cluster never learns about — the
+        // divergence seen as `Accord quorum unavailable` on PostgreSQL writes.
+        for kind in ["forming", "unavailable"] {
+            assert!(
+                default_keyspace_boot_action(kind, 3).is_none(),
+                "{kind} must wait, not attempt a creation the path cannot complete"
+            );
+        }
+    }
 
     fn jsonb_toml(body: &str) -> toml::Value {
         format!("[jsonb]\n{body}\n").parse().unwrap()

@@ -272,7 +272,7 @@ use crate::ring::TokenRing;
 use crate::state::RaftClusterState;
 use crate::streaming::{
     sender::{SstableSendRequest, StreamSender},
-    StreamConfig, StreamedMutation,
+    StreamConfig,
 };
 use crate::write_path::WritePath;
 
@@ -944,6 +944,12 @@ impl ModeController {
     /// for mesh formation. Does NOT initialize Raft — that happens in
     /// `transition_to_cluster` after all peers are connected.
     pub(super) fn transition_to_forming(&self, peers: Vec<(Uuid, SocketAddr)>) {
+        // Boot-state gate: must precede `try_transition_mode(Forming)` so a
+        // deferred transition never leaves the node labelled Forming with no
+        // Raft behind it. See [`ModeController::defer_consensus_until_boot_state`].
+        if self.defer_transition_if_boot_loading(&peers) {
+            return;
+        }
         if self.peer_manager.load().is_none() {
             tracing::error!("cannot transition to forming: peer_manager not set");
             return;
@@ -996,6 +1002,14 @@ impl ModeController {
         // old group beside the pair.
         if let Some(reason) = self.raft_start_refusal() {
             tracing::error!(%reason, "refusing to start Raft");
+            return;
+        }
+        // Boot-state gate: the internode listener binds before the boot-time
+        // object-store work, so a peer can reconnect while that work is still
+        // running. Do not start Raft (elections) until the node holds the state
+        // it is required to hold; the request is re-driven once boot completes.
+        // See [`ModeController::defer_consensus_until_boot_state`].
+        if self.defer_transition_if_boot_loading(&peers) {
             return;
         }
         // `peers` are internode addresses as tracked in `connected_peers`: the
@@ -1792,6 +1806,10 @@ impl ModeController {
             self.registry
                 .register(MsgType::AccordApplyV2, accord_handler.clone());
             self.registry
+                .register(MsgType::AccordApplyV2Capnp, accord_handler.clone());
+            self.registry
+                .register(MsgType::AccordApplyV2Region, accord_handler.clone());
+            self.registry
                 .register(MsgType::AccordRecover, accord_handler);
         }
 
@@ -1928,22 +1946,49 @@ impl ModeController {
                     let prune_ticks = (60_000u64 / urgent_flush_interval_millis).max(1);
                     if ticks.is_multiple_of(prune_ticks) {
                         // Prune applied Accord transactions to prevent unbounded
-                        // memory growth in txn_states and committed_txns.
+                        // memory growth in txn_states and committed_txns. The SAME
+                        // call drops the apply engine's idempotency records at or
+                        // below the decided-transaction retention floor it just
+                        // advanced (`prune_applied_idempotency`), so that set is
+                        // bounded by the replay window, not the lifetime
+                        // transaction count — it used to hold an owned partition
+                        // key per applied mutation forever.
                         // On the blocking pool: the mutex may be held through a
                         // protocol-log fsync (see `on_state_machine`).
                         let counts =
                             crate::accord::handlers::on_state_machine(&accord_state, |sm| {
-                                (sm.prune_applied(), sm.txn_count())
+                                let pruned = sm.prune_applied();
+                                (pruned, sm.txn_count(), sm.applied_idempotency_footprint())
                             })
                             .await;
-                        let Some((pruned, accord_txns)) = counts else {
+                        let Some((pruned, accord_txns, applied_idem_bytes)) = counts else {
                             continue;
                         };
                         if pruned > 0 {
                             tracing::info!(
                                 pruned,
+                                applied_idem_bytes,
                                 "maintenance: pruned applied Accord transactions"
                             );
+                        }
+
+                        // Reclaim parked write-sets whose dependency never arrived.
+                        // The graph bounds its own bookkeeping; this bounds the parked
+                        // PAYLOADS. Reported at ERROR — a fact, never a silent drop.
+                        let reclaimed =
+                            crate::accord::handlers::on_state_machine(&accord_state, move |sm| {
+                                sm.reclaim_stale_parked_applies_default()
+                            })
+                            .await;
+                        if let Some(reclaimed) = reclaimed {
+                            if !reclaimed.is_empty() {
+                                tracing::error!(
+                                    count = reclaimed.len(),
+                                    "maintenance: reclaimed unresolvable parked Accord write-sets \
+                                     (dependency never arrived; NOT applied — the coordinator \
+                                     abandons the txn and the client retries)"
+                                );
+                            }
                         }
 
                         // Log table-level memory stats.
@@ -1952,6 +1997,7 @@ impl ModeController {
                             table_count,
                             closed_buf_bytes,
                             accord_txns,
+                            applied_idem_bytes,
                             "maintenance: periodic memory check"
                         );
                     }
@@ -2773,7 +2819,6 @@ impl ModeController {
                                 let stream_plan = super::bootstrap::bootstrap_stream::plan_table_stream(
                                     super::bootstrap::bootstrap_stream::TableStreamPlanInput {
                                         sstable_dir_count: sstable_dirs.len(),
-                                        row_fallback_limit: super::bootstrap::bootstrap_stream::BOUNDED_ROW_FALLBACK_LIMIT,
                                     },
                                 );
                                 if let super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } = stream_plan {
@@ -2844,54 +2889,39 @@ impl ModeController {
                                     continue;
                                 }
 
-                                let row_fallback_limit = match stream_plan {
-                                    super::bootstrap::bootstrap_stream::TableStreamPlan::BoundedRows { limit } => limit,
+                                match stream_plan {
+                                    super::bootstrap::bootstrap_stream::TableStreamPlan::StreamRows => {}
                                     super::bootstrap::bootstrap_stream::TableStreamPlan::RetryRequired => {
                                         tracing::warn!(
                                             ks,
                                             tbl,
-                                            "bootstrap: table stream requires retry/repair; skipping row materialization"
+                                            "bootstrap: table stream requires retry/repair; skipping row streaming"
                                         );
                                         continue;
                                     }
                                     super::bootstrap::bootstrap_stream::TableStreamPlan::SstableBulk { .. } => unreachable!(
-                                        "SSTable-backed bootstrap tables return above and never row-materialize"
+                                        "SSTable-backed bootstrap tables return above and never row-stream"
                                     ),
-                                };
-                                let partitions = match storage_for_bootstrap.read_range(
+                                }
+
+                                // Stream EVERY partition of the table, one at a
+                                // time, into the per-owner batches. There is no row
+                                // cap: the capped read this replaces silently dropped
+                                // the tail of a table larger than the limit.
+                                let by_node = match super::bootstrap::bootstrap_stream::stream_row_fallback_into(
+                                    &storage_for_bootstrap,
                                     &table_id,
-                                    None,
-                                    None,
-                                    row_fallback_limit,
+                                    ks,
+                                    tbl,
+                                    local_node_id,
+                                    |token| ring.primary_owner(token).unwrap_or(local_node_id),
                                 ) {
-                                    Ok(p) => p,
+                                    Ok(by_node) => by_node,
                                     Err(e) => {
-                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to read small in-memory table");
+                                        tracing::warn!(%e, ks, tbl, "bootstrap: failed to stream in-memory table");
                                         continue;
                                     }
                                 };
-
-                                let mut by_node: std::collections::HashMap<u64, Vec<StreamedMutation>> =
-                                    std::collections::HashMap::new();
-                                for partition in &partitions {
-                                    let token = partition.key.token.0;
-                                    let owner = ring.primary_owner(token).unwrap_or(local_node_id);
-
-                                    if owner != local_node_id {
-                                        let mutation = match StreamedMutation::from_partition(ks, tbl, partition) {
-                                            Ok(mutation) => mutation,
-                                            Err(e) => {
-                                                tracing::error!(
-                                                    %e,
-                                                    partition_key = ?partition.key,
-                                                    "bootstrap: failed to serialize partition, skipping partition (data loss avoided)"
-                                                );
-                                                continue;
-                                            }
-                                        };
-                                        by_node.entry(owner).or_default().push(mutation);
-                                    }
-                                }
 
                                 for (target_node_id, mutations) in by_node {
                                     let target_uuid = node_map.get(&target_node_id).copied();

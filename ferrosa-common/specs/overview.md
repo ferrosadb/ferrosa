@@ -45,6 +45,7 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 | `cell` (`src/cell.rs`) | 151 | `CellValue` live/expiring/tombstone + sentinels |
 | `data_type` (`src/data_type.rs`) | 89 | `DataType` scalar descriptor (exhaustive) |
 | `token` (`src/token.rs`) | 79 | `Token` newtype + `from_key` |
+| `timeuuid` (`src/timeuuid.rs`) | 187 | v1 TimeUUID byte layout (`v1_timeuuid`) for the synthetic `_sys_ck_` key of a PK-less Postgres table, plus `SYNTHETIC_KEY_COLUMN` / `is_reserved_column_name` guarding the reserved `_sys_` prefix. No clock of its own: callers pass `(time, clock_seq, node)` in, so uniqueness stays the caller's guarantee |
 | `task_pool` (`src/task_pool.rs`) | 71 | `TaskPool` runtime-aware spawn helper |
 | `test_generators` (`src/test_generators.rs`) | ~140 | proptest strategies (feature `test-generators`) for cells/keys and shrink-friendly generated DDL/snapshot table identities, drop markers, and index declarations |
 | `lib` (`src/lib.rs`) | 39 | module declarations + headline re-exports |

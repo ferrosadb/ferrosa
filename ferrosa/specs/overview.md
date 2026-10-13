@@ -1,7 +1,7 @@
 ---
 crate: ferrosa
 status: implemented
-last_updated: 2026-08-07
+last_updated: 2026-10-11
 executive_summary: >
   The top-level binary and composition root. It constructs one StorageEngine,
   one Schema, one ModeController, one PeerManager, and one CdcBus, then wires
@@ -69,6 +69,15 @@ replication uniform.
    the self-heal cluster view (which reads live membership) and before
    `SessionCore` (so LWT routes over real peers). Re-ordering silently breaks
    recovery (e.g. "table not registered" during Raft replay).
+   **Reachability is decoupled from object-store health (2026-10-10).** The
+   internode listener binds *before* the boot-time object-store work (CAS probe,
+   pending-upload replay, cold-start S3 bootstrap) so a restarting node is on the
+   internode lane in bounded time. Correctness is preserved by the `ModeController`
+   **boot-state consensus gate**: `transition_to_cluster` refuses to start Raft
+   until `mark_boot_state_loaded` opens the gate, and re-drives the deferred
+   transition afterwards. So *consensus* still starts only after the object-store
+   work completes — the exact ordering the old "block the listener" approach
+   enforced — while *the node being reachable* no longer depends on it.
 2. **Single CdcBus, attached pre-listener.** The change bus is attached to the
    commit log in step 4, before any front-end binds, so no early write is missed
    by `SUBSCRIBE`/Flight consumers.

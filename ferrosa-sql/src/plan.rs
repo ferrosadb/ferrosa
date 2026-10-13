@@ -13,12 +13,13 @@ use std::sync::Arc;
 use std::cmp::Ordering;
 
 use crate::ast::{
-    AggArg, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef, Term,
+    AggArg, CastTarget, ColumnRef, Expr, Operand, Projection, SelectItem, SelectStmt, TableRef,
+    Term,
 };
 use crate::catalog::Catalog;
 use crate::exec::{
     dedup, fallible, hash_aggregate, hash_join, limit_offset, seq_scan, sort, try_project, AggFunc,
-    CmpOp, SortKey, TryRowStream,
+    AggSpec, AggregateError, CmpOp, SortKey, TryRowStream,
 };
 use crate::provider::TableProvider;
 use crate::spill::{SpillCtx, SpillError};
@@ -96,6 +97,18 @@ pub enum ExecError {
     /// purpose: a lost run would silently shorten the result, so the query
     /// fails rather than returning rows it cannot vouch for.
     Spill(SpillError),
+    /// A comparison term carries a `::` cast the pure engine cannot resolve. A
+    /// cast target's meaning (a relation name to a `pg_class.oid`) lives in the
+    /// PostgreSQL front end, which rewrites every cast before planning; reaching
+    /// this means a caller drove `execute`/`execute_streaming` directly with a
+    /// cast that never passed through the front end. Refuse loudly rather than
+    /// compare an unresolved cast.
+    UnresolvedCast(CastTarget),
+    /// An exact aggregate total does not fit the type PostgreSQL gives it
+    /// (`sum(int2|int4)` is int8, so a total outside int8 is `bigint out of
+    /// range`, 22003). Never wrapped: a silently wrong total is the one
+    /// unacceptable outcome (invariant I-EXACT).
+    AggregateOutOfRange(String),
 }
 
 impl fmt::Display for ExecError {
@@ -124,17 +137,27 @@ impl fmt::Display for ExecError {
                 write!(f, "there is no parameter ${n}")
             }
             ExecError::Spill(e) => write!(f, "{e}"),
+            ExecError::UnresolvedCast(ty) => write!(
+                f,
+                "a `::{}` cast was not resolved before planning (the PostgreSQL front end \
+                 resolves casts; this statement did not pass through it)",
+                ty.name()
+            ),
+            ExecError::AggregateOutOfRange(m) => write!(f, "{m}"),
         }
     }
 }
 
 /// Resolve a comparison [`Term`] to a concrete [`Value`]: a literal yields
 /// itself; a `$N` parameter looks up `params[N-1]`, failing loud with
-/// [`ExecError::MissingParameter`] when the index is out of range.
+/// [`ExecError::MissingParameter`] when the index is out of range. A cast has no
+/// value here — its target's meaning lives in the PostgreSQL front end, which
+/// rewrites casts away before planning — so reaching it is [`ExecError::UnresolvedCast`].
 fn resolve_term<'a>(term: &'a Term, params: &'a [Value]) -> Result<&'a Value, ExecError> {
     match term {
         Term::Literal(v) => Ok(v),
         Term::Param(n) => params.get(n - 1).ok_or(ExecError::MissingParameter(*n)),
+        Term::Cast { ty, .. } => Err(ExecError::UnresolvedCast(*ty)),
     }
 }
 
@@ -581,9 +604,23 @@ fn infer_in_expr(
 ) -> Result<(), ExecError> {
     match expr {
         Expr::Compare { left, value, .. } => {
-            if let Term::Param(n) = value {
-                let ty = operand_type(left, scope, combined_schema)?;
-                record(n - 1, ty);
+            match value {
+                Term::Param(n) => {
+                    let ty = operand_type(left, scope, combined_schema)?;
+                    record(n - 1, ty);
+                }
+                // `$N::regclass` — the parameter is a relation NAME (text) on the
+                // wire; that is regclass's input type. A cast over anything else
+                // (a literal) carries no parameter to record.
+                Term::Cast {
+                    value,
+                    ty: CastTarget::Regclass,
+                } => {
+                    if let Term::Param(n) = &**value {
+                        record(*n - 1, ColumnType::Text);
+                    }
+                }
+                Term::Literal(_) => {}
             }
             Ok(())
         }
@@ -634,13 +671,18 @@ fn simple_projection(
             let mut indices = Vec::with_capacity(items.len());
             for item in items {
                 match item {
-                    SelectItem::Column(cr) => {
+                    SelectItem::Column { col: cr, .. } => {
                         let gi = resolve_column(scope, cr)?;
                         indices.push(gi);
                         columns.push(combined_schema.columns[gi].clone());
                     }
                     // Unreachable: an aggregate item forces aggregate mode.
                     SelectItem::Aggregate { .. } => unreachable!("aggregate in simple plan"),
+                }
+                // An output alias renames only the RESULT column: the cell read is
+                // unchanged, so it is applied after the source column is resolved.
+                if let Some(alias) = item.alias() {
+                    columns.last_mut().expect("just pushed").name = alias.to_string();
                 }
             }
             Ok((columns, indices))
@@ -735,7 +777,7 @@ fn plan_aggregate(
     // SELECT list: plain columns must be grouped; aggregates feed the union.
     for item in items {
         match item {
-            SelectItem::Column(cr) => {
+            SelectItem::Column { col: cr, .. } => {
                 let gi = resolve_column(scope, cr)?;
                 let pos = group_cols
                     .iter()
@@ -744,12 +786,17 @@ fn plan_aggregate(
                 slots.push(Slot::Group(pos));
                 out_columns.push(combined_schema.columns[gi].clone());
             }
-            SelectItem::Aggregate { func, arg } => {
+            SelectItem::Aggregate { func, arg, .. } => {
                 let arg_col = resolve_agg_arg(arg, scope)?;
                 let agg_index = intern_agg(*func, arg_col, &mut agg_defs, &mut agg_keys);
                 slots.push(Slot::Agg(agg_index));
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
             }
+        }
+        // An output alias renames the RESULT column only; the aggregate or group
+        // slot it projects is unchanged.
+        if let Some(alias) = item.alias() {
+            out_columns.last_mut().expect("just pushed").name = alias.to_string();
         }
     }
 
@@ -786,8 +833,24 @@ fn plan_aggregate(
     // Compute the internal layout `[group values..., union agg values...]`.
     // Spilling, sort-based: one accumulator set is resident whatever the GROUP BY
     // cardinality, and first-seen group order is preserved.
+    //
+    // Each aggregate carries its argument's DECLARED type, so the accumulator
+    // returns a `Value` whose type is exactly the one `aggregate_column` derived
+    // for the output (I-OID): `sum(bigint)` is a numeric, `sum(int)` an int8.
+    let agg_specs: Vec<AggSpec> = agg_defs
+        .iter()
+        .map(|(func, arg)| match arg {
+            Some(c) => AggSpec::typed(*func, Some(*c), combined_schema.columns[*c].ty),
+            None => AggSpec::new(*func, None),
+        })
+        .collect();
     let internal_rows =
-        hash_aggregate(rows, &group_cols, &agg_defs, ctx).map_err(ExecError::Spill)?;
+        hash_aggregate(rows, &group_cols, &agg_specs, ctx).map_err(|e| match e {
+            // A spill failure is an operator failure (58030); an exact total that
+            // does not fit its derived type is a range failure (22003).
+            AggregateError::Spill(s) => ExecError::Spill(s),
+            AggregateError::OutOfRange(m) => ExecError::AggregateOutOfRange(m),
+        })?;
 
     // HAVING filter over the internal layout (Kleene; keep Some(true)).
     let group_len = group_cols.len();
@@ -863,17 +926,22 @@ fn aggregate_output_columns(
     let mut out_columns = Vec::with_capacity(items.len());
     for item in items {
         match item {
-            SelectItem::Column(cr) => {
+            SelectItem::Column { col: cr, .. } => {
                 let gi = resolve_column(scope, cr)?;
                 if !group_cols.contains(&gi) {
                     return Err(ExecError::NotGrouped(cr.qualified_name()));
                 }
                 out_columns.push(combined_schema.columns[gi].clone());
             }
-            SelectItem::Aggregate { func, arg } => {
+            SelectItem::Aggregate { func, arg, .. } => {
                 let arg_col = resolve_agg_arg(arg, scope)?;
                 out_columns.push(aggregate_column(*func, arg_col, combined_schema));
             }
+        }
+        // `describe` must advertise the same names `execute` produces, so the alias
+        // is applied here identically.
+        if let Some(alias) = item.alias() {
+            out_columns.last_mut().expect("just pushed").name = alias.to_string();
         }
     }
     Ok(out_columns)
@@ -909,18 +977,61 @@ fn intern_agg(
     agg_defs.len() - 1
 }
 
-/// The output column for an aggregate: name `count`/`sum`/`min`/`max`/`avg`.
-/// COUNT is always `Int`; AVG is always `Float`; SUM and MIN/MAX take the
-/// argument column's type.
+/// The output column for an aggregate, typed as **PostgreSQL** types it.
+///
+/// COUNT is always `BigInt` (PostgreSQL's `count()` is `int8` — its result can
+/// exceed `int4`, and a driver reading `i64` deserializes on the strength of the
+/// advertised OID). SUM and AVG follow PostgreSQL's result-type rules, NOT the
+/// argument's engine type; MIN/MAX take the argument's engine type:
+///
+/// * `sum(int2 | int4)` -> `int8`; `sum(int8 | numeric)` -> `numeric`;
+///   `sum(float4 | float8)` -> `float8`;
+/// * `avg(int2 | int4 | int8 | numeric)` -> `numeric`;
+///   `avg(float4 | float8)` -> `float8`.
+///
+/// The engine carries one integer value type (`Value::Int`, an `i64`) for both
+/// `int4` and `int8` columns and one float value type (`Value::Float`, an `f64`)
+/// for `float4`/`float8`; the PG wire layer picks the byte width from THIS
+/// derived column type, so `sum(int4) -> int8` is encoded (and read) as an
+/// 8-byte int8 by construction. A `numeric` result has no numeric-valued engine
+/// result yet and no binary codec, so the front end refuses to encode it
+/// (loudly, `0A000`) rather than mislabel `int`/`float` bytes under OID 1700 —
+/// see `ferrosa_postgres::query::encode_value`.
 fn aggregate_column(func: AggFunc, arg_col: Option<usize>, schema: &RelSchema) -> Column {
     let (name, ty) = match func {
-        AggFunc::Count => ("count", ColumnType::Int),
-        AggFunc::Sum => ("sum", arg_ty(arg_col, schema)),
-        AggFunc::Avg => ("avg", ColumnType::Float),
+        AggFunc::Count => ("count", ColumnType::BigInt),
+        AggFunc::Sum => ("sum", sum_result_type(arg_ty(arg_col, schema))),
+        AggFunc::Avg => ("avg", avg_result_type(arg_ty(arg_col, schema))),
         AggFunc::Min => ("min", arg_ty(arg_col, schema)),
         AggFunc::Max => ("max", arg_ty(arg_col, schema)),
     };
     Column::new(name, ty)
+}
+
+/// PostgreSQL's result type for `sum(arg)` (see [`aggregate_column`]).
+fn sum_result_type(arg: ColumnType) -> ColumnType {
+    match arg {
+        // A sum of int4 can exceed int4, so PostgreSQL widens to int8.
+        ColumnType::Int => ColumnType::BigInt,
+        // A sum of int8 can exceed int8, so PostgreSQL widens to numeric.
+        ColumnType::BigInt | ColumnType::Numeric => ColumnType::Numeric,
+        // The engine has one float type; sum(float4|float8) is float8.
+        ColumnType::Float => ColumnType::Float,
+        // No PostgreSQL `sum` is defined for the remaining types; keep the
+        // argument's type rather than invent one here.
+        other => other,
+    }
+}
+
+/// PostgreSQL's result type for `avg(arg)` (see [`aggregate_column`]).
+fn avg_result_type(arg: ColumnType) -> ColumnType {
+    match arg {
+        // Every integer/numeric average is exact in PostgreSQL: numeric.
+        ColumnType::Int | ColumnType::BigInt | ColumnType::Numeric => ColumnType::Numeric,
+        // avg(float4|float8) -> float8 (the engine's one float type).
+        ColumnType::Float => ColumnType::Float,
+        other => other,
+    }
 }
 
 fn arg_ty(arg_col: Option<usize>, schema: &RelSchema) -> ColumnType {
@@ -1125,6 +1236,7 @@ mod tests {
     use crate::parser::parse;
     use crate::provider::InMemoryTable;
     use crate::types::{Column, ColumnType, RelSchema, Row, Value};
+    use num_bigint::BigInt;
     use std::sync::Arc;
 
     fn catalog() -> MapCatalog {
@@ -1302,6 +1414,79 @@ mod tests {
         assert_eq!(described, executed);
     }
 
+    /// I7 (derivation path): the OUTPUT type of a computed/aggregate column is
+    /// DERIVED by `aggregate_column`, and that one derivation is what BOTH
+    /// `describe` (the `RowDescription` a client deserializes against) and
+    /// `execute` (the row bytes it deserializes) read. So the agreement check
+    /// belongs on the derivation, not on `count(*)` alone: a special-case fix for
+    /// `count` would leave every other derived type unchecked. Every type here is
+    /// PostgreSQL's RESULT type: COUNT is `int8` (a driver reading `i64` must
+    /// work, and a count can exceed `int4`); `sum(int4)` is `int8`;
+    /// `avg(int4)` is `numeric`; MIN/MAX take the argument's engine type.
+    /// Asserted on BOTH paths so they cannot drift.
+    #[test]
+    fn derived_aggregate_column_types_match_postgres_on_both_paths() {
+        let sql = "SELECT COUNT(*), SUM(amount), MIN(amount), MAX(amount), AVG(amount) FROM sales";
+        let want = [
+            ("count", ColumnType::BigInt),
+            ("sum", ColumnType::BigInt),
+            ("min", ColumnType::Int),
+            ("max", ColumnType::Int),
+            ("avg", ColumnType::Numeric),
+        ];
+        let described_all = describe(&parse(sql).unwrap(), &sales_catalog(), "public").unwrap();
+        let described: Vec<(&str, ColumnType)> = described_all
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty))
+            .collect();
+        assert_eq!(described, want, "describe (RowDescription) derivation");
+        let run = run_sales(sql);
+        let executed: Vec<(&str, ColumnType)> = run
+            .columns
+            .iter()
+            .map(|c| (c.name.as_str(), c.ty))
+            .collect();
+        assert_eq!(executed, want, "execute (row bytes) derivation");
+    }
+
+    #[test]
+    fn describe_reports_the_output_alias_names() {
+        // `AS` names the output column in BOTH the `describe` shape and the executed
+        // columns — the group column `r` and the aggregate `n`.
+        let stmt = parse("SELECT region AS r, COUNT(*) AS n FROM sales GROUP BY region").unwrap();
+        let described = describe(&stmt, &sales_catalog(), "public").unwrap();
+        assert_eq!(
+            described
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["r", "n"],
+            "describe must advertise the alias, not `region`/`count`"
+        );
+        let executed = execute(&stmt, &sales_catalog(), "public", &[])
+            .unwrap()
+            .columns;
+        assert_eq!(
+            described, executed,
+            "describe and execute must agree on the aliased names"
+        );
+    }
+
+    #[test]
+    fn describe_reports_a_plain_column_alias_and_keeps_its_type() {
+        // The simple (non-aggregate) projection path applies the alias too, and the
+        // alias renames the column WITHOUT changing its type.
+        let stmt = parse("SELECT name AS n FROM users").unwrap();
+        let described = describe(&stmt, &catalog(), "public").unwrap();
+        assert_eq!(described.len(), 1);
+        assert_eq!(described[0].name, "n");
+        assert_eq!(
+            described[0].ty,
+            ColumnType::Text,
+            "the alias keeps the source column's type"
+        );
+    }
+
     #[test]
     fn describe_fails_loud_on_unknown_table() {
         let stmt = parse("SELECT * FROM nope").unwrap();
@@ -1410,8 +1595,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("region", ColumnType::Text),
-                ("count", ColumnType::Int),
-                ("sum", ColumnType::Int),
+                ("count", ColumnType::BigInt),
+                ("sum", ColumnType::BigInt),
             ]
         );
         // east: count 2, sum 30; west: count 2, sum 5 (one NULL ignored).
@@ -1426,16 +1611,23 @@ mod tests {
     }
 
     #[test]
-    fn avg_ungrouped_gives_fractional_float() {
-        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 11.666...
+    fn avg_ungrouped_is_exact_numeric_not_float() {
+        // AVG over the int `amount` column: (10 + 5 + 20) / 3 = 35/3 =
+        // 11.6666666666666667. The derived column type is PostgreSQL's `numeric`
+        // (avg(int4) -> numeric), and the accumulator now produces the EXACT
+        // decimal at PostgreSQL's 16-digit scale — no float rounding, and the
+        // value's type matches the advertised column (I-EXACT, I-OID).
         let r = run_sales("SELECT AVG(amount) FROM sales");
         assert_eq!(r.columns.len(), 1);
         assert_eq!(r.columns[0].name, "avg");
-        assert_eq!(r.columns[0].ty, ColumnType::Float);
-        let Value::Float(of) = &r.rows[0].0[0] else {
-            panic!("expected float avg");
-        };
-        assert!((of.0 - 35.0 / 3.0).abs() < 1e-9);
+        assert_eq!(r.columns[0].ty, ColumnType::Numeric);
+        assert_eq!(
+            r.rows[0].0,
+            vec![Value::numeric(
+                BigInt::from(116_666_666_666_666_667i128),
+                16
+            )]
+        );
     }
 
     #[test]
@@ -1446,16 +1638,22 @@ mod tests {
                 .iter()
                 .map(|c| (c.name.as_str(), c.ty))
                 .collect::<Vec<_>>(),
-            [("region", ColumnType::Text), ("avg", ColumnType::Float)]
+            [("region", ColumnType::Text), ("avg", ColumnType::Numeric)]
         );
-        // east: (10+20)/2 = 15.0; west: 5/1 = 5.0 (NULL ignored).
+        // east: (10+20)/2 = 15; west: 5/1 = 5 (NULL ignored), exact numeric.
         assert_eq!(
             r.rows[0].0,
-            vec![Value::Text("east".into()), Value::float(15.0)]
+            vec![
+                Value::Text("east".into()),
+                Value::numeric(BigInt::from(15), 0)
+            ]
         );
         assert_eq!(
             r.rows[1].0,
-            vec![Value::Text("west".into()), Value::float(5.0)]
+            vec![
+                Value::Text("west".into()),
+                Value::numeric(BigInt::from(5), 0)
+            ]
         );
     }
 

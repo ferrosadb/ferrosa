@@ -21,7 +21,7 @@
 //! - [`super::snapshot_pusher::run_snapshot_pusher`] calls
 //!   [`ReplicationHealth::observe_sweep`] on every leader sweep and
 //!   [`ReplicationHealth::clear`] when the node is not the leader.
-//! - [`super::network::FerrosRaftNetwork::install_snapshot`] calls
+//! - [`super::network::FerrosRaftNetwork`]'s `install_snapshot` calls
 //!   [`ReplicationHealth::record_snapshot_send`] for every chunk.
 
 use std::collections::BTreeMap;

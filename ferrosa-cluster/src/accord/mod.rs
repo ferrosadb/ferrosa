@@ -3,10 +3,13 @@
 //! This module contains the deterministic test harness ([`TestCluster`]) for
 //! protocol-level testing of the Accord (EPaxos-family) consensus protocol.
 
+#[cfg(test)]
+mod abandon_durability;
 pub mod apply;
 pub mod chaos_minority_kill;
 pub mod clock;
 pub mod clock_validation;
+pub mod compression;
 pub mod coordinator;
 pub mod cross_dc_adapter;
 pub mod cross_shard;
@@ -53,7 +56,7 @@ pub(crate) mod wire;
 
 pub use apply::{
     ApplyError, ApplyMutation, DepWaitApplier, EngineStorageApplier, EngineStorageReader,
-    NoopStorageApplier, RowReadError, StorageApplier, StorageReader,
+    MutationView, NoopStorageApplier, RowReadError, StorageApplier, StorageReader,
 };
 pub use clock::{ClockError, ClockValidator};
 pub use clock_validation::{
@@ -87,6 +90,6 @@ pub use recovery::{
 pub use reorder_buffer::ReorderBuffer;
 pub use state_machine::{AccordStateMachine, SmResponse};
 pub use test_cluster::{TestCluster, TestMessage, TestMessagePayload, TestReplica};
-pub use transaction_commit::{AccordTransactionCommitter, ReplicaResolver};
+pub use transaction_commit::{AccordTransactionCommitter, AllServingMarkerWriter, ReplicaResolver};
 pub use two_phase_ddl::{DdlMarker, DdlOperation, DdlPhase, TwoPhaseDdlError, TwoPhaseDdlManager};
 pub use wire::{ReadPredicate, RowRead};

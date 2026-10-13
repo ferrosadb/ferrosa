@@ -22,6 +22,63 @@ pub trait AccordTransport: Send + Sync {
         msg: Message,
         lane: Lane,
     ) -> ferrosa_net::error::Result<Message>;
+
+    /// Whether `host_id` advertised [`ferrosa_net::handshake::CAP_ACCORD_CAPNP`],
+    /// i.e. decodes the Cap'n Proto `AccordApplyV2Capnp` body.
+    ///
+    /// Defaults to `false`: a transport that cannot positively confirm the peer's
+    /// capability must fall back to the bincode `AccordApplyV2` frame. Sending the
+    /// Cap'n Proto type to a peer that does not know the type byte drops the whole
+    /// internode connection — a rolled-back (version-skewed) peer must still be sent
+    /// a frame it can decode.
+    async fn supports_accord_capnp(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
+
+    /// Whether `host_id` advertised
+    /// [`ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION`], i.e. decodes the
+    /// region-REFERENCE `AccordApplyV2Region` body.
+    ///
+    /// Defaults to `false`: a transport that cannot positively confirm the peer's
+    /// capability must fall back to the inline `AccordApplyV2Capnp` (or bincode
+    /// `AccordApplyV2`) frame. Sending the region type to a peer that does not know
+    /// the type byte drops the whole internode connection.
+    async fn supports_accord_apply_region(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
+
+    /// Whether `host_id` advertised
+    /// [`ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED`], i.e. decodes a
+    /// COMPRESSED region body.
+    ///
+    /// Gated SEPARATELY from the region bit so that enabling
+    /// `FERROSA_ACCORD_COMPRESSION` can never send a compressed body to a peer that
+    /// understands only the uncompressed region form. Defaults to `false`.
+    async fn supports_accord_apply_region_compressed(&self, _host_id: uuid::Uuid) -> bool {
+        false
+    }
+
+    /// Send `msg` to `host_id` on `lane` with an EXPLICIT response timeout, awaiting the
+    /// peer's reply.
+    ///
+    /// The timeout is a parameter so a caller can bound a phase by its OWN configured
+    /// bound instead of the lane's hard-coded default. The Apply fan-out passes the
+    /// operator-tunable transaction bound here, so `FERROSA_ACCORD_TXN_TIMEOUT_SECS`
+    /// governs the very bound the abandon message names — otherwise the knob and the
+    /// message both claim to govern a wait the fixed [`Lane::Data`] timeout actually ends.
+    ///
+    /// Defaults to [`Self::send`] (the lane's default timeout) so a transport that cannot
+    /// override a timeout behaves exactly as before.
+    async fn send_with_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+        timeout: std::time::Duration,
+    ) -> ferrosa_net::error::Result<Message> {
+        let _ = timeout;
+        self.send(host_id, msg, lane).await
+    }
 }
 
 #[async_trait]
@@ -34,5 +91,34 @@ impl AccordTransport for PeerManager {
     ) -> ferrosa_net::error::Result<Message> {
         // Forward to the inherent method (this trait impl only adds the dyn seam).
         PeerManager::send(self, host_id, msg, lane).await
+    }
+
+    async fn supports_accord_capnp(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_CAPNP != 0)
+    }
+
+    async fn supports_accord_apply_region(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id)
+            .await
+            .is_some_and(|caps| caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION != 0)
+    }
+
+    async fn supports_accord_apply_region_compressed(&self, host_id: uuid::Uuid) -> bool {
+        self.peer_capabilities(host_id).await.is_some_and(|caps| {
+            caps & ferrosa_net::handshake::CAP_ACCORD_APPLY_REGION_COMPRESSED != 0
+        })
+    }
+
+    async fn send_with_timeout(
+        &self,
+        host_id: uuid::Uuid,
+        msg: Message,
+        lane: Lane,
+        timeout: std::time::Duration,
+    ) -> ferrosa_net::error::Result<Message> {
+        // Forward to the inherent method (this trait impl only adds the dyn seam).
+        PeerManager::send_with_timeout(self, host_id, msg, lane, timeout).await
     }
 }

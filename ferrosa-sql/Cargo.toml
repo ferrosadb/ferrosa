@@ -30,3 +30,8 @@ ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 
 [dev-dependencies]
 tempfile = "3"
+# `spill_operators` raises the process soft `RLIMIT_NOFILE` to its hard limit,
+# so the plain-`cargo test` (single-process, one-thread-per-test) gate is not
+# defeated by a low descriptor default (macOS shells default to 256) while a
+# dozen spilling tests share one process's merge readers. See the helper's doc.
+libc = "0.2"

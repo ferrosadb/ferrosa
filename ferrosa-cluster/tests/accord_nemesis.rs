@@ -667,8 +667,9 @@ enum BatchAtomicityResult {
     NoneApplied,
     /// Quorum unavailable — acceptable under nemesis.
     QuorumUnavailable,
-    /// Apply quorum unavailable — acceptable under nemesis.
-    ApplyQuorumUnavailable,
+    /// Abandoned after the operator-configured dependency-wait bound: rolled back
+    /// and never applied — acceptable under nemesis (nothing partial is visible).
+    TxnAbandoned,
     /// Network error — acceptable under nemesis.
     NetworkError,
     /// Codec error (should not happen).
@@ -683,7 +684,7 @@ impl BatchAtomicityResult {
             Ok(_) => Self::AllApplied,
             Err(AccordDriverError::ConditionNotMet { .. }) => Self::NoneApplied,
             Err(AccordDriverError::QuorumUnavailable) => Self::QuorumUnavailable,
-            Err(AccordDriverError::ApplyQuorumUnavailable) => Self::ApplyQuorumUnavailable,
+            Err(AccordDriverError::TxnAbandoned { .. }) => Self::TxnAbandoned,
             Err(AccordDriverError::Network(_)) => Self::NetworkError,
             Err(AccordDriverError::Codec(_)) => Self::CodecError,
             Err(AccordDriverError::SnapshotStale) => Self::SnapshotStale,

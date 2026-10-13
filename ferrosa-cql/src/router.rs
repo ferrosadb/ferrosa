@@ -2824,12 +2824,14 @@ pub enum RouteResult {
 ///   carried nothing. The mutation is now threaded across the wire so the Apply
 ///   phase has the real bytes to persist.
 ///
-///   NOTE: a replica only *persists* these bytes once it is constructed with an
-///   [`EngineStorageApplier`](ferrosa_cluster::accord::apply). Production today
-///   still builds `AccordStateMachine` with the default `NoopStorageApplier`
-///   (see `controller/cluster.rs`), so on a live replica the decode-and-write
-///   step is a no-op pending the inc6 startup-wiring increment — no client path
-///   reaches `route_lwt_via_accord` yet, so this is not user-visible.
+///   NOTE: a replica *persists* these bytes through the `StorageApplier` its
+///   state machine was built with. Production wires the live storage engine:
+///   `controller/cluster.rs` builds the state machine with
+///   `build_accord_state_machine`, which installs an
+///   [`EngineStorageApplier`](ferrosa_cluster::accord::apply) so the
+///   decode-and-write step lands the row in real storage. (The default
+///   `NoopStorageApplier` is reached only by `AccordStateMachine::new`, which no
+///   production path uses.) No client path reaches `route_lwt_via_accord` yet.
 ///
 /// Reuses the same `materialize_insert`/`materialize_update`/`materialize_delete`
 /// path as logged batches, so an Accord-routed INSERT/UPDATE/DELETE produces
@@ -3796,8 +3798,10 @@ async fn finish_lwt_via_accord(
         Err(AccordDriverError::QuorumUnavailable) => Err(CqlError::ServerError(
             "Accord quorum unavailable for LWT transaction".into(),
         )),
-        Err(AccordDriverError::ApplyQuorumUnavailable) => Err(CqlError::ServerError(
-            "Accord apply quorum unavailable — LWT transaction may not be durable".into(),
+        Err(AccordDriverError::TxnAbandoned { .. }) => Err(CqlError::ServerError(
+            "Accord transaction abandoned after the dependency-wait bound — rolled back and NOT \
+             applied; safe to retry"
+                .into(),
         )),
         Err(AccordDriverError::Network(msg)) => Err(CqlError::ServerError(format!(
             "Accord network error: {msg}"

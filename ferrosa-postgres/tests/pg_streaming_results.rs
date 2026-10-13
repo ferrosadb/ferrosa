@@ -269,6 +269,7 @@ async fn start() -> (tokio_postgres::Client, tempfile::TempDir) {
     engine.register_table(storage_schema()).expect("register");
     seed(&engine);
     let ctx = Arc::new(QueryContext {
+        cluster_read: Default::default(),
         engine: Arc::new(engine),
         schema: Arc::new(schema_with_table()),
         default_schema: "ks".into(),
