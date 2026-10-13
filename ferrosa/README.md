@@ -197,6 +197,18 @@ See `ferrosa.example.toml` for the file form (`[cql] [udf] [jsonb] [internode]
 
 **Called by**: **NONE** — it is the top-level binary.
 
+### Readiness-timeout diagnostics
+
+The cluster/integration suites wait on each node's `/readyz` before driving it. When a
+node does not become ready, the harness now reports the node's own `/readyz` body —
+`waiting_for=<condition>` (`raft_leader`, a schema-registration wait, the
+expected-cluster-size gate) — or says `no /readyz response at all` when the listener
+never answered. That body is what separates a genuinely unmet readiness condition from
+a node starved on a contended runner; discarding it turns every occurrence into a fresh
+investigation (t_64dd3703). The message is built by a pure function
+(`readiness_timeout_message`, `tests/pg_public_keyspace_rf_process.rs`) with its own
+test, so its shape cannot silently regress.
+
 ## Tests
 
 ~265 in-crate tests (`src/main.rs` + `web/*` + `cql_broadcast.rs` +
