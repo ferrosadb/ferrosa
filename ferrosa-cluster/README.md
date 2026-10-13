@@ -697,6 +697,18 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   the writer's and the check cannot silently miss. Test (red first):
   `quorum_availability::an_insert_into_a_table_a_scanner_read_is_refused`; the negative control — a
   writer that registers no watermark — leaves the stale scan committing (`got Committed`).
+- **The read set `commit_postgres` receives is HYBRID and STREAMED, not a table list.** The
+  argument is a `ferrosa_storage::accord::PgReadSet`: `scan_tables` (the wide scans that could not be
+  resolved to keys, each driving the synthetic `POSTGRES_READ_TABLE_KEY_PREFIX` key above) PLUS the
+  keyed reads resolved to ROW keys, which are visited one at a time through
+  `PgReadSet::for_each_row_key` out of a spilled, memory-mapped staging region — never a resident
+  `Vec`. A keyed reader therefore registers the ROW it visited: two keyed readers of DISJOINT rows of
+  one table both commit, while a concurrent writer of one of those rows still conflicts (the reader
+  consults the key it read, `postgres_read_lookup_key`). The engine streams the row keys into the
+  driven read registrations rather than materializing them, which is what lets a fixed-4-GB node carry
+  a read set of any size. The staging is `ferrosa-storage`'s `row_read_set` (FMEA ST-WS-03); the
+  front-end gate is
+  `ferrosa-postgres/tests/pg_full_scan_memory_bound.rs::keyed_read_set_residency_stays_flat_through_the_postgres_front_end`.
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
   Accept is dependency-monotonic: replicas retain dependencies seen locally

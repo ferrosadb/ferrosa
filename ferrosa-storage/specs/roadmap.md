@@ -139,6 +139,15 @@ open work lives in specs and the items below.
 
 ## Recently landed
 
+- **Row-level read set (`accord/row_read_set`, ST-WS-03).** `RowReadSet` stages a keyed
+  read's resolved ROW key through the SAME `write_set_stage` spill the write-set uses (one
+  spill path, one tunable), so the read set's residency is FLAT in the recorded row count;
+  `PgReadSet` is the HYBRID finished view (`scan_tables` + streamed `StagedRowReads`). The
+  transaction-level gate
+  `ferrosa-postgres/tests/pg_full_scan_memory_bound.rs::keyed_read_set_residency_stays_flat_through_the_postgres_front_end`
+  is SHOWN red under a resident read set and green under the staged one. Not done: feeding
+  the ROW keys into the Accord driver without materializing them (a named residual).
+
 - **Stale secondary index after restart (ST-85).** A compaction swap retires
   its inputs from the index tracker, failed backfills log on their edges and
   are retried by the maintenance loop's healer, and not-current indexes show

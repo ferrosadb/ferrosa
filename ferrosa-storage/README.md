@@ -997,6 +997,26 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   an_un_staged_index_fails_loud_in_both_regimes, a_small_write_set_stays_fully_resident,
   dropping_the_staged_view_removes_the_staging_directory,
   an_invalid_threshold_setting_falls_back_to_the_default}`.
+- **Row-level read set** (`accord/row_read_set.rs`) — a PostgreSQL `SERIALIZABLE`
+  transaction's read set used to be a `HashSet<String>` of TABLE names, so two READERS of
+  one table registered the same key and collided (one refused `SnapshotStale`) even though
+  neither wrote anything for the other to serialize against. `RowReadSet` stages each keyed
+  read's resolved ROW key through the **SAME `WriteSetStage`** the write-set uses — a
+  bounded resident prefix plus a private staging file, read back as a stream. There is
+  deliberately **no second, read-set-specific buffer or constant**; the resident limit is
+  the write-set's own `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`. `PgReadSet` is the finished,
+  HYBRID read set: `scan_tables` (the wide scans that could not be resolved to keys, bounded
+  by the schema, where a resident `Vec` is correct) plus `StagedRowReads` (the keyed reads,
+  streamed one key at a time through `for_each_row_key`). Residency is the staging buffer,
+  never the number of rows read: `resident_bytes` is FLAT in the recorded row count, which
+  is what `ferrosa-postgres`'s
+  `tests/pg_full_scan_memory_bound.rs::keyed_read_set_residency_stays_flat_through_the_postgres_front_end`
+  measures end to end. **A resident `HashSet<RowKey>`/`Vec<RowKey>` read set is FORBIDDEN on
+  this path** — it grows with the rows read and the node RAM is fixed at 4 GB; it is wired
+  only as that gate's negative control. Tests:
+  `row_read_set::tests::{every_row_key_round_trips_across_the_spill_boundary_and_the_last,
+  residency_is_flat_across_widely_separated_row_counts, the_threshold_is_the_write_set_threshold,
+  an_empty_read_set_is_inert_and_the_hybrid_keeps_both_granularities}`.
 - **Range merger run grouping** (`range_merger.rs`) — to keep the merge heap
   small, token-disjoint SSTables are grouped into concatenated "runs"
   (`partition_into_disjoint_runs`), one heap source per run instead of one per

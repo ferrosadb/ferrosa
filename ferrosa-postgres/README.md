@@ -107,7 +107,22 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   contribute a `POSTGRES_WRITE_TABLE_KEY_PREFIX` WRITE watermark that a scanner
   reads as a namespaced READ registration — so a phantom inserted into a scanned
   table is refused even when the writer never scanned it, while two readers never
-  conflict and two writers of DISJOINT rows still commit (RT-2). Accord atomically
+  conflict and two writers of DISJOINT rows still commit (RT-2). The read set is HYBRID, at
+  the granularity each read could be resolved to: a KEYED read (`WHERE <partition-key> =
+  <literal>`, which the front end's `point_read_row_key` judgement resolves) registers the
+  ROW it visited — encoded with the SAME canonical encoder the DML write path uses, so a
+  reader's registration lands on the key a writer of that row registers — while a WIDE scan
+  that cannot be resolved to keys keeps the TABLE-level key, unchanged. Two keyed readers of
+  DISJOINT rows therefore both commit, a concurrent writer of one of those rows still
+  conflicts, and the phantom path through the per-table WRITE WATERMARK does not move.
+  The visited-row set is STAGED, never materialized: `Session.txn_read_rows` is a
+  `ferrosa_storage::accord::RowReadSet` over the SAME threshold-bounded spill the write-set
+  uses, so its RESIDENT bytes stay FLAT as the recorded row count grows — a resident
+  `HashSet`/`Vec` of row keys is FORBIDDEN on this path (fixed 4 GB node). The gate
+  `tests/pg_full_scan_memory_bound.rs::keyed_read_set_residency_stays_flat_through_the_postgres_front_end`
+  drives `BEGIN ISOLATION LEVEL SERIALIZABLE`…N keyed reads…one write…`COMMIT` over the wire
+  and asserts it on the `PgReadSet` the COMMIT hands the committer; it is SHOWN to fail
+  under a resident read set. Accord atomically
   applies the buffered
   mutation batch. Row versions are staged before replica storage
   apply and made visible after the atomic batch succeeds. Conflicts return
