@@ -999,3 +999,74 @@ async fn an_insert_into_a_table_a_scanner_read_is_refused() {
          saw; got {scanned:?}"
     );
 }
+
+/// The false-refusal half of the hybrid read set: two SERIALIZABLE transactions that
+/// each READ a bounded RANGE that RESOLVES TO KEYS of one table, and WRITE DISJOINT
+/// rows of ANOTHER table, must BOTH commit.
+///
+/// A read registration is a READ, not a write: two READERS of one table do not
+/// conflict (there is no write to serialize against). Today the read is registered at
+/// TABLE granularity as a plain driven key (`postgres_read_table_key`), so the second
+/// reader collides with the first reader's registration of that one shared table key
+/// and is refused `SnapshotStale` — the false conflict the owner names. It is what
+/// forced the CL-28 fixture (`run_postgres_transaction`) to hand an EMPTY read set,
+/// because any shared table key starved the queue.
+///
+/// The hybrid resolves a keyed read to the ROW keys it VISITED, so the two readers
+/// register DISJOINT keys and both commit. This test drives the read at the only
+/// granularity the engine accepts today — the table — so it fails on the OUTCOME
+/// VALUE: the second reader comes back `Aborted`, not `Committed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_serializable_range_readers_of_one_table_both_commit() {
+    let cluster = Cluster::three_nodes();
+
+    // Both BEGIN before either COMMITs, so neither can be excused by real time.
+    let first_snapshot = cluster.committers[0]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("first BEGIN");
+    let second_snapshot = cluster.committers[1]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("second BEGIN");
+
+    // Each transaction READS a bounded range of `public.doctors` — a range that
+    // resolves to keys — and WRITES a DISJOINT row of `public.appointments`. Neither
+    // writes the table it read, so no write makes either read stale.
+    let read_tables = vec!["public.doctors".to_string()];
+    let written_tables = vec!["public.appointments".to_string()];
+
+    let first = cluster.committers[0]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "appt-a", "appt-a=1")]),
+            read_tables.clone(),
+            written_tables.clone(),
+            first_snapshot,
+        )
+        .await
+        .expect("first commit");
+    assert_eq!(
+        first,
+        CommitOutcome::Committed,
+        "nothing was written against the range the first reader read, so it must commit"
+    );
+
+    let second = cluster.committers[1]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "appt-b", "appt-b=1")]),
+            read_tables.clone(),
+            written_tables.clone(),
+            second_snapshot,
+        )
+        .await
+        .expect("second commit");
+    assert_eq!(
+        second,
+        CommitOutcome::Committed,
+        "two READERS of one table, writing DISJOINT rows of another, do not conflict: \
+         the second must commit, not be refused on the first reader's table read key; \
+         got {second:?}"
+    );
+}
