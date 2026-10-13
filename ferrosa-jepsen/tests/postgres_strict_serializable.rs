@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
+use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -331,10 +332,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .map_err(anyhow::Error::from)
         .context("PostgreSQL transaction history violated strict serializability")?;
 
-    cql_session
-        .query_unpaged(format!("DROP TABLE {POSTGRES_DEFAULT_SCHEMA}.{table}"), &[])
-        .await
-        .context("drop strict-serializability workload table through CQL")?;
+    drop_workload_table(&cql_session, &table).await?;
     drop(clients);
     drop(actor_clients);
     for connection in connections.into_iter().chain(actor_connections) {
@@ -1092,16 +1090,106 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
         .with_context(|| format!("write PostgreSQL fault marker {}", path.display()))
 }
 
+/// The CQL refusals that mean the statement was NOT applied and may be re-issued.
+///
+/// The teardown DDL travels the cluster's Raft log, so with a replica paused the
+/// proposal can be refused in a class the server documents as "not applied, safe
+/// to re-issue": `Unavailable` (0x1000, did not reach the consistency level). Any
+/// other refusal — a bad query, or the driver's own client timeout, whose outcome
+/// is NOT known — is reported where it stands and never retried, so a real failure
+/// cannot be turned into a pass. The client deadline itself is untouched: this
+/// re-issues a statement the server said it did not apply, it does not lengthen
+/// how long a single attempt may take.
+fn is_retryable_cql_refusal(error: &scylla::errors::ExecutionError) -> bool {
+    matches!(
+        error,
+        scylla::errors::ExecutionError::LastAttemptError(
+            scylla::errors::RequestAttemptError::DbError(
+                scylla::errors::DbError::Unavailable { .. },
+                _
+            )
+        )
+    )
+}
+
+/// Issue a CQL statement, re-issuing a refusal in the retryable class. Bounded by
+/// the SAME retry budget as the workload's transactions. The refusal is returned
+/// boxed because the driver's `ExecutionError` is oversized and this helper is on
+/// a test path where the class, not the byte count, is what the caller reads.
+async fn retry_cql_refusal<F, Fut, T>(
+    mut attempt: F,
+) -> Result<T, Box<scylla::errors::ExecutionError>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, scylla::errors::ExecutionError>>,
+{
+    let mut last_refusal = None;
+    for retry in 0..=SERIALIZATION_RETRIES {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable_cql_refusal(&error) => {
+                last_refusal = Some(error);
+                if retry < SERIALIZATION_RETRIES {
+                    tokio::time::sleep(retry_backoff(retry, retry as u64)).await;
+                }
+            }
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+    Err(Box::new(
+        last_refusal.expect("the retry loop records a retryable CQL refusal"),
+    ))
+}
+
+/// Drop the workload table through CQL, re-issuing a retryable refusal.
+async fn drop_workload_table(session: &Session, table: &str) -> Result<()> {
+    let statement = format!("DROP TABLE {POSTGRES_DEFAULT_SCHEMA}.{table}");
+    retry_cql_refusal(|| {
+        let statement = statement.clone();
+        async move { session.query_unpaged(statement, &[]).await }
+    })
+    .await
+    .context("drop strict-serializability workload table through CQL")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, expected_history_length,
-        initial_workload_statements, is_retryable_serialization_state, is_write_skew_writer,
-        predicate_observations, record_attempts, retry_backoff, retry_jitter_millis,
-        retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
-        OperationRetryCounts, RecordedTransaction, TransactionOperation, ACTORS, RETRY_BASE_DELAY,
-        RETRY_MAX_DELAY, SERIALIZATION_RETRIES, TRANSACTIONS_PER_ACTOR,
+        initial_workload_statements, is_retryable_cql_refusal, is_retryable_serialization_state,
+        is_write_skew_writer, predicate_observations, record_attempts, retry_backoff,
+        retry_cql_refusal, retry_jitter_millis, retry_serializable_transactions,
+        run_until_actor_failure, wait_for_phase, FaultSchedule, OperationRetryCounts,
+        RecordedTransaction, TransactionOperation, ACTORS, RETRY_BASE_DELAY, RETRY_MAX_DELAY,
+        SERIALIZATION_RETRIES, TRANSACTIONS_PER_ACTOR,
     };
+
+    /// The class the engine sends when a coordinator did not reach its
+    /// consistency level: refused, and NOT applied, so it may be re-issued.
+    fn cql_unavailable() -> scylla::errors::ExecutionError {
+        scylla::errors::ExecutionError::LastAttemptError(
+            scylla::errors::RequestAttemptError::DbError(
+                scylla::errors::DbError::Unavailable {
+                    consistency: scylla::statement::Consistency::One,
+                    required: 2,
+                    alive: 1,
+                },
+                "too few replicas".to_owned(),
+            ),
+        )
+    }
+
+    /// A refusal whose outcome is known to be a permanent failure of THIS
+    /// statement: it must be reported, never re-issued.
+    fn fatal_cql_refusal() -> scylla::errors::ExecutionError {
+        scylla::errors::ExecutionError::LastAttemptError(
+            scylla::errors::RequestAttemptError::DbError(
+                scylla::errors::DbError::SyntaxError,
+                "the submitted query has a syntax error".to_owned(),
+            ),
+        )
+    }
 
     #[tokio::test]
     async fn serialization_retries_keep_aborted_attempts_and_stop_after_commit() {
@@ -1506,5 +1594,61 @@ mod tests {
             }),
             invoked + 10
         );
+    }
+
+    /// Only the class the server documents as "not applied, safe to re-issue" is
+    /// retryable. A client timeout is NOT: its outcome is unknown, so retrying it
+    /// would both guess and lengthen how long a single attempt may take.
+    #[test]
+    fn only_the_not_applied_cql_class_is_retryable() {
+        assert!(is_retryable_cql_refusal(&cql_unavailable()));
+        assert!(!is_retryable_cql_refusal(&fatal_cql_refusal()));
+        assert!(!is_retryable_cql_refusal(
+            &scylla::errors::ExecutionError::RequestTimeout(std::time::Duration::from_secs(30))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_retryable_cql_refusal_is_reissued_and_a_fatal_one_is_reported() {
+        use std::cell::Cell;
+
+        // Two refusals, then the statement applies.
+        let attempts = Cell::new(0);
+        let mut refusals = [true, true, false].into_iter();
+        let applied = retry_cql_refusal(|| {
+            let refused = refusals.next().expect("three attempts were budgeted");
+            attempts.set(attempts.get() + 1);
+            let error = cql_unavailable();
+            async move {
+                if refused {
+                    Err(error)
+                } else {
+                    Ok(7_u8)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            applied.expect("the third attempt applies the statement"),
+            7,
+            "a retryable refusal is re-issued, not reported as a failure"
+        );
+        assert_eq!(attempts.get(), 3);
+
+        // A fatal refusal ends it where it stands, on the FIRST attempt.
+        let fatal_attempts = Cell::new(0);
+        let error = retry_cql_refusal(|| {
+            fatal_attempts.set(fatal_attempts.get() + 1);
+            async { Err::<u8, _>(fatal_cql_refusal()) }
+        })
+        .await
+        .expect_err("a fatal refusal is reported, never retried");
+
+        assert!(matches!(
+            *error,
+            scylla::errors::ExecutionError::LastAttemptError(_)
+        ));
+        assert_eq!(fatal_attempts.get(), 1);
     }
 }
