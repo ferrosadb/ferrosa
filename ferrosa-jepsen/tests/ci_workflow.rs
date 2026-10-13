@@ -5,14 +5,11 @@
 //! Jepsen smoke run. We don't validate the YAML syntax (that's CI's job)
 //! — we just assert the keywords are present.
 
+mod support;
+
 use std::path::PathBuf;
 
-fn repo_root() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .expect("CARGO_MANIFEST_DIR must be set under cargo test");
-    manifest_dir.join("..")
-}
+use support::repo_root;
 
 fn ci_yaml_path() -> PathBuf {
     repo_root().join(".github/workflows/ci.yml")

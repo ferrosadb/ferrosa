@@ -13,6 +13,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+/// Host-facing admin endpoint of the local single-DC Jepsen cluster's first
+/// node (`jepsen-cluster.yml` node1), used by nemeses that read cluster
+/// membership. Its host port must stay below the kernel's ephemeral range floor
+/// (32768) — an outbound connection can otherwise already hold it as a source
+/// port and `docker compose up` fails to publish the mapping. The
+/// `host_port_band` test pins this.
+pub const DEFAULT_ADMIN_URL: &str = "http://localhost:49090/admin/membership-snapshot";
+
 /// A nemesis action that can be injected and healed.
 #[async_trait]
 pub trait NemesisAction: Send + Sync {
@@ -260,7 +268,7 @@ impl NemesisRegistry {
             compose_file: None,
         }));
         reg.register(Box::new(topology::DecommissionLeader {
-            admin_url: "http://localhost:49090/admin/membership-snapshot".to_string(),
+            admin_url: DEFAULT_ADMIN_URL.to_string(),
             ctl_binary: "ferrosa-ctl".to_string(),
         }));
         reg.register(Box::new(topology::RandomStartupOrder {

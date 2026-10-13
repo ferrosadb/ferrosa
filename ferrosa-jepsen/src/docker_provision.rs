@@ -17,8 +17,14 @@ use tracing::{debug, info};
 
 use crate::config::Topology;
 
-// CQL ports assigned to each of the three Jepsen cluster nodes on localhost.
-const NODE_CQL_PORTS: [u16; 3] = [49042, 49043, 49044];
+// Host-side CQL ports assigned to each of the three Jepsen cluster nodes on
+// localhost. They must stay below the kernel's ephemeral range floor (32768) so
+// an outbound connection can never already hold one as its source port and make
+// `docker compose up` fail to publish the mapping. They must also match the CQL
+// host ports published by `tests/docker/jepsen-cluster.yml`; the
+// `host_port_band` test pins both, and uses the 29xxx band the multi-DC nightly
+// topology already uses.
+pub const NODE_CQL_PORTS: [u16; 3] = [49042, 49043, 49044];
 
 /// Detect whether `docker` or `podman` is usable and return the binary name.
 ///
