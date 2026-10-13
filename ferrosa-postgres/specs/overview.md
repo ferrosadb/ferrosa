@@ -97,8 +97,10 @@ opening each referenced table as a bounded-channel storage provider. The scan
 **consults the cluster**: when the deployment has a range-read path
 (`QueryContext::cluster_read`, wired by the binary to the live
 `ferrosa_cluster::write_path::WritePath`), the producer opens
-`WritePath::range_read_stream_all_with` at `ConsistencyLevel::Quorum`
-(`DEFAULT_READ_CONSISTENCY`) with the keyspace's replication strategy, so the
+`WritePath::range_read_stream_all_with` at the level
+`cluster_read::read_consistency()` resolves (`FERROSA_PG_READ_CONSISTENCY`,
+defaulting to `ConsistencyLevel::Quorum`) with the keyspace's replication
+strategy, so the
 scan fans out across the ring instead of reading only this node's local
 `StorageEngine`. A cluster read that cannot reach the replicas the level
 requires is a **loud failure** recorded in `ScanFailure` (`58000`) — never a

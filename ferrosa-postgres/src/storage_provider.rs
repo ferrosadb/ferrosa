@@ -109,7 +109,7 @@ use futures::{FutureExt, StreamExt};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
-use crate::cluster_read::{PartitionStream, RangeRead, DEFAULT_READ_CONSISTENCY};
+use crate::cluster_read::{read_consistency, PartitionStream, RangeRead};
 
 /// Convert a ferrosa [`CqlValue`] to [`ferrosa_sql::Value`]. Unsupported values
 /// return an error so callers cannot turn real data into fabricated SQL NULLs.
@@ -394,9 +394,9 @@ struct ScanContext {
     /// Sparse PostgreSQL row replacements/deletions for the query snapshot.
     overlay: Arc<std::collections::HashMap<Vec<Value>, Option<Row>>>,
     /// The cluster range-read path, when this deployment has one. `Some` routes
-    /// the scan through the ring at [`DEFAULT_READ_CONSISTENCY`]; `None` (a
-    /// standalone node or a unit test) scans this node's local storage, which
-    /// IS the complete answer there.
+    /// the scan through the ring at [`read_consistency`]; `None` (a standalone
+    /// node or a unit test) scans this node's local storage, which IS the
+    /// complete answer there.
     cluster_read: Option<Arc<dyn RangeRead>>,
     /// The keyspace's replication strategy, used only by the cluster read. It
     /// is resolved once here rather than per scan.
@@ -406,24 +406,34 @@ struct ScanContext {
 /// Open the partition stream for one full-table scan.
 ///
 /// The **cluster** range read is used when this deployment has one: it fans out
-/// across the ring at [`DEFAULT_READ_CONSISTENCY`] and refuses (loudly) to serve
-/// a read it cannot complete. Otherwise this node's **local** storage is read —
-/// complete for a standalone node, and the local path unit tests exercise.
+/// across the ring at the level [`read_consistency`] resolves
+/// (`FERROSA_PG_READ_CONSISTENCY`, `QUORUM` by default) and refuses (loudly) to
+/// serve a read it cannot complete, including one whose configured level is not
+/// a level at all. Otherwise this node's **local** storage is read — complete
+/// for a standalone node, and the local path unit tests exercise.
 ///
 /// A failure here is an `Err` that the caller records into [`ScanFailure`]; it is
 /// **never** downgraded to a local-only scan, because the whole point is that an
 /// under-return must not look like a small table.
 async fn open_partition_stream(ctx: &Arc<ScanContext>) -> Result<PartitionStream, String> {
     match &ctx.cluster_read {
-        Some(reader) => reader
-            .stream_all(&ctx.table_id, DEFAULT_READ_CONSISTENCY, &ctx.replication)
-            .await
-            .map_err(|error| {
+        Some(reader) => {
+            let cl = read_consistency().map_err(|error| {
                 format!(
-                    "cluster range read of {}.{} failed: {error}",
+                    "cluster range read of {}.{} refused: {error}",
                     ctx.table_id.keyspace, ctx.table_id.table
                 )
-            }),
+            })?;
+            reader
+                .stream_all(&ctx.table_id, cl, &ctx.replication)
+                .await
+                .map_err(|error| {
+                    format!(
+                        "cluster range read of {}.{} failed: {error}",
+                        ctx.table_id.keyspace, ctx.table_id.table
+                    )
+                })
+        }
         None => {
             let stream = ctx
                 .engine

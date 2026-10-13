@@ -602,7 +602,9 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   partition hashing, divergent-leaf detection.
 - `repair/{coordinator,executor}.rs` — Merkle-then-stream sessions with bounded
   fetch/apply chunks; deterministic single-initiator selection (no thundering
-  herd); timestamp ties surfaced, never auto-resolved (Aphyr-safe).
+  herd), and adjacent token ranges that share a replica set collapse into ONE
+  session per replica set on BOTH the table-wide and the automatic/initiated path
+  (CL-64); timestamp ties surfaced, never auto-resolved (Aphyr-safe).
 - Every path that moves a partition between nodes carries the whole partition:
   rows, static row and partition deletion (P0-3, CL-43). Row streaming encodes
   through `StreamedMutation::from_partition` (legacy `Vec<RowWire>` bytes when
@@ -660,6 +662,16 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   members taken down can never re-form the old cluster (CL-42, CL-45).
 
 ### Accord transactions (`accord/`)
+- **A PostgreSQL snapshot's staleness is judged on the transaction's OWN keys, never on a
+  cluster-global marker.** Every PostgreSQL commit bumps one shared
+  `POSTGRES_TRANSACTION_MARKER_KEY` high-water mark, and the pre-accept stale check used to refuse any
+  transaction whose snapshot predated that mark — regardless of which rows it touched. Since every PG
+  transaction touches that one protocol key, this serialized the entire front end: two concurrent
+  transactions on DISJOINT keys conflicted, one side refused `40001`, and four concurrent clients
+  measured 0 tps. Staleness is now computed from the keys the transaction itself wrote, excluding the
+  two shared protocol keys (the data-commit marker and the BEGIN/COMMIT barrier). Verified from a real
+  client on a settled 3-node cluster (two concurrent pairs, `refused A=0 B=0`, no `40001`). See FMEA
+  CL-62; the read-set half of the same family is CL-28 (`t_1ba6ccc8`).
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
   Accept is dependency-monotonic: replicas retain dependencies seen locally
@@ -702,7 +714,11 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   vote collector stops once F+1 matching votes decide the predicate, without
   waiting for an unavailable minority. PostgreSQL snapshot barriers use the
   committed slow quorum plus a local dependency/apply check and do not fan out
-  remote read-votes. The replica apply path is **dep-ordered**: `handle_apply`
+  remote read-votes; that check decides on EVIDENCE OF PROGRESS (the dependency
+  set, each dependency's protocol phase, and the engine's completed-resolution
+  watermark) and its bound is a no-progress STALL BACKSTOP, never a total wait
+  budget, so a live-but-behind engine cannot make a barrier abstain (CL-63). The
+  replica apply path is **dep-ordered**: `handle_apply`
   routes every real write
   through `apply.rs`'s `DepWaitApplier`, so a mutation persists only once all of
   its dependencies have applied locally (otherwise it parks and the cascade
@@ -737,19 +753,50 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   transaction did not commit and may retry: the PostgreSQL front end maps the
   `abandoned:` reason to SQLSTATE 40001 (serialization failure) and the CQL
   router to a retryable server error.
-  **The abandon is decided before the coordinator writes anything.** The
+  **The abandon is decided by EVIDENCE, never by the clock alone.** The
   coordinator's own-shard apply is deferred until the remote Apply quorum is
-  secured; before that point NO replica has applied, so the "NOT committed"
-  report is the truth and leaves no row readable (pinned by
+  secured, so at the decision point the only durable applies are the remote
+  replicas that ACKED — and a replica writes its rows durably *before* it acks.
+  The apply fan-out therefore reports two facts, not one: `ApplyFanout {
+  quorum_reached, peer_acks }` (the per-shard quorum verdict, and the count of
+  distinct remote `ApplyOK`s — the coordinator's own deferred self-ack is NOT
+  counted). The abandon is reserved for **zero verified Apply acks**: no replica
+  is known to have applied, so the "NOT committed" report is the truth and leaves
+  no row readable (pinned by
   `abandon_durability::an_abandoned_transaction_leaves_no_row_readable_across_restart`,
-  a point lookup of a known key that must survive a restart as absent). If the
-  Apply quorum *is* secured, the transaction is committed and durably applied on
-  a quorum and is never reported as abandoned: a coordinator whose own replica
-  then fails to converge fails loud with a non-retryable durability error instead
-  (`coordinator local Apply did not reach Applied ... (NOT an abandon)`), because
-  "safe to retry" would invite a double-apply. The residual boundary — a remote
-  that persists a write before its `ApplyOK` is lost — is inherent to Accord's
-  at-least-once apply and is not closed here.
+  a point lookup of a known key that must survive a restart as absent, and by
+  `coordinator::tests::zero_apply_acks_still_abandon_truthfully`). **Any**
+  verified Apply ack — even one, below quorum — means the transaction is
+  COMMITTED and durably applied on that replica and MUST NOT be abandoned: the
+  coordinator fails loud with a non-retryable durability error that names the
+  commit, never the retryable 40001
+  (`coordinator::tests::a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon`;
+  the fan-out's evidence is pinned directly by
+  `coordinator::tests::the_multi_key_apply_fan_out_reports_the_partial_apply_evidence`).
+  The same non-retryable error covers the case where the Apply quorum *is*
+  secured but the coordinator's own replica then fails to converge
+  (`coordinator local Apply did not reach Applied ... (NOT an abandon)`).
+  **A replica that wrote its rows durably always acks.** The protocol-log `Applied`
+  marker is the journal's *record* of the apply; it is written after the storage
+  write, whose own commit-log fsync is the durability instant for the row, and the
+  two are decided together by `applied_journal::record_applied_marker` — the one
+  entry point that owns the marker write and the ack decision. A marker fsync
+  failure with the rows already durable therefore still acknowledges
+  (`bookkeep_applied` advances the txn to `Applied`, which is the phase the ack gate
+  waits for) instead of withholding `ApplyOK` on a row that is already readable and
+  letting the coordinator report an abandon over durable data (finding G1). A
+  **no-write finalize** has no durable row, so there the marker *is* the durability
+  and a failed fsync still withholds the ack. Tests:
+  `apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails`,
+  `sm_marker_fsync_failure_after_a_durable_row_write_still_applies`, with
+  `a_failed_marker_withholds_when_nothing_durable_was_written` and
+  `sm_storage_apply_failure_does_not_advance` as the negative controls.
+  The residual boundary — a remote replica that applies durably and then loses
+  its `ApplyOK` before ANY ack reaches the coordinator, so the coordinator sees
+  zero acks and abandons a partially applied transaction — is inherent to
+  Accord's at-least-once apply and is NOT closed here. Closing it needs a durable
+  abandon decision the apply path consults (R6 of the commit-path refactor plan),
+  not a bigger wait: the 10 s bound is a detector, never a knob.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write

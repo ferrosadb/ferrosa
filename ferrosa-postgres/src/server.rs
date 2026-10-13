@@ -706,10 +706,22 @@ async fn begin_block(
 
 /// Record a `SELECT`'s tables in the open serializable transaction's read set,
 /// so commit can detect a phantom or write-skew against them.
+///
+/// A read of a single row BY ITS PARTITION KEY (`WHERE pk = <literal>`) is a
+/// POINT read: it is recorded as that ROW, not as the table, so two
+/// transactions touching disjoint keys of one table do not collide on table
+/// identity (RT-2). A scan keeps the table-level guard, which is what still
+/// catches a predicate phantom.
 fn track_select_reads(ctx: &QueryContext, session: &mut Session, select: &ferrosa_sql::SelectStmt) {
     if !(session.in_txn()
         && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable))
     {
+        return;
+    }
+    if let Some(row) = point_read_row_key(ctx, select) {
+        if let Some(snapshot) = session.txn_snapshot() {
+            ctx.mvcc.record_point_read(snapshot, row);
+        }
         return;
     }
     let read_tables = session.txn_read_tables_mut();
@@ -725,6 +737,44 @@ fn track_select_reads(ctx: &QueryContext, session: &mut Session, select: &ferros
             join.table.table
         ));
     }
+}
+
+/// The [`crate::mvcc::RowKey`] a `SELECT` names exactly, when its filter is a
+/// single `<partition-key> = <literal>` equality on the read table. Returns
+/// `None` for any other filter, join, or column: those are scans, and stay
+/// table-granular. The key is the predicate's literal value, keyed by the same
+/// `keyspace.table` string the version maps use.
+fn point_read_row_key(
+    ctx: &QueryContext,
+    select: &ferrosa_sql::SelectStmt,
+) -> Option<crate::mvcc::RowKey> {
+    if select.join.is_some() {
+        return None;
+    }
+    let ferrosa_sql::Expr::Compare { left, op, value } = select.filter.as_ref()? else {
+        return None;
+    };
+    if *op != ferrosa_sql::CmpOp::Eq {
+        return None;
+    }
+    let ferrosa_sql::Operand::Column(column) = left else {
+        return None;
+    };
+    let ferrosa_sql::Term::Literal(column_value) = value else {
+        return None;
+    };
+    let keyspace = select.from.schema.as_deref().unwrap_or(&ctx.default_schema);
+    let snapshot = ctx.schema.snapshot();
+    let table = snapshot
+        .tables
+        .get(&(keyspace.to_string(), select.from.table.clone()))?;
+    if !table.partition_key.contains(&column.name) {
+        return None;
+    }
+    Some(crate::mvcc::RowKey {
+        table: format!("{keyspace}.{}", select.from.table),
+        key: vec![column_value.clone()],
+    })
 }
 
 /// The environment a read runs against under `snapshot`.
@@ -826,30 +876,19 @@ async fn run_data_statement<O: ReplySink>(
     Ok(msgs)
 }
 
+/// The pre-statement liveness probe for a serializable transaction: does its
+/// snapshot still exist? Only EXPIRY aborts a later statement — a read-set
+/// conflict is a COMMIT-time decision, so a live snapshot keeps serving reads
+/// from its BEGIN snapshot even after another session commits.
 fn expired_transaction_error(ctx: &QueryContext, session: &Session) -> Option<BackendMessage> {
     let snapshot = session.txn_snapshot()?;
-    match ctx
-        .mvcc
-        .validate_commit(snapshot, &std::collections::HashSet::new())
-    {
-        Ok(()) => None,
-        Err(MvccCommitError::SnapshotExpired) => Some(query::error_response(
-            "40001",
-            "PostgreSQL transaction snapshot expired",
-        )),
-        Err(MvccCommitError::SerializationFailure) => Some(query::error_response(
-            "40001",
-            "could not serialize PostgreSQL transaction",
-        )),
-        // Backpressure answers 53000 (retryable); a real fault keeps 58000.
-        Err(MvccCommitError::Storage(error)) if error.is_backpressure() => Some(
-            query::error_response("53000", &format!("transaction refused: {error}")),
-        ),
-        Err(MvccCommitError::Storage(error)) => Some(query::error_response(
-            "58000",
-            &format!("transaction validation failed: {error}"),
-        )),
+    if ctx.mvcc.snapshot_is_active(snapshot) {
+        return None;
     }
+    Some(query::error_response(
+        "40001",
+        "PostgreSQL transaction snapshot expired",
+    ))
 }
 
 /// Validate PostgreSQL snapshot conflicts and commit the buffered write-set.
@@ -947,6 +986,11 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         }];
     }
 
+    // The SCANNED tables (a `SELECT` that read a table it could not enumerate)
+    // are the only ones judged at table granularity. A table this transaction
+    // merely WROTE is judged by the rows it wrote, not by table identity: two
+    // transactions on disjoint keys of one table are independent (RT-2).
+    let scanned_tables = read_tables.clone();
     let mut write_tables = read_tables;
     // Stream the write-set once to learn the tables it touches. The set is read
     // one mutation at a time out of the staging (resident prefix or spill), so the
@@ -980,7 +1024,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         );
     }
     let outcome = if let Some(committer) = ctx.accord.committer() {
-        if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &write_tables) {
+        if let Err(error) = ctx.mvcc.validate_commit(&snapshot, &scanned_tables) {
             Err(error)
         } else {
             // One streaming pass builds the Accord write-set: each partition's
@@ -1093,7 +1137,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
             &ctx.schema,
             &ctx.mvcc,
             &snapshot,
-            &write_tables,
+            &scanned_tables,
             staged,
         )
     };
@@ -2962,6 +3006,139 @@ pub(crate) mod txn_atomicity_tests {
             code, "53000",
             "a commit refused for backpressure must be retryable insufficient_resources, \
              not 58000 system_error: {msgs:?}"
+        );
+
+        ctx.engine.shutdown().unwrap();
+    }
+
+    /// The invariant RT-2 breaks: two transactions touching DISJOINT keys of the same table are
+    /// independent, so BOTH must commit. PostgreSQL raises a serialization failure on read-set /
+    /// write-set OVERLAP, never on table identity alone.
+    ///
+    /// RED as written: `validate_snapshot` (`ferrosa-postgres/src/mvcc.rs:725`) compares the TABLE's
+    /// epoch against the snapshot's `read_ts`, so any concurrent write to a table the transaction
+    /// read from refuses it, however unrelated the rows. The second COMMIT dies with 40001 while the
+    /// two rows share nothing. It fails on the commit path's BEHAVIOUR, not on a missing symbol.
+    #[tokio::test]
+    async fn transactions_on_disjoint_keys_do_not_conflict() {
+        let (_dir, ctx) = make_ctx().await;
+        let read_value = |messages: &[BackendMessage]| {
+            messages.iter().find_map(|message| match message {
+                BackendMessage::DataRow { columns } => columns
+                    .first()
+                    .and_then(Option::as_ref)
+                    .and_then(|bytes| String::from_utf8(bytes.clone()).ok()),
+                _ => None,
+            })
+        };
+        let mut seed = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('d1', 'one')",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('d2', 'two')",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('same', 'orig')",
+        )
+        .await;
+
+        // NEGATIVE CONTROL, run FIRST so it cannot be skipped: two transactions writing the SAME key
+        // ARE dependent and exactly one of them MUST be refused. Without this, a "fix" that simply
+        // never reports a conflict would turn the case below green while breaking the invariant.
+        {
+            let ts = ferrosa_common::accord::Timestamp::synthetic(20);
+            let mut c = Session::new(superuser());
+            let mut d = Session::new(superuser());
+            c.begin_txn(
+                Some(ferrosa_sql::IsolationLevel::Serializable),
+                ctx.mvcc.snapshot_with_cluster_ts(ts),
+            );
+            d.begin_txn(
+                Some(ferrosa_sql::IsolationLevel::Serializable),
+                ctx.mvcc.snapshot_with_cluster_ts(ts),
+            );
+            execute_simple(&ctx, &mut c, "SELECT v FROM kv WHERE k = 'same'").await;
+            execute_simple(&ctx, &mut d, "SELECT v FROM kv WHERE k = 'same'").await;
+            execute_simple(&ctx, &mut c, "UPDATE kv SET v = 'c' WHERE k = 'same'").await;
+            execute_simple(&ctx, &mut d, "UPDATE kv SET v = 'd' WHERE k = 'same'").await;
+            let mc = execute_simple(&ctx, &mut c, "COMMIT").await;
+            let md = execute_simple(&ctx, &mut d, "COMMIT").await;
+            let refused = |m: &[BackendMessage]| {
+                m.iter().any(|x| match x {
+                    BackendMessage::ErrorResponse { fields } => {
+                        fields.iter().any(|(_, v)| v == "40001")
+                    }
+                    _ => false,
+                })
+            };
+            assert!(
+                refused(&mc) ^ refused(&md),
+                "same-key writers are dependent: EXACTLY ONE must be refused (C={mc:?} D={md:?})"
+            );
+        }
+        execute_simple(&ctx, &mut seed, "UPDATE kv SET v = 'orig' WHERE k = 'same'").await;
+
+        // Two transactions from overlapping snapshots, each READING the table (which is what puts
+        // it in the read-set) and writing its OWN key.
+        let before = ferrosa_common::accord::Timestamp::synthetic(19);
+        let mut a = Session::new(superuser());
+        let mut b = Session::new(superuser());
+        a.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot_with_cluster_ts(before),
+        );
+        b.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot_with_cluster_ts(before),
+        );
+        execute_simple(&ctx, &mut a, "SELECT v FROM kv WHERE k = 'd1'").await;
+        execute_simple(&ctx, &mut b, "SELECT v FROM kv WHERE k = 'd2'").await;
+        execute_simple(
+            &ctx,
+            &mut a,
+            "UPDATE kv SET v = 'one-updated' WHERE k = 'd1'",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut b,
+            "UPDATE kv SET v = 'two-updated' WHERE k = 'd2'",
+        )
+        .await;
+
+        let ma = execute_simple(&ctx, &mut a, "COMMIT").await;
+        assert!(
+            matches!(&ma[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
+            "A writes d1 only and must commit: {ma:?}"
+        );
+        let mb = execute_simple(&ctx, &mut b, "COMMIT").await;
+        assert!(
+            matches!(&mb[..], [BackendMessage::CommandComplete { tag }] if tag == "COMMIT"),
+            "B writes d2 only - a DISJOINT key - so refusing it is the false conflict: {mb:?}"
+        );
+
+        // VALUES, not counts: both writes must be readable afterwards.
+        let mut reader = Session::new(superuser());
+        let v1 = execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'd1'").await;
+        let v2 = execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'd2'").await;
+        assert_eq!(
+            read_value(&v1).as_deref(),
+            Some("one-updated"),
+            "A's write took effect"
+        );
+        assert_eq!(
+            read_value(&v2).as_deref(),
+            Some("two-updated"),
+            "B's write took effect"
         );
 
         ctx.engine.shutdown().unwrap();

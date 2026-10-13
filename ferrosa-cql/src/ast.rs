@@ -167,6 +167,9 @@ pub enum Statement {
         timeout_ms: Option<u64>,
         statements: Vec<Statement>,
         rollback: bool,
+        /// `LET` bindings declared in this block, in declaration order. Each names a read
+        /// that is explicit at parse time (see [`LetBinding`]).
+        bindings: Vec<LetBinding>,
     },
     /// `COMMIT [TRANSACTION [<id>]]` — commits a transaction. `txn_id = Some(id)`
     /// targets a connection-independent transaction by id; `None` resolves via the
@@ -185,6 +188,18 @@ pub enum Statement {
         txn_id: String,
         inner: Box<Statement>,
     },
+}
+
+/// A `LET <name> = SELECT ...` binding inside a transaction block.
+///
+/// The read is DECLARED in the statement, so the transaction's read-set is known at PARSE
+/// time rather than inferred from an open transaction. `stmt_index` points at the SELECT this
+/// binding names inside `TransactionBlock::statements`; later statements in the same block may
+/// reference `name` instead of re-reading storage.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LetBinding {
+    pub name: String,
+    pub stmt_index: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,10 +486,24 @@ pub struct InsertStatement {
 pub enum Assignment {
     /// Simple: `col = term`
     Simple { column: String, value: Term },
-    /// Addition: `col = col + term` (counter increment or collection append)
-    Add { column: String, value: Term },
-    /// Subtraction: `col = col - term` (counter decrement or collection subtract)
-    Sub { column: String, value: Term },
+    /// Addition: `col = <lhs> + term` (counter increment or collection append).
+    ///
+    /// `lhs` is the name on the left of the operator — the column itself for a plain
+    /// self-increment (`v = v + 1`), or the name a `LET` block bound (`v = cur + 1`). It is kept
+    /// rather than dropped because a transaction must RESOLVE it to the value it read; without it
+    /// the two forms are indistinguishable and the read inside the transaction is lost.
+    Add {
+        column: String,
+        value: Term,
+        lhs: Option<String>,
+    },
+    /// Subtraction: `col = <lhs> - term` (counter decrement or collection subtract). See
+    /// [`Self::Add`], which carries the same `lhs`.
+    Sub {
+        column: String,
+        value: Term,
+        lhs: Option<String>,
+    },
     /// Map/list element: `col[key] = term`
     Element {
         column: String,

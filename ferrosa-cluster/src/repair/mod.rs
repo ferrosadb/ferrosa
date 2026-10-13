@@ -27,7 +27,9 @@ pub mod trigger;
 pub use cluster_view::{
     ClusterRepairView, ClusterTopology, ProbeOutcome, RepairProbe, RingTopology, RpcRepairProbe,
 };
-pub use coordinator::{RepairCoordinator, SessionExecutor, SessionResult, SessionStats};
+pub use coordinator::{
+    InitiatedRepair, RepairCoordinator, SessionExecutor, SessionResult, SessionStats,
+};
 pub use executor::{
     InMemoryRepairStore, LocalRepairExecutor, RepairStore, StorageEngineRepairStore,
 };

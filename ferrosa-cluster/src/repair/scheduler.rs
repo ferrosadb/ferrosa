@@ -53,6 +53,33 @@ pub fn select_initiated_ranges(
     local_node_id: u64,
     rf: usize,
 ) -> Vec<InitiatedRange> {
+    owned_ranges_with_peers(ring, local_node_id, rf)
+        .into_iter()
+        .filter_map(|(start, end, peers, is_initiator)| {
+            is_initiator.then_some(InitiatedRange { start, end, peers })
+        })
+        .collect()
+}
+
+/// How many of `local_node_id`'s owned ranges have at least one live peer to
+/// compare against. `0` means this replica is the only live replica of
+/// everything it owns for the range set, so it has nothing to verify against —
+/// the fact that distinguishes the two benign empty-repair cycles (see
+/// [`NoSessionsReason`]).
+pub fn owned_ranges_with_live_peers(ring: &TokenRing, local_node_id: u64, rf: usize) -> usize {
+    owned_ranges_with_peers(ring, local_node_id, rf).len()
+}
+
+/// Every range `local_node_id` owns, with its live peers (excluding self) and
+/// whether this replica is the range's elected initiator.
+///
+/// Ranges with no live peer are dropped: there is nothing to reconcile. Private
+/// so the two views above cannot drift apart — one is the subset to initiate,
+/// the other is the count that says whether initiating anything was possible at
+/// all.
+type OwnedRange = (i64, i64, Vec<u64>, bool);
+
+fn owned_ranges_with_peers(ring: &TokenRing, local_node_id: u64, rf: usize) -> Vec<OwnedRange> {
     // The local node must be in the ring to compare host_ids; if it isn't yet
     // (still joining), it initiates nothing.
     let local_host = match ring.get_node(local_node_id) {
@@ -84,9 +111,7 @@ pub fn select_initiated_ranges(
             .filter_map(|&n| ring.get_node(n).map(|info| info.host_id))
             .min();
 
-        if initiator_host == Some(local_host) {
-            out.push(InitiatedRange { start, end, peers });
-        }
+        out.push((start, end, peers, initiator_host == Some(local_host)));
     }
     out
 }
@@ -221,6 +246,27 @@ static AUTO_REPAIR_SKIPPED_NOT_READY: AtomicU64 = AtomicU64::new(0);
 static AUTO_REPAIR_TABLES_FAILED: AtomicU64 = AtomicU64::new(0);
 static AUTO_REPAIR_TABLES_NO_SESSIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Why a repair cycle attempted no session at all.
+///
+/// Both cases leave `ok == 0 && failed == 0`, and neither is an error — but they
+/// are different facts about the table, and collapsing them into one warning
+/// that says "replica agreement NOT verified" made a replica that is behaving
+/// exactly as designed read as a broken one. Only ONE initiator per range is
+/// elected (the live participant with the lowest host_id — see
+/// [`select_initiated_ranges`]), so every other replica of that range starts
+/// nothing on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoSessionsReason {
+    /// This replica owns ranges of the table that have a live peer, but another
+    /// participant is their elected initiator. Expected, benign, and the state
+    /// of every replica except one per range.
+    NotAnInitiator,
+    /// Every range of the table this replica owns has no other live replica:
+    /// there is nothing to compare against. Benign, but this replica verifies
+    /// nothing and cannot until a peer returns.
+    SoleLiveReplica,
+}
+
 /// How one table's repair cycle ended, derived from its session results.
 ///
 /// `Converged` is a positive claim ("replicas agree") and so requires at least
@@ -228,8 +274,9 @@ static AUTO_REPAIR_TABLES_NO_SESSIONS: AtomicU64 = AtomicU64::new(0);
 /// nothing ran, or in which sessions failed, must never read as converged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepairOutcome {
-    /// No sessions were attempted (e.g. no peers / no initiated ranges).
-    NoSessionsAttempted,
+    /// No sessions were attempted; `reason` says which of the two benign
+    /// situations this replica is in.
+    NoSessionsAttempted { reason: NoSessionsReason },
     /// Every attempted session failed.
     AllFailed { failed: u64 },
     /// Some sessions succeeded and some failed.
@@ -241,9 +288,20 @@ pub enum RepairOutcome {
 }
 
 /// Pure classification of a table's session tallies into a [`RepairOutcome`].
-pub fn classify_repair_outcome(ok: u64, failed: u64, divergent: bool) -> RepairOutcome {
+///
+/// `no_sessions_reason` is only consulted when nothing ran at all; the caller
+/// derives it from what THIS replica owns (see
+/// [`owned_ranges_with_live_peers`]), so the classification never has to guess.
+pub fn classify_repair_outcome(
+    ok: u64,
+    failed: u64,
+    divergent: bool,
+    no_sessions_reason: NoSessionsReason,
+) -> RepairOutcome {
     match (ok, failed) {
-        (0, 0) => RepairOutcome::NoSessionsAttempted,
+        (0, 0) => RepairOutcome::NoSessionsAttempted {
+            reason: no_sessions_reason,
+        },
         (0, failed) => RepairOutcome::AllFailed { failed },
         (ok, failed) if failed > 0 => RepairOutcome::PartialFailure { ok, failed },
         _ if divergent => RepairOutcome::DivergenceReconciled,
@@ -443,11 +501,12 @@ impl AutoRepairScheduler {
                 "auto-repair: starting initiated repair for table"
             );
 
-            let results = self
+            let initiated = self
                 .coord
                 .repair_initiated(executor.clone(), &ring, local_node_id, rf, &table)
                 .await;
-            let outcome = Self::observe(&table, &results);
+            let outcome =
+                Self::observe(&table, &initiated.results, initiated.ranges_with_live_peers);
 
             self.in_flight.remove(&table);
             // Only a cycle that actually compared replicas counts as repaired;
@@ -461,7 +520,7 @@ impl AutoRepairScheduler {
                 RepairOutcome::AllFailed { .. } | RepairOutcome::PartialFailure { .. } => {
                     AUTO_REPAIR_TABLES_FAILED.fetch_add(1, Ordering::Relaxed);
                 }
-                RepairOutcome::NoSessionsAttempted => {
+                RepairOutcome::NoSessionsAttempted { .. } => {
                     AUTO_REPAIR_TABLES_NO_SESSIONS.fetch_add(1, Ordering::Relaxed);
                 }
             }
@@ -476,7 +535,18 @@ impl AutoRepairScheduler {
 
     /// Aggregate + loudly report one table's session results (FMEA #7) and
     /// return the classified outcome.
-    fn observe(table: &TableId, results: &[SessionResult]) -> RepairOutcome {
+    ///
+    /// `ranges_with_live_peers` is how many of the table's ranges THIS replica
+    /// owns *and* has a live peer for (see [`owned_ranges_with_live_peers`]). It
+    /// is what lets an empty cycle be reported honestly: starting nothing while
+    /// a peer exists is the elected initiator's job being done by someone else,
+    /// whereas having no live peer at all means this replica verifies nothing and
+    /// cannot.
+    fn observe(
+        table: &TableId,
+        results: &[SessionResult],
+        ranges_with_live_peers: usize,
+    ) -> RepairOutcome {
         let mut ok = 0u64;
         let mut failed = 0u64;
         let mut streamed = 0u64;
@@ -507,13 +577,41 @@ impl AutoRepairScheduler {
         AUTO_REPAIR_PARTITIONS_STREAMED.fetch_add(streamed, Ordering::Relaxed);
         AUTO_REPAIR_TIMESTAMP_TIES.fetch_add(ties, Ordering::Relaxed);
 
-        let outcome = classify_repair_outcome(ok, failed, streamed > 0 || ties > 0);
+        let no_sessions_reason = if ranges_with_live_peers == 0 {
+            NoSessionsReason::SoleLiveReplica
+        } else {
+            NoSessionsReason::NotAnInitiator
+        };
+        let outcome =
+            classify_repair_outcome(ok, failed, streamed > 0 || ties > 0, no_sessions_reason);
         let (keyspace, tbl) = (table.keyspace(), table.table());
         match outcome {
-            RepairOutcome::NoSessionsAttempted => tracing::warn!(
+            // The designed state of every replica except the range's elected
+            // initiator. Reported with the reason named, because the old text
+            // ("replica agreement NOT verified") read as a failure on a replica
+            // that is behaving exactly as intended.
+            RepairOutcome::NoSessionsAttempted {
+                reason: NoSessionsReason::NotAnInitiator,
+            } => tracing::info!(
                 keyspace,
                 table = tbl,
-                "auto-repair: no repair sessions attempted for table (no peers or no initiated ranges); replica agreement NOT verified"
+                ranges_with_live_peers,
+                "auto-repair: another live replica is the elected initiator for every range of \
+                 this table (one initiator per range: the live participant with the lowest \
+                 host_id); nothing to verify on this replica — replica agreement is that \
+                 replica's to report"
+            ),
+            // This replica verifies nothing and cannot: it has no live co-replica
+            // for anything it owns. Distinct from the above, and the only case in
+            // which this replica's silence leaves the table unverified.
+            RepairOutcome::NoSessionsAttempted {
+                reason: NoSessionsReason::SoleLiveReplica,
+            } => tracing::info!(
+                keyspace,
+                table = tbl,
+                "auto-repair: no live peer for any range of this table that this replica owns; \
+                 no session attempted and none is possible — replica agreement is not verified \
+                 on this replica until a peer returns"
             ),
             RepairOutcome::AllFailed { failed } => tracing::error!(
                 keyspace,
@@ -1044,37 +1142,55 @@ mod tests {
     #[test]
     fn classify_converged_requires_a_success_and_no_failures() {
         assert_eq!(
-            classify_repair_outcome(3, 0, false),
+            classify_repair_outcome(3, 0, false, NoSessionsReason::NotAnInitiator),
             RepairOutcome::Converged
         );
         // Zero sessions is NOT convergence: nothing was compared.
         assert_eq!(
-            classify_repair_outcome(0, 0, false),
-            RepairOutcome::NoSessionsAttempted
+            classify_repair_outcome(0, 0, false, NoSessionsReason::NotAnInitiator),
+            RepairOutcome::NoSessionsAttempted {
+                reason: NoSessionsReason::NotAnInitiator
+            }
         );
         // Zero sessions with a (nonsensical) divergent flag is still no sessions.
         assert_eq!(
-            classify_repair_outcome(0, 0, true),
-            RepairOutcome::NoSessionsAttempted
+            classify_repair_outcome(0, 0, true, NoSessionsReason::SoleLiveReplica),
+            RepairOutcome::NoSessionsAttempted {
+                reason: NoSessionsReason::SoleLiveReplica
+            }
+        );
+    }
+
+    /// The two benign empty cycles must stay DISTINGUISHABLE: the whole point of
+    /// the split is that a replica which is simply not the initiator is not
+    /// reported the same way as one with no peer to compare against.
+    #[test]
+    fn classify_carries_the_reason_for_an_empty_cycle() {
+        let not_initiator = classify_repair_outcome(0, 0, false, NoSessionsReason::NotAnInitiator);
+        let sole = classify_repair_outcome(0, 0, false, NoSessionsReason::SoleLiveReplica);
+        assert_ne!(
+            not_initiator, sole,
+            "an empty cycle on a non-initiator replica must not be indistinguishable from an \
+             empty cycle with no peer at all"
         );
     }
 
     #[test]
     fn classify_failures_are_never_converged() {
         assert_eq!(
-            classify_repair_outcome(0, 4, false),
+            classify_repair_outcome(0, 4, false, NoSessionsReason::NotAnInitiator),
             RepairOutcome::AllFailed { failed: 4 }
         );
         assert_eq!(
-            classify_repair_outcome(0, 1, true),
+            classify_repair_outcome(0, 1, true, NoSessionsReason::NotAnInitiator),
             RepairOutcome::AllFailed { failed: 1 }
         );
         assert_eq!(
-            classify_repair_outcome(2, 1, false),
+            classify_repair_outcome(2, 1, false, NoSessionsReason::NotAnInitiator),
             RepairOutcome::PartialFailure { ok: 2, failed: 1 }
         );
         assert_eq!(
-            classify_repair_outcome(2, 1, true),
+            classify_repair_outcome(2, 1, true, NoSessionsReason::NotAnInitiator),
             RepairOutcome::PartialFailure { ok: 2, failed: 1 }
         );
     }
@@ -1082,7 +1198,7 @@ mod tests {
     #[test]
     fn classify_divergence_reconciled_when_all_ok() {
         assert_eq!(
-            classify_repair_outcome(2, 0, true),
+            classify_repair_outcome(2, 0, true, NoSessionsReason::NotAnInitiator),
             RepairOutcome::DivergenceReconciled
         );
     }
@@ -1167,5 +1283,97 @@ mod tests {
         sched.run_tick().await;
 
         assert_eq!(sched.last_outcome(&t), Some(&RepairOutcome::Converged));
+    }
+
+    /// The state that misled an investigation: a healthy replica of a healthy
+    /// cluster that is simply NOT the elected initiator. Its tick must record
+    /// `NotAnInitiator` — a replica that owns ranges with live peers and starts
+    /// nothing — and not `SoleLiveReplica`, which is the case where there is
+    /// genuinely no peer to compare against.
+    #[tokio::test]
+    async fn run_tick_on_a_non_initiator_replica_records_the_benign_reason() {
+        let t = tid("app", "non_in");
+        let exec = Arc::new(RecordingExecutor::new());
+        let ctx = Arc::new(MockContext {
+            ring: three_node_ring(),
+            // node 2's host_id is higher than node 1's, so node 1 is the
+            // initiator of every range and node 2 initiates none.
+            local_node_id: 2,
+            exec: exec.clone(),
+            tables: vec![(t.clone(), 3)],
+            ready: true,
+        });
+        let mut sched = AutoRepairScheduler::new(
+            RepairCoordinator::default(),
+            ctx,
+            AutoRepairConfig::default(),
+        );
+
+        sched.run_tick().await;
+
+        assert_eq!(
+            sched.last_outcome(&t),
+            Some(&RepairOutcome::NoSessionsAttempted {
+                reason: NoSessionsReason::NotAnInitiator
+            }),
+            "a non-initiating replica of a healthy table must be reported as such"
+        );
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "and it must have run no session"
+        );
+    }
+
+    /// The other benign empty cycle: this replica owns ranges and has NO live
+    /// peer for any of them, so no session was possible. Distinct from
+    /// `NotAnInitiator` — a single-node ring is the minimal shape of it.
+    #[tokio::test]
+    async fn run_tick_with_no_live_peer_records_the_sole_replica_reason() {
+        let t = tid("app", "sole");
+        let mut ring = TokenRing::new();
+        ring.add_node(1, node("10.0.0.1:7000", 1, NodeState::Normal));
+        ring.assign_tokens(1, &[100, 400, 700]);
+        let exec = Arc::new(RecordingExecutor::new());
+        let ctx = Arc::new(MockContext {
+            ring,
+            local_node_id: 1,
+            exec,
+            tables: vec![(t.clone(), 1)],
+            ready: true,
+        });
+        let mut sched = AutoRepairScheduler::new(
+            RepairCoordinator::default(),
+            ctx,
+            AutoRepairConfig::default(),
+        );
+
+        sched.run_tick().await;
+
+        assert_eq!(
+            sched.last_outcome(&t),
+            Some(&RepairOutcome::NoSessionsAttempted {
+                reason: NoSessionsReason::SoleLiveReplica
+            }),
+            "a replica with no live peer must not be reported as merely not-the-initiator"
+        );
+    }
+
+    /// The count the scheduler reports from: ranges owned with a live peer.
+    #[test]
+    fn owned_ranges_with_live_peers_counts_only_ranges_that_have_a_peer() {
+        let three = three_node_ring();
+        assert!(
+            owned_ranges_with_live_peers(&three, 1, 3) > 0,
+            "every range of a 3-node RF=3 ring has the other two as live peers"
+        );
+
+        let mut alone = TokenRing::new();
+        alone.add_node(1, node("10.0.0.1:7000", 1, NodeState::Normal));
+        alone.assign_tokens(1, &[100, 400, 700]);
+        assert_eq!(
+            owned_ranges_with_live_peers(&alone, 1, 1),
+            0,
+            "a single-node ring has nothing to compare against"
+        );
     }
 }
