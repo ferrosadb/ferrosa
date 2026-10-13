@@ -29,6 +29,10 @@ const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
 // Bound retries so an unavailable cluster cannot hold a test actor indefinitely.
 const SERIALIZATION_RETRIES: usize = 8;
+// Bounds the PACING of a retry, never the NUMBER of retries: SERIALIZATION_RETRIES
+// above is what terminates a retrying transaction.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+const RETRY_MAX_DELAY: Duration = Duration::from_millis(160);
 const WRITE_SKEW_WRITERS: usize = 2;
 const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
@@ -788,16 +792,55 @@ where
     Fut: std::future::Future<Output = Result<RecordedTransaction>>,
 {
     let mut history = Vec::with_capacity(SERIALIZATION_RETRIES + 1);
-    for _ in 0..=SERIALIZATION_RETRIES {
+    for retry in 0..=SERIALIZATION_RETRIES {
         let transaction = attempt().await?;
         let committed = transaction.committed;
+        let invocation = transaction.invoked;
         history.push(transaction);
         if committed {
             break;
         }
-        tokio::task::yield_now().await;
+        // A refusal applied nothing, so re-entering at once re-reads exactly what
+        // lost. Pace the retry instead: see `retry_backoff`.
+        tokio::time::sleep(retry_backoff(retry, invocation)).await;
     }
     Ok(history)
+}
+
+/// How long to wait before re-entering a transaction that a retryable
+/// serialization refusal aborted.
+///
+/// The engine refuses a commit whose read set went stale under a conflicting
+/// commit, and a refusal changes NO state — so a transaction that retries at
+/// once finds the state that made it lose, enters the same conflict window, and
+/// loses again. Two writers released from one barrier therefore refuse each
+/// other for as long as their attempts keep overlapping, and the pair can
+/// consume both retry budgets with neither having committed: that is the
+/// measured shape of the line-298 progress assertion (13, 7 and 7 consecutive
+/// refusals in three of the recorded runs, against the usual one).
+///
+/// Bounded exponential backoff with a per-attempt offset drawn from the refused
+/// attempt's OWN invocation sequence — which differs between the two writers and
+/// between successive attempts — puts the retry in a different conflict window,
+/// so the retry is a new schedule rather than a replay of the one that lost.
+fn retry_backoff(retry: usize, invocation: u64) -> Duration {
+    let shift = u32::try_from(retry).unwrap_or(u32::MAX).min(4);
+    let window = (RETRY_BASE_DELAY * (1_u32 << shift)).min(RETRY_MAX_DELAY);
+    let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    window + Duration::from_millis(retry_jitter_millis(invocation, window_millis))
+}
+
+/// Spread the offset across the whole backoff window. A plain
+/// `invocation % window` would leave two writers whose sequences differ by one
+/// a fixed one millisecond apart — still lockstep, still the same window.
+fn retry_jitter_millis(invocation: u64, window_millis: u64) -> u64 {
+    if window_millis == 0 {
+        return 0;
+    }
+    let mixed = invocation
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(invocation >> 17);
+    mixed % (window_millis + 1)
 }
 
 async fn wait_for_phase(
@@ -984,8 +1027,9 @@ mod tests {
     use super::{
         actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
         is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
-        retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
-        RecordedTransaction, TransactionOperation, ACTORS, SERIALIZATION_RETRIES,
+        retry_backoff, retry_jitter_millis, retry_serializable_transactions, run_until_actor_failure,
+        wait_for_phase, FaultSchedule, RecordedTransaction, TransactionOperation, ACTORS,
+        RETRY_BASE_DELAY, RETRY_MAX_DELAY, SERIALIZATION_RETRIES,
     };
 
     #[tokio::test]
@@ -1294,6 +1338,49 @@ mod tests {
             elapsed <= std::time::Duration::from_secs(5),
             "the retry pacing must stay bounded so a refused transaction cannot hold an actor \
              indefinitely; it took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_retry_backoff_is_always_positive_and_never_unbounded() {
+        assert_eq!(retry_backoff(0, 0), RETRY_BASE_DELAY);
+        for retry in 0..=SERIALIZATION_RETRIES + 4 {
+            for invocation in [0_u64, 1, 2, 3, 7, 2_000, 2_001, u64::MAX] {
+                let delay = retry_backoff(retry, invocation);
+                assert!(
+                    delay >= RETRY_BASE_DELAY,
+                    "a refusal is never retried in the same instant: {delay:?} at retry {retry}"
+                );
+                assert!(
+                    delay <= RETRY_MAX_DELAY * 2,
+                    "the pacing is bounded, so it cannot become a hang: {delay:?} at retry {retry}"
+                );
+            }
+        }
+    }
+
+    /// Adjacent invocation sequences are two writers released together — the
+    /// write-skew pair. Their offsets must be spread across the window, not
+    /// spaced by a fixed small amount: a plain modulo would put them a
+    /// millisecond apart and leave the pair in the same conflict window.
+    #[test]
+    fn a_retry_backoff_spreads_adjacent_invocations_across_the_window() {
+        let window = 100_u64;
+        let mut offsets: Vec<u64> = (0..100)
+            .map(|invocation| retry_jitter_millis(invocation, window))
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        assert!(
+            offsets.iter().all(|offset| *offset <= window),
+            "every offset stays inside the backoff window: {offsets:?}"
+        );
+        assert!(
+            offsets.len() >= 50,
+            "100 adjacent invocation sequences must spread across the window rather than \
+             collapse onto a fixed spacing; got {} distinct offsets",
+            offsets.len()
         );
     }
 }
