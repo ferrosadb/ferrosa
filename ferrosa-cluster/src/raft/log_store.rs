@@ -610,7 +610,11 @@ impl SledLogStore {
     /// True only for the transient "directory lock already held" condition,
     /// not a real corruption/IO fault. sled wraps the OS `EWOULDBLOCK` as
     /// `Error::Io` whose message contains "could not acquire lock".
-    fn is_lock_contention(err: &sled::Error) -> bool {
+    ///
+    /// `pub(crate)`: the controller's post-give-up recovery
+    /// (`open_raft_log_store_with_recovery`) must tell a transient
+    /// in-process lock contention from a real fault before it re-opens.
+    pub(crate) fn is_lock_contention(err: &sled::Error) -> bool {
         match err {
             sled::Error::Io(io) => {
                 io.kind() == std::io::ErrorKind::WouldBlock

@@ -274,11 +274,56 @@ fn first_fatal_line(log: &str) -> Option<&str> {
     log.lines().find(|line| is_fatal_line(line))
 }
 
-/// The body of every readiness failure this harness reports: a headline naming
-/// the condition, the node's first fatal/ERROR line, and its log tail.
-fn readiness_failure_message(headline: &str, log: &str) -> String {
+/// The last `/readyz` answer the harness saw, so a wait that expires can name
+/// the CONDITION the node was reporting rather than only the process state.
+///
+/// An alive-but-unready node answers `503` with a body saying what it is waiting
+/// for (`{"ready":false,"waiting_for":"raft_leader"}`). The wait this harness
+/// replaced threw that body away, so a node patiently reporting its condition
+/// was indistinguishable from a dead one — and CI could never have shown which
+/// condition it was (t_4e9a3e61).
+struct Probe {
+    /// HTTP status of the answer.
+    status: u16,
+    /// The body — the node's own statement of why it is not ready.
+    body: String,
+}
+
+/// Split a raw HTTP response — [`http_get`] returns the whole thing, status line
+/// and headers included — into its status code and body.
+fn parse_probe(raw: &str) -> Option<Probe> {
+    let (head, body) = raw.split_once("\r\n\r\n")?;
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(Probe {
+        status,
+        body: body.trim().to_string(),
+    })
+}
+
+/// The condition a `/readyz` body names, or the body itself when it names none.
+///
+/// `waiting_for` is the field the node uses to say what it is waiting on. It is
+/// present on every not-ready answer (`ferrosa/src/web/readiness.rs`) and is the
+/// thing a failing harness has to quote.
+fn probe_condition(body: &str) -> String {
+    match json_str(body, "waiting_for") {
+        Some(condition) => format!("waiting_for=\"{condition}\""),
+        None => body.chars().take(200).collect(),
+    }
+}
+
+/// The body of every readiness failure this harness reports: a headline, the
+/// CONDITION the node reported (its `/readyz` answer, or that it exited), the
+/// node's first fatal/ERROR line, and its log tail.
+fn readiness_failure_message(headline: &str, condition: &str, log: &str) -> String {
     format!(
-        "{headline}\n  first fatal/ERROR line: {}\n  log tail (last {LOG_TAIL_LINES} lines):\n{}",
+        "{headline}\n  node reported: {condition}\n  first fatal/ERROR line: {}\n  log tail (last {LOG_TAIL_LINES} lines):\n{}",
         first_fatal_line(log).unwrap_or(NO_FATAL_LINE),
         tail(log, LOG_TAIL_LINES)
     )
@@ -298,15 +343,35 @@ fn node_exit_message(
         &format!(
             "node {host_id} exited {waited:?} into the readiness wait: {status}; web={web_port}"
         ),
+        "the process is gone — it can report no /readyz condition",
         log,
     )
 }
 
 /// What the harness must say when the node is still running but never answered
-/// ready: the budget it spent, and the node's first fatal line beside the tail.
-fn readiness_timeout_message(host_id: &str, web_port: u16, timeout: Duration, log: &str) -> String {
+/// ready: the budget it spent, the CONDITION the node itself reported on
+/// `/readyz` (or that it never answered at all), and its first fatal line
+/// beside the tail.
+fn readiness_timeout_message(
+    host_id: &str,
+    web_port: u16,
+    timeout: Duration,
+    last_probe: Option<&Probe>,
+    log: &str,
+) -> String {
+    let condition = match last_probe {
+        Some(probe) => format!(
+            "HTTP {} from /readyz: {}",
+            probe.status,
+            probe_condition(&probe.body)
+        ),
+        None => {
+            format!("/readyz on web={web_port} never answered — connection refused or timed out")
+        }
+    };
     readiness_failure_message(
         &format!("node {host_id} did not become ready within {timeout:?}; web={web_port}"),
+        &condition,
         log,
     )
 }
@@ -314,14 +379,20 @@ fn readiness_timeout_message(host_id: &str, web_port: u16, timeout: Duration, lo
 /// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
 /// every listener up).
 ///
-/// A node process that has EXITED can never report ready, and polling it costs
-/// the whole budget: the last line of that node's log was 74 s before the panic
-/// in the merge-queue failure of PR #551 (job 115370033050). So the child is
-/// checked on every poll, and its exit — with the status and the node's own
-/// first fatal line — fails the wait at once (t_4e9a3e61).
+/// Two failure modes, and each is named with what the node reported:
+///
+/// * the process has EXITED — it can never report ready, and polling it costs
+///   the whole budget (the last line of that node's log was 74 s before the
+///   panic in the merge-queue failure of PR #551, job 115370033050). The child is
+///   checked on every poll and its exit fails the wait at once.
+/// * the node is ALIVE but never ready — its `/readyz` body says what it is
+///   waiting for, and the failure quotes that condition rather than leaving the
+///   reader with a tail. An alive node reporting `waiting_for` used to look
+///   exactly like a dead one (t_4e9a3e61).
 fn wait_ready(node: &mut Node, timeout: Duration) {
     let started = Instant::now();
     let deadline = started + timeout;
+    let mut last_probe: Option<Probe> = None;
     loop {
         if let Some(status) = node.child.try_wait().expect("try_wait on the node") {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
@@ -336,16 +407,25 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
                 )
             );
         }
-        if let Some(body) = http_get(node.ports.web, "/readyz", None) {
-            if body.contains("\"ready\":true") {
+        if let Some(raw) = http_get(node.ports.web, "/readyz", None) {
+            if raw.contains("\"ready\":true") {
                 return;
+            }
+            if let Some(probe) = parse_probe(&raw) {
+                last_probe = Some(probe);
             }
         }
         if Instant::now() >= deadline {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
             panic!(
                 "{}",
-                readiness_timeout_message(&node.host_id, node.ports.web, timeout, &log)
+                readiness_timeout_message(
+                    &node.host_id,
+                    node.ports.web,
+                    timeout,
+                    last_probe.as_ref(),
+                    &log
+                )
             );
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -756,11 +836,13 @@ fn a_readiness_failure_leads_with_the_first_fatal_line_not_only_the_tail() {
         "the fixture holds exactly one fatal line"
     );
     assert!(
-        !tail_lines.iter().any(|l| l.contains("PairSchemaSync REFUSED")),
+        !tail_lines
+            .iter()
+            .any(|l| l.contains("PairSchemaSync REFUSED")),
         "the fixture must put the ERROR above the tail, or this test proves nothing"
     );
 
-    let message = readiness_failure_message("headline", &log);
+    let message = readiness_failure_message("headline", "waiting_for=\"raft_leader\"", &log);
     assert!(
         message.contains(
             "first fatal/ERROR line: 2026-10-13T15:13:01.000000Z ERROR \
@@ -773,7 +855,7 @@ fn a_readiness_failure_leads_with_the_first_fatal_line_not_only_the_tail() {
         "the tail is still printed beside it:\n{message}"
     );
 
-    let silent = readiness_failure_message("headline", "INFO a\nINFO b\n");
+    let silent = readiness_failure_message("headline", "HTTP 503 from /readyz", "INFO a\nINFO b\n");
     assert!(
         silent.contains(NO_FATAL_LINE),
         "a log with nothing fatal in it must say so:\n{silent}"
@@ -799,8 +881,10 @@ fn a_node_exit_is_named_with_its_status_and_its_first_fatal_line() {
         log,
     );
     assert!(
-        message.contains("node 11111111-1111-1111-1111-111111111111 exited 700ms into the \
-                          readiness wait: exit status: 70"),
+        message.contains(
+            "node 11111111-1111-1111-1111-111111111111 exited 700ms into the \
+                          readiness wait: exit status: 70"
+        ),
         "the headline names the exit status and when it happened:\n{message}"
     );
     assert!(
@@ -808,10 +892,117 @@ fn a_node_exit_is_named_with_its_status_and_its_first_fatal_line() {
         "and quotes the node's own first fatal line:\n{message}"
     );
 
-    let timed_out = readiness_timeout_message("h", 1, Duration::from_secs(90), "INFO a\n");
+    let timed_out = readiness_timeout_message("h", 1, Duration::from_secs(90), None, "INFO a\n");
     assert!(
         timed_out.contains("did not become ready within 90s"),
-        "a timeout still says what it waited for:\n{timed_out}"
+        "a timeout still says what it waited for:\\n{timed_out}"
+    );
+    assert!(
+        timed_out.contains("/readyz on web=1 never answered"),
+        "a node that never answered says so, instead of inventing a condition:\\n{timed_out}"
+    );
+
+    // The condition the node reported is what a probe-shaped failure must name.
+    let probe = parse_probe(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 41\r\n\r\n\
+         {\"ready\":false,\"waiting_for\":\"raft_leader\"}",
+    )
+    .expect("an HTTP response parses");
+    assert_eq!(probe.status, 503);
+    let waiting =
+        readiness_timeout_message("h", 1, Duration::from_secs(90), Some(&probe), "INFO a\n");
+    assert!(
+        waiting.contains("HTTP 503 from /readyz: waiting_for=\"raft_leader\""),
+        "the timeout must quote the /readyz condition the node reported:\\n{waiting}"
+    );
+}
+
+/// The OTHER readiness failure the harness must name: the node is ALIVE and
+/// reporting a condition it never satisfies.
+///
+/// The wait this harness replaced threw the `/readyz` body away, so a node
+/// patiently reporting `waiting_for` was indistinguishable from a dead one and
+/// CI could never show which condition was being waited on (t_4e9a3e61). The
+/// requirement is not "fail when the process is gone" but "fail naming THE
+/// CONDITION the node reports".
+///
+/// The node here can never be ready: the PostgreSQL port it must bind is already
+/// held, so its `postgres` listener records a bind failure and `/readyz` answers
+/// `503 {"ready":false,"waiting_for":"listeners",…}` for the node's whole life.
+/// A failed listener is checked before every other readiness condition
+/// (`ferrosa/src/web/readiness.rs`), and a failed background listener is not
+/// fatal — the node keeps running, which is the case this test exists for.
+#[test]
+fn a_node_alive_but_never_ready_fails_the_wait_naming_its_condition() {
+    let mut taken: HashSet<u16> = HashSet::new();
+    let ports = alloc_ports(&mut taken);
+    let dir = tempfile::tempdir().expect("node data dir");
+    // Held for the whole test: the node can never bind it.
+    let _held_pg = std::net::TcpListener::bind(("127.0.0.1", ports.pg))
+        .expect("occupy the node's PostgreSQL port");
+    let host_id = "11111111-1111-1111-1111-111111111111".to_string();
+    let mut node = spawn_node_with_env(dir, ports, host_id, "alive-never-ready", None, &[]);
+
+    // Bounded poll for the node to be UP and reporting a not-ready condition.
+    // Waiting for the condition before calling `wait_ready` is what makes this
+    // deterministic: a failed listener, once recorded, gates every later answer.
+    let observe_deadline = Instant::now() + Duration::from_secs(45);
+    let mut observed: Option<String> = None;
+    while Instant::now() < observe_deadline {
+        if let Some(status) = node.child.try_wait().expect("try_wait on the node") {
+            panic!("the never-ready fixture node exited before reporting a condition: {status}");
+        }
+        if let Some(raw) = http_get(node.ports.web, "/readyz", None) {
+            if !raw.contains("\"ready\":true") {
+                if let Some(condition) =
+                    parse_probe(&raw).and_then(|p| json_str(&p.body, "waiting_for"))
+                {
+                    observed = Some(condition);
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let observed = observed.expect(
+        "the node must report a /readyz waiting condition within 45s \
+         (is the PostgreSQL listener still started when its port is held?)",
+    );
+
+    let budget = Duration::from_secs(10);
+    let started = Instant::now();
+    let failure = catch_unwind(AssertUnwindSafe(|| {
+        wait_ready(&mut node, budget);
+    }))
+    .expect_err("a node that is alive but never ready must not pass the readiness wait");
+    let elapsed = started.elapsed();
+    let message = panic_text(failure);
+    eprintln!("readiness wait failed after {elapsed:?} naming condition {observed:?}:\n{message}");
+
+    assert!(
+        node.child
+            .try_wait()
+            .expect("try_wait on the node")
+            .is_none(),
+        "the node must still be ALIVE when the wait fails — this is the \
+         alive-but-never-ready case, not the dead-process one:\n{message}"
+    );
+    assert!(
+        elapsed >= budget,
+        "the wait must spend its whole budget on a node that is up but never ready \
+         (it took {elapsed:?}):\n{message}"
+    );
+    assert!(
+        message.contains(&observed),
+        "the failure must NAME the condition the node reported ({observed:?}):\n{message}"
+    );
+    assert!(
+        message.contains("waiting_for"),
+        "the failure must quote the /readyz condition, not only the process state:\n{message}"
+    );
+    assert!(
+        !message.contains("exited"),
+        "an alive node did not exit; the failure must not claim it did:\n{message}"
     );
 }
 
