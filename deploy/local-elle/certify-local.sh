@@ -36,18 +36,46 @@ running() { [ "$(podman inspect "$1" --format '{{.State.Running}}' 2>/dev/null)"
 ready() { curl -sf --max-time 3 "http://localhost:$1/readyz" >/dev/null 2>&1; }
 port_for() { case "$1" in 1) echo 9090;; 2) echo 9091;; 3) echo 9092;; esac; }
 
+# Cluster-formation gate, the CI job's own recipe (`.github/workflows/ci.yml`,
+# postgres-jepsen-fault "Wait for PostgreSQL cluster formation"): `/readyz` alone
+# is NOT sufficient. A node answers /readyz as soon as a Raft leader exists; its
+# DDL path and its ring view can still be catching up, and a driver connecting in
+# that window sees fewer than three nodes. A run of THIS script started the
+# generator against a 2-node view and the generator died with
+# `initial cluster metadata fetch: Connection refused` before writing any history.
+# So require, on every node: its own host_id, mode "cluster", DDL on the cluster
+# path, and all three host ids present and "Normal" in the ring.
+HOST_IDS=(e11e0001-0001-0001-0001-000000000001
+          e11e0002-0002-0002-0002-000000000002
+          e11e0003-0003-0003-0003-000000000003)
+
+formed() {
+  local n="$1" web status ring
+  web="$(port_for "$n")"
+  status="$(curl -sf --max-time 5 "http://localhost:$web/api/cluster/status")" || return 1
+  printf '%s' "$status" | jq -e --arg id "${HOST_IDS[$((n - 1))]}" \
+    '.host_id == $id and .mode == "cluster" and .ddl_path == "cluster"' >/dev/null || return 1
+  ring="$(curl -sf --max-time 5 "http://localhost:$web/api/cluster/ring")" || return 1
+  printf '%s' "$ring" | jq -e \
+    '([.nodes[] | select(.state == "Normal") | .host_id] | sort) == (["e11e0001-0001-0001-0001-000000000001","e11e0002-0002-0002-0002-000000000002","e11e0003-0003-0003-0003-000000000003"] | sort)' \
+    >/dev/null || return 1
+  return 0
+}
+
 wait_all_ready() {
-  local i n up rdy
+  local i n up rdy ok
   for i in $(seq 1 60); do
-    up=0; rdy=0
+    up=0; rdy=0; ok=0
     for n in 1 2 3; do
       running "ferrosa-elle-node${n}" && up=$((up + 1))
       ready "$(port_for "$n")" && rdy=$((rdy + 1))
+      formed "$n" && ok=$((ok + 1))
     done
-    [ "$up" = 3 ] && [ "$rdy" = 3 ] && { log "3/3 running and ready (${i}x2s)"; return 0; }
+    [ "$up" = 3 ] && [ "$rdy" = 3 ] && [ "$ok" = 3 ] \
+      && { log "3/3 running, ready, cluster mode, 3-node Normal ring (${i}x2s)"; return 0; }
     sleep 2
   done
-  die "cluster did not reach 3 running + 3 ready"
+  die "cluster did not reach 3 running + 3 ready + 3 cluster-formed (last: up=$up ready=$rdy formed=$ok)"
 }
 
 # Kill a node, verify it actually died, restart it, verify it actually returned.
