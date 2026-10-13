@@ -125,6 +125,8 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
 
     let event_clock = Arc::new(AtomicU64::new(1));
     let transfer_retry_count = Arc::new(AtomicUsize::new(0));
+    let register_retry_count = Arc::new(AtomicUsize::new(0));
+    let predicate_retry_count = Arc::new(AtomicUsize::new(0));
     let write_skew_retry_count = Arc::new(AtomicUsize::new(0));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
         ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
@@ -137,6 +139,8 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
         let transfer_retry_count = Arc::clone(&transfer_retry_count);
+        let register_retry_count = Arc::clone(&register_retry_count);
+        let predicate_retry_count = Arc::clone(&predicate_retry_count);
         let write_skew_retry_count = Arc::clone(&write_skew_retry_count);
         let history = Arc::clone(&history);
         let predicate_barrier = Arc::clone(&predicate_barrier);
@@ -152,19 +156,11 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                         let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
                         let transfers =
                             transfer_once(&client, &table, operation_id, &event_clock).await?;
-                        transfer_retry_count
-                            .fetch_add(transfers.len().saturating_sub(1), Ordering::Relaxed);
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .extend(transfers);
-                        let register =
+                        record_attempts(&history, &transfer_retry_count, transfers);
+                        let registers =
                             register_once(&client, &table, operation_id * 2 + 1, &event_clock)
                                 .await?;
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(register);
+                        record_attempts(&history, &register_retry_count, registers);
                     }
 
                     wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
@@ -174,22 +170,14 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                         observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
                             .await?
                     };
-                    history
-                        .lock()
-                        .expect("history mutex poisoned")
-                        .push(predicate);
+                    record_attempts(&history, &predicate_retry_count, predicate);
 
                     wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
                     if is_write_skew_writer(actor) {
                         let transactions =
                             write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock)
                                 .await?;
-                        write_skew_retry_count
-                            .fetch_add(transactions.len().saturating_sub(1), Ordering::Relaxed);
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .extend(transactions);
+                        record_attempts(&history, &write_skew_retry_count, transactions);
                     } else {
                         let observation = observe_predicate_once(
                             &client,
@@ -198,10 +186,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                             &event_clock,
                         )
                         .await?;
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(observation);
+                        record_attempts(&history, &predicate_retry_count, observation);
                     }
                     Ok(())
                 },
@@ -256,9 +241,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2)
-            + transfer_retry_count.load(Ordering::Relaxed)
-            + write_skew_retry_count.load(Ordering::Relaxed),
+        expected_history_length(OperationRetryCounts {
+            transfers: transfer_retry_count.load(Ordering::Relaxed),
+            registers: register_retry_count.load(Ordering::Relaxed),
+            predicates: predicate_retry_count.load(Ordering::Relaxed),
+            write_skews: write_skew_retry_count.load(Ordering::Relaxed),
+        }),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -560,7 +548,23 @@ async fn transfer_attempt(
     .await
 }
 
+/// A register read/modify/write, retried on a retryable refusal.
+///
+/// This is the shape a lost update hides in: recording the refusal and moving
+/// on leaves the register short of the read/modify/writes that were invoked, and
+/// the checker then judges a history no client ran. Measured: the register phase
+/// always recorded exactly ten attempts — one per invocation, no retry — while
+/// between one and nine of the ten were refused.
 async fn register_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| register_attempt(client, table, id, event_clock)).await
+}
+
+async fn register_attempt(
     client: &Client,
     table: &str,
     _id: u64,
@@ -610,7 +614,20 @@ async fn register_once(
     .await
 }
 
+/// A predicate read, retried on a retryable refusal. A refused observation still
+/// carries the values it read, but it is an abort, and the checker drops it — so
+/// leaving it un-retried quietly removes an observation from the history.
 async fn observe_predicate_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| observe_predicate_attempt(client, table, id, event_clock))
+        .await
+}
+
+async fn observe_predicate_attempt(
     client: &Client,
     table: &str,
     _id: u64,
@@ -640,7 +657,19 @@ async fn observe_predicate_once(
     .await
 }
 
+/// The predicate phantom insert, retried on a retryable refusal. The assertion it
+/// feeds is a liveness requirement — the workload must attempt the phantom — so a
+/// refused attempt that is never retried is an attempt it did not make.
 async fn insert_phantom_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| phantom_insert_attempt(client, table, id, event_clock)).await
+}
+
+async fn phantom_insert_attempt(
     client: &Client,
     table: &str,
     _id: u64,
@@ -843,6 +872,47 @@ fn retry_jitter_millis(invocation: u64, window_millis: u64) -> u64 {
     mixed % (window_millis + 1)
 }
 
+/// Record a retrying operation's attempts and count the retries it took.
+///
+/// EVERY attempt is recorded, refusals included: the history is the evidence, and
+/// a refused attempt that is dropped would hide the conflict it lost to. The
+/// count of the extra records is what the history-length identity is reconciled
+/// against, so "every invoked operation has a recorded completion" stays true
+/// however many retries each operation needed.
+fn record_attempts(
+    history: &Mutex<Vec<RecordedTransaction>>,
+    retry_count: &AtomicUsize,
+    attempts: Vec<RecordedTransaction>,
+) {
+    retry_count.fetch_add(attempts.len().saturating_sub(1), Ordering::Relaxed);
+    history
+        .lock()
+        .expect("history mutex poisoned")
+        .extend(attempts);
+}
+
+/// The extra records each retrying operation kind contributed: one per retry
+/// that followed a retryable refusal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OperationRetryCounts {
+    transfers: usize,
+    registers: usize,
+    predicates: usize,
+    write_skews: usize,
+}
+
+impl OperationRetryCounts {
+    fn total(self) -> usize {
+        self.transfers + self.registers + self.predicates + self.write_skews
+    }
+}
+
+/// The history length the workload must record: one completion per operation it
+/// invokes, plus one extra record for each retry of ANY operation kind.
+fn expected_history_length(retries: OperationRetryCounts) -> usize {
+    ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2) + retries.total()
+}
+
 async fn wait_for_phase(
     barrier: &tokio::sync::Barrier,
     actor_failure_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
@@ -1025,11 +1095,12 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
-        retry_backoff, retry_jitter_millis, retry_serializable_transactions, run_until_actor_failure,
-        wait_for_phase, FaultSchedule, RecordedTransaction, TransactionOperation, ACTORS,
-        RETRY_BASE_DELAY, RETRY_MAX_DELAY, SERIALIZATION_RETRIES,
+        actor_client_count, actor_client_urls, convergence_node_count, expected_history_length,
+        initial_workload_statements, is_retryable_serialization_state, is_write_skew_writer,
+        predicate_observations, record_attempts, retry_backoff, retry_jitter_millis,
+        retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
+        OperationRetryCounts, RecordedTransaction, TransactionOperation, ACTORS, RETRY_BASE_DELAY,
+        RETRY_MAX_DELAY, SERIALIZATION_RETRIES, TRANSACTIONS_PER_ACTOR,
     };
 
     #[tokio::test]
@@ -1381,6 +1452,59 @@ mod tests {
             "100 adjacent invocation sequences must spread across the window rather than \
              collapse onto a fixed spacing; got {} distinct offsets",
             offsets.len()
+        );
+    }
+
+    /// A refusal is RETAINED and retried. Dropping it would hide the conflict it
+    /// lost to; not retrying it is what leaves a register read/modify/write lost.
+    #[test]
+    fn a_refused_operation_records_every_attempt_and_counts_the_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let history = std::sync::Mutex::new(Vec::new());
+        let retries = AtomicUsize::new(0);
+        let attempt = |committed: bool, invoked: u64| RecordedTransaction {
+            id: invoked,
+            invoked,
+            completed: invoked + 1,
+            committed,
+            operations: Vec::new(),
+        };
+
+        record_attempts(
+            &history,
+            &retries,
+            vec![attempt(false, 1), attempt(false, 2), attempt(true, 3)],
+        );
+
+        assert_eq!(retries.load(Ordering::Relaxed), 2);
+        let history = history.lock().expect("history mutex poisoned");
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history
+                .iter()
+                .map(|transaction| transaction.committed)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
+
+    #[test]
+    fn history_length_accounts_for_a_retry_of_every_operation_kind() {
+        let invoked = ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2);
+
+        assert_eq!(
+            expected_history_length(OperationRetryCounts::default()),
+            invoked
+        );
+        assert_eq!(
+            expected_history_length(OperationRetryCounts {
+                transfers: 1,
+                registers: 2,
+                predicates: 3,
+                write_skews: 4,
+            }),
+            invoked + 10
         );
     }
 }
