@@ -451,6 +451,20 @@ fn notify_contention_hook(attempt: u32) {
     }
 }
 
+/// Install the test seam from outside this module: `open_raft_log_store_*` runs
+/// on the caller's thread, so a test driving a transition can observe the
+/// contention it causes without sleeping at the open site.
+#[cfg(test)]
+pub(crate) fn set_contention_hook(hook: impl Fn(u32) + 'static) {
+    CONTENTION_HOOK.with(|h| *h.borrow_mut() = Some(std::rc::Rc::new(hook)));
+}
+
+/// Remove the observer installed by [`set_contention_hook`].
+#[cfg(test)]
+pub(crate) fn clear_contention_hook() {
+    CONTENTION_HOOK.with(|h| *h.borrow_mut() = None);
+}
+
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
 impl SledLogStore {
     /// Open (or create) a log store at the given filesystem `path`.

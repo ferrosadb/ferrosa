@@ -33,8 +33,9 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::config::SslMode;
@@ -127,6 +128,7 @@ impl Node {
             &self.host_id,
             cluster_name,
             seed,
+            &[],
         );
     }
 }
@@ -137,13 +139,16 @@ impl Drop for Node {
     }
 }
 
-/// Launch one `ferrosa` process against an existing data directory.
+/// Launch one `ferrosa` process against an existing data directory. `extra_env`
+/// is the caller's addition to the node's environment (the fault-injection seam
+/// the harness tests use); it is applied last, so a test can override anything.
 fn spawn_child(
     data_dir: &Path,
     ports: Ports,
     host_id: &str,
     cluster_name: &str,
     seed: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> Child {
     let log = std::fs::File::create(data_dir.join("node.log")).expect("create node log");
     let stderr = log.try_clone().expect("clone log handle");
@@ -179,6 +184,7 @@ fn spawn_child(
     if let Some(seed) = seed {
         cmd.env("FERROSA_SEED", seed);
     }
+    cmd.envs(extra_env.iter().copied());
     cmd.spawn().expect("spawn ferrosa node")
 }
 
@@ -189,8 +195,20 @@ fn spawn_node(
     cluster_name: &str,
     seed: Option<&str>,
 ) -> Node {
+    spawn_node_with_env(dir, ports, host_id, cluster_name, seed, &[])
+}
+
+/// [`spawn_node`] with extra environment for the node process.
+fn spawn_node_with_env(
+    dir: tempfile::TempDir,
+    ports: Ports,
+    host_id: String,
+    cluster_name: &str,
+    seed: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Node {
     let data_dir = dir.path().to_path_buf();
-    let child = spawn_child(&data_dir, ports, &host_id, cluster_name, seed);
+    let child = spawn_child(&data_dir, ports, &host_id, cluster_name, seed, extra_env);
     Node {
         _dir: dir,
         data_dir,
@@ -229,11 +247,95 @@ fn json_str(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// How many trailing log lines a failing harness prints.
+const LOG_TAIL_LINES: usize = 40;
+
+/// The line a diagnostic must not leave out: what a tail-only dump cannot show.
+const NO_FATAL_LINE: &str = "none — the log has no FATAL/ERROR line";
+
+/// Whether a log line says the node was failing: the synchronous `FATAL:` line
+/// `lifecycle` writes when a thread panics (and the bare one it also writes to
+/// stderr), or a line carrying the `ERROR` level.
+///
+/// The level is surrounded by spaces because tracing prints the timestamp and
+/// the target first (`2026-…Z ERROR ferrosa_cluster::pair::ddl: …`).
+fn is_fatal_line(line: &str) -> bool {
+    line.contains("FATAL:") || line.contains(" ERROR ") || line.starts_with("ERROR ")
+}
+
+/// The FIRST line in `log` that says why the node stopped.
+///
+/// The tail alone is not the evidence. In the merge-queue failure of PR #551
+/// (job 115370033050) the node's last line was 74 s before the harness gave up,
+/// so the 40 lines it printed were the shutdown — the cause (the `ERROR
+/// PairSchemaSync REFUSED` storm) sat above them. The first fatal/ERROR line is
+/// the one that names the failure (t_4e9a3e61).
+fn first_fatal_line(log: &str) -> Option<&str> {
+    log.lines().find(|line| is_fatal_line(line))
+}
+
+/// The body of every readiness failure this harness reports: a headline naming
+/// the condition, the node's first fatal/ERROR line, and its log tail.
+fn readiness_failure_message(headline: &str, log: &str) -> String {
+    format!(
+        "{headline}\n  first fatal/ERROR line: {}\n  log tail (last {LOG_TAIL_LINES} lines):\n{}",
+        first_fatal_line(log).unwrap_or(NO_FATAL_LINE),
+        tail(log, LOG_TAIL_LINES)
+    )
+}
+
+/// What the harness must say when the node process is GONE: the exit status,
+/// when it went, and the node's own first fatal line. Waiting out the budget on
+/// a process that already exited hides the cause and wastes the round.
+fn node_exit_message(
+    host_id: &str,
+    web_port: u16,
+    status: &ExitStatus,
+    waited: Duration,
+    log: &str,
+) -> String {
+    readiness_failure_message(
+        &format!(
+            "node {host_id} exited {waited:?} into the readiness wait: {status}; web={web_port}"
+        ),
+        log,
+    )
+}
+
+/// What the harness must say when the node is still running but never answered
+/// ready: the budget it spent, and the node's first fatal line beside the tail.
+fn readiness_timeout_message(host_id: &str, web_port: u16, timeout: Duration, log: &str) -> String {
+    readiness_failure_message(
+        &format!("node {host_id} did not become ready within {timeout:?}; web={web_port}"),
+        log,
+    )
+}
+
 /// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
-/// every listener up). Panics with the node log if it never does.
-fn wait_ready(node: &Node, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+/// every listener up).
+///
+/// A node process that has EXITED can never report ready, and polling it costs
+/// the whole budget: the last line of that node's log was 74 s before the panic
+/// in the merge-queue failure of PR #551 (job 115370033050). So the child is
+/// checked on every poll, and its exit — with the status and the node's own
+/// first fatal line — fails the wait at once (t_4e9a3e61).
+fn wait_ready(node: &mut Node, timeout: Duration) {
+    let started = Instant::now();
+    let deadline = started + timeout;
     loop {
+        if let Some(status) = node.child.try_wait().expect("try_wait on the node") {
+            let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+            panic!(
+                "{}",
+                node_exit_message(
+                    &node.host_id,
+                    node.ports.web,
+                    &status,
+                    started.elapsed(),
+                    &log
+                )
+            );
+        }
         if let Some(body) = http_get(node.ports.web, "/readyz", None) {
             if body.contains("\"ready\":true") {
                 return;
@@ -242,10 +344,8 @@ fn wait_ready(node: &Node, timeout: Duration) {
         if Instant::now() >= deadline {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
             panic!(
-                "node {} did not become ready within {timeout:?}; web={} log tail:\n{}",
-                node.host_id,
-                node.ports.web,
-                tail(&log, 40)
+                "{}",
+                readiness_timeout_message(&node.host_id, node.ports.web, timeout, &log)
             );
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -258,6 +358,8 @@ fn tail(text: &str, lines: usize) -> String {
 }
 
 /// Every node's log tail, labelled — the evidence a failing harness must show.
+/// Each block also leads with that node's first fatal/ERROR line, because a tail
+/// can start after the cause (t_4e9a3e61).
 fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
     nodes
         .iter()
@@ -265,9 +367,10 @@ fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
         .map(|(i, n)| {
             let log = std::fs::read_to_string(n.log_path()).unwrap_or_default();
             format!(
-                "\n===== node {i} host {} (web {}) log tail =====\n{}",
+                "\n===== node {i} host {} (web {}) first fatal/ERROR line: {}; log tail =====\n{}",
                 n.host_id,
                 n.ports.web,
+                first_fatal_line(&log).unwrap_or(NO_FATAL_LINE),
                 tail(&log, lines)
             )
         })
@@ -474,7 +577,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
         let node = spawn_node(dir, *ports, host_id, &cluster_name, Some(&seeds_for(i)));
         nodes.push(node);
     }
-    for node in &nodes {
+    for node in nodes.iter_mut() {
         wait_ready(node, Duration::from_secs(90));
     }
 
@@ -619,4 +722,165 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
         ),
         Err(_) => { /* relation does not exist — the durable drop held */ }
     }
+}
+
+// ── a node that dies on its way up ─────────────────────────────────────────────
+
+/// A readiness failure must quote the node's FIRST fatal/ERROR line, not only a
+/// tail that can start after the cause. In the merge-queue failure of PR #551 the
+/// dumped tail began at the node's shutdown and the `PairSchemaSync REFUSED`
+/// storm that named the trouble sat above it (t_4e9a3e61).
+#[test]
+fn a_readiness_failure_leads_with_the_first_fatal_line_not_only_the_tail() {
+    // 60 lines, with the ERROR second: the 40-line tail cannot contain it.
+    let mut log = String::from(
+        "2026-10-13T15:13:00.000000Z  INFO ferrosa: ferrosa starting\n\
+         2026-10-13T15:13:01.000000Z ERROR ferrosa_cluster::pair::ddl: PairSchemaSync REFUSED: \
+         this node is the pair primary and its schema is authoritative peer=33333333\n",
+    );
+    for n in 0..58 {
+        log.push_str(&format!(
+            "2026-10-13T15:13:02.000000Z  INFO ferrosa_net::lane_actor: filler {n}\n"
+        ));
+    }
+    log.push_str(
+        "2026-10-13T15:13:16.000000Z  INFO ferrosa_net::lane_actor: lane actor: shutting down lane=Data\n",
+    );
+
+    let tail_lines: Vec<&str> = log.lines().rev().take(LOG_TAIL_LINES).collect();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("PairSchemaSync REFUSED"))
+            .count(),
+        1,
+        "the fixture holds exactly one fatal line"
+    );
+    assert!(
+        !tail_lines.iter().any(|l| l.contains("PairSchemaSync REFUSED")),
+        "the fixture must put the ERROR above the tail, or this test proves nothing"
+    );
+
+    let message = readiness_failure_message("headline", &log);
+    assert!(
+        message.contains(
+            "first fatal/ERROR line: 2026-10-13T15:13:01.000000Z ERROR \
+             ferrosa_cluster::pair::ddl: PairSchemaSync REFUSED"
+        ),
+        "the first fatal line is the evidence, not the tail:\n{message}"
+    );
+    assert!(
+        message.contains("lane actor: shutting down lane=Data"),
+        "the tail is still printed beside it:\n{message}"
+    );
+
+    let silent = readiness_failure_message("headline", "INFO a\nINFO b\n");
+    assert!(
+        silent.contains(NO_FATAL_LINE),
+        "a log with nothing fatal in it must say so:\n{silent}"
+    );
+}
+
+/// A node exit is the one readiness failure the harness can settle at once: it
+/// must name the exit status, when it happened, and the node's first fatal line.
+#[test]
+fn a_node_exit_is_named_with_its_status_and_its_first_fatal_line() {
+    use std::os::unix::process::ExitStatusExt;
+    // The shape `fatal_exit(70, ..)` after an injected worker panic leaves.
+    let status = ExitStatus::from_raw(70 << 8);
+    let log = "2026-10-13T17:10:06.639956Z FATAL: thread 'fault-injected' panicked at \
+               ferrosa/src/main.rs:1863:27: injected fault: worker thread panic\n\
+               2026-10-13T17:10:06.671163Z ferrosa exiting code=70 reason=injected fault\n";
+
+    let message = node_exit_message(
+        "11111111-1111-1111-1111-111111111111",
+        33385,
+        &status,
+        Duration::from_millis(700),
+        log,
+    );
+    assert!(
+        message.contains("node 11111111-1111-1111-1111-111111111111 exited 700ms into the \
+                          readiness wait: exit status: 70"),
+        "the headline names the exit status and when it happened:\n{message}"
+    );
+    assert!(
+        message.contains("FATAL: thread 'fault-injected' panicked at"),
+        "and quotes the node's own first fatal line:\n{message}"
+    );
+
+    let timed_out = readiness_timeout_message("h", 1, Duration::from_secs(90), "INFO a\n");
+    assert!(
+        timed_out.contains("did not become ready within 90s"),
+        "a timeout still says what it waited for:\n{timed_out}"
+    );
+}
+
+/// The panic message as text, so a test can assert on what the harness SAID and
+/// not merely that it panicked.
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => message.to_string(),
+            Err(_) => "<non-string panic payload>".to_string(),
+        },
+    }
+}
+
+/// The harness must fail the moment the node process is GONE, naming the exit
+/// status and the node's own first fatal line — not poll a corpse for the whole
+/// budget and then print a tail that starts after the cause.
+///
+/// PR #551 was ejected from the merge queue by this test burning its full 90 s
+/// readiness budget on a process that had already exited: the last line of the
+/// log it dumped was 74 s before the panic (job 115370033050, t_4e9a3e61).
+///
+/// The node here fails at startup on purpose, through the binary's hidden
+/// fault-injection seam: a worker thread panics, `lifecycle` writes the
+/// synchronous `FATAL:` line, and the process exits 70.
+#[test]
+fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
+    let mut taken: HashSet<u16> = HashSet::new();
+    let ports = alloc_ports(&mut taken);
+    let dir = tempfile::tempdir().expect("node data dir");
+    let host_id = "11111111-1111-1111-1111-111111111111".to_string();
+    let mut node = spawn_node_with_env(
+        dir,
+        ports,
+        host_id,
+        "drop-dead-startup",
+        None,
+        &[("FERROSA_TEST_FAULT_INJECT", "panic-thread")],
+    );
+
+    let started = Instant::now();
+    let failure = catch_unwind(AssertUnwindSafe(|| {
+        wait_ready(&mut node, Duration::from_secs(90));
+    }))
+    .expect_err("a node process that has exited must not pass the readiness wait");
+    let elapsed = started.elapsed();
+    let message = panic_text(failure);
+    eprintln!("readiness wait failed after {elapsed:?}:\n{message}");
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the wait must fail as soon as the process is gone, not spend its budget \
+         (it took {elapsed:?}):\n{message}"
+    );
+    assert!(
+        message.contains("exited") && message.contains("exit status"),
+        "the failure must name the exit status:\n{message}"
+    );
+    assert!(
+        message.contains("70"),
+        "the exit status must be the node's (70 for the injected panic):\n{message}"
+    );
+    assert!(
+        message.contains("FATAL:") && message.contains("injected fault: worker thread panic"),
+        "the failure must quote the node's first fatal line:\n{message}"
+    );
+    assert!(
+        !message.contains("did not become ready within"),
+        "a node that exited did not merely time out:\n{message}"
+    );
 }

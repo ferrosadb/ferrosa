@@ -1153,10 +1153,10 @@ impl ModeController {
             tracing::error!(%e, dir = %raft_dir.display(), "failed to create per-DC raft log dir");
             return;
         }
-        let mut log_store = match SledLogStore::new(&raft_dir) {
+        let mut log_store = match open_raft_log_store_with_recovery(&raft_dir) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!(%e, "failed to create Raft log store");
+                tracing::error!(%e, dir = %raft_dir.display(), "failed to create Raft log store");
                 return;
             }
         };
@@ -3367,6 +3367,70 @@ impl ModeController {
             }
         });
     }
+}
+
+/// Pauses before each extra re-open of the Raft log store, after the production
+/// retry budget (`LockRetryPolicy::DEFAULT`) has been exhausted.
+///
+/// Bounded, and deliberately short: the last re-open starts 3 s after the first
+/// failure, and only a transition that has already lost its Raft is ever on this
+/// path. Nothing here widens the production budget — sled's lock is taken for
+/// the node's whole lifetime when the holder is another live node, so a real
+/// dual-open conflict still surfaces a typed error after this schedule too.
+const LOG_STORE_RECOVERY_PAUSES_MS: [u64; 4] = [200, 400, 800, 1600];
+
+/// Open the Raft log store, re-opening through the in-process directory-lock
+/// race (t_e67af7e7) after the production retry budget has been exhausted.
+///
+/// `SledLogStore::new` retries under `LockRetryPolicy::DEFAULT` (10 attempts,
+/// 50 ms apart, ~490 ms) — deliberately short, because a formation attempt that
+/// waits longer misses its leader window (CL-Tsledrevert). That budget is NOT
+/// widened here. What is added is what happens when it is exhausted. On
+/// 2026-10-13, three real node processes started under deliberate CPU
+/// contention on one box, and the production open gave up (`sled directory lock
+/// still held; giving up ... attempts=10 waited_ms=488`) while another
+/// in-process handle still held sled's directory lock. The caller at that point
+/// used to `return` from the whole cluster transition: the node was left in
+/// `Forming` with NO Raft instance and nothing armed to try again, so `/readyz`
+/// answered `{"ready":false,"waiting_for":"raft_leader"}` — "raft not yet
+/// initialized" — for as long as the process lived, no leader could ever be
+/// elected on it, and only an unrelated later peer event re-drove the
+/// transition. The lock is released within milliseconds to seconds of the
+/// give-up, so a short bounded re-open recovers the node instead of abandoning
+/// consensus (t_4e9a3e61).
+fn open_raft_log_store_with_recovery(raft_dir: &std::path::Path) -> Result<SledLogStore, sled::Error> {
+    let first = match SledLogStore::new(raft_dir) {
+        Ok(store) => return Ok(store),
+        Err(e) => e,
+    };
+    if !SledLogStore::is_lock_contention(&first) {
+        // Not the in-process lock race: re-opening would not tell us anything.
+        return Err(first);
+    }
+    let mut last = first;
+    for (attempt, pause_ms) in LOG_STORE_RECOVERY_PAUSES_MS.iter().enumerate() {
+        tracing::warn!(
+            dir = %raft_dir.display(),
+            attempt = attempt + 1,
+            pause_ms,
+            %last,
+            "raft log store open gave up; re-opening (in-process lock contention, t_e67af7e7)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(*pause_ms));
+        match SledLogStore::new(raft_dir) {
+            Ok(store) => {
+                tracing::info!(
+                    dir = %raft_dir.display(),
+                    attempt = attempt + 1,
+                    "raft log store recovered after the production retry gave up"
+                );
+                return Ok(store);
+            }
+            Err(e) if !SledLogStore::is_lock_contention(&e) => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
 }
 
 // ---------------------------------------------------------------------------
