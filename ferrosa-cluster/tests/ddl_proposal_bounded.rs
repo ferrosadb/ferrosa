@@ -120,4 +120,42 @@ async fn ddl_proposal_on_a_leader_that_cannot_commit_fails_bounded_and_names_the
         "the failure must name the DDL that could not complete (expected it to mention \
          {KS:?}), got: {message}"
     );
+
+    // The bound that expired is the existing agreement bound, and the class is a
+    // retryable one: the DDL is unconfirmed, so the client must retry (possibly
+    // on another node) rather than treat the statement as done.
+    match &err {
+        ferrosa_cluster::ClusterError::DdlProposalNotAgreed {
+            operation,
+            required,
+            alive,
+            timeout_ms,
+            elapsed_ms,
+        } => {
+            assert!(
+                operation.contains(KS),
+                "the error must name the statement, got {operation:?}"
+            );
+            assert_eq!(
+                *required, 2,
+                "a 3-voter group needs 2 voters to agree, got {required}"
+            );
+            assert_eq!(
+                *alive, 1,
+                "only the local voter holds the unconfirmed proposal, got {alive}"
+            );
+            assert_eq!(
+                *timeout_ms, 5000,
+                "the bound must be the existing 5 s agreement bound, not a new one"
+            );
+            assert!(
+                *elapsed_ms >= 5000,
+                "the proposal must have been awaited for the whole bound, got {elapsed_ms}ms"
+            );
+        }
+        other => panic!(
+            "expected ClusterError::DdlProposalNotAgreed (retryable, unconfirmed DDL), got \
+             {other:?}"
+        ),
+    }
 }

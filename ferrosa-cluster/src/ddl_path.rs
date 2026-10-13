@@ -1273,11 +1273,7 @@ fn ddl_op_target(op: &DdlOperation) -> String {
 /// — claiming otherwise would be a fabrication in a fail-loud path.
 fn raft_quorum_and_confirmed(raft: &FerrosRaft) -> (usize, usize) {
     let metrics = raft.metrics().borrow().clone();
-    let voters = metrics
-        .membership_config
-        .membership()
-        .voter_ids()
-        .count();
+    let voters = metrics.membership_config.membership().voter_ids().count();
     (voters / 2 + 1, 1)
 }
 
