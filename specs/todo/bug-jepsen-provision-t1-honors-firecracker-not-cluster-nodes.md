@@ -21,7 +21,7 @@ Caused by:
     {"fault_message":"Boot source error: The kernel file cannot be opened: ..."}
 ```
 
-A user who sets `FERROSA_TEST_CLUSTER_NODES=localhost:49042,localhost:49043,localhost:49044`
+A user who sets `FERROSA_TEST_CLUSTER_NODES=localhost:29042,localhost:29043,localhost:29044`
 expecting to use a pre-provisioned cluster gets a Firecracker failure instead.
 
 ## Where to fix

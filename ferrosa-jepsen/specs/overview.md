@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-09-27
+last_updated: 2026-10-13
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
@@ -150,6 +150,15 @@ recovery, and mixed CQL/PostgreSQL histories are separate acceptance work.
    discovers topology using the normal policy, selects a deterministic host ID
    from its own metadata, and then remaps its execution profile to that node.
    A disposable probe session must not choose the destination session's pin.
+9. **Fixed host ports stay below the kernel's ephemeral range floor.** Every
+   host port the harness or its compose publishes is below `32768` (Linux's
+   `net.ipv4.ip_local_port_range` floor), so the kernel can never already hold
+   one as an outbound connection's source port. A port inside the range makes
+   `docker compose up` fail to bind the mapping before any ferrosa code runs.
+   `tests/host_port_band.rs` walks every YAML in the repo plus the harness port
+   constants (`docker_provision::NODE_CQL_PORTS`, `chaos::DEFAULT_ADMIN_URL`)
+   and fails on any host port at or above the floor; the single-DC Jepsen
+   compose now uses the same 29xxx band as the multi-DC nightly topology.
 
 ## Position in the dependency graph
 

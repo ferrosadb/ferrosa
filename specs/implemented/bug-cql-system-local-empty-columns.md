@@ -83,7 +83,7 @@ which is malformed per the CQL native protocol spec.
    docker run --rm --network host python:3.12-slim sh -c '
      pip install -q cassandra-driver
      python -c "from cassandra.cluster import Cluster
-   c = Cluster([\"localhost\"], port=49042)
+   c = Cluster([\"localhost\"], port=29042)
    s = c.connect()
    print(list(s.execute(\"SELECT now() FROM system.local\")))"
    '
