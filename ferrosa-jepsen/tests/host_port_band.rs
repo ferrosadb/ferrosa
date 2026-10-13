@@ -88,6 +88,38 @@ fn published_host_ports_stay_below_the_ephemeral_range() {
         )),
     }
 
+    // (D) The repo's other node-spawning harnesses default a host port too:
+    // `scripts/rf_evidence.py` (`--base-port`) and `scripts/rf-evidence-ci.sh`
+    // (`RF_BASE_PORT`) start real ferrosa nodes from it, and both defaulted to
+    // 49200 — inside the range on BOTH platforms (macOS's floor is 49152).
+    for (path, label, needle) in [
+        (
+            "scripts/rf_evidence.py",
+            "--base-port",
+            "\"--base-port\", type=int, default=",
+        ),
+        (
+            "scripts/rf-evidence-ci.sh",
+            "RF_BASE_PORT",
+            "RF_BASE_PORT:-",
+        ),
+    ] {
+        let full = root.join(path);
+        let text = std::fs::read_to_string(&full)
+            .unwrap_or_else(|e| panic!("read {}: {e}", full.display()));
+        let port = default_port_after(&text, needle).unwrap_or_else(|| {
+            panic!(
+                "{path}: no {label} default found after {needle:?} — the guard must \
+                 never pass vacuously on a file that moved"
+            )
+        });
+        if port >= EPHEMERAL_PORT_FLOOR {
+            violations.push(format!(
+                "{path}: default {label} = {port} (>= {EPHEMERAL_PORT_FLOOR})"
+            ));
+        }
+    }
+
     assert!(
         violations.is_empty(),
         "fixed host ports must stay BELOW {EPHEMERAL_PORT_FLOOR} (the kernel's ephemeral \
@@ -114,6 +146,16 @@ fn published_host_ports_stay_below_the_ephemeral_range() {
          jepsen-cluster.yml; the driver dials the constant, so a mismatch would dial a port \
          the cluster does not expose"
     );
+}
+
+/// The digits written immediately after `needle`.
+fn default_port_after(text: &str, needle: &str) -> Option<u16> {
+    let rest = &text[text.find(needle)? + needle.len()..];
+    rest.chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 /// Parse the host port out of an URL like
