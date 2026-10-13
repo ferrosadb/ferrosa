@@ -2,7 +2,7 @@
 //!
 //! # Why a staged read set at all
 //!
-//! A SERIALIZABLE transaction's read set was, until the hybrid, a [`HashSet<String>`] of
+//! A SERIALIZABLE transaction's read set was, until the hybrid, a `HashSet<String>` of
 //! TABLE names (`ferrosa-postgres/src/extended.rs`): a read registration was the whole
 //! table, so two READERS of one table registered the same key and collided. That is a
 //! false refusal — two readers of a table do not conflict, because neither wrote anything
@@ -195,6 +195,14 @@ impl StagedRowReads {
         self.inner.spilled_to_disk()
     }
 
+    /// Row-key payload bytes still resident, i.e. the un-spilled prefix. Once the set has
+    /// spilled this is zero, so residency is FLAT in the number of row keys recorded —
+    /// the property `ferrosa-postgres`'s read-set OOM gate measures end to end.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.inner.resident_bytes()
+    }
+
     /// Visit every recorded row key in visit order, one at a time.
     ///
     /// Residency is ONE row key, never the set: a spilled entry is a slice of the staging
@@ -263,6 +271,23 @@ impl PgReadSet {
     #[must_use]
     pub fn row_key_count(&self) -> usize {
         self.row_keys.len()
+    }
+
+    /// Row-granular payload bytes still RESIDENT, as this read set was handed to the
+    /// committer. Bounded by the shared spill buffer in the number of keyed reads, and zero
+    /// once the set has spilled: the OOM gate
+    /// (`ferrosa-postgres/tests/pg_full_scan_memory_bound.rs`) asserts exactly this stays
+    /// FLAT end to end. A resident `HashSet`/`Vec` of row keys is FORBIDDEN on this path.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.row_keys.resident_bytes()
+    }
+
+    /// Whether any row-granular read has reached the disk, i.e. the read set stopped being
+    /// fully resident. Once true, [`Self::resident_bytes`] is zero.
+    #[must_use]
+    pub fn spilled_to_disk(&self) -> bool {
+        self.row_keys.spilled_to_disk()
     }
 
     /// Visit every row-granular read's key, streamed, one at a time.
@@ -364,7 +389,10 @@ mod tests {
             large_resident, 0,
             "once spilling, no row key stays resident — residency is FLAT in N"
         );
-        assert!(!small.spilled_to_disk(), "a small keyed read touches no disk");
+        assert!(
+            !small.spilled_to_disk(),
+            "a small keyed read touches no disk"
+        );
 
         // Completeness at both scales.
         assert_eq!(small.len(), 64);

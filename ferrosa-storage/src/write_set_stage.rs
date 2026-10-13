@@ -445,6 +445,19 @@ impl StagedWriteSet {
         self.bytes
     }
 
+    /// Payload bytes still held in MEMORY, i.e. the un-spilled prefix. The spilled region
+    /// is memory-mapped and is reported by [`Self::bytes`] separately; it is NOT counted
+    /// here because the kernel can reclaim it. A set that has spilled therefore keeps
+    /// NOTHING resident here — residency is FLAT in the entry count, which is the property
+    /// the read-set OOM gate measures.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident
+            .iter()
+            .map(|payload| payload.len() as u64)
+            .sum()
+    }
+
     /// Whether anything reached the disk.
     #[must_use]
     pub fn spilled_to_disk(&self) -> bool {
