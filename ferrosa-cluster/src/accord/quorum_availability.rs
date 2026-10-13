@@ -327,6 +327,61 @@ async fn a_paused_replica_does_not_fail_postgres_transactions_while_a_quorum_is_
     );
 }
 
+/// A LONG PostgreSQL queue over a paused replica — the same criterion as
+/// [`a_paused_replica_does_not_fail_postgres_transactions_while_a_quorum_is_live`],
+/// stressed past the 5 s barrier budget.
+///
+/// Every PG transaction serializes on the one cluster-global barrier key, and a
+/// paused replica widens each transaction's PreAccept-to-Commit window by the
+/// fast-path wait, so the queue drains at roughly one transaction per second.
+/// A barrier near the tail therefore waits far longer than the 5 s barrier
+/// budget — but the engine is applying continuously underneath it, one
+/// predecessor at a time. The barrier must decide on that PROGRESS, not on a
+/// wall clock: each completed apply resets its stall backstop, so the queue
+/// drains and every transaction commits. Before that fix the tail abstained at
+/// exactly 5 s with "PostgreSQL snapshot barrier dependencies were not applied
+/// locally" while its predecessors were still applying — a live quorum failing
+/// a transaction the engine was still resolving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_long_postgres_queue_over_a_paused_replica_still_commits_on_a_live_quorum() {
+    // Enough actors that the tail of the single-key queue outlasts the 5 s
+    // barrier budget; the queue's own drain (not a timeout) must decide.
+    const ACTORS: usize = 9;
+    const TRANSACTIONS_PER_ACTOR: usize = 2;
+
+    let cluster = Cluster::three_nodes();
+    cluster
+        .transport
+        .set(cluster.hosts[2], Reachability::Paused);
+
+    let started = Instant::now();
+    let mut actors = Vec::new();
+    for actor in 0..ACTORS {
+        let committer = Arc::clone(&cluster.committers[actor % 2]);
+        actors.push(tokio::spawn(async move {
+            for _ in 0..TRANSACTIONS_PER_ACTOR {
+                run_postgres_transaction(&committer, actor, 20).await?;
+                run_postgres_read(&committer).await?;
+            }
+            Ok::<(), String>(())
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for actor in actors {
+        if let Err(error) = actor.await.expect("actor task panicked") {
+            failures.push(error);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "a live quorum must commit every transaction of a long queue while node 3 is \
+         paused; {} of {ACTORS} actors failed after {:?}: {failures:#?}",
+        failures.len(),
+        started.elapsed()
+    );
+}
+
 /// The other half of the criterion: with only one of three replicas reachable
 /// there is no quorum, so an error is correct — and it must be prompt and name
 /// the missing quorum, never a dependency-wait timeout.

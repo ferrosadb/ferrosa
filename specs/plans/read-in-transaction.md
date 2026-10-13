@@ -17,7 +17,7 @@ executive_summary: >
 
 | Sprint | Outcome (what a user can do after it) | Gate |
 |---|---|---|
-| S1 | Two known concurrency defects are held down by tests at the level where each reproduces | RT-3's in-process fixture measured GREEN (3/3), so its reproducer MUST be clustered (two processes + wire) - OWED; the live probe holds it meanwhile. RT-2: live probe. |
+| S1 | Both known concurrency defects tested at the level where each reproduces, RT-3 ISOLATED | RT-3: real-process reproducer WRITTEN and GREEN (3 nodes + wire, positive control passing), in-process fixture also GREEN (3/3) - neither reproduces it, so the OWED next step is LIVE re-verification on a healthy cluster (state artifact or not). RT-2: live probe (disjoint-key peers conflict; concurrency alone). RT-3 ISOLATED to the READ inside the transaction: blind writes survive concurrency, read-modify-writes lose the cell - so the read-in-transaction work (CQL `LET` + read-set validation) is ALSO the fix for a live data-loss bug, which raises it above a new-feature priority. |
 | S2 | A transaction can `SELECT` and commit; the read returns the value at the transaction's agreed `t`, validated through Accord | in-repo red at the engine seam, then green |
 | S3 | Transactions with large read/write sets stay bounded in memory | measured flat peak-memory curve at stated N |
 | S4 | Strict-serializability is CERTIFIED, not asserted | Elle `list-append`, `:valid? true`, live RF=3 + nemesis, no assumptions |

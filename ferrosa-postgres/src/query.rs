@@ -1793,6 +1793,19 @@ pub(crate) fn commit_mutations<S: ferrosa_storage::write_set_stage::WriteSetSour
         return Ok(mvcc.current_commit_seq());
     }
     let changes = prepare_row_changes_from_source(engine, schema, &source)?;
+    // A write reads the row it writes: record each written key row-granularly, so
+    // two transactions writing the SAME key conflict while two writing DISJOINT
+    // keys of one table do NOT (RT-2). The table-level check is retained only for
+    // SCANS, which cannot enumerate their rows.
+    for change in &changes {
+        mvcc.record_point_read(
+            snapshot,
+            crate::mvcc::RowKey {
+                table: change.table.clone(),
+                key: change.key.clone(),
+            },
+        );
+    }
     mvcc.commit(snapshot, read_tables, || {
         // The durable apply reads the write-set as a STREAM: a staged, spilled
         // write-set is decoded one mutation at a time, so the apply never
@@ -4551,10 +4564,10 @@ pub(crate) async fn load_catalog_with_mvcc(
 ) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
     let mut catalog = MapCatalog::new();
     if let (Some(mvcc), Some(snapshot)) = (mvcc, snapshot) {
-        if mvcc
-            .validate_commit(snapshot, &std::collections::HashSet::new())
-            .is_err()
-        {
+        // Liveness only: an EXPIRED snapshot must not silently read current rows.
+        // A read-set conflict is a COMMIT-time decision, so it must not refuse
+        // this read — a live snapshot keeps serving its own view.
+        if !mvcc.snapshot_is_active(snapshot) {
             return Err(error_response(
                 "40001",
                 "PostgreSQL transaction snapshot expired",

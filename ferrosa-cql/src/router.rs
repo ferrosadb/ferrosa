@@ -3053,9 +3053,21 @@ pub async fn route_transactional(
             timeout_ms,
             statements,
             rollback,
+            bindings,
         } => Some(
-            route_transaction_block(state, ctx, shim, now, *timeout_ms, statements, *rollback)
-                .await,
+            route_transaction_block(
+                state,
+                ctx,
+                shim,
+                now,
+                *timeout_ms,
+                TxnBlock {
+                    statements: statements.as_slice(),
+                    bindings: bindings.as_slice(),
+                },
+                *rollback,
+            )
+            .await,
         ),
         Statement::Commit { txn_id } => {
             Some(commit_transaction(state, owner, shim, now, txn_id.as_deref()).await)
@@ -3077,13 +3089,126 @@ pub async fn route_transactional(
     }
 }
 
+/// Read each `LET` binding's SELECT once, before any statement of the block routes.
+///
+/// The bound read is the transaction's INPUT. A write whose operand names a binding must carry the
+/// value this transaction read, not a fresh look at storage taken at a different instant, so the read
+/// happens up front and the value is carried forward. Read through the ordinary read path, which is
+/// the same view the front end would serve.
+async fn resolve_bindings(
+    state: &SharedState,
+    ctx: &RequestContext<'_>,
+    statements: &[Statement],
+    bindings: &[crate::ast::LetBinding],
+) -> Result<Vec<(String, CqlValue)>, CqlError> {
+    let mut resolved = Vec::with_capacity(bindings.len());
+    for binding in bindings {
+        let statement = statements.get(binding.stmt_index).ok_or_else(|| {
+            CqlError::ServerError(format!(
+                "LET binding `{}` points at statement {}, which is not in the block",
+                binding.name, binding.stmt_index
+            ))
+        })?;
+        let Statement::Select(select) = statement else {
+            return Err(CqlError::Invalid(format!(
+                "LET binding `{}` must be a SELECT: a transaction can only bind a read",
+                binding.name
+            )));
+        };
+        let result = route_select_raw(state, ctx, select).await?;
+        let value = result
+            .rows
+            .first()
+            .and_then(|row| row.first().cloned().flatten())
+            .ok_or_else(|| {
+                CqlError::Invalid(format!(
+                    "LET binding `{}` read no rows; refusing to continue with nothing to bind",
+                    binding.name
+                ))
+            })?;
+        resolved.push((binding.name.clone(), value));
+    }
+    Ok(resolved)
+}
+
+/// Rewrite an `Add`/`Sub` whose operand names a `LET` binding into the concrete assignment it means.
+///
+/// `SET v = cur + 1` is a read-modify-write, but it parses into the same node as the self-increment
+/// `SET v = v + 1` — the operand is distinguishable only by `lhs`, which is why the parser keeps it.
+/// Unrewritten, the write is treated as a collection merge and refused by name. Refuses loudly on any
+/// operand it cannot evaluate exactly, rather than writing something plausible.
+fn resolve_bound_operands(
+    statement: &Statement,
+    bound: &[(String, CqlValue)],
+) -> Result<Statement, CqlError> {
+    let Statement::Update(update) = statement else {
+        return Ok(statement.clone());
+    };
+    let mut rewritten = update.clone();
+    for assignment in update.assignments.iter() {
+        let (column, value, name, add) = match assignment {
+            Assignment::Add {
+                column,
+                value,
+                lhs: Some(name),
+            } => (column, value, name, true),
+            Assignment::Sub {
+                column,
+                value,
+                lhs: Some(name),
+            } => (column, value, name, false),
+            _ => continue,
+        };
+        let Some((_, base)) = bound.iter().find(|(n, _)| n == name) else {
+            return Err(CqlError::Invalid(format!(
+                "`{column}` is written from `{name}`, which no LET in this block bound; \
+                 a transaction can only consume a value it declared at parse time"
+            )));
+        };
+        let (CqlValue::Int(base), Term::IntegerLiteral(rhs)) = (base, value) else {
+            return Err(CqlError::Invalid(format!(
+                "`{column}` is written from `{name}` with a non-integer operand; only exact integer \
+                 arithmetic is supported inside a transaction, and this is not it"
+            )));
+        };
+        let result = if add {
+            i64::from(*base) + *rhs
+        } else {
+            i64::from(*base) - *rhs
+        };
+        let slot = rewritten
+            .assignments
+            .iter_mut()
+            .find(|a| match (a, assignment) {
+                (Assignment::Add { column: c, .. }, Assignment::Add { column, .. })
+                | (Assignment::Sub { column: c, .. }, Assignment::Sub { column, .. }) => {
+                    c == column
+                }
+                _ => false,
+            })
+            .expect("the assignment came from this same list");
+        *slot = Assignment::Simple {
+            column: column.to_string(),
+            value: Term::IntegerLiteral(result),
+        };
+    }
+    Ok(Statement::Update(rewritten))
+}
+
+/// The body of a `BEGIN TRANSACTION` block: its statements, and the `LET` bindings that name the
+/// reads it declares. Grouped so the block's routing keeps a readable arity.
+struct TxnBlock<'a> {
+    statements: &'a [Statement],
+    bindings: &'a [crate::ast::LetBinding],
+}
+
 async fn route_transaction_block(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     shim: &mut Option<crate::txn_registry::CqlTxnId>,
     now: std::time::Instant,
     timeout_ms: Option<u64>,
-    statements: &[Statement],
+    block: TxnBlock<'_>,
     rollback: bool,
 ) -> Result<RouteResult, CqlError> {
     let owner = ctx.auth.role.as_str();
@@ -3093,8 +3218,13 @@ async fn route_transaction_block(
     })?;
     let id_text = id.to_string();
 
-    for statement in statements {
-        if let Err(error) = route_in_transaction(state, ctx, owner, now, &id_text, statement).await
+    // The block's LET reads happen FIRST, so a write that names a binding carries the value this
+    // transaction read rather than a fresh look at storage taken at a different instant.
+    let bound = resolve_bindings(state, ctx, block.statements, block.bindings).await?;
+
+    for statement in block.statements {
+        let resolved = resolve_bound_operands(statement, &bound)?;
+        if let Err(error) = route_in_transaction(state, ctx, owner, now, &id_text, &resolved).await
         {
             // A body error must not leave an open transaction for the reaper.
             let _ = rollback_transaction(state, owner, shim, Some(&id_text));
@@ -9765,7 +9895,9 @@ async fn route_update(
         // map-key remove) become per-element cells and skip the whole-value RMW.
         // Ops that need a read (counter, list remove-by-value, positional) build
         // nothing here and fall through to the RMW match below.
-        if let Assignment::Add { column, value } | Assignment::Sub { column, value } = assignment {
+        if let Assignment::Add { column, value, .. } | Assignment::Sub { column, value, .. } =
+            assignment
+        {
             let col_meta = table_meta
                 .columns
                 .get(column)
@@ -9835,7 +9967,7 @@ async fn route_update(
                 let val = bridge::term_to_cql_value(value, &cql_type)?;
                 (column.as_str(), val)
             }
-            Assignment::Add { column, value } => {
+            Assignment::Add { column, value, .. } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
@@ -9933,7 +10065,7 @@ async fn route_update(
                     }
                 }
             }
-            Assignment::Sub { column, value } => {
+            Assignment::Sub { column, value, .. } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
@@ -10773,7 +10905,7 @@ fn materialize_update(
                     regular_cells.push((col_idx, val));
                 }
             }
-            Assignment::Add { column, value } | Assignment::Sub { column, value } => {
+            Assignment::Add { column, value, .. } | Assignment::Sub { column, value, .. } => {
                 let col_meta = table_meta
                     .columns
                     .get(column)
@@ -17851,6 +17983,180 @@ mod tests {
     fn keyspace_rf_returns_1_when_keyspace_not_found() {
         let (state, _dir) = setup();
         assert_eq!(keyspace_rf(&state.schema, "nonexistent"), 1);
+    }
+
+    /// The parse-time form: Cassandra's `LET` block declares its read IN the statement, so the
+    /// transaction's read-set is known at PARSE time rather than inferred from an open
+    /// transaction. That is the simpler half of read-in-transaction, and the half the
+    /// read-modify-write defect needs first (see
+    /// `specs/todo/bug-txn-read-modify-write-loses-the-cell.md`).
+    ///
+    /// RED as written: no `LET` keyword exists in the lexer or AST, so this statement is
+    /// REFUSED at parse time today. It fails on that refusal - the behaviour - and not on a
+    /// missing internal symbol: every variant it inspects (`TransactionBlock`, `Select`,
+    /// `Update`) already exists, so removing the fix cannot make it fail to compile.
+    #[test]
+    fn a_let_block_declares_its_read_at_parse_time() {
+        let sql = "BEGIN TRANSACTION; \
+                   LET cur = SELECT v FROM ks.t WHERE aid = 7; \
+                   UPDATE ks.t SET v = cur + 1 WHERE aid = 7; \
+                   COMMIT TRANSACTION";
+        let stmt = crate::parser::parse(sql)
+            .expect("a LET block must parse into a transaction block, not be refused");
+        let (statements, rollback) = match stmt {
+            Statement::TransactionBlock {
+                statements,
+                rollback,
+                ..
+            } => (statements, rollback),
+            other => panic!("a LET block must parse as a transaction block, got {other:?}"),
+        };
+        assert!(!rollback, "a LET block is not a rollback block");
+        assert!(
+            statements.iter().any(|s| matches!(s, Statement::Select(_))),
+            "the LET read must appear in the block as a SELECT, so the read-set is explicit at \
+             parse time: {statements:?}"
+        );
+        assert!(
+            statements.iter().any(|s| matches!(s, Statement::Update(_))),
+            "the UPDATE that consumes the bound value must appear in the block: {statements:?}"
+        );
+    }
+
+    /// PARSE-CONTRACT GUARD, and it is GREEN ON ARRIVAL — say so, because a green test that looks
+    /// like it holds I2 down is worse than no test.
+    ///
+    /// Measured, not assumed: `SET v = cur + 1` parses today. The counter-increment path takes the
+    /// assignment target from the column and DISCARDS the left-hand term, and a bare word is
+    /// accepted as a term, so a bound name is accepted as the operand without being resolved.
+    /// Therefore this test does NOT reproduce I2 and CANNOT fail on it.
+    ///
+    /// I2's real red is at RUNTIME: `route_transaction_block` ignores `bindings`, so the bound name
+    /// resolves to nothing when the write is staged, and the value that reaches the committer is not
+    /// the value this transaction read. That red needs an engine-backed fixture and is still OWED.
+    #[test]
+    fn a_let_binding_is_accepted_as_the_update_operand_at_parse_time() {
+        let sql = "BEGIN TRANSACTION; \
+                   LET cur = SELECT v FROM ks.t WHERE aid = 7; \
+                   UPDATE ks.t SET v = cur + 1 WHERE aid = 7; \
+                   COMMIT TRANSACTION";
+        let stmt = crate::parser::parse(sql)
+            .expect("the bound name must be usable as the UPDATE operand, not refused");
+        let Statement::TransactionBlock {
+            statements,
+            bindings,
+            ..
+        } = stmt
+        else {
+            panic!("a LET block must parse as a transaction block");
+        };
+        assert_eq!(bindings.len(), 1, "exactly one LET binding");
+        assert_eq!(bindings[0].name, "cur");
+        assert!(
+            bindings[0].stmt_index < statements.len(),
+            "the binding must point at the read inside this block"
+        );
+        let update = statements
+            .iter()
+            .find_map(|s| match s {
+                Statement::Update(u) => Some(u),
+                _ => None,
+            })
+            .expect("the block contains the UPDATE");
+        let operand = update
+            .assignments
+            .iter()
+            .find_map(|a| match a {
+                Assignment::Add { lhs, .. } => Some(lhs.clone()),
+                _ => None,
+            })
+            .expect("`SET v = cur + 1` parses as an Add");
+        assert_eq!(
+            operand,
+            Some("cur".to_string()),
+            "the operand must be the BOUND NAME `cur`, not the column `v`: this is the difference \
+             between a read-modify-write and a plain self-increment, and it is what a transaction \
+             resolves to the value it read"
+        );
+    }
+
+    /// The resolution that makes a LET binding feed the write, asserted directly.
+    ///
+    /// The behaviour was first proven end-to-end: before it, a read-modify-write block was refused by
+    /// name ("unsupported collection assignment: Add of a non-collection value"); after it, the
+    /// refusal is gone, the block stages and reaches COMMIT. This pins the rewrite itself so a
+    /// regression is caught without needing a cluster fixture to reach a commit.
+    #[test]
+    fn a_bound_operand_resolves_to_the_value_the_transaction_read() {
+        use crate::ast::{Assignment, Term, UpdateStatement};
+        let statement = Statement::Update(UpdateStatement {
+            keyspace: None,
+            table: "t".to_string(),
+            assignments: vec![Assignment::Add {
+                column: "v".to_string(),
+                value: Term::IntegerLiteral(1),
+                lhs: Some("cur".to_string()),
+            }],
+            where_clauses: vec![],
+            if_exists: false,
+            if_conditions: vec![],
+            using_timestamp: None,
+            using_ttl: None,
+        });
+        let bound = vec![("cur".to_string(), CqlValue::Int(100))];
+        let resolved = resolve_bound_operands(&statement, &bound).expect("integer arithmetic");
+        let Statement::Update(update) = resolved else {
+            panic!("still an UPDATE");
+        };
+        match &update.assignments[0] {
+            Assignment::Simple { column, value } => {
+                assert_eq!(column, "v");
+                assert_eq!(
+                    value,
+                    &Term::IntegerLiteral(101),
+                    "100 was read, so 101 is written"
+                );
+            }
+            other => panic!("the bound operand must become a concrete assignment, got {other:?}"),
+        }
+    }
+
+    /// Negative controls: anything this cannot evaluate EXACTLY is refused, never guessed at.
+    #[test]
+    fn a_bound_operand_that_cannot_be_evaluated_exactly_is_refused() {
+        use crate::ast::{Assignment, Term, UpdateStatement};
+        let make = |value: Term, lhs: Option<String>| {
+            Statement::Update(UpdateStatement {
+                keyspace: None,
+                table: "t".to_string(),
+                assignments: vec![Assignment::Add {
+                    column: "v".to_string(),
+                    value,
+                    lhs,
+                }],
+                where_clauses: vec![],
+                if_exists: false,
+                if_conditions: vec![],
+                using_timestamp: None,
+                using_ttl: None,
+            })
+        };
+
+        // An unbound name: nothing in this transaction declared it.
+        let error =
+            resolve_bound_operands(&make(Term::IntegerLiteral(1), Some("nope".into())), &[])
+                .expect_err("an unbound operand must be refused");
+        assert!(
+            format!("{error}").contains("no LET"),
+            "names the cause: {error}"
+        );
+
+        // Bound, but not an integer: refuse rather than write something that merely looks plausible.
+        let bound = vec![("cur".to_string(), CqlValue::Text("abc".to_string()))];
+        let error =
+            resolve_bound_operands(&make(Term::IntegerLiteral(1), Some("cur".into())), &bound)
+                .expect_err("a non-integer operand must be refused");
+        assert!(format!("{error}").contains("integer"), "says why: {error}");
     }
 
     #[tokio::test]

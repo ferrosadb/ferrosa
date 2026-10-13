@@ -119,7 +119,10 @@ coordinator's local dependency wait, while success still requires both local
 `Applied` and the per-shard remote quorum. LWT read-votes return as soon as F+1 matching votes decide, so an
 unavailable minority does not hold a completed quorum open. PostgreSQL snapshot
 barriers rely on their committed slow quorum and the serving replica's local
-dependency/apply check, without remote read-vote fanout. See
+dependency/apply check, without remote read-vote fanout. That check decides on
+evidence of progress - the dependency set, each dependency's phase, and the
+engine's completion watermark - with its bound a no-progress backstop rather
+than a total wait budget (CL-63). See
 [data-flow.md](data-flow.md).
 
 ## Key invariants

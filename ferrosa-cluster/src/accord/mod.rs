@@ -5,6 +5,9 @@
 
 #[cfg(test)]
 mod abandon_durability;
+/// The durability journal's `Applied` marker: the one entry point that writes the
+/// marker and decides the apply ack (finding G1's seam).
+pub(crate) mod applied_journal;
 pub mod apply;
 pub mod chaos_minority_kill;
 pub mod clock;

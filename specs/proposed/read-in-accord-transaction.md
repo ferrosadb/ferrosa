@@ -102,6 +102,29 @@ front-end staged a read against a committer that has not implemented the read
 path — turning a missing capability into wrong query results. Fail loud; the
 front-end surfaces the error and the transaction does not lie.
 
+## CQL surface: the `LET` block
+
+A transactional read is spelled the way Cassandra 5 spells it, so stock drivers and existing
+scripts work unmodified:
+
+```sql
+BEGIN TRANSACTION
+  LET cur = SELECT v FROM accounts WHERE aid = 7;
+  UPDATE accounts SET v = cur + 1 WHERE aid = 7;
+COMMIT TRANSACTION
+```
+
+- Each `LET <var> = SELECT ...` stages exactly one `TransactionRead { keyspace, table, key }`
+  and binds `<var>` for the remainder of the transaction.
+- A later statement may reference `<var>`; that reference is a READ of the value returned at
+  the transaction's agreed commit timestamp, not a second read of storage.
+- The read-set is therefore explicit at parse time, which is what the commit-time validation
+  consumes — no inference from "a transaction happens to be open".
+- Reads that cannot be served exactly (a scan, an unmapped expression, a non-equality
+  predicate on a non-key column) are REFUSED BY NAME inside a transaction rather than
+  silently served from the local store; a wrong answer inside a transaction is worse than a
+  refusal, because the commit decision depends on it.
+
 ## Phased TDD plan
 
 **Slice 1 — CQL plumbing (proves the path, mock engine). Small.**

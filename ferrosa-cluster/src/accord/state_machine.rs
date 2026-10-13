@@ -37,6 +37,7 @@ use ferrosa_storage::accord::conflict_index::{
 use ferrosa_storage::accord::sync_writer::{SyncWriteResult, SyncWriter};
 use tokio::sync::Notify;
 
+use crate::accord::applied_journal::{record_applied_marker, AppliedAck};
 use crate::accord::apply::{
     DepWaitApplier, MutationView, NoopStorageApplier, StorageApplier, StorageReader,
 };
@@ -155,6 +156,20 @@ pub struct AccordStateMachine {
     /// always re-checks the unapplied-conflict condition under the lock after a
     /// wake — a spurious or coalesced wake just costs one extra re-check.
     applied_notify: Arc<Notify>,
+    /// Monotone count of dependency RESOLUTIONS this replica's apply path has
+    /// performed: advanced once per transaction advanced to `Applied`, and once
+    /// per transaction finalized without state (a dep resolved without a write).
+    ///
+    /// This is the **progress watermark** a dependency wait reads — the engine
+    /// ADVANCING it is the evidence that a wait is making progress. A read that
+    /// is merely behind a live engine (its dependencies still draining) sees the
+    /// watermark advance on every poll and keeps waiting; a read whose
+    /// dependencies have genuinely stalled sees it frozen for the whole interval
+    /// and abstains. It is deliberately a completion count, not a wall clock: the
+    /// engine advances it exactly when it finishes work, so the wait tracks the
+    /// engine's progress rather than elapsed time (see
+    /// [`crate::accord::handlers::await_conflicting_deps_applied`]).
+    applied_epoch: u64,
     /// The node's shared hybrid logical clock (the same `Arc` the transaction
     /// committer mints `t0` from). When set, every timestamp this replica
     /// observes through consensus — a PreAccept's proposed/bumped `t`, a
@@ -330,6 +345,7 @@ impl AccordStateMachine {
             applying: HashSet::new(),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            applied_epoch: 0,
             clock: None,
             finalized: FinalizedTxns::default(),
             refusing_by_floor: false,
@@ -359,6 +375,7 @@ impl AccordStateMachine {
             applying: HashSet::new(),
             reader: None,
             applied_notify: Arc::new(Notify::new()),
+            applied_epoch: 0,
             clock: None,
             finalized: FinalizedTxns::default(),
             refusing_by_floor: false,
@@ -391,6 +408,7 @@ impl AccordStateMachine {
             applying: HashSet::new(),
             reader: Some(reader),
             applied_notify: Arc::new(Notify::new()),
+            applied_epoch: 0,
             clock: None,
             finalized: FinalizedTxns::default(),
             refusing_by_floor: false,
@@ -464,6 +482,16 @@ impl AccordStateMachine {
         Arc::clone(&self.applied_notify)
     }
 
+    /// The dependency-resolution progress watermark (see the `applied_epoch`
+    /// field): a monotone count advanced every time this replica advances a
+    /// transaction to `Applied` or finalizes one without state. Two reads that
+    /// are equal bracket an interval in which the apply path resolved nothing —
+    /// the only condition under which a dependency wait may abstain.
+    #[inline]
+    pub fn applied_epoch(&self) -> u64 {
+        self.applied_epoch
+    }
+
     /// Conflicting transactions on `key` that a linearizable read-at-`t` must
     /// wait for before reading: those that are **`Committed`** (their final
     /// execution timestamp is locked) ordered **before** `t` (`t_committed < t`)
@@ -513,6 +541,44 @@ impl AccordStateMachine {
             }
         }
         pending
+    }
+
+    /// A stable, order-independent signature of the conflicting dependencies a
+    /// linearizable read at `t` is still waiting on, carrying each one's PHASE.
+    ///
+    /// This is the per-read half of the dependency wait's progress evidence. Two
+    /// signatures that compare equal bracket an interval in which neither the SET
+    /// of dependencies nor any dependency's PROTOCOL PROGRESS changed — a
+    /// dependency advancing `PreAccepted → Accepted → Committed` is making
+    /// progress even before it applies, so a wait on it must not abstain. The
+    /// engine-wide [`Self::applied_epoch`] is the other half: it catches the case
+    /// where a dependency sits in `Committed` while the apply path is still
+    /// draining other work. A wait may abstain only when BOTH are frozen for its
+    /// whole bound — a genuinely stuck dependency.
+    pub fn dependency_wait_signature(&self, key: &[u8], t: &Timestamp) -> Vec<(TxnId, u8)> {
+        let mut signature: Vec<(TxnId, u8)> = self
+            .unapplied_conflicts_before(key, t)
+            .into_iter()
+            .map(|dep_id| {
+                // Phases advance forward only, so the rank is a monotone tag: any
+                // change is real progress, never a regression.
+                let phase = self
+                    .txn_states
+                    .get(&dep_id)
+                    .map_or(0, |state| match state.phase {
+                        TxnPhase::PreAccepted => 1,
+                        TxnPhase::Accepted => 2,
+                        TxnPhase::Committed => 3,
+                        TxnPhase::Applied => 4,
+                    });
+                (dep_id, phase)
+            })
+            .collect();
+        // `sort_unstable` on `(TxnId, u8)` is a total order, so the signature is
+        // independent of the `HashSet` iteration order the pending set is built
+        // from.
+        signature.sort_unstable();
+        signature
     }
 
     /// Diagnostic detail for every conflicting transaction a read at `t` is
@@ -697,10 +763,33 @@ impl AccordStateMachine {
 
         // Check before registering this transaction, so an aborted stale
         // snapshot never becomes a dependency that can block subsequent reads.
+        //
+        // Staleness is judged against the keys THIS transaction actually WROTE,
+        // never against the global data-commit marker. The marker's high-water
+        // mark advances on EVERY PostgreSQL data commit, so consulting it here
+        // refused any transaction whose snapshot predated ANY other commit in the
+        // cluster — two transactions on DISJOINT keys of one table collided on
+        // the marker alone (RT-2), which is the write-side throughput collapse:
+        // every concurrent transaction is refused 40001 however unrelated its
+        // rows are. PostgreSQL raises a serialization failure on read-set /
+        // write-set OVERLAP; a write-only transaction's overlap is exactly the
+        // keys it wrote, and each already carries its own execution high-water
+        // mark (kept past GC). The two protocol keys — the data-commit marker and
+        // the BEGIN/COMMIT barrier — are SHARED BOOKKEEPING, not user data, so
+        // they are excluded: a same-key collision still refuses LOUD (the written
+        // key's own HWM is past the snapshot) while disjoint keys commit
+        // concurrently.
         if let Some(snapshot_ts) = snapshot_ts {
-            let latest = self.conflict_index.max_conflicting_timestamp(
-                ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY,
-            );
+            let latest = keys
+                .iter()
+                .copied()
+                .filter(|key| {
+                    *key != ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY
+                        && *key
+                            != ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_BARRIER_KEY
+                })
+                .filter_map(|key| self.conflict_index.max_conflicting_timestamp(key))
+                .max();
             if latest.is_some_and(|latest| latest > snapshot_ts) {
                 return SmResponse::SnapshotStale;
             }
@@ -1076,26 +1165,32 @@ impl AccordStateMachine {
                 // PreAccept may still be queued behind this finalize (CL-36).
                 self.finalized.record(txn_id);
                 self.conflict_index.remove(&txn_id);
+                // A dependency resolved without a write is still progress for any
+                // read waiting on it: advance the same watermark.
+                self.applied_epoch = self.applied_epoch.wrapping_add(1);
                 let woken = {
                     let _gate = self.apply_gate.lock();
                     self.apply_engine.notify_applied(txn_id)
                 };
-                self.bookkeep_applied_dedup(woken);
+                // Every woken waiter was persisted by the engine, so its rows are durable.
+                self.bookkeep_applied_dedup(woken, true);
                 SmResponse::NoWriteFinalized
             }
             ApplyDecision::NoWriteFinalize => {
                 // No-write finalize: nothing to persist and no dependency ordering
                 // to respect. Advance to Applied, then advance any waiters it
-                // unblocks.
-                if self.bookkeep_applied(txn_id, Vec::new()).is_err() {
-                    // Marker fsync failed — fail loud, leave Committed; Apply retries.
+                // unblocks. NO durable row was written, so the marker is this
+                // transaction's only durable record: `rows_durable = false`.
+                if self.bookkeep_applied(txn_id, Vec::new(), false) == AppliedAck::Withhold {
+                    // Marker fsync failed and there is no durable row behind it —
+                    // fail loud, leave Committed; Apply retries.
                     return SmResponse::None;
                 }
                 let woken = {
                     let _gate = self.apply_gate.lock();
                     self.apply_engine.notify_applied(txn_id)
                 };
-                self.bookkeep_applied_dedup(woken);
+                self.bookkeep_applied_dedup(woken, true);
                 SmResponse::None
             }
             ApplyDecision::Persist { t, deps } => {
@@ -1147,7 +1242,9 @@ impl AccordStateMachine {
                 }
                 // Persisted: the primary's writes plus any cascade-woken waiters.
                 // Dedup by TxnId so each txn is marked Applied / fsynced exactly once.
-                self.bookkeep_applied_dedup(applied);
+                // The engine returned these only after its own commit-log fsync, so
+                // every one of them has durable rows.
+                self.bookkeep_applied_dedup(applied, true);
                 SmResponse::None
             }
         }
@@ -1210,7 +1307,9 @@ impl AccordStateMachine {
         for (id, _) in &outcome.applied {
             self.applying.remove(id);
         }
-        self.bookkeep_applied_dedup(outcome.applied);
+        // `storage_ok` was required above, so the engine's own commit-log fsync has
+        // already returned for every id here: their rows are durable.
+        self.bookkeep_applied_dedup(outcome.applied, true);
         SmResponse::None
     }
 
@@ -1240,7 +1339,9 @@ impl AccordStateMachine {
                 released.extend(self.apply_engine.waive_dependency(waiter, dep));
             }
         }
-        self.bookkeep_applied_dedup(released);
+        // Each released waiter's parked write-set was applied by `waive_dependency`
+        // (or it would not be in the list), so its rows are durable.
+        self.bookkeep_applied_dedup(released, true);
     }
 
     /// Run [`bookkeep_applied`] **once per distinct `TxnId`** in `applied`.
@@ -1250,52 +1351,66 @@ impl AccordStateMachine {
     /// `Applied` advance, conflict-index GC, dep-wait wake — is a per-transaction
     /// action and must fire exactly once. The first entry's data is used; later
     /// same-txn entries are skipped (their write is already durable). Each is
-    /// best-effort: a fsync failure leaves that txn `Committed` for its Apply
-    /// retry to re-drive (storage apply is idempotent), never falsely `Applied`.
-    fn bookkeep_applied_dedup(&mut self, applied: Vec<(TxnId, Vec<u8>)>) {
+    /// best-effort: a fsync failure with durable rows still advances (see
+    /// [`bookkeep_applied`]); without them it leaves that txn `Committed` for its
+    /// Apply retry to re-drive (storage apply is idempotent), never falsely
+    /// `Applied`.
+    ///
+    /// `rows_durable` is the caller's knowledge of the storage half, and is uniform
+    /// for one call because every entry here was returned *by* a storage apply that
+    /// returned `Ok`.
+    fn bookkeep_applied_dedup(&mut self, applied: Vec<(TxnId, Vec<u8>)>, rows_durable: bool) {
         let mut bookkept: HashSet<TxnId> = HashSet::new();
         for (applied_id, applied_data) in applied {
             if bookkept.insert(applied_id) {
-                let _ = self.bookkeep_applied(applied_id, applied_data);
+                // The decision is consumed by the phase advance inside; only the
+                // no-write path has a reply to withhold, and it calls
+                // `bookkeep_applied` directly.
+                let _ = self.bookkeep_applied(applied_id, applied_data, rows_durable);
             }
         }
     }
 
     /// Post-apply bookkeeping for a transaction the apply engine has **already
-    /// persisted** (or a no-write finalize): persist the protocol-log marker,
-    /// advance the in-memory state to `Applied`, GC the conflict index, and wake
-    /// any `ReadVote` dep-wait parked on this transaction.
+    /// persisted** (or a no-write finalize): record the protocol-log `Applied`
+    /// marker and, from that one decision, advance the in-memory state to
+    /// `Applied`, GC the conflict index, and wake any `ReadVote` dep-wait parked on
+    /// this transaction.
     ///
-    /// Returns `Err(())` if the marker fsync fails — the caller must then leave
-    /// the txn `Committed` (never falsely `Applied`); the per-txn Apply retry
-    /// re-drives it, and because the storage applier is idempotent on
-    /// `(txn_id, t)` the re-driven apply is a no-op on storage.
-    fn bookkeep_applied(&mut self, txn_id: TxnId, result_data: Vec<u8>) -> Result<(), ()> {
-        // Persist the protocol-log marker. Fail loud (return Err) on fsync
-        // failure so the caller does not advance a non-durable apply.
-        let data = format!("Applied:{}", txn_id.0.time);
-        if let SyncWriteResult::FsyncFailed(e) = self.sync_writer.write_and_sync(data.as_bytes()) {
-            // Logged here because several callers (the cascade in
-            // `bookkeep_applied_dedup`, the no-write finalize) have no reply to
-            // withhold: without this line the txn silently stays Committed.
-            tracing::error!(
-                txn_id = ?txn_id, error = %e,
-                "accord: Applied marker fsync failed — txn stays Committed until its Apply is retried"
-            );
-            return Err(());
+    /// The marker write and the ack decision are this ONE function — the journal
+    /// seam (see [`crate::accord::applied_journal`]). It returns the journal's
+    /// [`AppliedAck`], and the returned `Ack` is exactly what the ack gate reads,
+    /// because `Applied` is the phase [`crate::accord::handlers::await_txn_applied`]
+    /// waits for. `rows_durable` keeps "the rows are on disk" apart from "the
+    /// journal recorded the decision", so a marker fsync failure cannot withhold an
+    /// ack for a transaction whose rows are already durable and readable (G1).
+    fn bookkeep_applied(
+        &mut self,
+        txn_id: TxnId,
+        result_data: Vec<u8>,
+        rows_durable: bool,
+    ) -> AppliedAck {
+        let ack = record_applied_marker(&*self.sync_writer, txn_id, rows_durable);
+        if ack == AppliedAck::Withhold {
+            // Nothing durable records the apply: leave the txn undecided so the
+            // per-txn Apply retry re-drives it.
+            return AppliedAck::Withhold;
         }
 
         if let Some(state) = self.txn_states.get_mut(&txn_id) {
             state.apply(result_data);
         }
         self.conflict_index.mark_applied(&txn_id);
+        // A completed dependency resolution: advance the progress watermark the
+        // dependency wait reads. See the `applied_epoch` field.
+        self.applied_epoch = self.applied_epoch.wrapping_add(1);
 
         // Wake any ReadVote dep-wait parked on a conflicting transaction reaching
         // Applied. Broadcast (all parked reads re-check their own condition under
         // the lock); see [`Self::applied_notify`].
         self.applied_notify.notify_waiters();
 
-        Ok(())
+        AppliedAck::Ack
     }
 
     // -----------------------------------------------------------------------
@@ -2682,18 +2797,12 @@ mod tests {
 
     #[test]
     fn stale_postgres_snapshot_is_rejected_before_conflict_registration() {
-        use ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY;
-
         let (mut sm, _) = make_sm(1);
         let earlier = txn(1, 100);
         let latest = ts(100);
-        sm.handle_preaccept(
-            earlier,
-            latest,
-            POSTGRES_TRANSACTION_MARKER_KEY,
-            BallotNumber(0),
-            0,
-        );
+        // The conflicting commit is on a DATA key the stale txn also writes: a
+        // same-key collision must still refuse LOUD (RT-2 keeps this case).
+        sm.handle_preaccept(earlier, latest, b"d1", BallotNumber(0), 0);
         sm.handle_commit(earlier, latest, latest, vec![]);
         sm.handle_apply(earlier, vec![]);
         let conflicts_before_stale_attempt = sm.conflict_index().len();
@@ -2702,7 +2811,7 @@ mod tests {
         let response = sm.handle_preaccept_multi_with_snapshot(
             stale,
             ts(200),
-            &[POSTGRES_TRANSACTION_MARKER_KEY],
+            &[b"d1"],
             BallotNumber(0),
             0,
             Some(ts(99)),
@@ -2717,6 +2826,82 @@ mod tests {
             sm.conflict_index().len(),
             conflicts_before_stale_attempt,
             "stale txn leaves no conflict entry"
+        );
+    }
+
+    /// RT-2 at the Accord layer: a snapshot older than a commit on a DIFFERENT
+    /// key is NOT stale. The global data-commit marker advanced, but it is shared
+    /// bookkeeping, not data this transaction touched — refusing here is the
+    /// false conflict that collapses concurrent write throughput.
+    #[test]
+    fn a_snapshot_stale_only_against_a_disjoint_key_is_not_rejected() {
+        let (mut sm, _) = make_sm(1);
+        let earlier = txn(1, 100);
+        let latest = ts(100);
+        sm.handle_preaccept(earlier, latest, b"d1", BallotNumber(0), 0);
+        sm.handle_commit(earlier, latest, latest, vec![]);
+        sm.handle_apply(earlier, vec![]);
+
+        // A later txn writes only d2, with a snapshot older than d1's commit.
+        let disjoint = txn(2, 200);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            disjoint,
+            ts(200),
+            &[b"d2"],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "a disjoint key must not be vetoed by another key's commit: {response:?}"
+        );
+        assert!(
+            sm.get_state(&disjoint).is_some(),
+            "the disjoint txn must register"
+        );
+    }
+
+    /// The two shared protocol keys are bookkeeping, not data: a snapshot older
+    /// than a data commit does not make a marker/barrier-only txn stale.
+    #[test]
+    fn a_snapshot_older_than_a_data_commit_does_not_veto_a_protocol_key_txn() {
+        use ferrosa_storage::accord::conflict_index::{
+            POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
+        };
+        let (mut sm, _) = make_sm(1);
+        let earlier = txn(1, 100);
+        let latest = ts(100);
+        sm.handle_preaccept(earlier, latest, b"d1", BallotNumber(0), 0);
+        sm.handle_commit(earlier, latest, latest, vec![]);
+        sm.handle_apply(earlier, vec![]);
+
+        let barrier_only = txn(2, 200);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            barrier_only,
+            ts(200),
+            &[POSTGRES_TRANSACTION_BARRIER_KEY],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "a BEGIN barrier must not be vetoed by a data commit: {response:?}"
+        );
+
+        let marker_only = txn(3, 300);
+        let response = sm.handle_preaccept_multi_with_snapshot(
+            marker_only,
+            ts(300),
+            &[POSTGRES_TRANSACTION_MARKER_KEY],
+            BallotNumber(0),
+            0,
+            Some(ts(99)),
+        );
+        assert!(
+            matches!(response, SmResponse::PreAcceptOK { .. }),
+            "the data-commit marker must not veto itself: {response:?}"
         );
     }
 
@@ -3391,41 +3576,102 @@ mod tests {
         assert_eq!(state.phase, TxnPhase::Applied);
     }
 
-    /// Crash after persist but before flag = safe (replay recovers).
+    /// The durability instant for the DATA is the storage write: the engine fsyncs
+    /// its commit log before `apply` returns `Ok`, so any row the applier accepted is
+    /// durable and readable. The protocol-log `Applied` marker is the journal's
+    /// *record* of that decision, and crash replay re-drives it idempotently on
+    /// `(txn_id, t)`.
+    ///
+    /// So a marker fsync failure AFTER a durable row write must not withhold the
+    /// apply — withholding it is finding G1: the coordinator loses this replica's ack
+    /// and reports the transaction abandoned while the row is on disk.
+    ///
+    /// Replaces the former `sm_crash_between_persist_and_flag`, whose assertion ("phase
+    /// must still be Committed when fsync fails during apply") made the redundant
+    /// marker the durability gate and thereby encoded the defect. The assertion here is
+    /// STRENGTHENED, not relaxed: the fsync-failed path is proven to have run, and the
+    /// retry is proven idempotent.
     #[test]
-    fn sm_crash_between_persist_and_flag() {
+    fn sm_marker_fsync_failure_after_a_durable_row_write_still_applies() {
         let (mut sm, writer) = make_sm(1);
         let txn_id = txn(1, 1000);
         let t0 = ts(1000);
 
-        // Set up committed state.
         sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
         sm.handle_accept(txn_id, t0, ts(1001), vec![], BallotNumber(1));
         sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        writer.call_log.lock().unwrap().clear();
 
-        // Simulate crash: fsync succeeds for persist but we "crash" before
-        // setting the applied flag by making fsync fail on the apply call.
+        // Only the marker's fsync fails; the storage applier's own write — the
+        // durability instant — still returns Ok, so the row is durable.
         writer.set_fsync_failure(true);
-
         sm.handle_apply(txn_id, vec![42]);
 
-        // Applied flag must NOT be set because fsync "failed" (simulated crash).
-        let state = sm.get_state(&txn_id).unwrap();
+        assert!(
+            writer.calls().contains(&SyncWriteCall::FsyncFailed),
+            "precondition: the marker fsync must have been attempted and failed, so this \
+             test is not vacuous; got {:?}",
+            writer.calls()
+        );
         assert_eq!(
-            state.phase,
-            TxnPhase::Committed,
-            "phase must still be Committed when fsync fails during apply"
+            sm.get_state(&txn_id).unwrap().phase,
+            TxnPhase::Applied,
+            "a durably written row must be Applied even when the redundant marker fsync \
+             failed — the row is readable, so denying the apply is the G1 lie"
         );
 
-        // On recovery: re-enable fsync and retry apply.
+        // A retry after the disk heals is idempotent: already Applied, so it writes no
+        // second marker (N markers per txn would corrupt the protocol log).
         writer.set_fsync_failure(false);
+        writer.call_log.lock().unwrap().clear();
+        sm.handle_apply(txn_id, vec![42]);
+        assert!(
+            !writer.calls().contains(&SyncWriteCall::Fsync),
+            "a retried Apply for an already-Applied txn must not write a second marker; \
+             got {:?}",
+            writer.calls()
+        );
+    }
+
+    /// NEGATIVE CONTROL for the corrected apply contract: when the STORAGE write
+    /// itself fails there is no durable row at all, so the transaction must stay
+    /// Committed and no `Applied` marker may be written — the replica must never claim
+    /// an apply it did not durably perform. Without this, "advanced to Applied" would
+    /// be satisfied by a journal that acked unconditionally.
+    #[test]
+    fn sm_storage_apply_failure_does_not_advance() {
+        struct FailingApplier;
+
+        impl StorageApplier for FailingApplier {
+            fn apply(&self, txn_id: TxnId, _mutation: ApplyMutation) -> Result<(), ApplyError> {
+                Err(ApplyError {
+                    txn_id,
+                    reason: "simulated storage write failure".to_owned(),
+                })
+            }
+        }
+
+        let writer = Arc::new(MockSyncWriter::new());
+        let mut sm = AccordStateMachine::with_applier(1, writer.clone(), Arc::new(FailingApplier));
+
+        let txn_id = txn(1, 1000);
+        let t0 = ts(1000);
+        sm.handle_preaccept(txn_id, t0, b"key1", BallotNumber(0), 0);
+        sm.handle_accept(txn_id, t0, ts(1001), vec![], BallotNumber(1));
+        sm.handle_commit(txn_id, t0, ts(1001), vec![]);
+        writer.call_log.lock().unwrap().clear();
+
         sm.handle_apply(txn_id, vec![42]);
 
-        let state = sm.get_state(&txn_id).unwrap();
         assert_eq!(
-            state.phase,
-            TxnPhase::Applied,
-            "replay after crash must successfully apply"
+            sm.get_state(&txn_id).unwrap().phase,
+            TxnPhase::Committed,
+            "a failed storage write leaves nothing durable, so the txn must stay Committed"
+        );
+        assert!(
+            writer.calls().is_empty(),
+            "no durable row means no Applied marker may be written; got {:?}",
+            writer.calls()
         );
     }
 
