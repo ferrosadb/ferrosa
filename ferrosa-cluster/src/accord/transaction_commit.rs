@@ -258,7 +258,7 @@ impl TransactionCommitter for AccordTransactionCommitter {
         &self,
         keyspace: &str,
         writes: StagedAccordWriteSet,
-        tables: Vec<String>,
+        reads: ferrosa_storage::accord::PgReadSet,
         written_tables: Vec<String>,
         snapshot: ferrosa_common::accord::Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
@@ -288,16 +288,17 @@ impl TransactionCommitter for AccordTransactionCommitter {
         // staged region is therefore an exact PREFIX of the driven write-set; the driver reads
         // entries at/after the prefix from their resident (empty) mutation field.
         let staged_count = writes.len();
-        // The tables this transaction SCANNED are driven as one synthetic conflict
-        // key each, appended AFTER the staged payload region (so the staged region
-        // stays an exact prefix) and BEFORE the two protocol markers. That puts the
-        // READ into the DISTRIBUTED Accord ordering — PreAccept registration,
-        // dependency union, and the per-key execution high-water-mark — so a later
-        // writer that scanned the same table is refused (`SnapshotStale` -> Aborted
-        // -> SQLSTATE 40001) once the table was written after the reader's snapshot.
-        // Row-level point reads are judged by the row they named and never reach
-        // here (RT-2), so disjoint-key writers still commit concurrently.
-        let read_table_keys: Vec<Vec<u8>> = tables
+        // The tables this transaction SCANNED — the reads that could NOT be resolved to keys —
+        // are driven as one synthetic conflict key each, appended AFTER the staged payload
+        // region (so the staged region stays an exact prefix) and BEFORE the two protocol
+        // markers. That puts the READ into the DISTRIBUTED Accord ordering — PreAccept
+        // registration, dependency union, and the per-key execution high-water-mark — so a
+        // later writer that scanned the same table is refused (`SnapshotStale` -> Aborted ->
+        // SQLSTATE 40001) once the table was written after the reader's snapshot. A KEYED read
+        // is ROW-granular instead and is driven as a READ OF EACH ROW it visited, below, so
+        // disjoint-key readers and writers still commit concurrently (RT-2).
+        let read_table_keys: Vec<Vec<u8>> = reads
+            .scan_tables()
             .iter()
             .map(|table| postgres_read_table_key(table))
             .collect();
@@ -312,7 +313,8 @@ impl TransactionCommitter for AccordTransactionCommitter {
         // two scanners of one table never conflict on the watermark; the watermark is
         // skipped in a WRITER's own staleness check, so two writers of DISJOINT rows
         // still commit concurrently (RT-2).
-        let read_watermark_keys: Vec<Vec<u8>> = tables
+        let read_watermark_keys: Vec<Vec<u8>> = reads
+            .scan_tables()
             .iter()
             .map(|table| postgres_read_key(&postgres_write_table_key(table)))
             .collect();
@@ -320,7 +322,11 @@ impl TransactionCommitter for AccordTransactionCommitter {
             .iter()
             .map(|table| postgres_write_table_key(table))
             .collect();
-        let extra = read_table_keys.len() + read_watermark_keys.len() + write_table_keys.len() + 2;
+        let extra = read_table_keys.len()
+            + read_watermark_keys.len()
+            + write_table_keys.len()
+            + reads.row_key_count()
+            + 2;
         let mut resolve_inputs: Vec<(String, Vec<u8>)> = Vec::with_capacity(staged_count + extra);
         let mut write_set: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(staged_count + extra);
         for (keyspace, key) in writes.keys() {
@@ -338,6 +344,28 @@ impl TransactionCommitter for AccordTransactionCommitter {
         for key in write_table_keys {
             resolve_inputs.push((keyspace.to_string(), key.clone()));
             write_set.push((key, Vec::new()));
+        }
+        // ROW-granular reads, STREAMED out of the staged read set. Each visited row's key
+        // is registered as a READ OF THAT ROW (`postgres_read_key`), so a concurrent writer
+        // of the row sees the reader under the underlying key and conflicts, while two keyed
+        // readers of DISJOINT rows register DISJOINT keys and both commit — the false refusal
+        // the table-level key caused. The visited-key set is NEVER materialized as a resident
+        // collection: `for_each_row_key` hands one key at a time out of the resident prefix or
+        // the staging memory map. (The driven `resolve_inputs`/`write_set` below still hold
+        // the keys, which is the Accord driver's own shape; streaming INTO the driver is named
+        // NOT-DONE in the crate docs.)
+        {
+            let mut push_row_read = |row_key: &[u8]| -> ferrosa_common::Result<()> {
+                let key = postgres_read_key(row_key);
+                resolve_inputs.push((keyspace.to_string(), key.clone()));
+                write_set.push((key, Vec::new()));
+                Ok(())
+            };
+            reads
+                .for_each_row_key(&mut push_row_read)
+                .map_err(|error| CommitError {
+                    reason: format!("PostgreSQL transaction read set is unreadable: {error}"),
+                })?;
         }
         for marker in [
             POSTGRES_TRANSACTION_BARRIER_KEY,
@@ -1317,7 +1345,7 @@ mod tests {
             .commit_postgres(
                 "ks",
                 staged(vec![tombstone_write()]),
-                vec![],
+                ferrosa_storage::accord::PgReadSet::empty(),
                 vec![],
                 snapshot(),
             )
@@ -1355,7 +1383,7 @@ mod tests {
             .commit_postgres(
                 "ks",
                 staged(vec![tombstone_write()]),
-                vec![],
+                ferrosa_storage::accord::PgReadSet::empty(),
                 vec![],
                 snapshot(),
             )
@@ -1379,7 +1407,7 @@ mod tests {
             .commit_postgres(
                 "ks",
                 staged(vec![tombstone_write()]),
-                vec![],
+                ferrosa_storage::accord::PgReadSet::empty(),
                 vec![],
                 snapshot(),
             )

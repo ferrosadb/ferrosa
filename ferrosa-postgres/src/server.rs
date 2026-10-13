@@ -711,17 +711,38 @@ async fn begin_block(
 /// transactions touching disjoint keys of one table do not collide on table
 /// identity (RT-2). A scan keeps the table-level guard, which is what still
 /// catches a predicate phantom.
-fn track_select_reads(ctx: &QueryContext, session: &mut Session, select: &ferrosa_sql::SelectStmt) {
+fn track_select_reads(
+    ctx: &QueryContext,
+    session: &mut Session,
+    select: &ferrosa_sql::SelectStmt,
+) -> Result<(), BackendMessage> {
     if !(session.in_txn()
         && session.txn_isolation() == Some(ferrosa_sql::IsolationLevel::Serializable))
     {
-        return;
+        return Ok(());
     }
     if let Some(row) = point_read_row_key(ctx, select) {
         if let Some(snapshot) = session.txn_snapshot() {
             ctx.mvcc.record_point_read(snapshot, row);
         }
-        return;
+        // HYBRID read granularity: this read RESOLVED to a key, so the DISTRIBUTED commit
+        // carries the ROW it resolved to, not the table. Encode it into the SAME partition-key
+        // bytes a writer of that row registers, through the front-end's canonical encoder, so a
+        // concurrent writer of the row conflicts while two readers of DISJOINT rows do not. The
+        // set is STAGED (bounded resident prefix + spill), never a resident row set.
+        let bytes = point_read_key_bytes(ctx, select).ok_or_else(|| {
+            query::error_response(
+                "58000",
+                "transaction read set: the resolved row key could not be encoded",
+            )
+        })?;
+        session.txn_read_rows_mut().record(&bytes).map_err(|error| {
+            query::error_response(
+                "58000",
+                &format!("transaction read set could not be staged: {error}"),
+            )
+        })?;
+        return Ok(());
     }
     let read_tables = session.txn_read_tables_mut();
     read_tables.insert(format!(
@@ -736,6 +757,40 @@ fn track_select_reads(ctx: &QueryContext, session: &mut Session, select: &ferros
             join.table.table
         ));
     }
+    Ok(())
+}
+
+/// The partition-key BYTES of the point read `select` names, or `None` when the resolved key
+/// has no encodable form.
+///
+/// It REUSES [`point_read_row_key`]'s judgement rather than re-deciding resolvability, then
+/// encodes the resolved row through the SAME canonical front-end encoder the DML write path
+/// uses ([`ferrosa_row_bridge::build_decorated_key`]). That is what makes a reader's
+/// registration land on the same partition key a writer of that row registers — a second,
+/// divergent key derivation would register a key no writer ever touches, and the conflict would
+/// be lost silently.
+fn point_read_key_bytes(ctx: &QueryContext, select: &ferrosa_sql::SelectStmt) -> Option<Vec<u8>> {
+    let row = point_read_row_key(ctx, select)?;
+    let keyspace = select.from.schema.as_deref().unwrap_or(&ctx.default_schema);
+    let snapshot = ctx.schema.snapshot();
+    let meta = snapshot
+        .tables
+        .get(&(keyspace.to_string(), select.from.table.clone()))?;
+    // `point_read_row_key` guarantees the filter's column is a partition-key column, and the
+    // `RowKey` it built carries that table's partition-key values in key order.
+    if meta.partition_key.len() != row.key.len() {
+        return None;
+    }
+    let mut pk_values: Vec<ferrosa_common::CqlValue> = Vec::with_capacity(row.key.len());
+    for (name, value) in meta.partition_key.iter().zip(row.key.iter()) {
+        let column = meta.columns.get(name)?;
+        let ty =
+            ferrosa_row_bridge::parse_cql_type_in_keyspace(&column.column_type, keyspace, &ctx.schema)
+                .ok()?;
+        pk_values.push(crate::query::value_to_cql(value, &ty, &ctx.jsonb_limits).ok()?);
+    }
+    let key = ferrosa_row_bridge::build_decorated_key(&pk_values, &[]).ok()?;
+    Some(key.key.as_bytes().to_vec())
 }
 
 /// The [`crate::mvcc::RowKey`] a `SELECT` names exactly, when its filter is a
@@ -847,7 +902,10 @@ async fn run_data_statement<O: ReplySink>(
         return Ok(vec![error]);
     }
     if let ferrosa_sql::Statement::Select(select) = stmt {
-        track_select_reads(ctx, session, select);
+        if let Err(error) = track_select_reads(ctx, session, select) {
+            session.mark_txn_failed();
+            return Ok(vec![error]);
+        }
     }
     let snapshot = read_snapshot(ctx, session);
     let in_txn = session.in_txn();
@@ -924,6 +982,18 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         }
     };
     let read_tables = session.take_txn_read_tables();
+    // The ROW-level half of the read set: the keyed reads, streamed (never materialized) out of
+    // the staged set into the distributed commit. Read before the staging is consumed.
+    let read_rows = match session.take_txn_read_rows() {
+        Ok(rows) => rows,
+        Err(error) => {
+            session.end_txn();
+            return vec![query::error_response(
+                "58000",
+                &format!("transaction commit failed: {error}"),
+            )];
+        }
+    };
     let snapshot = session
         .txn_snapshot()
         .cloned()
@@ -1088,14 +1158,19 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                     "cluster PostgreSQL transaction has no Accord snapshot timestamp",
                 )];
             };
-            let tables = scanned_tables.iter().cloned().collect();
+            // The HYBRID read set: the wide scans that could not be resolved to keys stay
+            // TABLE-granular; the keyed reads are ROW-granular and stream out of the staged set.
+            let reads = ferrosa_storage::accord::PgReadSet::with_row_keys(
+                scanned_tables.iter().cloned().collect(),
+                read_rows,
+            );
             let written = written_tables.clone();
             let accord_started = std::time::Instant::now();
             let accord_result = match committer
                 .commit_postgres(
                     &ctx.default_schema,
                     accord_writes,
-                    tables,
+                    reads,
                     written,
                     cluster_snapshot,
                 )
@@ -1606,7 +1681,10 @@ async fn open_portal_stream(
         session.mark_txn_failed();
         return Err(error);
     }
-    track_select_reads(ctx, session, &select);
+    if let Err(error) = track_select_reads(ctx, session, &select) {
+        session.mark_txn_failed();
+        return Err(error);
+    }
     // Read-your-own-writes: a portal SELECT inside the open transaction must see
     // its own uncommitted rows, so decode the staged write-set into resident
     // writes the stream reader folds into the scan. The COMMIT path does NOT do

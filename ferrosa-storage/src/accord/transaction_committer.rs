@@ -10,6 +10,7 @@
 //! layer — mirroring how `StorageApplier` is injected.
 
 use super::postgres_mvcc::PostgresMvccApplyObserver;
+use super::row_read_set::PgReadSet;
 use async_trait::async_trait;
 use ferrosa_common::accord::Timestamp;
 use std::sync::Arc;
@@ -349,15 +350,28 @@ pub trait TransactionCommitter: Send + Sync {
     }
 
     /// Commit PostgreSQL writes after checking the captured snapshot against
-    /// every table the transaction READ (scanned). Implementations must put the
-    /// read set into the DISTRIBUTED commit order, so a table the transaction read
-    /// and another transaction wrote after that snapshot is refused loudly. Write
-    /// tables are passed separately as `written_tables`: a transaction's writes are
+    /// everything the transaction READ. Implementations must put the read set into
+    /// the DISTRIBUTED commit order, so anything a transaction READ and another
+    /// transaction WROTE after that snapshot is refused loudly.
+    ///
+    /// `reads` is the HYBRID read set ([`PgReadSet`]), at the granularity each read
+    /// could be resolved to:
+    ///
+    /// - a wide scan that could NOT be resolved to keys stays TABLE-granular
+    ///   ([`PgReadSet::scan_tables`]) and keeps the table-level key — conservative, and
+    ///   what still catches a predicate phantom through the per-table WRITE WATERMARK;
+    /// - a keyed read that WAS resolved to keys is ROW-granular, and its visited row keys
+    ///   stream out of the staged set ([`PgReadSet::for_each_row_key`]) so they are never
+    ///   materialized. Two keyed readers of DISJOINT rows therefore register DISJOINT
+    ///   keys and both commit, while a concurrent writer of one of those rows still
+    ///   conflicts.
+    ///
+    /// Write tables are passed separately as `written_tables`: a transaction's writes are
     /// already ordered by their row-level keys, so registering a write table as a
-    /// conflict key would re-serialize two transactions on DISJOINT keys of one
-    /// table (RT-2). The write table instead contributes a per-table WRITE
-    /// WATERMARK that a SCANNER of that table reads — so a stale scan is refused
-    /// even when the writer never read the table. The default fails closed.
+    /// conflict key would re-serialize two transactions on DISJOINT keys of one table
+    /// (RT-2). The write table instead contributes a per-table WRITE WATERMARK that a
+    /// SCANNER of that table reads — so a stale scan is refused even when the writer never
+    /// read the table. The default fails closed.
     ///
     /// `writes` is a [`StagedAccordWriteSet`]: the payload bulk may live on disk behind a
     /// bounded buffer, so the committer must read payloads through it rather than assume a
@@ -366,7 +380,7 @@ pub trait TransactionCommitter: Send + Sync {
         &self,
         _keyspace: &str,
         _writes: StagedAccordWriteSet,
-        _tables: Vec<String>,
+        _reads: PgReadSet,
         _written_tables: Vec<String>,
         _snapshot: Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
@@ -497,7 +511,7 @@ impl TransactionCommitter for MockTransactionCommitter {
         &self,
         _keyspace: &str,
         writes: StagedAccordWriteSet,
-        _tables: Vec<String>,
+        _reads: PgReadSet,
         _written_tables: Vec<String>,
         _snapshot: Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
