@@ -103,10 +103,10 @@ ferrosa-jepsen report list                       # (report subcommands are stubs
 
 ## Tests
 
-- **235** in-crate unit tests (checker correctness, registries, config
+- **244** in-crate unit tests (checker correctness, registries, config
   resolution, the endurance-sim smoke + tri-DC headline runs, etc.) — these run
   under default `cargo test -p ferrosa-jepsen`.
-- **32** integration test functions across `tests/`. The live-infra ones
+- **64** integration test functions across `tests/`. The live-infra ones
   (Docker mini-Jepsen, smoke tier, topology invariants, nemesis correctness)
   are gated behind the `live-infra-tests` feature and `panic!` with setup
   instructions when their `FERROSA_TEST_*` prerequisite is absent —
@@ -156,6 +156,49 @@ same final state. At least three reachable PostgreSQL URLs using the same
 CQL-backed role are required. The test fails loudly when the feature is enabled
 without its cluster variables.
 
+### Serialization refusals are retried, paced, and recorded
+
+A `SERIALIZABLE` client MUST retry a serialization refusal. The engine refuses a
+commit whose read set went stale under a conflicting commit and reports it as
+SQLSTATE `40001`; the engine log names the class (`finalizing it as a no-write` /
+`PostgreSQL MVCC snapshot is stale`). A refusal applies NOTHING, so the only
+correct response is to run the transaction again under a new instant.
+
+Every operation kind the workload invokes — the two-row transfer, the register
+read/modify/write, the exact-key predicate read, the phantom insert and the
+write-skew pair — goes through ONE retry policy (`retry_serializable_transactions`)
+bounded by `SERIALIZATION_RETRIES` (8, unchanged). Routing only the transfer and
+write-skew paths through it once meant a refused register RMW was recorded as a
+lost update: the history held exactly one record per invocation while 1–9 of the
+10 attempts were refused, silently abandoning most of the register's and
+predicate's work. Every attempt is now recorded (`record_attempts`), refusals
+included, and the history-length assertion is reconciled against the
+per-operation-kind retry counts (`expected_history_length(OperationRetryCounts)`),
+so "every invoked operation has a recorded completion" holds however many
+retries it needed.
+
+A retry that re-enters in the same instant is not a retry. Because a refusal
+changes no state, an immediate retry re-reads exactly what lost, re-enters the
+same conflict window and loses again until the budget is spent — the measured
+shape of the `native write-skew workload must commit at least one doctor update`
+progress assertion (13, 7 and 7 consecutive refusals in three recorded runs,
+against the usual one). Retries are therefore paced with bounded exponential
+backoff (`RETRY_BASE_DELAY` 10 ms, `RETRY_MAX_DELAY` 160 ms, five-step cap) and
+jitter drawn from the refused attempt's OWN invocation sequence, which differs
+between writers and between attempts: the retry lands in a different conflict
+window instead of replaying the schedule that lost. The pacing bounds WHEN a
+retry is issued, never how many — the retry budget and every timeout are
+unchanged.
+
+The teardown `DROP TABLE` travels the cluster's Raft log, so with a replica
+paused it can be refused in the driver's not-applied class (`Unavailable`,
+0x1000). That class, and only that class, is re-issued by `drop_workload_table`,
+again under `SERIALIZATION_RETRIES` and the same pacing. A bad query and the
+driver's own client timeout are reported where they stand: a `RequestTimeout`
+outcome is UNKNOWN, which is exactly why it is not retryable and is never
+re-issued. The bounded DDL proposal in `ferrosa-cluster` is what turns a stuck
+leader into this retryable class instead of a 30 s hang — see its specs.
+
 The `postgres-jepsen-fault` job in `.github/workflows/ci.yml` runs this history
 against the bundled three-node cluster while pausing node 3. It reuses the node
 image built earlier in CI and coordinates the pause through marker files. The
@@ -163,7 +206,10 @@ actors connect only to nodes 1 and 2 during the pause. The history checker and
 final-state convergence check cover the active quorum; the resumed node's
 Accord catch-up is a separate recovery property and is not part of this gate.
 This schedule does not claim network-partition, process-crash, ambiguous-commit,
-or cross-protocol CQL/PostgreSQL serializability coverage.
+or cross-protocol CQL/PostgreSQL serializability coverage. Because the workload
+now actually performs the operations it previously abandoned, it exercises the
+engine harder than the runs that passed while dropping them, so a higher failure
+rate on this test is the expected consequence of the fix, not a regression.
 
 Local live-infra form:
 
