@@ -261,10 +261,13 @@ fn commit_path_key_buffers_are_attributed_to_their_allocation_sites() {
     let at = |site: usize| allocs[site];
     // Every site the commit path is KNOWN to allocate conflict keys at must actually be
     // charged, or the instrument is blind and the table says nothing.
+    //
+    // `order.preaccept_v2_keys` is deliberately NOT in this list: it now BORROWS the driver's
+    // write-set keys and allocates ONE slice buffer, not one key buffer per conflict key. Its
+    // own regression guard is below, the mirror of the self-vote guard.
     for site in [
         mem_probe::SITE_DRIVE_PER_KEY_INDEX,
         mem_probe::SITE_DRIVE_WRITE_SET,
-        mem_probe::SITE_ORDER_PREACCEPT_KEYS,
         mem_probe::SITE_SM_CONFLICT_INDEX,
         mem_probe::SITE_APPENDED_ROW_READ_KEY,
     ] {
@@ -292,6 +295,20 @@ fn commit_path_key_buffers_are_attributed_to_their_allocation_sites() {
         mem_probe::SITE_NAMES[mem_probe::SITE_ORDER_SELF_VOTE_KEYS]
     );
 
+    // THE FIX THIS GUARDS, landed by `refactor/borrow-the-commit-keys`: the PreAcceptV2 wire
+    // key list used to clone every conflict key into a `Vec<Vec<u8>>` before serializing. It
+    // now BORROWS the driver's keys (a `Vec<&[u8]>`) and serializes them through
+    // `PreAcceptV2PayloadBorrowed`, whose frame is byte-identical. This site costs ONE
+    // borrowed-slice buffer instead of one owned key buffer per key; the byte identity is
+    // pinned in `accord::wire` and the ordering by the driver's own write-set order.
+    assert!(
+        at(mem_probe::SITE_ORDER_PREACCEPT_KEYS) <= 4,
+        "the PreAcceptV2 key list must BORROW the driver's write-set keys, not clone them: \
+         {} key-sized allocations were charged to site {}",
+        at(mem_probe::SITE_ORDER_PREACCEPT_KEYS),
+        mem_probe::SITE_NAMES[mem_probe::SITE_ORDER_PREACCEPT_KEYS]
+    );
+
     // The honesty check. A key-sized allocation the instrument cannot name lands in the
     // untagged bucket; a large remainder means the table is missing a site and must not be
     // reported as the whole story.
@@ -305,8 +322,8 @@ fn commit_path_key_buffers_are_attributed_to_their_allocation_sites() {
     );
 
     // The named sites must account for the conflict keys several times over — every key is
-    // allocated by the driver index, the driver write-set, the wire list and the index
-    // registration. A total at or below one copy per key would mean a site went uncharged.
+    // allocated by the driver index, the driver write-set and the index registration. A total
+    // at or below one copy per key would mean a site went uncharged.
     let named: i64 = allocs[1..].iter().sum();
     assert!(
         named >= 3 * conflict_keys(),

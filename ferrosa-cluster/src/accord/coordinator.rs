@@ -1563,7 +1563,7 @@ impl AccordCoordinatorDriver {
     async fn order_and_gate(&mut self) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::{
             AcceptOkPayload, AcceptPayload, CommitOkPayload, CommitPayload, LegacyAcceptOkPayload,
-            PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload,
+            PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2PayloadBorrowed, ReadVoteOkPayload,
             ReadVotePayload,
         };
 
@@ -1619,15 +1619,23 @@ impl AccordCoordinatorDriver {
                 .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
             Message::AccordPreAccept(Bytes::from(pa_bytes))
         } else {
+            // The PreAcceptV2 key list BORROWS the driver's write-set keys: a key is
+            // immutable, write-once bytes that are only read here and written to the wire,
+            // so nothing owns a second copy of it. `keys` is one small slice-of-slices
+            // buffer; `PreAcceptV2PayloadBorrowed` serializes BYTE-IDENTICALLY to the owned
+            // `PreAcceptV2Payload` the replica decodes (see
+            // `wire::tests::borrowed_preaccept_v2_keys_serialize_byte_identically`), so the
+            // wire format does not move. The owned form cloned one key buffer per conflict
+            // key — the `order.preaccept_v2_keys` attribution site.
             let site = ferrosa_common::mem_probe::enter_site(
                 ferrosa_common::mem_probe::SITE_ORDER_PREACCEPT_KEYS,
             );
-            let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+            let keys: Vec<&[u8]> = self.write_set.iter().map(|w| w.key.as_slice()).collect();
             ferrosa_common::mem_probe::exit_site(site);
-            let pa_payload = PreAcceptV2Payload {
+            let pa_payload = PreAcceptV2PayloadBorrowed {
                 txn_id,
                 t0,
-                keys,
+                keys: &keys,
                 ballot: BallotNumber(0),
                 epoch: 0,
                 snapshot_ts: self.snapshot_ts,
