@@ -59,6 +59,19 @@ and the coordinator's own apply borrows it the same way (see below — no owned
 never becomes a per-entry copy; small write-sets stay wholly resident. See FMEA
 `CL-51` and `ferrosa-storage`'s `write_set_spill`.
 
+Every conflict key the COMMIT path holds is IMMUTABLE, write-once bytes that are
+read and handed through to disk — so nothing needs to OWN a second copy. The two
+places that used to clone one key buffer per key now BORROW: the per-shard
+participant set is carried BY POSITION, aligned with the driver's write-set
+(`with_per_key_replica_sets_by_position` — the commit path resolves each key during
+its single walk and so builds no keyed index), and the `PreAcceptV2` wire key list
+is a borrowed `Vec<&[u8]>` serialized by `PreAcceptV2PayloadBorrowed`, whose frame is
+byte-identical to the owned one. Together they take the consumer's peak from 4.05 to
+3.04 key-sized buffers per conflict key, so the ratchet in
+`tests/pg_commit_path_consumer_residency.rs` tightened 4 -> 3, and
+`tests/pg_commit_path_key_attribution.rs` pins each site's own count (the per-key
+index site at ZERO). See FMEA `CL-73`.
+
 When the write-set is the **same for every peer** — no per-key resolver, or every
 key resolving to the same replica set (the `RF == node count` shape) — the payload
 is built and CAPNP-encoded ONCE (`borrowed_write_set_entries` borrows `(key, mutation)`
