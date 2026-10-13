@@ -51,7 +51,7 @@ pub struct SessionResult {
     pub result: Result<SessionStats, String>,
 }
 
-/// What one table's *initiated* repair produced: the per-`(range, peer)`
+/// What one table's *initiated* repair produced: the per-`(merged range, peer)`
 /// sessions, plus how many of this node's own ranges had a live peer at all.
 ///
 /// The second field exists so an EMPTY session list is not reported as "nothing
@@ -107,6 +107,47 @@ impl Default for RepairCoordinator {
     }
 }
 
+/// One token range paired with the peers (excluding self) to reconcile over it —
+/// the unit [`merge_contiguous_same_peers`] operates on, and the shape both the
+/// table-wide and the initiated repair paths build before scheduling.
+pub(crate) type RangeWithPeers = (i64, i64, Vec<u64>);
+
+/// Collapse adjacent token ranges that share a replica set into one span.
+///
+/// Every `(range, peer)` pair inside such a group does identical work, so
+/// issuing N×peers wire calls where 1×peers would suffice only amplifies load on
+/// the peer — and on the local CQL listener, which has crashed in the past from
+/// a 1 536-session storm on RF=3 / 3-node.
+///
+/// Sorts by `start` first, so the wrap segment `[i64::MIN, first_token)` — which
+/// [`owned_token_ranges`] emits last — lands before the body and can merge with
+/// it where the replica set agrees. Merges only where the span is **contiguous**
+/// (`last.end == start`) AND the **peer set is identical**: merging across a
+/// differing replica set would run a session for a range the peer does not hold.
+///
+/// The peers are canonicalised (sorted) here, because "the same replica set" is a
+/// property of the SET: `repair_table` pre-sorted its peers, but
+/// [`select_initiated_ranges`] does not, so comparing `Vec`s directly would make
+/// the merge depend on the order `repair_participants` happened to enumerate them
+/// in — and silently collapse nothing when two adjacent ranges enumerating the
+/// same replicas in different orders.
+pub(crate) fn merge_contiguous_same_peers(mut ranges: Vec<RangeWithPeers>) -> Vec<RangeWithPeers> {
+    ranges.sort_by_key(|(start, _, _)| *start);
+    let mut merged: Vec<RangeWithPeers> = Vec::new();
+    for (range_start, range_end, mut peers) in ranges {
+        peers.sort_unstable();
+        if let Some(last) = merged.last_mut() {
+            if last.1 == range_start && last.2 == peers {
+                // Same replica set AND contiguous in token order.
+                last.1 = range_end;
+                continue;
+            }
+        }
+        merged.push((range_start, range_end, peers));
+    }
+    merged
+}
+
 impl RepairCoordinator {
     /// Repair `table` across every owned token range against every peer
     /// participant. Returns one [`SessionResult`] per `(range, peer)`
@@ -127,11 +168,8 @@ impl RepairCoordinator {
         // peer (and the local CQL listener, which has crashed in the
         // past from a 1 536-session storm on RF=3 / 3-node).
         let owned_ranges = owned_token_ranges(ring, local_node_id, rf);
-        // (start, end, peers_excluding_self_sorted). Sort by start so
-        // the wrap segment `[i64::MIN, first_token)` — which
-        // `owned_token_ranges` emits last — sits before the body and
-        // can merge with it where the replica set agrees.
-        let mut owned_with_peers: Vec<(i64, i64, Vec<u64>)> = owned_ranges
+        // (start, end, peers_excluding_self_sorted).
+        let owned_with_peers: Vec<RangeWithPeers> = owned_ranges
             .into_iter()
             .map(|(s, e)| {
                 let mut peers: Vec<u64> = super::repair_participants(ring, s, rf)
@@ -142,18 +180,7 @@ impl RepairCoordinator {
                 (s, e, peers)
             })
             .collect();
-        owned_with_peers.sort_by_key(|(s, _, _)| *s);
-        let mut merged: Vec<(i64, i64, Vec<u64>)> = Vec::new();
-        for (range_start, range_end, peers) in owned_with_peers {
-            if let Some(last) = merged.last_mut() {
-                if last.1 == range_start && last.2 == peers {
-                    // Same replica set AND contiguous in token order.
-                    last.1 = range_end;
-                    continue;
-                }
-            }
-            merged.push((range_start, range_end, peers));
-        }
+        let merged = merge_contiguous_same_peers(owned_with_peers);
         // One session per (merged-range, peer). Per-session memory
         // is now bounded INSIDE the session by the Merkle-then-
         // stream shape: build a streaming Merkle tree of the local
@@ -183,6 +210,9 @@ impl RepairCoordinator {
     /// [`Self::repair_table`] (which repairs *every* owned range and is meant to
     /// be triggered on a single node), this is safe to run on **every** node
     /// simultaneously — each range is initiated exactly once (FMEA #1, no herd).
+    /// Like [`Self::repair_table`] it collapses contiguous ranges that share a
+    /// replica set into one session per replica set before scheduling, so the
+    /// automatic path cannot storm a peer (CL-64).
     pub async fn repair_initiated(
         &self,
         executor: Arc<dyn SessionExecutor>,
@@ -197,10 +227,16 @@ impl RepairCoordinator {
         // replica unverified (`NoSessionsReason`).
         let ranges_with_live_peers =
             super::scheduler::owned_ranges_with_live_peers(ring, local_node_id, rf);
+        let initiated = super::scheduler::select_initiated_ranges(ring, local_node_id, rf);
         let mut tasks: Vec<(i64, i64, u64)> = Vec::new();
-        for r in super::scheduler::select_initiated_ranges(ring, local_node_id, rf) {
-            for peer in r.peers {
-                tasks.push((r.start, r.end, peer));
+        for (start, end, peers) in merge_contiguous_same_peers(
+            initiated
+                .into_iter()
+                .map(|r| (r.start, r.end, r.peers))
+                .collect(),
+        ) {
+            for peer in peers {
+                tasks.push((start, end, peer));
             }
         }
         InitiatedRepair {
@@ -447,6 +483,16 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    /// `node_with`, but with a FIXED `host_id` so the initiator election
+    /// (`min(host_id)` among a range's live replicas) is deterministic and a test
+    /// can pin an exact expected work list.
+    fn node_with_host_id(addr: &str, state: NodeState, host_id: u128) -> NodeInfo {
+        NodeInfo {
+            host_id: Uuid::from_u128(host_id),
+            ..node_with(addr, state)
+        }
+    }
+
     fn node_with(addr: &str, state: NodeState) -> NodeInfo {
         NodeInfo {
             host_id: Uuid::new_v4(),
@@ -538,6 +584,275 @@ mod tests {
             "exactly one node initiates each range (no herd)"
         );
         assert!(total > 0, "the sole initiator scheduled its sessions");
+    }
+
+    /// Union of a set of `[start, end)` spans, as the minimal sorted list of
+    /// disjoint spans covering exactly the same token space. Used to state the
+    /// merge's coverage invariant as VALUES (exact spans), not as a count.
+    fn union_of_spans(mut spans: Vec<(i64, i64)>) -> Vec<(i64, i64)> {
+        spans.sort_unstable();
+        let mut out: Vec<(i64, i64)> = Vec::new();
+        for (s, e) in spans {
+            match out.last_mut() {
+                Some(last) if s <= last.1 => last.1 = last.1.max(e),
+                _ => out.push((s, e)),
+            }
+        }
+        out
+    }
+
+    /// t_af51a55c: the AUTOMATIC path must collapse work exactly as
+    /// [`RepairCoordinator::repair_table`] does. Measured live: **769 ranges ×
+    /// 2 peers = 1 538 sessions per tick**, because `repair_initiated` emitted
+    /// one session per `(range, peer)` instead of one per replica set — the very
+    /// storm the coordinator's own comment records as having crashed the local
+    /// CQL listener (1 536 sessions on RF=3 / 3-node).
+    ///
+    /// RED as written: the count assertion fails on the CURRENT code, which
+    /// already schedules sessions — it fails on the BEHAVIOUR (too many, each
+    /// covering one vnode range), not on a missing symbol.
+    #[tokio::test]
+    async fn repair_initiated_merges_into_one_session_per_replica_set() {
+        let ring = three_node_ring();
+        let table = TableId::new("ks", "tbl");
+        let coord = RepairCoordinator {
+            max_concurrent_sessions: 4,
+        };
+
+        // Exactly one node is the initiator for every range in this ring, so
+        // find it rather than assuming the fixture's host_id order.
+        let mut scheduling = Vec::new();
+        let mut selected_spans: Vec<(i64, i64)> = Vec::new();
+        for node in [1u64, 2, 3] {
+            let exec = Arc::new(MockExecutor::new());
+            let initiated = coord
+                .repair_initiated(exec.clone(), &ring, node, 3, &table)
+                .await;
+            let calls: Vec<(i64, i64, u64)> = exec
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, s, e, p)| (*s, *e, *p))
+                .collect();
+            if !calls.is_empty() {
+                selected_spans.extend(
+                    crate::repair::scheduler::select_initiated_ranges(&ring, node, 3)
+                        .into_iter()
+                        .map(|r| (r.start, r.end)),
+                );
+                assert_eq!(
+                    initiated.results.len(),
+                    calls.len(),
+                    "one SessionResult per scheduled session"
+                );
+                scheduling.push((node, calls));
+            } else {
+                assert!(
+                    initiated.results.is_empty(),
+                    "node {node} initiates nothing, so it must schedule nothing \
+                     (the merge must not invent work)"
+                );
+            }
+        }
+
+        assert_eq!(scheduling.len(), 1, "exactly one initiator (no herd)");
+        let (node, calls) = &scheduling[0];
+
+        // The whole point: one session per non-self replica, not per range.
+        assert_eq!(
+            calls.len(),
+            2,
+            "node {node}: RF=3/3-node must merge into one session per non-self peer, \
+             but scheduled {} sessions ({} selected ranges × 2 peers)",
+            calls.len(),
+            selected_spans.len()
+        );
+        // VALUES, not just the count: each merged session covers the full ring.
+        for (s, e, p) in calls.iter() {
+            assert_eq!(
+                (*s, *e),
+                (i64::MIN, i64::MAX),
+                "the wrap segment must merge across the ring seam (peer {p})"
+            );
+        }
+        let peers: std::collections::BTreeSet<u64> = calls.iter().map(|(_, _, p)| *p).collect();
+        assert_eq!(
+            peers,
+            [1u64, 2, 3].iter().copied().filter(|n| n != node).collect(),
+            "sessions run against the two replicas other than self, and never self"
+        );
+
+        // Coverage invariant: merging must not drop or invent token space.
+        assert_eq!(
+            union_of_spans(calls.iter().map(|(s, e, _)| (*s, *e)).collect()),
+            union_of_spans(selected_spans),
+            "the merged spans must cover exactly the token space that was selected"
+        );
+    }
+
+    /// The OTHER half of the rule: the merge keys on the replica set, not on
+    /// contiguity alone. Fusing `[400,500)` (peer 4) with `[500,600)` (peer 2)
+    /// would run a session for token space that peer does not hold.
+    ///
+    /// Four nodes, RF=2, with **fixed** host_ids (node N → host_id N) so the
+    /// election is deterministic, giving one node a contiguous pair of ranges
+    /// with DIFFERENT replica sets. The assertion compares the cluster-wide work
+    /// list against an oracle written from the RULE (group a node's selected
+    /// ranges by peer set; merge maximal contiguous runs within each group), and
+    /// the fixture asserts up front both that such a mismatched seam exists and
+    /// that a legitimate merge does fire — so this guard cannot pass vacuously in
+    /// either direction.
+    #[tokio::test]
+    async fn repair_initiated_never_merges_ranges_with_different_replica_sets() {
+        let mut ring = TokenRing::new();
+        for (id, addr) in [
+            (1u64, "10.0.0.1:7000"),
+            (2, "10.0.0.2:7000"),
+            (3, "10.0.0.3:7000"),
+            (4, "10.0.0.4:7000"),
+        ] {
+            ring.add_node(id, node_with_host_id(addr, NodeState::Normal, id as u128));
+        }
+        ring.assign_tokens(1, &[100, 500]);
+        ring.assign_tokens(2, &[200, 600]);
+        ring.assign_tokens(3, &[300, 700]);
+        ring.assign_tokens(4, &[400, 800]);
+        let table = TableId::new("ks", "tbl");
+        let coord = RepairCoordinator {
+            max_concurrent_sessions: 4,
+        };
+
+        let mut work: std::collections::BTreeSet<(i64, i64, u64)> =
+            std::collections::BTreeSet::new();
+        // Spec oracle: group by peer set, merge maximal contiguous runs within
+        // each group. Written from the rule, not from the implementation.
+        let mut expected: std::collections::BTreeSet<(i64, i64, u64)> =
+            std::collections::BTreeSet::new();
+        let mut one_per_range = 0usize;
+        let mut selected: Vec<(i64, i64)> = Vec::new();
+        // Precondition: at least one node initiates two ranges that are
+        // contiguous in token order but have DIFFERENT replica sets — the only
+        // shape in which a contiguity-only merge misfires.
+        let mut mismatched_seams = 0usize;
+        for node in [1u64, 2, 3, 4] {
+            let exec = Arc::new(MockExecutor::new());
+            coord
+                .repair_initiated(exec.clone(), &ring, node, 2, &table)
+                .await;
+            work.extend(
+                exec.calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, s, e, p)| (*s, *e, *p)),
+            );
+
+            let mut ranges = crate::repair::scheduler::select_initiated_ranges(&ring, node, 2);
+            ranges.sort_by_key(|r| r.start);
+            for w in ranges.windows(2) {
+                if w[0].end == w[1].start && w[0].peers != w[1].peers {
+                    mismatched_seams += 1;
+                }
+            }
+            one_per_range += ranges.iter().map(|r| r.peers.len()).sum::<usize>();
+            for r in &ranges {
+                selected.push((r.start, r.end));
+            }
+            let mut i = 0;
+            while i < ranges.len() {
+                let mut peers = ranges[i].peers.clone();
+                peers.sort_unstable();
+                let mut end = ranges[i].end;
+                let mut j = i + 1;
+                while j < ranges.len() {
+                    let mut next = ranges[j].peers.clone();
+                    next.sort_unstable();
+                    if ranges[j].start == end && next == peers {
+                        end = ranges[j].end;
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                for p in peers {
+                    expected.insert((ranges[i].start, end, p));
+                }
+                i = j;
+            }
+        }
+        assert!(
+            mismatched_seams > 0,
+            "fixture precondition: no node has a contiguous pair with differing \
+             replica sets, so this guard cannot fire — fix the fixture, not the test"
+        );
+        assert!(
+            expected.len() < one_per_range,
+            "fixture precondition: no legitimate merge occurs in this ring \
+             ({expected:?} vs {one_per_range} sessions), so 'merges nothing' is vacuous"
+        );
+        assert_eq!(
+            work, expected,
+            "the work list must be exactly one session per maximal contiguous run \
+             of a node's selected ranges that share a replica set"
+        );
+        assert_eq!(
+            union_of_spans(work.iter().map(|(s, e, _)| (*s, *e)).collect()),
+            union_of_spans(selected),
+            "and it must still cover exactly the selected token space"
+        );
+    }
+
+    /// The merge predicate itself, on hand-made values: contiguity AND an
+    /// identical peer set are both required, and unsorted input (the wrap
+    /// segment `[i64::MIN, …)` arrives last from `owned_token_ranges`) must still
+    /// merge across the ring seam.
+    ///
+    /// Characterisation suite for the rule extracted from `repair_table`'s body —
+    /// it is not the red that produced the code (that is
+    /// `repair_initiated_merges_into_one_session_per_replica_set`); its
+    /// non-vacuity is shown by the contiguity-only negative control.
+    #[test]
+    fn merge_contiguous_same_peers_requires_both_contiguity_and_a_matching_replica_set() {
+        let merge = super::merge_contiguous_same_peers;
+
+        // Contiguous + identical peers → one span.
+        assert_eq!(
+            merge(vec![
+                (10, 20, vec![2, 3]),
+                (20, 30, vec![2, 3]),
+                (30, 40, vec![2, 3]),
+            ]),
+            vec![(10, 40, vec![2, 3])]
+        );
+        // Contiguous but DIFFERENT peers → must not merge.
+        assert_eq!(
+            merge(vec![(10, 20, vec![2]), (20, 30, vec![3])]),
+            vec![(10, 20, vec![2]), (20, 30, vec![3])]
+        );
+        // Contiguous + the SAME replica set enumerated in a different ORDER →
+        // still ONE span: the peer set is a set, not a sequence. (This is what
+        // `select_initiated_ranges` supplies — it does not pre-sort its peers.)
+        assert_eq!(
+            merge(vec![(10, 20, vec![3, 2]), (20, 30, vec![2, 3])]),
+            vec![(10, 30, vec![2, 3])]
+        );
+        // Identical peers but a GAP → must not merge.
+        assert_eq!(
+            merge(vec![(10, 20, vec![2]), (25, 30, vec![2])]),
+            vec![(10, 20, vec![2]), (25, 30, vec![2])]
+        );
+        // Unsorted, with the wrap segment last → merges across the ring seam.
+        assert_eq!(
+            merge(vec![
+                (100, 200, vec![2, 3]),
+                (i64::MIN, 100, vec![2, 3, 4]),
+                (200, i64::MAX, vec![2, 3]),
+            ]),
+            vec![(i64::MIN, 100, vec![2, 3, 4]), (100, i64::MAX, vec![2, 3])]
+        );
+        // Empty in, empty out.
+        assert_eq!(merge(vec![]), vec![]);
     }
 
     #[tokio::test]

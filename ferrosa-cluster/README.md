@@ -602,7 +602,9 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   partition hashing, divergent-leaf detection.
 - `repair/{coordinator,executor}.rs` — Merkle-then-stream sessions with bounded
   fetch/apply chunks; deterministic single-initiator selection (no thundering
-  herd); timestamp ties surfaced, never auto-resolved (Aphyr-safe).
+  herd), and adjacent token ranges that share a replica set collapse into ONE
+  session per replica set on BOTH the table-wide and the automatic/initiated path
+  (CL-64); timestamp ties surfaced, never auto-resolved (Aphyr-safe).
 - Every path that moves a partition between nodes carries the whole partition:
   rows, static row and partition deletion (P0-3, CL-43). Row streaming encodes
   through `StreamedMutation::from_partition` (legacy `Vec<RowWire>` bytes when
