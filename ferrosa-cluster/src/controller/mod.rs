@@ -202,6 +202,9 @@ pub struct ModeController {
     /// Monotonic process-wide consensus health, read synchronously by CQL and
     /// readiness so neither path waits on a failed Raft runtime.
     pub(super) consensus_health: Arc<ConsensusHealth>,
+    /// Per-follower replication progress, fed by the leader's snapshot pusher
+    /// and Raft network; read by readiness and the metrics endpoint.
+    pub(super) replication_health: Arc<crate::raft::replication_health::ReplicationHealth>,
     pub(super) mode: Arc<ArcSwap<DeploymentMode>>,
     pub(super) write_path: Arc<ArcSwap<WritePath>>,
     pub(super) cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
@@ -483,6 +486,7 @@ impl ModeController {
         schema.set_deployment_mode(initial_mode);
         let controller = Arc::new(Self {
             consensus_health: Arc::new(ConsensusHealth::new()),
+            replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: schema.deployment_mode_handle(),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
@@ -602,6 +606,7 @@ impl ModeController {
 
         Arc::new(Self {
             consensus_health: Arc::new(ConsensusHealth::new()),
+            replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: {
                 schema.set_deployment_mode(DeploymentMode::Standalone);
                 schema.deployment_mode_handle()
@@ -676,6 +681,7 @@ impl ModeController {
 
         Arc::new(Self {
             consensus_health: Arc::new(ConsensusHealth::new()),
+            replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: {
                 schema.set_deployment_mode(DeploymentMode::Pair);
                 schema.deployment_mode_handle()
@@ -870,6 +876,11 @@ impl ModeController {
     /// Shared, monotonic health gate for the process's consensus lane.
     pub fn consensus_health(&self) -> Arc<ConsensusHealth> {
         self.consensus_health.clone()
+    }
+
+    /// Per-follower replication progress (lag, stalls, snapshot-send failures).
+    pub fn replication_health(&self) -> Arc<crate::raft::replication_health::ReplicationHealth> {
+        self.replication_health.clone()
     }
 
     /// Synchronous fast path used by readiness and CQL dispatch.

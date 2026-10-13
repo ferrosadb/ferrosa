@@ -28,6 +28,15 @@
 //! acknowledges. It is also what makes a replication factor of *quorum* (rather
 //! than the whole cluster) sufficient: see the crate README.
 //!
+//! The level is configurable per node through
+//! [`READ_CONSISTENCY_ENV`] (`FERROSA_PG_READ_CONSISTENCY`), resolved by
+//! [`read_consistency`]. The default is unchanged; the knob exists because
+//! `QUORUM` is answered by *some* quorum of the replicas and therefore says
+//! nothing about whether **this** node holds a row — when the replication
+//! factor spans the ring, `ONE` is the level at which the coordinator is served
+//! from its own replicas alone, which is the property a per-replica durability
+//! check has to measure. See [`read_consistency_from`].
+//!
 //! ## Fail loud
 //!
 //! The coordinator refuses (with an error, never a warning) to serve a read
@@ -52,7 +61,51 @@ use futures::{Stream, StreamExt};
 /// any node sees every committed write at that level. `ONE` would make a read
 /// complete only while the local node happens to hold every partition it is
 /// asked for — the defect this module exists to remove.
+///
+/// This is the DEFAULT, not the only choice: [`read_consistency`] resolves
+/// `FERROSA_PG_READ_CONSISTENCY` over it.
 pub const DEFAULT_READ_CONSISTENCY: ConsistencyLevel = ConsistencyLevel::Quorum;
+
+/// The environment variable that selects the front end's read consistency
+/// level for this node (`ONE`, `LOCAL_ONE`, `QUORUM`, `ALL`, ...; any name
+/// [`ConsistencyLevel::from_str`] accepts, case-insensitively).
+pub const READ_CONSISTENCY_ENV: &str = "FERROSA_PG_READ_CONSISTENCY";
+
+/// Resolve the configured read consistency level from a raw setting.
+///
+/// * `None`, an unset variable, or a blank one — [`DEFAULT_READ_CONSISTENCY`].
+/// * A level name — that level.
+/// * Anything else — an `Err` naming the value and the accepted set. It is
+///   deliberately NOT a fallback: silently reading at a different level than
+///   the operator asked for is the class of defect this module exists to
+///   remove, so a misconfiguration fails loud on every scan instead.
+pub fn read_consistency_from(value: Option<&str>) -> Result<ConsistencyLevel, String> {
+    let raw = match value {
+        // `FOO= cmd` and `unset FOO` are the same intent; a blank value is
+        // "unset", not a level.
+        None => return Ok(DEFAULT_READ_CONSISTENCY),
+        Some(raw) if raw.trim().is_empty() => return Ok(DEFAULT_READ_CONSISTENCY),
+        Some(raw) => raw,
+    };
+    ConsistencyLevel::from_str(raw.trim()).ok_or_else(|| {
+        format!(
+            "{READ_CONSISTENCY_ENV}={raw:?} is not a consistency level; expected one of ONE, \
+             TWO, THREE, QUORUM, ALL, LOCAL_ONE, LOCAL_QUORUM, EACH_QUORUM, SERIAL, LOCAL_SERIAL"
+        )
+    })
+}
+
+/// [`read_consistency_from`] over this process's environment, resolved once.
+///
+/// Cached so the per-scan path never re-reads the environment; the environment
+/// cannot change mid-process in any way that should affect a read level.
+pub fn read_consistency() -> Result<ConsistencyLevel, String> {
+    static RESOLVED: std::sync::OnceLock<Result<ConsistencyLevel, String>> =
+        std::sync::OnceLock::new();
+    RESOLVED
+        .get_or_init(|| read_consistency_from(std::env::var(READ_CONSISTENCY_ENV).ok().as_deref()))
+        .clone()
+}
 
 /// A stream of the partitions one full-table range read produces, with failures
 /// carried inline (a stream cannot report a mid-read error any other way).
@@ -147,5 +200,85 @@ impl ClusterRead {
     /// it is not a cluster (fall back to local storage).
     pub fn reader(&self) -> Option<Arc<dyn RangeRead>> {
         self.factory.as_ref().and_then(|factory| factory())
+    }
+}
+
+/// Regression guards for the read-level resolver.
+///
+/// These were written AFTER `read_consistency_from` (so they are a guard, not
+/// the red that produced it): the function is instrumentation — the only way a
+/// test outside the process can ask for a read served from one node's own
+/// replicas. The guard worth having is the FAIL-LOUD one: a mis-set level must
+/// never quietly become a different level.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unset_setting_is_the_quorum_default() {
+        assert_eq!(
+            read_consistency_from(None).expect("unset must resolve"),
+            DEFAULT_READ_CONSISTENCY
+        );
+        assert_eq!(DEFAULT_READ_CONSISTENCY, ConsistencyLevel::Quorum);
+    }
+
+    /// `FOO= cmd` leaves the variable present but empty; that is "unset", and
+    /// must not be an error and must not be a level.
+    #[test]
+    fn blank_setting_is_unset_and_not_an_error() {
+        assert_eq!(
+            read_consistency_from(Some("")).unwrap(),
+            ConsistencyLevel::Quorum
+        );
+        assert_eq!(
+            read_consistency_from(Some("   ")).unwrap(),
+            ConsistencyLevel::Quorum
+        );
+    }
+
+    #[test]
+    fn an_explicit_level_is_honoured_case_insensitively() {
+        assert_eq!(
+            read_consistency_from(Some("one")).unwrap(),
+            ConsistencyLevel::One
+        );
+        assert_eq!(
+            read_consistency_from(Some("ONE")).unwrap(),
+            ConsistencyLevel::One
+        );
+        assert_eq!(
+            read_consistency_from(Some("  local_one  ")).unwrap(),
+            ConsistencyLevel::LocalOne
+        );
+        assert_eq!(
+            read_consistency_from(Some("quorum")).unwrap(),
+            ConsistencyLevel::Quorum
+        );
+        assert_eq!(
+            read_consistency_from(Some("all")).unwrap(),
+            ConsistencyLevel::All
+        );
+    }
+
+    /// A value that is not a level must not silently become one. This is the
+    /// guard that bites: it asserts the refusal names the offending value and
+    /// the accepted set, so an operator can fix it from the log alone.
+    #[test]
+    fn a_bogus_level_fails_loud_and_names_the_value() {
+        let error = read_consistency_from(Some("nearest"))
+            .expect_err("a bogus level must be refused, never silently replaced");
+        assert!(
+            error.contains("nearest"),
+            "the refusal must quote the value: {error}"
+        );
+        assert!(
+            error.contains(READ_CONSISTENCY_ENV),
+            "the refusal must name the variable to fix: {error}"
+        );
+        assert!(
+            error.contains("LOCAL_QUORUM"),
+            "the refusal must list the accepted set: {error}"
+        );
     }
 }

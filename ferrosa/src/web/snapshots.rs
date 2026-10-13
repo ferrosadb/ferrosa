@@ -599,6 +599,9 @@ mod tests {
             request_timeout: std::time::Duration::from_secs(
                 ferrosa_storage::upload::config::DEFAULT_S3_REQUEST_TIMEOUT_SECS,
             ),
+            body_idle_timeout: std::time::Duration::from_secs(
+                ferrosa_storage::upload::config::DEFAULT_S3_BODY_IDLE_TIMEOUT_SECS,
+            ),
         };
         let storage_config = StorageEngineConfig {
             commit_log: CommitLogConfig {

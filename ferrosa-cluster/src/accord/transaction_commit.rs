@@ -258,11 +258,12 @@ impl TransactionCommitter for AccordTransactionCommitter {
         &self,
         keyspace: &str,
         writes: StagedAccordWriteSet,
-        _tables: Vec<String>,
+        tables: Vec<String>,
         snapshot: ferrosa_common::accord::Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         use ferrosa_storage::accord::conflict_index::{
-            POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
+            postgres_read_table_key, POSTGRES_TRANSACTION_BARRIER_KEY,
+            POSTGRES_TRANSACTION_MARKER_KEY,
         };
 
         // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The per-key
@@ -286,11 +287,30 @@ impl TransactionCommitter for AccordTransactionCommitter {
         // staged region is therefore an exact PREFIX of the driven write-set; the driver reads
         // entries at/after the prefix from their resident (empty) mutation field.
         let staged_count = writes.len();
-        let mut resolve_inputs: Vec<(String, Vec<u8>)> = Vec::with_capacity(staged_count + 2);
-        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(staged_count + 2);
+        // The tables this transaction SCANNED are driven as one synthetic conflict
+        // key each, appended AFTER the staged payload region (so the staged region
+        // stays an exact prefix) and BEFORE the two protocol markers. That puts the
+        // READ into the DISTRIBUTED Accord ordering — PreAccept registration,
+        // dependency union, and the per-key execution high-water-mark — so a later
+        // writer that scanned the same table is refused (`SnapshotStale` -> Aborted
+        // -> SQLSTATE 40001) once the table was written after the reader's snapshot.
+        // Row-level point reads are judged by the row they named and never reach
+        // here (RT-2), so disjoint-key writers still commit concurrently.
+        let read_table_keys: Vec<Vec<u8>> = tables
+            .iter()
+            .map(|table| postgres_read_table_key(table))
+            .collect();
+        let mut resolve_inputs: Vec<(String, Vec<u8>)> =
+            Vec::with_capacity(staged_count + read_table_keys.len() + 2);
+        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> =
+            Vec::with_capacity(staged_count + read_table_keys.len() + 2);
         for (keyspace, key) in writes.keys() {
             resolve_inputs.push((keyspace.clone(), key.clone()));
             write_set.push((key.clone(), Vec::new()));
+        }
+        for key in read_table_keys {
+            resolve_inputs.push((keyspace.to_string(), key.clone()));
+            write_set.push((key, Vec::new()));
         }
         for marker in [
             POSTGRES_TRANSACTION_BARRIER_KEY,

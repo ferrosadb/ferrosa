@@ -182,9 +182,27 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   (`bookkeep_applied`: protocol-log marker → `Applied` flag → conflict-index GC →
   ReadVote wake) for exactly those. The storage write precedes the marker and the
   applier is idempotent on `(txn_id, t)`, so a crash between them is recovered by
-  the per-txn Apply retry — never a falsely-`Applied` txn. This is the single-key
+  the per-txn Apply retry — never a falsely-`Applied` txn.
+  **Correction (R0 journal slice, 2026-10-12):** that sentence must not be read as
+  "a marker fsync failure leaves the txn Committed". The marker is the journal's
+  *record*; the storage write is the durability instant, so `bookkeep_applied` now
+  decides the marker write and the ack together through
+  `applied_journal::record_applied_marker` (`AppliedAck::Ack` / `Withhold`). It
+  advances the txn to `Applied` — which is what the ack gate waits for — whenever
+  the rows are durable, and withholds the ack only for a no-write finalize, where
+  the marker really is the sole durable record. Withholding an ack on a durable row
+  is finding G1: the coordinator reports `TxnAbandoned` while the row is readable
+  (`apply_acks_when_the_rows_are_durable_even_if_the_marker_fsync_fails`). This is the single-key
   prerequisite for the multi-key/multi-partition transaction work (Phases 1+).
   Regression test: `sm_apply_is_dep_ordered_parks_until_dependency_applies`.
+  **R6a abandon-decision split (2026-10-12):** the retryable `TxnAbandoned` is now
+  reserved for a transaction with **zero verified Apply acks**. The apply fan-out
+  reports `ApplyFanout { quorum_reached, peer_acks }` (distinct remote verified
+  `ApplyOK`s; the coordinator's deferred self-ack is excluded), and ANY verified ack
+  — a replica writes its rows durably before it acks — turns an unmet quorum into a
+  non-retryable committed-and-converging error instead of the abandon, because a
+  retry would double-apply. See `specs/reference/commit-path-refactor-plan.md` R6a and
+  `coordinator::tests::a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon`.
 - **Dep-wait cascade replayed queued txns with empty data — fixed (PR #159).**
   `DepWaitApplier` parked dependency waiters but never stored their mutation, so
   when the last dependency resolved the cascade re-applied each waiter with

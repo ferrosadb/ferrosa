@@ -39,7 +39,8 @@ use serde::{Deserialize, Serialize};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
 use ferrosa_index::IndexKey;
 use ferrosa_net::message::Message;
-use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_net::rpc::error_reply::RemoteFailureKind;
+use ferrosa_net::rpc::handler::{HandlerOutcome, PeerId, RpcHandler};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
@@ -50,36 +51,117 @@ use super::FerrosRaftConfig;
 // Replying
 // ---------------------------------------------------------------------------
 
-/// Encode a handler's reply, or refuse to answer.
+/// The body every Raft RPC handler shares: wait for Raft, decode the request,
+/// run it, encode the response.
 ///
-/// Three handlers used to answer an encode failure with a successfully-encoded
-/// EMPTY payload — `partitions: vec![]`, `matching_keys: vec![]` — on the
-/// reasoning that sending something beat dropping the message. It does not. An
-/// empty reply is indistinguishable from a replica that legitimately matched
-/// nothing, so the coordinator unions it in and serves a short answer as a
-/// complete one. `RangeReadHandler`'s version was the worst of the three: it
-/// also set `truncated: false`, actively asserting that nothing was cut off.
-///
-/// A missing reply, by contrast, is something the caller can see and act on —
-/// it times out or fails coverage, both of which are loud. Silence beats a
-/// confident wrong answer (`skills/rules/safety.md`: never fake success).
-///
-/// Returns `None` when the payload cannot be encoded, having logged the cause
-/// at ERROR — this is a "should be impossible" path, so it is worth a line
-/// every time rather than being sampled.
-fn encode_reply<T: Serialize>(payload: &T, handler: &'static str) -> Option<Bytes> {
-    match bincode::serialize(payload) {
-        Ok(bytes) => Some(Bytes::from(bytes)),
+/// Each failure becomes a typed [`HandlerOutcome::Fail`] (outage 2026-10-10,
+/// D2). These handlers used to return no reply at all, so the sender held its
+/// stream slot until its own deadline and retried blind — on the
+/// install-snapshot path that was one full timeout per refused chunk. The
+/// server now logs and counts the failure and, for a peer that understands
+/// error replies, answers at once.
+async fn raft_rpc<Req, Resp, E, F, Fut>(
+    handler: &'static str,
+    lazy: &LazyRaft,
+    bytes: &[u8],
+    call: F,
+    wrap: fn(Bytes) -> Message,
+) -> HandlerOutcome
+where
+    Req: serde::de::DeserializeOwned + Send,
+    Resp: Serialize,
+    E: std::fmt::Display,
+    F: FnOnce(Arc<super::FerrosRaft>, Req) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<Resp, E>> + Send,
+{
+    let Some(raft) = lazy.get().await else {
+        return HandlerOutcome::fail(
+            RemoteFailureKind::NotReady,
+            format!("{handler}: Raft is not ready on this node (not initialised)"),
+        );
+    };
+    let req: Req = match bincode::deserialize(bytes) {
+        Ok(req) => req,
         Err(e) => {
-            tracing::error!(
-                handler,
-                %e,
-                "failed to serialize reply; sending NO reply rather than an empty one \
-                 that would read as 'nothing matched'"
-            );
-            None
+            return HandlerOutcome::fail(
+                RemoteFailureKind::RequestDecodeFailed,
+                format!("{handler}: request failed to deserialize: {e}"),
+            )
         }
+    };
+    let resp = match call(raft, req).await {
+        Ok(resp) => resp,
+        Err(e) => {
+            return HandlerOutcome::fail(
+                RemoteFailureKind::HandlerFailed,
+                format!("{handler}: {e}"),
+            )
+        }
+    };
+    match bincode::serialize(&resp) {
+        Ok(encoded) => HandlerOutcome::Reply(wrap(Bytes::from(encoded))),
+        Err(e) => HandlerOutcome::fail(
+            RemoteFailureKind::ResponseEncodeFailed,
+            format!("{handler}: response failed to serialize: {e}"),
+        ),
     }
+}
+
+/// Decode a data-path request body, or the typed failure that answers it.
+fn decode_request<T: serde::de::DeserializeOwned>(
+    handler: &'static str,
+    bytes: &[u8],
+) -> Result<T, Box<HandlerOutcome>> {
+    bincode::deserialize(bytes).map_err(|e| {
+        Box::new(HandlerOutcome::fail(
+            RemoteFailureKind::RequestDecodeFailed,
+            format!("{handler}: request failed to deserialize: {e}"),
+        ))
+    })
+}
+
+/// Encode a data-path reply, or the typed failure that answers instead.
+///
+/// Never an EMPTY payload in place of a failure: an empty reply is
+/// indistinguishable from a replica that legitimately matched nothing, so the
+/// coordinator would serve a short answer as a complete one.
+fn reply_outcome<T: Serialize>(
+    handler: &'static str,
+    payload: &T,
+    wrap: fn(Bytes) -> Message,
+) -> HandlerOutcome {
+    match bincode::serialize(payload) {
+        Ok(encoded) => HandlerOutcome::Reply(wrap(Bytes::from(encoded))),
+        Err(e) => HandlerOutcome::fail(
+            RemoteFailureKind::ResponseEncodeFailed,
+            format!("{handler}: response failed to serialize: {e}"),
+        ),
+    }
+}
+
+/// A replica's local storage could not serve the request. Answered as a typed
+/// failure naming the storage error (outage 2026-10-10, t_9113289f): a replica
+/// that stays silent costs the coordinator its whole lane deadline (10 s per
+/// read in the outage) before it tries another replica, and one that answers
+/// "nothing here" is a confident wrong answer.
+fn storage_failure(
+    handler: &'static str,
+    operation: &str,
+    error: impl std::fmt::Display,
+) -> HandlerOutcome {
+    HandlerOutcome::fail(
+        RemoteFailureKind::HandlerFailed,
+        format!("{handler}: {operation} failed: {error}"),
+    )
+}
+
+/// A Raft handler was routed a message type it does not handle: a
+/// registration bug, answered rather than left to the sender's deadline.
+fn unexpected_message(handler: &'static str, msg: &Message) -> HandlerOutcome {
+    HandlerOutcome::fail(
+        RemoteFailureKind::HandlerFailed,
+        format!("{handler}: unexpected message type {:?}", msg.msg_type()),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -862,48 +944,27 @@ impl RaftAppendHandler {
 
 #[async_trait]
 impl RpcHandler for RaftAppendHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftAppendEntries(b) => b,
-            other => {
-                tracing::error!(msg_type = ?other.msg_type(), "RaftAppendHandler: unexpected message type");
-                return None;
-            }
+            other => return unexpected_message("RaftAppendHandler", &other),
         };
-
-        let raft = match self.raft.get().await {
-            Some(r) => r,
-            None => {
-                tracing::error!(
-                    "RaftAppendHandler: Raft instance not ready (LazyRaft returned None)"
-                );
-                return None;
-            }
-        };
-
-        let req: AppendEntriesRequest<FerrosRaftConfig> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftAppendHandler: deserialize failed: {e}");
-                return None;
-            }
-        };
-
-        let resp = match raft.append_entries(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftAppendHandler: append_entries failed: {e}");
-                return None;
-            }
-        };
-
-        match bincode::serialize(&resp) {
-            Ok(bytes) => Some(Message::RaftAppendResponse(Bytes::from(bytes))),
-            Err(e) => {
-                tracing::error!("RaftAppendHandler: serialize response failed: {e}");
-                None
-            }
-        }
+        raft_rpc(
+            "RaftAppendHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: AppendEntriesRequest<FerrosRaftConfig>| async move {
+                raft.append_entries(req)
+                    .await
+                    .map_err(|e| format!("append_entries failed: {e}"))
+            },
+            Message::RaftAppendResponse,
+        )
+        .await
     }
 }
 
@@ -927,48 +988,28 @@ impl RaftVoteHandler {
 
 #[async_trait]
 impl RpcHandler for RaftVoteHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftVote(b) => b,
-            other => {
-                tracing::error!(msg_type = ?other.msg_type(), "RaftVoteHandler: unexpected message type");
-                return None;
-            }
+            other => return unexpected_message("RaftVoteHandler", &other),
         };
-
-        let raft = match self.raft.get().await {
-            Some(r) => r,
-            None => {
-                tracing::error!(
-                    "RaftVoteHandler: Raft instance not ready (LazyRaft returned None)"
-                );
-                return None;
-            }
-        };
-
-        let req: VoteRequest<u64> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftVoteHandler: deserialize failed: {e}");
-                return None;
-            }
-        };
-
-        let resp: VoteResponse<u64> = match raft.vote(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftVoteHandler: vote failed: {e}");
-                return None;
-            }
-        };
-
-        match bincode::serialize(&resp) {
-            Ok(bytes) => Some(Message::RaftVoteResponse(Bytes::from(bytes))),
-            Err(e) => {
-                tracing::error!("RaftVoteHandler: serialize response failed: {e}");
-                None
-            }
-        }
+        raft_rpc(
+            "RaftVoteHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: VoteRequest<u64>| async move {
+                raft.vote(req)
+                    .await
+                    .map(|resp: VoteResponse<u64>| resp)
+                    .map_err(|e| format!("vote failed: {e}"))
+            },
+            Message::RaftVoteResponse,
+        )
+        .await
     }
 }
 
@@ -1000,48 +1041,28 @@ impl RaftPreVoteHandler {
 
 #[async_trait]
 impl RpcHandler for RaftPreVoteHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftPreVote(b) => b,
-            other => {
-                tracing::error!(msg_type = ?other.msg_type(), "RaftPreVoteHandler: unexpected message type");
-                return None;
-            }
+            other => return unexpected_message("RaftPreVoteHandler", &other),
         };
-
-        let raft = match self.raft.get().await {
-            Some(r) => r,
-            None => {
-                tracing::error!(
-                    "RaftPreVoteHandler: Raft instance not ready (LazyRaft returned None)"
-                );
-                return None;
-            }
-        };
-
-        let req: PreVoteRequest<u64> = match bincode::deserialize(&bytes) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftPreVoteHandler: deserialize failed: {e}");
-                return None;
-            }
-        };
-
-        let resp: PreVoteResponse<u64> = match raft.pre_vote(req).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("RaftPreVoteHandler: pre_vote failed: {e}");
-                return None;
-            }
-        };
-
-        match bincode::serialize(&resp) {
-            Ok(bytes) => Some(Message::RaftPreVoteResponse(Bytes::from(bytes))),
-            Err(e) => {
-                tracing::error!("RaftPreVoteHandler: serialize response failed: {e}");
-                None
-            }
-        }
+        raft_rpc(
+            "RaftPreVoteHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: PreVoteRequest<u64>| async move {
+                raft.pre_vote(req)
+                    .await
+                    .map(|resp: PreVoteResponse<u64>| resp)
+                    .map_err(|e| format!("pre_vote failed: {e}"))
+            },
+            Message::RaftPreVoteResponse,
+        )
+        .await
     }
 }
 
@@ -1066,35 +1087,30 @@ impl RaftSnapshotHandler {
 
 #[async_trait]
 impl RpcHandler for RaftSnapshotHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
         let bytes = match msg {
             Message::RaftInstallSnapshot(b) => b,
-            _ => return None,
+            other => return unexpected_message("RaftSnapshotHandler", &other),
         };
-
-        let raft = self.raft.get().await?;
-
-        let req: InstallSnapshotRequest<FerrosRaftConfig> = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("RaftSnapshotHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
-
-        let resp: InstallSnapshotResponse<u64> = raft
-            .install_snapshot(req)
-            .await
-            .map_err(|e| {
-                tracing::warn!("RaftSnapshotHandler: install_snapshot failed: {e}");
-                e
-            })
-            .ok()?;
-
-        let resp_bytes = encode_reply(&resp, "RaftSnapshotHandler")?;
-
-        // Reuses `RaftAppendResponse` as the snapshot ack wire type, matching
-        // the decode side in `FerrosRaftNetwork::install_snapshot`.
-        Some(Message::RaftAppendResponse(resp_bytes))
+        // The ack reuses `RaftAppendResponse` as its wire type, matching the
+        // decode side in `FerrosRaftNetwork::install_snapshot`.
+        raft_rpc(
+            "RaftSnapshotHandler",
+            &self.raft,
+            &bytes,
+            |raft, req: InstallSnapshotRequest<FerrosRaftConfig>| async move {
+                raft.install_snapshot(req)
+                    .await
+                    .map(|resp: InstallSnapshotResponse<u64>| resp)
+                    .map_err(|e| format!("install_snapshot failed: {e}"))
+            },
+            Message::RaftAppendResponse,
+        )
+        .await
     }
 }
 
@@ -1123,40 +1139,41 @@ impl ReadRequestHandler {
 
 #[async_trait]
 impl RpcHandler for ReadRequestHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "ReadRequestHandler";
         let (req, start_clustering) = match msg {
             Message::ReadRequest(bytes) => {
-                let req: ReadRequestPayload = bincode::deserialize(&bytes)
-                    .map_err(|e| {
-                        tracing::warn!("ReadRequestHandler: failed to deserialize request: {e}");
-                        e
-                    })
-                    .ok()?;
-                (req, None)
+                match decode_request::<ReadRequestPayload>(HANDLER, &bytes) {
+                    Ok(req) => (req, None),
+                    Err(failed) => return *failed,
+                }
             }
             Message::PartitionSuffixReadRequest(bytes) => {
-                let suffix: PartitionSuffixReadRequestPayload = bincode::deserialize(&bytes)
-                    .map_err(|e| {
-                        tracing::warn!(
-                            "ReadRequestHandler: failed to deserialize suffix request: {e}"
-                        );
-                        e
-                    })
-                    .ok()?;
+                let suffix: PartitionSuffixReadRequestPayload =
+                    match decode_request(HANDLER, &bytes) {
+                        Ok(suffix) => suffix,
+                        Err(failed) => return *failed,
+                    };
                 if suffix.version != 1
                     || suffix.start_clustering.is_empty()
                     || !suffix.request.clustering.is_empty()
                     || !suffix.request.page_state.is_empty()
                 {
-                    tracing::warn!(
-                        version = suffix.version,
-                        "ReadRequestHandler: rejected malformed suffix read request"
+                    return HandlerOutcome::fail(
+                        RemoteFailureKind::RequestDecodeFailed,
+                        format!(
+                            "{HANDLER}: malformed suffix read request (version {})",
+                            suffix.version
+                        ),
                     );
-                    return None;
                 }
                 (suffix.request, Some(suffix.start_clustering))
             }
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
 
         let table_id = TableId::new(&req.keyspace, &req.table);
@@ -1248,15 +1265,12 @@ impl RpcHandler for ReadRequestHandler {
                 has_more: false,
                 next_page_state: vec![],
             },
-            Err(e) => {
-                tracing::warn!("ReadRequestHandler: storage read failed: {e}");
-                return None;
-            }
+            // The server logs and counts this and answers the requester at
+            // once (t_9113289f).
+            Err(e) => return storage_failure(HANDLER, "storage read", e),
         };
 
-        let resp_bytes = encode_reply(&payload, "ReadRequestHandler")?;
-
-        Some(Message::ReadResponse(resp_bytes))
+        reply_outcome(HANDLER, &payload, Message::ReadResponse)
     }
 }
 
@@ -1312,18 +1326,20 @@ impl RangeReadHandler {
 
 #[async_trait]
 impl RpcHandler for RangeReadHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "RangeReadHandler";
         let bytes = match msg {
             Message::RangeReadRequest(b) => b,
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
-
-        let req: RangeReadRequestPayload = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("RangeReadHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
+        let req: RangeReadRequestPayload = match decode_request(HANDLER, &bytes) {
+            Ok(req) => req,
+            Err(failed) => return *failed,
+        };
 
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
 
@@ -1339,13 +1355,11 @@ impl RpcHandler for RangeReadHandler {
             row_limit,
         ) {
             Ok(ps) => ps,
-            Err(e) => {
-                tracing::warn!("RangeReadHandler: read_range failed: {e}");
-                // Return empty response instead of None — a None response
-                // means NO response at all, causing the coordinator to wait
-                // for the full 120s timeout and hang the client.
-                vec![]
-            }
+            // Not an empty reply: that reads as "this replica holds nothing"
+            // and the coordinator serves a short scan as complete. Not silence
+            // either: that costs the coordinator its lane deadline. A typed
+            // error reply fails the read at once (t_9113289f).
+            Err(e) => return storage_failure(HANDLER, "range read", e),
         };
 
         let truncated = partitions.len() >= range_read_limit;
@@ -1354,10 +1368,7 @@ impl RpcHandler for RangeReadHandler {
             partitions: wire_partitions,
             truncated,
         };
-
-        let resp_bytes = encode_reply(&payload, "RangeReadHandler")?;
-
-        Some(Message::RangeReadResponse(resp_bytes))
+        reply_outcome(HANDLER, &payload, Message::RangeReadResponse)
     }
 }
 
@@ -1617,18 +1628,20 @@ impl IndexReadInPartitionHandler {
 
 #[async_trait]
 impl RpcHandler for IndexReadInPartitionHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "IndexReadInPartitionHandler";
         let bytes = match msg {
             Message::IndexReadInPartitionRequest(b) => b,
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
-
-        let req: IndexReadInPartitionRequestPayload = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("IndexReadInPartitionHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
+        let req: IndexReadInPartitionRequestPayload = match decode_request(HANDLER, &bytes) {
+            Ok(req) => req,
+            Err(failed) => return *failed,
+        };
 
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
         let index_key = IndexKey(req.index_key);
@@ -1640,22 +1653,15 @@ impl RpcHandler for IndexReadInPartitionHandler {
             &req.partition_key,
         ) {
             Ok(ps) => ps,
-            Err(e) => {
-                tracing::warn!(
-                    "IndexReadInPartitionHandler: read_by_index_in_partition failed: {e}"
-                );
-                vec![]
-            }
+            // An empty reply would read as "no row matches" (t_9113289f).
+            Err(e) => return storage_failure(HANDLER, "index read", e),
         };
 
         let wire_partitions = partitions.into_iter().map(partition_to_wire).collect();
         let payload = IndexReadResponsePayload {
             partitions: wire_partitions,
         };
-
-        let resp_bytes = encode_reply(&payload, "IndexReadInPartitionHandler")?;
-
-        Some(Message::IndexReadInPartitionResponse(resp_bytes))
+        reply_outcome(HANDLER, &payload, Message::IndexReadInPartitionResponse)
     }
 }
 
@@ -1707,18 +1713,20 @@ impl FulltextSearchHandler {
 
 #[async_trait]
 impl RpcHandler for FulltextSearchHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "FulltextSearchHandler";
         let bytes = match msg {
             Message::FulltextSearchRequest(b) => b,
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
-
-        let req: FulltextSearchRequestPayload = bincode::deserialize(&bytes)
-            .map_err(|e| {
-                tracing::warn!("FulltextSearchHandler: failed to deserialize request: {e}");
-                e
-            })
-            .ok()?;
+        let req: FulltextSearchRequestPayload = match decode_request(HANDLER, &bytes) {
+            Ok(req) => req,
+            Err(failed) => return *failed,
+        };
 
         let table_id = ferrosa_storage::TableId::new(&req.keyspace, &req.table);
 
@@ -1782,25 +1790,15 @@ impl RpcHandler for FulltextSearchHandler {
 
         let matching_keys = match outcome {
             Ok(Ok(keys)) => keys,
-            Ok(Err(e)) => {
-                // Fail loud: serving `vec![]` here reports a storage failure as
-                // "no matches", and the coordinator cannot tell the difference.
-                tracing::error!(%e, "FulltextSearchHandler: fulltext_search failed");
-                return None;
-            }
-            Err(join_err) => {
-                tracing::error!(
-                    %join_err,
-                    "FulltextSearchHandler: fulltext_search task join failed"
-                );
-                return None;
-            }
+            // Fail loud: serving `vec![]` here reports a storage failure as
+            // "no matches", and the coordinator cannot tell the difference;
+            // answering nothing costs it the Bulk lane deadline (t_9113289f).
+            Ok(Err(e)) => return storage_failure(HANDLER, "fulltext search", e),
+            Err(join_err) => return storage_failure(HANDLER, "fulltext search task", join_err),
         };
 
         let payload = FulltextSearchResponsePayload { matching_keys };
-        let resp_bytes = encode_reply(&payload, "FulltextSearchHandler")?;
-
-        Some(Message::FulltextSearchResponse(resp_bytes))
+        reply_outcome(HANDLER, &payload, Message::FulltextSearchResponse)
     }
 }
 
@@ -2744,6 +2742,162 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Data-path handlers answer a storage failure with a typed error reply
+    // (outage 2026-10-10, t_9113289f): never silence (the requester waits out
+    // its lane deadline) and never an empty answer (read as "nothing here").
+    // -----------------------------------------------------------------------
+
+    fn assert_handler_failed(outcome: HandlerOutcome, handler: &str, what: &str) {
+        match outcome {
+            HandlerOutcome::Fail {
+                kind: RemoteFailureKind::HandlerFailed,
+                detail,
+            } => assert!(
+                detail.starts_with(handler) && detail.contains(what),
+                "the failure must name {handler} and {what:?}; got {detail:?}"
+            ),
+            other => panic!(
+                "{handler}: a storage failure must be a HandlerFailed error reply, \
+                 not silence or an empty answer; got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_request_handler_answers_an_undecodable_request_with_an_error_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ReadRequestHandler::new(test_storage(dir.path()));
+        let outcome = handler
+            .handle_outcome(
+                make_peer_id(),
+                Message::ReadRequest(Bytes::from_static(&[0xff])),
+            )
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                HandlerOutcome::Fail {
+                    kind: RemoteFailureKind::RequestDecodeFailed,
+                    ..
+                }
+            ),
+            "an undecodable read must be answered RequestDecodeFailed; got {outcome:?}"
+        );
+    }
+
+    /// Write one row under `pk` with value `val`, flush it, then truncate every
+    /// `Data.db` of the table so the only copy cannot be read. The storage
+    /// engine reports that as an error (an unreadable SSTable never reads as
+    /// "absent" on first contact).
+    fn unreadable_row(dir: &std::path::Path, storage: &StorageEngine, pk: &[u8], val: &[u8]) {
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(val.to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let dk = DecoratedKey::new(PartitionKey::new(pk.to_vec()));
+        storage.write(&table_id, &dk, row, 1000).unwrap();
+        storage.flush(&table_id).unwrap();
+        let mut damaged = 0usize;
+        let mut pending = vec![dir.join("sstables").join(table_id.to_string())];
+        for _ in 0..64 {
+            let Some(next) = pending.pop() else { break };
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.to_string_lossy().ends_with("-Data.db") {
+                    std::fs::write(&path, [0u8]).unwrap();
+                    damaged += 1;
+                }
+            }
+        }
+        assert!(damaged > 0, "test setup: no flushed Data.db to damage");
+    }
+
+    #[tokio::test]
+    async fn range_read_handler_answers_a_storage_failure_with_an_error_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        unreadable_row(dir.path(), &storage, b"pk", b"v");
+        let handler = RangeReadHandler::new(storage);
+        let req = RangeReadRequestPayload {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            limit: 10,
+            row_limit: 0,
+        };
+        let msg = Message::RangeReadRequest(Bytes::from(bincode::serialize(&req).unwrap()));
+        let outcome = handler.handle_outcome(make_peer_id(), msg).await;
+        assert_handler_failed(outcome, "RangeReadHandler", "range read failed");
+    }
+
+    #[tokio::test]
+    async fn index_read_in_partition_handler_answers_a_storage_failure_with_an_error_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = TableSchema {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            clustering_columns: vec![],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "val".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        };
+        storage
+            .register_table_with_indexes(schema, vec![("val_idx".to_string(), 0_usize)])
+            .unwrap();
+        unreadable_row(dir.path(), &storage, b"pk", b"v");
+        let handler = IndexReadInPartitionHandler::new(storage);
+        let req = IndexReadInPartitionRequestPayload {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            index_name: "val_idx".to_string(),
+            index_key: b"v".to_vec(),
+            partition_key: b"pk".to_vec(),
+        };
+        let msg =
+            Message::IndexReadInPartitionRequest(Bytes::from(bincode::serialize(&req).unwrap()));
+        let outcome = handler.handle_outcome(make_peer_id(), msg).await;
+        assert_handler_failed(outcome, "IndexReadInPartitionHandler", "index read failed");
+    }
+
+    #[tokio::test]
+    async fn fulltext_search_handler_answers_a_storage_failure_with_an_error_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+        let table_id = TableId::new("test_ks", "test_tbl");
+        storage.add_fulltext_index(&table_id, "val_fti", 0).unwrap();
+        // A query the full-text parser rejects: the search fails in storage.
+        const BAD_QUERY: &str = "\"unterminated";
+        assert!(
+            storage
+                .fulltext_search(&table_id, "val_fti", BAD_QUERY, None)
+                .is_err(),
+            "test setup: an unparseable full-text query must fail in storage"
+        );
+        let handler = FulltextSearchHandler::new(storage);
+        let req = FulltextSearchRequestPayload {
+            keyspace: "test_ks".to_string(),
+            table: "test_tbl".to_string(),
+            index_name: "val_fti".to_string(),
+            query: BAD_QUERY.to_string(),
+            limit: None,
+        };
+        let msg = Message::FulltextSearchRequest(Bytes::from(bincode::serialize(&req).unwrap()));
+        let outcome = handler.handle_outcome(make_peer_id(), msg).await;
+        assert_handler_failed(outcome, "FulltextSearchHandler", "fulltext search failed");
+    }
+
+    // -----------------------------------------------------------------------
     // Vote serialization round-trip (tests serde codec without live Raft)
     // -----------------------------------------------------------------------
 
@@ -2918,7 +3072,7 @@ mod tests {
         assert_eq!(&encoded[..4], &0xDEAD_BEEFu32.to_le_bytes());
     }
 
-    // ---- encode_reply ----------------------------------------------------
+    // ---- reply_outcome ---------------------------------------------------
 
     /// A payload that cannot be encoded.
     ///
@@ -2938,7 +3092,11 @@ mod tests {
         let payload = FulltextSearchResponsePayload {
             matching_keys: vec![b"doc-1".to_vec(), b"doc-2".to_vec()],
         };
-        let bytes = encode_reply(&payload, "TestHandler").expect("an encodable reply must be sent");
+        let HandlerOutcome::Reply(Message::FulltextSearchResponse(bytes)) =
+            reply_outcome("TestHandler", &payload, Message::FulltextSearchResponse)
+        else {
+            panic!("an encodable reply must be sent as the handler's message");
+        };
         let decoded: FulltextSearchResponsePayload =
             bincode::deserialize(&bytes).expect("reply must round-trip");
         assert_eq!(decoded.matching_keys, payload.matching_keys);
@@ -2949,10 +3107,18 @@ mod tests {
     /// apart from a replica that genuinely matched nothing.
     #[test]
     fn a_reply_that_cannot_be_encoded_is_refused_rather_than_faked() {
+        let outcome = reply_outcome("TestHandler", &Unencodable, Message::FulltextSearchResponse);
         assert!(
-            encode_reply(&Unencodable, "TestHandler").is_none(),
-            "an encode failure must send NO reply — an empty one reports the \
-             failure as an empty ANSWER, which is a silent wrong result"
+            matches!(
+                outcome,
+                HandlerOutcome::Fail {
+                    kind: RemoteFailureKind::ResponseEncodeFailed,
+                    ..
+                }
+            ),
+            "an encode failure must be a typed error reply — an empty one reports \
+             the failure as an empty ANSWER, which is a silent wrong result; got \
+             {outcome:?}"
         );
     }
 
@@ -2971,7 +3137,8 @@ mod tests {
         assert!(
             !source.contains(needle),
             "a handler is falling back to a default-encoded reply on a \
-             serialization failure; use `encode_reply` and send nothing instead"
+             serialization failure; use `reply_outcome`, which answers with a \
+             typed error reply instead"
         );
     }
 }

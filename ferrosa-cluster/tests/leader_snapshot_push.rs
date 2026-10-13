@@ -69,6 +69,7 @@ use openraft::{
 use tokio::sync::Mutex;
 
 use ferrosa_cluster::raft::election_guard::{run_election_guard, ELECTION_STORM_TERM_JUMPS_TOTAL};
+use ferrosa_cluster::raft::replication_health::ReplicationHealth;
 use ferrosa_cluster::raft::snapshot_pusher::{run_snapshot_pusher, INSTALLSNAPSHOT_PUSHES_TOTAL};
 
 // ---------------------------------------------------------------------------
@@ -647,11 +648,13 @@ async fn leader_pushes_snapshot_to_wiped_node() {
         let pn2 = n2.clone();
         let cancel1 = pusher_cancel.clone();
         let cancel2 = pusher_cancel.clone();
+        let health1 = Arc::new(ReplicationHealth::new());
+        let health2 = Arc::new(ReplicationHealth::new());
         tokio::spawn(async move {
-            run_snapshot_pusher(pn1, cancel1, 200, 5).await;
+            run_snapshot_pusher(pn1, cancel1, 200, 5, health1).await;
         });
         tokio::spawn(async move {
-            run_snapshot_pusher(pn2, cancel2, 200, 5).await;
+            run_snapshot_pusher(pn2, cancel2, 200, 5, health2).await;
         });
     }
 

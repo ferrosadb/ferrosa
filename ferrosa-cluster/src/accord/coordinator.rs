@@ -538,13 +538,18 @@ pub enum AccordDriverError {
     /// # Atomicity of the abandon
     ///
     /// Because the client is told the transaction did not commit and may retry,
-    /// an abandon must leave **no committed row readable on any replica**. That
-    /// holds because the abandon is decided BEFORE the coordinator writes its own
-    /// shard: the coordinator's own-shard apply is deferred until the remote Apply
-    /// quorum is secured, so an abandon means no replica applied. If the Apply
-    /// quorum *is* secured the transaction is committed and durably applied on a
-    /// quorum and is never reported as abandoned — a coordinator whose own replica
-    /// then fails to converge fails loud with [`Self::Network`] instead.
+    /// an abandon must leave **no committed row readable on any replica**. The
+    /// abandon is therefore reserved for the case where **no replica acked the
+    /// Apply**: the coordinator's own-shard write is deferred until the remote
+    /// Apply quorum is secured, and a replica writes its rows durably *before* it
+    /// acks, so zero verified `ApplyOK`s means no replica is known to have applied
+    /// and the "NOT committed" report is the truth. If **any** replica acked, the
+    /// transaction is committed on that replica (its apply fan-out's durable
+    /// write-before-ack ordering) and MUST NOT be abandoned — the coordinator
+    /// fails loud with a non-retryable [`Self::Network`] instead, because "safe to
+    /// retry" would invite a double-apply. The same non-retryable error covers the
+    /// case where the Apply quorum *is* secured but the coordinator's own replica
+    /// then fails to converge.
     ///
     /// This subsumes the former `ApplyQuorumUnavailable`: when the apply quorum
     /// could not be reached within the bound, the transaction is now abandoned
@@ -586,6 +591,33 @@ impl std::error::Error for AccordDriverError {}
 /// (the write should apply). Injected by the CQL router; see
 /// [`AccordCoordinatorDriver::with_condition_gate`].
 pub type ConditionGate = Box<dyn Fn(Option<&[u8]>) -> bool + Send + Sync>;
+
+/// What the Apply fan-out observed — the evidence the abandon decision turns on.
+///
+/// A replica writes its rows durably *before* it acknowledges the Apply, so a
+/// verified `ApplyOK` is proof the sender applied. The two facts are kept apart
+/// because they answer two different questions at the instant the coordinator
+/// decides the transaction's fate:
+///
+/// * `quorum_reached` — every shard met its slow quorum: the transaction is
+///   committed and durably applied on a quorum.
+/// * `peer_acks` — distinct remote replicas that returned a verified `ApplyOK`.
+///   This deliberately EXCLUDES the coordinator's own implicit self-ack: the
+///   coordinator defers its own-shard write until the remote quorum is secured
+///   (see the ordering note in `apply_phase_within`), so its self-ack is not
+///   evidence of a durable apply.
+///
+/// `!quorum_reached && peer_acks == 0` — no replica is known to have applied, so
+/// the retryable abandon is truthful. `!quorum_reached && peer_acks > 0` — a
+/// PARTIAL apply: the transaction is committed on those replicas, so it must NOT
+/// be reported as an abandon; a retry would double-apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ApplyFanout {
+    /// Every shard reached its slow quorum.
+    pub(crate) quorum_reached: bool,
+    /// Distinct remote replicas that acknowledged a durable apply.
+    pub(crate) peer_acks: usize,
+}
 
 /// A driver that connects the pure `AccordCoordinator` state machine to real
 /// network I/O via `PeerManager`.
@@ -2781,7 +2813,7 @@ impl AccordCoordinatorDriver {
             if self.write_set.len() == 1 {
                 let apply_bytes = self.apply_payload_bytes()?;
                 let apply_msg = Message::AccordApply(Bytes::from(apply_bytes));
-                Ok::<bool, AccordDriverError>(
+                Ok::<ApplyFanout, AccordDriverError>(
                     self.quorum_broadcast_within(apply_msg, &participant, is_apply_ok, bound)
                         .await,
                 )
@@ -2809,7 +2841,8 @@ impl AccordCoordinatorDriver {
         // truthful and leaves nothing behind; after it, the transaction is committed
         // and durably applied on a quorum, so it must NOT be reported as abandoned.
         // ------------------------------------------------------------------
-        let apply_ok = remote_apply.await?;
+        let fanout = remote_apply.await?;
+        let apply_ok = fanout.quorum_reached;
         if residency_profile {
             tracing::info!(
                 phase = "apply_phase.remote_decided",
@@ -2821,22 +2854,80 @@ impl AccordCoordinatorDriver {
         }
 
         if !apply_ok {
-            // No replica has applied: the coordinator has not written yet, and the
-            // apply quorum (self + the remotes) was not met, so nothing durable
-            // exists. Rolling the transaction back is the true outcome, and
-            // finalizing it as a no-write releases any successor parked behind it,
-            // so one slow apply can never poison the key. The client is told it did
-            // not commit and may retry.
-            let timeout = bound;
+            if fanout.peer_acks == 0 {
+                // ZERO verified acks: no replica is known to have applied. The
+                // coordinator has not written yet, and the apply quorum (self + the
+                // remotes) was not met with a single ack, so nothing durable exists.
+                // Rolling the transaction back is the true outcome, and finalizing it
+                // as a no-write releases any successor parked behind it, so one slow
+                // apply can never poison the key. The client is told it did not
+                // commit and may retry.
+                let timeout = bound;
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    unmet = ?participant.shards.len(),
+                    ?timeout,
+                    "accord: Apply quorum not reached within the dependency-wait bound with \
+                     zero verified acks — abandoning the transaction (NOT committed; safe \
+                     to retry)"
+                );
+                self.finalize_no_write().await;
+                return Err(AccordDriverError::TxnAbandoned { timeout });
+            }
+            // PARTIAL APPLY: at least one replica returned a verified ApplyOK, and a
+            // replica writes its rows durably BEFORE it acks. The transaction is
+            // therefore COMMITTED and durably applied on those replicas even though
+            // the Apply quorum was not reached inside the bound. This must NOT be
+            // reported as an abandon: "NOT committed; safe to retry" would invite a
+            // retry that double-applies the rows the acked replicas already hold.
+            // Fail loud with a non-retryable error; the replicas that did not ack
+            // converge on the committed transaction through recovery. NOTE:
+            // `finalize_no_write` is deliberately NOT called here — rolling back a
+            // committed transaction would be a second lie.
+            //
+            // The coordinator's OWN shard is converged HERE, before the error is
+            // returned. The transaction is COMMITTED, so leaving its own shard
+            // unwritten would strand it as a permanent dependency on the
+            // coordinator's own keys: every later read or snapshot barrier there
+            // dep-waits on it and abstains ("PostgreSQL snapshot barrier
+            // dependencies were not applied locally") until a restart — the wedge
+            // this branch must not create. Deferring the own-shard apply to the
+            // quorum exists to keep the ABANDON truthful; this branch never
+            // abandons, so converging here cannot make any client-visible report
+            // false. It is the same progress recovery would make, not deferred to
+            // it.
+            let (local_apply_result, local_applied) = tokio::join!(local_apply, local_apply_wait);
+            if let Err(error) = local_apply_result {
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    %error,
+                    "accord: coordinator's own-shard apply failed on the committed-but-not-\
+                     quorum path; its replica converges via recovery"
+                );
+            }
+            if !local_applied {
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    ?bound,
+                    "accord: coordinator's own shard did not reach Applied on the \
+                     committed-but-not-quorum path; its replica converges via recovery"
+                );
+            }
             tracing::error!(
                 txn_id = ?txn_id,
-                unmet = ?participant.shards.len(),
-                ?timeout,
-                "accord: Apply quorum not reached within the dependency-wait bound — \
-                 abandoning the transaction (NOT committed; safe to retry)"
+                acked = fanout.peer_acks,
+                shards = participant.shards.len(),
+                ?bound,
+                "accord: Apply reached a verified replica but not the quorum within the \
+                 dependency-wait bound — the transaction is COMMITTED and durably applied \
+                 on those replicas (NOT an abandon; a retry would double-apply)"
             );
-            self.finalize_no_write().await;
-            return Err(AccordDriverError::TxnAbandoned { timeout });
+            return Err(AccordDriverError::Network(format!(
+                "accord: Apply quorum not reached within {bound:?}, but {} replica(s) durably \
+                 applied this transaction — it IS committed and will converge (NOT an \
+                 abandon; do NOT retry, a retry would double-apply)",
+                fanout.peer_acks
+            )));
         }
 
         // The Apply quorum is secured. Only NOW does the coordinator persist its own
@@ -2946,9 +3037,31 @@ impl AccordCoordinatorDriver {
         participant: &crate::accord::shard_quorum::ParticipantSet,
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
         timeout: std::time::Duration,
-    ) -> bool {
-        self.quorum_broadcast_per_peer(participant, |_| msg.clone(), is_ack, timeout)
-            .await
+    ) -> ApplyFanout {
+        // Count the acks the predicate certifies: a verified ApplyOK is a remote
+        // replica that wrote its rows durably before answering. This is the
+        // single-key apply path's only source of partial-apply evidence, and it
+        // never counts the coordinator's own implicit self-ack (the per-peer
+        // fan-out skips `self_id`), which is not evidence of a durable apply.
+        let peer_acks = std::sync::atomic::AtomicUsize::new(0);
+        let quorum_reached = self
+            .quorum_broadcast_per_peer(
+                participant,
+                |_| msg.clone(),
+                |r| {
+                    let ack = is_ack(r);
+                    if ack {
+                        peer_acks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    ack
+                },
+                timeout,
+            )
+            .await;
+        ApplyFanout {
+            quorum_reached,
+            peer_acks: peer_acks.load(std::sync::atomic::Ordering::Relaxed),
+        }
     }
 
     /// Apply fan-out that keeps AT MOST `APPLY_FANOUT_WINDOW` replica payloads
@@ -2987,6 +3100,7 @@ impl AccordCoordinatorDriver {
     ) -> Result<bool, AccordDriverError> {
         self.apply_fanout_bounded_within(participant, is_ack, Lane::Data.timeout())
             .await
+            .map(|outcome| outcome.quorum_reached)
     }
 
     /// [`Self::apply_fanout_bounded`] with an explicit per-peer RPC timeout, so the Apply
@@ -2997,7 +3111,7 @@ impl AccordCoordinatorDriver {
         participant: &crate::accord::shard_quorum::ParticipantSet,
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
         timeout: std::time::Duration,
-    ) -> Result<bool, AccordDriverError> {
+    ) -> Result<ApplyFanout, AccordDriverError> {
         use futures::StreamExt;
         let txn_id = self.coordinator.txn_id;
         let self_id = self.self_id;
@@ -3006,7 +3120,14 @@ impl AccordCoordinatorDriver {
             quorum.record_node_ack(self_id);
         }
         if quorum.all_reached() {
-            return Ok(true);
+            // The coordinator's own implicit self-ack alone satisfied every shard
+            // (it is the only replica of its shards). No peer is due an ack, but no
+            // peer can have applied either; the quorum is reached and the
+            // coordinator's own write follows in `apply_phase_within`.
+            return Ok(ApplyFanout {
+                quorum_reached: true,
+                peer_acks: 0,
+            });
         }
         // Send to every replica CONCURRENTLY, up to a small in-flight window.
         //
@@ -3020,6 +3141,10 @@ impl AccordCoordinatorDriver {
         // resident bytes bounded the same way the old code did — only the
         // serialized frame of an in-flight send is held, and at most
         // `APPLY_FANOUT_WINDOW` of them — while removing the N-fold serialization.
+        // Distinct remote replicas that acknowledged a durable apply. This is the
+        // partial-apply evidence the abandon decision reads: a replica writes its
+        // rows durably before it acks, so ANY verified ack here means this
+        // transaction is committed on that replica.
         // One task per peer: it builds that peer's SCOPED frame and sends it. Spawning
         // (rather than buffering the build inside this task's `FuturesUnordered`) is the
         // point — a remote peer's frame build is CPU-bound compression of its shard, and with
@@ -3040,9 +3165,11 @@ impl AccordCoordinatorDriver {
                 AccordDriverError,
             >,
         >;
-        let mut inflight: futures::stream::FuturesUnordered<PeerTask> =
-            futures::stream::FuturesUnordered::new();
-        let mut peers = self.replica_ids.iter().filter(|&&id| id != self_id);
+        let mut peer_acks = 0usize;
+        // Replicas whose ack is verified. They are NOT re-sent to: a re-sent
+        // Apply is a durable no-op there, and re-dialling them would hold the
+        // round on replicas that have already answered.
+        let mut acked: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
         let profile = txn_profile_enabled();
         let t_fanout = profile.then(std::time::Instant::now);
         // Frame-build CPU time accumulates across the spawned tasks; read once at fan-out end.
@@ -3151,122 +3278,155 @@ impl AccordCoordinatorDriver {
         };
         let mut frame_bytes: usize = 0;
         loop {
-            while inflight.len() < APPLY_FANOUT_WINDOW {
-                let Some(&peer_id) = peers.next() else { break };
-                // The frame this peer receives: the SHARED one when the write-set is
-                // uniform, else the indices of the entries THIS peer owns. Computing the
-                // owned set here is cheap — one ownership test per key, no payload copy — and
-                // the spawned task then builds exactly its own scoped frame.
-                let shared_frame = shared.clone();
-                let owns: Option<Vec<usize>> = if shared_frame.is_none() {
-                    Some(
-                        self.write_set
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, entry)| self.replica_owns_key(peer_id, &entry.key))
-                            .map(|(index, _)| index)
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
-                // `Arc` clones, not write-set copies: the build task reads the SAME keys,
-                // resident payloads and spill mmap this driver holds.
-                let write_set = Arc::clone(&self.write_set);
-                let blobs = self.write_blobs.clone();
-                let staged_prefix = self.staged_prefix;
-                let peers_handle = Arc::clone(&self.peers);
-                let serialize_ns_task = Arc::clone(&serialize_ns);
-                inflight.push(tokio::spawn(async move {
-                    let t_build = profile.then(std::time::Instant::now);
-                    let bytes: Bytes = match &shared_frame {
-                        Some(frame) => frame.clone(),
-                        None => encode_peer_apply_frame(
-                            &write_set,
-                            blobs.as_deref(),
-                            staged_prefix,
-                            owns.as_deref().unwrap_or(&[]),
-                            region,
-                            capnp,
-                            compress_region,
-                            region_compression,
-                            txn_id,
-                            accord_txn_id,
-                        )?,
-                    };
-                    if let Some(started) = t_build {
-                        serialize_ns_task.fetch_add(
-                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                    }
-                    let frame_len = bytes.len();
-                    if profile && ferrosa_common::mem_probe::installed() {
-                        tracing::info!(
-                            phase = "apply.frame_built",
-                            frame_bytes = frame_len,
-                            live_mib = ferrosa_common::mem_probe::live_mib(),
-                            "accord apply residency"
-                        );
-                    }
-                    let msg = if region {
-                        Message::AccordApplyV2Region(bytes)
-                    } else if capnp {
-                        Message::AccordApplyV2Capnp(bytes)
+            // ONE bounded round over the replicas whose shard ack is still
+            // missing. A round that adds NO verified ack is the signature of a
+            // genuinely unreachable shard, and that is when the fan-out stops. A
+            // round that MOVED a shard means at least one replica was merely
+            // slower than one RPC deadline, so the replicas that did not answer
+            // get a RE-SENT Apply: the bound is a detector over the whole phase,
+            // never a per-peer verdict, and one slow peer's ack must not decide a
+            // transaction's fate while a quorum of replicas is up (CL-71). The
+            // re-send is safe — the Apply carries the SAME `txn_id`, so the
+            // replica's idempotency record makes it a durable no-op, and a
+            // replica that already applied answers at once.
+            let evidence_before = peer_acks;
+            let mut inflight: futures::stream::FuturesUnordered<PeerTask> =
+                futures::stream::FuturesUnordered::new();
+            // Collected (not a filtered iterator): the round mutates `acked` as
+            // acks land, and the peer set must be fixed for the whole round.
+            let peers: Vec<uuid::Uuid> = self
+                .replica_ids
+                .iter()
+                .copied()
+                .filter(|&id| id != self_id && !acked.contains(&id))
+                .collect();
+            let mut peers = peers.into_iter();
+            loop {
+                while inflight.len() < APPLY_FANOUT_WINDOW {
+                    let Some(peer_id) = peers.next() else { break };
+                    // The frame this peer receives: the SHARED one when the write-set is
+                    // uniform, else the indices of the entries THIS peer owns. Computing the
+                    // owned set here is cheap — one ownership test per key, no payload copy — and
+                    // the spawned task then builds exactly its own scoped frame.
+                    let shared_frame = shared.clone();
+                    let owns: Option<Vec<usize>> = if shared_frame.is_none() {
+                        Some(
+                            self.write_set
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, entry)| self.replica_owns_key(peer_id, &entry.key))
+                                .map(|(index, _)| index)
+                                .collect(),
+                        )
                     } else {
-                        Message::AccordApplyV2(bytes)
+                        None
                     };
-                    let pushed = std::time::Instant::now();
-                    let result = peers_handle
-                        .send_with_timeout(peer_id, msg, Lane::Data, timeout)
-                        .await;
-                    Ok::<_, AccordDriverError>((peer_id, result, pushed, frame_len))
-                }));
-            }
-            let Some(joined) = inflight.next().await else {
-                break;
-            };
-            let (peer_id, result, pushed, frame_len) = match joined {
-                Ok(Ok(task)) => task,
-                // A per-peer frame BUILD failure is an invariant violation: a write-set
-                // entry the spill cannot resolve, or an index outside the write-set. The
-                // serial fan-out returned `Err` here, and a peer must never be silently
-                // dropped from the fan-out — that would turn an inconsistent coordinator
-                // state into a quiet "one peer just never got the frame". Keep it loud:
-                // abort the fan-out (spawning changes only WHERE the build runs).
-                Ok(Err(error)) => return Err(error),
-                // A spawned task reaches here only as a panic (this fan-out never aborts
-                // one). The serial build could not panic the fan-out without unwinding it,
-                // so a detached task panic must not become a silent skip either.
-                Err(join_error) => {
-                    return Err(AccordDriverError::Network(format!(
-                        "accord apply frame-build task failed: {join_error}"
-                    )))
+                    // `Arc` clones, not write-set copies: the build task reads the SAME keys,
+                    // resident payloads and spill mmap this driver holds.
+                    let write_set = Arc::clone(&self.write_set);
+                    let blobs = self.write_blobs.clone();
+                    let staged_prefix = self.staged_prefix;
+                    let peers_handle = Arc::clone(&self.peers);
+                    let serialize_ns_task = Arc::clone(&serialize_ns);
+                    inflight.push(tokio::spawn(async move {
+                        let t_build = profile.then(std::time::Instant::now);
+                        let bytes: Bytes = match &shared_frame {
+                            Some(frame) => frame.clone(),
+                            None => encode_peer_apply_frame(
+                                &write_set,
+                                blobs.as_deref(),
+                                staged_prefix,
+                                owns.as_deref().unwrap_or(&[]),
+                                region,
+                                capnp,
+                                compress_region,
+                                region_compression,
+                                txn_id,
+                                accord_txn_id,
+                            )?,
+                        };
+                        if let Some(started) = t_build {
+                            serialize_ns_task.fetch_add(
+                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        }
+                        let frame_len = bytes.len();
+                        if profile && ferrosa_common::mem_probe::installed() {
+                            tracing::info!(
+                                phase = "apply.frame_built",
+                                frame_bytes = frame_len,
+                                live_mib = ferrosa_common::mem_probe::live_mib(),
+                                "accord apply residency"
+                            );
+                        }
+                        let msg = if region {
+                            Message::AccordApplyV2Region(bytes)
+                        } else if capnp {
+                            Message::AccordApplyV2Capnp(bytes)
+                        } else {
+                            Message::AccordApplyV2(bytes)
+                        };
+                        let pushed = std::time::Instant::now();
+                        let result = peers_handle
+                            .send_with_timeout(peer_id, msg, Lane::Data, timeout)
+                            .await;
+                        Ok::<_, AccordDriverError>((peer_id, result, pushed, frame_len))
+                    }));
                 }
-            };
-            frame_bytes = frame_bytes.max(frame_len);
-            if profile {
-                ack_ms.push(pushed.elapsed().as_millis() as u64);
-            }
-            if let Err(error) = &result {
-                tracing::warn!(
-                    txn_id = ?txn_id,
-                    error = %error,
-                    peer = ?peer_id,
-                    "accord: quorum broadcast RPC failed"
-                );
-            }
-            if is_ack(&result) {
-                quorum.record_node_ack(peer_id);
-                if quorum.all_reached() {
-                    log_fanout(
-                        serialize_ns.load(std::sync::atomic::Ordering::Relaxed),
-                        &ack_ms,
-                        frame_bytes,
-                        shared.is_some(),
+                let Some(joined) = inflight.next().await else {
+                    break;
+                };
+                let (peer_id, result, pushed, frame_len) = match joined {
+                    Ok(Ok(task)) => task,
+                    // A per-peer frame BUILD failure is an invariant violation: a write-set
+                    // entry the spill cannot resolve, or an index outside the write-set. The
+                    // serial fan-out returned `Err` here, and a peer must never be silently
+                    // dropped from the fan-out — that would turn an inconsistent coordinator
+                    // state into a quiet "one peer just never got the frame". Keep it loud:
+                    // abort the fan-out (spawning changes only WHERE the build runs).
+                    Ok(Err(error)) => return Err(error),
+                    // A spawned task reaches here only as a panic (this fan-out never aborts
+                    // one). The serial build could not panic the fan-out without unwinding it,
+                    // so a detached task panic must not become a silent skip either.
+                    Err(join_error) => {
+                        return Err(AccordDriverError::Network(format!(
+                            "accord apply frame-build task failed: {join_error}"
+                        )))
+                    }
+                };
+                frame_bytes = frame_bytes.max(frame_len);
+                if profile {
+                    ack_ms.push(pushed.elapsed().as_millis() as u64);
+                }
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        txn_id = ?txn_id,
+                        error = %error,
+                        peer = ?peer_id,
+                        "accord: quorum broadcast RPC failed"
                     );
-                    return Ok(true);
                 }
+                if is_ack(&result) {
+                    peer_acks += 1;
+                    acked.insert(peer_id);
+                    quorum.record_node_ack(peer_id);
+                    if quorum.all_reached() {
+                        log_fanout(
+                            serialize_ns.load(std::sync::atomic::Ordering::Relaxed),
+                            &ack_ms,
+                            frame_bytes,
+                            shared.is_some(),
+                        );
+                        return Ok(ApplyFanout {
+                            quorum_reached: true,
+                            peer_acks,
+                        });
+                    }
+                }
+            }
+            if peer_acks == evidence_before {
+                break;
             }
         }
         log_fanout(
@@ -3275,7 +3435,10 @@ impl AccordCoordinatorDriver {
             frame_bytes,
             shared.is_some(),
         );
-        Ok(quorum.all_reached())
+        Ok(ApplyFanout {
+            quorum_reached: quorum.all_reached(),
+            peer_acks,
+        })
     }
 
     /// Like [`quorum_broadcast`](Self::quorum_broadcast) but builds a **distinct
@@ -6526,6 +6689,171 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Regression: the abandon decision must be EVIDENCE-based. A replica writes
+    // its rows durably BEFORE it acks, so a verified ApplyOK proves the sender
+    // applied — and a partial apply below quorum (some acks, not enough) is a
+    // COMMITTED transaction, never the retryable "NOT committed; safe to retry"
+    // abandon. Only ZERO acks keep the truthful abandon.
+    // -----------------------------------------------------------------------
+
+    /// Acks the Apply only for the replicas in `acking`; every other peer's ack is
+    /// LOST inside the bound (an RPC error, which `is_ack` rejects — an error is not
+    /// a verified ApplyOK). Models the measured reproducer: a remote replica writes
+    /// its rows durably and then its ack does not make it back inside the bound.
+    struct PartialApplyAckTransport {
+        acking: Vec<uuid::Uuid>,
+    }
+
+    #[async_trait::async_trait]
+    impl AccordTransport for PartialApplyAckTransport {
+        async fn send(
+            &self,
+            host_id: uuid::Uuid,
+            msg: Message,
+            _lane: ferrosa_net::codec::Lane,
+        ) -> ferrosa_net::error::Result<Message> {
+            match msg {
+                apply @ (Message::AccordApply(_) | Message::AccordApplyV2(_)) => {
+                    if self.acking.contains(&host_id) {
+                        Ok(structured_apply_ack(apply, node_id_of(host_id)))
+                    } else {
+                        Err(ferrosa_net::error::NetError::Timeout(
+                            "apply ack lost inside the bound".into(),
+                        ))
+                    }
+                }
+                other => panic!("unexpected Apply-phase test message: {other:?}"),
+            }
+        }
+    }
+
+    /// A PARTIAL apply — one replica durably applied and acked, the rest lost their
+    /// acks inside the bound — must NOT be reported as the retryable abandon.
+    ///
+    /// A replica writes its rows durably BEFORE it acks, so that single verified
+    /// `ApplyOK` is proof the transaction is committed on that replica; a retry
+    /// would double-apply. The outcome must be non-retryable, never "NOT committed;
+    /// safe to retry". (Red first: the pre-fix driver returns `TxnAbandoned` here.)
+    #[tokio::test]
+    async fn a_partial_apply_below_quorum_is_not_reported_as_a_retryable_abandon() {
+        let replicas = vec![
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        // RF=3, coordinator is not a replica → slow quorum is 2. Only replica 1's
+        // verified ApplyOK arrives (1 < 2, so the quorum is NOT reached), but
+        // replica 1 wrote its rows durably before acking.
+        let transport = Arc::new(PartialApplyAckTransport {
+            acking: vec![replicas[0]],
+        });
+        let mut driver = driver_with(transport, replicas);
+
+        let result = driver
+            .apply_phase_within(
+                make_ts(2000),
+                std::collections::HashSet::new(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(
+            !matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
+            "one replica durably applied and acked, so a retryable abandon would tell the \
+             client to retry a committed transaction and double-apply; got {result:?}"
+        );
+        assert!(
+            matches!(result, Err(AccordDriverError::Network(_))),
+            "the partial apply must surface as a non-retryable durability/convergence error \
+             (the transaction is committed and will converge), never the retryable abandon; \
+             got {result:?}"
+        );
+        let rendered = result
+            .expect_err("a partial apply is not a success")
+            .to_string();
+        assert!(
+            !rendered.contains("safe to retry"),
+            "a committed partial apply must never be advertised as safe to retry; got {rendered:?}"
+        );
+        assert!(
+            rendered.contains("committed"),
+            "the non-retryable outcome must name the commit so the client knows not to retry; \
+             got {rendered:?}"
+        );
+    }
+
+    /// The multi-key Apply fan-out reports the SAME partial-apply evidence the
+    /// single-key path does: with one of three replicas acking (RF=3, quorum 2) the
+    /// outcome carries `peer_acks == 1` and `!quorum_reached`, which is what makes
+    /// `apply_phase_within` refuse the retryable abandon. Pins the evidence at the
+    /// fan-out itself, not only at the decision that consumes it.
+    #[tokio::test]
+    async fn the_multi_key_apply_fan_out_reports_the_partial_apply_evidence() {
+        let a = uuid::Uuid::from_u128(0xA);
+        let b = uuid::Uuid::from_u128(0xB);
+        let c = uuid::Uuid::from_u128(0xC);
+        let transport = Arc::new(PartialApplyAckTransport { acking: vec![a] });
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            vec![a, b, c],
+            transport,
+            false,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), b"mutation-1".to_vec()),
+                (b"key-2".to_vec(), b"mutation-2".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(Arc::new(move |_key: &[u8]| vec![a, b, c]));
+        let participant = driver.participant_set();
+
+        let outcome = driver
+            .apply_fanout_bounded_within(
+                &participant,
+                |r| r.is_ok(),
+                std::time::Duration::from_millis(200),
+            )
+            .await
+            .expect("bounded fan-out runs");
+
+        assert!(
+            !outcome.quorum_reached && outcome.peer_acks == 1,
+            "one replica acked of the two required: the fan-out must report the partial apply \
+             as peer_acks=1 with the quorum not reached; got {outcome:?}"
+        );
+    }
+
+    /// Control for the split: with ZERO verified Apply acks no replica is known to
+    /// have applied, so the retryable abandon stays truthful and is preserved.
+    /// Without this, "any ack ⇒ committed" could be implemented by abandoning
+    /// nothing at all.
+    #[tokio::test]
+    async fn zero_apply_acks_still_abandon_truthfully() {
+        let replicas = vec![
+            uuid::Uuid::from_u128(1),
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        ];
+        let transport = Arc::new(PartialApplyAckTransport { acking: vec![] });
+        let mut driver = driver_with(transport, replicas);
+
+        let result = driver
+            .apply_phase_within(
+                make_ts(2000),
+                std::collections::HashSet::new(),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(AccordDriverError::TxnAbandoned { .. })),
+            "no replica acked, so nothing is known to have applied and the abandon is \
+             truthful; got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Regression: a Commit ack must PROVE it processed THIS transaction.
     //
     // The Commit quorum predicate was `|r| r.is_ok()`, so it accepted ANY `Ok`
@@ -7962,11 +8290,14 @@ mod tests {
             Lane::Data.timeout(),
             "the test must use a bound distinct from the lane default, or it proves nothing"
         );
-        let ok = driver
+        let outcome = driver
             .apply_fanout_bounded_within(&participant, |r| r.is_ok(), configured)
             .await
             .expect("bounded fan-out runs");
-        assert!(ok, "every replica acked; the per-shard quorum is reached");
+        assert!(
+            outcome.quorum_reached,
+            "every replica acked; the per-shard quorum is reached"
+        );
 
         let seen = recorder.seen.lock().expect("record mutex").clone();
         assert!(
