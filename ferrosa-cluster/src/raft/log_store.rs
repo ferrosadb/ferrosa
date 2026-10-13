@@ -440,6 +440,10 @@ impl LockRetryPolicy {
 /// attempts PER CALL, so the recovery's new open starts again at 1. The
 /// (cap + 1)-th contention notification therefore marks the recovery's first
 /// attempt, whatever the production cap becomes.
+///
+/// Test-only: nothing in the library reads it, so a plain `--lib` build would
+/// otherwise dead-code it under `-D warnings`.
+#[cfg(test)]
 pub(crate) const SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP: u32 = LockRetryPolicy::DEFAULT.max_attempts;
 
 #[cfg(test)]
