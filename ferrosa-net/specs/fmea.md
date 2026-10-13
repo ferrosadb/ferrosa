@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-net
 doc: fmea
-last_updated: 2026-10-03
+last_updated: 2026-10-10
 ---
 
 # ferrosa-net — FMEA / Known Issues
@@ -14,6 +14,7 @@ not are flagged as open gaps.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation / status |
 |----|--------------|--------|---|---|---|-----|---------------------|
+| NET-20 | **A lane request's deadline ignored time spent queued, and abandoned queued requests were still sent** (outage 2026-10-10, F2). | A 200 ms Raft snapshot chunk queued behind a full Bulk stream window got a fresh 200 ms at dispatch and was delivered after its caller had given up; the backlog fed itself. | 7 | 6 | 7 | 294 → 21 | **Fixed:** `LaneHandle::send/fire` stamp `enqueued_at`; at dispatch a request whose reply receiver is closed is dropped unsent (`ferrosa_net_lane_abandoned_unsent_total`), one whose budget is spent is answered `Timeout` unsent (`ferrosa_net_lane_expired_in_queue_total`), and the rest are sent with `timeout - queued`. Tests: `lane_drops_queued_send_whose_caller_gave_up`, `lane_timeout_counts_queue_wait_from_enqueue`. Handlers can now fail a request with a typed error via `RpcHandler::handle_outcome` / `HandlerOutcome::Fail`; new `RemoteFailureKind` codes 5 (`HandlerFailed`) and 6 (`NotReady`) decode as `Other` on older peers (`new_kinds_decode_as_other_on_the_previous_build`). |
 | NET-1 | A `MsgType` byte tag is added to the enum but not to the `TryFrom<u8>` decoder | Peers serialise the frame fine but reject it on receipt with `UnknownMessageType` — e.g. repair sessions converge **zero** partitions, silently | 9 | 4 | 7 | 252 | **Partially mitigated.** A regression test pins the repair tags `0x29..=0x2E` and the streaming tags `0x36..=0x3A`, but there is **no exhaustive test** asserting every declared `MsgType` round-trips. New tags can still slip through. Add an enumerate-all round-trip test. |
 | NET-2 | Lane actor holds work behind a network round-trip and the caller future is cancelled | Half-sent state / leaked in-flight slot / wrong correlation | 9 | 2 | 6 | 108 | **Structural.** Lane state is owned by one actor; callers use `reserve().await` + `permit.send()`, so cancellation drops the permit cleanly. Central design invariant; covered by lane_actor tests. |
 | NET-3 | Frame format mismatch (legacy frame on a Cap'n Proto connection or vice versa) | Body misparse → corrupt `Message` or hung stream | 8 | 2 | 4 | 64 | **Mitigated.** `InternodeCodec::decode` checks `header.version` against the negotiated `WireFrameFormat` and returns a descriptive `Protocol` error rather than misparsing. Covered by `capnp_envelope_framing` tests. |

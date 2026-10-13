@@ -110,6 +110,7 @@ pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 mod cql_broadcast;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_tuning;
+mod lifecycle;
 mod listener_status;
 mod listener_tls;
 mod log_rotation;
@@ -399,8 +400,9 @@ const DEFAULT_POSTGRES_BIND: &str = "127.0.0.1:5432";
 /// as a `.expect()` panic. A panic unwinds the `#[tokio::main]` async stack,
 /// which drops the subsystem tokio runtimes in an async context and fires the
 /// "Cannot drop a runtime …" panic *on top of* the real error, masking it
-/// (issue #172). `process::exit` runs no destructors, so the diagnostic below
-/// is the last thing the operator sees. `label`/`env_key` name the setting so
+/// (issue #172). [`lifecycle::fatal_exit`] runs no destructors but flushes the
+/// log first, so the diagnostic below and the exit line are the last things
+/// the operator sees. `label`/`env_key` name the setting so
 /// the message is actionable.
 fn parse_bind_addr(label: &str, env_key: &str, value: &str) -> std::net::SocketAddr {
     match value.parse() {
@@ -411,7 +413,7 @@ fn parse_bind_addr(label: &str, env_key: &str, value: &str) -> std::net::SocketA
                  Fix the config-file value or the {env_key} environment variable \
                  (expected host:port, e.g. 127.0.0.1:9090)."
             );
-            std::process::exit(1);
+            lifecycle::fatal_exit(1, &format!("invalid {label} bind address {value:?}: {e}"));
         }
     }
 }
@@ -427,7 +429,7 @@ fn parse_listener_port(label: &str, env_key: &str, value: &str) -> u16 {
                  Fix the config-file value or the {env_key} environment variable \
                  (expected an integer from 0 through 65535)."
             );
-            std::process::exit(1);
+            lifecycle::fatal_exit(1, &format!("invalid {label} port {value:?}: {e}"));
         }
     }
 }
@@ -1152,7 +1154,7 @@ fn build_flight_service(
     )
     .unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
-        std::process::exit(1);
+        lifecycle::fatal_exit(1, &error.to_string());
     });
     let mut service = ferrosa_flight::service::FerrosaFlight::new(state, signing_key)
         .with_token_ttl(token_ttl_secs);
@@ -1195,7 +1197,7 @@ fn parse_flight_token_ttl(raw: Option<String>) -> Result<u64, String> {
 fn resolve_flight_enabled_or_exit(file_config: &toml::Value) -> bool {
     resolve_flight_enabled(file_config).unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
-        std::process::exit(1);
+        lifecycle::fatal_exit(1, &error.to_string());
     })
 }
 
@@ -1248,7 +1250,7 @@ fn enforce_production_requirements(
              listener <section> require_tls = true with tls_cert/tls_key; change the default \
              superuser password), or run a development node (unset FERROSA_MODE=production)."
         );
-        std::process::exit(1);
+        lifecycle::fatal_exit(1, "production node fails its security requirements");
     }
 }
 
@@ -1848,8 +1850,36 @@ FERROSA_* environment variables. Pass --validate to scan local SSTables during s
     None
 }
 
+/// Hidden: makes the binary fail on purpose so tests/last_line.rs can check
+/// that a dying node leaves its last line (outage 2026-10-10, F3).
+const TEST_FAULT_ENV: &str = "FERROSA_TEST_FAULT_INJECT";
+
+/// Fail the way `fault` names. See [`TEST_FAULT_ENV`].
+fn inject_test_fault(fault: &str) {
+    match fault {
+        "panic-thread" => {
+            let worker = std::thread::Builder::new()
+                .name("fault-injected".into())
+                .spawn(|| panic!("injected fault: worker thread panic"))
+                .expect("spawn the fault-injection thread");
+            let joined = worker.join();
+            assert!(joined.is_err(), "the injected panic did not panic");
+            lifecycle::fatal_exit(70, "injected fault: a worker thread panicked");
+        }
+        "fatal-exit" => {
+            // Fill the non-blocking buffer so a missing flush loses lines
+            // deterministically instead of racing the writer thread.
+            for n in 0..20_000 {
+                tracing::info!("injected fault: buffered line {n}");
+            }
+            lifecycle::fatal_exit(3, "x")
+        }
+        other => lifecycle::fatal_exit(2, &format!("unknown {TEST_FAULT_ENV} value {other:?}")),
+    }
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
     // Apply jemalloc runtime knobs before any allocation-heavy setup (the tokio
     // runtimes below are built right after this). No-op when the FERROSA_JEMALLOC_*
     // vars are unset; see jemalloc_tuning.rs for why this cannot go through the
@@ -1858,6 +1888,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(not(target_env = "msvc"))]
     jemalloc_tuning::apply_from_env();
 
+    // Every way out of the node ends in `lifecycle`, which flushes the buffered
+    // log and writes `ferrosa exiting code=N reason=...` synchronously as the
+    // last line (outage 2026-10-10, F3: nodes died with no final line).
+    match run().await {
+        Ok(None) => {} // --version / --help: stdout must stay one clean line
+        Ok(Some(reason)) => lifecycle::exit_process(0, &reason),
+        Err(e) => lifecycle::fatal_exit(1, &format!("{e}")),
+    }
+}
+
+/// The node. Returns why it stopped (`None` for `--version` / `--help`).
+async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // 0. Version/help, before ANYTHING else.
     //
     // This must run before tracing is initialised and before any config or
@@ -1869,7 +1911,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     binary for its version silently launched a database instead, which is
     //     exactly what installers and update checks want to do.
     if handle_cli_meta_flags() {
-        return Ok(());
+        return Ok(None);
     }
 
     // 1. Initialize tracing.
@@ -1908,18 +1950,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Err(error) = rotation.validate() {
         // Before any subscriber exists, so this is the only way to say it.
         eprintln!("ferrosa: refusing to start: {error}");
-        std::process::exit(2);
+        lifecycle::fatal_exit(2, &format!("refusing to start: {error}"));
     }
     // A directory turns on process-owned rotation. Without one the process
     // writes to stdout exactly as before, which is what a foreground run wants.
     let log_dir =
         config_val_opt("FERROSA_LOG_DIR", &early_config, "logging", "directory").map(expand_tilde);
 
-    let (non_blocking_writer, _log_guard) = match (&log_dir, rotation.enabled) {
+    // `log_file` is where `lifecycle` appends the synchronous last line; `None`
+    // means the log is stdout.
+    let (log_file, (non_blocking_writer, log_guard)) = match (&log_dir, rotation.enabled) {
         (Some(dir), true) => {
             let dir = std::path::PathBuf::from(dir);
             match log_rotation::RotatingWriter::open(&dir, "ferrosa.log", rotation.clone()) {
-                Ok(writer) => tracing_appender::non_blocking(writer),
+                Ok(writer) => (
+                    Some(dir.join("ferrosa.log")),
+                    lifecycle::non_blocking(writer),
+                ),
                 Err(error) => {
                     // Say so and keep the logs, rather than start a database
                     // that silently writes its diagnostics nowhere.
@@ -1927,11 +1974,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "ferrosa: cannot open the log directory {}: {error} -- logging to stdout",
                         dir.display()
                     );
-                    tracing_appender::non_blocking(std::io::stdout())
+                    (None, lifecycle::non_blocking(std::io::stdout()))
                 }
             }
         }
-        _ => tracing_appender::non_blocking(std::io::stdout()),
+        _ => (None, lifecycle::non_blocking(std::io::stdout())),
     };
 
     // Before the subscriber. The Sentry layer is inert without a client, and
@@ -1989,7 +2036,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
+    // The guard now lives in `lifecycle` for the rest of the process: every
+    // exit path drains it before leaving. The panic hook goes in right after,
+    // so a panic on any thread from here on leaves a synchronous FATAL line;
+    // the consensus hook installed later wraps it.
+    lifecycle::install(log_file, log_guard);
+    lifecycle::install_panic_hook();
+
     tracing::info!("ferrosa starting");
+
+    // Test-only fault injection for tests/last_line.rs. Never set in production.
+    if let Ok(fault) = std::env::var(TEST_FAULT_ENV) {
+        inject_test_fault(&fault);
+    }
 
     // 1b. Load TOML config file (env vars override file values)
     let config_path =
@@ -2057,7 +2116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // fallback (same bridge as `data_dir` / `local_path` above).
     if let Err(e) = apply_storage_tunables(&file_config) {
         eprintln!("FATAL: invalid storage configuration: {e}");
-        std::process::exit(1);
+        lifecycle::fatal_exit(1, &format!("invalid storage configuration: {e}"));
     }
 
     // 3. Create StorageEngine — use open() on restart to replay commit log
@@ -2094,7 +2153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(limits) => limits,
             Err(e) => {
                 eprintln!("FATAL: invalid [jsonb] configuration: {e}");
-                std::process::exit(1);
+                lifecycle::fatal_exit(1, &format!("invalid [jsonb] configuration: {e}"));
             }
         };
     tracing::info!(?jsonb_limits, "jsonb limits");
@@ -2580,7 +2639,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the env-derived defaults (TOML-wins precedence).
     if let Err(error) = apply_internode_toml_overrides(&mut net_config_mut, &file_config) {
         eprintln!("FATAL: {error}");
-        std::process::exit(1);
+        lifecycle::fatal_exit(1, &error);
     }
     // Node-wide `[tls]` (FERROSA_TLS_*): one certificate for every listener
     // and internode; anything a section sets itself wins.
@@ -2600,7 +2659,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener_tls_inputs = ListenerTlsInputs::resolve(&file_config, &node_tls);
     if let Err(error) = listener_tls_inputs.validate() {
         eprintln!("FATAL: {error}");
-        std::process::exit(1);
+        lifecycle::fatal_exit(1, &error);
     }
     // SEC: `enforce_production_requirements` now runs after the internode
     // listener binds (see the "deferred object-store boot work" block below), so
@@ -2978,7 +3037,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("FATAL: invalid UDF sandbox configuration: {e}");
-            std::process::exit(1);
+            lifecycle::fatal_exit(1, &format!("invalid UDF sandbox configuration: {e}"));
         }
     };
     tracing::info!(
@@ -3205,7 +3264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .unwrap_or_else(|error| {
                 eprintln!("FATAL: {error}");
-                std::process::exit(1);
+                lifecycle::fatal_exit(1, &error.to_string());
             });
             let service = build_flight_service(flight_state)
                 .with_tls_locations(serves_tls)
@@ -3417,7 +3476,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      Set [graph] tls_cert and tls_key (or FERROSA_GRAPH_TLS_CERT / \
                      FERROSA_GRAPH_TLS_KEY) to readable PEM files."
                 );
-                std::process::exit(1);
+                lifecycle::fatal_exit(1, &format!("Bolt listener TLS: {error}"));
             }
         };
         tracing::info!(
@@ -3602,7 +3661,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                      Set [postgres] tls_cert and tls_key (or FERROSA_POSTGRES_TLS_CERT / \
                      FERROSA_POSTGRES_TLS_KEY) to readable PEM files."
                 );
-                std::process::exit(1);
+                lifecycle::fatal_exit(1, &format!("PostgreSQL listener TLS: {error}"));
             }
         };
         let pg_store =
@@ -3883,22 +3942,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ));
     }
 
+    tracing::info!("ferrosa ready; waiting for SIGINT or SIGTERM");
+
     // 13. Wait for shutdown signal (SIGINT or SIGTERM)
     //
     // Docker/Podman sends SIGTERM on `stop`. Without this, the process
     // only handles Ctrl-C (SIGINT) and gets killed after the stop timeout
     // WITHOUT flushing memtables — causing 100% data loss on restart.
-    {
+    let signal_name = {
         use tokio::signal::unix::{signal, SignalKind};
         let mut sigterm = signal(SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
+            interrupted = tokio::signal::ctrl_c() => match interrupted {
+                Ok(()) => "SIGINT",
+                // The SIGINT listener failing resolves this branch at once; say
+                // so rather than drain as if an operator had asked for it.
+                Err(e) => {
+                    tracing::error!(%e, "SIGINT listener failed; shutting down");
+                    "SIGINT-listener-failure"
+                }
+            },
+            term = sigterm.recv() => match term {
+                Some(()) => "SIGTERM",
+                None => {
+                    tracing::error!("SIGTERM listener closed; shutting down");
+                    "SIGTERM-listener-closed"
+                }
+            },
         }
-    }
+    };
 
     // 14. Graceful shutdown: flush memtables, sync to S3, stop compaction
-    tracing::info!("shutdown signal received, draining...");
+    tracing::info!(
+        signal = signal_name,
+        "received {signal_name}; shutdown signal received, draining..."
+    );
 
     // Signal Bolt server (and any other watch-based services) to stop.
     let _ = shutdown_tx.send(true);
@@ -3945,7 +4023,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("ferrosa stopped");
 
-    Ok(())
+    Ok(Some(format!("shutdown after {signal_name}")))
 }
 
 /// Return the subset of `seeds` that have not yet been recorded in

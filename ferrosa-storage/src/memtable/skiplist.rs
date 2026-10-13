@@ -126,22 +126,19 @@ impl Memtable for SkipListMemtable {
         // clone-per-write that made filling a partition O(N^2); see module docs.
         let mut guard = entry.value().write();
         let was_empty = guard.rows.is_empty();
-        let old_size = estimate_partition_size(&guard);
 
         let partition = Arc::make_mut(&mut guard);
-        super::sharded::merge_row_into_partition(partition, row, schema)?;
+        // The merge returns the size change of the rows it touched; re-walking
+        // the whole partition before and after made every write O(N) and a
+        // replay of one partition O(N^2) (t_32b6670b).
+        let delta = super::sharded::merge_row_into_partition(partition, row, schema)?;
 
         // Record the write only after it is in the partition, so a rejected row
         // cannot make a reader believe something landed (I-1: the epoch must be
         // exact in the conservative direction — never skip a real late write).
         self.write_epoch.fetch_add(1, Ordering::Release);
 
-        let new_size = estimate_partition_size(partition);
-        if new_size >= old_size {
-            self.size.fetch_add(new_size - old_size, Ordering::Relaxed);
-        } else {
-            self.size.fetch_sub(old_size - new_size, Ordering::Relaxed);
-        }
+        super::sharded::apply_size_delta(&self.size, delta);
         if was_empty {
             self.count.fetch_add(1, Ordering::Relaxed);
         }
@@ -315,30 +312,6 @@ impl Memtable for SkipListMemtable {
     fn min_timestamp(&self) -> i64 {
         self.min_ts.load(Ordering::SeqCst)
     }
-}
-
-fn estimate_partition_size(partition: &Partition) -> usize {
-    let mut size = std::mem::size_of::<Partition>();
-    size += partition.key.key.as_bytes().len();
-    if let Some(ref sr) = partition.static_row {
-        size += estimate_row_size(sr);
-    }
-    for row in &partition.rows {
-        size += estimate_row_size(row);
-    }
-    size
-}
-
-fn estimate_row_size(row: &Row) -> usize {
-    let mut size = std::mem::size_of::<Row>();
-    size += row.clustering.len();
-    for (_, cell) in &row.cells {
-        size += std::mem::size_of::<(u16, ferrosa_common::cell::CellValue)>();
-        if let Some(ref v) = cell.value {
-            size += v.len();
-        }
-    }
-    size
 }
 
 #[cfg(test)]

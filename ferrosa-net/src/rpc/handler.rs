@@ -6,15 +6,62 @@ use parking_lot::RwLock;
 
 use crate::codec::MsgType;
 use crate::message::Message;
+use crate::rpc::error_reply::RemoteFailureKind;
 
 /// Peer identifier: (host_id, socket_addr).
 pub type PeerId = (uuid::Uuid, std::net::SocketAddr);
+
+/// What a handler did with one request.
+#[derive(Debug)]
+pub enum HandlerOutcome {
+    /// Answer the requester with this message.
+    Reply(Message),
+    /// Nothing to send (fire-and-forget).
+    NoReply,
+    /// The request cannot be answered. The server logs it, counts it and,
+    /// for a peer that advertised `CAP_RPC_ERROR_REPLY`, sends a typed error
+    /// reply so the requester releases its stream slot at once instead of at
+    /// its deadline.
+    Fail {
+        kind: RemoteFailureKind,
+        detail: String,
+    },
+}
+
+impl HandlerOutcome {
+    pub fn fail(kind: RemoteFailureKind, detail: impl Into<String>) -> Self {
+        Self::Fail {
+            kind,
+            detail: detail.into(),
+        }
+    }
+
+    /// The `Option<Message>` view `RpcHandler::handle` returns. A failure has
+    /// no message; the error reply only exists on the server dispatch path.
+    pub fn into_reply(self) -> Option<Message> {
+        match self {
+            Self::Reply(msg) => Some(msg),
+            Self::NoReply | Self::Fail { .. } => None,
+        }
+    }
+}
 
 /// Trait for handling incoming RPC messages.
 #[async_trait::async_trait]
 pub trait RpcHandler: Send + Sync {
     /// Handle a message from a peer. Returns None for fire-and-forget.
     async fn handle(&self, from: PeerId, msg: Message) -> Option<Message>;
+
+    /// Handle a message and say why it could not be answered, if it could
+    /// not. The server dispatches through this. The default wraps
+    /// [`Self::handle`]; handlers whose failures the requester must hear
+    /// about (the Raft handlers) override it.
+    async fn handle_outcome(&self, from: PeerId, msg: Message) -> HandlerOutcome {
+        match self.handle(from, msg).await {
+            Some(reply) => HandlerOutcome::Reply(reply),
+            None => HandlerOutcome::NoReply,
+        }
+    }
 }
 
 /// Registry mapping MsgType → handler.
@@ -50,12 +97,24 @@ impl HandlerRegistry {
     }
 
     pub async fn dispatch(&self, from: PeerId, msg_type: MsgType, msg: Message) -> Option<Message> {
+        self.dispatch_outcome(from, msg_type, msg)
+            .await
+            .into_reply()
+    }
+
+    /// Dispatch to the registered handler's [`RpcHandler::handle_outcome`].
+    pub async fn dispatch_outcome(
+        &self,
+        from: PeerId,
+        msg_type: MsgType,
+        msg: Message,
+    ) -> HandlerOutcome {
         let handler = self.handlers.read().get(&msg_type).cloned();
         match handler {
-            Some(handler) => handler.handle(from, msg).await,
+            Some(handler) => handler.handle_outcome(from, msg).await,
             None => {
                 tracing::warn!(?msg_type, "no handler registered");
-                None
+                HandlerOutcome::NoReply
             }
         }
     }

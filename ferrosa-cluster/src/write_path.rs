@@ -312,8 +312,44 @@ fn bounded_partition_stream(
     Box::pin(stream)
 }
 
+/// Carry a coordinator error across the storage-typed `WritePath` boundary.
+///
+/// Read/write timeouts and unavailability stay typed: flattened into a message
+/// they reached CQL clients as ServerError ("storage error: invalid data:
+/// cluster: read timeout ..."), so neither drivers' retry policies nor
+/// ferrosa-memory's transient-error classifier recognised them (outage
+/// 2026-10-10, t_43f70b3a). Everything else keeps its message form.
 fn cluster_error_to_common(err: ClusterError) -> ferrosa_common::Error {
     match err {
+        ClusterError::ReadTimeout {
+            consistency,
+            received,
+            required,
+            data_present,
+        } => ferrosa_common::Error::ReadTimeout {
+            consistency,
+            received,
+            required,
+            data_present,
+        },
+        ClusterError::WriteTimeout {
+            consistency,
+            received,
+            required,
+        } => ferrosa_common::Error::WriteTimeout {
+            consistency,
+            received,
+            required,
+        },
+        ClusterError::Unavailable {
+            consistency,
+            required,
+            alive,
+        } => ferrosa_common::Error::Unavailable {
+            consistency,
+            required,
+            alive,
+        },
         ClusterError::Overloaded(msg) => {
             ferrosa_common::Error::InvalidData(format!("overloaded: {msg}"))
         }
@@ -620,7 +656,7 @@ impl WritePath {
                         rows,
                     })),
                     Ok(_) => Ok(None),
-                    Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                    Err(e) => Err(cluster_error_to_common(e)),
                 }
             }
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
@@ -695,7 +731,7 @@ impl WritePath {
                 rows,
             })),
             Ok(_) => Ok(None),
-            Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+            Err(e) => Err(cluster_error_to_common(e)),
         }
     }
 
@@ -742,7 +778,7 @@ impl WritePath {
                         rows,
                     })),
                     Ok(_) => Ok(None),
-                    Err(e) => Err(ferrosa_common::Error::InvalidData(format!("cluster: {e}"))),
+                    Err(e) => Err(cluster_error_to_common(e)),
                 }
             }
             Self::Unavailable => Err(ferrosa_common::Error::InvalidData(
@@ -774,9 +810,7 @@ impl WritePath {
                     rows,
                 })),
                 Ok(None) => Ok(None),
-                Err(e) => Err(ferrosa_common::Error::InvalidFormat(format!(
-                    "coordinate_read: {e}"
-                ))),
+                Err(e) => Err(cluster_error_to_common(e)),
             },
             Self::Unavailable => Ok(None),
         }
@@ -1903,6 +1937,58 @@ mod tests {
             4,
             "index_read must return all 4 rows with label='shared'"
         );
+    }
+
+    /// Timeouts and unavailability cross the `WritePath` boundary typed, with
+    /// every field, so the CQL layer can send the protocol's own errors
+    /// (t_43f70b3a). `tests/cluster_error_frames.rs` in ferrosa-cql pins the
+    /// read case end to end; this pins the write and unavailable mappings.
+    #[test]
+    fn cluster_timeouts_and_unavailability_stay_typed_across_the_boundary() {
+        match cluster_error_to_common(ClusterError::WriteTimeout {
+            consistency: "QUORUM".into(),
+            received: 1,
+            required: 2,
+        }) {
+            ferrosa_common::Error::WriteTimeout {
+                consistency,
+                received,
+                required,
+            } => assert_eq!((consistency.as_str(), received, required), ("QUORUM", 1, 2)),
+            other => panic!("a write timeout must stay typed; got {other:?}"),
+        }
+        match cluster_error_to_common(ClusterError::Unavailable {
+            consistency: "LOCAL_QUORUM".into(),
+            required: 2,
+            alive: 1,
+        }) {
+            ferrosa_common::Error::Unavailable {
+                consistency,
+                required,
+                alive,
+            } => assert_eq!(
+                (consistency.as_str(), required, alive),
+                ("LOCAL_QUORUM", 2, 1)
+            ),
+            other => panic!("unavailability must stay typed; got {other:?}"),
+        }
+        match cluster_error_to_common(ClusterError::ReadTimeout {
+            consistency: "LOCAL_QUORUM".into(),
+            received: 1,
+            required: 2,
+            data_present: false,
+        }) {
+            ferrosa_common::Error::ReadTimeout {
+                consistency,
+                received,
+                required,
+                data_present,
+            } => assert_eq!(
+                (consistency.as_str(), received, required, data_present),
+                ("LOCAL_QUORUM", 1, 2, false)
+            ),
+            other => panic!("a read timeout must stay typed; got {other:?}"),
+        }
     }
 
     #[test]

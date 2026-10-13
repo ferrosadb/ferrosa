@@ -59,6 +59,11 @@ pub struct ObjectStoreConfig {
     /// (`FERROSA_S3_REQUEST_TIMEOUT_SECS`, default
     /// [`DEFAULT_S3_REQUEST_TIMEOUT_SECS`]).
     pub request_timeout: std::time::Duration,
+    /// Longest a GET response body may send nothing before it fails as
+    /// retryable and releases its request slot
+    /// (`FERROSA_S3_BODY_IDLE_TIMEOUT_SECS`, default
+    /// [`DEFAULT_S3_BODY_IDLE_TIMEOUT_SECS`]).
+    pub body_idle_timeout: std::time::Duration,
 }
 
 impl ObjectStoreConfig {
@@ -100,6 +105,11 @@ impl ObjectStoreConfig {
                 .ok()
                 .as_deref(),
         )?;
+        let body_idle_timeout = parse_body_idle_timeout(
+            std::env::var("FERROSA_S3_BODY_IDLE_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )?;
         // Validate the download tunables and the stats switch up front so a
         // typo fails startup instead of the first restore. Both are read once
         // per process; `build_object_store` and the download path use them.
@@ -127,6 +137,7 @@ impl ObjectStoreConfig {
                     max_requests_per_second,
                     max_concurrent_requests,
                     request_timeout,
+                    body_idle_timeout,
                 });
             }
         }
@@ -170,6 +181,7 @@ impl ObjectStoreConfig {
             max_requests_per_second,
             max_concurrent_requests,
             request_timeout,
+            body_idle_timeout,
         })
     }
 
@@ -282,8 +294,6 @@ impl ObjectStoreConfig {
         // deletes, rehydration and restore together. 429 retry is always on:
         // object_store does not retry client errors.
         let max_in_flight = self.effective_max_in_flight();
-        let store: std::sync::Arc<dyn ObjectStore> =
-            std::sync::Arc::new(object_store::limit::LimitStore::new(store, max_in_flight));
         let pool_max_idle = self.pool_max_idle_per_host()?;
         let pool = super::pool::config()?;
         super::stats::record_pool_settings(max_in_flight, pool_max_idle);
@@ -293,11 +303,25 @@ impl ObjectStoreConfig {
             pool_idle_timeout_secs = pool.idle_timeout.as_secs(),
             connect_timeout_secs = pool.connect_timeout.as_secs(),
             max_requests_per_second = ?self.max_requests_per_second,
+            body_idle_timeout_secs = self.body_idle_timeout.as_secs(),
             "object store client built"
         );
+        for warning in validate_limits(
+            max_in_flight,
+            self.max_requests_per_second,
+            STARTUP_FETCH_CONCURRENCY,
+            &self.endpoint,
+        ) {
+            tracing::warn!("object store limits: {warning}");
+        }
         Ok(Box::new(super::throttle::ThrottledStore::new(
             store,
-            self.max_requests_per_second,
+            super::throttle::ThrottleLimits {
+                requests_per_second: self.max_requests_per_second,
+                max_in_flight,
+                body_idle_timeout: self.body_idle_timeout,
+                wait_warn_after: super::throttle::DEFAULT_WAIT_WARN_AFTER,
+            },
             super::throttle::RateLimitRetry::default(),
         )))
     }
@@ -322,8 +346,78 @@ impl ObjectStoreConfig {
             max_requests_per_second: None,
             max_concurrent_requests: None,
             request_timeout: std::time::Duration::from_secs(DEFAULT_S3_REQUEST_TIMEOUT_SECS),
+            body_idle_timeout: std::time::Duration::from_secs(DEFAULT_S3_BODY_IDLE_TIMEOUT_SECS),
         }
     }
+}
+
+/// Generations startup registration of evicted SSTables fetches at once.
+pub const STARTUP_FETCH_CONCURRENCY: usize = 16;
+
+/// Round trip assumed when checking that a rate cap can keep the in-flight
+/// limit busy: a GET to R2 measured 150-300 ms on 2026-10-10.
+const ASSUMED_ROUND_TRIP_MS: usize = 300;
+
+/// Fewest requests in flight that make sense against a remote endpoint: at
+/// a 300 ms round trip, fewer cannot keep startup or a restore moving.
+const MIN_REMOTE_IN_FLIGHT: usize = 8;
+
+/// Check the client-side limits against each other and the endpoint. Each
+/// returned string is a warning naming the variables involved; an empty
+/// result means the limits are coherent. They are warnings, not errors: an
+/// operator may set a low cap on purpose during an R2 429 storm.
+///
+/// - a rate cap `rps` keeps at most `rps x 0.3 s` requests in flight, so a
+///   cap below `in_flight / 0.3` makes the in-flight limit unreachable;
+/// - startup fetches `startup_fetch` generations at once, so an in-flight
+///   limit below it queues startup behind the limit;
+/// - fewer than 8 in flight against a remote endpoint starves every path.
+pub fn validate_limits(
+    in_flight: usize,
+    requests_per_second: Option<u32>,
+    startup_fetch: usize,
+    endpoint: &str,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(rps) = requests_per_second {
+        let sustained = rps as usize * ASSUMED_ROUND_TRIP_MS / 1000;
+        if sustained < in_flight {
+            warnings.push(format!(
+                "FERROSA_S3_MAX_REQUESTS_PER_SECOND={rps} keeps at most {sustained} requests in \
+                 flight at a {ASSUMED_ROUND_TRIP_MS} ms round trip, below \
+                 FERROSA_S3_MAX_CONCURRENT_REQUESTS={in_flight}: the rate cap, not the in-flight \
+                 limit, bounds throughput. Unset the rate cap unless the bucket answers 429"
+            ));
+        }
+    }
+    if in_flight < startup_fetch {
+        warnings.push(format!(
+            "FERROSA_S3_MAX_CONCURRENT_REQUESTS={in_flight} is below the startup fetch \
+             concurrency {startup_fetch}: startup registration of evicted SSTables queues \
+             behind the limit"
+        ));
+    }
+    if in_flight < MIN_REMOTE_IN_FLIGHT && is_remote_endpoint(endpoint) {
+        warnings.push(format!(
+            "FERROSA_S3_MAX_CONCURRENT_REQUESTS={in_flight} is below {MIN_REMOTE_IN_FLIGHT} for \
+             the remote endpoint {endpoint}: at a {ASSUMED_ROUND_TRIP_MS} ms round trip it \
+             cannot keep startup or a restore moving"
+        ));
+    }
+    warnings
+}
+
+/// Whether `endpoint` names a host other than this machine.
+fn is_remote_endpoint(endpoint: &str) -> bool {
+    let without_scheme = endpoint
+        .split_once("://")
+        .map_or(endpoint, |(_, rest)| rest);
+    let authority = without_scheme.split('/').next().unwrap_or_default();
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.split(':').next().unwrap_or_default(),
+    };
+    !(host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127."))
 }
 
 /// Validate S3 bucket connectivity and write permissions at startup.
@@ -467,8 +561,23 @@ pub fn parse_request_timeout(value: Option<&str>) -> ferrosa_common::Result<std:
     Ok(std::time::Duration::from_secs(secs))
 }
 
+/// Default for `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS`. A healthy body sends
+/// something every few hundred milliseconds even at 1 MB/s; 30 s of silence is
+/// a stalled connection, which on 2026-10-10 otherwise held its request slot
+/// for the whole 900 s request timeout.
+pub const DEFAULT_S3_BODY_IDLE_TIMEOUT_SECS: u64 = 30;
+
+/// Parse `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS`. Unset or empty means the
+/// default; anything else must be a positive whole number of seconds, and a
+/// bad value is rejected naming the variable.
+pub fn parse_body_idle_timeout(value: Option<&str>) -> ferrosa_common::Result<std::time::Duration> {
+    let secs = parse_request_limit::<u64>("FERROSA_S3_BODY_IDLE_TIMEOUT_SECS", value)?
+        .unwrap_or(DEFAULT_S3_BODY_IDLE_TIMEOUT_SECS);
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -648,7 +757,7 @@ mod tests {
         cfg.max_concurrent_requests = Some(4);
         let store = cfg.build_object_store().unwrap().to_string();
         assert!(store.starts_with("ThrottledStore("), "{store}");
-        assert!(store.contains("LimitStore(4"), "{store}");
+        assert!(store.contains("max_in_flight=4"), "{store}");
     }
 
     /// An HTTP server that answers every request with a 10-byte body sent one
@@ -733,6 +842,276 @@ mod tests {
         let long = s3_against(&endpoint, 10);
         let body = long.get(&path).await.unwrap().bytes().await.unwrap();
         assert_eq!(&body[..], b"0123456789");
+    }
+
+    /// An HTTP object server for the 10-byte object `0123456789` that honours
+    /// `Range` (206 with `Content-Range`). The first `stalls` responses send
+    /// their headers and one body byte, then nothing more while holding the
+    /// connection open: the shape of the 2026-10-10 stalled R2 GETs. Later
+    /// responses are sent whole.
+    async fn stalling_body_server(stalls: usize) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let answered = std::sync::Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let answered = std::sync::Arc::clone(&answered);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = match sock.read(&mut buf).await {
+                        Ok(n) => n,
+                        Err(_) => return,
+                    };
+                    let head = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                    let ranged = head.contains("range: bytes=");
+                    let (status, content_range) = if ranged {
+                        ("206 Partial Content", "Content-Range: bytes 0-9/10\r\n")
+                    } else {
+                        ("200 OK", "")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 10\r\n{content_range}ETag: \"e\"\r\n\
+                         Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\n"
+                    );
+                    if sock.write_all(response.as_bytes()).await.is_err() {
+                        return;
+                    }
+                    if answered.fetch_add(1, Ordering::SeqCst) < stalls {
+                        if sock.write_all(b"0").await.is_err() {
+                            return;
+                        }
+                        // Hold the connection open and send nothing more.
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        return;
+                    }
+                    let _ = sock.write_all(b"0123456789").await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A store built the production way against `endpoint`, with ONE request
+    /// in flight, so a stalled body that kept its permit would block every
+    /// later request.
+    fn one_permit_store_against(endpoint: &str) -> Box<dyn ObjectStore> {
+        let cfg = ObjectStoreConfig {
+            endpoint: endpoint.to_string(),
+            max_concurrent_requests: Some(1),
+            body_idle_timeout: std::time::Duration::from_secs(1),
+            ..ObjectStoreConfig::test_config()
+        };
+        cfg.build_object_store().unwrap()
+    }
+
+    /// T-F5-1 (2026-10-10): stalled GET bodies held every object-store permit
+    /// for the 900 s request timeout, so startup sat idle with open
+    /// connections. A body that yields nothing for the idle timeout must fail
+    /// as retryable, release its permit, and the retry must complete the
+    /// download. Bound: idle timeout 1 s plus a 1 ms retry backoff; measured
+    /// at about 1.0 s, asserted under 3 s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_get_whose_body_stalls_fails_on_the_idle_timeout() {
+        let endpoint = stalling_body_server(1).await;
+        let store = one_permit_store_against(&endpoint);
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("1-Data.db");
+        let dl = super::super::download::DownloadConfig {
+            retry_backoff: std::time::Duration::from_millis(1),
+            ..super::super::download::DownloadConfig::default()
+        };
+        let started = std::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            super::super::download::download_component(
+                store.as_ref(),
+                &object_store::path::Path::from("p/1-Data.db"),
+                &out,
+                &dl,
+            ),
+        )
+        .await
+        .expect("a stalled body must fail on the idle timeout, not hold the download for 900 s");
+
+        assert_eq!(outcome.unwrap(), Some(10), "the retry downloads the object");
+        assert_eq!(std::fs::read(&out).unwrap(), b"0123456789");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// T-F5-1, the `.bytes()` consumers (evicted-read small components, ranged
+    /// parts, `get_range`): a body that stalls fails with an error naming the
+    /// idle-timeout variable instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_body_read_whole_or_by_range_fails_naming_the_idle_timeout() {
+        let endpoint = stalling_body_server(usize::MAX).await;
+        let store = one_permit_store_against(&endpoint);
+        let path = object_store::path::Path::from("p/1-Index.db");
+
+        for how in ["get().bytes()", "get_range"] {
+            let started = std::time::Instant::now();
+            let read = async {
+                match how {
+                    "get_range" => store.get_range(&path, 0..10).await,
+                    _ => match store.get(&path).await {
+                        Ok(r) => r.bytes().await,
+                        Err(e) => Err(e),
+                    },
+                }
+            };
+            let err = tokio::time::timeout(std::time::Duration::from_secs(6), read)
+                .await
+                .unwrap_or_else(|_| panic!("{how}: a stalled body hung past 6 s"))
+                .expect_err("a stalled body must fail");
+            assert!(
+                err.to_string()
+                    .contains("FERROSA_S3_BODY_IDLE_TIMEOUT_SECS"),
+                "{how}: {err}"
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(3),
+                "{how}: took {:?}",
+                started.elapsed()
+            );
+        }
+    }
+
+    /// Captures formatted tracing output so a test can assert on log lines.
+    #[derive(Clone, Default)]
+    pub(crate) struct CapturedLogs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        pub(crate) fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
+        }
+
+        pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            tracing_subscriber::fmt()
+                .with_writer(self.clone())
+                .with_max_level(tracing::Level::INFO)
+                .with_ansi(false)
+                .finish()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Build `cfg`'s store and return the WARN lines it logged.
+    fn warnings_building(cfg: &ObjectStoreConfig) -> Vec<String> {
+        let logs = CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            cfg.build_object_store().unwrap();
+        });
+        logs.text()
+            .lines()
+            .filter(|l| l.contains("WARN"))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// T-F5-2: the nodes ran `rps=20` with 64 requests in flight. 20 requests
+    /// a second at a 300 ms round trip keep only 6 in flight, so the in-flight
+    /// limit was unreachable and nothing said so. Building the store must warn,
+    /// naming both variables and their values.
+    #[test]
+    fn misconfigured_limits_warn_naming_both_variables() {
+        let paced = ObjectStoreConfig {
+            max_requests_per_second: Some(20),
+            max_concurrent_requests: Some(64),
+            ..ObjectStoreConfig::test_config()
+        };
+        let warned = warnings_building(&paced).join("\n");
+        assert!(
+            warned.contains("FERROSA_S3_MAX_REQUESTS_PER_SECOND=20")
+                && warned.contains("FERROSA_S3_MAX_CONCURRENT_REQUESTS=64"),
+            "{warned}"
+        );
+
+        // Startup fetches 16 generations at once; 8 in flight starves it.
+        let narrow = ObjectStoreConfig {
+            max_concurrent_requests: Some(8),
+            ..ObjectStoreConfig::test_config()
+        };
+        let warned = warnings_building(&narrow).join("\n");
+        assert!(
+            warned.contains("FERROSA_S3_MAX_CONCURRENT_REQUESTS=8")
+                && warned.contains("startup fetch concurrency 16"),
+            "{warned}"
+        );
+
+        // The incident's in-flight 4 against a remote endpoint.
+        let remote_four = ObjectStoreConfig {
+            endpoint: "https://account.r2.cloudflarestorage.com".into(),
+            max_concurrent_requests: Some(4),
+            ..ObjectStoreConfig::test_config()
+        };
+        let warned = warnings_building(&remote_four).join("\n");
+        assert!(
+            warned.contains("FERROSA_S3_MAX_CONCURRENT_REQUESTS=4") && warned.contains("below 8"),
+            "{warned}"
+        );
+
+        // The defaults are sane: no limit warning at all.
+        let defaults = warnings_building(&ObjectStoreConfig::test_config());
+        assert!(defaults.is_empty(), "{defaults:?}");
+    }
+
+    /// T-F5-6: the nodes ran a build that predated the 64 in-flight default.
+    /// Unset limits mean 64 in flight, no pacing, and a 30 s body idle timeout.
+    #[test]
+    fn default_limits_are_64_in_flight_and_unpaced() {
+        let cfg = ObjectStoreConfig::test_config();
+        assert_eq!(cfg.max_concurrent_requests, None);
+        assert_eq!(cfg.effective_max_in_flight(), 64);
+        assert_eq!(
+            parse_request_limit::<u32>("FERROSA_S3_MAX_REQUESTS_PER_SECOND", None).unwrap(),
+            None
+        );
+        let built = format!("{:?}", cfg.build_object_store().unwrap());
+        assert!(built.contains("pacer: None"), "{built}");
+        assert!(built.contains("max_in_flight: 64"), "{built}");
+        assert_eq!(
+            parse_body_idle_timeout(None).unwrap(),
+            std::time::Duration::from_secs(30)
+        );
+        assert_eq!(cfg.body_idle_timeout, std::time::Duration::from_secs(30));
+        assert!(built.contains("body_idle_timeout: 30s"), "{built}");
+    }
+
+    #[test]
+    fn an_invalid_body_idle_timeout_is_rejected_naming_the_variable() {
+        for bad in ["0", "-1", "soon", "1.5"] {
+            let err = parse_body_idle_timeout(Some(bad)).unwrap_err().to_string();
+            assert!(
+                err.contains("FERROSA_S3_BODY_IDLE_TIMEOUT_SECS"),
+                "{bad}: {err}"
+            );
+        }
+        assert_eq!(
+            parse_body_idle_timeout(Some("5")).unwrap(),
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]

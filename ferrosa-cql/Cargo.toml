@@ -70,6 +70,10 @@ ferrosa-jsonb = { path = "../ferrosa-jsonb" }
 criterion = "0.5"
 proptest = "1"
 rcgen = "0.14"
+# Parses our ERROR frames the way the scylla driver does, so the tests pin the
+# driver's classification (outage 2026-10-10, t_43f70b3a). Already in the
+# workspace lock via ferrosa-jepsen.
+scylla-cql = "1.6"
 serial_test = "3"
 tempfile = "3"
 tokio = { version = "1", features = ["full", "test-util"] }

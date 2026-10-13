@@ -57,12 +57,14 @@ static RPC_HANDLER_PANICS: [AtomicU64; 256] = [const { AtomicU64::new(0) }; 256]
 
 /// Inbound RPC requests that got no response, by `RemoteFailureKind` code
 /// (index 0 is unused; unknown codes never originate locally).
-static RPC_HANDLER_FAILURES: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
-const LOCAL_FAILURE_KINDS: [RemoteFailureKind; 4] = [
+static RPC_HANDLER_FAILURES: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+const LOCAL_FAILURE_KINDS: [RemoteFailureKind; 6] = [
     RemoteFailureKind::HandlerPanicked,
     RemoteFailureKind::ResponseEncodeFailed,
     RemoteFailureKind::RequestDecodeFailed,
     RemoteFailureKind::ResponseTooLarge,
+    RemoteFailureKind::HandlerFailed,
+    RemoteFailureKind::NotReady,
 ];
 
 /// Handler panics recorded for `msg_type` since process start.
@@ -214,6 +216,30 @@ pub fn record_rpc_timeout(lane: Lane) {
     RPC_TIMEOUTS[lane.index()].fetch_add(1, Ordering::Relaxed);
 }
 
+/// Queued requests discarded unsent because their caller had stopped waiting.
+static LANE_ABANDONED_UNSENT: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// Queued requests answered `Timeout` unsent because their whole deadline was
+/// spent in the lane queue.
+static LANE_EXPIRED_IN_QUEUE: [AtomicU64; 3] =
+    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+pub fn record_lane_abandoned_unsent(lane: Lane) {
+    LANE_ABANDONED_UNSENT[lane.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn record_lane_expired_in_queue(lane: Lane) {
+    LANE_EXPIRED_IN_QUEUE[lane.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn lane_abandoned_unsent(lane: Lane) -> u64 {
+    LANE_ABANDONED_UNSENT[lane.index()].load(Ordering::Relaxed)
+}
+
+pub fn lane_expired_in_queue(lane: Lane) -> u64 {
+    LANE_EXPIRED_IN_QUEUE[lane.index()].load(Ordering::Relaxed)
+}
+
 pub fn render_prometheus() -> String {
     let mut output = String::new();
     output.push_str(
@@ -256,6 +282,10 @@ pub fn render_prometheus() -> String {
     output.push_str("# TYPE ferrosa_net_lane_pending_stream_depth gauge\n");
     output.push_str("# HELP ferrosa_net_lane_pending_stream_depth_max Maximum pending request/response RPCs observed inside each lane actor.\n");
     output.push_str("# TYPE ferrosa_net_lane_pending_stream_depth_max gauge\n");
+    output.push_str("# HELP ferrosa_net_lane_abandoned_unsent_total Queued RPCs discarded unsent because the caller stopped waiting.\n");
+    output.push_str("# TYPE ferrosa_net_lane_abandoned_unsent_total counter\n");
+    output.push_str("# HELP ferrosa_net_lane_expired_in_queue_total Queued RPCs answered Timeout unsent because their deadline ran out in the lane queue.\n");
+    output.push_str("# TYPE ferrosa_net_lane_expired_in_queue_total counter\n");
 
     for lane in LANES {
         let label = lane.as_str();
@@ -315,6 +345,14 @@ pub fn render_prometheus() -> String {
         output.push_str(&format!(
             "ferrosa_net_lane_pending_stream_depth_max{{lane=\"{label}\"}} {}\n",
             LANE_PENDING_STREAM_DEPTH_MAX[index].load(Ordering::Relaxed)
+        ));
+        output.push_str(&format!(
+            "ferrosa_net_lane_abandoned_unsent_total{{lane=\"{label}\"}} {}\n",
+            LANE_ABANDONED_UNSENT[index].load(Ordering::Relaxed)
+        ));
+        output.push_str(&format!(
+            "ferrosa_net_lane_expired_in_queue_total{{lane=\"{label}\"}} {}\n",
+            LANE_EXPIRED_IN_QUEUE[index].load(Ordering::Relaxed)
         ));
     }
 

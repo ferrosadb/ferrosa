@@ -4488,11 +4488,15 @@ async fn adjacency_write_with_retry(
 }
 
 /// Distinguish a transient replica-schema-lag write timeout (retryable) from
-/// a real cluster failure (not retryable). The cluster coordinator surfaces
-/// `WriteTimeout` as `Error::InvalidData("cluster: write timeout: CL=…,
-/// received=N, required=M")` — that exact wrapping is the contract we match
-/// against. Any other error (unavailable, validation, storage I/O) is final.
+/// a real cluster failure (not retryable). The cluster coordinator surfaces a
+/// write timeout as the typed `Error::WriteTimeout` (t_43f70b3a; it was once
+/// `InvalidData("cluster: write timeout: …")`, and that text is still accepted
+/// from a path that wraps it). Any other error (unavailable, validation,
+/// storage I/O) is final.
 fn is_transient_replica_lag(e: &ferrosa_common::Error) -> bool {
+    if matches!(e, ferrosa_common::Error::WriteTimeout { .. }) {
+        return true;
+    }
     let msg = e.to_string();
     msg.contains("cluster: write timeout") || msg.contains("table not registered")
 }
@@ -9787,5 +9791,31 @@ mod tests {
         )
         .await;
         assert_typed_validation_error("execute_create", result);
+    }
+
+    /// A coordinator write timeout now crosses `WritePath` as the typed
+    /// `Error::WriteTimeout` (t_43f70b3a), not as an "cluster: write timeout"
+    /// message; the adjacency-write retry must still treat it as transient,
+    /// and must still treat unavailability as final.
+    #[test]
+    fn a_typed_write_timeout_is_transient_replica_lag() {
+        let timeout = ferrosa_common::Error::WriteTimeout {
+            consistency: "QUORUM".to_string(),
+            received: 1,
+            required: 2,
+        };
+        assert!(
+            is_transient_replica_lag(&timeout),
+            "a write timeout must be retried as replica schema lag"
+        );
+        let unavailable = ferrosa_common::Error::Unavailable {
+            consistency: "QUORUM".to_string(),
+            required: 2,
+            alive: 1,
+        };
+        assert!(
+            !is_transient_replica_lag(&unavailable),
+            "unavailability is final for this retry"
+        );
     }
 }

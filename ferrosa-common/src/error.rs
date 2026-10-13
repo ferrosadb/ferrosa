@@ -57,6 +57,31 @@ pub enum Error {
     /// buffer and reach disk later, so the outcome is unknown, exactly like a
     /// write timeout: the caller must not report it as applied, and may retry.
     CommitLogNotDurable { reason: String },
+    /// A coordinated read got fewer replica responses than its consistency
+    /// level needs. Carried typed (not as a message) across the storage
+    /// boundary so the CQL layer can answer with the protocol's Read_timeout
+    /// error and its fields (outage 2026-10-10, t_43f70b3a).
+    ReadTimeout {
+        consistency: String,
+        received: usize,
+        required: usize,
+        data_present: bool,
+    },
+    /// A coordinated write got fewer acknowledgements than its consistency
+    /// level needs. Typed for the same reason as [`Error::ReadTimeout`].
+    WriteTimeout {
+        consistency: String,
+        received: usize,
+        required: usize,
+    },
+    /// Fewer replicas are eligible than the consistency level needs, so the
+    /// operation was not attempted. Typed for the same reason as
+    /// [`Error::ReadTimeout`].
+    Unavailable {
+        consistency: String,
+        required: usize,
+        alive: usize,
+    },
 }
 
 impl Error {
@@ -130,6 +155,34 @@ impl fmt::Display for Error {
             Error::CommitLogNotDurable { reason } => write!(
                 f,
                 "commit log not durable, write not acknowledged: {reason}"
+            ),
+            // Same text as the coordinator's own error, so a log line or a
+            // message reads the same on either side of the boundary.
+            Error::ReadTimeout {
+                consistency,
+                received,
+                required,
+                data_present,
+            } => write!(
+                f,
+                "read timeout: CL={consistency}, received={received}, \
+                 required={required}, data_present={data_present}"
+            ),
+            Error::WriteTimeout {
+                consistency,
+                received,
+                required,
+            } => write!(
+                f,
+                "write timeout: CL={consistency}, received={received}, required={required}"
+            ),
+            Error::Unavailable {
+                consistency,
+                required,
+                alive,
+            } => write!(
+                f,
+                "unavailable: CL={consistency}, required={required}, alive={alive}"
             ),
         }
     }

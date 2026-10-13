@@ -259,8 +259,13 @@ impl Default for AntiEntropyRepairQueue {
 
 /// Outcome of a single replica read attempt.
 enum ReplicaRead {
-    /// Full partition data (from the designated full-read replica).
-    Full(Option<Partition>),
+    /// Full partition data (from the replica currently serving the full read).
+    Full {
+        partition: Option<Partition>,
+        /// Host ID of the replica that served it (the local node's own host
+        /// ID when the full read was local).
+        host_id: Option<uuid::Uuid>,
+    },
     /// Digest + timestamp only (from digest-only replicas).
     Digest {
         digest: Option<u32>,
@@ -268,8 +273,35 @@ enum ReplicaRead {
         /// Host ID of the replica that sent this digest.
         host_id: Option<uuid::Uuid>,
     },
-    /// The replica did not respond or returned an error.
-    Failed,
+    /// The replica did not respond or returned an error. Kept with its reason
+    /// so a read that fails names every replica that failed it and why.
+    Failed(ReplicaFailure),
+}
+
+/// One replica's failed read, as reported when the read cannot meet its CL.
+#[derive(Debug, Clone)]
+struct ReplicaFailure {
+    replica: u64,
+    /// Whether this was the full-data read (as opposed to a digest).
+    full: bool,
+    reason: String,
+}
+
+impl ReplicaRead {
+    fn failed(replica: u64, full: bool, reason: impl Into<String>) -> Self {
+        Self::Failed(ReplicaFailure {
+            replica,
+            full,
+            reason: reason.into(),
+        })
+    }
+}
+
+impl std::fmt::Display for ReplicaFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = if self.full { "full" } else { "digest" };
+        write!(f, "node {} ({kind}): {}", self.replica, self.reason)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -414,7 +446,7 @@ async fn digest_read_attempt(
                 timestamp: i64::MIN,
                 host_id: None,
             },
-            Err(_) => ReplicaRead::Failed,
+            Err(e) => ReplicaRead::failed(replica_id, false, format!("local storage read: {e}")),
         }
     } else {
         let payload = ReadRequestPayload {
@@ -427,22 +459,255 @@ async fn digest_read_attempt(
             clustering: clustering.unwrap_or_default(),
         };
         let message = encode_partition_read_request(payload, start_clustering);
-        match remote {
-            None => ReplicaRead::Failed,
-            Some((hid, addr)) => match coordinator
-                .send_remote_with_reconnect(hid, &addr, message, Lane::Data)
-                .await
-            {
-                Ok(Message::ReadResponse(b)) => match decode_read_response(&b) {
-                    Some(resp) => ReplicaRead::Digest {
-                        digest: resp.digest,
-                        timestamp: resp.timestamp,
-                        host_id: Some(hid),
-                    },
-                    None => ReplicaRead::Failed,
-                },
-                _ => ReplicaRead::Failed,
+        match remote_partition_read(coordinator, replica_id, remote, message).await {
+            Ok((resp, hid)) => ReplicaRead::Digest {
+                digest: resp.digest,
+                timestamp: resp.timestamp,
+                host_id: Some(hid),
             },
+            Err(reason) => ReplicaRead::failed(replica_id, false, reason),
+        }
+    }
+}
+
+/// Read the full partition from `replica_id`: the local storage engine when it
+/// is the local node, otherwise a remote `ReadRequest` on the Data lane.
+///
+/// `host_id` is the replica's host ID from the ring; it travels with the
+/// result so read repair knows which replica served the data, whichever replica
+/// ended up serving the full read.
+#[allow(clippy::too_many_arguments)]
+async fn full_read_attempt(
+    coordinator: &ClusterCoordinator,
+    table_id: TableId,
+    key: DecoratedKey,
+    replica_id: u64,
+    remote: Option<(uuid::Uuid, String)>,
+    row_limit: usize,
+    clustering: Option<Vec<u8>>,
+    start_clustering: Option<Vec<u8>>,
+) -> ReplicaRead {
+    let host_id = remote.as_ref().map(|(hid, _)| *hid);
+    if replica_id == coordinator.local_node_id {
+        return match read_local_partition(
+            &coordinator.storage,
+            table_id,
+            key,
+            row_limit,
+            clustering,
+            start_clustering,
+        )
+        .await
+        {
+            Ok(partition) => ReplicaRead::Full { partition, host_id },
+            Err(e) => ReplicaRead::failed(replica_id, true, format!("local storage read: {e}")),
+        };
+    }
+    let payload = ReadRequestPayload {
+        keyspace: table_id.keyspace,
+        table: table_id.table,
+        key: key.key.as_bytes().to_vec(),
+        digest_only: false,
+        page_size: row_limit.min(u32::MAX as usize) as u32,
+        page_state: vec![],
+        clustering: clustering.unwrap_or_default(),
+    };
+    let message = encode_partition_read_request(payload, start_clustering);
+    match remote_partition_read(coordinator, replica_id, remote, message).await {
+        Ok((resp, hid)) => ReplicaRead::Full {
+            partition: if resp.found {
+                resp.partition.map(partition_from_wire)
+            } else {
+                None
+            },
+            host_id: Some(hid),
+        },
+        Err(reason) => ReplicaRead::failed(replica_id, true, reason),
+    }
+}
+
+/// Send one partition read to a remote replica and decode its reply. Every way
+/// it can fail comes back as a reason string, never as an absent partition.
+async fn remote_partition_read(
+    coordinator: &ClusterCoordinator,
+    replica_id: u64,
+    remote: Option<(uuid::Uuid, String)>,
+    message: Message,
+) -> Result<(ReadResponsePayload, uuid::Uuid), String> {
+    let Some((hid, addr)) = remote else {
+        return Err(format!("node {replica_id} is not in the ring"));
+    };
+    match coordinator
+        .send_remote_with_reconnect(hid, &addr, message, Lane::Data)
+        .await
+    {
+        Ok(Message::ReadResponse(b)) => decode_read_response(&b)
+            .map(|resp| (resp, hid))
+            .ok_or_else(|| format!("ReadResponse ({} bytes) does not decode", b.len())),
+        Ok(other) => Err(format!("expected ReadResponse, got {:?}", other.msg_type())),
+        Err(e) => Err(format!("send to {addr}: {e}")),
+    }
+}
+
+/// A replica a quorum read may ask: its node ID and, when the ring knows it,
+/// its host ID and internode address.
+type ReadCandidate = (u64, Option<(uuid::Uuid, String)>);
+
+type ReplicaReadFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = ReplicaRead> + Send + 'a>>;
+
+/// The responses a quorum read gathered: the full data, from whichever replica
+/// served it, plus enough digests to meet the consistency level.
+struct QuorumReads {
+    full_partition: Option<Partition>,
+    full_digest: Option<u32>,
+    full_host_id: Option<uuid::Uuid>,
+    digest_responses: Vec<(Option<u32>, i64, Option<uuid::Uuid>)>,
+    received: usize,
+}
+
+impl ClusterCoordinator {
+    fn launch_replica_read<'a>(
+        &'a self,
+        full: bool,
+        (replica_id, remote): ReadCandidate,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        slice: &PartitionReadSlice,
+    ) -> ReplicaReadFuture<'a> {
+        let PartitionReadSlice {
+            row_limit,
+            clustering,
+            start_clustering,
+        } = slice.clone();
+        if full {
+            Box::pin(full_read_attempt(
+                self,
+                table_id.clone(),
+                key.clone(),
+                replica_id,
+                remote,
+                row_limit,
+                clustering,
+                start_clustering,
+            ))
+        } else {
+            Box::pin(digest_read_attempt(
+                self,
+                self.storage.clone(),
+                table_id.clone(),
+                key.clone(),
+                self.local_node_id,
+                replica_id,
+                remote,
+                row_limit,
+                clustering,
+                start_clustering,
+            ))
+        }
+    }
+
+    /// Fan a partition read out to `required` replicas (the first candidate
+    /// does the full read, the rest send digests) and gather their answers.
+    ///
+    /// A failed read is replaced by the next spare candidate. While no replica
+    /// has supplied the data and no full read is in flight, that spare does the
+    /// FULL read: digests can make up the count but cannot answer the query, so
+    /// replacing a failed full read with a digest fails a read that the live
+    /// replicas could serve (F11, outage 2026-10-10:
+    /// `received=2, required=2, data_present=false` with two healthy replicas).
+    ///
+    /// When the consistency level cannot be met, the error is logged once with
+    /// every replica that failed and why.
+    async fn gather_quorum_reads(
+        &self,
+        table_id: &TableId,
+        key: &DecoratedKey,
+        cl: ConsistencyLevel,
+        required: usize,
+        mut candidates: std::collections::VecDeque<ReadCandidate>,
+        slice: PartitionReadSlice,
+    ) -> crate::error::Result<QuorumReads> {
+        let first = candidates.pop_front().ok_or_else(|| {
+            ClusterError::Internal(format!(
+                "quorum read of {table_id} at {cl}: no replica to read from"
+            ))
+        })?;
+        let mut fan_out: FuturesUnordered<ReplicaReadFuture<'_>> = FuturesUnordered::new();
+        fan_out.push(self.launch_replica_read(true, first, table_id, key, &slice));
+        let mut full_in_flight = true;
+        let initial_digests = required.saturating_sub(1).min(candidates.len());
+        for candidate in candidates.drain(..initial_digests) {
+            fan_out.push(self.launch_replica_read(false, candidate, table_id, key, &slice));
+        }
+
+        let mut full: Option<(Option<Partition>, Option<u32>, Option<uuid::Uuid>)> = None;
+        let mut digest_responses = Vec::new();
+        let mut received = 0usize;
+        let mut failures: Vec<ReplicaFailure> = Vec::new();
+        while let Some(result) = fan_out.next().await {
+            match result {
+                ReplicaRead::Full { partition, host_id } => {
+                    let digest = partition
+                        .as_ref()
+                        .and_then(|p| crate::raft::handlers::compute_partition_digest(p).ok());
+                    full = Some((partition, digest, host_id));
+                    full_in_flight = false;
+                    received += 1;
+                }
+                ReplicaRead::Digest {
+                    digest,
+                    timestamp,
+                    host_id,
+                } => {
+                    digest_responses.push((digest, timestamp, host_id));
+                    received += 1;
+                }
+                ReplicaRead::Failed(failure) => {
+                    tracing::debug!(table = %table_id, %cl, %failure,
+                        "quorum read: a replica read failed; trying a spare replica");
+                    full_in_flight &= !failure.full;
+                    failures.push(failure);
+                    if let Some(candidate) = candidates.pop_front() {
+                        let needs_full = full.is_none() && !full_in_flight;
+                        fan_out.push(
+                            self.launch_replica_read(needs_full, candidate, table_id, key, &slice),
+                        );
+                        full_in_flight |= needs_full;
+                    }
+                }
+            }
+            if full.is_some() && received >= required {
+                break;
+            }
+        }
+
+        match full {
+            Some((full_partition, full_digest, full_host_id)) if received >= required => {
+                Ok(QuorumReads {
+                    full_partition,
+                    full_digest,
+                    full_host_id,
+                    digest_responses,
+                    received,
+                })
+            }
+            full => {
+                let failed = failures
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                tracing::warn!(table = %table_id, %cl, received, required,
+                    data_present = full.is_some(), failures = %failed,
+                    "quorum read cannot meet its consistency level");
+                Err(ClusterError::ReadTimeout {
+                    consistency: cl.to_string(),
+                    received,
+                    required,
+                    data_present: full.is_some(),
+                })
+            }
         }
     }
 }
@@ -792,189 +1057,43 @@ impl ClusterCoordinator {
             replicas[0]
         };
 
-        // Start with only the digest reads needed for quorum. Spare eligible
-        // replicas are kept in reserve and launched only if an initial read
-        // fails, avoiding a permanent extra digest RPC on every healthy read.
-        let digest_replicas: Vec<u64> = replicas
-            .iter()
-            .copied()
-            .filter(|&r| r != full_replica)
-            .collect();
-
-        // Collect node metadata before dropping the ring guard.
-        let full_remote = ring
-            .get_node(full_replica)
-            .map(|n| (n.host_id, n.addr.clone()));
-        let full_host_id = full_remote.as_ref().map(|(host_id, _)| *host_id);
-        let mut digest_remotes: std::collections::VecDeque<(u64, Option<(uuid::Uuid, String)>)> =
-            digest_replicas
-                .iter()
-                .map(|&r| (r, ring.get_node(r).map(|n| (n.host_id, n.addr.clone()))))
+        // Collect node metadata before dropping the ring guard. The full-read
+        // replica goes first; the rest are digest replicas, and those beyond
+        // the quorum are spares launched only if an earlier read fails, so a
+        // healthy read never pays a permanent extra RPC.
+        let remote_of = |r: u64| (r, ring.get_node(r).map(|n| (n.host_id, n.addr.clone())));
+        let candidates: std::collections::VecDeque<ReadCandidate> =
+            std::iter::once(remote_of(full_replica))
+                .chain(
+                    replicas
+                        .iter()
+                        .copied()
+                        .filter(|&r| r != full_replica)
+                        .map(remote_of),
+                )
                 .collect();
         drop(ring);
 
-        // -------------------------------------------------------------------
-        // Phase 1: fan out — full read + digest-only reads concurrently.
-        // -------------------------------------------------------------------
-
-        let mut fan_out: FuturesUnordered<_> = {
-            // Full-read future
-            let full_future = {
-                let storage = self.storage.clone();
-                let coordinator = self;
-                let table_id = table_id.clone();
-                let key = key.clone();
-                let local_node_id = self.local_node_id;
-                let keyspace = table_id.keyspace.clone();
-                let table_name = table_id.table.clone();
-                let key_bytes = key.key.as_bytes().to_vec();
-                let clustering = clustering.clone();
-                let start_clustering = start_clustering.clone();
-
-                async move {
-                    if full_replica == local_node_id {
-                        // Local full read.
-                        match read_local_partition(
-                            &storage,
-                            table_id,
-                            key,
-                            row_limit,
-                            clustering,
-                            start_clustering,
-                        )
-                        .await
-                        {
-                            Ok(opt) => ReplicaRead::Full(opt),
-                            Err(_) => ReplicaRead::Failed,
-                        }
-                    } else {
-                        // Remote full read via Data lane.
-                        let payload = ReadRequestPayload {
-                            keyspace,
-                            table: table_name,
-                            key: key_bytes,
-                            digest_only: false,
-                            page_size: row_limit.min(u32::MAX as usize) as u32,
-                            page_state: vec![],
-                            clustering: clustering.unwrap_or_default(),
-                        };
-                        let message = encode_partition_read_request(payload, start_clustering);
-                        match full_remote {
-                            None => ReplicaRead::Failed,
-                            Some((hid, addr)) => {
-                                match coordinator
-                                    .send_remote_with_reconnect(hid, &addr, message, Lane::Data)
-                                    .await
-                                {
-                                    Ok(Message::ReadResponse(b)) => {
-                                        match decode_read_response(&b) {
-                                            Some(resp) if resp.found => {
-                                                let partition =
-                                                    resp.partition.map(partition_from_wire);
-                                                ReplicaRead::Full(partition)
-                                            }
-                                            Some(_) => ReplicaRead::Full(None),
-                                            None => ReplicaRead::Failed,
-                                        }
-                                    }
-                                    _ => ReplicaRead::Failed,
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-
-            // Collect all futures into one FuturesUnordered.
-            let all: FuturesUnordered<
-                std::pin::Pin<Box<dyn std::future::Future<Output = ReplicaRead> + Send>>,
-            > = FuturesUnordered::new();
-            all.push(Box::pin(full_future));
-            for _ in 0..required.saturating_sub(1) {
-                if let Some((replica_id, remote)) = digest_remotes.pop_front() {
-                    all.push(Box::pin(digest_read_attempt(
-                        self,
-                        self.storage.clone(),
-                        table_id.clone(),
-                        key.clone(),
-                        self.local_node_id,
-                        replica_id,
-                        remote,
-                        row_limit,
-                        clustering.clone(),
-                        start_clustering.clone(),
-                    )));
-                }
-            }
-            all
-        };
-
-        // -------------------------------------------------------------------
-        // Phase 2: collect results and resolve.
-        // -------------------------------------------------------------------
-
-        let mut full_partition: Option<Option<Partition>> = None; // None means "not received yet"
-        let mut digest_responses: Vec<(Option<u32>, i64, Option<uuid::Uuid>)> = Vec::new();
-        let mut received = 0usize;
-        let mut full_digest: Option<Option<u32>> = None;
-
-        while let Some(result) = fan_out.next().await {
-            match result {
-                ReplicaRead::Full(opt_partition) => {
-                    let d = opt_partition
-                        .as_ref()
-                        .and_then(|p| crate::raft::handlers::compute_partition_digest(p).ok());
-                    full_digest = Some(d);
-                    full_partition = Some(opt_partition);
-                    received += 1;
-                }
-                ReplicaRead::Digest {
-                    digest,
-                    timestamp,
-                    host_id,
-                } => {
-                    digest_responses.push((digest, timestamp, host_id));
-                    received += 1;
-                }
-                ReplicaRead::Failed => {
-                    // Don't count failures toward `received`. If another
-                    // eligible digest replica is available, launch it now so a
-                    // single failed remote doesn't fail the quorum read.
-                    if let Some((replica_id, remote)) = digest_remotes.pop_front() {
-                        fan_out.push(Box::pin(digest_read_attempt(
-                            self,
-                            self.storage.clone(),
-                            table_id.clone(),
-                            key.clone(),
-                            self.local_node_id,
-                            replica_id,
-                            remote,
-                            row_limit,
-                            clustering.clone(),
-                            start_clustering.clone(),
-                        )));
-                    }
-                }
-            }
-
-            // We're done once we have the full read + all needed digests.
-            if full_partition.is_some() && received >= required {
-                break;
-            }
-        }
-
-        // Fail if we didn't get enough responses.
-        if received < required || full_partition.is_none() {
-            return Err(ClusterError::ReadTimeout {
-                consistency: cl.to_string(),
-                received,
+        let QuorumReads {
+            full_partition,
+            full_digest: full_d,
+            full_host_id,
+            digest_responses,
+            received,
+        } = self
+            .gather_quorum_reads(
+                table_id,
+                key,
+                cl,
                 required,
-                data_present: full_partition.is_some(),
-            });
-        }
-
-        let full_partition = full_partition.unwrap();
-        let full_d = full_digest.unwrap(); // same Some wrapping as full_partition above
+                candidates,
+                PartitionReadSlice {
+                    row_limit,
+                    clustering: clustering.clone(),
+                    start_clustering: start_clustering.clone(),
+                },
+            )
+            .await?;
 
         // Check for digest mismatches.
         let all_match = digest_responses.iter().all(|(d, _, _)| *d == full_d);
