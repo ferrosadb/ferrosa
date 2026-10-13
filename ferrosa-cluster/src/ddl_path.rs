@@ -894,10 +894,53 @@ pub async fn wait_for_local_apply(
 /// error: a DROP that did not take effect must not be reported as success.
 #[doc(hidden)]
 pub async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
+    // Name the statement for the failure path before the op is consumed: a DDL
+    // that cannot be committed has to say which statement was left unconfirmed.
+    let operation = ddl_op_target(&op);
     let cmd = ddl_op_to_raft_command(op);
 
-    match raft.client_write(cmd).await {
-        Ok(resp) => {
+    // The proposal is **bounded**. openraft's `client_write` has no deadline of
+    // its own, and it does not notify a pending proposal when the leader stops
+    // leading: `client_resp_channels` is drained only when the entry applies
+    // (openraft `core/raft_core.rs:802`) or when a conflicting log truncates it
+    // (`:1960`). A standing leader that cannot reach a quorum — which a fault
+    // schedule guarantees while a node is paused and stepping down — therefore
+    // leaves this await open for as long as the leader keeps trying, and the
+    // only deadline that eventually fires is the CQL client's own (30 s), whose
+    // expiry is indistinguishable from a slow DDL (forge t_e8abe81a). Every
+    // other wait on this path is already bounded by `DDL_AGREEMENT_TIMEOUT`;
+    // this one was the exception. Expiring that bound is the evidence that the
+    // proposal path can hang — it is never a reason to widen the bound, and the
+    // client's own deadline is not touched by this fix.
+    let started = std::time::Instant::now();
+    let write = tokio::time::timeout(DDL_AGREEMENT_TIMEOUT, raft.client_write(cmd)).await;
+
+    match write {
+        // The bound expired: the proposal is unconfirmed. Fail loud and
+        // retryably rather than reporting a DDL as done (it may not exist) or
+        // leaving the client to time out without knowing why.
+        Err(_elapsed) => {
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            let timeout_ms = DDL_AGREEMENT_TIMEOUT.as_millis() as u64;
+            let (required, alive) = raft_quorum_and_confirmed(raft);
+            tracing::error!(
+                operation = %operation,
+                timeout_ms,
+                elapsed_ms,
+                quorum_required = required,
+                quorum_alive = alive,
+                "DDL proposal was not agreed within {timeout_ms}ms: the leader could not \
+                 commit it. The DDL is unconfirmed; failing retryably"
+            );
+            Err(ClusterError::DdlProposalNotAgreed {
+                operation,
+                required,
+                alive,
+                timeout_ms,
+                elapsed_ms,
+            })
+        }
+        Ok(Ok(resp)) => {
             // The applying node folds a refused DROP (its storage could not
             // remove the table's SSTables) into `RaftResponse::Error`. The
             // leader applies synchronously inside `client_write`, so that
@@ -919,7 +962,7 @@ pub async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64
             wait_for_replication_to_catch_up(raft, resp.log_id.index).await;
             Ok(resp.log_id.index)
         }
-        Err(raft_err) => {
+        Ok(Err(raft_err)) => {
             // Extract a ForwardToLeader hint if present.
             if let Some(fwd) = raft_err.forward_to_leader() {
                 return Err(ClusterError::NotLeader {
@@ -1193,6 +1236,49 @@ fn ddl_op_kind(op: &DdlOperation) -> &'static str {
         DdlOperation::AlterTable { .. } => "AlterTable",
         _ => "other",
     }
+}
+
+/// The DDL as the client wrote it: variant name plus the object it targets, so
+/// a failure can name the statement that needs retrying. No schema payload.
+fn ddl_op_target(op: &DdlOperation) -> String {
+    match op {
+        DdlOperation::CreateKeyspace(ks) => format!("CreateKeyspace {}", ks.name),
+        DdlOperation::DropKeyspace(name) => format!("DropKeyspace {name}"),
+        DdlOperation::CreateTable(t) => format!("CreateTable {}.{}", t.keyspace, t.name),
+        DdlOperation::DropTable { keyspace, table } => format!("DropTable {keyspace}.{table}"),
+        DdlOperation::AlterKeyspace { name, .. } => format!("AlterKeyspace {name}"),
+        DdlOperation::AlterTable {
+            keyspace, table, ..
+        } => format!("AlterTable {keyspace}.{table}"),
+        DdlOperation::CreateRole(role) => format!("CreateRole {}", role.name),
+        DdlOperation::AlterRole { name, .. } => format!("AlterRole {name}"),
+        DdlOperation::DropRole(name) => format!("DropRole {name}"),
+        DdlOperation::CreateIndex(idx) => {
+            format!("CreateIndex {}.{}.{}", idx.keyspace, idx.table, idx.name)
+        }
+        DdlOperation::DropIndex {
+            keyspace,
+            table,
+            index,
+        } => format!("DropIndex {keyspace}.{table}.{index}"),
+        other => ddl_op_kind(other).to_string(),
+    }
+}
+
+/// The Raft quorum this group needs, and how many voters this node can confirm
+/// right now.
+///
+/// `alive` is 1: the local voter holds the proposal in its own log, and a node
+/// that could not commit has no replication progress from any peer to point at
+/// — claiming otherwise would be a fabrication in a fail-loud path.
+fn raft_quorum_and_confirmed(raft: &FerrosRaft) -> (usize, usize) {
+    let metrics = raft.metrics().borrow().clone();
+    let voters = metrics
+        .membership_config
+        .membership()
+        .voter_ids()
+        .count();
+    (voters / 2 + 1, 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,6 +1727,35 @@ mod tests {
         ));
     }
 
+    // -- DDL statement naming (fail-loud precision) ------------------------
+
+    /// The error a client gets for an unconfirmed DDL has to say *which*
+    /// statement it was, so it can retry the right one.
+    #[test]
+    fn ddl_op_target_names_the_statement_and_its_object() {
+        assert_eq!(
+            ddl_op_target(&DdlOperation::CreateKeyspace(simple_keyspace("ks_obj"))),
+            "CreateKeyspace ks_obj"
+        );
+        assert_eq!(
+            ddl_op_target(&DdlOperation::DropTable {
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+            }),
+            "DropTable ks.tbl"
+        );
+        assert_eq!(
+            ddl_op_target(&DdlOperation::DropIndex {
+                keyspace: "ks".into(),
+                table: "tbl".into(),
+                index: "idx".into(),
+            }),
+            "DropIndex ks.tbl.idx"
+        );
+        // A variant with no target still names its kind rather than nothing.
+        assert!(!ddl_op_target(&DdlOperation::DropKeyspace("bye".into())).is_empty());
+    }
+
     // -- ClusterError::NotLeader display ----------------------------------
 
     #[test]
@@ -1697,6 +1812,10 @@ mod tests {
         // Simulate DdlPath::Cluster being stored after Raft initialises.
         // We use a minimal placeholder FerrosRaft struct via openraft in a way
         // that only tests the ArcSwap swap — not Raft itself.
+        // (This test predates the in-process harness; a real `FerrosRaft` IS
+        // constructible under a `#[tokio::test]` — see
+        // `tests/common/raft_harness.rs` and the DDL proposal bound test in
+        // `tests/ddl_proposal_bounded.rs`, which builds three of them.)
         // Since we can't construct a FerrosRaft without a running tokio runtime
         // and network, we just verify the enum variant discrimination.
         //

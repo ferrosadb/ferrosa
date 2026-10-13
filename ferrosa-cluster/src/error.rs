@@ -36,6 +36,31 @@ pub enum ClusterError {
     ///
     /// `leader_id` is the openraft `NodeId` of the current leader, if known.
     NotLeader { leader_id: Option<u64> },
+    /// A DDL proposal reached a Raft leader that could not get it committed
+    /// within the DDL agreement bound.
+    ///
+    /// Distinct from [`Self::NotLeader`] (openraft named the leader) and
+    /// [`Self::RaftError`] (openraft reported a fault): here the proposal is
+    /// still pending on a node that believes it is the leader, and nothing is
+    /// known about whether it applied anywhere. A DDL that was never confirmed
+    /// must be reported as a failure the client can retry — never as done, and
+    /// never by holding the client's own deadline open (forge t_e8abe81a).
+    DdlProposalNotAgreed {
+        /// The DDL that could not complete, named with its target (for example
+        /// `DropTable ks.tbl`) so a retrying client knows which statement is
+        /// unconfirmed.
+        operation: String,
+        /// Voters that must acknowledge the proposal (Raft quorum) in the
+        /// group's membership.
+        required: usize,
+        /// Voters this node could confirm when the bound expired. Only the
+        /// local voter holds the proposal, so this is 1.
+        alive: usize,
+        /// The bound that expired.
+        timeout_ms: u64,
+        /// How long the proposal was awaited before giving up.
+        elapsed_ms: u64,
+    },
     /// Attempted mode transition that is not allowed.
     ModeTransitionRejected(String),
     /// Replication to peer failed.
@@ -103,6 +128,18 @@ impl fmt::Display for ClusterError {
                 Some(id) => write!(f, "not Raft leader; forward to node {id}"),
                 None => write!(f, "not Raft leader; leader unknown"),
             },
+            Self::DdlProposalNotAgreed {
+                operation,
+                required,
+                alive,
+                timeout_ms,
+                elapsed_ms,
+            } => write!(
+                f,
+                "DDL proposal not agreed: {operation} was accepted by the Raft leader but \
+                 was not committed within {timeout_ms}ms (waited {elapsed_ms}ms, quorum \
+                 required={required}, alive={alive}); the DDL is unconfirmed, retry it"
+            ),
             Self::ModeTransitionRejected(reason) => write!(f, "mode transition rejected: {reason}"),
             Self::ReplicationFailed(reason) => write!(f, "replication failed: {reason}"),
             Self::CatchUpRequired => write!(f, "peer requires full catch-up"),
@@ -163,6 +200,20 @@ mod tests {
 
         let e = ClusterError::PairWriteUnavailable;
         assert!(e.to_string().contains("primary"));
+
+        // A DDL that could not be agreed names the statement, the bound it
+        // waited on, and that it must be retried (never silently done).
+        let e = ClusterError::DdlProposalNotAgreed {
+            operation: "DropTable ks.tbl".into(),
+            required: 2,
+            alive: 1,
+            timeout_ms: 5000,
+            elapsed_ms: 5004,
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("DropTable ks.tbl"), "got: {msg}");
+        assert!(msg.contains("5000"), "got: {msg}");
+        assert!(msg.contains("retry"), "got: {msg}");
     }
 
     #[test]
