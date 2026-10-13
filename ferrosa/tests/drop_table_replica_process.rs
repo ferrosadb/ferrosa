@@ -305,7 +305,8 @@ fn spawn_node_with_env(
 /// listening yet" case. Short on purpose — see [`PROBE_READ_TIMEOUT`].
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// The read timeout for a readiness probe.
+/// The read timeout for an UNAUTHENTICATED readiness probe (`/readyz`,
+/// `/metrics`).
 ///
 /// A live `/readyz` answers in single-digit milliseconds even with the node
 /// under contention, so this is generous for a real answer and still short
@@ -314,23 +315,71 @@ const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 /// former 3 s read let a listener that had accepted but was shutting down hold
 /// each poll for the full 3 s — one to two such rounds are what stretched that
 /// test to 5.6-8.7 s (t_4e9a3e61).
+///
+/// This bound is for the UNAUTHENTICATED probes only. The authenticated status
+/// probe pays a bcrypt and gets its own, larger budget — see
+/// [`AUTH_PROBE_READ_TIMEOUT`].
 const PROBE_READ_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// A minimal HTTP/1.1 GET. Returns the raw response text, or `None` if the
-/// listener is not up yet (or does not answer inside the probe timeouts).
-fn http_get(port: u16, path: &str, authorization: Option<&str>) -> Option<String> {
+/// The read timeout for an AUTHENTICATED probe — `GET /api/cluster/status`,
+/// which sits behind the web console's Basic-auth middleware.
+///
+/// This is a different request from the unauthenticated `/readyz` probe that
+/// [`PROBE_READ_TIMEOUT`] bounds, and 500 ms is wrong for it. The middleware
+/// verifies the credential with a bcrypt `cost=12` comparison
+/// (`ferrosa/src/web/auth.rs`): measured at **0.62 s** on a cold `AuthCache` on
+/// this host, ~0.5 ms on a hit. The cache is keyed on the live schema `Arc` and
+/// invalidated by any schema mutation, so while a cluster bootstraps the entry
+/// churns — the failing runs' node logs carried an `AuthSuccess` every ~1.78 s —
+/// and a probe pays the full bcrypt. Under the former 500 ms budget every such
+/// probe timed out and `ddl_path_is_cluster` reported `false` for a node whose
+/// DDL path was in fact `cluster`, so the panic asserted a product fact the
+/// harness never observed (t_c8625592).
+///
+/// 5 s is the bound `ferrosa-cluster/src/ddl_path.rs` puts on every other wait on
+/// the DDL path, and ~8x the measured cold bcrypt — headroom for the loaded hosts
+/// the real-node tests share. It bounds ONE probe, not the wait: the 240 s
+/// formation budget in `wait_cluster_ddl_ready` is unchanged.
+const AUTH_PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A minimal HTTP/1.1 GET bounded by `read_timeout`.
+///
+/// Returns the raw response text, or a human-readable reason no answer arrived.
+/// The reason is kept rather than collapsed into `None` so a caller can tell a
+/// probe that TIMED OUT from an answer that said something — collapsing those
+/// two is what let a timed-out probe be reported as `ddl_path=false`
+/// (t_c8625592). `authorization` is a full header value terminated with CRLF, or
+/// `None` for the unauthenticated probes.
+fn http_get(
+    port: u16,
+    path: &str,
+    authorization: Option<&str>,
+    read_timeout: Duration,
+) -> Result<String, String> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut stream = TcpStream::connect_timeout(&addr, PROBE_CONNECT_TIMEOUT).ok()?;
-    stream.set_read_timeout(Some(PROBE_READ_TIMEOUT)).ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_CONNECT_TIMEOUT)
+        .map_err(|e| format!("not listening: connect failed ({e})"))?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|e| format!("cannot set the probe read timeout: {e}"))?;
     let auth = authorization
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).ok()?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("request write failed: {e}"))?;
     let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(body)
+    stream
+        .read_to_string(&mut body)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                format!("no answer within {read_timeout:?} — the read timed out")
+            }
+            _ => format!("reading the answer failed: {e}"),
+        })?;
+    Ok(body)
 }
 
 /// Extract a top-level `"key":"value"` string field from a small flat JSON object,
@@ -511,7 +560,7 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
         if let Some(message) = node_gone_message(node, started) {
             panic!("{message}");
         }
-        let raw = http_get(node.ports.web, "/readyz", None);
+        let raw = http_get(node.ports.web, "/readyz", None, PROBE_READ_TIMEOUT);
         // An exit DURING the probe must not wait for the next tick. The probe
         // is bounded (a live /readyz answers in milliseconds; a listener that
         // accepted and then stalled is cut off by the read timeout), so this
@@ -519,7 +568,7 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
         if let Some(message) = node_gone_message(node, started) {
             panic!("{message}");
         }
-        if let Some(raw) = raw {
+        if let Ok(raw) = raw {
             if raw.contains("\"ready\":true") {
                 return;
             }
@@ -573,7 +622,8 @@ fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
 /// `/metrics` endpoint — the Raft leader that a DDL `client_write` will apply on.
 fn find_leader(nodes: &[Node]) -> Option<usize> {
     nodes.iter().position(|node| {
-        http_get(node.ports.web, "/metrics", None)
+        http_get(node.ports.web, "/metrics", None, PROBE_READ_TIMEOUT)
+            .ok()
             .map(|body| {
                 body.lines()
                     .any(|line| line.trim() == "ferrosa_raft_is_leader 1")
@@ -582,11 +632,66 @@ fn find_leader(nodes: &[Node]) -> Option<usize> {
     })
 }
 
-/// Whether this node has installed the Raft-replicated `DdlPath::Cluster`.
-fn ddl_path_is_cluster(node: &Node) -> bool {
-    http_get(node.ports.web, "/api/cluster/status", Some(ADMIN_BASIC))
-        .map(|body| json_str(&body, "ddl_path").as_deref() == Some("cluster"))
-        .unwrap_or(false)
+/// One node's answer to the AUTHENTICATED `GET /api/cluster/status` probe.
+///
+/// A `bool` here conflated two different facts — "this node is NOT on the cluster
+/// DDL path" and "this probe never got an answer" — so a probe cut off by a cold
+/// bcrypt was reported as `ddl_path=false`, a product fact the harness had not
+/// observed (t_c8625592).
+#[derive(Debug)]
+enum DdlProbe {
+    /// The node answered and reports `"ddl_path":"cluster"`.
+    Cluster,
+    /// The node answered, but its DDL path is something else. The string is the
+    /// path the node itself named.
+    Other(String),
+    /// No usable answer inside [`AUTH_PROBE_READ_TIMEOUT`]: the listener was not
+    /// up, the read timed out under a cold bcrypt, or the answer named no
+    /// `ddl_path`. This is NOT evidence about the node's DDL path.
+    NoAnswer(String),
+}
+
+impl DdlProbe {
+    fn is_cluster(&self) -> bool {
+        matches!(self, DdlProbe::Cluster)
+    }
+
+    /// How this probe's outcome reads in a failure, in terms that do not
+    /// overstate what was observed.
+    fn describe(&self) -> String {
+        match self {
+            DdlProbe::Cluster => "cluster".to_string(),
+            DdlProbe::Other(path) => format!("not cluster (ddl_path=\"{path}\")"),
+            DdlProbe::NoAnswer(why) => {
+                format!("NO ANSWER ({why}) — not evidence about the DDL path")
+            }
+        }
+    }
+}
+
+/// Probe whether this node has installed the Raft-replicated `DdlPath::Cluster`.
+///
+/// The read budget is [`AUTH_PROBE_READ_TIMEOUT`], not [`PROBE_READ_TIMEOUT`]:
+/// this request is authenticated and can pay a bcrypt `cost=12`.
+fn ddl_path_probe(node: &Node) -> DdlProbe {
+    match http_get(
+        node.ports.web,
+        "/api/cluster/status",
+        Some(ADMIN_BASIC),
+        AUTH_PROBE_READ_TIMEOUT,
+    ) {
+        Ok(raw) => match json_str(&raw, "ddl_path") {
+            Some(path) if path == "cluster" => DdlProbe::Cluster,
+            Some(path) => DdlProbe::Other(path),
+            None => DdlProbe::NoAnswer(format!(
+                "answered {} but named no ddl_path",
+                parse_probe(&raw)
+                    .map(|p| format!("HTTP {}", p.status))
+                    .unwrap_or_else(|| "an unparseable response".to_string())
+            )),
+        },
+        Err(why) => DdlProbe::NoAnswer(why),
+    }
 }
 
 /// Wait until a Raft leader has been elected AND **every** node reports the
@@ -594,41 +699,91 @@ fn ddl_path_is_cluster(node: &Node) -> bool {
 ///
 /// Both conditions are polled per node on a generous budget (formation is not a
 /// timed production limit — a flat 60 s that is too short only ever costs a
-/// round). On timeout it dumps **every** node's log tail: a harness that fails
-/// without showing why is worth nothing.
+/// round). On timeout it dumps **every** node's log tail — and it distinguishes a
+/// node that ANSWERED "not cluster" from a probe that never answered, so the
+/// failure never asserts a product fact the harness did not observe.
 async fn wait_cluster_ddl_ready(nodes: &[Node], budget: Duration) -> usize {
     let deadline = Instant::now() + budget;
     loop {
-        let ddl: Vec<bool> = nodes.iter().map(ddl_path_is_cluster).collect();
+        let ddl: Vec<DdlProbe> = nodes.iter().map(ddl_path_probe).collect();
         let leader = find_leader(nodes);
         if let Some(leader) = leader {
-            if ddl.iter().all(|ready| *ready) {
+            if ddl.iter().all(DdlProbe::is_cluster) {
                 return leader;
             }
         }
         if Instant::now() >= deadline {
+            let per_node: String = ddl
+                .iter()
+                .enumerate()
+                .map(|(i, probe)| format!("  node {i}: {}", probe.describe()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let silent = ddl
+                .iter()
+                .filter(|probe| matches!(probe, DdlProbe::NoAnswer(_)))
+                .count();
             let logs: String = nodes
                 .iter()
                 .enumerate()
                 .map(|(i, n)| {
                     let log = std::fs::read_to_string(n.log_path()).unwrap_or_default();
                     format!(
-                        "\n===== node {i} host {} (web {}) ddl_path={} log tail =====\n{}",
+                        "\n===== node {i} host {} (web {}) ddl_path: {}; log tail =====\n{}",
                         n.host_id,
                         n.ports.web,
-                        ddl[i],
+                        ddl[i].describe(),
                         tail(&log, 80)
                     )
                 })
                 .collect();
             panic!(
                 "cluster did not elect a Raft leader and install the replicated DDL path on \
-                 every node within {budget:?} (leader={leader:?}, ddl_path_per_node={ddl:?}):\
-                 {logs}"
+                 every node within {budget:?} (leader={leader:?});\nper node:\n{per_node}\n\
+                 {silent} of {N_NODES} probes produced NO ANSWER — a probe that timed out \
+                 (a cold bcrypt can exceed any probe budget) is NOT evidence that the node \
+                 is off the cluster DDL path.{logs}"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// A probe that got no answer must NOT be reported as "not cluster": the failure
+/// has to distinguish "never answered" from "answered: not cluster", or a
+/// timed-out probe asserts a product fact the harness never observed — the bug
+/// that made a real node read `ddl_path=false` for a node whose path was
+/// `cluster` (t_c8625592).
+#[test]
+fn a_probe_that_never_answered_is_not_reported_as_not_cluster() {
+    let timed_out = DdlProbe::NoAnswer(format!(
+        "no answer within {AUTH_PROBE_READ_TIMEOUT:?} — the read timed out"
+    ));
+    let refused = DdlProbe::NoAnswer("not listening: connect failed (Connection refused)".into());
+    let answered = DdlProbe::Other("pair".to_string());
+
+    assert!(!timed_out.is_cluster() && !refused.is_cluster() && !answered.is_cluster());
+
+    let t = timed_out.describe();
+    let a = answered.describe();
+    assert_ne!(
+        t, a,
+        "a timed-out probe must read differently from a real 'not cluster' answer"
+    );
+    assert!(
+        t.contains("timed out"),
+        "the probe must say it TIMED OUT, not merely report false: {t}"
+    );
+    assert!(
+        t.contains("NO ANSWER") && t.contains("not evidence"),
+        "a probe with no answer must not claim the node is off the path: {t}"
+    );
+    assert!(
+        a.contains("not cluster") && a.contains("pair"),
+        "an answer must quote the path the node named: {a}"
+    );
+    assert_eq!(DdlProbe::Cluster.describe(), "cluster");
+    assert!(DdlProbe::Cluster.is_cluster());
 }
 
 // ── PostgreSQL wire ───────────────────────────────────────────────────────────
@@ -1064,7 +1219,7 @@ fn a_node_alive_but_never_ready_fails_the_wait_naming_its_condition() {
         if let Some(status) = node.child.try_wait().expect("try_wait on the node") {
             panic!("the never-ready fixture node exited before reporting a condition: {status}");
         }
-        if let Some(raw) = http_get(node.ports.web, "/readyz", None) {
+        if let Ok(raw) = http_get(node.ports.web, "/readyz", None, PROBE_READ_TIMEOUT) {
             if !raw.contains("\"ready\":true") {
                 if let Some(condition) =
                     parse_probe(&raw).and_then(|p| json_str(&p.body, "waiting_for"))

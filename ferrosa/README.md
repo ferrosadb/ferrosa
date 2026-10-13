@@ -292,6 +292,16 @@ about what a readiness failure must say:
   answers in single-digit ms even loaded — the former 3 s read let a listener that had
   accepted and was shutting down hold a whole poll), and the exit check runs on BOTH
   sides of the probe, so a blocking probe cannot delay it by more than one probe.
+  That 500 ms is the UNAUTHENTICATED probe's budget only. The AUTHENTICATED status probe
+  (`/api/cluster/status`, behind the console's Basic-auth middleware) is a different
+  request and carries its own 5 s read budget, because it can pay a bcrypt `cost=12`
+  comparison — measured at 0.62 s on a cold cache here, ~0.5 ms on a hit, and the cache
+  is invalidated by every schema mutation, so a bootstrap churns it. Under the shared
+  500 ms every such probe timed out and the harness reported `ddl_path=false` for a node
+  whose DDL path was in fact `cluster`: the panic asserted a product fact it had never
+  observed. A probe with no answer now says so (`NO ANSWER … not evidence about the DDL
+  path`), distinctly from a node that ANSWERED `not cluster` (t_c8625592). The 240 s
+  formation budget is not moved.
   `spawn_child` also warms the node binary once per test process: a `cargo test`
   relinks `ferrosa` on every run (its build script watches `../.git/HEAD`, which does
   not resolve inside a git worktree), and macOS's first exec of a freshly written
