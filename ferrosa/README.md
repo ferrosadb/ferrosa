@@ -270,7 +270,8 @@ node), and drives the DROP over the **PostgreSQL wire**: the client must receive
 an ERROR (SQLSTATE 58000), no node may serve the seeded rows afterwards, and
 they must stay gone after **restarting the node that applied the drop**.
 
-Two harness traps are load-bearing and easy to re-derive wrongly:
+Two harness traps are load-bearing and easy to re-derive wrongly, and one rule
+about what a readiness failure must say:
 
 - **Host ids must be distinct in BOTH halves.** Raft's
   `ferrosa_cluster::raft::uuid_to_node_id` reads `bytes[8..16]` (little-endian)
@@ -285,6 +286,41 @@ Two harness traps are load-bearing and easy to re-derive wrongly:
   factor is `max(seeds + 1, FERROSA_EXPECTED_CLUSTER_SIZE, committed cluster
   size)` (never below 1) — sizing it from the seed list ALONE was the live defect
   described in the next subsection.
+- **A readiness failure must name the CONDITION, not only the process.** Every
+  readiness failure the harness reports now carries the node's first `FATAL:`/`ERROR`
+  line and the `/readyz` answer the node was giving — not just a log tail, which can
+  start after the cause. `wait_ready` fails AT ONCE when the child has exited (the old
+  wait burned its whole 90 s budget on a process that was already gone: PR #551's
+  merge-queue ejection, job 115370033050, whose dumped tail began 74 s after the last
+  real line), and otherwise quotes the body's `waiting_for`, e.g.
+  `HTTP 503 from /readyz: waiting_for="listeners"`. Throwing that body away made an
+  ALIVE node patiently reporting its condition indistinguishable from a dead one, so
+  CI could never show which condition was in play. The 90 s budget is a detector and is
+  NOT raised: reproduced under deliberate CPU contention (the harness's exact 3-node
+  topology, 72 then 200 busy loops on 18 cores) no node EVER exited, and nodes become
+  ready at about 6 s idle, 39.45 s at 72 spinners and 64.54 s at 200, so the miss has a
+  real cause that a longer wait would only hide (t_4e9a3e61). The probe is bounded
+  tightly for the same reason: 250 ms to connect and 500 ms to read (a live `/readyz`
+  answers in single-digit ms even loaded — the former 3 s read let a listener that had
+  accepted and was shutting down hold a whole poll), and the exit check runs on BOTH
+  sides of the probe, so a blocking probe cannot delay it by more than one probe.
+  That 500 ms is the UNAUTHENTICATED probe's budget only. The AUTHENTICATED status probe
+  (`/api/cluster/status`, behind the console's Basic-auth middleware) is a different
+  request and carries its own 5 s read budget, because it can pay a bcrypt `cost=12`
+  comparison — measured at 0.62 s on a cold cache here, ~0.5 ms on a hit, and the cache
+  is invalidated by every schema mutation, so a bootstrap churns it. Under the shared
+  500 ms every such probe timed out and the harness reported `ddl_path=false` for a node
+  whose DDL path was in fact `cluster`: the panic asserted a product fact it had never
+  observed. A probe with no answer now says so (`NO ANSWER … not evidence about the DDL
+  path`), distinctly from a node that ANSWERED `not cluster` (t_c8625592). The 240 s
+  formation budget is not moved.
+  `spawn_child` also warms the node binary once per test process: a `cargo test`
+  relinks `ferrosa` on every run (its build script watches `../.git/HEAD`, which does
+  not resolve inside a git worktree), and macOS's first exec of a freshly written
+  336 MB debug binary stalls about 7 s inside `_dyld_start`, which would otherwise land
+  inside every timed window in that file and read as a slow node. Re-measured after the
+  fix: 3.07 s idle, 27.84/31.74/31.74 s at 72 spinners, 70.60/70.60/72.05 s at 200, all
+  three nodes ready every time and no node log carrying a log-store give-up.
 
 ### PostgreSQL default-keyspace replication (real-process)
 
