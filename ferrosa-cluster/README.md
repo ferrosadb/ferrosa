@@ -291,6 +291,24 @@ build; the codec's own cost is its delta against `none`.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+- **A DDL proposal is bounded, and an unconfirmed one fails loud and
+  retryable.** `ddl_path::execute_via_raft` awaits `raft.client_write` under the
+  same 5 s `DDL_AGREEMENT_TIMEOUT` every other wait on that path uses. openraft
+  has no deadline on `client_write`, and it never notifies a pending proposal
+  when the leader stops leading (`RaftCore::client_resp_channels` is drained
+  only when the entry applies or a conflicting log truncates it), so without a
+  bound a leader that cannot reach a quorum held the await open until the CQL
+  client's own 30 s deadline fired — the unexplained `Request execution
+  exceeded a client timeout of 30000ms` on the Jepsen teardown DROP (t_e8abe81a,
+  CL-73). On expiry it returns
+  `ClusterError::DdlProposalNotAgreed { operation, required, alive, timeout_ms,
+  elapsed_ms }`, which names the statement (`ddl_op_target`), the quorum it
+  needed and the wait; `ferrosa-cql` maps it to the CQL unavailable class so
+  drivers retry it on another node. The bound is the existing one — the driver's
+  30 s deadline and every detector are untouched — and the expiry is only ever
+  reported, never widened. Regression:
+  `tests/ddl_proposal_bounded.rs::ddl_proposal_on_a_leader_that_cannot_commit_fails_bounded_and_names_the_operation`,
+  which isolates the leader of a real three-voter in-process cluster.
 - `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
   (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
   `cluster` from the start of `transition_to_cluster`, but DDL stays `direct`

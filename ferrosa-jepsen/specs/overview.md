@@ -117,6 +117,26 @@ runs actors through the two active nodes; it verifies the history and final
 state on that active quorum. The resumed node's Accord catch-up, process-crash
 recovery, and mixed CQL/PostgreSQL histories are separate acceptance work.
 
+A `SERIALIZABLE` client must retry the engine's serialization refusals, which it
+reports as SQLSTATE `40001` (the engine log names the cause: a commit finalised as
+a no-write because its `PostgreSQL MVCC snapshot is stale`). One retry policy —
+`retry_serializable_transactions`, bounded by `SERIALIZATION_RETRIES`, unchanged —
+now covers EVERY operation kind: transfer, register read/modify/write, predicate
+read, phantom insert and write-skew pair. Previously only the transfer and
+write-skew paths retried, so a refused register RMW was recorded as a lost update
+and most of the register's and predicate's invocations were abandoned while the
+run still "passed". Each attempt is recorded (refusals included) and
+`expected_history_length(OperationRetryCounts)` reconciles the history-length
+assertion against the per-kind retry counts. A refusal applies no state, so an
+immediate retry re-enters the very conflict window it lost to — it must be PACED:
+bounded exponential backoff (`RETRY_BASE_DELAY` 10 ms, `RETRY_MAX_DELAY` 160 ms)
+with jitter from the refused attempt's own invocation sequence. The pacing changes
+only WHEN a retry is issued; the retry budget and all timeouts are unmodified.
+Teardown re-issues the workload `DROP TABLE` only when the coordinator refuses it
+in the not-applied class (`Unavailable`, 0x1000); a `RequestTimeout` outcome is
+unknown and is reported, never retried. `ferrosa-cluster`'s bounded DDL proposal
+is what surfaces a stuck leader as that class rather than a 30 s hang.
+
 ## Key invariants
 
 1. **Fail loud on harness breakage.** A Knossos invocation failure is surfaced
@@ -150,15 +170,23 @@ recovery, and mixed CQL/PostgreSQL histories are separate acceptance work.
    discovers topology using the normal policy, selects a deterministic host ID
    from its own metadata, and then remaps its execution profile to that node.
    A disposable probe session must not choose the destination session's pin.
-9. **Fixed host ports stay below the kernel's ephemeral range floor.** Every
+9. **A refusal is not a result.** A refused transaction applied nothing, so it is
+   retried — under one policy for EVERY operation kind, with every attempt
+   recorded — and the retry is PACED, because an immediate re-entry replays the
+   schedule that lost. Only a class the server documents as "not applied"
+   (`40001` for a transaction, `Unavailable`/0x1000 for the teardown DDL) is
+   retryable; a client timeout's outcome is unknown and is reported, never
+   re-issued. No retry count and no timeout is widened by any of this.
+10. **Fixed host ports stay below the kernel's ephemeral range floor.** Every
    host port the harness or its compose publishes is below `32768` (Linux's
    `net.ipv4.ip_local_port_range` floor), so the kernel can never already hold
    one as an outbound connection's source port. A port inside the range makes
    `docker compose up` fail to bind the mapping before any ferrosa code runs.
    `tests/host_port_band.rs` walks every YAML in the repo plus the harness port
-   constants (`docker_provision::NODE_CQL_PORTS`, `chaos::DEFAULT_ADMIN_URL`)
-   and fails on any host port at or above the floor; the single-DC Jepsen
-   compose now uses the same 29xxx band as the multi-DC nightly topology.
+   constants (`docker_provision::NODE_CQL_PORTS`, `chaos::DEFAULT_ADMIN_URL`,
+   and the `--base-port` / `RF_BASE_PORT` defaults in `scripts/`) and fails on
+   any host port at or above the floor; the single-DC Jepsen compose now uses
+   the same 29xxx band as the multi-DC nightly topology.
 
 ## Position in the dependency graph
 

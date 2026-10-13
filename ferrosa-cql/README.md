@@ -393,6 +393,19 @@ Storage's typed `Error::Overloaded { reason, table }` maps directly to CQL
 `OVERLOADED` (`0x1001`). The legacy string-detected backpressure path remains
 for older storage/cluster errors and logs when it is used.
 
+### A DDL proposal that could not be agreed
+
+`ClusterError::DdlProposalNotAgreed { operation, required, alive, timeout_ms,
+elapsed_ms }` — raised by `ddl_path::execute_via_raft` when a DDL the leader
+accepted was not committed within the 5 s agreement bound (t_e8abe81a) — maps to
+CQL `UNAVAILABLE` (`0x1000`) as `CqlError::DdlProposalNotAgreed`, carrying the
+`[consistency][required][alive]` trailer the code requires, with the DDL's name
+and the bound it waited on in the message. It is the *unavailable* class rather
+than `WRITE_TIMEOUT` on purpose: drivers retry unavailable once on another node
+and do not retry a write timeout for a non-idempotent statement, and a DDL that
+was never confirmed must be retried, never treated as done. The statement stays
+out of the success path — an unconfirmed DDL is always an error.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, invariants, position
