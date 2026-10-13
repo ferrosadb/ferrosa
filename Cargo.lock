@@ -2242,7 +2242,7 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "ferrosa"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "axum 0.8.9",
@@ -2299,7 +2299,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-cdc"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "ferrosa-common",
  "ferrosa-sstable",
@@ -2308,7 +2308,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-cluster"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-common"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "crossbeam-channel",
  "ferrosa-jsonb",
@@ -2359,7 +2359,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-cql"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "ahash 0.8.12",
  "arc-swap",
@@ -2416,7 +2416,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-ctl"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2447,7 +2447,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-flight"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -2476,7 +2476,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-graph"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "async-stream",
@@ -2517,7 +2517,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-index"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "bincode",
  "crc32fast",
@@ -2531,7 +2531,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-index-builder"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "axum 0.8.9",
  "bytes",
@@ -2553,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-jepsen"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2579,7 +2579,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-jsonb"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "bytes",
  "num-bigint",
@@ -2591,7 +2591,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-loadgen"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "clap",
  "crossterm",
@@ -2616,7 +2616,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-net"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-postgres"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2690,7 +2690,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-row-bridge"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "ferrosa-common",
  "ferrosa-jsonb",
@@ -2703,7 +2703,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sched"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "proptest",
  "tokio",
@@ -2711,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-schema"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "argon2 0.6.0-rc.8",
@@ -2738,7 +2738,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-session"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "ferrosa-cluster",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sim"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "ferrosa-common",
  "proptest",
@@ -2763,7 +2763,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sparql"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "axum 0.8.9",
  "axum-server",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sql"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "chrono",
  "ferrosa-jsonb",
@@ -2811,7 +2811,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-sstable"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "crc32fast",
  "crossbeam-channel",
@@ -2831,7 +2831,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-storage"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2874,7 +2874,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-udf"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "anyhow",
  "bumpalo",
@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-view"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "ferrosa-schema",
  "indexmap 2.14.0",
@@ -2906,7 +2906,7 @@ dependencies = [
 
 [[package]]
 name = "ferrosa-worker"
-version = "0.22.0"
+version = "0.23.0-nightly"
 dependencies = [
  "ferrosa-common",
  "ferrosa-index",
