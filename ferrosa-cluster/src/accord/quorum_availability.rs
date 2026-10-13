@@ -11,7 +11,7 @@
 //! replica behaves like `docker pause`: the connection stays up and a request
 //! to it never gets an answer until the RPC deadline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -117,7 +117,23 @@ enum Reachability {
     Paused,
     /// Connection refused or reset: the caller fails at once.
     Down,
+    /// Accepted, applied, but the ACK is slower than the caller's RPC deadline:
+    /// the FIRST Apply to this replica consumes the full deadline and the caller
+    /// gives up (its late `ApplyOK` is the live `orphan RPC response`), and a
+    /// RE-SENT Apply for the same transaction is answered at once. This is the
+    /// live incident exactly: the replica is REACHABLE and its rows are durable,
+    /// only its ack outlived the caller's per-peer timeout.
+    SlowApplyAck,
+    /// The Apply ACK never comes back at all: every attempt is accepted and the
+    /// caller gives up at its RPC deadline. This is the OTHER half of the live
+    /// `orphan RPC response` — the ack is LOST, not merely late — so the apply
+    /// quorum is never reached and the committed-but-not-quorum path runs.
+    ApplyAckLost,
 }
+
+/// What an `ApplyAckLost` replica costs each caller (short: the fixture models a
+/// LOST ack, not a slow one).
+const LOST_APPLY_ACK_DEADLINE: Duration = Duration::from_millis(100);
 
 /// The Data-lane RPC deadline a paused peer costs its caller.
 const PAUSED_RPC_DEADLINE: Duration = Duration::from_secs(10);
@@ -125,11 +141,26 @@ const PAUSED_RPC_DEADLINE: Duration = Duration::from_secs(10);
 struct ClusterTransport {
     handlers: HashMap<Uuid, Arc<AccordHandler>>,
     reachability: parking_lot::Mutex<HashMap<Uuid, Reachability>>,
+    /// Hosts whose first Apply has already been answered late, so a re-sent
+    /// Apply is served at once (`Reachability::SlowApplyAck`).
+    slow_apply_seen: parking_lot::Mutex<HashSet<Uuid>>,
     /// When set, the first PreAccept each coordinator sends waits here until
     /// every coordinator has registered the transaction locally, so their
     /// PreAccepts cross on the wire (node 1 sees Y then X, node 2 sees X then
     /// Y). Raced for real, this window is a few hundred microseconds wide.
     preaccept_crossing: parking_lot::Mutex<Option<Arc<tokio::sync::Barrier>>>,
+}
+
+/// Whether `msg` is an Apply request — the only phase whose ack the slow-peer
+/// fixture withholds (`Reachability::SlowApplyAck`).
+fn is_apply_request(msg: &Message) -> bool {
+    matches!(
+        msg,
+        Message::AccordApply(_)
+            | Message::AccordApplyV2(_)
+            | Message::AccordApplyV2Capnp(_)
+            | Message::AccordApplyV2Region(_)
+    )
 }
 
 /// A coordinator's view of the cluster transport.
@@ -186,7 +217,29 @@ impl AccordTransport for ClusterTransport {
                 tokio::time::sleep(PAUSED_RPC_DEADLINE).await;
                 return Err(NetError::Timeout("Data lane timeout".into()));
             }
-            Reachability::Live => {}
+            Reachability::SlowApplyAck if is_apply_request(&msg) => {
+                // The FIRST Apply is applied but its ack outlives the caller's
+                // RPC deadline, so the caller gives up (this is the live
+                // `orphan RPC response`). A RE-SENT Apply for the same
+                // transaction is a durable no-op on the replica, so it is
+                // answered at once — the peer was reachable the whole time.
+                let first = self.slow_apply_seen.lock().insert(host);
+                if first {
+                    tokio::time::sleep(PAUSED_RPC_DEADLINE).await;
+                    return Err(NetError::Timeout(
+                        "Apply ack outlived the RPC deadline".into(),
+                    ));
+                }
+            }
+            Reachability::ApplyAckLost if is_apply_request(&msg) => {
+                // The ack is lost: the replica applied (in the live incident its
+                // `ApplyOK` arrived as an orphan long after the caller stopped
+                // waiting), so the coordinator can never learn of it from THIS
+                // transaction's fan-out.
+                tokio::time::sleep(LOST_APPLY_ACK_DEADLINE).await;
+                return Err(NetError::Timeout("Apply ack lost".into()));
+            }
+            Reachability::Live | Reachability::SlowApplyAck | Reachability::ApplyAckLost => {}
         }
         let handler = self
             .handlers
@@ -219,8 +272,42 @@ struct Cluster {
     appliers: Vec<Arc<RecordingApplier>>,
 }
 
+/// How a key's replica set is placed on the three nodes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    /// Every key on every replica: ONE rf=3 shard, whose slow quorum is 2 of 3.
+    AllReplicas,
+    /// Each key on exactly ONE replica: one rf=1 shard per owner, so a
+    /// transaction that spans the owners needs EVERY owner's ack — the bench's
+    /// RF=1 shape, where the apply quorum is the whole (three-node) replica
+    /// set. The two PostgreSQL protocol keys live on the coordinator (node 1),
+    /// so a barrier never depends on a remote shard.
+    PerKeyOwner,
+}
+
+/// The replica host ids `key` resolves to under `placement`.
+fn placed_replicas(placement: Placement, hosts: &[Uuid; 3], key: &[u8]) -> Vec<Uuid> {
+    match placement {
+        Placement::AllReplicas => hosts.to_vec(),
+        Placement::PerKeyOwner => {
+            let is_protocol = key.starts_with(b"\0ferrosa:postgres:");
+            match key.last().filter(|last| last.is_ascii_digit()) {
+                Some(last) if !is_protocol => {
+                    let owner = ((last - b'1') as usize).min(hosts.len() - 1);
+                    vec![hosts[owner]]
+                }
+                _ => vec![hosts[0]],
+            }
+        }
+    }
+}
+
 impl Cluster {
     fn three_nodes() -> Self {
+        Self::three_nodes_placed(Placement::AllReplicas)
+    }
+
+    fn three_nodes_placed(placement: Placement) -> Self {
         let hosts = [host(0x1111), host(0x2222), host(0x3333)];
         let mut handlers = HashMap::new();
         let mut states: Vec<AccordState> = Vec::new();
@@ -240,6 +327,7 @@ impl Cluster {
             reachability: parking_lot::Mutex::new(
                 hosts.iter().map(|h| (*h, Reachability::Live)).collect(),
             ),
+            slow_apply_seen: parking_lot::Mutex::new(HashSet::new()),
             preaccept_crossing: parking_lot::Mutex::new(None),
         });
         let replicas = hosts.to_vec();
@@ -254,22 +342,34 @@ impl Cluster {
             .collect();
         let committers = hosts
             .iter()
-            .enumerate()
-            .map(|(index, h)| {
+            .zip(states)
+            .zip(node_transports.iter())
+            .zip(appliers.iter())
+            .map(|(((h, state), node_transport), recording)| {
                 let node_id = node_id_of(*h);
                 let replicas = replicas.clone();
-                let resolve: ReplicaResolver =
-                    Arc::new(move |_ks: &str, _key: &[u8]| Some(replicas.clone()));
-                let applier: Arc<dyn StorageApplier> = appliers[index].clone();
+                let hosts_for_resolve = hosts;
+                let resolve: ReplicaResolver = match placement {
+                    Placement::AllReplicas => {
+                        Arc::new(move |_ks: &str, _key: &[u8]| Some(replicas.clone()))
+                    }
+                    Placement::PerKeyOwner => Arc::new(move |_ks: &str, key: &[u8]| {
+                        Some(placed_replicas(placement, &hosts_for_resolve, key))
+                    }),
+                };
+                // origin/main built each committer with a `NoopStorageApplier`;
+                // the write-skew tests assert the VALUES a node persisted, so
+                // each committer keeps its own node's recording applier.
+                let applier: Arc<dyn StorageApplier> = recording.clone();
                 Arc::new(
                     AccordTransactionCommitter::new(
                         node_id,
                         Arc::new(HybridLogicalClock::new(node_id, 0)),
-                        node_transports[index].clone(),
+                        node_transport.clone(),
                         applier,
                         resolve,
                     )
-                    .with_local_accord_state(states[index].clone()),
+                    .with_local_accord_state(state),
                 )
             })
             .collect();
@@ -680,5 +780,129 @@ async fn two_simultaneous_write_skew_writers_never_both_go_off_call() {
         total >= 1,
         "two simultaneous write-skew writers must never BOTH go off call; the engine applied \
          writes leaving {total} on call (0 means both committed); first: {first:?}, second: {second:?}"
+    );
+}
+
+/// An OVERSIZED (multi-key) commit spanning more than one shard in the bench's
+/// RF=1 shape, where a shard has ONE owner and the apply quorum is therefore
+/// EVERY owner.
+///
+/// One owner's Apply is REACHABLE but slower than the coordinator's per-peer RPC
+/// deadline: it applied durably, its `ApplyOK` outlived the deadline (the live
+/// `orphan RPC response`), and the coordinator's own shard plus the one acked
+/// peer reach only 2 of 3 shards. A quorum of replicas is up, so ONE peer's
+/// per-peer timeout must not decide the transaction's fate: the commit must
+/// succeed and every node must then serve a following SELECT. Before the apply
+/// fan-out re-sent to a shard whose ack was merely late AND the coordinator
+/// converged its OWN shard on the committed-but-not-quorum path, the commit
+/// failed `Apply quorum not reached within 10s, but 1 replica durably applied
+/// ... (NOT an abandon; do NOT retry)`, the coordinator's own shard was never
+/// written, and every following statement on every node failed `PostgreSQL
+/// snapshot barrier dependencies were not applied locally` (FMEA CL-71).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_apply_ack_does_not_decide_an_oversized_commits_fate() {
+    let cluster = Cluster::three_nodes_placed(Placement::PerKeyOwner);
+    // Node 3 owns the shard whose apply ack is slow; nodes 1 and 2 are a quorum.
+    cluster
+        .transport
+        .set(cluster.hosts[2], Reachability::SlowApplyAck);
+
+    let committer = Arc::clone(&cluster.committers[0]);
+    let snapshot = committer
+        .begin_postgres_snapshot("ks")
+        .await
+        .expect("an idle cluster grants a snapshot");
+    // One key per owner: the write-set spans three rf=1 shards, so the
+    // coordinator self-acks only its own and needs BOTH peers to reach quorum.
+    let writes: Vec<TransactionWrite> = (1..=3)
+        .map(|owner| TransactionWrite {
+            keyspace: "ks".to_string(),
+            key: format!("k-owner-{owner}").into_bytes(),
+            mutation: format!("write-{owner}").into_bytes(),
+        })
+        .collect();
+
+    let started = Instant::now();
+    let outcome = committer
+        .commit_postgres("ks", staged(writes), vec!["t".to_string()], snapshot)
+        .await;
+    assert!(
+        matches!(outcome, Ok(CommitOutcome::Committed)),
+        "a quorum of replicas (nodes 1 and 2) is up and node 3 is only SLOW, so the commit \
+         must succeed — one peer's per-peer RPC deadline must never decide the fate of a \
+         transaction that is committed and durably applied; after {:?}: {outcome:?}",
+        started.elapsed()
+    );
+
+    for (node, committer) in cluster.committers.iter().enumerate() {
+        let read = run_postgres_read(committer).await;
+        assert!(
+            read.is_ok(),
+            "a SELECT must succeed on node {} after the commit: {read:?}",
+            node + 1
+        );
+    }
+}
+
+/// The other half of the criterion. When the apply quorum is genuinely
+/// UNREACHABLE — here the third owner's Apply ACK is LOST, not merely late — the
+/// commit must fail loud and non-retryably, because the transaction IS committed
+/// on the replicas that acked. But the coordinator must ALSO converge its OWN
+/// shard in the same breath: leaving it unwritten strands this committed
+/// transaction as a permanent dependency on the coordinator's own keys, so every
+/// later statement there abstains ("PostgreSQL snapshot barrier dependencies were
+/// not applied locally") until a restart. The error is the correct outcome; a
+/// permanent wedge is not. This is the deferred own-shard apply of CL-60 run on
+/// the committed-but-not-quorum path — the abandon ordering it protects is
+/// untouched, because this path never abandons.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_apply_ack_still_converges_the_coordinators_own_shard() {
+    let cluster = Cluster::three_nodes_placed(Placement::PerKeyOwner);
+    cluster
+        .transport
+        .set(cluster.hosts[2], Reachability::ApplyAckLost);
+
+    let committer = Arc::clone(&cluster.committers[0]);
+    let snapshot = committer
+        .begin_postgres_snapshot("ks")
+        .await
+        .expect("an idle cluster grants a snapshot");
+    let writes: Vec<TransactionWrite> = (1..=3)
+        .map(|owner| TransactionWrite {
+            keyspace: "ks".to_string(),
+            key: format!("k-owner-{owner}").into_bytes(),
+            mutation: format!("write-{owner}").into_bytes(),
+        })
+        .collect();
+
+    let outcome = committer
+        .commit_postgres("ks", staged(writes), vec!["t".to_string()], snapshot)
+        .await;
+    let error = outcome.expect_err("an unreachable apply quorum must fail loud, never ack");
+    assert!(
+        error.reason.contains("committed"),
+        "the failure must NAME the commit so the client knows not to retry: {}",
+        error.reason
+    );
+    assert!(
+        !error.reason.contains("safe to retry"),
+        "a committed transaction must never be advertised as safe to retry: {}",
+        error.reason
+    );
+
+    // The coordinator's own shard MUST have converged: its local replica owns the
+    // barrier/marker keys AND k-owner-1, so a barrier that never resolves there
+    // wedges every later statement on the node.
+    let coordinator_read = run_postgres_read(&cluster.committers[0]).await;
+    assert!(
+        coordinator_read.is_ok(),
+        "the coordinator's own shard must converge on the committed-but-not-quorum path, \
+         otherwise every later statement on the node abstains; got {coordinator_read:?}"
+    );
+    // The replica that acked applied its own shard, so its statements work too.
+    let acked_read = run_postgres_read(&cluster.committers[1]).await;
+    assert!(
+        acked_read.is_ok(),
+        "the acked replica's shard must be readable; got {acked_read:?}"
     );
 }
