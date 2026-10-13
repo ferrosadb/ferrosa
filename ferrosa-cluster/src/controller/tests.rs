@@ -5215,3 +5215,92 @@ async fn mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transit
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// The Raft log-store give-up must not dead-end the node in `Forming` with no
+/// Raft instance and nothing armed.
+///
+/// `SledLogStore::new` retries a transient sled directory lock ten times 50 ms
+/// apart (`LockRetryPolicy::DEFAULT`, about 490 ms) — deliberately short, because
+/// a formation attempt that waits longer misses its leader window
+/// (CL-Tsledrevert). When a transition exhausted that budget while another
+/// handle in THIS process still held the raft dir, `transition_to_cluster`
+/// logged ERROR and `return`ed: the node kept reporting
+/// `{"ready":false,"waiting_for":"raft_leader"}` for as long as it lived, no
+/// leader could be elected on it, and only an unrelated later peer event
+/// re-drove the transition (t_4e9a3e61, t_e67af7e7). Reproduced under CPU
+/// contention in a real three-node start, whose node log reads
+/// `sled directory lock still held; giving up ... attempts=10 waited_ms=488`
+/// followed by `failed to create Raft log store`.
+///
+/// The holder is released only AFTER the contention the recovery exists to
+/// survive — on the (cap + 1)-th contention notification, which is the recovery's
+/// first re-open — so the production retry budget is exhausted first, exactly as
+/// at the real call site. The production budget is NOT widened by this test.
+///
+/// RED as written: with the open reduced to a bare `SledLogStore::new`, the
+/// budget is exhausted, the transition returns, and the controller ends with no
+/// Raft — the assertion fails on that behaviour, not on a missing symbol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raft_log_store_give_up_does_not_dead_end_the_transition() {
+    use crate::raft::log_store::{SledLogStore, SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+    let raft_dir = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &controller.config.data_center,
+    );
+    std::fs::create_dir_all(&raft_dir).unwrap();
+
+    // The in-process handle holding sled's directory lock — the sibling form of
+    // the node's own live Raft, which is what re-opens it at the real call site.
+    let holder = SledLogStore::new(&raft_dir).expect("hold the raft directory lock");
+
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    crate::raft::log_store::set_contention_hook(move |attempt| {
+        let _ = tx.send(attempt);
+    });
+    let releaser = std::thread::spawn(move || {
+        let mut seen = 0u32;
+        // The deadline keeps a run that never recovers (the RED) finite instead
+        // of hanging the suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen <= SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok(_) => seen += 1,
+                Err(_) => break,
+            }
+        }
+        drop(holder);
+    });
+
+    // Start from Pair, as the node is when a second `ClusterInvite` copy arrives:
+    // `transition_to_forming` then moves it to Forming and fans into
+    // `transition_to_cluster`, which opens the log store synchronously on THIS
+    // thread — so the thread-local contention hook observes it.
+    controller.on_peer_connected((peer_id, peer_addr));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the fixture must reach Pair before the forming transition"
+    );
+    controller.transition_to_forming(vec![(peer_id, peer_addr)]);
+    crate::raft::log_store::clear_contention_hook();
+    releaser.join().expect("releaser thread");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while controller.raft().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        controller.raft().is_some(),
+        "a Raft log-store give-up must not leave the node dead-ended in {:?} with no \
+         Raft instance (write_path_is_cluster={})",
+        controller.mode(),
+        write_path_is_cluster(&controller),
+    );
+}

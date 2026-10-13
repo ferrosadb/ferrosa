@@ -3398,7 +3398,9 @@ const LOG_STORE_RECOVERY_PAUSES_MS: [u64; 4] = [200, 400, 800, 1600];
 /// transition. The lock is released within milliseconds to seconds of the
 /// give-up, so a short bounded re-open recovers the node instead of abandoning
 /// consensus (t_4e9a3e61).
-fn open_raft_log_store_with_recovery(raft_dir: &std::path::Path) -> Result<SledLogStore, sled::Error> {
+fn open_raft_log_store_with_recovery(
+    raft_dir: &std::path::Path,
+) -> Result<SledLogStore, sled::Error> {
     let first = match SledLogStore::new(raft_dir) {
         Ok(store) => return Ok(store),
         Err(e) => e,

@@ -432,6 +432,16 @@ impl LockRetryPolicy {
     };
 }
 
+/// Production's attempt cap before the sled directory-lock retry gives up —
+/// `LockRetryPolicy::DEFAULT.max_attempts`.
+///
+/// Exposed so the controller's log-store recovery test can tell the give-up
+/// apart from the recovery's first re-open: `open_sled_db_with_policy` counts
+/// attempts PER CALL, so the recovery's new open starts again at 1. The
+/// (cap + 1)-th contention notification therefore marks the recovery's first
+/// attempt, whatever the production cap becomes.
+pub(crate) const SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP: u32 = LockRetryPolicy::DEFAULT.max_attempts;
+
 #[cfg(test)]
 type ContentionHook = std::rc::Rc<dyn Fn(u32)>;
 
