@@ -2844,6 +2844,35 @@ impl AccordCoordinatorDriver {
             // converge on the committed transaction through recovery. NOTE:
             // `finalize_no_write` is deliberately NOT called here — rolling back a
             // committed transaction would be a second lie.
+            //
+            // The coordinator's OWN shard is converged HERE, before the error is
+            // returned. The transaction is COMMITTED, so leaving its own shard
+            // unwritten would strand it as a permanent dependency on the
+            // coordinator's own keys: every later read or snapshot barrier there
+            // dep-waits on it and abstains ("PostgreSQL snapshot barrier
+            // dependencies were not applied locally") until a restart — the wedge
+            // this branch must not create. Deferring the own-shard apply to the
+            // quorum exists to keep the ABANDON truthful; this branch never
+            // abandons, so converging here cannot make any client-visible report
+            // false. It is the same progress recovery would make, not deferred to
+            // it.
+            let (local_apply_result, local_applied) = tokio::join!(local_apply, local_apply_wait);
+            if let Err(error) = local_apply_result {
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    %error,
+                    "accord: coordinator's own-shard apply failed on the committed-but-not-\
+                     quorum path; its replica converges via recovery"
+                );
+            }
+            if !local_applied {
+                tracing::error!(
+                    txn_id = ?txn_id,
+                    ?bound,
+                    "accord: coordinator's own shard did not reach Applied on the \
+                     committed-but-not-quorum path; its replica converges via recovery"
+                );
+            }
             tracing::error!(
                 txn_id = ?txn_id,
                 acked = fanout.peer_acks,
@@ -3073,13 +3102,15 @@ impl AccordCoordinatorDriver {
         // resident bytes bounded the same way the old code did — only the
         // serialized frame of an in-flight send is held, and at most
         // `APPLY_FANOUT_WINDOW` of them — while removing the N-fold serialization.
-        let mut inflight = futures::stream::FuturesUnordered::new();
         // Distinct remote replicas that acknowledged a durable apply. This is the
         // partial-apply evidence the abandon decision reads: a replica writes its
         // rows durably before it acks, so ANY verified ack here means this
         // transaction is committed on that replica.
         let mut peer_acks = 0usize;
-        let mut peers = self.replica_ids.iter().filter(|&&id| id != self_id);
+        // Replicas whose ack is verified. They are NOT re-sent to: a re-sent
+        // Apply is a durable no-op there, and re-dialling them would hold the
+        // round on replicas that have already answered.
+        let mut acked: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
         let profile = txn_profile_enabled();
         let t_fanout = profile.then(std::time::Instant::now);
         let mut serialize_ns = 0u64;
@@ -3224,82 +3255,110 @@ impl AccordCoordinatorDriver {
         };
         let mut frame_bytes: usize = 0;
         loop {
-            while inflight.len() < APPLY_FANOUT_WINDOW {
-                let Some(&peer_id) = peers.next() else { break };
-                let bytes: Bytes = match &shared {
-                    // ONE allocation, refcounted to each in-flight peer.
-                    Some(frame) => frame.clone(),
-                    None => {
-                        let t_build = profile.then(std::time::Instant::now);
-                        // Borrow each owned entry (a staged payload is a slice of the
-                        // spill's mapping, never a clone from a resident copy — for a
-                        // staged write-set the stored `mutation` is EMPTY, so the old
-                        // clone would have shipped empty writes), then write the frame
-                        // straight from those borrows.
-                        let entries = self.borrowed_write_set_entries(|key| {
-                            self.replica_owns_key(peer_id, key)
-                        })?;
-                        let bytes = encode_frame(&entries)?;
-                        if let Some(started) = t_build {
-                            serialize_ns +=
-                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            // ONE bounded round over the replicas whose shard ack is still
+            // missing. A round that adds NO verified ack is the signature of a
+            // genuinely unreachable shard, and that is when the fan-out stops. A
+            // round that MOVED a shard means at least one replica was merely
+            // slower than one RPC deadline, so the replicas that did not answer
+            // get a RE-SENT Apply: the bound is a detector over the whole phase,
+            // never a per-peer verdict, and one slow peer's ack must not decide a
+            // transaction's fate while a quorum of replicas is up (CL-71). The
+            // re-send is safe — the Apply carries the SAME `txn_id`, so the
+            // replica's idempotency record makes it a durable no-op, and a
+            // replica that already applied answers at once.
+            let evidence_before = peer_acks;
+            let mut inflight = futures::stream::FuturesUnordered::new();
+            // Collected (not a filtered iterator): the round mutates `acked` as
+            // acks land, and the peer set must be fixed for the whole round.
+            let peers: Vec<uuid::Uuid> = self
+                .replica_ids
+                .iter()
+                .copied()
+                .filter(|&id| id != self_id && !acked.contains(&id))
+                .collect();
+            let mut peers = peers.into_iter();
+            loop {
+                while inflight.len() < APPLY_FANOUT_WINDOW {
+                    let Some(peer_id) = peers.next() else { break };
+                    let bytes: Bytes = match &shared {
+                        // ONE allocation, refcounted to each in-flight peer.
+                        Some(frame) => frame.clone(),
+                        None => {
+                            let t_build = profile.then(std::time::Instant::now);
+                            // Borrow each owned entry (a staged payload is a slice of the
+                            // spill's mapping, never a clone from a resident copy — for a
+                            // staged write-set the stored `mutation` is EMPTY, so the old
+                            // clone would have shipped empty writes), then write the frame
+                            // straight from those borrows.
+                            let entries = self.borrowed_write_set_entries(|key| {
+                                self.replica_owns_key(peer_id, key)
+                            })?;
+                            let bytes = encode_frame(&entries)?;
+                            if let Some(started) = t_build {
+                                serialize_ns +=
+                                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                            }
+                            // Free the borrows before the RPC: only the frame is resident
+                            // while the send is in flight.
+                            drop(entries);
+                            bytes
                         }
-                        // Free the borrows before the RPC: only the frame is resident
-                        // while the send is in flight.
-                        drop(entries);
-                        bytes
+                    };
+                    frame_bytes = frame_bytes.max(bytes.len());
+                    if profile && ferrosa_common::mem_probe::installed() {
+                        tracing::info!(
+                            phase = "apply.frame_built",
+                            frame_bytes = bytes.len(),
+                            inflight = inflight.len() + 1,
+                            live_mib = ferrosa_common::mem_probe::live_mib(),
+                            "accord apply residency"
+                        );
                     }
-                };
-                frame_bytes = frame_bytes.max(bytes.len());
-                if profile && ferrosa_common::mem_probe::installed() {
-                    tracing::info!(
-                        phase = "apply.frame_built",
-                        frame_bytes = bytes.len(),
-                        inflight = inflight.len() + 1,
-                        live_mib = ferrosa_common::mem_probe::live_mib(),
-                        "accord apply residency"
-                    );
-                }
-                let msg = if region {
-                    Message::AccordApplyV2Region(bytes)
-                } else if capnp {
-                    Message::AccordApplyV2Capnp(bytes)
-                } else {
-                    Message::AccordApplyV2(bytes)
-                };
-                let peers_handle = &self.peers;
-                let pushed = std::time::Instant::now();
-                inflight.push(async move {
-                    let result = peers_handle
-                        .send_with_timeout(peer_id, msg, Lane::Data, timeout)
-                        .await;
-                    (peer_id, result, pushed)
-                });
-            }
-            let Some((peer_id, result, pushed)) = inflight.next().await else {
-                break;
-            };
-            if profile {
-                ack_ms.push(pushed.elapsed().as_millis() as u64);
-            }
-            if let Err(error) = &result {
-                tracing::warn!(
-                    txn_id = ?txn_id,
-                    error = %error,
-                    peer = ?peer_id,
-                    "accord: quorum broadcast RPC failed"
-                );
-            }
-            if is_ack(&result) {
-                peer_acks += 1;
-                quorum.record_node_ack(peer_id);
-                if quorum.all_reached() {
-                    log_fanout(serialize_ns, &ack_ms, frame_bytes, shared.is_some());
-                    return Ok(ApplyFanout {
-                        quorum_reached: true,
-                        peer_acks,
+                    let msg = if region {
+                        Message::AccordApplyV2Region(bytes)
+                    } else if capnp {
+                        Message::AccordApplyV2Capnp(bytes)
+                    } else {
+                        Message::AccordApplyV2(bytes)
+                    };
+                    let peers_handle = &self.peers;
+                    let pushed = std::time::Instant::now();
+                    inflight.push(async move {
+                        let result = peers_handle
+                            .send_with_timeout(peer_id, msg, Lane::Data, timeout)
+                            .await;
+                        (peer_id, result, pushed)
                     });
                 }
+                let Some((peer_id, result, pushed)) = inflight.next().await else {
+                    break;
+                };
+                if profile {
+                    ack_ms.push(pushed.elapsed().as_millis() as u64);
+                }
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        txn_id = ?txn_id,
+                        error = %error,
+                        peer = ?peer_id,
+                        "accord: quorum broadcast RPC failed"
+                    );
+                }
+                if is_ack(&result) {
+                    peer_acks += 1;
+                    acked.insert(peer_id);
+                    quorum.record_node_ack(peer_id);
+                    if quorum.all_reached() {
+                        log_fanout(serialize_ns, &ack_ms, frame_bytes, shared.is_some());
+                        return Ok(ApplyFanout {
+                            quorum_reached: true,
+                            peer_acks,
+                        });
+                    }
+                }
+            }
+            if peer_acks == evidence_before {
+                break;
             }
         }
         log_fanout(serialize_ns, &ack_ms, frame_bytes, shared.is_some());

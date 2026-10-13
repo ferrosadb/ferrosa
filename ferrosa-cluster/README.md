@@ -797,6 +797,25 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   Accord's at-least-once apply and is NOT closed here. Closing it needs a durable
   abandon decision the apply path consults (R6 of the commit-path refactor plan),
   not a bigger wait: the 10 s bound is a detector, never a knob.
+  **The apply fan-out is a DETECTOR too, never a per-peer verdict** (FMEA CL-71).
+  `apply_fanout_bounded_within` runs bounded ROUNDS over the replicas whose shard
+  ack is still missing and RE-SENDS to them while a round MOVES a shard; it stops
+  only when a whole round adds no verified ack, the signature of a genuinely
+  unreachable shard. A re-sent Apply is safe — it carries the same `txn_id`, so
+  the replica's idempotency record makes it a durable no-op and a replica that
+  already applied answers at once — so a peer that was merely SLOWER than one
+  per-peer RPC deadline still acks and the commit succeeds. Otherwise the bench's
+  RF=1 shape (every shard has ONE owner, so the apply quorum is EVERY owner)
+  turned one slow owner's ack into `Apply quorum not reached within 10s, but 1
+  replica(s) durably applied ... (NOT an abandon; do NOT retry)`. And on the
+  committed-but-not-quorum path the coordinator now CONVERGES ITS OWN SHARD
+  before returning that non-retryable error: the deferral below exists to keep
+  the abandon truthful, and that path never abandons, so leaving its own shard
+  unwritten would strand this committed transaction as a permanent dependency on
+  its own keys (every later statement there abstains `PostgreSQL snapshot barrier
+  dependencies were not applied locally` until a restart — the live wedge). Tests:
+  `a_slow_apply_ack_does_not_decide_an_oversized_commits_fate` and
+  `a_lost_apply_ack_still_converges_the_coordinators_own_shard`.
   A PreAccept for a transaction the replica already knows is decided is
   refused (`SmResponse::AlreadyDecided`, the empty `PreAcceptOK` on the wire)
   and registers nothing; otherwise a PreAccept queued behind a no-write
