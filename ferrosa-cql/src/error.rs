@@ -22,6 +22,22 @@ pub enum CqlError {
         required: usize,
         alive: usize,
     },
+    /// 0x1000 — a DDL proposal reached a Raft leader that could not get it
+    /// committed within the DDL agreement bound.
+    ///
+    /// Shares the *unavailable* code so drivers retry it: their default policy
+    /// retries `Unavailable` once on another node, and does **not** retry
+    /// `Write_timeout` for a non-idempotent statement (DDL is not idempotent
+    /// here). The message names the DDL, the bound and the wait, since the
+    /// proposal is unconfirmed — nothing is known about whether any node
+    /// applied it (forge t_e8abe81a).
+    DdlProposalNotAgreed {
+        operation: String,
+        required: usize,
+        alive: usize,
+        timeout_ms: u64,
+        elapsed_ms: u64,
+    },
     /// 0x1100 — replicas alive but not enough acknowledged the write.
     WriteTimeout {
         consistency: ConsistencyLevel,
@@ -79,7 +95,7 @@ impl CqlError {
             Self::ServerError(_) | Self::CorruptCell(_) => 0x0000,
             Self::Protocol(_) | Self::ProtocolVersionMismatch { .. } => 0x000A,
             Self::BadCredentials => 0x0100,
-            Self::Unavailable { .. } => 0x1000,
+            Self::Unavailable { .. } | Self::DdlProposalNotAgreed { .. } => 0x1000,
             Self::Overloaded(_) => 0x1001,
             Self::WriteTimeout { .. } | Self::TransactionTimeout { .. } => 0x1100,
             Self::ReadTimeout { .. } => 0x1200,
@@ -149,6 +165,19 @@ impl CqlError {
                 buf.put_i32(0); // blockfor
                 put_string(&mut buf, "CAS");
             }
+            Self::DdlProposalNotAgreed {
+                required, alive, ..
+            } => {
+                // Shares the Unavailable code (0x1000), so it MUST carry the
+                // Unavailable trailer (`[consistency][required][alive]`) or the
+                // driver reads past the buffer. The DDL went through Raft
+                // agreement rather than a CL read/write, but the shape the
+                // driver parses is the same: the quorum this coordinator needed
+                // and what it could confirm.
+                put_consistency(&mut buf, ConsistencyLevel::Quorum);
+                buf.put_i32(saturating_i32(*required));
+                buf.put_i32(saturating_i32(*alive));
+            }
             Self::AlreadyExists { keyspace, table } => {
                 buf.put_u16(keyspace.len() as u16);
                 buf.put_slice(keyspace.as_bytes());
@@ -197,6 +226,18 @@ impl std::fmt::Display for CqlError {
             } => write!(
                 f,
                 "unavailable: CL={consistency}, required={required}, alive={alive}"
+            ),
+            Self::DdlProposalNotAgreed {
+                operation,
+                required,
+                alive,
+                timeout_ms,
+                elapsed_ms,
+            } => write!(
+                f,
+                "DDL proposal not agreed: {operation} was not committed within {timeout_ms}ms \
+                 (waited {elapsed_ms}ms, quorum required={required}, alive={alive}); the DDL is \
+                 unconfirmed, retry it"
             ),
             Self::WriteTimeout {
                 consistency,
@@ -446,6 +487,19 @@ impl From<ferrosa_cluster::ClusterError> for CqlError {
                 required,
                 write_type: "SIMPLE",
             },
+            ClusterError::DdlProposalNotAgreed {
+                operation,
+                required,
+                alive,
+                timeout_ms,
+                elapsed_ms,
+            } => Self::DdlProposalNotAgreed {
+                operation,
+                required,
+                alive,
+                timeout_ms,
+                elapsed_ms,
+            },
             ClusterError::ReadTimeout {
                 consistency,
                 received,
@@ -518,6 +572,17 @@ mod tests {
                 consistency: ConsistencyLevel::Quorum,
                 required: 2,
                 alive: 1,
+            }
+            .error_code(),
+            0x1000
+        );
+        assert_eq!(
+            CqlError::DdlProposalNotAgreed {
+                operation: "DropTable ks.tbl".into(),
+                required: 2,
+                alive: 1,
+                timeout_ms: 5000,
+                elapsed_ms: 5001,
             }
             .error_code(),
             0x1000
@@ -644,6 +709,80 @@ mod tests {
         // Exact length: the frame is precisely code+message+trailer, so the
         // driver's buffer fills exactly — no under-run, no trailing garbage.
         assert_eq!(offset + wt_len, body.len());
+    }
+
+    #[test]
+    fn encode_ddl_proposal_not_agreed_has_complete_unavailable_trailer() {
+        // Sent as Unavailable (0x1000) so the driver retries on another node.
+        // The trailer MUST be present and exact, or the driver fails to
+        // deserialize the frame ("Malformed error field CONSISTENCY … failed to
+        // fill whole buffer"), as the TransactionTimeout variant learned against
+        // Accord commit timeouts (t_03c8b79b).
+        let err = CqlError::DdlProposalNotAgreed {
+            operation: "DropTable ks.tbl".into(),
+            required: 2,
+            alive: 1,
+            timeout_ms: 5000,
+            elapsed_ms: 5012,
+        };
+        let body = err.encode_body();
+
+        assert_eq!(&body[..4], &0x1000u32.to_be_bytes());
+        let msg_len = u16::from_be_bytes([body[4], body[5]]) as usize;
+        let mut offset = 6 + msg_len;
+        // [short consistency]
+        assert_eq!(
+            u16::from_be_bytes([body[offset], body[offset + 1]]),
+            ConsistencyLevel::Quorum.to_wire()
+        );
+        offset += 2;
+        // [int required] — the Raft quorum this coordinator needed.
+        assert_eq!(
+            i32::from_be_bytes([
+                body[offset],
+                body[offset + 1],
+                body[offset + 2],
+                body[offset + 3],
+            ]),
+            2
+        );
+        offset += 4;
+        // [int alive] — what it could confirm.
+        assert_eq!(
+            i32::from_be_bytes([
+                body[offset],
+                body[offset + 1],
+                body[offset + 2],
+                body[offset + 3],
+            ]),
+            1
+        );
+        offset += 4;
+        // Exact length: code + message + trailer, nothing trailing.
+        assert_eq!(offset, body.len());
+    }
+
+    #[test]
+    fn ddl_proposal_not_agreed_names_the_operation_and_survives_the_mapping() {
+        let cluster_err = ferrosa_cluster::ClusterError::DdlProposalNotAgreed {
+            operation: "DropTable ks.tbl".into(),
+            required: 2,
+            alive: 1,
+            timeout_ms: 5000,
+            elapsed_ms: 5003,
+        };
+
+        let cql_err: CqlError = cluster_err.into();
+        assert_eq!(cql_err.error_code(), 0x1000);
+        let message = cql_err.to_string();
+        assert!(
+            message.contains("DropTable ks.tbl"),
+            "the client must be told which DDL was left unconfirmed, got: {message}"
+        );
+        assert!(
+            message.contains("5000"),
+            "the client must be told the bound that expired, got: {message}"
+        );
     }
 
     #[test]

@@ -96,7 +96,8 @@ pub fn is_retryable_forward_error(error: &ClusterError) -> bool {
         | ClusterError::WriteTimeout { .. }
         | ClusterError::ReadTimeout { .. }
         | ClusterError::ReplicationFailed(_)
-        | ClusterError::CatchUpRequired => true,
+        | ClusterError::CatchUpRequired
+        | ClusterError::DdlProposalNotAgreed { .. } => true,
         ClusterError::Storage(_)
         | ClusterError::PairWriteUnavailable
         | ClusterError::NotPrimary
@@ -415,6 +416,17 @@ mod tests {
         assert!(!is_retryable_forward_error(&ClusterError::Storage(
             ferrosa_common::Error::InvalidFormat("bad op".into())
         )));
+        // A DDL whose proposal could not be agreed is unconfirmed: a later round
+        // (once a leader can commit) may succeed, so it must be replayed.
+        assert!(is_retryable_forward_error(
+            &ClusterError::DdlProposalNotAgreed {
+                operation: "DropTable ks.tbl".into(),
+                required: 2,
+                alive: 1,
+                timeout_ms: 5000,
+                elapsed_ms: 5002,
+            }
+        ));
     }
 
     /// Edges, not events: a round that converges returns nothing to resend;

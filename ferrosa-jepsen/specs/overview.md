@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 status: implemented
-last_updated: 2026-09-27
+last_updated: 2026-10-13
 executive_summary: >
   Jepsen-style distributed correctness harness for Ferrosa. Generates
   concurrent workloads, injects faults (nemeses) over SSH, records an operation
@@ -117,6 +117,26 @@ runs actors through the two active nodes; it verifies the history and final
 state on that active quorum. The resumed node's Accord catch-up, process-crash
 recovery, and mixed CQL/PostgreSQL histories are separate acceptance work.
 
+A `SERIALIZABLE` client must retry the engine's serialization refusals, which it
+reports as SQLSTATE `40001` (the engine log names the cause: a commit finalised as
+a no-write because its `PostgreSQL MVCC snapshot is stale`). One retry policy —
+`retry_serializable_transactions`, bounded by `SERIALIZATION_RETRIES`, unchanged —
+now covers EVERY operation kind: transfer, register read/modify/write, predicate
+read, phantom insert and write-skew pair. Previously only the transfer and
+write-skew paths retried, so a refused register RMW was recorded as a lost update
+and most of the register's and predicate's invocations were abandoned while the
+run still "passed". Each attempt is recorded (refusals included) and
+`expected_history_length(OperationRetryCounts)` reconciles the history-length
+assertion against the per-kind retry counts. A refusal applies no state, so an
+immediate retry re-enters the very conflict window it lost to — it must be PACED:
+bounded exponential backoff (`RETRY_BASE_DELAY` 10 ms, `RETRY_MAX_DELAY` 160 ms)
+with jitter from the refused attempt's own invocation sequence. The pacing changes
+only WHEN a retry is issued; the retry budget and all timeouts are unmodified.
+Teardown re-issues the workload `DROP TABLE` only when the coordinator refuses it
+in the not-applied class (`Unavailable`, 0x1000); a `RequestTimeout` outcome is
+unknown and is reported, never retried. `ferrosa-cluster`'s bounded DDL proposal
+is what surfaces a stuck leader as that class rather than a 30 s hang.
+
 ## Key invariants
 
 1. **Fail loud on harness breakage.** A Knossos invocation failure is surfaced
@@ -150,6 +170,13 @@ recovery, and mixed CQL/PostgreSQL histories are separate acceptance work.
    discovers topology using the normal policy, selects a deterministic host ID
    from its own metadata, and then remaps its execution profile to that node.
    A disposable probe session must not choose the destination session's pin.
+9. **A refusal is not a result.** A refused transaction applied nothing, so it is
+   retried — under one policy for EVERY operation kind, with every attempt
+   recorded — and the retry is PACED, because an immediate re-entry replays the
+   schedule that lost. Only a class the server documents as "not applied"
+   (`40001` for a transaction, `Unavailable`/0x1000 for the teardown DDL) is
+   retryable; a client timeout's outcome is unknown and is reported, never
+   re-issued. No retry count and no timeout is widened by any of this.
 
 ## Position in the dependency graph
 

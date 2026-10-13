@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-jepsen
 doc: fmea
-last_updated: 2026-08-09
+last_updated: 2026-10-13
 ---
 
 # ferrosa-jepsen — Failure Modes and Effects Analysis
@@ -17,6 +17,10 @@ last_updated: 2026-08-09
 | WAN command lacks network privilege, tools, or the right IP family | `dc-partition`/`dc-slow` fail instead of changing connectivity. | Command exit status is included in the run failure; the Fly validation applies and removes IPv6 partition and `tc` rules on a real machine. | T3 image installs `iptables` and `iproute2`; all six T3 services declare `NET_ADMIN`; topology test guards capability; WAN partition selects `ip6tables` for Fly private IPv6 addresses. |
 | Stale Docker CLI masks a functioning Podman daemon | Local fault executor targets an unavailable Docker service. | Runtime selection fails or commands cannot start. | `container_runtime()` checks `info` and chooses a usable daemon; `FERROSA_CONTAINER_RUNTIME` can explicitly select one. |
 | Local Apple Podman emulates AMD64 netfilter incompletely | `iptables`/`tc` cannot exercise a Linux WAN fault locally. | The command fails loudly with its kernel error. | Treat this as an unsupported local fault host; validate the compose path on native Linux CI or Fly, never turn the nemesis into a no-op. |
+| A refused serialization attempt is recorded as the operation's result | A register read/modify/write or predicate read the engine refused is recorded as if it had applied; most of those invocations are silently abandoned and the run still "passes". | The history-length identity (`expected_history_length`) would not reconcile if a refused attempt were counted as a completion; the register/predicate retry counters stay at their floor while the transfer counter moves. | Route EVERY operation kind through one retry policy (`retry_serializable_transactions`) and record every attempt, refusals included; reconcile the history length against the per-kind retry counts (`OperationRetryCounts`). |
+| A serialization retry re-enters in the same instant as the attempt that lost | Because a refusal changes no state, the retry re-reads exactly what lost and re-enters the same conflict window, so it loses until the budget is spent — the workload's progress assertion fails without the engine being wrong. | The retry budget (`SERIALIZATION_RETRIES`) is consumed with no commit; measured 13, 7 and 7 consecutive refusals in three runs against a usual one. | Pace the retry: bounded exponential backoff (10 ms base, 160 ms max, five-step cap) with jitter from the refused attempt's OWN invocation sequence, so it lands in a different conflict window. This bounds WHEN a retry is issued, never how many. |
+| A refusal whose outcome is unknown is re-issued | A statement that may already have applied could be applied twice. | n/a — the workload never re-issues this class. | Retry only the class the server documents as "not applied": SQLSTATE `40001` for a transaction, `Unavailable`/0x1000 for the teardown DDL. A `RequestTimeout` outcome is unknown and is reported where it stands. |
+| A DDL proposal with a stuck leader hangs the teardown to the driver's 30 s deadline | The teardown reports `ExecutionError::RequestTimeout(30s)` — a failure the workload cannot retry, because its outcome is unknown. | Engine log: `ddl_path: ddl_agreement: timed out waiting for all voters to replicate the DDL log entry … lagging_voters=1`. | `ferrosa-cluster` bounds the DDL proposal to the existing 5 s agreement budget and returns the retryable class, which the driver's default retry policy re-issues unconditionally. No deadline is widened, and the teardown's own re-issue is limited to the not-applied class. |
 
 The controls above deliberately prefer a loud, diagnosable failure to a
 successful-looking test that did not use its requested topology or fault.
