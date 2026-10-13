@@ -319,10 +319,16 @@ build; the codec's own cost is its delta against `none`.
   directory, and any other error is returned unchanged. A give-up therefore cannot
   leave the node dead-ended in `Forming` with no Raft and nothing armed, reporting
   `{"ready":false,"waiting_for":"raft_leader"}` until an unrelated peer event
-  re-drives it (t_4e9a3e61). The double-open itself is fixed at its source: a
+  re-drives it (t_4e9a3e61). The double-open is fixed at its source twice over now: a
   `ClusterInvite` copy takes `transition_guard` before it re-reads the mode and
-  transitions (CL-25), because `transition_to_cluster`'s own re-entry check sits
-  after the sled open.
+  transitions (CL-25), and `transition_to_cluster`'s own re-entry check runs at the
+  TOP of the function, before any work — it used to sit beside the end-of-function
+  `try_transition_mode(Cluster)` swap, 345 lines after the sled open, where it could
+  not stop the re-open (a re-open this schedule can now let SUCCEED). A node already
+  in `Cluster`, a mode the state machine forbids, or a `raft()` already installed is
+  refused before `create_dir_all`, so a second transition cannot touch the log
+  store; `DegradedCluster`'s rejoin and the invite path's `Pair` still transition.
+  Regression: `a_second_cluster_transition_is_refused_at_once`.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.

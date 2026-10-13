@@ -287,7 +287,18 @@ about what a readiness failure must say:
   NOT raised: reproduced under deliberate CPU contention (the harness's exact 3-node
   topology, 72 then 200 busy loops on 18 cores) no node EVER exited, and nodes become
   ready at about 6 s idle, 39.45 s at 72 spinners and 64.54 s at 200, so the miss has a
-  real cause that a longer wait would only hide (t_4e9a3e61).
+  real cause that a longer wait would only hide (t_4e9a3e61). The probe is bounded
+  tightly for the same reason: 250 ms to connect and 500 ms to read (a live `/readyz`
+  answers in single-digit ms even loaded — the former 3 s read let a listener that had
+  accepted and was shutting down hold a whole poll), and the exit check runs on BOTH
+  sides of the probe, so a blocking probe cannot delay it by more than one probe.
+  `spawn_child` also warms the node binary once per test process: a `cargo test`
+  relinks `ferrosa` on every run (its build script watches `../.git/HEAD`, which does
+  not resolve inside a git worktree), and macOS's first exec of a freshly written
+  336 MB debug binary stalls about 7 s inside `_dyld_start`, which would otherwise land
+  inside every timed window in that file and read as a slow node. Re-measured after the
+  fix: 3.07 s idle, 27.84/31.74/31.74 s at 72 spinners, 70.60/70.60/72.05 s at 200, all
+  three nodes ready every time and no node log carrying a log-store give-up.
 
 ### PostgreSQL default-keyspace replication (real-process)
 
