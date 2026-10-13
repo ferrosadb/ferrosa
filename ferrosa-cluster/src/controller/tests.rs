@@ -5304,3 +5304,116 @@ async fn a_raft_log_store_give_up_does_not_dead_end_the_transition() {
         write_path_is_cluster(&controller),
     );
 }
+
+/// A `ClusterInvite` copy must take `transition_guard` before it re-reads the mode
+/// and calls `transition_to_cluster`, exactly as every other caller does.
+///
+/// Every invite receiver re-broadcasts the invite, so copies arrive together
+/// (0.34 ms apart on a real 3-node start). `ClusterInviteHandler::handle` re-read
+/// the mode and transitioned WITHOUT the guard, so two copies both saw Pair and
+/// both called `transition_to_cluster`; the second re-opened the sled Raft
+/// directory the first one's Raft already held, exhausted the ~490 ms retry
+/// budget and returned, dead-ending the node in Forming with no Raft (FMEA CL-25,
+/// whose two named regressions —
+/// `a_cluster_invite_transitions_only_under_the_transition_guard` and
+/// `a_second_cluster_transition_is_refused_at_once` — do not exist in the tree;
+/// the give-up itself is in the node log of t_4e9a3e61).
+///
+/// RED as written: without the guard the handler leaves Pair inside the window
+/// below, so this assertion fails on that behaviour. The window is generous
+/// because reaching the guard is preceded by address lookups and connection
+/// attempts; it is the negative control that keeps the window honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cluster_invite_transitions_only_under_the_transition_guard() {
+    use ferrosa_net::rpc::RpcHandler;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config.clone(),
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm.clone());
+
+    controller.on_peer_connected((peer1_id, "127.0.0.1:1".parse().unwrap()));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the fixture must reach Pair before the invite arrives"
+    );
+
+    let handler = Arc::new(cluster::ClusterInviteHandler::new(
+        local_id,
+        pm,
+        net_config,
+        Arc::downgrade(&controller),
+    ));
+    let invite = ferrosa_net::message::Message::ClusterInvite {
+        initiator: peer1_id,
+        peers: vec![
+            (local_id, "127.0.0.1:9".parse().unwrap()),
+            (peer1_id, "127.0.0.1:1".parse().unwrap()),
+            (peer2_id, "127.0.0.1:7".parse().unwrap()),
+        ],
+    };
+    let from = (
+        peer1_id,
+        "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+    );
+
+    // Hold the guard the way a concurrent transition does, then let the handler
+    // run. The wait is a blocking sleep so the guard is never held across an
+    // await; the spawned handler runs on another worker of this runtime.
+    let guard = controller.transition_guard.lock();
+    let task = tokio::spawn(async move { handler.handle(from, invite).await });
+
+    let window = Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        assert_eq!(
+            controller.mode(),
+            DeploymentMode::Pair,
+            "a ClusterInvite handler must not transition while another caller holds \
+             transition_guard"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // POSITIVE control: once the guard is free the same invite still drives the
+    // transition — otherwise the assertion above would hold even if the handler
+    // could never transition at all.
+    drop(guard);
+    assert!(
+        task.await.expect("the handler task").is_some(),
+        "the handler still replies with an ack"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while controller.mode() == DeploymentMode::Pair && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_ne!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "with the guard free the invite must still drive the transition"
+    );
+}

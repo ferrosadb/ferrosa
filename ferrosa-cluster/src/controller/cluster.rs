@@ -3641,50 +3641,67 @@ impl RpcHandler for ClusterInviteHandler {
         // only the node that saw the 3rd peer connection transitions — the
         // other nodes stay in Pair forever and never register Raft handlers.
         if let Some(ctrl) = self.controller.upgrade() {
+            // Resolve the initiator's address FIRST — it awaits, and a std
+            // `transition_guard` must not be held across an await (that would make
+            // this RPC handler's future `!Send` and it would not compile). This is
+            // the order FMEA CL-25 prescribes: resolve, then guard, then transition.
+            // Include the initiator in the peer list so that all nodes have a
+            // complete view of cluster membership. Without this, a node receiving
+            // the invite would only see a subset of peers and might incorrectly
+            // determine the seed (RC-3 race).
+            let mut all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
+                .iter()
+                .filter(|(id, _)| *id != self.local_host_id)
+                .cloned()
+                .collect();
+            // Add the initiator if not already in the list. Use the sender's
+            // address from the RPC handler (from.1).
+            if initiator != self.local_host_id && !all_peers.iter().any(|(id, _)| *id == initiator)
+            {
+                let known = self.peer_manager.peer_addr(initiator).await;
+                let advertised = self
+                    .peer_manager
+                    .get_peer_internode_broadcast_sync(initiator);
+                let (addr, assumed) = plan_invite_initiator_addr(
+                    known.as_deref(),
+                    advertised.as_deref(),
+                    from.1,
+                    self.net_config.bind_addr.port(),
+                );
+                if assumed {
+                    tracing::warn!(
+                        %initiator,
+                        observed = %from.1,
+                        chosen = %addr,
+                        "cluster invite: initiator's internode address unknown; \
+                         assuming it shares our internode port"
+                    );
+                }
+                all_peers.push((initiator, addr));
+            }
+
+            // Hold `transition_guard` across the mode re-read and the transition,
+            // exactly as every other caller does (`on_peer_connected`,
+            // `on_inbound_peer`, the deferred boot re-drive, `upgrade()`). Every
+            // invite receiver re-broadcasts the invite, so copies arrive together
+            // — 0.34 ms apart on a real 3-node start — and without the guard both
+            // copies see Pair and both call `transition_to_cluster`. The second one
+            // then re-opens the sled Raft directory that the first one's Raft
+            // already holds, burns the whole ~490 ms lock-retry budget and returns
+            // from the transition, dead-ending the node in Forming with no Raft
+            // (FMEA CL-25; the give-up in the node log of t_4e9a3e61). The re-entry
+            // check inside `transition_to_cluster` sits 345 lines AFTER that open,
+            // so it cannot prevent this — only the guard can.
+            let _transition_guard = ctrl.transition_guard.lock();
             let mode = ctrl.mode();
-            if mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone {
-                // Include the initiator in the peer list so that all nodes
-                // have a complete view of cluster membership. Without this,
-                // a node receiving the invite would only see a subset of
-                // peers and might incorrectly determine the seed (RC-3 race).
-                let mut all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
-                    .iter()
-                    .filter(|(id, _)| *id != self.local_host_id)
-                    .cloned()
-                    .collect();
-                // Add the initiator if not already in the list. Use the
-                // sender's address from the RPC handler (from.1).
-                if initiator != self.local_host_id
-                    && !all_peers.iter().any(|(id, _)| *id == initiator)
-                {
-                    let known = self.peer_manager.peer_addr(initiator).await;
-                    let advertised = self
-                        .peer_manager
-                        .get_peer_internode_broadcast_sync(initiator);
-                    let (addr, assumed) = plan_invite_initiator_addr(
-                        known.as_deref(),
-                        advertised.as_deref(),
-                        from.1,
-                        self.net_config.bind_addr.port(),
-                    );
-                    if assumed {
-                        tracing::warn!(
-                            %initiator,
-                            observed = %from.1,
-                            chosen = %addr,
-                            "cluster invite: initiator's internode address unknown; \
-                             assuming it shares our internode port"
-                        );
-                    }
-                    all_peers.push((initiator, addr));
-                }
-                if all_peers.len() >= 2 {
-                    tracing::info!(
-                        peer_count = all_peers.len(),
-                        "cluster invite: triggering cluster transition from {mode:?}"
-                    );
-                    ctrl.transition_to_cluster(all_peers);
-                }
+            if (mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone)
+                && all_peers.len() >= 2
+            {
+                tracing::info!(
+                    peer_count = all_peers.len(),
+                    "cluster invite: triggering cluster transition from {mode:?}"
+                );
+                ctrl.transition_to_cluster(all_peers);
             }
         }
 
