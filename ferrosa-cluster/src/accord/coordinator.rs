@@ -51,11 +51,6 @@ const DEFAULT_PREACCEPT_FAST_PATH_TIMEOUT_MS: u64 = 1_000;
 /// an explicit ceiling rather than a serialization side effect.
 const APPLY_FANOUT_WINDOW: usize = 4;
 
-/// One write-set entry's borrowed bytes as `(key, mutation)` — sliced straight out
-/// of the resident write-set, or out of the spill's mmap, so an entry can be written
-/// into a wire frame without an intermediate owned copy.
-pub(crate) type BorrowedWriteSetEntries<'a> = Vec<(&'a [u8], &'a [u8])>;
-
 /// Whether the per-phase commit attribution (`FERROSA_PG_COMMIT_PROFILE`) is on.
 ///
 /// Every probe is gated on this so the path is zero-cost when unset — no
@@ -637,7 +632,7 @@ pub struct AccordCoordinatorDriver {
     /// fans a per-replica [`Message::AccordApplyV2`](ferrosa_net::Message) (scoped
     /// to each replica's owned keys via [`Self::with_per_key_replicas`]) over this
     /// set, and the coordinator's own-replica Apply persists the keys it owns.
-    write_set: Vec<crate::accord::wire::WriteSetEntry>,
+    write_set: Arc<[crate::accord::wire::WriteSetEntry]>,
     /// How replicas should answer the Gap-4 read-vote: existence semantics for
     /// `INSERT IF NOT EXISTS` (the default) or a generic read-row-at-`t` whose
     /// IF predicate this coordinator evaluates after collecting F+1 agreed rows.
@@ -865,6 +860,80 @@ fn decide_existence_votes(
     }
 }
 
+/// Build ONE peer's Apply frame from SHARED, borrowed write-set data.
+///
+/// Split out of [`AccordCoordinatorDriver::apply_fanout_bounded_within`] so a per-peer
+/// build can run in its OWN task: the write-set (keys plus any resident payloads) and the
+/// spill are `Arc`-shared, so a task reads them without copying a single payload — and,
+/// because two peers own DIFFERENT shards, their scoped frames are built CONCURRENTLY
+/// instead of one after the other. `owns` lists the write-set indices this peer is a
+/// replica for; the frame carries ONLY those, so a peer is never sent an entry outside its
+/// shard scope. A staged payload (`index < staged_prefix`) is a slice of the spill's memory
+/// map; an out-of-range index FAILS LOUD rather than shipping an empty write.
+#[allow(clippy::too_many_arguments)]
+fn encode_peer_apply_frame(
+    write_set: &[crate::accord::wire::WriteSetEntry],
+    blobs: Option<&ferrosa_storage::write_set_spill::WriteSetSpill>,
+    staged_prefix: Option<usize>,
+    owns: &[usize],
+    region: bool,
+    capnp: bool,
+    compress: bool,
+    compression: ferrosa_net::protocol::RegionCompression,
+    txn_id: TxnId,
+    accord_txn_id: ferrosa_net::protocol::AccordTxnId,
+) -> Result<Bytes, AccordDriverError> {
+    use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
+
+    let mut entries: Vec<(&[u8], &[u8])> = Vec::with_capacity(owns.len());
+    for &index in owns {
+        let entry = write_set.get(index).ok_or_else(|| {
+            AccordDriverError::Codec(format!(
+                "write-set index {index} is out of range ({} entries)",
+                write_set.len()
+            ))
+        })?;
+        let mutation: &[u8] = match blobs {
+            Some(blobs) if index < staged_prefix.unwrap_or(usize::MAX) => blobs
+                .entry(index)
+                .map_err(|e| AccordDriverError::Codec(e.to_string()))?,
+            _ => entry.mutation.as_slice(),
+        };
+        entries.push((entry.key.as_slice(), mutation));
+    }
+
+    if region {
+        let mutations = entries.iter().map(|(_, mutation)| *mutation);
+        let encoded = if compress {
+            ferrosa_net::protocol::encode_accord_apply_v2_region_with_compression(
+                accord_txn_id,
+                mutations,
+                compression,
+            )
+        } else {
+            ferrosa_net::protocol::encode_accord_apply_v2_region(accord_txn_id, mutations)
+        };
+        encoded
+            .map(Bytes::from)
+            .map_err(|e| AccordDriverError::Codec(e.to_string()))
+    } else if capnp {
+        ferrosa_net::protocol::encode_accord_apply_v2(accord_txn_id, entries.iter().copied())
+            .map(Bytes::from)
+            .map_err(|e| AccordDriverError::Codec(e.to_string()))
+    } else {
+        let writes: Vec<WriteSetEntry> = entries
+            .iter()
+            .map(|(key, mutation)| WriteSetEntry {
+                key: key.to_vec(),
+                mutation: mutation.to_vec(),
+            })
+            .collect();
+        bincode::serialize(&ApplyV2Payload { txn_id, writes })
+            .map(Bytes::from)
+            .map_err(|e| AccordDriverError::Codec(e.to_string()))
+    }
+}
+
 impl AccordCoordinatorDriver {
     /// Build a driver for a new transaction.
     ///
@@ -985,7 +1054,7 @@ impl AccordCoordinatorDriver {
             snapshot_ts: None,
             self_id,
             mutation,
-            write_set,
+            write_set: write_set.into(),
             read_predicate: crate::accord::wire::ReadPredicate::NotExists,
             last_read_row: None,
             local_reader: None,
@@ -1189,7 +1258,8 @@ impl AccordCoordinatorDriver {
     /// So `apply_phase_within` hands the `Arc<WriteSetSpill>` into the closure and
     /// borrows the mapping inside, applying through
     /// `AccordStateMachine::handle_apply_writeset_borrowed` — the same borrow the
-    /// per-peer fan-out already takes via [`Self::borrowed_write_set_entries`]. No owned
+    /// per-peer fan-out already takes (each peer's frame is built straight from borrowed
+    /// spill slices in `encode_peer_apply_frame`). No owned
     /// `Vec<u8>` is materialized per entry on that path.
     fn entry_mutation(&self, index: usize) -> Result<Vec<u8>, AccordDriverError> {
         Ok(self.write_set_payload(index)?.to_vec())
@@ -1217,36 +1287,6 @@ impl AccordCoordinatorDriver {
         }
     }
 
-    /// Borrow the `(key, mutation)` bytes of every write-set entry matching `own`,
-    /// in write-set order.
-    ///
-    /// The keys are already resident, and a STAGED payload resolves to a slice of the
-    /// spill's memory map ([`ferrosa_storage::write_set_spill::WriteSetSpill::entry`]),
-    /// so the returned vector copies NOTHING: it holds borrows into `self` and the
-    /// caller writes each entry's bytes into the wire frame exactly once. The old
-    /// shape resolved every entry to an owned `Vec<u8>` first (one allocation and one
-    /// copy per entry) and THEN serialized, paying the per-entry payload copy twice.
-    ///
-    /// Fails loud on a staged index that is out of range: a missing payload must never
-    /// be silently skipped out of the frame.
-    fn borrowed_write_set_entries<F>(
-        &self,
-        own: F,
-    ) -> Result<BorrowedWriteSetEntries<'_>, AccordDriverError>
-    where
-        F: Fn(&[u8]) -> bool,
-    {
-        self.write_set
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| own(&e.key))
-            .map(|(index, e)| {
-                let mutation: &[u8] = self.write_set_payload(index)?;
-                Ok((e.key.as_slice(), mutation))
-            })
-            .collect()
-    }
-
     /// Whether every replica this fan-out contacts owns EVERY key in the
     /// write-set, so the per-peer `AccordApplyV2` payload is provably IDENTICAL
     /// for every peer and can be built, serialized and shared ONCE.
@@ -1263,7 +1303,7 @@ impl AccordCoordinatorDriver {
             return true;
         };
         let mut reference: Option<Vec<uuid::Uuid>> = None;
-        for entry in &self.write_set {
+        for entry in self.write_set.iter() {
             let set = resolve(&entry.key);
             match &reference {
                 None => reference = Some(set),
@@ -1356,7 +1396,7 @@ impl AccordCoordinatorDriver {
     fn apply_v2_payload(&self) -> crate::accord::wire::ApplyV2Payload {
         crate::accord::wire::ApplyV2Payload {
             txn_id: self.coordinator.txn_id,
-            writes: self.write_set.clone(),
+            writes: self.write_set.to_vec(),
         }
     }
 
@@ -2958,7 +2998,6 @@ impl AccordCoordinatorDriver {
         is_ack: impl Fn(&ferrosa_net::error::Result<Message>) -> bool,
         timeout: std::time::Duration,
     ) -> Result<bool, AccordDriverError> {
-        use crate::accord::wire::{ApplyV2Payload, WriteSetEntry};
         use futures::StreamExt;
         let txn_id = self.coordinator.txn_id;
         let self_id = self.self_id;
@@ -2981,11 +3020,33 @@ impl AccordCoordinatorDriver {
         // resident bytes bounded the same way the old code did — only the
         // serialized frame of an in-flight send is held, and at most
         // `APPLY_FANOUT_WINDOW` of them — while removing the N-fold serialization.
-        let mut inflight = futures::stream::FuturesUnordered::new();
+        // One task per peer: it builds that peer's SCOPED frame and sends it. Spawning
+        // (rather than buffering the build inside this task's `FuturesUnordered`) is the
+        // point — a remote peer's frame build is CPU-bound compression of its shard, and with
+        // the build inlined here every peer's frame was serialized behind the previous one
+        // (measured `serialize_ms` ≈ 3.1 s on the 1.1 M-row commit, with `sum_ack` ≈ 2 x
+        // `max_ack`). A spawned task overlaps a peer's build AND its transfer with every other
+        // peer's, so the fan-out's critical path is `max(per-peer build + transfer)`, not their
+        // sum. The window below still bounds how many frames are in flight at once, so resident
+        // payload bytes stay bounded by `APPLY_FANOUT_WINDOW` frames, exactly as before.
+        type PeerTask = tokio::task::JoinHandle<
+            Result<
+                (
+                    uuid::Uuid,
+                    ferrosa_net::error::Result<Message>,
+                    std::time::Instant,
+                    usize,
+                ),
+                AccordDriverError,
+            >,
+        >;
+        let mut inflight: futures::stream::FuturesUnordered<PeerTask> =
+            futures::stream::FuturesUnordered::new();
         let mut peers = self.replica_ids.iter().filter(|&&id| id != self_id);
         let profile = txn_profile_enabled();
         let t_fanout = profile.then(std::time::Instant::now);
-        let mut serialize_ns = 0u64;
+        // Frame-build CPU time accumulates across the spawned tasks; read once at fan-out end.
+        let serialize_ns = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let mut ack_ms: Vec<u64> = Vec::new();
         let log_fanout = |serialize_ns: u64, ack_ms: &[u64], frame_bytes: usize, shared: bool| {
             if let Some(started) = t_fanout {
@@ -3060,67 +3121,30 @@ impl AccordCoordinatorDriver {
             seq: txn_id.0.seq,
             node: txn_id.0.node,
         };
-        // Build one wire frame for a set of BORROWED entries. The region form (when every
-        // peer advertises `CAP_ACCORD_APPLY_REGION`) writes the mutation bytes into ONE
-        // contiguous region right after a small index header — no per-entry capnp struct,
-        // and the partition keys are not carried (the frame is already scoped). The
-        // capnp-inline form writes each entry's bytes straight into the arena (one copy);
-        // the legacy bincode twin (a peer that did not advertise the capability) keeps the
-        // exact bytes that path always shipped.
-        let encode_frame = |entries: &[(&[u8], &[u8])]| -> Result<Bytes, AccordDriverError> {
-            if region {
-                let mutations = entries.iter().map(|(_, mutation)| *mutation);
-                let encoded = if compress_region {
-                    ferrosa_net::protocol::encode_accord_apply_v2_region_with_compression(
-                        accord_txn_id,
-                        mutations,
-                        region_compression,
-                    )
-                } else {
-                    ferrosa_net::protocol::encode_accord_apply_v2_region(accord_txn_id, mutations)
-                };
-                encoded
-                    .map(Bytes::from)
-                    .map_err(|e| AccordDriverError::Codec(e.to_string()))
-            } else if capnp {
-                ferrosa_net::protocol::encode_accord_apply_v2(
-                    accord_txn_id,
-                    entries.iter().copied(),
-                )
-                .map(Bytes::from)
-                .map_err(|e| AccordDriverError::Codec(e.to_string()))
-            } else {
-                let writes: Vec<WriteSetEntry> = entries
-                    .iter()
-                    .map(|(key, mutation)| WriteSetEntry {
-                        key: key.to_vec(),
-                        mutation: mutation.to_vec(),
-                    })
-                    .collect();
-                let payload = ApplyV2Payload { txn_id, writes };
-                bincode::serialize(&payload)
-                    .map(Bytes::from)
-                    .map_err(|e| AccordDriverError::Codec(e.to_string()))
-            }
-        };
-        // When every peer owns every key, the per-peer payload is IDENTICAL: build
-        // and serialize it ONCE, borrowing the write-set, and share the frame by
-        // refcount. This is where the fan-out's cost collapses — the old code
-        // copied the whole write-set, read every staged payload back from disk and
-        // re-serialized the frame once PER PEER (measured 1321 ms of a 3030 ms
-        // fan-out at N=100k, and N-1 redundant write-set copies resident at peak).
-        // Each staged payload is read from local temp storage exactly once here,
-        // not once per peer.
+        // When every peer owns every key, the per-peer payload is IDENTICAL: build and
+        // serialize it ONCE, borrowing the write-set, and share the frame by refcount — each
+        // staged payload is read from local temp storage exactly once, not once per peer.
         let shared: Option<Bytes> = if self.apply_payload_is_uniform() {
             let t_build = profile.then(std::time::Instant::now);
-            let entries = self.borrowed_write_set_entries(|_| true)?;
-            let bytes = encode_frame(&entries)?;
+            let owns: Vec<usize> = (0..self.write_set.len()).collect();
+            let bytes = encode_peer_apply_frame(
+                &self.write_set,
+                self.write_blobs.as_deref(),
+                self.staged_prefix,
+                &owns,
+                region,
+                capnp,
+                compress_region,
+                region_compression,
+                txn_id,
+                accord_txn_id,
+            )?;
             if let Some(started) = t_build {
-                serialize_ns += u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+                serialize_ns.fetch_add(
+                    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
-            // The borrows are dropped here; only the shared frame stays resident, and
-            // every peer's send borrows it by refcount.
-            drop(entries);
             Some(bytes)
         } else {
             None
@@ -3129,59 +3153,98 @@ impl AccordCoordinatorDriver {
         loop {
             while inflight.len() < APPLY_FANOUT_WINDOW {
                 let Some(&peer_id) = peers.next() else { break };
-                let bytes: Bytes = match &shared {
-                    // ONE allocation, refcounted to each in-flight peer.
-                    Some(frame) => frame.clone(),
-                    None => {
-                        let t_build = profile.then(std::time::Instant::now);
-                        // Borrow each owned entry (a staged payload is a slice of the
-                        // spill's mapping, never a clone from a resident copy — for a
-                        // staged write-set the stored `mutation` is EMPTY, so the old
-                        // clone would have shipped empty writes), then write the frame
-                        // straight from those borrows.
-                        let entries = self.borrowed_write_set_entries(|key| {
-                            self.replica_owns_key(peer_id, key)
-                        })?;
-                        let bytes = encode_frame(&entries)?;
-                        if let Some(started) = t_build {
-                            serialize_ns +=
-                                u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                        }
-                        // Free the borrows before the RPC: only the frame is resident
-                        // while the send is in flight.
-                        drop(entries);
-                        bytes
-                    }
-                };
-                frame_bytes = frame_bytes.max(bytes.len());
-                if profile && ferrosa_common::mem_probe::installed() {
-                    tracing::info!(
-                        phase = "apply.frame_built",
-                        frame_bytes = bytes.len(),
-                        inflight = inflight.len() + 1,
-                        live_mib = ferrosa_common::mem_probe::live_mib(),
-                        "accord apply residency"
-                    );
-                }
-                let msg = if region {
-                    Message::AccordApplyV2Region(bytes)
-                } else if capnp {
-                    Message::AccordApplyV2Capnp(bytes)
+                // The frame this peer receives: the SHARED one when the write-set is
+                // uniform, else the indices of the entries THIS peer owns. Computing the
+                // owned set here is cheap — one ownership test per key, no payload copy — and
+                // the spawned task then builds exactly its own scoped frame.
+                let shared_frame = shared.clone();
+                let owns: Option<Vec<usize>> = if shared_frame.is_none() {
+                    Some(
+                        self.write_set
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, entry)| self.replica_owns_key(peer_id, &entry.key))
+                            .map(|(index, _)| index)
+                            .collect(),
+                    )
                 } else {
-                    Message::AccordApplyV2(bytes)
+                    None
                 };
-                let peers_handle = &self.peers;
-                let pushed = std::time::Instant::now();
-                inflight.push(async move {
+                // `Arc` clones, not write-set copies: the build task reads the SAME keys,
+                // resident payloads and spill mmap this driver holds.
+                let write_set = Arc::clone(&self.write_set);
+                let blobs = self.write_blobs.clone();
+                let staged_prefix = self.staged_prefix;
+                let peers_handle = Arc::clone(&self.peers);
+                let serialize_ns_task = Arc::clone(&serialize_ns);
+                inflight.push(tokio::spawn(async move {
+                    let t_build = profile.then(std::time::Instant::now);
+                    let bytes: Bytes = match &shared_frame {
+                        Some(frame) => frame.clone(),
+                        None => encode_peer_apply_frame(
+                            &write_set,
+                            blobs.as_deref(),
+                            staged_prefix,
+                            owns.as_deref().unwrap_or(&[]),
+                            region,
+                            capnp,
+                            compress_region,
+                            region_compression,
+                            txn_id,
+                            accord_txn_id,
+                        )?,
+                    };
+                    if let Some(started) = t_build {
+                        serialize_ns_task.fetch_add(
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                    let frame_len = bytes.len();
+                    if profile && ferrosa_common::mem_probe::installed() {
+                        tracing::info!(
+                            phase = "apply.frame_built",
+                            frame_bytes = frame_len,
+                            live_mib = ferrosa_common::mem_probe::live_mib(),
+                            "accord apply residency"
+                        );
+                    }
+                    let msg = if region {
+                        Message::AccordApplyV2Region(bytes)
+                    } else if capnp {
+                        Message::AccordApplyV2Capnp(bytes)
+                    } else {
+                        Message::AccordApplyV2(bytes)
+                    };
+                    let pushed = std::time::Instant::now();
                     let result = peers_handle
                         .send_with_timeout(peer_id, msg, Lane::Data, timeout)
                         .await;
-                    (peer_id, result, pushed)
-                });
+                    Ok::<_, AccordDriverError>((peer_id, result, pushed, frame_len))
+                }));
             }
-            let Some((peer_id, result, pushed)) = inflight.next().await else {
+            let Some(joined) = inflight.next().await else {
                 break;
             };
+            let (peer_id, result, pushed, frame_len) = match joined {
+                Ok(Ok(task)) => task,
+                // A per-peer frame BUILD failure is an invariant violation: a write-set
+                // entry the spill cannot resolve, or an index outside the write-set. The
+                // serial fan-out returned `Err` here, and a peer must never be silently
+                // dropped from the fan-out — that would turn an inconsistent coordinator
+                // state into a quiet "one peer just never got the frame". Keep it loud:
+                // abort the fan-out (spawning changes only WHERE the build runs).
+                Ok(Err(error)) => return Err(error),
+                // A spawned task reaches here only as a panic (this fan-out never aborts
+                // one). The serial build could not panic the fan-out without unwinding it,
+                // so a detached task panic must not become a silent skip either.
+                Err(join_error) => {
+                    return Err(AccordDriverError::Network(format!(
+                        "accord apply frame-build task failed: {join_error}"
+                    )))
+                }
+            };
+            frame_bytes = frame_bytes.max(frame_len);
             if profile {
                 ack_ms.push(pushed.elapsed().as_millis() as u64);
             }
@@ -3196,12 +3259,22 @@ impl AccordCoordinatorDriver {
             if is_ack(&result) {
                 quorum.record_node_ack(peer_id);
                 if quorum.all_reached() {
-                    log_fanout(serialize_ns, &ack_ms, frame_bytes, shared.is_some());
+                    log_fanout(
+                        serialize_ns.load(std::sync::atomic::Ordering::Relaxed),
+                        &ack_ms,
+                        frame_bytes,
+                        shared.is_some(),
+                    );
                     return Ok(true);
                 }
             }
         }
-        log_fanout(serialize_ns, &ack_ms, frame_bytes, shared.is_some());
+        log_fanout(
+            serialize_ns.load(std::sync::atomic::Ordering::Relaxed),
+            &ack_ms,
+            frame_bytes,
+            shared.is_some(),
+        );
         Ok(quorum.all_reached())
     }
 
@@ -5360,6 +5433,333 @@ mod tests {
         assert_ne!(
             shard_a_ptr, shard_b_ptr,
             "two different scoped write-sets must not be served by one shared frame"
+        );
+    }
+
+    /// A per-peer frame BUILD failure must ABORT the fan-out with an error, never
+    /// silently drop that peer.
+    ///
+    /// The write-set spill resolves a staged payload by index and FAILS LOUD on an index
+    /// that was never staged. The one-task-per-peer fan-out catches that error inside the
+    /// spawned task; converting it to a `warn!` + skip would make an inconsistent
+    /// coordinator look like a partial quorum — and, if the skipped shard happened to have
+    /// another replica ack, a full one. The serial build returned `Err`; spawning changes
+    /// only WHERE the build runs, so the error must still surface.
+    #[tokio::test]
+    async fn apply_fanout_build_failure_aborts_loudly_instead_of_skipping_a_peer() {
+        use std::sync::Mutex;
+
+        struct AckProbe {
+            sent: Mutex<Vec<uuid::Uuid>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for AckProbe {
+            async fn send(
+                &self,
+                host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                self.sent.lock().expect("probe mutex").push(host);
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+        }
+
+        let n = six_nodes();
+        let probe = Arc::new(AckProbe {
+            sent: Mutex::new(Vec::new()),
+        });
+        let clock = HybridLogicalClock::new(999_999, 0);
+        // Two keys on DISJOINT replica sets -> the per-peer (scoped) build path, where
+        // each peer's frame is built in its OWN task.
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            n.clone(),
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), b"mutation-for-ka".to_vec()),
+                (b"kb".to_vec(), b"mutation-for-kb".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(per_key_resolver(n.clone()));
+
+        // Stage ONE payload while the write-set holds TWO entries: index 1 (key `kb`)
+        // was never staged, so the shard-B peers cannot build their frames.
+        let mut blobs = vec![b"mutation-for-ka".to_vec()];
+        let reservation =
+            ferrosa_storage::write_set_spill::reserve_write_set_stage().expect("stage dir");
+        let spill = ferrosa_storage::write_set_spill::WriteSetSpill::stage(reservation, &mut blobs)
+            .expect("stage payload");
+        assert!(
+            blobs.iter().all(|b| b.is_empty()),
+            "staging drains the resident copies"
+        );
+        let driver = driver.with_spilled_write_set(Arc::new(spill));
+        let participant = driver.participant_set();
+
+        let result = driver
+            .apply_fanout_bounded(&participant, |r| r.is_ok())
+            .await;
+        assert!(
+            result.is_err(),
+            "an unstaged write-set index must abort the fan-out loudly, never be \
+             silently skipped from a peer's frame build; got {result:?}"
+        );
+    }
+
+    /// Each peer's scoped Apply frame must be BYTE-IDENTICAL to the frame the serial
+    /// build produced for that peer: the same entries, in write-set order, each carrying
+    /// its resolved payload.
+    ///
+    /// The concurrency change moves the frame build into a per-peer task; it must not
+    /// reorder, drop or duplicate an entry. Values (and their ORDER within a shard), not
+    /// merely the entry count, are asserted — a count-only check is satisfied by the wrong
+    /// rows.
+    #[tokio::test]
+    async fn apply_fanout_per_peer_frame_is_byte_identical_to_the_scoped_encoding() {
+        use std::sync::Mutex;
+
+        struct FrameProbe {
+            frames: Mutex<Vec<(uuid::Uuid, Bytes)>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for FrameProbe {
+            async fn send(
+                &self,
+                host: uuid::Uuid,
+                msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                if let Message::AccordApplyV2(bytes) = &msg {
+                    self.frames
+                        .lock()
+                        .expect("probe mutex")
+                        .push((host, bytes.clone()));
+                }
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+        }
+
+        // Shard A owns `ka` and `ka2` (two entries, so ORDER inside the frame matters);
+        // shard B owns `kb`. Distinct payload bytes catch an entry swap.
+        let n = six_nodes();
+        let shard_a_of = |host: uuid::Uuid| n[0..3].contains(&host);
+        let resolver: KeyResolver = {
+            let n = n.clone();
+            Arc::new(move |key: &[u8]| {
+                if key.starts_with(b"ka") {
+                    vec![n[0], n[1], n[2]]
+                } else {
+                    vec![n[3], n[4], n[5]]
+                }
+            })
+        };
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let probe = Arc::new(FrameProbe {
+            frames: Mutex::new(Vec::new()),
+        });
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            n.clone(),
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), vec![0xAu8; 300]),
+                (b"ka2".to_vec(), vec![0xBu8; 200]),
+                (b"kb".to_vec(), vec![0xCu8; 100]),
+            ],
+        )
+        .with_per_key_replicas(resolver);
+        let txn_id = driver.apply_v2_payload().txn_id;
+        let participant = driver.participant_set();
+
+        let ok = driver
+            .apply_fanout_bounded(&participant, |r| r.is_ok())
+            .await
+            .expect("bounded fan-out runs");
+        assert!(ok, "every shard reached quorum");
+
+        let frames = probe.frames.lock().expect("probe mutex").clone();
+        assert!(
+            !frames.is_empty(),
+            "the fan-out must dial at least one peer"
+        );
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for (host, frame) in frames.iter() {
+            let expected: Vec<crate::accord::wire::WriteSetEntry> = if shard_a_of(*host) {
+                saw_a = true;
+                vec![
+                    crate::accord::wire::WriteSetEntry {
+                        key: b"ka".to_vec(),
+                        mutation: vec![0xAu8; 300],
+                    },
+                    crate::accord::wire::WriteSetEntry {
+                        key: b"ka2".to_vec(),
+                        mutation: vec![0xBu8; 200],
+                    },
+                ]
+            } else {
+                saw_b = true;
+                vec![crate::accord::wire::WriteSetEntry {
+                    key: b"kb".to_vec(),
+                    mutation: vec![0xCu8; 100],
+                }]
+            };
+            let decoded: crate::accord::wire::ApplyV2Payload =
+                bincode::deserialize(frame).expect("scoped frame decodes");
+            assert_eq!(
+                decoded.writes, expected,
+                "peer {host:?}: the frame must carry exactly its OWN shard's entries, \
+                 in write-set order"
+            );
+            // Byte identity, not just value equality: the task-built frame is the same
+            // bytes the serial build put on the wire.
+            let reference = bincode::serialize(&crate::accord::wire::ApplyV2Payload {
+                txn_id,
+                writes: expected,
+            })
+            .expect("reference encodes");
+            assert_eq!(
+                frame.as_ref(),
+                reference.as_slice(),
+                "peer {host:?}: the task-built frame must be BYTE-IDENTICAL to the \
+                 serial scoped encoding"
+            );
+        }
+        assert!(saw_a && saw_b, "both shards must be represented");
+    }
+
+    /// The fan-out window bounds resident payloads in FRAMES, not bytes. With large
+    /// per-peer frames a byte-based budget would collapse the concurrency to 1 (it would
+    /// refuse to overlap two multi-megabyte frames); the window must still overlap up to
+    /// `APPLY_FANOUT_WINDOW` peers. This is the mechanism the bound is meant to be.
+    #[tokio::test]
+    async fn apply_fanout_window_is_bounded_in_frames_not_bytes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ConcurrencyProbe {
+            in_flight: AtomicUsize,
+            max_in_flight: AtomicUsize,
+            sent: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for ConcurrencyProbe {
+            async fn send(
+                &self,
+                _host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                self.sent.fetch_add(1, Ordering::SeqCst);
+                self.in_flight.fetch_sub(1, Ordering::SeqCst);
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+        }
+
+        let n = six_nodes();
+        let probe = Arc::new(ConcurrencyProbe {
+            in_flight: AtomicUsize::new(0),
+            max_in_flight: AtomicUsize::new(0),
+            sent: AtomicUsize::new(0),
+        });
+        let clock = HybridLogicalClock::new(999_999, 0);
+        // One MiB per entry, two entries: ~2 MiB per frame. A byte budget tuned to keep
+        // resident payloads small would serialize these; the window is about frames.
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            n.clone(),
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"key-1".to_vec(), vec![0x11u8; 1 << 20]),
+                (b"key-2".to_vec(), vec![0x22u8; 1 << 20]),
+            ],
+        );
+        let participant = driver.participant_set();
+
+        let ok = driver
+            .apply_fanout_bounded(&participant, |r| r.is_ok())
+            .await
+            .expect("bounded fan-out runs");
+        assert!(ok, "quorum reached");
+
+        let peak = probe.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(
+            peak, APPLY_FANOUT_WINDOW,
+            "the in-flight window is {APPLY_FANOUT_WINDOW} FRAMES; a multi-megabyte \
+             frame must not collapse it, which is what a byte budget would do"
+        );
+    }
+
+    /// With no ack at all (no quorum), the fan-out must still dial EVERY peer exactly
+    /// ONCE — the window refill must not strand or duplicate a peer.
+    ///
+    /// This is the "results complete" invariant for the one-task-per-peer fan-out: the
+    /// `peers` iterator is consumed exactly once, and no peer is skipped by the window
+    /// bookkeeping.
+    #[tokio::test]
+    async fn apply_fanout_without_quorum_dials_every_peer_exactly_once() {
+        use std::sync::Mutex;
+
+        struct DialProbe {
+            sent: Mutex<Vec<uuid::Uuid>>,
+        }
+        #[async_trait::async_trait]
+        impl AccordTransport for DialProbe {
+            async fn send(
+                &self,
+                host: uuid::Uuid,
+                _msg: Message,
+                _lane: Lane,
+            ) -> ferrosa_net::error::Result<Message> {
+                self.sent.lock().expect("probe mutex").push(host);
+                Ok(Message::AccordApplyOK(Bytes::new()))
+            }
+        }
+
+        let n = six_nodes();
+        let probe = Arc::new(DialProbe {
+            sent: Mutex::new(Vec::new()),
+        });
+        let clock = HybridLogicalClock::new(999_999, 0);
+        let driver = AccordCoordinatorDriver::new_multi_with_transport(
+            999_999,
+            n.clone(),
+            probe.clone(),
+            false,
+            &clock,
+            vec![
+                (b"ka".to_vec(), b"mutation-for-ka".to_vec()),
+                (b"kb".to_vec(), b"mutation-for-kb".to_vec()),
+            ],
+        )
+        .with_per_key_replicas(per_key_resolver(n.clone()));
+        let participant = driver.participant_set();
+
+        // `|_| false` -> no reply is ever an ack, so the fan-out must drain EVERY peer
+        // before it can conclude the quorum is unmet.
+        let ok = driver
+            .apply_fanout_bounded(&participant, |_| false)
+            .await
+            .expect("bounded fan-out runs");
+        assert!(!ok, "without an ack the quorum cannot be reached");
+
+        let mut sent = probe.sent.lock().expect("probe mutex").clone();
+        sent.sort();
+        let mut expected = n.clone();
+        expected.sort();
+        assert_eq!(
+            sent, expected,
+            "the fan-out must dial every peer exactly once; a skipped peer is a \
+             missing frame and a duplicated one is a doubled send"
         );
     }
 
