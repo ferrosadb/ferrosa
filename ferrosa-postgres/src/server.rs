@@ -736,12 +736,15 @@ fn track_select_reads(
                 "transaction read set: the resolved row key could not be encoded",
             )
         })?;
-        session.txn_read_rows_mut().record(&bytes).map_err(|error| {
-            query::error_response(
-                "58000",
-                &format!("transaction read set could not be staged: {error}"),
-            )
-        })?;
+        session
+            .txn_read_rows_mut()
+            .record(&bytes)
+            .map_err(|error| {
+                query::error_response(
+                    "58000",
+                    &format!("transaction read set could not be staged: {error}"),
+                )
+            })?;
         return Ok(());
     }
     let read_tables = session.txn_read_tables_mut();
@@ -784,9 +787,12 @@ fn point_read_key_bytes(ctx: &QueryContext, select: &ferrosa_sql::SelectStmt) ->
     let mut pk_values: Vec<ferrosa_common::CqlValue> = Vec::with_capacity(row.key.len());
     for (name, value) in meta.partition_key.iter().zip(row.key.iter()) {
         let column = meta.columns.get(name)?;
-        let ty =
-            ferrosa_row_bridge::parse_cql_type_in_keyspace(&column.column_type, keyspace, &ctx.schema)
-                .ok()?;
+        let ty = ferrosa_row_bridge::parse_cql_type_in_keyspace(
+            &column.column_type,
+            keyspace,
+            &ctx.schema,
+        )
+        .ok()?;
         pk_values.push(crate::query::value_to_cql(value, &ty, &ctx.jsonb_limits).ok()?);
     }
     let key = ferrosa_row_bridge::build_decorated_key(&pk_values, &[]).ok()?;

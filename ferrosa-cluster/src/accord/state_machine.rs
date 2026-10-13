@@ -801,7 +801,7 @@ impl AccordStateMachine {
                 // itself: a reader sees a WRITER of that key, while two readers —
                 // which both register under the READ prefix — never conflict with
                 // each other.
-                .map(|key| postgres_read_lookup_key(key))
+                .map(postgres_read_lookup_key)
                 .filter_map(|key| self.conflict_index.max_conflicting_timestamp(key))
                 .max();
             if latest.is_some_and(|latest| latest > snapshot_ts) {

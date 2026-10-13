@@ -452,7 +452,13 @@ async fn run_postgres_transaction(
             // table-level read participates in the Accord ordering, a shared
             // placeholder would make every actor conflict on one table and starve
             // the queue — which is not what this quorum-availability test measures.
-            .commit_postgres("ks", staged(vec![write]), PgReadSet::empty(), Vec::new(), snapshot)
+            .commit_postgres(
+                "ks",
+                staged(vec![write]),
+                PgReadSet::empty(),
+                Vec::new(),
+                snapshot,
+            )
             .await
         {
             Ok(CommitOutcome::Committed) => return Ok(()),
