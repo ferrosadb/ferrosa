@@ -66,14 +66,56 @@ struct Ports {
     flight: u16,
 }
 
+/// Every port this test binary has handed out, process-wide.
+///
+/// `#[test]` functions run on separate threads of one process, each with its
+/// own `taken` set, so a per-test set alone lets two tests draw the SAME port:
+/// [`free_port`] binds `:0`, reads the port and drops the listener, and the
+/// port is then free for the other test to draw too. The global set closes that
+/// window. The sibling never-ready fixture is where it showed: its node's
+/// PostgreSQL listener reported `Address already in use` under load, because a
+/// port another test had been handed was still bound (t_4e9a3e61).
+fn reserved_ports() -> &'static std::sync::Mutex<HashSet<u16>> {
+    static RESERVED: std::sync::OnceLock<std::sync::Mutex<HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    RESERVED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Whether a connection to `port` is REFUSED — i.e. nothing is listening on it
+/// right now.
+///
+/// The bind-then-drop in [`free_port`] proves the port was free a moment ago;
+/// this proves nothing holds it NOW. A stale listener (a container runtime's
+/// proxy, a peer test's node) answers the connect, and this node's own bind
+/// would then fail `Address already in use` — a harness accident reported as a
+/// product red.
+fn port_is_refused(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err()
+}
+
+/// A port no other test in this process holds and nothing is listening on.
+///
+/// Retries on every collision rather than taking the first ephemeral port the
+/// kernel offers: a port can be spoken for by this process, or already bound by
+/// something outside it.
 fn free_port(taken: &mut HashSet<u16>) -> u16 {
-    for _ in 0..200 {
+    for _ in 0..500 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        if taken.insert(port) {
-            return port;
+        // Genuinely free: refused now (nothing outside holds it) and not
+        // claimed by another test or an earlier allocation in this one.
+        if !port_is_refused(port) {
+            continue;
         }
+        if !taken.insert(port) {
+            continue;
+        }
+        if !reserved_ports().lock().unwrap().insert(port) {
+            continue;
+        }
+        return port;
     }
     panic!("could not allocate a free port");
 }
@@ -139,6 +181,42 @@ impl Drop for Node {
     }
 }
 
+/// Exec the node binary once so the OS has it mapped, validated and warm.
+///
+/// Every `cargo test` invocation RELINKS the 336 MB `ferrosa` binary: the
+/// crate's build script re-runs on each build, because `build.rs` watches
+/// `../.git/HEAD` and in a git worktree `../.git` is a *file*, not a directory,
+/// so the watched path never exists and cargo treats it as always changed
+/// (`Compiling ferrosa v0.22.0` on every run). macOS's first exec of a freshly
+/// written binary then stalls ~7 s inside `_dyld_start` — code-signature
+/// validation plus a cold page-in of the image (measured: 7.08 s for a fresh
+/// copy, 0.03 s for the next exec; 1.6 s after a bare `touch`).
+///
+/// That stall lands inside EVERY timed window in this file and reads as a node
+/// that is slow to boot. It is a build/host artifact, not node behaviour, so it
+/// is paid once here, before any window opens — the readiness wait's 5 s
+/// detector above all (t_4e9a3e61). `--version` prints one line and exits before
+/// the node does any setup.
+fn warm_node_binary() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let started = Instant::now();
+        match Command::new(env!("CARGO_BIN_EXE_ferrosa"))
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) => eprintln!(
+                "harness: warmed the node binary in {:.2?} ({}) — the first exec of a \
+                 freshly linked debug binary stalls in dyld on this host",
+                started.elapsed(),
+                String::from_utf8_lossy(&out.stdout).trim()
+            ),
+            Err(e) => panic!("could not exec the node binary to warm it: {e}"),
+        }
+    });
+}
+
 /// Launch one `ferrosa` process against an existing data directory. `extra_env`
 /// is the caller's addition to the node's environment (the fault-injection seam
 /// the harness tests use); it is applied last, so a test can override anything.
@@ -150,6 +228,7 @@ fn spawn_child(
     seed: Option<&str>,
     extra_env: &[(&str, &str)],
 ) -> Child {
+    warm_node_binary();
     let log = std::fs::File::create(data_dir.join("node.log")).expect("create node log");
     let stderr = log.try_clone().expect("clone log handle");
 
@@ -220,12 +299,29 @@ fn spawn_node_with_env(
 
 // ── readiness ─────────────────────────────────────────────────────────────────
 
+/// The connect timeout for a readiness probe.
+///
+/// A loopback listener that is UP accepts at once, so this only bounds the "not
+/// listening yet" case. Short on purpose — see [`PROBE_READ_TIMEOUT`].
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The read timeout for a readiness probe.
+///
+/// A live `/readyz` answers in single-digit milliseconds even with the node
+/// under contention, so this is generous for a real answer and still short
+/// enough that an exit DURING a stalled probe costs well under the 5 s detector
+/// budget of `a_node_that_dies_at_startup_fails_the_readiness_wait_at_once`. The
+/// former 3 s read let a listener that had accepted but was shutting down hold
+/// each poll for the full 3 s — one to two such rounds are what stretched that
+/// test to 5.6-8.7 s (t_4e9a3e61).
+const PROBE_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A minimal HTTP/1.1 GET. Returns the raw response text, or `None` if the
-/// listener is not up yet.
+/// listener is not up yet (or does not answer inside the probe timeouts).
 fn http_get(port: u16, path: &str, authorization: Option<&str>) -> Option<String> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_CONNECT_TIMEOUT).ok()?;
+    stream.set_read_timeout(Some(PROBE_READ_TIMEOUT)).ok()?;
     let auth = authorization
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
@@ -376,6 +472,19 @@ fn readiness_timeout_message(
     )
 }
 
+/// The failure message if the node process is already GONE, else `None`.
+fn node_gone_message(node: &mut Node, started: Instant) -> Option<String> {
+    let status = node.child.try_wait().expect("try_wait on the node")?;
+    let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+    Some(node_exit_message(
+        &node.host_id,
+        node.ports.web,
+        &status,
+        started.elapsed(),
+        &log,
+    ))
+}
+
 /// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
 /// every listener up).
 ///
@@ -389,25 +498,28 @@ fn readiness_timeout_message(
 ///   waiting for, and the failure quotes that condition rather than leaving the
 ///   reader with a tail. An alive node reporting `waiting_for` used to look
 ///   exactly like a dead one (t_4e9a3e61).
+///
+/// The exit check runs BOTH sides of the probe. A probe is bounded by
+/// [`PROBE_CONNECT_TIMEOUT`] and [`PROBE_READ_TIMEOUT`], so an exit during one
+/// can delay the check by at most one probe — never by a whole poll tick, which
+/// is what the former 3 s read cost (5.6-8.7 s to notice a dead child).
 fn wait_ready(node: &mut Node, timeout: Duration) {
     let started = Instant::now();
     let deadline = started + timeout;
     let mut last_probe: Option<Probe> = None;
     loop {
-        if let Some(status) = node.child.try_wait().expect("try_wait on the node") {
-            let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
-            panic!(
-                "{}",
-                node_exit_message(
-                    &node.host_id,
-                    node.ports.web,
-                    &status,
-                    started.elapsed(),
-                    &log
-                )
-            );
+        if let Some(message) = node_gone_message(node, started) {
+            panic!("{message}");
         }
-        if let Some(raw) = http_get(node.ports.web, "/readyz", None) {
+        let raw = http_get(node.ports.web, "/readyz", None);
+        // An exit DURING the probe must not wait for the next tick. The probe
+        // is bounded (a live /readyz answers in milliseconds; a listener that
+        // accepted and then stalled is cut off by the read timeout), so this
+        // keeps the check within about one probe of the exit.
+        if let Some(message) = node_gone_message(node, started) {
+            panic!("{message}");
+        }
+        if let Some(raw) = raw {
             if raw.contains("\"ready\":true") {
                 return;
             }
@@ -428,7 +540,7 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
                 )
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
