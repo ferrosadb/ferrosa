@@ -1012,6 +1012,51 @@ impl ModeController {
         if self.defer_transition_if_boot_loading(&peers) {
             return;
         }
+        // RE-ENTRY CHECK, here and not at the end of this function.
+        //
+        // It used to live only beside the `try_transition_mode(Cluster)` swap
+        // below, 345 lines AFTER `open_raft_log_store_with_recovery`. That is 345
+        // lines too late: a second transition re-opened the sled Raft directory
+        // the first one's Raft already held and only then discovered the mode
+        // could not move. Two `ClusterInvite` copies that arrive together (0.34 ms
+        // apart on a real 3-node start) did exactly that, and the second one
+        // dead-ended the node in Forming with no Raft (CL-25, t_4e9a3e61). The
+        // bounded re-open schedule added for that give-up now makes it worse
+        // rather than better: a re-open can SUCCEED and install a second Raft over
+        // the first one's store.
+        //
+        // Refuse before any of the work: nothing below this line runs for a node
+        // that is already a cluster member, so the sled directory is never touched.
+        // The modes that MUST still transition are unaffected —
+        // `can_transition_to(Cluster)` allows Standalone, Pair, Forming,
+        // DegradedPair and DegradedCluster (the rejoin path that rebuilds Raft from
+        // persisted state, `RejoinClusterWithRaftInit`), and refuses only Cluster.
+        let current = self.mode();
+        if current == DeploymentMode::Cluster {
+            tracing::error!(
+                %current,
+                "refusing a second cluster transition: this node is already a cluster member \
+                 and its Raft holds the log store; re-opening it would race that sled \
+                 directory lock (CL-25)"
+            );
+            return;
+        }
+        if !current.can_transition_to(DeploymentMode::Cluster) {
+            tracing::error!(
+                %current,
+                target = %DeploymentMode::Cluster,
+                "refusing illegal mode transition; staying in the current mode"
+            );
+            return;
+        }
+        if self.raft().is_some() {
+            tracing::error!(
+                %current,
+                "refusing a second cluster transition: this node already runs a Raft instance; \
+                 a second one would re-open the log store the first holds (CL-25)"
+            );
+            return;
+        }
         // `peers` are internode addresses as tracked in `connected_peers`: the
         // address dialled for an outbound peer, the resolved advertised
         // address for an inbound one. They used to be rewritten to each
@@ -1153,10 +1198,10 @@ impl ModeController {
             tracing::error!(%e, dir = %raft_dir.display(), "failed to create per-DC raft log dir");
             return;
         }
-        let mut log_store = match SledLogStore::new(&raft_dir) {
+        let mut log_store = match open_raft_log_store_with_recovery(&raft_dir) {
             Ok(s) => s,
             Err(e) => {
-                tracing::error!(%e, "failed to create Raft log store");
+                tracing::error!(%e, dir = %raft_dir.display(), "failed to create Raft log store");
                 return;
             }
         };
@@ -3369,6 +3414,72 @@ impl ModeController {
     }
 }
 
+/// Pauses before each extra re-open of the Raft log store, after the production
+/// retry budget (`LockRetryPolicy::DEFAULT`) has been exhausted.
+///
+/// Bounded, and deliberately short: the last re-open starts 3 s after the first
+/// failure, and only a transition that has already lost its Raft is ever on this
+/// path. Nothing here widens the production budget — sled's lock is taken for
+/// the node's whole lifetime when the holder is another live node, so a real
+/// dual-open conflict still surfaces a typed error after this schedule too.
+const LOG_STORE_RECOVERY_PAUSES_MS: [u64; 4] = [200, 400, 800, 1600];
+
+/// Open the Raft log store, re-opening through the in-process directory-lock
+/// race (t_e67af7e7) after the production retry budget has been exhausted.
+///
+/// `SledLogStore::new` retries under `LockRetryPolicy::DEFAULT` (10 attempts,
+/// 50 ms apart, ~490 ms) — deliberately short, because a formation attempt that
+/// waits longer misses its leader window (CL-Tsledrevert). That budget is NOT
+/// widened here. What is added is what happens when it is exhausted. On
+/// 2026-10-13, three real node processes started under deliberate CPU
+/// contention on one box, and the production open gave up (`sled directory lock
+/// still held; giving up ... attempts=10 waited_ms=488`) while another
+/// in-process handle still held sled's directory lock. The caller at that point
+/// used to `return` from the whole cluster transition: the node was left in
+/// `Forming` with NO Raft instance and nothing armed to try again, so `/readyz`
+/// answered `{"ready":false,"waiting_for":"raft_leader"}` — "raft not yet
+/// initialized" — for as long as the process lived, no leader could ever be
+/// elected on it, and only an unrelated later peer event re-drove the
+/// transition. The lock is released within milliseconds to seconds of the
+/// give-up, so a short bounded re-open recovers the node instead of abandoning
+/// consensus (t_4e9a3e61).
+fn open_raft_log_store_with_recovery(
+    raft_dir: &std::path::Path,
+) -> Result<SledLogStore, sled::Error> {
+    let first = match SledLogStore::new(raft_dir) {
+        Ok(store) => return Ok(store),
+        Err(e) => e,
+    };
+    if !SledLogStore::is_lock_contention(&first) {
+        // Not the in-process lock race: re-opening would not tell us anything.
+        return Err(first);
+    }
+    let mut last = first;
+    for (attempt, pause_ms) in LOG_STORE_RECOVERY_PAUSES_MS.iter().enumerate() {
+        tracing::warn!(
+            dir = %raft_dir.display(),
+            attempt = attempt + 1,
+            pause_ms,
+            %last,
+            "raft log store open gave up; re-opening (in-process lock contention, t_e67af7e7)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(*pause_ms));
+        match SledLogStore::new(raft_dir) {
+            Ok(store) => {
+                tracing::info!(
+                    dir = %raft_dir.display(),
+                    attempt = attempt + 1,
+                    "raft log store recovered after the production retry gave up"
+                );
+                return Ok(store);
+            }
+            Err(e) if !SledLogStore::is_lock_contention(&e) => return Err(e),
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
 // ---------------------------------------------------------------------------
 // ClusterInviteHandler — connects to discovered peers on invite receipt
 // ---------------------------------------------------------------------------
@@ -3575,50 +3686,67 @@ impl RpcHandler for ClusterInviteHandler {
         // only the node that saw the 3rd peer connection transitions — the
         // other nodes stay in Pair forever and never register Raft handlers.
         if let Some(ctrl) = self.controller.upgrade() {
+            // Resolve the initiator's address FIRST — it awaits, and a std
+            // `transition_guard` must not be held across an await (that would make
+            // this RPC handler's future `!Send` and it would not compile). This is
+            // the order FMEA CL-25 prescribes: resolve, then guard, then transition.
+            // Include the initiator in the peer list so that all nodes have a
+            // complete view of cluster membership. Without this, a node receiving
+            // the invite would only see a subset of peers and might incorrectly
+            // determine the seed (RC-3 race).
+            let mut all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
+                .iter()
+                .filter(|(id, _)| *id != self.local_host_id)
+                .cloned()
+                .collect();
+            // Add the initiator if not already in the list. Use the sender's
+            // address from the RPC handler (from.1).
+            if initiator != self.local_host_id && !all_peers.iter().any(|(id, _)| *id == initiator)
+            {
+                let known = self.peer_manager.peer_addr(initiator).await;
+                let advertised = self
+                    .peer_manager
+                    .get_peer_internode_broadcast_sync(initiator);
+                let (addr, assumed) = plan_invite_initiator_addr(
+                    known.as_deref(),
+                    advertised.as_deref(),
+                    from.1,
+                    self.net_config.bind_addr.port(),
+                );
+                if assumed {
+                    tracing::warn!(
+                        %initiator,
+                        observed = %from.1,
+                        chosen = %addr,
+                        "cluster invite: initiator's internode address unknown; \
+                         assuming it shares our internode port"
+                    );
+                }
+                all_peers.push((initiator, addr));
+            }
+
+            // Hold `transition_guard` across the mode re-read and the transition,
+            // exactly as every other caller does (`on_peer_connected`,
+            // `on_inbound_peer`, the deferred boot re-drive, `upgrade()`). Every
+            // invite receiver re-broadcasts the invite, so copies arrive together
+            // — 0.34 ms apart on a real 3-node start — and without the guard both
+            // copies see Pair and both call `transition_to_cluster`. The second one
+            // then re-opens the sled Raft directory that the first one's Raft
+            // already holds, burns the whole ~490 ms lock-retry budget and returns
+            // from the transition, dead-ending the node in Forming with no Raft
+            // (FMEA CL-25; the give-up in the node log of t_4e9a3e61). The re-entry
+            // check inside `transition_to_cluster` sits 345 lines AFTER that open,
+            // so it cannot prevent this — only the guard can.
+            let _transition_guard = ctrl.transition_guard.lock();
             let mode = ctrl.mode();
-            if mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone {
-                // Include the initiator in the peer list so that all nodes
-                // have a complete view of cluster membership. Without this,
-                // a node receiving the invite would only see a subset of
-                // peers and might incorrectly determine the seed (RC-3 race).
-                let mut all_peers: Vec<(Uuid, std::net::SocketAddr)> = peers
-                    .iter()
-                    .filter(|(id, _)| *id != self.local_host_id)
-                    .cloned()
-                    .collect();
-                // Add the initiator if not already in the list. Use the
-                // sender's address from the RPC handler (from.1).
-                if initiator != self.local_host_id
-                    && !all_peers.iter().any(|(id, _)| *id == initiator)
-                {
-                    let known = self.peer_manager.peer_addr(initiator).await;
-                    let advertised = self
-                        .peer_manager
-                        .get_peer_internode_broadcast_sync(initiator);
-                    let (addr, assumed) = plan_invite_initiator_addr(
-                        known.as_deref(),
-                        advertised.as_deref(),
-                        from.1,
-                        self.net_config.bind_addr.port(),
-                    );
-                    if assumed {
-                        tracing::warn!(
-                            %initiator,
-                            observed = %from.1,
-                            chosen = %addr,
-                            "cluster invite: initiator's internode address unknown; \
-                             assuming it shares our internode port"
-                        );
-                    }
-                    all_peers.push((initiator, addr));
-                }
-                if all_peers.len() >= 2 {
-                    tracing::info!(
-                        peer_count = all_peers.len(),
-                        "cluster invite: triggering cluster transition from {mode:?}"
-                    );
-                    ctrl.transition_to_cluster(all_peers);
-                }
+            if (mode == DeploymentMode::Pair || mode == DeploymentMode::Standalone)
+                && all_peers.len() >= 2
+            {
+                tracing::info!(
+                    peer_count = all_peers.len(),
+                    "cluster invite: triggering cluster transition from {mode:?}"
+                );
+                ctrl.transition_to_cluster(all_peers);
             }
         }
 

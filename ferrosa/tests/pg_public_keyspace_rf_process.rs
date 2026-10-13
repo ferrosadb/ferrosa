@@ -237,27 +237,98 @@ fn tail(text: &str, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+/// The message a readiness timeout must carry, as a pure function so its SHAPE is
+/// testable without a cluster.
+///
+/// The `/readyz` body is the only artifact that separates "the readiness condition
+/// is genuinely unmet" — the body names it under `waiting_for` (raft_leader, a
+/// schema-registration wait, the expected-cluster-size topology gate) — from "this
+/// test's three node processes were starved on a contended runner", where the node
+/// is plainly alive in its own log. Discarding that body, as this harness used to,
+/// turns every occurrence into a fresh investigation of a failure that never says
+/// what it was waiting for.
+fn readiness_timeout_message(
+    host_id: &str,
+    web_port: u16,
+    timeout: Duration,
+    body: Option<&str>,
+    log_tail: &str,
+) -> String {
+    let verdict = match body {
+        None => "no /readyz response at all (its listener never came up)".to_string(),
+        Some(raw) => {
+            // `http_get` returns the whole response; the JSON body follows the header block.
+            let json = raw.rsplit("\r\n\r\n").next().unwrap_or(raw).trim();
+            match json_str(json, "waiting_for") {
+                Some(w) => format!("waiting_for={w}  body: {json}"),
+                None => format!("no waiting_for field  body: {json}"),
+            }
+        }
+    };
+    format!(
+        "node {host_id} did not become ready within {timeout:?}; web={web_port}\n  \
+         /readyz: {verdict}\n  log tail:\n{log_tail}"
+    )
+}
+
 /// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
-/// every listener up). Panics with the node log if it never does.
+/// every listener up). Panics — naming the condition it was waiting on — if it
+/// never does.
 fn wait_ready(node: &Node, timeout: Duration) {
     let deadline = Instant::now() + timeout;
+    let mut last_body: Option<String> = None;
     loop {
         if let Some(body) = http_get(node.ports.web, "/readyz", None) {
             if body.contains("\"ready\":true") {
                 return;
             }
+            last_body = Some(body);
         }
         if Instant::now() >= deadline {
+            // One last probe: the freshest body is the one that names the condition.
+            let body = http_get(node.ports.web, "/readyz", None).or(last_body);
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
             panic!(
-                "node {} did not become ready within {timeout:?}; web={} log tail:\n{}",
-                node.host_id,
-                node.ports.web,
-                tail(&log, 40)
+                "{}",
+                readiness_timeout_message(
+                    &node.host_id,
+                    node.ports.web,
+                    timeout,
+                    body.as_deref(),
+                    &tail(&log, 40)
+                )
             );
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// A readiness timeout must NAME the condition it was waiting on, and must say so
+/// even when the listener never answered. The `/readyz` body is the artifact that
+/// distinguishes a genuinely unmet condition from a starved runner (t_64dd3703),
+/// so pin its presence in the message.
+#[test]
+fn a_readiness_timeout_names_the_condition_the_node_is_waiting_on() {
+    let with_body = "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\n\r\n\
+                     {\"ready\":false,\"waiting_for\":\"raft_leader\"}";
+    let msg = readiness_timeout_message(
+        "11111111-1111-1111-1111-111111111111",
+        38059,
+        Duration::from_secs(90),
+        Some(with_body),
+        "log line A\nlog line B",
+    );
+    assert!(msg.contains("waiting_for=raft_leader"), "{msg}");
+    assert!(msg.contains("did not become ready within 90s"), "{msg}");
+    assert!(msg.contains("log line B"), "{msg}");
+    assert!(
+        !msg.contains("HTTP/1.1"),
+        "the header block is not the evidence: {msg}"
+    );
+
+    let no_body = readiness_timeout_message("h", 1, Duration::from_secs(90), None, "tail");
+    assert!(no_body.contains("no /readyz response at all"), "{no_body}");
+    assert!(no_body.contains("tail"), "{no_body}");
 }
 
 /// Every node's log tail, labelled — the evidence a failing harness must show.

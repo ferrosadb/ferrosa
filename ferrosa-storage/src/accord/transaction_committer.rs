@@ -349,8 +349,12 @@ pub trait TransactionCommitter: Send + Sync {
     }
 
     /// Commit PostgreSQL writes after checking the captured snapshot against
-    /// every table the transaction read or wrote. Implementations must order
-    /// this validation with the writes in Accord. The default fails closed.
+    /// every table the transaction READ (scanned). Implementations must put the
+    /// read set into the DISTRIBUTED commit order, so a table the transaction read
+    /// and another transaction wrote after that snapshot is refused loudly. Write
+    /// tables are NOT passed here: a transaction's writes are already ordered by
+    /// their row-level keys, so registering a write table would re-serialize two
+    /// transactions on DISJOINT keys of one table (RT-2). The default fails closed.
     ///
     /// `writes` is a [`StagedAccordWriteSet`]: the payload bulk may live on disk behind a
     /// bounded buffer, so the committer must read payloads through it rather than assume a
