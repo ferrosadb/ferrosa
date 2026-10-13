@@ -126,7 +126,7 @@ PostgreSQL strict-serializability workload (external cluster):
 
 ```bash
 # CQL nodes create the backing table used by the PostgreSQL transaction test.
-export FERROSA_TEST_CQL_URLS='127.0.0.1:49042;127.0.0.1:49043;127.0.0.1:49044'
+export FERROSA_TEST_CQL_URLS='127.0.0.1:29042;127.0.0.1:29043;127.0.0.1:29044'
 
 # Start the bundled cluster once (all three nodes use the one built image):
 docker compose -f tests/docker/jepsen-cluster.yml build node1
@@ -134,10 +134,10 @@ docker compose -f tests/docker/jepsen-cluster.yml up -d --no-build
 
 # Use a disposable test cluster and a SCRAM-enabled CQL role visible to all
 # nodes. For the compose cluster below, create the test-only role with:
-docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 49042 \
+docker run --rm --network host cassandra:5.0 cqlsh 127.0.0.1 29042 \
   -e "CREATE ROLE ferrosa_pg_jepsen WITH PASSWORD = 'ferrosa-jepsen-test' AND LOGIN = true AND SUPERUSER = true;"
 
-FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49052/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49053/postgres;postgresql://ferrosa_pg_jepsen:ferrosa-jepsen-test@127.0.0.1:49054/postgres' \
+FERROSA_TEST_POSTGRES_URLS='postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29052/postgres;postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29053/postgres;postgresql://ferrosa_pg_jepsen:***@127.0.0.1:29054/postgres' \
   cargo test -p ferrosa-jepsen --features postgres-jepsen \
   --test postgres_strict_serializable -- --nocapture
 ```

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 /// (32768) — an outbound connection can otherwise already hold it as a source
 /// port and `docker compose up` fails to publish the mapping. The
 /// `host_port_band` test pins this.
-pub const DEFAULT_ADMIN_URL: &str = "http://localhost:49090/admin/membership-snapshot";
+pub const DEFAULT_ADMIN_URL: &str = "http://localhost:29090/admin/membership-snapshot";
 
 /// A nemesis action that can be injected and healed.
 #[async_trait]

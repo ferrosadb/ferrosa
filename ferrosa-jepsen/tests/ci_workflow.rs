@@ -84,7 +84,7 @@ fn postgres_jepsen_compose_advertises_host_reachable_cql_ports() {
         .and_then(serde_yaml::Value::as_mapping)
         .expect("services mapping");
 
-    for (node, port) in [("node1", 49042), ("node2", 49043), ("node3", 49044)] {
+    for (node, port) in [("node1", 29042), ("node2", 29043), ("node3", 29044)] {
         let service = services
             .get(serde_yaml::Value::String(node.into()))
             .unwrap_or_else(|| panic!("service {node} missing"));
