@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use ferrosa_jepsen::checker::strict_serializable::{
     check_strict_serializable, RecordedTransaction, TransactionOperation,
 };
+use scylla::client::session::Session;
 use scylla::client::session_builder::SessionBuilder;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -29,6 +30,10 @@ const ACTORS: usize = 5;
 const TRANSACTIONS_PER_ACTOR: usize = 2;
 // Bound retries so an unavailable cluster cannot hold a test actor indefinitely.
 const SERIALIZATION_RETRIES: usize = 8;
+// Bounds the PACING of a retry, never the NUMBER of retries: SERIALIZATION_RETRIES
+// above is what terminates a retrying transaction.
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(10);
+const RETRY_MAX_DELAY: Duration = Duration::from_millis(160);
 const WRITE_SKEW_WRITERS: usize = 2;
 const WORKLOAD_STATE_READ_RETRIES: usize = 120;
 const INITIAL_BALANCE: i64 = 10_000;
@@ -121,6 +126,8 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
 
     let event_clock = Arc::new(AtomicU64::new(1));
     let transfer_retry_count = Arc::new(AtomicUsize::new(0));
+    let register_retry_count = Arc::new(AtomicUsize::new(0));
+    let predicate_retry_count = Arc::new(AtomicUsize::new(0));
     let write_skew_retry_count = Arc::new(AtomicUsize::new(0));
     let history = Arc::new(Mutex::new(Vec::with_capacity(
         ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2),
@@ -133,6 +140,8 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         let client = Arc::clone(actor_client);
         let event_clock = Arc::clone(&event_clock);
         let transfer_retry_count = Arc::clone(&transfer_retry_count);
+        let register_retry_count = Arc::clone(&register_retry_count);
+        let predicate_retry_count = Arc::clone(&predicate_retry_count);
         let write_skew_retry_count = Arc::clone(&write_skew_retry_count);
         let history = Arc::clone(&history);
         let predicate_barrier = Arc::clone(&predicate_barrier);
@@ -148,19 +157,11 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                         let operation_id = (actor * TRANSACTIONS_PER_ACTOR + iteration) as u64;
                         let transfers =
                             transfer_once(&client, &table, operation_id, &event_clock).await?;
-                        transfer_retry_count
-                            .fetch_add(transfers.len().saturating_sub(1), Ordering::Relaxed);
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .extend(transfers);
-                        let register =
+                        record_attempts(&history, &transfer_retry_count, transfers);
+                        let registers =
                             register_once(&client, &table, operation_id * 2 + 1, &event_clock)
                                 .await?;
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(register);
+                        record_attempts(&history, &register_retry_count, registers);
                     }
 
                     wait_for_phase(&predicate_barrier, &mut actor_failure_rx).await?;
@@ -170,22 +171,14 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                         observe_predicate_once(&client, &table, 1_000 + actor as u64, &event_clock)
                             .await?
                     };
-                    history
-                        .lock()
-                        .expect("history mutex poisoned")
-                        .push(predicate);
+                    record_attempts(&history, &predicate_retry_count, predicate);
 
                     wait_for_phase(&write_skew_barrier, &mut actor_failure_rx).await?;
                     if is_write_skew_writer(actor) {
                         let transactions =
                             write_skew_once(&client, &table, 2_000 + actor as u64, &event_clock)
                                 .await?;
-                        write_skew_retry_count
-                            .fetch_add(transactions.len().saturating_sub(1), Ordering::Relaxed);
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .extend(transactions);
+                        record_attempts(&history, &write_skew_retry_count, transactions);
                     } else {
                         let observation = observe_predicate_once(
                             &client,
@@ -194,10 +187,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
                             &event_clock,
                         )
                         .await?;
-                        history
-                            .lock()
-                            .expect("history mutex poisoned")
-                            .push(observation);
+                        record_attempts(&history, &predicate_retry_count, observation);
                     }
                     Ok(())
                 },
@@ -252,9 +242,12 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
     history.sort_by_key(|transaction| transaction.id);
     assert_eq!(
         history.len(),
-        ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2)
-            + transfer_retry_count.load(Ordering::Relaxed)
-            + write_skew_retry_count.load(Ordering::Relaxed),
+        expected_history_length(OperationRetryCounts {
+            transfers: transfer_retry_count.load(Ordering::Relaxed),
+            registers: register_retry_count.load(Ordering::Relaxed),
+            predicates: predicate_retry_count.load(Ordering::Relaxed),
+            write_skews: write_skew_retry_count.load(Ordering::Relaxed),
+        }),
         "every invoked operation must have a recorded completion"
     );
     assert!(
@@ -339,10 +332,7 @@ async fn postgres_transactions_are_strictly_serializable() -> Result<()> {
         .map_err(anyhow::Error::from)
         .context("PostgreSQL transaction history violated strict serializability")?;
 
-    cql_session
-        .query_unpaged(format!("DROP TABLE {POSTGRES_DEFAULT_SCHEMA}.{table}"), &[])
-        .await
-        .context("drop strict-serializability workload table through CQL")?;
+    drop_workload_table(&cql_session, &table).await?;
     drop(clients);
     drop(actor_clients);
     for connection in connections.into_iter().chain(actor_connections) {
@@ -556,7 +546,23 @@ async fn transfer_attempt(
     .await
 }
 
+/// A register read/modify/write, retried on a retryable refusal.
+///
+/// This is the shape a lost update hides in: recording the refusal and moving
+/// on leaves the register short of the read/modify/writes that were invoked, and
+/// the checker then judges a history no client ran. Measured: the register phase
+/// always recorded exactly ten attempts — one per invocation, no retry — while
+/// between one and nine of the ten were refused.
 async fn register_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| register_attempt(client, table, id, event_clock)).await
+}
+
+async fn register_attempt(
     client: &Client,
     table: &str,
     _id: u64,
@@ -606,7 +612,20 @@ async fn register_once(
     .await
 }
 
+/// A predicate read, retried on a retryable refusal. A refused observation still
+/// carries the values it read, but it is an abort, and the checker drops it — so
+/// leaving it un-retried quietly removes an observation from the history.
 async fn observe_predicate_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| observe_predicate_attempt(client, table, id, event_clock))
+        .await
+}
+
+async fn observe_predicate_attempt(
     client: &Client,
     table: &str,
     _id: u64,
@@ -636,7 +655,19 @@ async fn observe_predicate_once(
     .await
 }
 
+/// The predicate phantom insert, retried on a retryable refusal. The assertion it
+/// feeds is a liveness requirement — the workload must attempt the phantom — so a
+/// refused attempt that is never retried is an attempt it did not make.
 async fn insert_phantom_once(
+    client: &Client,
+    table: &str,
+    id: u64,
+    event_clock: &AtomicU64,
+) -> Result<Vec<RecordedTransaction>> {
+    retry_serializable_transactions(|| phantom_insert_attempt(client, table, id, event_clock)).await
+}
+
+async fn phantom_insert_attempt(
     client: &Client,
     table: &str,
     _id: u64,
@@ -788,16 +819,96 @@ where
     Fut: std::future::Future<Output = Result<RecordedTransaction>>,
 {
     let mut history = Vec::with_capacity(SERIALIZATION_RETRIES + 1);
-    for _ in 0..=SERIALIZATION_RETRIES {
+    for retry in 0..=SERIALIZATION_RETRIES {
         let transaction = attempt().await?;
         let committed = transaction.committed;
+        let invocation = transaction.invoked;
         history.push(transaction);
         if committed {
             break;
         }
-        tokio::task::yield_now().await;
+        // A refusal applied nothing, so re-entering at once re-reads exactly what
+        // lost. Pace the retry instead: see `retry_backoff`.
+        tokio::time::sleep(retry_backoff(retry, invocation)).await;
     }
     Ok(history)
+}
+
+/// How long to wait before re-entering a transaction that a retryable
+/// serialization refusal aborted.
+///
+/// The engine refuses a commit whose read set went stale under a conflicting
+/// commit, and a refusal changes NO state — so a transaction that retries at
+/// once finds the state that made it lose, enters the same conflict window, and
+/// loses again. Two writers released from one barrier therefore refuse each
+/// other for as long as their attempts keep overlapping, and the pair can
+/// consume both retry budgets with neither having committed: that is the
+/// measured shape of the line-298 progress assertion (13, 7 and 7 consecutive
+/// refusals in three of the recorded runs, against the usual one).
+///
+/// Bounded exponential backoff with a per-attempt offset drawn from the refused
+/// attempt's OWN invocation sequence — which differs between the two writers and
+/// between successive attempts — puts the retry in a different conflict window,
+/// so the retry is a new schedule rather than a replay of the one that lost.
+fn retry_backoff(retry: usize, invocation: u64) -> Duration {
+    let shift = u32::try_from(retry).unwrap_or(u32::MAX).min(4);
+    let window = (RETRY_BASE_DELAY * (1_u32 << shift)).min(RETRY_MAX_DELAY);
+    let window_millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX);
+    window + Duration::from_millis(retry_jitter_millis(invocation, window_millis))
+}
+
+/// Spread the offset across the whole backoff window. A plain
+/// `invocation % window` would leave two writers whose sequences differ by one
+/// a fixed one millisecond apart — still lockstep, still the same window.
+fn retry_jitter_millis(invocation: u64, window_millis: u64) -> u64 {
+    if window_millis == 0 {
+        return 0;
+    }
+    let mixed = invocation
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(invocation >> 17);
+    mixed % (window_millis + 1)
+}
+
+/// Record a retrying operation's attempts and count the retries it took.
+///
+/// EVERY attempt is recorded, refusals included: the history is the evidence, and
+/// a refused attempt that is dropped would hide the conflict it lost to. The
+/// count of the extra records is what the history-length identity is reconciled
+/// against, so "every invoked operation has a recorded completion" stays true
+/// however many retries each operation needed.
+fn record_attempts(
+    history: &Mutex<Vec<RecordedTransaction>>,
+    retry_count: &AtomicUsize,
+    attempts: Vec<RecordedTransaction>,
+) {
+    retry_count.fetch_add(attempts.len().saturating_sub(1), Ordering::Relaxed);
+    history
+        .lock()
+        .expect("history mutex poisoned")
+        .extend(attempts);
+}
+
+/// The extra records each retrying operation kind contributed: one per retry
+/// that followed a retryable refusal.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OperationRetryCounts {
+    transfers: usize,
+    registers: usize,
+    predicates: usize,
+    write_skews: usize,
+}
+
+impl OperationRetryCounts {
+    fn total(self) -> usize {
+        self.transfers + self.registers + self.predicates + self.write_skews
+    }
+}
+
+/// The history length the workload must record: one completion per operation it
+/// invokes, plus one extra record for each retry of ANY operation kind.
+fn expected_history_length(retries: OperationRetryCounts) -> usize {
+    ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2) + retries.total()
 }
 
 async fn wait_for_phase(
@@ -979,14 +1090,106 @@ async fn write_marker(path: &PathBuf) -> Result<()> {
         .with_context(|| format!("write PostgreSQL fault marker {}", path.display()))
 }
 
+/// The CQL refusals that mean the statement was NOT applied and may be re-issued.
+///
+/// The teardown DDL travels the cluster's Raft log, so with a replica paused the
+/// proposal can be refused in a class the server documents as "not applied, safe
+/// to re-issue": `Unavailable` (0x1000, did not reach the consistency level). Any
+/// other refusal — a bad query, or the driver's own client timeout, whose outcome
+/// is NOT known — is reported where it stands and never retried, so a real failure
+/// cannot be turned into a pass. The client deadline itself is untouched: this
+/// re-issues a statement the server said it did not apply, it does not lengthen
+/// how long a single attempt may take.
+fn is_retryable_cql_refusal(error: &scylla::errors::ExecutionError) -> bool {
+    matches!(
+        error,
+        scylla::errors::ExecutionError::LastAttemptError(
+            scylla::errors::RequestAttemptError::DbError(
+                scylla::errors::DbError::Unavailable { .. },
+                _
+            )
+        )
+    )
+}
+
+/// Issue a CQL statement, re-issuing a refusal in the retryable class. Bounded by
+/// the SAME retry budget as the workload's transactions. The refusal is returned
+/// boxed because the driver's `ExecutionError` is oversized and this helper is on
+/// a test path where the class, not the byte count, is what the caller reads.
+async fn retry_cql_refusal<F, Fut, T>(
+    mut attempt: F,
+) -> Result<T, Box<scylla::errors::ExecutionError>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, scylla::errors::ExecutionError>>,
+{
+    let mut last_refusal = None;
+    for retry in 0..=SERIALIZATION_RETRIES {
+        match attempt().await {
+            Ok(value) => return Ok(value),
+            Err(error) if is_retryable_cql_refusal(&error) => {
+                last_refusal = Some(error);
+                if retry < SERIALIZATION_RETRIES {
+                    tokio::time::sleep(retry_backoff(retry, retry as u64)).await;
+                }
+            }
+            Err(error) => return Err(Box::new(error)),
+        }
+    }
+    Err(Box::new(
+        last_refusal.expect("the retry loop records a retryable CQL refusal"),
+    ))
+}
+
+/// Drop the workload table through CQL, re-issuing a retryable refusal.
+async fn drop_workload_table(session: &Session, table: &str) -> Result<()> {
+    let statement = format!("DROP TABLE {POSTGRES_DEFAULT_SCHEMA}.{table}");
+    retry_cql_refusal(|| {
+        let statement = statement.clone();
+        async move { session.query_unpaged(statement, &[]).await }
+    })
+    .await
+    .context("drop strict-serializability workload table through CQL")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        actor_client_count, actor_client_urls, convergence_node_count, initial_workload_statements,
-        is_retryable_serialization_state, is_write_skew_writer, predicate_observations,
-        retry_serializable_transactions, run_until_actor_failure, wait_for_phase, FaultSchedule,
-        RecordedTransaction, TransactionOperation, ACTORS, SERIALIZATION_RETRIES,
+        actor_client_count, actor_client_urls, convergence_node_count, expected_history_length,
+        initial_workload_statements, is_retryable_cql_refusal, is_retryable_serialization_state,
+        is_write_skew_writer, predicate_observations, record_attempts, retry_backoff,
+        retry_cql_refusal, retry_jitter_millis, retry_serializable_transactions,
+        run_until_actor_failure, wait_for_phase, FaultSchedule, OperationRetryCounts,
+        RecordedTransaction, TransactionOperation, ACTORS, RETRY_BASE_DELAY, RETRY_MAX_DELAY,
+        SERIALIZATION_RETRIES, TRANSACTIONS_PER_ACTOR,
     };
+
+    /// The class the engine sends when a coordinator did not reach its
+    /// consistency level: refused, and NOT applied, so it may be re-issued.
+    fn cql_unavailable() -> scylla::errors::ExecutionError {
+        scylla::errors::ExecutionError::LastAttemptError(
+            scylla::errors::RequestAttemptError::DbError(
+                scylla::errors::DbError::Unavailable {
+                    consistency: scylla::statement::Consistency::One,
+                    required: 2,
+                    alive: 1,
+                },
+                "too few replicas".to_owned(),
+            ),
+        )
+    }
+
+    /// A refusal whose outcome is known to be a permanent failure of THIS
+    /// statement: it must be reported, never re-issued.
+    fn fatal_cql_refusal() -> scylla::errors::ExecutionError {
+        scylla::errors::ExecutionError::LastAttemptError(
+            scylla::errors::RequestAttemptError::DbError(
+                scylla::errors::DbError::SyntaxError,
+                "the submitted query has a syntax error".to_owned(),
+            ),
+        )
+    }
 
     #[tokio::test]
     async fn serialization_retries_keep_aborted_attempts_and_stop_after_commit() {
@@ -1238,5 +1441,214 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    /// A retryable serialization refusal applies NOTHING, so the transaction
+    /// that lost re-reads the exact state that made it lose. A retry issued in
+    /// the same instant as the attempt that lost therefore re-enters the same
+    /// conflict window and is refused again, however many times it retries.
+    ///
+    /// This is the measured shape of the line-298 progress assertion. Across the
+    /// recorded runs of the reliability campaign the doctor phase is normally
+    /// two attempts with one refused, but three runs had thirteen, seven and
+    /// seven refused attempts against the usual one, with the doctor state
+    /// unchanged between every one of them (A-A01, A-A04, B-B05); the run that
+    /// failed the assertion committed zero doctor updates. The engine's own log
+    /// names the refusal `error=PostgreSQL MVCC snapshot is stale`, which the
+    /// front end maps to the retryable SQLSTATE 40001.
+    ///
+    /// The budget is what bounds a retrying transaction; the pause is what stops
+    /// the retry from being a replay of the schedule that lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_transaction_is_retried_after_a_pause_not_in_the_same_instant() {
+        // Three refusals, then the commit the workload needs for progress.
+        let outcomes = [false, false, false, true];
+        let mut outcomes = outcomes.into_iter();
+        let started = std::time::Instant::now();
+        let history = retry_serializable_transactions(|| {
+            let committed = outcomes.next().expect("four attempts were budgeted");
+            async move {
+                Ok(RecordedTransaction {
+                    id: 0,
+                    invoked: 0,
+                    completed: 1,
+                    committed,
+                    operations: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("a refusal is retried, never returned as an error");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|transaction| transaction.committed)
+                .collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "three refused retries must be paced so they are not a replay of the schedule that \
+             lost; reissuing them back to back took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(5),
+            "the retry pacing must stay bounded so a refused transaction cannot hold an actor \
+             indefinitely; it took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_retry_backoff_is_always_positive_and_never_unbounded() {
+        assert_eq!(retry_backoff(0, 0), RETRY_BASE_DELAY);
+        for retry in 0..=SERIALIZATION_RETRIES + 4 {
+            for invocation in [0_u64, 1, 2, 3, 7, 2_000, 2_001, u64::MAX] {
+                let delay = retry_backoff(retry, invocation);
+                assert!(
+                    delay >= RETRY_BASE_DELAY,
+                    "a refusal is never retried in the same instant: {delay:?} at retry {retry}"
+                );
+                assert!(
+                    delay <= RETRY_MAX_DELAY * 2,
+                    "the pacing is bounded, so it cannot become a hang: {delay:?} at retry {retry}"
+                );
+            }
+        }
+    }
+
+    /// Adjacent invocation sequences are two writers released together — the
+    /// write-skew pair. Their offsets must be spread across the window, not
+    /// spaced by a fixed small amount: a plain modulo would put them a
+    /// millisecond apart and leave the pair in the same conflict window.
+    #[test]
+    fn a_retry_backoff_spreads_adjacent_invocations_across_the_window() {
+        let window = 100_u64;
+        let mut offsets: Vec<u64> = (0..100)
+            .map(|invocation| retry_jitter_millis(invocation, window))
+            .collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+
+        assert!(
+            offsets.iter().all(|offset| *offset <= window),
+            "every offset stays inside the backoff window: {offsets:?}"
+        );
+        assert!(
+            offsets.len() >= 50,
+            "100 adjacent invocation sequences must spread across the window rather than \
+             collapse onto a fixed spacing; got {} distinct offsets",
+            offsets.len()
+        );
+    }
+
+    /// A refusal is RETAINED and retried. Dropping it would hide the conflict it
+    /// lost to; not retrying it is what leaves a register read/modify/write lost.
+    #[test]
+    fn a_refused_operation_records_every_attempt_and_counts_the_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let history = std::sync::Mutex::new(Vec::new());
+        let retries = AtomicUsize::new(0);
+        let attempt = |committed: bool, invoked: u64| RecordedTransaction {
+            id: invoked,
+            invoked,
+            completed: invoked + 1,
+            committed,
+            operations: Vec::new(),
+        };
+
+        record_attempts(
+            &history,
+            &retries,
+            vec![attempt(false, 1), attempt(false, 2), attempt(true, 3)],
+        );
+
+        assert_eq!(retries.load(Ordering::Relaxed), 2);
+        let history = history.lock().expect("history mutex poisoned");
+        assert_eq!(history.len(), 3);
+        assert_eq!(
+            history
+                .iter()
+                .map(|transaction| transaction.committed)
+                .collect::<Vec<_>>(),
+            [false, false, true]
+        );
+    }
+
+    #[test]
+    fn history_length_accounts_for_a_retry_of_every_operation_kind() {
+        let invoked = ACTORS * (TRANSACTIONS_PER_ACTOR * 2 + 2);
+
+        assert_eq!(
+            expected_history_length(OperationRetryCounts::default()),
+            invoked
+        );
+        assert_eq!(
+            expected_history_length(OperationRetryCounts {
+                transfers: 1,
+                registers: 2,
+                predicates: 3,
+                write_skews: 4,
+            }),
+            invoked + 10
+        );
+    }
+
+    /// Only the class the server documents as "not applied, safe to re-issue" is
+    /// retryable. A client timeout is NOT: its outcome is unknown, so retrying it
+    /// would both guess and lengthen how long a single attempt may take.
+    #[test]
+    fn only_the_not_applied_cql_class_is_retryable() {
+        assert!(is_retryable_cql_refusal(&cql_unavailable()));
+        assert!(!is_retryable_cql_refusal(&fatal_cql_refusal()));
+        assert!(!is_retryable_cql_refusal(
+            &scylla::errors::ExecutionError::RequestTimeout(std::time::Duration::from_secs(30))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_retryable_cql_refusal_is_reissued_and_a_fatal_one_is_reported() {
+        use std::cell::Cell;
+
+        // Two refusals, then the statement applies.
+        let attempts = Cell::new(0);
+        let mut refusals = [true, true, false].into_iter();
+        let applied = retry_cql_refusal(|| {
+            let refused = refusals.next().expect("three attempts were budgeted");
+            attempts.set(attempts.get() + 1);
+            let error = cql_unavailable();
+            async move {
+                if refused {
+                    Err(error)
+                } else {
+                    Ok(7_u8)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(
+            applied.expect("the third attempt applies the statement"),
+            7,
+            "a retryable refusal is re-issued, not reported as a failure"
+        );
+        assert_eq!(attempts.get(), 3);
+
+        // A fatal refusal ends it where it stands, on the FIRST attempt.
+        let fatal_attempts = Cell::new(0);
+        let error = retry_cql_refusal(|| {
+            fatal_attempts.set(fatal_attempts.get() + 1);
+            async { Err::<u8, _>(fatal_cql_refusal()) }
+        })
+        .await
+        .expect_err("a fatal refusal is reported, never retried");
+
+        assert!(matches!(
+            *error,
+            scylla::errors::ExecutionError::LastAttemptError(_)
+        ));
+        assert_eq!(fatal_attempts.get(), 1);
     }
 }
