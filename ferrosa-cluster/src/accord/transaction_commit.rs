@@ -15,7 +15,7 @@
 //! 3. **unconditional apply** — a general transaction has no `IF`, so it runs in
 //!    [`ReadPredicate::Always`] mode (no read-vote; #190).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -545,9 +545,9 @@ async fn drive_accord(
 /// The large PostgreSQL commit calls this directly, so neither the payload bulk nor the
 /// conflict-key set is materialized by the caller.
 ///
-/// The driver's write-set and the per-key replica index are built in ONE pass over the staged
-/// index and then over the appended keys, so no key is ever held in two resident collections
-/// at once.
+/// The driver's write-set and its per-entry replica sets (carried BY POSITION, so an immutable
+/// conflict key is stored once) are built in ONE pass over the staged index and then over the
+/// appended keys, so no key is ever held in two resident collections at once.
 ///
 /// # Errors
 ///
@@ -569,20 +569,20 @@ async fn drive_accord_core(
     let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
     let t_resolve = profile.then(std::time::Instant::now);
     let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
-    let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
+    // The per-entry replica sets, carried BY POSITION (aligned with `write_set`) rather than in
+    // a keyed index: a conflict key is immutable, write-once bytes, so it is stored ONCE (in
+    // `write_set`) and never cloned into a second collection merely to be looked up by its
+    // bytes. The driver resolves a replica set by the entry's position.
+    let mut participants: Vec<Vec<Uuid>> =
+        Vec::with_capacity(staged_entries.len() + appended.map_or(0, AppendedKeys::len_hint));
     let mut write_set: Vec<(Vec<u8>, Vec<u8>)> =
         Vec::with_capacity(staged_entries.len() + appended.map_or(0, AppendedKeys::len_hint));
     for (keyspace, key, resident_mutation) in staged_entries {
-        // `per_key` stays keyed by the DRIVEN key so the participant resolver finds it.
         let replicas = resolve_driven_key(committer, &keyspace, &key)?;
         for r in &replicas {
             replica_union.insert(*r);
         }
-        let site = ferrosa_common::mem_probe::enter_site(
-            ferrosa_common::mem_probe::SITE_DRIVE_PER_KEY_INDEX,
-        );
-        per_key.insert(key.clone(), replicas);
-        ferrosa_common::mem_probe::exit_site(site);
+        participants.push(replicas);
         // A STAGED entry (index < `staged_prefix`) reads its payload from the spill and is
         // EMPTY here; an entry at/after the prefix carries its own resident payload.
         write_set.push((key, resident_mutation));
@@ -602,11 +602,7 @@ async fn drive_accord_core(
                     for r in &replicas {
                         replica_union.insert(*r);
                     }
-                    let per_key_site = ferrosa_common::mem_probe::enter_site(
-                        ferrosa_common::mem_probe::SITE_DRIVE_PER_KEY_INDEX,
-                    );
-                    per_key.insert(key.to_vec(), replicas);
-                    ferrosa_common::mem_probe::exit_site(per_key_site);
+                    participants.push(replicas);
                     let write_set_site = ferrosa_common::mem_probe::enter_site(
                         ferrosa_common::mem_probe::SITE_DRIVE_WRITE_SET,
                     );
@@ -641,7 +637,7 @@ async fn drive_accord_core(
     if profile {
         tracing::info!(
             phase = "drive.resolve_done",
-            keys = per_key.len(),
+            keys = write_set.len(),
             live_mib = ferrosa_common::mem_probe::live_mib(),
             "accord drive residency"
         );
@@ -665,11 +661,6 @@ async fn drive_accord_core(
             "accord drive residency"
         );
     }
-    let per_key = Arc::new(per_key);
-    let pk = per_key.clone();
-    let participant_resolver =
-        move |k: &[u8]| -> Vec<Uuid> { pk.get(k).cloned().unwrap_or_default() };
-
     // 3. Drive one unconditional multi-key Accord transaction.
     let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
         committer.node_id,
@@ -679,7 +670,7 @@ async fn drive_accord_core(
         &committer.clock,
         write_set,
     )
-    .with_per_key_replicas(Arc::new(participant_resolver))
+    .with_per_key_replica_sets_by_position(participants)
     .with_local_applier(committer.applier.clone())
     .with_read_predicate(predicate);
     if let Some(blobs) = write_blobs {
@@ -731,6 +722,7 @@ async fn drive_accord_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use ferrosa_net::error::NetError;

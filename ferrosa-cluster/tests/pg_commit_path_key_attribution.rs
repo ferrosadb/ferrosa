@@ -262,11 +262,12 @@ fn commit_path_key_buffers_are_attributed_to_their_allocation_sites() {
     // Every site the commit path is KNOWN to allocate conflict keys at must actually be
     // charged, or the instrument is blind and the table says nothing.
     //
-    // `order.preaccept_v2_keys` is deliberately NOT in this list: it now BORROWS the driver's
-    // write-set keys and allocates ONE slice buffer, not one key buffer per conflict key. Its
-    // own regression guard is below, the mirror of the self-vote guard.
+    // `order.preaccept_v2_keys` and `drive.per_key_index` are deliberately NOT in this list:
+    // each now BORROWS the driver's write-set keys — the PreAcceptV2 wire list as a
+    // `Vec<&[u8]>`, and the per-entry replica sets as a position-aligned `Vec<Vec<Uuid>>` —
+    // so neither allocates one key buffer per conflict key. Each has its own regression guard
+    // below.
     for site in [
-        mem_probe::SITE_DRIVE_PER_KEY_INDEX,
         mem_probe::SITE_DRIVE_WRITE_SET,
         mem_probe::SITE_SM_CONFLICT_INDEX,
         mem_probe::SITE_APPENDED_ROW_READ_KEY,
@@ -307,6 +308,20 @@ fn commit_path_key_buffers_are_attributed_to_their_allocation_sites() {
          {} key-sized allocations were charged to site {}",
         at(mem_probe::SITE_ORDER_PREACCEPT_KEYS),
         mem_probe::SITE_NAMES[mem_probe::SITE_ORDER_PREACCEPT_KEYS]
+    );
+
+    // THE FIX THIS GUARDS, landed by `refactor/borrow-the-commit-keys`: the driver's per-key
+    // replica index was a `HashMap<Vec<u8>, Vec<Uuid>>` holding an OWNED copy of every conflict
+    // key. It is now carried BY POSITION (`with_per_key_replica_sets_by_position`), aligned
+    // with the driver's write-set, so the conflict key is stored once and never cloned into a
+    // second collection. This site must allocate nothing key-sized at all.
+    assert_eq!(
+        at(mem_probe::SITE_DRIVE_PER_KEY_INDEX),
+        0,
+        "the per-entry replica sets must be carried BY POSITION, not rebuilt as a keyed index: \
+         {} key-sized allocations were charged to site {} (expected zero)",
+        at(mem_probe::SITE_DRIVE_PER_KEY_INDEX),
+        mem_probe::SITE_NAMES[mem_probe::SITE_DRIVE_PER_KEY_INDEX]
     );
 
     // The honesty check. A key-sized allocation the instrument cannot name lands in the
