@@ -258,7 +258,8 @@ node), and drives the DROP over the **PostgreSQL wire**: the client must receive
 an ERROR (SQLSTATE 58000), no node may serve the seeded rows afterwards, and
 they must stay gone after **restarting the node that applied the drop**.
 
-Two harness traps are load-bearing and easy to re-derive wrongly:
+Two harness traps are load-bearing and easy to re-derive wrongly, and one rule
+about what a readiness failure must say:
 
 - **Host ids must be distinct in BOTH halves.** Raft's
   `ferrosa_cluster::raft::uuid_to_node_id` reads `bytes[8..16]` (little-endian)
@@ -273,6 +274,20 @@ Two harness traps are load-bearing and easy to re-derive wrongly:
   factor is `max(seeds + 1, FERROSA_EXPECTED_CLUSTER_SIZE, committed cluster
   size)` (never below 1) — sizing it from the seed list ALONE was the live defect
   described in the next subsection.
+- **A readiness failure must name the CONDITION, not only the process.** Every
+  readiness failure the harness reports now carries the node's first `FATAL:`/`ERROR`
+  line and the `/readyz` answer the node was giving — not just a log tail, which can
+  start after the cause. `wait_ready` fails AT ONCE when the child has exited (the old
+  wait burned its whole 90 s budget on a process that was already gone: PR #551's
+  merge-queue ejection, job 115370033050, whose dumped tail began 74 s after the last
+  real line), and otherwise quotes the body's `waiting_for`, e.g.
+  `HTTP 503 from /readyz: waiting_for="listeners"`. Throwing that body away made an
+  ALIVE node patiently reporting its condition indistinguishable from a dead one, so
+  CI could never show which condition was in play. The 90 s budget is a detector and is
+  NOT raised: reproduced under deliberate CPU contention (the harness's exact 3-node
+  topology, 72 then 200 busy loops on 18 cores) no node EVER exited, and nodes become
+  ready at about 6 s idle, 39.45 s at 72 spinners and 64.54 s at 200, so the miss has a
+  real cause that a longer wait would only hide (t_4e9a3e61).
 
 ### PostgreSQL default-keyspace replication (real-process)
 
