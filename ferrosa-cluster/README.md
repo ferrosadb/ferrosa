@@ -308,7 +308,27 @@ build; the codec's own cost is its delta against `none`.
   roles before missing seed roles are created, so rotated hashes survive both
   graceful and commit-log recovery paths.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
-  inspection/reset tooling.
+  inspection/reset tooling. An open retries a transient directory lock under
+  `LockRetryPolicy::DEFAULT` (main's 10 attempts, 50 ms apart, about 490 ms) —
+  deliberately short, because a longer wait misses the Raft leader window
+  (CL-Tsledrevert). That budget is exhausted by an IN-PROCESS double-open —
+  whoever else in this process already holds the raft dir — so the controller no
+  longer merely gives up: `open_raft_log_store_with_recovery` re-opens on a bounded,
+  explained schedule (`LOG_STORE_RECOVERY_PAUSES_MS = [200, 400, 800, 1600]`, the last
+  start 3 s after the first failure), only for lock contention, always naming the
+  directory, and any other error is returned unchanged. A give-up therefore cannot
+  leave the node dead-ended in `Forming` with no Raft and nothing armed, reporting
+  `{"ready":false,"waiting_for":"raft_leader"}` until an unrelated peer event
+  re-drives it (t_4e9a3e61). The double-open is fixed at its source twice over now: a
+  `ClusterInvite` copy takes `transition_guard` before it re-reads the mode and
+  transitions (CL-25), and `transition_to_cluster`'s own re-entry check runs at the
+  TOP of the function, before any work — it used to sit beside the end-of-function
+  `try_transition_mode(Cluster)` swap, 345 lines after the sled open, where it could
+  not stop the re-open (a re-open this schedule can now let SUCCEED). A node already
+  in `Cluster`, a mode the state machine forbids, or a `raft()` already installed is
+  refused before `create_dir_all`, so a second transition cannot touch the log
+  store; `DegradedCluster`'s rejoin and the invite path's `Pair` still transition.
+  Regression: `a_second_cluster_transition_is_refused_at_once`.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.
