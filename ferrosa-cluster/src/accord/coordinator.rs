@@ -669,7 +669,7 @@ pub struct AccordCoordinatorDriver {
     /// fans a per-replica [`Message::AccordApplyV2`](ferrosa_net::Message) (scoped
     /// to each replica's owned keys via [`Self::with_per_key_replicas`]) over this
     /// set, and the coordinator's own-replica Apply persists the keys it owns.
-    write_set: Vec<crate::accord::wire::WriteSetEntry>,
+    write_set: Arc<[crate::accord::wire::WriteSetEntry]>,
     /// How replicas should answer the Gap-4 read-vote: existence semantics for
     /// `INSERT IF NOT EXISTS` (the default) or a generic read-row-at-`t` whose
     /// IF predicate this coordinator evaluates after collecting F+1 agreed rows.
@@ -989,10 +989,11 @@ impl AccordCoordinatorDriver {
         // Keep `mutation` = the first entry so the single-key wire path (PreAccept
         // key, v1 Apply payload) is byte-identical for a one-entry write-set.
         let mutation = write_set[0].1.clone();
-        let write_set: Vec<crate::accord::wire::WriteSetEntry> = write_set
+        let write_set: Arc<[crate::accord::wire::WriteSetEntry]> = write_set
             .into_iter()
             .map(|(key, mutation)| crate::accord::wire::WriteSetEntry { key, mutation })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
 
         let coordinator = AccordCoordinator::new(txn_id, t0, key, node_id, rf, is_leaseholder);
 
@@ -1295,7 +1296,7 @@ impl AccordCoordinatorDriver {
             return true;
         };
         let mut reference: Option<Vec<uuid::Uuid>> = None;
-        for entry in &self.write_set {
+        for entry in self.write_set.iter() {
             let set = resolve(&entry.key);
             match &reference {
                 None => reference = Some(set),
@@ -1388,7 +1389,7 @@ impl AccordCoordinatorDriver {
     fn apply_v2_payload(&self) -> crate::accord::wire::ApplyV2Payload {
         crate::accord::wire::ApplyV2Payload {
             txn_id: self.coordinator.txn_id,
-            writes: self.write_set.clone(),
+            writes: self.write_set.to_vec(),
         }
     }
 
@@ -1618,7 +1619,11 @@ impl AccordCoordinatorDriver {
                 .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
             Message::AccordPreAccept(Bytes::from(pa_bytes))
         } else {
+            let site = ferrosa_common::mem_probe::enter_site(
+                ferrosa_common::mem_probe::SITE_ORDER_PREACCEPT_KEYS,
+            );
             let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+            ferrosa_common::mem_probe::exit_site(site);
             let pa_payload = PreAcceptV2Payload {
                 txn_id,
                 t0,
@@ -1697,10 +1702,22 @@ impl AccordCoordinatorDriver {
             && (self_vote_cannot_short_circuit || postgres_snapshot_transaction)
         {
             if let Some(local_sm) = &self.local_accord_state {
-                let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+                // The self-vote's keys are the driver's OWN write-set keys, so the key
+                // list is built INSIDE the closure out of an `Arc` the closure owns: the
+                // vote costs ONE borrowed-slice buffer rather than one owned key buffer
+                // per conflict key. `on_state_machine`'s `F: ... + 'static` bound
+                // constrains the closure's CAPTURES, not the payload representation — an
+                // `Arc<[WriteSetEntry]>` is `'static` and the keys are borrowed from it in
+                // the body. That is the same correction `entry_mutation`'s docs record
+                // against the older "structurally required owned copy" claim.
+                let write_set = Arc::clone(&self.write_set);
                 let snapshot_ts = self.snapshot_ts;
                 let resp = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
-                    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+                    let site = ferrosa_common::mem_probe::enter_site(
+                        ferrosa_common::mem_probe::SITE_ORDER_SELF_VOTE_KEYS,
+                    );
+                    let keys: Vec<&[u8]> = write_set.iter().map(|w| w.key.as_slice()).collect();
+                    ferrosa_common::mem_probe::exit_site(site);
                     sm.handle_preaccept_multi_with_snapshot(
                         txn_id,
                         t0,

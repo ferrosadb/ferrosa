@@ -287,26 +287,33 @@ fn measure_commit(n: usize, tag: &str) -> (ConsumerSample, u64, bool) {
     (sample, set_resident, set_spilled)
 }
 
-/// Resident key buffers per conflict key the Accord driver STRUCTURALLY holds, measured
-/// on the fixed tree. This is the FLOOR this lane reaches, not a target:
+/// Resident key-sized buffers per conflict key the Accord driver STRUCTURALLY holds,
+/// measured on the fixed tree. This is the FLOOR this lane reaches, not a target. The
+/// attribution instrument (`pg_commit_path_key_attribution.rs`) resolves the number to
+/// FOUR, from THREE sites:
 ///
-/// 1. the driver's own `write_set` (one owned key per conflict key);
-/// 2. the per-key replica index the participant resolver is built from;
-/// 3. the `PreAcceptV2` wire key list;
-/// 4. the local self-vote key list;
-/// 5. the state machine's conflict index (one registered entry per conflict key).
+/// 1. the driver's own `write_set` entry key (one owned key per conflict key);
+/// 2. the per-key replica index the participant resolver is built from (`per_key`);
+/// 3. the state machine's conflict index, which holds TWO key-sized buffers per key: the
+///    registered key AND the `Vec<InFlightWrite>` seeded at capacity one beside it.
 ///
-/// Copies 1, 4 and 5 are irreducible without a change to the consensus core: the driver
-/// orders conflicts on its key set, and `handle_preaccept_multi_with_snapshot` takes
-/// `&[&[u8]]` and registers the transaction under EVERY key. A sixth copy — the separate
-/// `resolve_inputs` collection plus the clone of the staged routing index into
-/// `write_set` — was removed by this lane.
-const DRIVER_REQUIRED_KEY_COPIES: i64 = 5;
+/// An earlier revision of this constant listed FIVE one-per-key copies and called three of
+/// them irreducible. The instrument falsified that enumeration twice: it counted
+/// `single_shard_participant` as live (never reached on this path — `per_key_replicas` is
+/// always set here, so `participant_set` takes its resolver branch, not the single-shard
+/// one), and it missed the conflict index's per-key `writes` buffer, a SECOND key-sized
+/// allocation under the same key. Four collections, one of them doubled, coincidentally
+/// total the 5.0 buffers per key that five single-copy sites would have given. Two copies
+/// this lane removed are gone for good: the `resolve_inputs`/`write_set` pair the consumer
+/// used to rebuild, and the local self-vote's `Vec<Vec<u8>>` key list, which now borrows the
+/// driver's keys from an `Arc<[WriteSetEntry]>` inside the `on_state_machine` closure.
+const DRIVER_REQUIRED_KEY_COPIES: i64 = 4;
 
-/// Slack above the structurally-required copies. The measured post-fix baseline is 2593
-/// buffers for 516 conflict keys (5.03 per key); the pre-fix baseline was 3113 (6.03). The
-/// slack keeps a couple of protocol allocations from flaking the ratchet while leaving the
-/// removed copy (one per key, ~516) far outside it.
+/// Slack above the structurally-required copies. The measured post-fix baseline is 2088
+/// buffers for 516 conflict keys (4.05 per key) and 297 for 68 (4.37); the pre-fix baseline
+/// was 2593 (5.03) and 354. The slack keeps a couple of protocol allocations from flaking
+/// the ratchet while leaving any removed copy (one per key, ~516) far outside it: the
+/// tightened budget is 2192, and the pre-fix peak of 2593 fails it.
 const KEY_BUFFER_SLACK: i64 = 128;
 
 /// The COMMIT path's consumer residency is NOT flat in the conflict-key count, and this
@@ -323,8 +330,10 @@ const KEY_BUFFER_SLACK: i64 = 128;
 /// RATCHET: re-introducing the duplicated collections the commit path used to build pushes
 /// the peak to ~6 per key and fails here.
 ///
-/// The measured baseline is 5.0 buffers per conflict key after the fix (2593 for 512 rows,
-/// 354 for 64) against 6.0 before it (3113 / 426).
+/// The measured baseline is 4.05 buffers per conflict key after this lane's two removals
+/// (2088 for 512 rows, 297 for 64), against 5.03 before them (2593 / 354) and 6.03 before the
+/// lane's first pair of removals (3113 / 426). The ratchet was TIGHTENED 5 -> 4 as the number
+/// fell; it is never loosened to reach green.
 #[test]
 #[serial_test::serial]
 fn commit_path_consumer_does_not_duplicate_the_staged_conflict_key_set() {
@@ -377,8 +386,9 @@ fn commit_path_consumer_does_not_duplicate_the_staged_conflict_key_set() {
          set (budget {budget} = {DRIVER_REQUIRED_KEY_COPIES} per conflict key, the count the \
          Accord driver structurally requires, plus {KEY_BUFFER_SLACK} slack). A resident \
          per-row-key collection rebuilt at the consumer — the `resolve_inputs`/`write_set` \
-         pair this path used to build — lands at ~6 per key. Residency is NOT flat in the row \
-         count; this bounds it at the driver's own copies.",
+         pair this path used to build, or the self-vote key list this lane removed — lands \
+         at ~5 per key. Residency is NOT flat in the row count; this bounds it at the \
+         driver's own copies.",
         large.peak_keys
     );
 }

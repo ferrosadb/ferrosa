@@ -851,7 +851,11 @@ impl AccordStateMachine {
                 accord_ts: Some(t),
                 status: TxnStatus::PreAccepted,
             };
+            let site = ferrosa_common::mem_probe::enter_site(
+                ferrosa_common::mem_probe::SITE_SM_CONFLICT_INDEX,
+            );
             self.conflict_index.register(key, entry);
+            ferrosa_common::mem_probe::exit_site(site);
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can

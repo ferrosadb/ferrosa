@@ -416,7 +416,11 @@ impl AppendedKeys<'_> {
         {
             let keyspace = self.keyspace;
             self.row_reads.for_each_row_key(&mut |row_key| {
+                let site = ferrosa_common::mem_probe::enter_site(
+                    ferrosa_common::mem_probe::SITE_APPENDED_ROW_READ_KEY,
+                );
                 let key = postgres_read_key(row_key);
+                ferrosa_common::mem_probe::exit_site(site);
                 visit(keyspace, &key)
             })?;
         }
@@ -574,7 +578,11 @@ async fn drive_accord_core(
         for r in &replicas {
             replica_union.insert(*r);
         }
+        let site = ferrosa_common::mem_probe::enter_site(
+            ferrosa_common::mem_probe::SITE_DRIVE_PER_KEY_INDEX,
+        );
         per_key.insert(key.clone(), replicas);
+        ferrosa_common::mem_probe::exit_site(site);
         // A STAGED entry (index < `staged_prefix`) reads its payload from the spill and is
         // EMPTY here; an entry at/after the prefix carries its own resident payload.
         write_set.push((key, resident_mutation));
@@ -594,8 +602,16 @@ async fn drive_accord_core(
                     for r in &replicas {
                         replica_union.insert(*r);
                     }
+                    let per_key_site = ferrosa_common::mem_probe::enter_site(
+                        ferrosa_common::mem_probe::SITE_DRIVE_PER_KEY_INDEX,
+                    );
                     per_key.insert(key.to_vec(), replicas);
+                    ferrosa_common::mem_probe::exit_site(per_key_site);
+                    let write_set_site = ferrosa_common::mem_probe::enter_site(
+                        ferrosa_common::mem_probe::SITE_DRIVE_WRITE_SET,
+                    );
                     write_set.push((key.to_vec(), Vec::new()));
+                    ferrosa_common::mem_probe::exit_site(write_set_site);
                     Ok(())
                 }
                 Err(error) => {
