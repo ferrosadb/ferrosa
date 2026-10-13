@@ -672,6 +672,14 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   two shared protocol keys (the data-commit marker and the BEGIN/COMMIT barrier). Verified from a real
   client on a settled 3-node cluster (two concurrent pairs, `refused A=0 B=0`, no `40001`). See FMEA
   CL-62; the read-set half of the same family is CL-28 (`t_1ba6ccc8`).
+- **A PostgreSQL transaction's READ SET now participates in the distributed ordering.** The tables a
+  transaction SCANNED are passed to `commit_postgres` and each drives a synthetic
+  `POSTGRES_READ_TABLE_KEY_PREFIX` conflict key in the transaction's key set, so the read registers at
+  PreAccept, joins the dependency union and the per-key execution high-water-mark. A later writer that
+  scanned the same table is refused (`SnapshotStale` → `CommitOutcome::Aborted` → SQLSTATE `40001`)
+  once the table was written after the reader's snapshot — the write-skew the engine used to commit
+  (EPIC t_27672375, FMEA CL-72). Row-level point reads are judged by the row they named and register
+  no table key, so two disjoint-key writers still commit concurrently (RT-2).
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
   Accept is dependency-monotonic: replicas retain dependencies seen locally

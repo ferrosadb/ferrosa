@@ -62,6 +62,36 @@ pub const POSTGRES_TRANSACTION_MARKER_KEY: &[u8] = b"\0ferrosa:postgres:serializ
 /// PostgreSQL begin and commit barriers share this key to order their Accord
 /// transactions. BEGIN-only barriers do not advance the data-commit marker.
 pub const POSTGRES_TRANSACTION_BARRIER_KEY: &[u8] = b"\0ferrosa:postgres:barrier:v1";
+/// Prefix of the synthetic conflict key that carries a PostgreSQL transaction's
+/// TABLE-level read of a scanned table (`schema.table`).
+///
+/// A transaction that SCANNED a table registers this key alongside its write keys,
+/// so the READ participates in the DISTRIBUTED Accord ordering: a later transaction
+/// that scanned the same table conflicts with it, and its captured snapshot is
+/// refused (fail loud; the front end reports SQLSTATE 40001) when the table was
+/// written after that snapshot — the write-skew case. A row-level POINT read
+/// (`WHERE pk = <literal>`) records its row instead and does NOT register this key,
+/// so two transactions on DISJOINT keys of one table still commit concurrently
+/// (RT-2). Table granularity is deliberately conservative: a table-level scan
+/// conflicts with ANY write to that table, which is exactly a scan's phantom
+/// guard.
+pub const POSTGRES_READ_TABLE_KEY_PREFIX: &[u8] = b"\0ferrosa:postgres:read-table:v1:";
+
+/// The synthetic read-table conflict key for a fully-qualified `schema.table`.
+#[must_use]
+pub fn postgres_read_table_key(qualified_table: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(POSTGRES_READ_TABLE_KEY_PREFIX.len() + qualified_table.len());
+    key.extend_from_slice(POSTGRES_READ_TABLE_KEY_PREFIX);
+    key.extend_from_slice(qualified_table.as_bytes());
+    key
+}
+
+/// Whether `key` is a synthetic read-table conflict key
+/// ([`POSTGRES_READ_TABLE_KEY_PREFIX`]).
+#[must_use]
+pub fn is_postgres_read_table_key(key: &[u8]) -> bool {
+    key.starts_with(POSTGRES_READ_TABLE_KEY_PREFIX)
+}
 
 /// Default pre-allocation hint for [`ConflictIndex::new`] — a starting buffer
 /// size for the hot maps, never a bound on how much they may hold.
@@ -1091,6 +1121,32 @@ mod tests {
             idx.max_conflicting_timestamp(key),
             Some(ts(900)),
             "the GC'd conflict must still be detected after the index grew past the old boundary"
+        );
+    }
+
+    /// The read-table key is a RESERVED key, and both halves are load-bearing: the
+    /// conflict index treats these keys uniformly with row keys, so a shape drift
+    /// would silently start colliding with real data. Pin the namespace and the
+    /// constructor/predicate agreement.
+    #[test]
+    fn the_read_table_key_stays_in_the_reserved_namespace() {
+        let key = super::postgres_read_table_key("public.doctors");
+        assert!(
+            key.starts_with(b"\0ferrosa:"),
+            "reserved namespace, got {:?}",
+            String::from_utf8_lossy(&key)
+        );
+        assert!(
+            key.ends_with(b"public.doctors"),
+            "carries the qualified table"
+        );
+        assert!(
+            super::is_postgres_read_table_key(&key),
+            "the predicate must accept exactly what the constructor produces"
+        );
+        assert!(
+            !super::is_postgres_read_table_key(b"doctor-a"),
+            "a row key must never be mistaken for a read-table key"
         );
     }
 }

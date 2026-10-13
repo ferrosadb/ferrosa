@@ -12,7 +12,6 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use bytes::BytesMut;
 use ferrosa_schema::Schema;
-use ferrosa_storage::write_set_stage::WriteSetSource as _;
 use ferrosa_storage::StorageEngine;
 use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -989,22 +988,11 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // The SCANNED tables (a `SELECT` that read a table it could not enumerate)
     // are the only ones judged at table granularity. A table this transaction
     // merely WROTE is judged by the rows it wrote, not by table identity: two
-    // transactions on disjoint keys of one table are independent (RT-2).
+    // transactions on disjoint keys of one table are independent (RT-2). The same
+    // scanned set is what the Accord commit carries as its READ-set: a write table
+    // registered as a conflict key would re-serialize every disjoint-key writer of
+    // that table, so only the tables the transaction actually READ participate.
     let scanned_tables = read_tables.clone();
-    let mut write_tables = read_tables;
-    // Stream the write-set once to learn the tables it touches. The set is read
-    // one mutation at a time out of the staging (resident prefix or spill), so the
-    // table set is built WITHOUT materializing the write-set.
-    if let Err(error) = staged.for_each_mutation(&mut |mutation| {
-        write_tables.insert(format!("{}.{}", mutation.keyspace, mutation.table));
-        Ok(())
-    }) {
-        session.end_txn();
-        return vec![query::error_response(
-            "58000",
-            &format!("transaction commit failed: {error}"),
-        )];
-    }
     let _commit_guard = ctx.mvcc.commit_guard().await;
     // Per-phase attribution for the COMMIT (see `MvccProfile`). Zero-valued and
     // unused unless `FERROSA_PG_COMMIT_PROFILE` is set.
@@ -1095,7 +1083,7 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
                     "cluster PostgreSQL transaction has no Accord snapshot timestamp",
                 )];
             };
-            let tables = write_tables.iter().cloned().collect();
+            let tables = scanned_tables.iter().cloned().collect();
             let accord_started = std::time::Instant::now();
             let accord_result = match committer
                 .commit_postgres(&ctx.default_schema, accord_writes, tables, cluster_snapshot)

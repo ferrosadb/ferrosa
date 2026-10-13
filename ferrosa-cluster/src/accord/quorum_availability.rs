@@ -24,7 +24,8 @@ use ferrosa_storage::accord::sync_writer::MockSyncWriter;
 use ferrosa_storage::accord::{CommitOutcome, TransactionCommitter, TransactionWrite};
 use uuid::Uuid;
 
-use crate::accord::apply::NoopStorageApplier;
+use crate::accord::apply::{ApplyError, ApplyMutation, StorageApplier};
+
 use crate::accord::handlers::{AccordHandler, AccordState};
 use crate::accord::state_machine::AccordStateMachine;
 use crate::accord::transaction_commit::{AccordTransactionCommitter, ReplicaResolver};
@@ -40,6 +41,71 @@ fn staged(writes: Vec<TransactionWrite>) -> ferrosa_storage::accord::StagedAccor
         builder.accept(write).expect("stage write");
     }
     builder.finish().expect("finish staging")
+}
+
+/// One buffered write, the shape the PostgreSQL front-end stages for a row.
+fn write(keyspace: &str, key: &str, mutation: &str) -> TransactionWrite {
+    TransactionWrite {
+        keyspace: keyspace.to_string(),
+        key: key.as_bytes().to_vec(),
+        mutation: mutation.as_bytes().to_vec(),
+    }
+}
+
+/// Records the payload of every mutation the apply engine persists, so a test can
+/// assert the VALUES the engine produced rather than only how many transactions it
+/// reported as committed.
+#[derive(Default)]
+struct RecordingApplier {
+    applied: parking_lot::Mutex<Vec<Vec<u8>>>,
+}
+
+impl RecordingApplier {
+    fn applied(&self) -> Vec<Vec<u8>> {
+        self.applied.lock().clone()
+    }
+}
+
+#[async_trait]
+impl StorageApplier for RecordingApplier {
+    fn register_postgres_mvcc_observer(
+        &self,
+        _observer: Arc<dyn ferrosa_storage::accord::PostgresMvccApplyObserver>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn apply(
+        &self,
+        _txn_id: ferrosa_common::accord::TxnId,
+        mutation: ApplyMutation,
+    ) -> Result<(), ApplyError> {
+        if !mutation.data.is_empty() {
+            self.applied.lock().push(mutation.data);
+        }
+        Ok(())
+    }
+}
+
+/// The on-call total a write-skew workload leaves behind: `doctor-a` and `doctor-b`
+/// both start on call (1) and a writer moves one of them off call (0). A correct
+/// engine leaves exactly one on call; a violation leaves none.
+fn on_call_total(appliers: &[Arc<RecordingApplier>]) -> i64 {
+    let mut on_call = std::collections::BTreeMap::from([("doctor-a", 1_i64), ("doctor-b", 1_i64)]);
+    for applier in appliers {
+        for payload in applier.applied() {
+            match payload.as_slice() {
+                b"doctor-a=0" => {
+                    on_call.insert("doctor-a", 0);
+                }
+                b"doctor-b=0" => {
+                    on_call.insert("doctor-b", 0);
+                }
+                _ => {}
+            }
+        }
+    }
+    on_call.values().sum()
 }
 
 /// How a replica answers requests.
@@ -148,6 +214,9 @@ struct Cluster {
     transport: Arc<ClusterTransport>,
     node_transports: Vec<Arc<NodeTransport>>,
     committers: Vec<Arc<AccordTransactionCommitter>>,
+    /// One recording applier per node — the mutations each node's replica
+    /// actually persisted, so a test can assert the resulting VALUES.
+    appliers: Vec<Arc<RecordingApplier>>,
 }
 
 impl Cluster {
@@ -155,14 +224,14 @@ impl Cluster {
         let hosts = [host(0x1111), host(0x2222), host(0x3333)];
         let mut handlers = HashMap::new();
         let mut states: Vec<AccordState> = Vec::new();
+        let mut appliers: Vec<Arc<RecordingApplier>> = Vec::new();
         for h in hosts {
             let node_id = node_id_of(h);
-            let state: AccordState =
-                Arc::new(parking_lot::Mutex::new(AccordStateMachine::with_applier(
-                    node_id,
-                    Arc::new(MockSyncWriter::new()),
-                    Arc::new(NoopStorageApplier::new()),
-                )));
+            let applier = Arc::new(RecordingApplier::default());
+            appliers.push(Arc::clone(&applier));
+            let state: AccordState = Arc::new(parking_lot::Mutex::new(
+                AccordStateMachine::with_applier(node_id, Arc::new(MockSyncWriter::new()), applier),
+            ));
             handlers.insert(h, Arc::new(AccordHandler::new(state.clone(), node_id)));
             states.push(state);
         }
@@ -185,22 +254,22 @@ impl Cluster {
             .collect();
         let committers = hosts
             .iter()
-            .zip(states)
-            .zip(node_transports.iter())
-            .map(|((h, state), node_transport)| {
+            .enumerate()
+            .map(|(index, h)| {
                 let node_id = node_id_of(*h);
                 let replicas = replicas.clone();
                 let resolve: ReplicaResolver =
                     Arc::new(move |_ks: &str, _key: &[u8]| Some(replicas.clone()));
+                let applier: Arc<dyn StorageApplier> = appliers[index].clone();
                 Arc::new(
                     AccordTransactionCommitter::new(
                         node_id,
                         Arc::new(HybridLogicalClock::new(node_id, 0)),
-                        node_transport.clone(),
-                        Arc::new(NoopStorageApplier::new()),
+                        node_transports[index].clone(),
+                        applier,
                         resolve,
                     )
-                    .with_local_accord_state(state),
+                    .with_local_accord_state(states[index].clone()),
                 )
             })
             .collect();
@@ -209,6 +278,7 @@ impl Cluster {
             transport,
             node_transports,
             committers,
+            appliers,
         }
     }
 
@@ -255,7 +325,13 @@ async fn run_postgres_transaction(
             mutation: format!("write-{actor}-{attempt}").into_bytes(),
         };
         match committer
-            .commit_postgres("ks", staged(vec![write]), vec!["t".to_string()], snapshot)
+            // This synthetic workload runs no table-level `SELECT` (its transfer
+            // reads are row-level), so its read set is EMPTY. `["t"]` was an inert
+            // placeholder while the commit path ignored the argument; now that a
+            // table-level read participates in the Accord ordering, a shared
+            // placeholder would make every actor conflict on one table and starve
+            // the queue — which is not what this quorum-availability test measures.
+            .commit_postgres("ks", staged(vec![write]), Vec::new(), snapshot)
             .await
         {
             Ok(CommitOutcome::Committed) => return Ok(()),
@@ -458,5 +534,151 @@ async fn a_snapshot_barrier_and_a_commit_whose_preaccepts_cross_do_not_deadlock(
         started.elapsed(),
         barrier.as_ref().err().map(|e| e.reason.clone()),
         commit.as_ref().map_err(|e| e.reason.clone()),
+    );
+}
+
+/// The PostgreSQL write-skew invariant, at the engine seam (FMEA CL-72).
+///
+/// Two SERIALIZABLE transactions each read the whole `doctors` table — their
+/// `WHERE id = $1` SELECT degrades to a TABLE-level read because a bind parameter
+/// is not an inline literal — and each moves ONE doctor off call, on DISJOINT
+/// write keys. Serializable requires ONE of them to be refused: if both commit,
+/// both doctors are off call and the on-call total collapses from 1 to 0. That
+/// is the exact invariant `postgres_strict_serializable` asserts
+/// (`final_state["doctor-a"] + final_state["doctor-b"] == 1`) and violates ~50%
+/// of live runs.
+///
+/// T1 commits first, so T2's table read — taken at its BEGIN snapshot, before T1
+/// committed — is provably stale by the time T2 orders. Today the read set never
+/// reaches Accord (the commit path drops the `tables` argument), so T2's write of
+/// a DISJOINT row conflicts with nothing and it commits: the engine produces 0
+/// doctors on call. The fix must make the read table participate in the ordering
+/// so T2 is refused as a retryable serialization failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_disjoint_writer_serializes_against_a_table_the_earlier_writer_changed() {
+    let cluster = Cluster::three_nodes();
+
+    // Both BEGIN before either COMMITs — the barrier the Jepsen actors hold.
+    let first_snapshot = cluster.committers[0]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("first BEGIN");
+    let second_snapshot = cluster.committers[1]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("second BEGIN");
+
+    // Both SELECT the table: doctor-a = 1, doctor-b = 1 — so both decide to move
+    // their own doctor off call.
+    let read_tables = vec!["public.doctors".to_string()];
+
+    let first = cluster.committers[0]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "doctor-a", "doctor-a=0")]),
+            read_tables.clone(),
+            first_snapshot,
+        )
+        .await
+        .expect("first commit");
+    assert_eq!(
+        first,
+        CommitOutcome::Committed,
+        "the first writer must commit"
+    );
+
+    // T2 holds a snapshot from before T1 committed, read the table T1 changed,
+    // and writes a DISJOINT row. It must be refused, not committed.
+    let second = cluster.committers[1]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "doctor-b", "doctor-b=0")]),
+            read_tables.clone(),
+            second_snapshot,
+        )
+        .await
+        .expect("second commit");
+
+    let total = on_call_total(&cluster.appliers);
+    assert_eq!(
+        total, 1,
+        "serializable write-skew must leave ONE doctor on call; the engine applied writes \
+         leaving {total} (0 means BOTH writers committed and the on-call cell was lost); \
+         second writer outcome: {second:?}"
+    );
+    assert!(
+        matches!(second, CommitOutcome::Aborted { .. }),
+        "the second writer read a table the first writer changed after its snapshot, so it must \
+         be refused as a retryable serialization failure; got {second:?}"
+    );
+}
+
+/// The SAME workload, but genuinely simultaneous: both writers commit at once, so
+/// neither PreAccept is guaranteed to observe the other ahead of time. A correct
+/// engine must never let BOTH go off call — the read set must participate in the
+/// DISTRIBUTED ordering, not merely a local check that a different node's commit
+/// has not yet reached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_simultaneous_write_skew_writers_never_both_go_off_call() {
+    let cluster = Cluster::three_nodes();
+    let first_snapshot = cluster.committers[0]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("first BEGIN");
+    let second_snapshot = cluster.committers[1]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("second BEGIN");
+    // Force the two commits' PreAccepts to cross on the wire, so each node sees
+    // the other's transaction while its own is in flight — the live race window.
+    cluster.arm_preaccept_crossing();
+
+    let read_tables = vec!["public.doctors".to_string()];
+    let first = tokio::spawn({
+        let committer = Arc::clone(&cluster.committers[0]);
+        let tables = read_tables.clone();
+        async move {
+            committer
+                .commit_postgres(
+                    "public",
+                    staged(vec![write("public", "doctor-a", "doctor-a=0")]),
+                    tables,
+                    first_snapshot,
+                )
+                .await
+        }
+    });
+    let second = tokio::spawn({
+        let committer = Arc::clone(&cluster.committers[1]);
+        let tables = read_tables.clone();
+        async move {
+            committer
+                .commit_postgres(
+                    "public",
+                    staged(vec![write("public", "doctor-b", "doctor-b=0")]),
+                    tables,
+                    second_snapshot,
+                )
+                .await
+        }
+    });
+    let first = first
+        .await
+        .expect("first task panicked")
+        .expect("first commit");
+    let second = second
+        .await
+        .expect("second task panicked")
+        .expect("second commit");
+
+    let total = on_call_total(&cluster.appliers);
+    // Serializable permits either writer to lose; it never permits BOTH to go off
+    // call. With both PreAccepts in flight each node refuses the other, so both may
+    // abort here — the live workload retries and the survivor converges — but the
+    // on-call cell is never lost.
+    assert!(
+        total >= 1,
+        "two simultaneous write-skew writers must never BOTH go off call; the engine applied \
+         writes leaving {total} on call (0 means both committed); first: {first:?}, second: {second:?}"
     );
 }
