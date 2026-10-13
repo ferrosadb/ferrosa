@@ -1239,4 +1239,61 @@ mod tests {
         .unwrap()
         .is_some());
     }
+
+    /// A retryable serialization refusal applies NOTHING, so the transaction
+    /// that lost re-reads the exact state that made it lose. A retry issued in
+    /// the same instant as the attempt that lost therefore re-enters the same
+    /// conflict window and is refused again, however many times it retries.
+    ///
+    /// This is the measured shape of the line-298 progress assertion. Across the
+    /// recorded runs of the reliability campaign the doctor phase is normally
+    /// two attempts with one refused, but three runs had thirteen, seven and
+    /// seven refused attempts against the usual one, with the doctor state
+    /// unchanged between every one of them (A-A01, A-A04, B-B05); the run that
+    /// failed the assertion committed zero doctor updates. The engine's own log
+    /// names the refusal `error=PostgreSQL MVCC snapshot is stale`, which the
+    /// front end maps to the retryable SQLSTATE 40001.
+    ///
+    /// The budget is what bounds a retrying transaction; the pause is what stops
+    /// the retry from being a replay of the schedule that lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_transaction_is_retried_after_a_pause_not_in_the_same_instant() {
+        // Three refusals, then the commit the workload needs for progress.
+        let outcomes = [false, false, false, true];
+        let mut outcomes = outcomes.into_iter();
+        let started = std::time::Instant::now();
+        let history = retry_serializable_transactions(|| {
+            let committed = outcomes.next().expect("four attempts were budgeted");
+            async move {
+                Ok(RecordedTransaction {
+                    id: 0,
+                    invoked: 0,
+                    completed: 1,
+                    committed,
+                    operations: Vec::new(),
+                })
+            }
+        })
+        .await
+        .expect("a refusal is retried, never returned as an error");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|transaction| transaction.committed)
+                .collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "three refused retries must be paced so they are not a replay of the schedule that \
+             lost; reissuing them back to back took {elapsed:?}"
+        );
+        assert!(
+            elapsed <= std::time::Duration::from_secs(5),
+            "the retry pacing must stay bounded so a refused transaction cannot hold an actor \
+             indefinitely; it took {elapsed:?}"
+        );
+    }
 }
