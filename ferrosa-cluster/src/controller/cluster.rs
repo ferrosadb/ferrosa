@@ -1012,6 +1012,51 @@ impl ModeController {
         if self.defer_transition_if_boot_loading(&peers) {
             return;
         }
+        // RE-ENTRY CHECK, here and not at the end of this function.
+        //
+        // It used to live only beside the `try_transition_mode(Cluster)` swap
+        // below, 345 lines AFTER `open_raft_log_store_with_recovery`. That is 345
+        // lines too late: a second transition re-opened the sled Raft directory
+        // the first one's Raft already held and only then discovered the mode
+        // could not move. Two `ClusterInvite` copies that arrive together (0.34 ms
+        // apart on a real 3-node start) did exactly that, and the second one
+        // dead-ended the node in Forming with no Raft (CL-25, t_4e9a3e61). The
+        // bounded re-open schedule added for that give-up now makes it worse
+        // rather than better: a re-open can SUCCEED and install a second Raft over
+        // the first one's store.
+        //
+        // Refuse before any of the work: nothing below this line runs for a node
+        // that is already a cluster member, so the sled directory is never touched.
+        // The modes that MUST still transition are unaffected —
+        // `can_transition_to(Cluster)` allows Standalone, Pair, Forming,
+        // DegradedPair and DegradedCluster (the rejoin path that rebuilds Raft from
+        // persisted state, `RejoinClusterWithRaftInit`), and refuses only Cluster.
+        let current = self.mode();
+        if current == DeploymentMode::Cluster {
+            tracing::error!(
+                %current,
+                "refusing a second cluster transition: this node is already a cluster member \
+                 and its Raft holds the log store; re-opening it would race that sled \
+                 directory lock (CL-25)"
+            );
+            return;
+        }
+        if !current.can_transition_to(DeploymentMode::Cluster) {
+            tracing::error!(
+                %current,
+                target = %DeploymentMode::Cluster,
+                "refusing illegal mode transition; staying in the current mode"
+            );
+            return;
+        }
+        if self.raft().is_some() {
+            tracing::error!(
+                %current,
+                "refusing a second cluster transition: this node already runs a Raft instance; \
+                 a second one would re-open the log store the first holds (CL-25)"
+            );
+            return;
+        }
         // `peers` are internode addresses as tracked in `connected_peers`: the
         // address dialled for an outbound peer, the resolved advertised
         // address for an inbound one. They used to be rewritten to each

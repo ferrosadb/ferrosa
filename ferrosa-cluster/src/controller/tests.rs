@@ -5314,10 +5314,10 @@ async fn a_raft_log_store_give_up_does_not_dead_end_the_transition() {
 /// both called `transition_to_cluster`; the second re-opened the sled Raft
 /// directory the first one's Raft already held, exhausted the ~490 ms retry
 /// budget and returned, dead-ending the node in Forming with no Raft (FMEA CL-25,
-/// whose two named regressions —
-/// `a_cluster_invite_transitions_only_under_the_transition_guard` and
-/// `a_second_cluster_transition_is_refused_at_once` — do not exist in the tree;
-/// the give-up itself is in the node log of t_4e9a3e61).
+/// whose two named regressions are this test and
+/// `a_second_cluster_transition_is_refused_at_once`; the give-up itself is in the
+/// node log of t_4e9a3e61). The guard line is what an earlier commit's note claimed
+/// this handler already had — it did not have it until the commit that added it.
 ///
 /// RED as written: without the guard the handler leaves Pair inside the window
 /// below, so this assertion fails on that behaviour. The window is generous
@@ -5414,6 +5414,78 @@ async fn a_cluster_invite_transitions_only_under_the_transition_guard() {
     assert_ne!(
         controller.mode(),
         DeploymentMode::Pair,
-        "with the guard free the invite must still drive the transition"
+        "with the guard free the invite message must still drive the transition"
+    );
+}
+
+/// A SECOND cluster transition must be refused AT ONCE — before it opens the Raft
+/// log store — and not 345 lines after the sled open, where the re-entry check
+/// used to sit. FMEA CL-25 names this as its second regression.
+///
+/// The node here is already a cluster member: the first transition has moved the
+/// mode to Cluster. A second transition therefore re-opens the sled Raft directory
+/// the running Raft holds. The old end-of-function `try_transition_mode(Cluster)`
+/// only reported that, and only after the open; and it could not even report it for
+/// a node already in Cluster, because `try_transition_mode_swap` treats
+/// `current == target` as success. With the bounded re-open schedule the give-up
+/// recovery now uses, a second open can also SUCCEED instead of giving up, so
+/// nothing downstream stops a second Raft being installed over the first.
+///
+/// The detector is the log store's own directory: the refusal returns before
+/// `create_dir_all(&raft_dir)`, so a refused second transition cannot even create
+/// it. No sleep and no lock holder are needed, which keeps the test deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_cluster_transition_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+    let raft_dir = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &controller.config.data_center,
+    );
+    assert!(
+        !raft_dir.exists(),
+        "the fixture must start with no Raft log store at {}",
+        raft_dir.display()
+    );
+
+    controller.on_peer_connected((peer_id, peer_addr));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the fixture must reach Pair before the transitions"
+    );
+
+    // What the FIRST copy of a ClusterInvite leaves behind: the mode is Cluster
+    // and Raft is up (the fixture has no peer to run a real Raft against, and the
+    // mode is the state the re-entry check reads).
+    assert!(
+        controller.try_transition_mode(DeploymentMode::Cluster),
+        "the fixture must be able to reach Cluster"
+    );
+
+    let started = std::time::Instant::now();
+    controller.transition_to_cluster(vec![(peer_id, peer_addr)]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        !raft_dir.exists(),
+        "a second cluster transition must be refused BEFORE it opens the Raft log \
+         store; it created {} instead (CL-25). It took {elapsed:?}.",
+        raft_dir.display()
+    );
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Cluster,
+        "the refusal must leave the mode alone"
+    );
+    assert!(
+        controller.raft().is_none(),
+        "a refused second transition must not install a Raft instance"
+    );
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "the second transition must be refused at once; without the re-entry check it \
+         reaches the sled open and waits out the lock-retry budget (~490 ms) and then \
+         the bounded re-open schedule (a further 3 s) before it gives up (took {elapsed:?})"
     );
 }
