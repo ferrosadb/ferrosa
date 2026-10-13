@@ -432,6 +432,20 @@ impl LockRetryPolicy {
     };
 }
 
+/// Production's attempt cap before the sled directory-lock retry gives up —
+/// `LockRetryPolicy::DEFAULT.max_attempts`.
+///
+/// Exposed so the controller's log-store recovery test can tell the give-up
+/// apart from the recovery's first re-open: `open_sled_db_with_policy` counts
+/// attempts PER CALL, so the recovery's new open starts again at 1. The
+/// (cap + 1)-th contention notification therefore marks the recovery's first
+/// attempt, whatever the production cap becomes.
+///
+/// Test-only: nothing in the library reads it, so a plain `--lib` build would
+/// otherwise dead-code it under `-D warnings`.
+#[cfg(test)]
+pub(crate) const SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP: u32 = LockRetryPolicy::DEFAULT.max_attempts;
+
 #[cfg(test)]
 type ContentionHook = std::rc::Rc<dyn Fn(u32)>;
 
@@ -449,6 +463,20 @@ fn notify_contention_hook(attempt: u32) {
     if let Some(hook) = hook {
         hook(attempt);
     }
+}
+
+/// Install the test seam from outside this module: `open_raft_log_store_*` runs
+/// on the caller's thread, so a test driving a transition can observe the
+/// contention it causes without sleeping at the open site.
+#[cfg(test)]
+pub(crate) fn set_contention_hook(hook: impl Fn(u32) + 'static) {
+    CONTENTION_HOOK.with(|h| *h.borrow_mut() = Some(std::rc::Rc::new(hook)));
+}
+
+/// Remove the observer installed by [`set_contention_hook`].
+#[cfg(test)]
+pub(crate) fn clear_contention_hook() {
+    CONTENTION_HOOK.with(|h| *h.borrow_mut() = None);
 }
 
 #[allow(clippy::result_large_err)] // StorageIOError is 224 bytes — dictated by openraft
@@ -596,7 +624,11 @@ impl SledLogStore {
     /// True only for the transient "directory lock already held" condition,
     /// not a real corruption/IO fault. sled wraps the OS `EWOULDBLOCK` as
     /// `Error::Io` whose message contains "could not acquire lock".
-    fn is_lock_contention(err: &sled::Error) -> bool {
+    ///
+    /// `pub(crate)`: the controller's post-give-up recovery
+    /// (`open_raft_log_store_with_recovery`) must tell a transient
+    /// in-process lock contention from a real fault before it re-opens.
+    pub(crate) fn is_lock_contention(err: &sled::Error) -> bool {
         match err {
             sled::Error::Io(io) => {
                 io.kind() == std::io::ErrorKind::WouldBlock

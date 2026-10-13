@@ -33,8 +33,9 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use tokio_postgres::config::SslMode;
@@ -65,14 +66,56 @@ struct Ports {
     flight: u16,
 }
 
+/// Every port this test binary has handed out, process-wide.
+///
+/// `#[test]` functions run on separate threads of one process, each with its
+/// own `taken` set, so a per-test set alone lets two tests draw the SAME port:
+/// [`free_port`] binds `:0`, reads the port and drops the listener, and the
+/// port is then free for the other test to draw too. The global set closes that
+/// window. The sibling never-ready fixture is where it showed: its node's
+/// PostgreSQL listener reported `Address already in use` under load, because a
+/// port another test had been handed was still bound (t_4e9a3e61).
+fn reserved_ports() -> &'static std::sync::Mutex<HashSet<u16>> {
+    static RESERVED: std::sync::OnceLock<std::sync::Mutex<HashSet<u16>>> =
+        std::sync::OnceLock::new();
+    RESERVED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
+}
+
+/// Whether a connection to `port` is REFUSED — i.e. nothing is listening on it
+/// right now.
+///
+/// The bind-then-drop in [`free_port`] proves the port was free a moment ago;
+/// this proves nothing holds it NOW. A stale listener (a container runtime's
+/// proxy, a peer test's node) answers the connect, and this node's own bind
+/// would then fail `Address already in use` — a harness accident reported as a
+/// product red.
+fn port_is_refused(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err()
+}
+
+/// A port no other test in this process holds and nothing is listening on.
+///
+/// Retries on every collision rather than taking the first ephemeral port the
+/// kernel offers: a port can be spoken for by this process, or already bound by
+/// something outside it.
 fn free_port(taken: &mut HashSet<u16>) -> u16 {
-    for _ in 0..200 {
+    for _ in 0..500 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        if taken.insert(port) {
-            return port;
+        // Genuinely free: refused now (nothing outside holds it) and not
+        // claimed by another test or an earlier allocation in this one.
+        if !port_is_refused(port) {
+            continue;
         }
+        if !taken.insert(port) {
+            continue;
+        }
+        if !reserved_ports().lock().unwrap().insert(port) {
+            continue;
+        }
+        return port;
     }
     panic!("could not allocate a free port");
 }
@@ -127,6 +170,7 @@ impl Node {
             &self.host_id,
             cluster_name,
             seed,
+            &[],
         );
     }
 }
@@ -137,14 +181,54 @@ impl Drop for Node {
     }
 }
 
-/// Launch one `ferrosa` process against an existing data directory.
+/// Exec the node binary once so the OS has it mapped, validated and warm.
+///
+/// Every `cargo test` invocation RELINKS the 336 MB `ferrosa` binary: the
+/// crate's build script re-runs on each build, because `build.rs` watches
+/// `../.git/HEAD` and in a git worktree `../.git` is a *file*, not a directory,
+/// so the watched path never exists and cargo treats it as always changed
+/// (`Compiling ferrosa v0.22.0` on every run). macOS's first exec of a freshly
+/// written binary then stalls ~7 s inside `_dyld_start` — code-signature
+/// validation plus a cold page-in of the image (measured: 7.08 s for a fresh
+/// copy, 0.03 s for the next exec; 1.6 s after a bare `touch`).
+///
+/// That stall lands inside EVERY timed window in this file and reads as a node
+/// that is slow to boot. It is a build/host artifact, not node behaviour, so it
+/// is paid once here, before any window opens — the readiness wait's 5 s
+/// detector above all (t_4e9a3e61). `--version` prints one line and exits before
+/// the node does any setup.
+fn warm_node_binary() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let started = Instant::now();
+        match Command::new(env!("CARGO_BIN_EXE_ferrosa"))
+            .arg("--version")
+            .stdin(Stdio::null())
+            .output()
+        {
+            Ok(out) => eprintln!(
+                "harness: warmed the node binary in {:.2?} ({}) — the first exec of a \
+                 freshly linked debug binary stalls in dyld on this host",
+                started.elapsed(),
+                String::from_utf8_lossy(&out.stdout).trim()
+            ),
+            Err(e) => panic!("could not exec the node binary to warm it: {e}"),
+        }
+    });
+}
+
+/// Launch one `ferrosa` process against an existing data directory. `extra_env`
+/// is the caller's addition to the node's environment (the fault-injection seam
+/// the harness tests use); it is applied last, so a test can override anything.
 fn spawn_child(
     data_dir: &Path,
     ports: Ports,
     host_id: &str,
     cluster_name: &str,
     seed: Option<&str>,
+    extra_env: &[(&str, &str)],
 ) -> Child {
+    warm_node_binary();
     let log = std::fs::File::create(data_dir.join("node.log")).expect("create node log");
     let stderr = log.try_clone().expect("clone log handle");
 
@@ -179,6 +263,7 @@ fn spawn_child(
     if let Some(seed) = seed {
         cmd.env("FERROSA_SEED", seed);
     }
+    cmd.envs(extra_env.iter().copied());
     cmd.spawn().expect("spawn ferrosa node")
 }
 
@@ -189,8 +274,20 @@ fn spawn_node(
     cluster_name: &str,
     seed: Option<&str>,
 ) -> Node {
+    spawn_node_with_env(dir, ports, host_id, cluster_name, seed, &[])
+}
+
+/// [`spawn_node`] with extra environment for the node process.
+fn spawn_node_with_env(
+    dir: tempfile::TempDir,
+    ports: Ports,
+    host_id: String,
+    cluster_name: &str,
+    seed: Option<&str>,
+    extra_env: &[(&str, &str)],
+) -> Node {
     let data_dir = dir.path().to_path_buf();
-    let child = spawn_child(&data_dir, ports, &host_id, cluster_name, seed);
+    let child = spawn_child(&data_dir, ports, &host_id, cluster_name, seed, extra_env);
     Node {
         _dir: dir,
         data_dir,
@@ -202,21 +299,87 @@ fn spawn_node(
 
 // ── readiness ─────────────────────────────────────────────────────────────────
 
-/// A minimal HTTP/1.1 GET. Returns the raw response text, or `None` if the
-/// listener is not up yet.
-fn http_get(port: u16, path: &str, authorization: Option<&str>) -> Option<String> {
+/// The connect timeout for a readiness probe.
+///
+/// A loopback listener that is UP accepts at once, so this only bounds the "not
+/// listening yet" case. Short on purpose — see [`PROBE_READ_TIMEOUT`].
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// The read timeout for an UNAUTHENTICATED readiness probe (`/readyz`,
+/// `/metrics`).
+///
+/// A live `/readyz` answers in single-digit milliseconds even with the node
+/// under contention, so this is generous for a real answer and still short
+/// enough that an exit DURING a stalled probe costs well under the 5 s detector
+/// budget of `a_node_that_dies_at_startup_fails_the_readiness_wait_at_once`. The
+/// former 3 s read let a listener that had accepted but was shutting down hold
+/// each poll for the full 3 s — one to two such rounds are what stretched that
+/// test to 5.6-8.7 s (t_4e9a3e61).
+///
+/// This bound is for the UNAUTHENTICATED probes only. The authenticated status
+/// probe pays a bcrypt and gets its own, larger budget — see
+/// [`AUTH_PROBE_READ_TIMEOUT`].
+const PROBE_READ_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The read timeout for an AUTHENTICATED probe — `GET /api/cluster/status`,
+/// which sits behind the web console's Basic-auth middleware.
+///
+/// This is a different request from the unauthenticated `/readyz` probe that
+/// [`PROBE_READ_TIMEOUT`] bounds, and 500 ms is wrong for it. The middleware
+/// verifies the credential with a bcrypt `cost=12` comparison
+/// (`ferrosa/src/web/auth.rs`): measured at **0.62 s** on a cold `AuthCache` on
+/// this host, ~0.5 ms on a hit. The cache is keyed on the live schema `Arc` and
+/// invalidated by any schema mutation, so while a cluster bootstraps the entry
+/// churns — the failing runs' node logs carried an `AuthSuccess` every ~1.78 s —
+/// and a probe pays the full bcrypt. Under the former 500 ms budget every such
+/// probe timed out and `ddl_path_is_cluster` reported `false` for a node whose
+/// DDL path was in fact `cluster`, so the panic asserted a product fact the
+/// harness never observed (t_c8625592).
+///
+/// 5 s is the bound `ferrosa-cluster/src/ddl_path.rs` puts on every other wait on
+/// the DDL path, and ~8x the measured cold bcrypt — headroom for the loaded hosts
+/// the real-node tests share. It bounds ONE probe, not the wait: the 240 s
+/// formation budget in `wait_cluster_ddl_ready` is unchanged.
+const AUTH_PROBE_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A minimal HTTP/1.1 GET bounded by `read_timeout`.
+///
+/// Returns the raw response text, or a human-readable reason no answer arrived.
+/// The reason is kept rather than collapsed into `None` so a caller can tell a
+/// probe that TIMED OUT from an answer that said something — collapsing those
+/// two is what let a timed-out probe be reported as `ddl_path=false`
+/// (t_c8625592). `authorization` is a full header value terminated with CRLF, or
+/// `None` for the unauthenticated probes.
+fn http_get(
+    port: u16,
+    path: &str,
+    authorization: Option<&str>,
+    read_timeout: Duration,
+) -> Result<String, String> {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(500)).ok()?;
-    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let mut stream = TcpStream::connect_timeout(&addr, PROBE_CONNECT_TIMEOUT)
+        .map_err(|e| format!("not listening: connect failed ({e})"))?;
+    stream
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|e| format!("cannot set the probe read timeout: {e}"))?;
     let auth = authorization
         .map(|a| format!("Authorization: {a}\r\n"))
         .unwrap_or_default();
     let request =
         format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Connection: close\r\n\r\n");
-    stream.write_all(request.as_bytes()).ok()?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("request write failed: {e}"))?;
     let mut body = String::new();
-    stream.read_to_string(&mut body).ok()?;
-    Some(body)
+    stream
+        .read_to_string(&mut body)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                format!("no answer within {read_timeout:?} — the read timed out")
+            }
+            _ => format!("reading the answer failed: {e}"),
+        })?;
+    Ok(body)
 }
 
 /// Extract a top-level `"key":"value"` string field from a small flat JSON object,
@@ -229,26 +392,204 @@ fn json_str(body: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+/// How many trailing log lines a failing harness prints.
+const LOG_TAIL_LINES: usize = 40;
+
+/// The line a diagnostic must not leave out: what a tail-only dump cannot show.
+const NO_FATAL_LINE: &str = "none — the log has no FATAL/ERROR line";
+
+/// Whether a log line says the node was failing: the synchronous `FATAL:` line
+/// `lifecycle` writes when a thread panics (and the bare one it also writes to
+/// stderr), or a line carrying the `ERROR` level.
+///
+/// The level is surrounded by spaces because tracing prints the timestamp and
+/// the target first (`2026-…Z ERROR ferrosa_cluster::pair::ddl: …`).
+fn is_fatal_line(line: &str) -> bool {
+    line.contains("FATAL:") || line.contains(" ERROR ") || line.starts_with("ERROR ")
+}
+
+/// The FIRST line in `log` that says why the node stopped.
+///
+/// The tail alone is not the evidence. In the merge-queue failure of PR #551
+/// (job 115370033050) the node's last line was 74 s before the harness gave up,
+/// so the 40 lines it printed were the shutdown — the cause (the `ERROR
+/// PairSchemaSync REFUSED` storm) sat above them. The first fatal/ERROR line is
+/// the one that names the failure (t_4e9a3e61).
+fn first_fatal_line(log: &str) -> Option<&str> {
+    log.lines().find(|line| is_fatal_line(line))
+}
+
+/// The last `/readyz` answer the harness saw, so a wait that expires can name
+/// the CONDITION the node was reporting rather than only the process state.
+///
+/// An alive-but-unready node answers `503` with a body saying what it is waiting
+/// for (`{"ready":false,"waiting_for":"raft_leader"}`). The wait this harness
+/// replaced threw that body away, so a node patiently reporting its condition
+/// was indistinguishable from a dead one — and CI could never have shown which
+/// condition it was (t_4e9a3e61).
+struct Probe {
+    /// HTTP status of the answer.
+    status: u16,
+    /// The body — the node's own statement of why it is not ready.
+    body: String,
+}
+
+/// Split a raw HTTP response — [`http_get`] returns the whole thing, status line
+/// and headers included — into its status code and body.
+fn parse_probe(raw: &str) -> Option<Probe> {
+    let (head, body) = raw.split_once("\r\n\r\n")?;
+    let status = head
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    Some(Probe {
+        status,
+        body: body.trim().to_string(),
+    })
+}
+
+/// The condition a `/readyz` body names, or the body itself when it names none.
+///
+/// `waiting_for` is the field the node uses to say what it is waiting on. It is
+/// present on every not-ready answer (`ferrosa/src/web/readiness.rs`) and is the
+/// thing a failing harness has to quote.
+fn probe_condition(body: &str) -> String {
+    match json_str(body, "waiting_for") {
+        Some(condition) => format!("waiting_for=\"{condition}\""),
+        None => body.chars().take(200).collect(),
+    }
+}
+
+/// The body of every readiness failure this harness reports: a headline, the
+/// CONDITION the node reported (its `/readyz` answer, or that it exited), the
+/// node's first fatal/ERROR line, and its log tail.
+fn readiness_failure_message(headline: &str, condition: &str, log: &str) -> String {
+    format!(
+        "{headline}\n  node reported: {condition}\n  first fatal/ERROR line: {}\n  log tail (last {LOG_TAIL_LINES} lines):\n{}",
+        first_fatal_line(log).unwrap_or(NO_FATAL_LINE),
+        tail(log, LOG_TAIL_LINES)
+    )
+}
+
+/// What the harness must say when the node process is GONE: the exit status,
+/// when it went, and the node's own first fatal line. Waiting out the budget on
+/// a process that already exited hides the cause and wastes the round.
+fn node_exit_message(
+    host_id: &str,
+    web_port: u16,
+    status: &ExitStatus,
+    waited: Duration,
+    log: &str,
+) -> String {
+    readiness_failure_message(
+        &format!(
+            "node {host_id} exited {waited:?} into the readiness wait: {status}; web={web_port}"
+        ),
+        "the process is gone — it can report no /readyz condition",
+        log,
+    )
+}
+
+/// What the harness must say when the node is still running but never answered
+/// ready: the budget it spent, the CONDITION the node itself reported on
+/// `/readyz` (or that it never answered at all), and its first fatal line
+/// beside the tail.
+fn readiness_timeout_message(
+    host_id: &str,
+    web_port: u16,
+    timeout: Duration,
+    last_probe: Option<&Probe>,
+    log: &str,
+) -> String {
+    let condition = match last_probe {
+        Some(probe) => format!(
+            "HTTP {} from /readyz: {}",
+            probe.status,
+            probe_condition(&probe.body)
+        ),
+        None => {
+            format!("/readyz on web={web_port} never answered — connection refused or timed out")
+        }
+    };
+    readiness_failure_message(
+        &format!("node {host_id} did not become ready within {timeout:?}; web={web_port}"),
+        &condition,
+        log,
+    )
+}
+
+/// The failure message if the node process is already GONE, else `None`.
+fn node_gone_message(node: &mut Node, started: Instant) -> Option<String> {
+    let status = node.child.try_wait().expect("try_wait on the node")?;
+    let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+    Some(node_exit_message(
+        &node.host_id,
+        node.ports.web,
+        &status,
+        started.elapsed(),
+        &log,
+    ))
+}
+
 /// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
-/// every listener up). Panics with the node log if it never does.
-fn wait_ready(node: &Node, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+/// every listener up).
+///
+/// Two failure modes, and each is named with what the node reported:
+///
+/// * the process has EXITED — it can never report ready, and polling it costs
+///   the whole budget (the last line of that node's log was 74 s before the
+///   panic in the merge-queue failure of PR #551, job 115370033050). The child is
+///   checked on every poll and its exit fails the wait at once.
+/// * the node is ALIVE but never ready — its `/readyz` body says what it is
+///   waiting for, and the failure quotes that condition rather than leaving the
+///   reader with a tail. An alive node reporting `waiting_for` used to look
+///   exactly like a dead one (t_4e9a3e61).
+///
+/// The exit check runs BOTH sides of the probe. A probe is bounded by
+/// [`PROBE_CONNECT_TIMEOUT`] and [`PROBE_READ_TIMEOUT`], so an exit during one
+/// can delay the check by at most one probe — never by a whole poll tick, which
+/// is what the former 3 s read cost (5.6-8.7 s to notice a dead child).
+fn wait_ready(node: &mut Node, timeout: Duration) {
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut last_probe: Option<Probe> = None;
     loop {
-        if let Some(body) = http_get(node.ports.web, "/readyz", None) {
-            if body.contains("\"ready\":true") {
+        if let Some(message) = node_gone_message(node, started) {
+            panic!("{message}");
+        }
+        let raw = http_get(node.ports.web, "/readyz", None, PROBE_READ_TIMEOUT);
+        // An exit DURING the probe must not wait for the next tick. The probe
+        // is bounded (a live /readyz answers in milliseconds; a listener that
+        // accepted and then stalled is cut off by the read timeout), so this
+        // keeps the check within about one probe of the exit.
+        if let Some(message) = node_gone_message(node, started) {
+            panic!("{message}");
+        }
+        if let Ok(raw) = raw {
+            if raw.contains("\"ready\":true") {
                 return;
+            }
+            if let Some(probe) = parse_probe(&raw) {
+                last_probe = Some(probe);
             }
         }
         if Instant::now() >= deadline {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
             panic!(
-                "node {} did not become ready within {timeout:?}; web={} log tail:\n{}",
-                node.host_id,
-                node.ports.web,
-                tail(&log, 40)
+                "{}",
+                readiness_timeout_message(
+                    &node.host_id,
+                    node.ports.web,
+                    timeout,
+                    last_probe.as_ref(),
+                    &log
+                )
             );
         }
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -258,6 +599,8 @@ fn tail(text: &str, lines: usize) -> String {
 }
 
 /// Every node's log tail, labelled — the evidence a failing harness must show.
+/// Each block also leads with that node's first fatal/ERROR line, because a tail
+/// can start after the cause (t_4e9a3e61).
 fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
     nodes
         .iter()
@@ -265,9 +608,10 @@ fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
         .map(|(i, n)| {
             let log = std::fs::read_to_string(n.log_path()).unwrap_or_default();
             format!(
-                "\n===== node {i} host {} (web {}) log tail =====\n{}",
+                "\n===== node {i} host {} (web {}) first fatal/ERROR line: {}; log tail =====\n{}",
                 n.host_id,
                 n.ports.web,
+                first_fatal_line(&log).unwrap_or(NO_FATAL_LINE),
                 tail(&log, lines)
             )
         })
@@ -278,7 +622,8 @@ fn dump_all_logs(nodes: &[Node], lines: usize) -> String {
 /// `/metrics` endpoint — the Raft leader that a DDL `client_write` will apply on.
 fn find_leader(nodes: &[Node]) -> Option<usize> {
     nodes.iter().position(|node| {
-        http_get(node.ports.web, "/metrics", None)
+        http_get(node.ports.web, "/metrics", None, PROBE_READ_TIMEOUT)
+            .ok()
             .map(|body| {
                 body.lines()
                     .any(|line| line.trim() == "ferrosa_raft_is_leader 1")
@@ -287,11 +632,66 @@ fn find_leader(nodes: &[Node]) -> Option<usize> {
     })
 }
 
-/// Whether this node has installed the Raft-replicated `DdlPath::Cluster`.
-fn ddl_path_is_cluster(node: &Node) -> bool {
-    http_get(node.ports.web, "/api/cluster/status", Some(ADMIN_BASIC))
-        .map(|body| json_str(&body, "ddl_path").as_deref() == Some("cluster"))
-        .unwrap_or(false)
+/// One node's answer to the AUTHENTICATED `GET /api/cluster/status` probe.
+///
+/// A `bool` here conflated two different facts — "this node is NOT on the cluster
+/// DDL path" and "this probe never got an answer" — so a probe cut off by a cold
+/// bcrypt was reported as `ddl_path=false`, a product fact the harness had not
+/// observed (t_c8625592).
+#[derive(Debug)]
+enum DdlProbe {
+    /// The node answered and reports `"ddl_path":"cluster"`.
+    Cluster,
+    /// The node answered, but its DDL path is something else. The string is the
+    /// path the node itself named.
+    Other(String),
+    /// No usable answer inside [`AUTH_PROBE_READ_TIMEOUT`]: the listener was not
+    /// up, the read timed out under a cold bcrypt, or the answer named no
+    /// `ddl_path`. This is NOT evidence about the node's DDL path.
+    NoAnswer(String),
+}
+
+impl DdlProbe {
+    fn is_cluster(&self) -> bool {
+        matches!(self, DdlProbe::Cluster)
+    }
+
+    /// How this probe's outcome reads in a failure, in terms that do not
+    /// overstate what was observed.
+    fn describe(&self) -> String {
+        match self {
+            DdlProbe::Cluster => "cluster".to_string(),
+            DdlProbe::Other(path) => format!("not cluster (ddl_path=\"{path}\")"),
+            DdlProbe::NoAnswer(why) => {
+                format!("NO ANSWER ({why}) — not evidence about the DDL path")
+            }
+        }
+    }
+}
+
+/// Probe whether this node has installed the Raft-replicated `DdlPath::Cluster`.
+///
+/// The read budget is [`AUTH_PROBE_READ_TIMEOUT`], not [`PROBE_READ_TIMEOUT`]:
+/// this request is authenticated and can pay a bcrypt `cost=12`.
+fn ddl_path_probe(node: &Node) -> DdlProbe {
+    match http_get(
+        node.ports.web,
+        "/api/cluster/status",
+        Some(ADMIN_BASIC),
+        AUTH_PROBE_READ_TIMEOUT,
+    ) {
+        Ok(raw) => match json_str(&raw, "ddl_path") {
+            Some(path) if path == "cluster" => DdlProbe::Cluster,
+            Some(path) => DdlProbe::Other(path),
+            None => DdlProbe::NoAnswer(format!(
+                "answered {} but named no ddl_path",
+                parse_probe(&raw)
+                    .map(|p| format!("HTTP {}", p.status))
+                    .unwrap_or_else(|| "an unparseable response".to_string())
+            )),
+        },
+        Err(why) => DdlProbe::NoAnswer(why),
+    }
 }
 
 /// Wait until a Raft leader has been elected AND **every** node reports the
@@ -299,41 +699,91 @@ fn ddl_path_is_cluster(node: &Node) -> bool {
 ///
 /// Both conditions are polled per node on a generous budget (formation is not a
 /// timed production limit — a flat 60 s that is too short only ever costs a
-/// round). On timeout it dumps **every** node's log tail: a harness that fails
-/// without showing why is worth nothing.
+/// round). On timeout it dumps **every** node's log tail — and it distinguishes a
+/// node that ANSWERED "not cluster" from a probe that never answered, so the
+/// failure never asserts a product fact the harness did not observe.
 async fn wait_cluster_ddl_ready(nodes: &[Node], budget: Duration) -> usize {
     let deadline = Instant::now() + budget;
     loop {
-        let ddl: Vec<bool> = nodes.iter().map(ddl_path_is_cluster).collect();
+        let ddl: Vec<DdlProbe> = nodes.iter().map(ddl_path_probe).collect();
         let leader = find_leader(nodes);
         if let Some(leader) = leader {
-            if ddl.iter().all(|ready| *ready) {
+            if ddl.iter().all(DdlProbe::is_cluster) {
                 return leader;
             }
         }
         if Instant::now() >= deadline {
+            let per_node: String = ddl
+                .iter()
+                .enumerate()
+                .map(|(i, probe)| format!("  node {i}: {}", probe.describe()))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let silent = ddl
+                .iter()
+                .filter(|probe| matches!(probe, DdlProbe::NoAnswer(_)))
+                .count();
             let logs: String = nodes
                 .iter()
                 .enumerate()
                 .map(|(i, n)| {
                     let log = std::fs::read_to_string(n.log_path()).unwrap_or_default();
                     format!(
-                        "\n===== node {i} host {} (web {}) ddl_path={} log tail =====\n{}",
+                        "\n===== node {i} host {} (web {}) ddl_path: {}; log tail =====\n{}",
                         n.host_id,
                         n.ports.web,
-                        ddl[i],
+                        ddl[i].describe(),
                         tail(&log, 80)
                     )
                 })
                 .collect();
             panic!(
                 "cluster did not elect a Raft leader and install the replicated DDL path on \
-                 every node within {budget:?} (leader={leader:?}, ddl_path_per_node={ddl:?}):\
-                 {logs}"
+                 every node within {budget:?} (leader={leader:?});\nper node:\n{per_node}\n\
+                 {silent} of {N_NODES} probes produced NO ANSWER — a probe that timed out \
+                 (a cold bcrypt can exceed any probe budget) is NOT evidence that the node \
+                 is off the cluster DDL path.{logs}"
             );
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// A probe that got no answer must NOT be reported as "not cluster": the failure
+/// has to distinguish "never answered" from "answered: not cluster", or a
+/// timed-out probe asserts a product fact the harness never observed — the bug
+/// that made a real node read `ddl_path=false` for a node whose path was
+/// `cluster` (t_c8625592).
+#[test]
+fn a_probe_that_never_answered_is_not_reported_as_not_cluster() {
+    let timed_out = DdlProbe::NoAnswer(format!(
+        "no answer within {AUTH_PROBE_READ_TIMEOUT:?} — the read timed out"
+    ));
+    let refused = DdlProbe::NoAnswer("not listening: connect failed (Connection refused)".into());
+    let answered = DdlProbe::Other("pair".to_string());
+
+    assert!(!timed_out.is_cluster() && !refused.is_cluster() && !answered.is_cluster());
+
+    let t = timed_out.describe();
+    let a = answered.describe();
+    assert_ne!(
+        t, a,
+        "a timed-out probe must read differently from a real 'not cluster' answer"
+    );
+    assert!(
+        t.contains("timed out"),
+        "the probe must say it TIMED OUT, not merely report false: {t}"
+    );
+    assert!(
+        t.contains("NO ANSWER") && t.contains("not evidence"),
+        "a probe with no answer must not claim the node is off the path: {t}"
+    );
+    assert!(
+        a.contains("not cluster") && a.contains("pair"),
+        "an answer must quote the path the node named: {a}"
+    );
+    assert_eq!(DdlProbe::Cluster.describe(), "cluster");
+    assert!(DdlProbe::Cluster.is_cluster());
 }
 
 // ── PostgreSQL wire ───────────────────────────────────────────────────────────
@@ -474,7 +924,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
         let node = spawn_node(dir, *ports, host_id, &cluster_name, Some(&seeds_for(i)));
         nodes.push(node);
     }
-    for node in &nodes {
+    for node in nodes.iter_mut() {
         wait_ready(node, Duration::from_secs(90));
     }
 
@@ -619,4 +1069,276 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
         ),
         Err(_) => { /* relation does not exist — the durable drop held */ }
     }
+}
+
+// ── a node that dies on its way up ─────────────────────────────────────────────
+
+/// A readiness failure must quote the node's FIRST fatal/ERROR line, not only a
+/// tail that can start after the cause. In the merge-queue failure of PR #551 the
+/// dumped tail began at the node's shutdown and the `PairSchemaSync REFUSED`
+/// storm that named the trouble sat above it (t_4e9a3e61).
+#[test]
+fn a_readiness_failure_leads_with_the_first_fatal_line_not_only_the_tail() {
+    // 60 lines, with the ERROR second: the 40-line tail cannot contain it.
+    let mut log = String::from(
+        "2026-10-13T15:13:00.000000Z  INFO ferrosa: ferrosa starting\n\
+         2026-10-13T15:13:01.000000Z ERROR ferrosa_cluster::pair::ddl: PairSchemaSync REFUSED: \
+         this node is the pair primary and its schema is authoritative peer=33333333\n",
+    );
+    for n in 0..58 {
+        log.push_str(&format!(
+            "2026-10-13T15:13:02.000000Z  INFO ferrosa_net::lane_actor: filler {n}\n"
+        ));
+    }
+    log.push_str(
+        "2026-10-13T15:13:16.000000Z  INFO ferrosa_net::lane_actor: lane actor: shutting down lane=Data\n",
+    );
+
+    let tail_lines: Vec<&str> = log.lines().rev().take(LOG_TAIL_LINES).collect();
+    assert_eq!(
+        log.lines()
+            .filter(|l| l.contains("PairSchemaSync REFUSED"))
+            .count(),
+        1,
+        "the fixture holds exactly one fatal line"
+    );
+    assert!(
+        !tail_lines
+            .iter()
+            .any(|l| l.contains("PairSchemaSync REFUSED")),
+        "the fixture must put the ERROR above the tail, or this test proves nothing"
+    );
+
+    let message = readiness_failure_message("headline", "waiting_for=\"raft_leader\"", &log);
+    assert!(
+        message.contains(
+            "first fatal/ERROR line: 2026-10-13T15:13:01.000000Z ERROR \
+             ferrosa_cluster::pair::ddl: PairSchemaSync REFUSED"
+        ),
+        "the first fatal line is the evidence, not the tail:\n{message}"
+    );
+    assert!(
+        message.contains("lane actor: shutting down lane=Data"),
+        "the tail is still printed beside it:\n{message}"
+    );
+
+    let silent = readiness_failure_message("headline", "HTTP 503 from /readyz", "INFO a\nINFO b\n");
+    assert!(
+        silent.contains(NO_FATAL_LINE),
+        "a log with nothing fatal in it must say so:\n{silent}"
+    );
+}
+
+/// A node exit is the one readiness failure the harness can settle at once: it
+/// must name the exit status, when it happened, and the node's first fatal line.
+#[test]
+fn a_node_exit_is_named_with_its_status_and_its_first_fatal_line() {
+    use std::os::unix::process::ExitStatusExt;
+    // The shape `fatal_exit(70, ..)` after an injected worker panic leaves.
+    let status = ExitStatus::from_raw(70 << 8);
+    let log = "2026-10-13T17:10:06.639956Z FATAL: thread 'fault-injected' panicked at \
+               ferrosa/src/main.rs:1863:27: injected fault: worker thread panic\n\
+               2026-10-13T17:10:06.671163Z ferrosa exiting code=70 reason=injected fault\n";
+
+    let message = node_exit_message(
+        "11111111-1111-1111-1111-111111111111",
+        33385,
+        &status,
+        Duration::from_millis(700),
+        log,
+    );
+    assert!(
+        message.contains(
+            "node 11111111-1111-1111-1111-111111111111 exited 700ms into the \
+                          readiness wait: exit status: 70"
+        ),
+        "the headline names the exit status and when it happened:\n{message}"
+    );
+    assert!(
+        message.contains("FATAL: thread 'fault-injected' panicked at"),
+        "and quotes the node's own first fatal line:\n{message}"
+    );
+
+    let timed_out = readiness_timeout_message("h", 1, Duration::from_secs(90), None, "INFO a\n");
+    assert!(
+        timed_out.contains("did not become ready within 90s"),
+        "a timeout still says what it waited for:\\n{timed_out}"
+    );
+    assert!(
+        timed_out.contains("/readyz on web=1 never answered"),
+        "a node that never answered says so, instead of inventing a condition:\\n{timed_out}"
+    );
+
+    // The condition the node reported is what a probe-shaped failure must name.
+    let probe = parse_probe(
+        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 41\r\n\r\n\
+         {\"ready\":false,\"waiting_for\":\"raft_leader\"}",
+    )
+    .expect("an HTTP response parses");
+    assert_eq!(probe.status, 503);
+    let waiting =
+        readiness_timeout_message("h", 1, Duration::from_secs(90), Some(&probe), "INFO a\n");
+    assert!(
+        waiting.contains("HTTP 503 from /readyz: waiting_for=\"raft_leader\""),
+        "the timeout must quote the /readyz condition the node reported:\\n{waiting}"
+    );
+}
+
+/// The OTHER readiness failure the harness must name: the node is ALIVE and
+/// reporting a condition it never satisfies.
+///
+/// The wait this harness replaced threw the `/readyz` body away, so a node
+/// patiently reporting `waiting_for` was indistinguishable from a dead one and
+/// CI could never show which condition was being waited on (t_4e9a3e61). The
+/// requirement is not "fail when the process is gone" but "fail naming THE
+/// CONDITION the node reports".
+///
+/// The node here can never be ready: the PostgreSQL port it must bind is already
+/// held, so its `postgres` listener records a bind failure and `/readyz` answers
+/// `503 {"ready":false,"waiting_for":"listeners",…}` for the node's whole life.
+/// A failed listener is checked before every other readiness condition
+/// (`ferrosa/src/web/readiness.rs`), and a failed background listener is not
+/// fatal — the node keeps running, which is the case this test exists for.
+#[test]
+fn a_node_alive_but_never_ready_fails_the_wait_naming_its_condition() {
+    let mut taken: HashSet<u16> = HashSet::new();
+    let ports = alloc_ports(&mut taken);
+    let dir = tempfile::tempdir().expect("node data dir");
+    // Held for the whole test: the node can never bind it.
+    let _held_pg = std::net::TcpListener::bind(("127.0.0.1", ports.pg))
+        .expect("occupy the node's PostgreSQL port");
+    let host_id = "11111111-1111-1111-1111-111111111111".to_string();
+    let mut node = spawn_node_with_env(dir, ports, host_id, "alive-never-ready", None, &[]);
+
+    // Bounded poll for the node to be UP and reporting a not-ready condition.
+    // Waiting for the condition before calling `wait_ready` is what makes this
+    // deterministic: a failed listener, once recorded, gates every later answer.
+    let observe_deadline = Instant::now() + Duration::from_secs(45);
+    let mut observed: Option<String> = None;
+    while Instant::now() < observe_deadline {
+        if let Some(status) = node.child.try_wait().expect("try_wait on the node") {
+            panic!("the never-ready fixture node exited before reporting a condition: {status}");
+        }
+        if let Ok(raw) = http_get(node.ports.web, "/readyz", None, PROBE_READ_TIMEOUT) {
+            if !raw.contains("\"ready\":true") {
+                if let Some(condition) =
+                    parse_probe(&raw).and_then(|p| json_str(&p.body, "waiting_for"))
+                {
+                    observed = Some(condition);
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let observed = observed.expect(
+        "the node must report a /readyz waiting condition within 45s \
+         (is the PostgreSQL listener still started when its port is held?)",
+    );
+
+    let budget = Duration::from_secs(10);
+    let started = Instant::now();
+    let failure = catch_unwind(AssertUnwindSafe(|| {
+        wait_ready(&mut node, budget);
+    }))
+    .expect_err("a node that is alive but never ready must not pass the readiness wait");
+    let elapsed = started.elapsed();
+    let message = panic_text(failure);
+    eprintln!("readiness wait failed after {elapsed:?} naming condition {observed:?}:\n{message}");
+
+    assert!(
+        node.child
+            .try_wait()
+            .expect("try_wait on the node")
+            .is_none(),
+        "the node must still be ALIVE when the wait fails — this is the \
+         alive-but-never-ready case, not the dead-process one:\n{message}"
+    );
+    assert!(
+        elapsed >= budget,
+        "the wait must spend its whole budget on a node that is up but never ready \
+         (it took {elapsed:?}):\n{message}"
+    );
+    assert!(
+        message.contains(&observed),
+        "the failure must NAME the condition the node reported ({observed:?}):\n{message}"
+    );
+    assert!(
+        message.contains("waiting_for"),
+        "the failure must quote the /readyz condition, not only the process state:\n{message}"
+    );
+    assert!(
+        !message.contains("exited"),
+        "an alive node did not exit; the failure must not claim it did:\n{message}"
+    );
+}
+
+/// The panic message as text, so a test can assert on what the harness SAID and
+/// not merely that it panicked.
+fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => message.to_string(),
+            Err(_) => "<non-string panic payload>".to_string(),
+        },
+    }
+}
+
+/// The harness must fail the moment the node process is GONE, naming the exit
+/// status and the node's own first fatal line — not poll a corpse for the whole
+/// budget and then print a tail that starts after the cause.
+///
+/// PR #551 was ejected from the merge queue by this test burning its full 90 s
+/// readiness budget on a process that had already exited: the last line of the
+/// log it dumped was 74 s before the panic (job 115370033050, t_4e9a3e61).
+///
+/// The node here fails at startup on purpose, through the binary's hidden
+/// fault-injection seam: a worker thread panics, `lifecycle` writes the
+/// synchronous `FATAL:` line, and the process exits 70.
+#[test]
+fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
+    let mut taken: HashSet<u16> = HashSet::new();
+    let ports = alloc_ports(&mut taken);
+    let dir = tempfile::tempdir().expect("node data dir");
+    let host_id = "11111111-1111-1111-1111-111111111111".to_string();
+    let mut node = spawn_node_with_env(
+        dir,
+        ports,
+        host_id,
+        "drop-dead-startup",
+        None,
+        &[("FERROSA_TEST_FAULT_INJECT", "panic-thread")],
+    );
+
+    let started = Instant::now();
+    let failure = catch_unwind(AssertUnwindSafe(|| {
+        wait_ready(&mut node, Duration::from_secs(90));
+    }))
+    .expect_err("a node process that has exited must not pass the readiness wait");
+    let elapsed = started.elapsed();
+    let message = panic_text(failure);
+    eprintln!("readiness wait failed after {elapsed:?}:\n{message}");
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the wait must fail as soon as the process is gone, not spend its budget \
+         (it took {elapsed:?}):\n{message}"
+    );
+    assert!(
+        message.contains("exited") && message.contains("exit status"),
+        "the failure must name the exit status:\n{message}"
+    );
+    assert!(
+        message.contains("70"),
+        "the exit status must be the node's (70 for the injected panic):\n{message}"
+    );
+    assert!(
+        message.contains("FATAL:") && message.contains("injected fault: worker thread panic"),
+        "the failure must quote the node's first fatal line:\n{message}"
+    );
+    assert!(
+        !message.contains("did not become ready within"),
+        "a node that exited did not merely time out:\n{message}"
+    );
 }

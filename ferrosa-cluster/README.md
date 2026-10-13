@@ -291,6 +291,24 @@ build; the codec's own cost is its delta against `none`.
   `ddl_path` apply, and all three delegate to
   `StorageEngine::register_index_in_engine` — the resolver the restart reload
   uses — so the wiring cannot drift between the paths again.
+- **A DDL proposal is bounded, and an unconfirmed one fails loud and
+  retryable.** `ddl_path::execute_via_raft` awaits `raft.client_write` under the
+  same 5 s `DDL_AGREEMENT_TIMEOUT` every other wait on that path uses. openraft
+  has no deadline on `client_write`, and it never notifies a pending proposal
+  when the leader stops leading (`RaftCore::client_resp_channels` is drained
+  only when the entry applies or a conflicting log truncates it), so without a
+  bound a leader that cannot reach a quorum held the await open until the CQL
+  client's own 30 s deadline fired — the unexplained `Request execution
+  exceeded a client timeout of 30000ms` on the Jepsen teardown DROP (t_e8abe81a,
+  CL-73). On expiry it returns
+  `ClusterError::DdlProposalNotAgreed { operation, required, alive, timeout_ms,
+  elapsed_ms }`, which names the statement (`ddl_op_target`), the quorum it
+  needed and the wait; `ferrosa-cql` maps it to the CQL unavailable class so
+  drivers retry it on another node. The bound is the existing one — the driver's
+  30 s deadline and every detector are untouched — and the expiry is only ever
+  reported, never widened. Regression:
+  `tests/ddl_proposal_bounded.rs::ddl_proposal_on_a_leader_that_cannot_commit_fails_bounded_and_names_the_operation`,
+  which isolates the leader of a real three-voter in-process cluster.
 - `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
   (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
   `cluster` from the start of `transition_to_cluster`, but DDL stays `direct`
@@ -308,7 +326,27 @@ build; the codec's own cost is its delta against `none`.
   roles before missing seed roles are created, so rotated hashes survive both
   graceful and commit-log recovery paths.
 - `SledLogStore` — sled-backed log + meta trees, legacy-format migration, log
-  inspection/reset tooling.
+  inspection/reset tooling. An open retries a transient directory lock under
+  `LockRetryPolicy::DEFAULT` (main's 10 attempts, 50 ms apart, about 490 ms) —
+  deliberately short, because a longer wait misses the Raft leader window
+  (CL-Tsledrevert). That budget is exhausted by an IN-PROCESS double-open —
+  whoever else in this process already holds the raft dir — so the controller no
+  longer merely gives up: `open_raft_log_store_with_recovery` re-opens on a bounded,
+  explained schedule (`LOG_STORE_RECOVERY_PAUSES_MS = [200, 400, 800, 1600]`, the last
+  start 3 s after the first failure), only for lock contention, always naming the
+  directory, and any other error is returned unchanged. A give-up therefore cannot
+  leave the node dead-ended in `Forming` with no Raft and nothing armed, reporting
+  `{"ready":false,"waiting_for":"raft_leader"}` until an unrelated peer event
+  re-drives it (t_4e9a3e61). The double-open is fixed at its source twice over now: a
+  `ClusterInvite` copy takes `transition_guard` before it re-reads the mode and
+  transitions (CL-25), and `transition_to_cluster`'s own re-entry check runs at the
+  TOP of the function, before any work — it used to sit beside the end-of-function
+  `try_transition_mode(Cluster)` swap, 345 lines after the sled open, where it could
+  not stop the re-open (a re-open this schedule can now let SUCCEED). A node already
+  in `Cluster`, a mode the state machine forbids, or a `raft()` already installed is
+  refused before `create_dir_all`, so a second transition cannot touch the log
+  store; `DegradedCluster`'s rejoin and the invite path's `Pair` still transition.
+  Regression: `a_second_cluster_transition_is_refused_at_once`.
 - `election_guard.rs` — `run_election_guard` watchdog (P0-17/P0-19): a burst
   detector and a 30 s rolling-window detector that call `elect(false)` to suppress
   divergence-driven election storms for 60 s; `ELECTION_STORM_TERM_JUMPS_TOTAL`.

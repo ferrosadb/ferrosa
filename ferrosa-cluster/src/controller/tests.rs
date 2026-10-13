@@ -5215,3 +5215,277 @@ async fn mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transit
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// The Raft log-store give-up must not dead-end the node in `Forming` with no
+/// Raft instance and nothing armed.
+///
+/// `SledLogStore::new` retries a transient sled directory lock ten times 50 ms
+/// apart (`LockRetryPolicy::DEFAULT`, about 490 ms) — deliberately short, because
+/// a formation attempt that waits longer misses its leader window
+/// (CL-Tsledrevert). When a transition exhausted that budget while another
+/// handle in THIS process still held the raft dir, `transition_to_cluster`
+/// logged ERROR and `return`ed: the node kept reporting
+/// `{"ready":false,"waiting_for":"raft_leader"}` for as long as it lived, no
+/// leader could be elected on it, and only an unrelated later peer event
+/// re-drove the transition (t_4e9a3e61, t_e67af7e7). Reproduced under CPU
+/// contention in a real three-node start, whose node log reads
+/// `sled directory lock still held; giving up ... attempts=10 waited_ms=488`
+/// followed by `failed to create Raft log store`.
+///
+/// The holder is released only AFTER the contention the recovery exists to
+/// survive — on the (cap + 1)-th contention notification, which is the recovery's
+/// first re-open — so the production retry budget is exhausted first, exactly as
+/// at the real call site. The production budget is NOT widened by this test.
+///
+/// RED as written: with the open reduced to a bare `SledLogStore::new`, the
+/// budget is exhausted, the transition returns, and the controller ends with no
+/// Raft — the assertion fails on that behaviour, not on a missing symbol.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_raft_log_store_give_up_does_not_dead_end_the_transition() {
+    use crate::raft::log_store::{SledLogStore, SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+    let raft_dir = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &controller.config.data_center,
+    );
+    std::fs::create_dir_all(&raft_dir).unwrap();
+
+    // The in-process handle holding sled's directory lock — the sibling form of
+    // the node's own live Raft, which is what re-opens it at the real call site.
+    let holder = SledLogStore::new(&raft_dir).expect("hold the raft directory lock");
+
+    let (tx, rx) = std::sync::mpsc::channel::<u32>();
+    crate::raft::log_store::set_contention_hook(move |attempt| {
+        let _ = tx.send(attempt);
+    });
+    let releaser = std::thread::spawn(move || {
+        let mut seen = 0u32;
+        // The deadline keeps a run that never recovers (the RED) finite instead
+        // of hanging the suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while seen <= SLED_OPEN_ATTEMPTS_BEFORE_GIVE_UP {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(left) {
+                Ok(_) => seen += 1,
+                Err(_) => break,
+            }
+        }
+        drop(holder);
+    });
+
+    // Start from Pair, as the node is when a second `ClusterInvite` copy arrives:
+    // `transition_to_forming` then moves it to Forming and fans into
+    // `transition_to_cluster`, which opens the log store synchronously on THIS
+    // thread — so the thread-local contention hook observes it.
+    controller.on_peer_connected((peer_id, peer_addr));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the fixture must reach Pair before the forming transition"
+    );
+    controller.transition_to_forming(vec![(peer_id, peer_addr)]);
+    crate::raft::log_store::clear_contention_hook();
+    releaser.join().expect("releaser thread");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while controller.raft().is_none() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        controller.raft().is_some(),
+        "a Raft log-store give-up must not leave the node dead-ended in {:?} with no \
+         Raft instance (write_path_is_cluster={})",
+        controller.mode(),
+        write_path_is_cluster(&controller),
+    );
+}
+
+/// A `ClusterInvite` copy must take `transition_guard` before it re-reads the mode
+/// and calls `transition_to_cluster`, exactly as every other caller does.
+///
+/// Every invite receiver re-broadcasts the invite, so copies arrive together
+/// (0.34 ms apart on a real 3-node start). `ClusterInviteHandler::handle` re-read
+/// the mode and transitioned WITHOUT the guard, so two copies both saw Pair and
+/// both called `transition_to_cluster`; the second re-opened the sled Raft
+/// directory the first one's Raft already held, exhausted the ~490 ms retry
+/// budget and returned, dead-ending the node in Forming with no Raft (FMEA CL-25,
+/// whose two named regressions are this test and
+/// `a_second_cluster_transition_is_refused_at_once`; the give-up itself is in the
+/// node log of t_4e9a3e61). The guard line is what an earlier commit's note claimed
+/// this handler already had — it did not have it until the commit that added it.
+///
+/// RED as written: without the guard the handler leaves Pair inside the window
+/// below, so this assertion fails on that behaviour. The window is generous
+/// because reaching the guard is preceded by address lookups and connection
+/// attempts; it is the negative control that keeps the window honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cluster_invite_transitions_only_under_the_transition_guard() {
+    use ferrosa_net::rpc::RpcHandler;
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let peer1_id = Uuid::new_v4();
+    let peer2_id = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config.clone(),
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm.clone());
+
+    controller.on_peer_connected((peer1_id, "127.0.0.1:1".parse().unwrap()));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the fixture must reach Pair before the invite arrives"
+    );
+
+    let handler = Arc::new(cluster::ClusterInviteHandler::new(
+        local_id,
+        pm,
+        net_config,
+        Arc::downgrade(&controller),
+    ));
+    let invite = ferrosa_net::message::Message::ClusterInvite {
+        initiator: peer1_id,
+        peers: vec![
+            (local_id, "127.0.0.1:9".parse().unwrap()),
+            (peer1_id, "127.0.0.1:1".parse().unwrap()),
+            (peer2_id, "127.0.0.1:7".parse().unwrap()),
+        ],
+    };
+    let from = (
+        peer1_id,
+        "127.0.0.1:1".parse::<std::net::SocketAddr>().unwrap(),
+    );
+
+    // Hold the guard the way a concurrent transition does, then let the handler
+    // run. The wait is a blocking sleep so the guard is never held across an
+    // await; the spawned handler runs on another worker of this runtime.
+    let guard = controller.transition_guard.lock();
+    let task = tokio::spawn(async move { handler.handle(from, invite).await });
+
+    let window = Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        assert_eq!(
+            controller.mode(),
+            DeploymentMode::Pair,
+            "a ClusterInvite handler must not transition while another caller holds \
+             transition_guard"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // POSITIVE control: once the guard is free the same invite still drives the
+    // transition — otherwise the assertion above would hold even if the handler
+    // could never transition at all.
+    drop(guard);
+    assert!(
+        task.await.expect("the handler task").is_some(),
+        "the handler still replies with an ack"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while controller.mode() == DeploymentMode::Pair && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_ne!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "with the guard free the invite message must still drive the transition"
+    );
+}
+
+/// A SECOND cluster transition must be refused AT ONCE — before it opens the Raft
+/// log store — and not 345 lines after the sled open, where the re-entry check
+/// used to sit. FMEA CL-25 names this as its second regression.
+///
+/// The node here is already a cluster member: the first transition has moved the
+/// mode to Cluster. A second transition therefore re-opens the sled Raft directory
+/// the running Raft holds. The old end-of-function `try_transition_mode(Cluster)`
+/// only reported that, and only after the open; and it could not even report it for
+/// a node already in Cluster, because `try_transition_mode_swap` treats
+/// `current == target` as success. With the bounded re-open schedule the give-up
+/// recovery now uses, a second open can also SUCCEED instead of giving up, so
+/// nothing downstream stops a second Raft being installed over the first.
+///
+/// The detector is the log store's own directory: the refusal returns before
+/// `create_dir_all(&raft_dir)`, so a refused second transition cannot even create
+/// it. No sleep and no lock holder are needed, which keeps the test deterministic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_cluster_transition_is_refused_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+    let raft_dir = super::cluster::raft_log_dir_for_dc(
+        &dir.path().join("raft"),
+        &controller.config.data_center,
+    );
+    assert!(
+        !raft_dir.exists(),
+        "the fixture must start with no Raft log store at {}",
+        raft_dir.display()
+    );
+
+    controller.on_peer_connected((peer_id, peer_addr));
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "the fixture must reach Pair before the transitions"
+    );
+
+    // What the FIRST copy of a ClusterInvite leaves behind: the mode is Cluster
+    // and Raft is up (the fixture has no peer to run a real Raft against, and the
+    // mode is the state the re-entry check reads).
+    assert!(
+        controller.try_transition_mode(DeploymentMode::Cluster),
+        "the fixture must be able to reach Cluster"
+    );
+
+    let started = std::time::Instant::now();
+    controller.transition_to_cluster(vec![(peer_id, peer_addr)]);
+    let elapsed = started.elapsed();
+
+    assert!(
+        !raft_dir.exists(),
+        "a second cluster transition must be refused BEFORE it opens the Raft log \
+         store; it created {} instead (CL-25). It took {elapsed:?}.",
+        raft_dir.display()
+    );
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Cluster,
+        "the refusal must leave the mode alone"
+    );
+    assert!(
+        controller.raft().is_none(),
+        "a refused second transition must not install a Raft instance"
+    );
+    assert!(
+        elapsed < Duration::from_millis(250),
+        "the second transition must be refused at once; without the re-entry check it \
+         reaches the sled open and waits out the lock-retry budget (~490 ms) and then \
+         the bounded re-open schedule (a further 3 s) before it gives up (took {elapsed:?})"
+    );
+}
