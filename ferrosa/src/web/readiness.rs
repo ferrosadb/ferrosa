@@ -5,9 +5,10 @@
 //! the missing condition otherwise.
 //! A failed consensus runtime overrides every deployment-mode shortcut and
 //! returns 503 without awaiting a Raft handle.
-//! Last revised: 2026-10-04
-//! Last changed: A ready answer names secondary indexes that are not current
-//!   under `stale_indexes`.
+//! Last revised: 2026-10-10
+//! Last changed: A ready answer reports `"status":"degraded"` and names, under
+//!   `stalled_replication`, any Raft follower whose lag has not shrunk across
+//!   `ReplicationHealth::STALL_SWEEPS` leader sweeps (outage 2026-10-10, D4).
 //!
 //! ## Readiness criteria
 //!
@@ -64,6 +65,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use axum::{Json, Router};
+use ferrosa_cluster::raft::replication_health::ReplicationHealth;
 use ferrosa_cluster::{DeploymentMode, ModeController};
 use serde_json::{json, Value};
 
@@ -103,15 +105,35 @@ fn mode_label(mode: DeploymentMode) -> &'static str {
 /// sidecars are rebuilt from the rows. Likewise a secondary index that is not
 /// current is named under `stale_indexes`: reads through it are refused
 /// until its backfill completes (and a failed one carries its last error).
-fn ready_response(storage: &ferrosa_storage::StorageEngine) -> (StatusCode, Json<Value>) {
+fn ready_response(
+    storage: &ferrosa_storage::StorageEngine,
+    replication: &ReplicationHealth,
+) -> (StatusCode, Json<Value>) {
     let degraded = storage.degraded_vector_indexes();
     let stale = storage.stale_secondary_indexes();
-    if degraded.is_empty() && stale.is_empty() {
+    let stalled = replication.stalled_peers();
+    if degraded.is_empty() && stale.is_empty() && stalled.is_empty() {
         return (StatusCode::OK, Json(json!({"ready": true})));
     }
     let mut body = serde_json::Map::new();
     body.insert("ready".into(), json!(true));
     let mut detail = Vec::new();
+    if !stalled.is_empty() {
+        // This node still serves; a follower is not keeping up with it. On
+        // 2026-10-10 one sat at a fixed index for an hour while every node
+        // answered a bare {"ready":true}.
+        body.insert("status".into(), json!("degraded"));
+        let stalled: Vec<Value> = stalled
+            .into_iter()
+            .map(|s| json!({"peer": s.peer, "lag": s.lag, "flat_sweeps": s.flat_sweeps}))
+            .collect();
+        body.insert("stalled_replication".into(), Value::Array(stalled));
+        detail.push(
+            "a Raft follower's replication lag has not shrunk across consecutive leader sweeps; \
+             see the ferrosa_raft_replication_lag_entries and \
+             ferrosa_raft_snapshot_send_consecutive_failures metrics",
+        );
+    }
     if !degraded.is_empty() {
         let degraded: Vec<Value> = degraded
             .into_iter()
@@ -260,13 +282,16 @@ pub async fn readyz_handler(
         );
     }
 
+    let replication = mc.replication_health();
     match mode {
         // Standalone always ready: no peers, no Raft.
-        DeploymentMode::Standalone => ready_response(&storage),
+        DeploymentMode::Standalone => ready_response(&storage, &replication),
 
         // Pair modes: primary accepts connections, degraded pair allows stale
         // reads. Mirrors `is_cql_ready()` — if CQL is ready, so is the probe.
-        DeploymentMode::Pair | DeploymentMode::DegradedPair => ready_response(&storage),
+        DeploymentMode::Pair | DeploymentMode::DegradedPair => {
+            ready_response(&storage, &replication)
+        }
 
         // A degraded CLUSTER is not ready, and grouping it with the pair modes
         // above is what made the 2026-08-20 outage invisible. node1 sat outside
@@ -309,7 +334,7 @@ pub async fn readyz_handler(
                 Some(raft) => {
                     let leader = raft.current_leader().await;
                     if leader.is_some() {
-                        ready_response(&storage)
+                        ready_response(&storage, &replication)
                     } else {
                         (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -843,6 +868,48 @@ what made this failure invisible"
             .await
             .unwrap();
         (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// T-F3-5 (outage 2026-10-10, F3/D4). On 2026-10-10 a follower sat at a
+    /// fixed index for an hour while the leader answered ready. A peer whose
+    /// lag has not shrunk for `STALL_SWEEPS` sweeps makes the probe report
+    /// degraded and name the peer; a peer that is catching up is not named.
+    #[tokio::test]
+    async fn readiness_degrades_when_a_peer_lag_does_not_shrink() {
+        use ferrosa_cluster::raft::replication_health::ReplicationHealth;
+        let state = make_state();
+        let health = state.mode_controller.replication_health();
+        for sweep in 0..=ReplicationHealth::STALL_SWEEPS {
+            let committed = 48_181 + u64::from(sweep) * 20;
+            // Peer 2 is frozen at 47_870 (the outage's snapshot index); peer 3
+            // closes 100 entries a sweep.
+            health.observe_sweep(
+                committed,
+                10,
+                &[(2, 47_870), (3, 47_000 + u64::from(sweep) * 100)],
+            );
+        }
+
+        let (status, body) = probe(state).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a leader with a stuck follower still serves: {body}"
+        );
+        assert_eq!(body["status"], "degraded", "{body}");
+        let stalled = body["stalled_replication"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no stalled_replication in {body}"));
+        assert_eq!(stalled.len(), 1, "only the frozen peer is named: {body}");
+        assert_eq!(stalled[0]["peer"], 2, "{body}");
+        let final_committed = 48_181 + u64::from(ReplicationHealth::STALL_SWEEPS) * 20;
+        assert_eq!(stalled[0]["lag"], final_committed - 47_870, "{body}");
+        assert_eq!(
+            stalled[0]["flat_sweeps"],
+            ReplicationHealth::STALL_SWEEPS,
+            "{body}"
+        );
     }
 
     /// A pod that declared a 3-node cluster and is still Standalone (it has not

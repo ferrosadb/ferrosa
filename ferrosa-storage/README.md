@@ -22,7 +22,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 - **Memtable** — sharded write buffer behind the `Memtable` trait. Default build
   uses `SkipListMemtable` (crossbeam skiplist, feature `skiplist-memtable`);
   `ShardedBTreeMemtable` (64 `parking_lot::RwLock` shards) is the alternative.
-  Per-partition merge-on-write (cell-level LWW, tombstone merge). Two
+  Per-partition merge-on-write (cell-level LWW, tombstone merge). A write's
+  size accounting comes from the rows the merge touched, never a walk of the
+  whole partition, so a write costs the same at any partition size
+  (`tests/memtable_write_cost_scale.rs`, t_32b6670b). Two
   empty-clustering marker rows carry partition-level state through the row
   write path (and so the commit log and `Mutation`): no cells + non-LIVE
   deletion is the partition deletion, and cells on a clustered table is the
@@ -49,7 +52,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   durability window (see FMEA). Open-time replay re-logs every mutation it
   keeps only in memory into the new log generation (`ReplayRelog`) and fsyncs
   it before deleting the old segment, so a second crash before the table
-  flushes loses nothing (FMEA ST-78).
+  flushes loses nothing (FMEA ST-78). Replay reports through a
+  `ReplayProgress` observer (`commitlog/replay_progress.rs`): a progress line
+  every 5 s (segments done/total, bytes, mutations, elapsed) and a final
+  summary, which `StorageEngine::open` logs. Replayed segments are unlinked on
+  the `commitlog-retire` thread, handed over only after the per-segment
+  barrier; a crash before the unlink replays them again, harmlessly
+  (outage 2026-10-10, F4).
   durability window: writes are refused with `CommitLogNotDurable` while the
   sync thread is dead, fsync is failing, or the oldest unsynced write is past
   `FERROSA_COMMITLOG_SYNC_STALL_DEADLINE_MS` (2000). The sync thread exposes
@@ -387,12 +396,22 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   **Request throttling (`upload/throttle.rs`):** every path shares one object
   store, wrapped in `ThrottledStore`. `FERROSA_S3_MAX_REQUESTS_PER_SECOND` paces
   requests evenly (no burst) and `FERROSA_S3_MAX_CONCURRENT_REQUESTS` caps them
-  in flight (`object_store::limit::LimitStore`); unset means the WAN default of 64, and a
+  in flight (the store's own permits; a GET body keeps its permit until it ends);
+  unset means the WAN default of 64 and no rate cap, and a
   non-positive or non-integer value stops startup naming the variable. A request
   answered `429 Too Many Requests` is retried with exponential backoff (10
   attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
-  log reports the start and end of a throttling episode, not every 429. Set both
-  when recovering from Cloudflare R2.
+  log reports the start and end of a throttling episode, not every 429; the
+  warning names the rate cap as the remedy and says latency is not a reason to
+  lower the limits. Since the 2026-10-10 outage: a GET body that sends nothing
+  for `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS` (default 30) fails as retryable and
+  releases its permit instead of holding it for the 900 s request timeout (every
+  body consumer: whole downloads, ranged parts, `get_range`, `.bytes()`); a wait
+  of more than 5 s for the pacer and a permit is logged as an edge (first slow
+  wait naming both limits, then the recovery with a count); and building the
+  store warns (`validate_limits`) when `rps x 0.3 s` is below the in-flight
+  limit, when the in-flight limit is below the startup fetch concurrency (16),
+  or when it is below 8 against a remote endpoint.
   **Downloads and pooling (`upload/download.rs`):** a component above
   `FERROSA_S3_DOWNLOAD_PART_BYTES` (16 MiB) is fetched as ranged GETs
   (`FERROSA_S3_DOWNLOAD_PART_CONCURRENCY`, default 4, through the same shared
@@ -450,7 +469,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   marked generation's index components (16 at a time) and the table loader
   registers it remote-backed (`remote_backed_generations`; the Data.db walk and
   smoke test are skipped, since reads verify checksums). A marked generation
-  missing from the manifest or the store fails startup. The pre-ST-51 behaviour
+  missing from the manifest or the store fails startup. Registration logs a
+  progress line every 10 s (done/total generations, index bytes, rate, elapsed,
+  failures, in flight) and fails with a stall error naming the requests in
+  flight, the elapsed time and the last progress when no generation finishes
+  for `FERROSA_STARTUP_REGISTRATION_STALL_SECS` (default 300) while fetches are
+  in flight, instead of hanging (outage 2026-10-10). The pre-ST-51 behaviour
   is `FERROSA_RESTORE_EVICTED_MODE=full` or `restore_evicted_sstables()`. After
   each sync, `restore_hot_evicted_sstables` fully restores hot tables'
   generations (8 per pass, only while free disk stays above the eviction target
@@ -535,7 +559,18 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
-  backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest.
+  backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest. The local
+  backend classifies each generation (`GenerationState::from_files`) and reads
+  an evicted one by ranged reads exactly as a query does
+  (`flush::prepare_evicted_for_query` + `FileReadAt::open_evicted`); a
+  generation whose object is gone fails with the typed
+  `BuildError::EvictedUnavailable`, recorded by the tracker as
+  `BuildFailureKind::EvictedUnavailable` with its own ERROR line (outage
+  2026-10-10: backfills over evicted generations failed forever with
+  `open data: No such file or directory`). `StorageEngine::open` installs the
+  same read-through as `new` (the ranged evicted-read store and the whole-file
+  rehydration hook), so a generation evicted while an `open`-started node runs
+  stays readable by queries and backfills.
   `LocalBackend` resolves SSTable components under the engine layout
   `<data_dir>/sstables/<keyspace>.<table>` and writes local sidecars beside the
   table's SSTables; legacy flat test layouts are still accepted. Remote build

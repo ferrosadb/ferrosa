@@ -21,7 +21,7 @@ use crate::handshake::{accept_handshake, CAP_RPC_ERROR_REPLY};
 use crate::message::Message;
 use crate::metrics;
 use crate::rpc::error_reply::{RemoteFailureKind, RpcErrorReply};
-use crate::rpc::handler::{HandlerRegistry, PeerId};
+use crate::rpc::handler::{HandlerOutcome, HandlerRegistry, PeerId};
 use crate::task_pool::TaskPool;
 
 /// Callback invoked when the server accepts an inbound peer connection.
@@ -578,12 +578,14 @@ async fn run_handler(registry: Arc<HandlerRegistry>, route: ReplyRoute, msg: Mes
     // state again; we only report it. Shared state the handler left
     // half-updated is no less exposed than it was when tokio caught the same
     // panic at the task boundary.
-    let dispatched = AssertUnwindSafe(registry.dispatch(route.peer_id, route.msg_type, msg))
-        .catch_unwind()
-        .await;
+    let dispatched =
+        AssertUnwindSafe(registry.dispatch_outcome(route.peer_id, route.msg_type, msg))
+            .catch_unwind()
+            .await;
     match dispatched {
-        Ok(Some(response)) => route.respond(response).await,
-        Ok(None) => {}
+        Ok(HandlerOutcome::Reply(response)) => route.respond(response).await,
+        Ok(HandlerOutcome::NoReply) => {}
+        Ok(HandlerOutcome::Fail { kind, detail }) => route.fail(kind, &detail).await,
         Err(payload) => {
             metrics::record_rpc_handler_panic(route.msg_type);
             let detail = panic_message(payload.as_ref());
@@ -1780,6 +1782,196 @@ mod tests {
             );
             assert!(started.elapsed() < Lane::Data.timeout());
             assert_eq!(client.pending_len(), 0, "stream slot leaked");
+        }
+
+        /// Outage 2026-10-10 (F2, decision D2): what a lane does with a request
+        /// that waited in its queue. The snapshot sender's 200 ms deadline
+        /// started only at dispatch, and a request whose caller had already
+        /// given up was still written to the peer, so a backed-up Bulk lane
+        /// kept delivering snapshot chunks nobody was waiting for.
+        mod queued_lane_requests {
+            use super::*;
+            use std::collections::BTreeSet;
+            use std::sync::Mutex as StdMutex;
+
+            /// Records every Ping nonce it receives, in arrival order. Gated
+            /// nonces wait for one `gate` permit; silent nonces never answer.
+            struct Recording {
+                seen: Arc<StdMutex<Vec<u64>>>,
+                gate: Arc<tokio::sync::Semaphore>,
+                gated: BTreeSet<u64>,
+                silent: BTreeSet<u64>,
+            }
+
+            #[async_trait::async_trait]
+            impl RpcHandler for Recording {
+                async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+                    let Message::Ping { nonce, .. } = msg else {
+                        panic!("Recording handles Ping only");
+                    };
+                    self.seen.lock().unwrap().push(nonce);
+                    if self.gated.contains(&nonce) {
+                        self.gate
+                            .acquire()
+                            .await
+                            .expect("gate semaphore closed")
+                            .forget();
+                    }
+                    if self.silent.contains(&nonce) {
+                        futures::future::pending::<()>().await;
+                    }
+                    Some(Message::Pong {
+                        nonce,
+                        ping_recv_at: 0,
+                        sent_at: 0,
+                    })
+                }
+            }
+
+            struct Peer {
+                seen: Arc<StdMutex<Vec<u64>>>,
+                gate: Arc<tokio::sync::Semaphore>,
+                lane: crate::lane_actor::LaneHandle,
+            }
+
+            /// A one-stream lane to a recording peer.
+            async fn one_stream_lane(gated: &[u64], silent: &[u64]) -> Peer {
+                let seen = Arc::new(StdMutex::new(Vec::new()));
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                let handler = Recording {
+                    seen: Arc::clone(&seen),
+                    gate: Arc::clone(&gate),
+                    gated: gated.iter().copied().collect(),
+                    silent: silent.iter().copied().collect(),
+                };
+                let client =
+                    connected_client(registry_with(MsgType::Ping, Arc::new(handler))).await;
+                Peer {
+                    seen,
+                    gate,
+                    lane: lane_with(client, Lane::Bulk, 1),
+                }
+            }
+
+            async fn wait_until_seen(seen: &Arc<StdMutex<Vec<u64>>>, nonce: u64) {
+                for _ in 0..1000 {
+                    if seen.lock().unwrap().contains(&nonce) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                panic!("peer never received nonce {nonce}");
+            }
+
+            /// T-F2-1. Every stream slot is busy, a send is queued behind it,
+            /// and its caller gives up (drops the reply receiver). When the
+            /// slot frees, nothing is written to the peer for that request.
+            #[tokio::test(start_paused = true)]
+            async fn lane_drops_queued_send_whose_caller_gave_up() {
+                let peer = one_stream_lane(&[0], &[]).await;
+                let lane = peer.lane.clone();
+                let holder = tokio::spawn(async move { lane.send(ping(0), None).await });
+                wait_until_seen(&peer.seen, 0).await;
+
+                // Queued behind nonce 0; the caller abandons it after 10 ms.
+                let abandoned =
+                    tokio::time::timeout(Duration::from_millis(10), peer.lane.send(ping(1), None))
+                        .await;
+                assert!(
+                    abandoned.is_err(),
+                    "nonce 1 must still be queued: {abandoned:?}"
+                );
+
+                peer.gate.add_permits(1);
+                let first = holder.await.unwrap().unwrap();
+                assert!(matches!(first, Message::Pong { nonce: 0, .. }), "{first:?}");
+                // A later request on the same single stream proves the queue
+                // drained past the abandoned one.
+                let later = peer.lane.send(ping(2), None).await.unwrap();
+                assert!(matches!(later, Message::Pong { nonce: 2, .. }), "{later:?}");
+
+                assert_eq!(
+                    *peer.seen.lock().unwrap(),
+                    vec![0, 2],
+                    "the abandoned request (nonce 1) was written to the peer"
+                );
+                assert!(
+                    metrics::lane_abandoned_unsent(Lane::Bulk) >= 1,
+                    "a discarded request must be counted"
+                );
+                peer.lane.shutdown().await;
+            }
+
+            /// T-F2-2. A 200 ms request that spent 150 ms queued has at most
+            /// 50 ms left when it dispatches; one that spent 250 ms queued is
+            /// answered `Timeout` without being sent.
+            #[tokio::test(start_paused = true)]
+            async fn lane_timeout_counts_queue_wait_from_enqueue() {
+                let budget = Duration::from_millis(200);
+                let peer = one_stream_lane(&[0, 10], &[1, 11]).await;
+
+                // 150 ms queued: dispatched with the remaining 50 ms.
+                let lane = peer.lane.clone();
+                let holder =
+                    tokio::spawn(
+                        async move { lane.send(ping(0), Some(Duration::from_secs(30))).await },
+                    );
+                wait_until_seen(&peer.seen, 0).await;
+                let lane = peer.lane.clone();
+                let enqueued = tokio::time::Instant::now();
+                let queued = tokio::spawn(async move {
+                    let result = lane.send(ping(1), Some(budget)).await;
+                    (result, enqueued.elapsed())
+                });
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                peer.gate.add_permits(1);
+                holder.await.unwrap().unwrap();
+                let (result, total) = queued.await.unwrap();
+                assert!(matches!(result, Err(NetError::Timeout(_))), "{result:?}");
+                assert!(
+                    total <= budget + Duration::from_millis(5),
+                    "a 200 ms request took {total:?} end to end: its deadline restarted at \
+                     dispatch instead of counting the 150 ms it spent queued"
+                );
+                assert!(
+                    peer.seen.lock().unwrap().contains(&1),
+                    "nonce 1 had 50 ms left and must be sent"
+                );
+
+                // 250 ms queued: exhausted before dispatch, never sent.
+                let lane = peer.lane.clone();
+                let holder = tokio::spawn(async move {
+                    lane.send(ping(10), Some(Duration::from_secs(30))).await
+                });
+                wait_until_seen(&peer.seen, 10).await;
+                let lane = peer.lane.clone();
+                let enqueued = tokio::time::Instant::now();
+                let expired = tokio::spawn(async move {
+                    let result = lane.send(ping(11), Some(budget)).await;
+                    (result, enqueued.elapsed())
+                });
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                peer.gate.add_permits(1);
+                holder.await.unwrap().unwrap();
+                let (result, total) = expired.await.unwrap();
+                assert!(matches!(result, Err(NetError::Timeout(_))), "{result:?}");
+                assert!(
+                    total < Duration::from_millis(260),
+                    "an exhausted request must be answered at dispatch, took {total:?}"
+                );
+                let pong = peer.lane.send(ping(12), None).await.unwrap();
+                assert!(matches!(pong, Message::Pong { nonce: 12, .. }), "{pong:?}");
+                assert!(
+                    !peer.seen.lock().unwrap().contains(&11),
+                    "nonce 11 exhausted its budget in the queue but was sent: {:?}",
+                    peer.seen.lock().unwrap()
+                );
+                assert!(
+                    metrics::lane_expired_in_queue(Lane::Bulk) >= 1,
+                    "a request that expired in the queue must be counted"
+                );
+                peer.lane.shutdown().await;
+            }
         }
     }
 }

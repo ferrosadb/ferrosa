@@ -13,6 +13,7 @@ pub mod local_state;
 pub mod log_store;
 pub mod multi_dc_apply;
 pub mod network;
+pub mod replication_health;
 pub mod snapshot_pusher;
 pub mod snapshot_transport;
 pub mod state_machine;

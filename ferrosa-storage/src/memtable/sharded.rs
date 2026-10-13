@@ -171,38 +171,6 @@ impl ShardedBTreeMemtable {
             .next()
             .map(|(_, arc)| Arc::clone(arc))
     }
-
-    /// Estimate the in-memory size of a partition in bytes.
-    fn estimate_partition_size(partition: &Partition) -> usize {
-        let mut size = std::mem::size_of::<Partition>();
-        // Key bytes
-        size += partition.key.key.as_bytes().len();
-        // Static row
-        if let Some(ref sr) = partition.static_row {
-            size += Self::estimate_row_size(sr);
-        }
-        // Regular rows
-        for row in &partition.rows {
-            size += Self::estimate_row_size(row);
-        }
-        size
-    }
-
-    /// Estimate the in-memory size of a row in bytes.
-    fn estimate_row_size(row: &Row) -> usize {
-        let mut size = std::mem::size_of::<Row>();
-        size += row.clustering.len();
-        for (_, cell) in &row.cells {
-            size += std::mem::size_of::<(u16, ferrosa_common::cell::CellValue)>();
-            if let Some(ref v) = cell.value {
-                size += v.len();
-            }
-            if let Some(ref p) = cell.path {
-                size += p.len();
-            }
-        }
-        size
-    }
 }
 
 impl Memtable for ShardedBTreeMemtable {
@@ -228,23 +196,15 @@ impl Memtable for ShardedBTreeMemtable {
         };
 
         if let Some(existing) = shard.get_mut(key) {
-            // Compute old size for delta
-            let old_size = Self::estimate_partition_size(existing);
-
             // We need to mutate the partition inside the Arc. Since we hold the
             // write lock, no other thread can be reading/writing this shard.
             // Use Arc::make_mut for copy-on-write if there are other Arc refs.
             let partition = Arc::make_mut(existing);
-            merge_row_into_partition(partition, row, schema)?;
-
-            let new_size = Self::estimate_partition_size(partition);
-            // Update size delta (could be negative if overwrite with smaller value,
-            // but we use wrapping arithmetic via AtomicUsize)
-            if new_size >= old_size {
-                self.size.fetch_add(new_size - old_size, Ordering::Relaxed);
-            } else {
-                self.size.fetch_sub(old_size - new_size, Ordering::Relaxed);
-            }
+            // The merge reports the size change of the rows it touched. Walking
+            // the whole partition before and after, as this did, made every
+            // write O(rows-in-partition) and replay O(N^2) (t_32b6670b).
+            let delta = merge_row_into_partition(partition, row, schema)?;
+            apply_size_delta(&self.size, delta);
         } else {
             // New partition. A partition-tombstone marker (empty clustering,
             // no cells, non-LIVE deletion) is a partition-level DELETE: lift it
@@ -260,7 +220,7 @@ impl Memtable for ShardedBTreeMemtable {
                 rows: Vec::with_capacity(1),
             };
             merge_row_into_partition(&mut partition, row, schema)?;
-            let size = Self::estimate_partition_size(&partition);
+            let size = estimate_partition_size(&partition);
             shard.insert(key.clone(), Arc::new(partition));
             self.count.fetch_add(1, Ordering::Relaxed);
             self.size.fetch_add(size, Ordering::Relaxed);
@@ -435,16 +395,54 @@ impl Memtable for ShardedBTreeMemtable {
     }
 }
 
+/// Estimate the in-memory size of a partition in bytes. Walks every row: use
+/// it for a partition being built, never per write into an existing one.
+pub(crate) fn estimate_partition_size(partition: &Partition) -> usize {
+    std::mem::size_of::<Partition>()
+        + partition.key.key.as_bytes().len()
+        + partition.static_row.as_ref().map_or(0, estimate_row_size)
+        + partition.rows.iter().map(estimate_row_size).sum::<usize>()
+}
+
+/// Estimate the in-memory size of one row in bytes.
+pub(crate) fn estimate_row_size(row: &Row) -> usize {
+    let mut size = std::mem::size_of::<Row>() + row.clustering.len();
+    for (_, cell) in &row.cells {
+        size += std::mem::size_of::<(u16, ferrosa_common::cell::CellValue)>();
+        size += cell.value.as_ref().map_or(0, Vec::len);
+        size += cell.path.as_ref().map_or(0, Vec::len);
+    }
+    size
+}
+
+/// Add a signed size change to a memtable's running byte estimate.
+pub(crate) fn apply_size_delta(size: &AtomicUsize, delta: isize) {
+    if delta >= 0 {
+        size.fetch_add(delta.unsigned_abs(), Ordering::Relaxed);
+    } else {
+        size.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+    }
+}
+
+fn static_row_size(partition: &Partition) -> isize {
+    partition.static_row.as_ref().map_or(0, estimate_row_size) as isize
+}
+
 /// Merge a row into an existing partition using cell-level last-write-wins.
 ///
 /// Binary searches the partition's rows by clustering key. If a row with the
 /// same clustering key exists, merges cells (newer timestamp wins per cell).
 /// Otherwise inserts the row at the correct sorted position.
+///
+/// Returns how much [`estimate_partition_size`] changed, computed from the
+/// static row and the one clustered row the merge touched, so a write costs
+/// the same whatever the partition's size (t_32b6670b; T-F4-3 in
+/// `tests/memtable_write_cost_scale.rs`).
 pub(crate) fn merge_row_into_partition(
     partition: &mut Partition,
     new_row: Row,
     schema: &TableSchema,
-) -> Result<()> {
+) -> Result<isize> {
     // A partition-tombstone marker is a partition-level DELETE: merge it into
     // `Partition::deletion` (newer tombstone wins, LWW) rather than storing it
     // as a clustered row. Otherwise it would sit in `rows` as a phantom
@@ -453,8 +451,11 @@ pub(crate) fn merge_row_into_partition(
         if new_row.deletion.marked_for_delete_at > partition.deletion.marked_for_delete_at {
             partition.deletion = new_row.deletion;
         }
-        return Ok(());
+        // `deletion` is inline in `Partition`: no size change.
+        return Ok(0);
     }
+
+    let static_before = static_row_size(partition);
 
     // A static-row marker (empty clustering + cells on a clustered table) is
     // the partition's static row: merge it into `Partition::static_row` with
@@ -464,7 +465,7 @@ pub(crate) fn merge_row_into_partition(
             Some(existing) => merge_into_existing_row(existing, new_row, schema)?,
             None => partition.static_row = Some(new_row),
         }
-        return Ok(());
+        return Ok(static_row_size(partition) - static_before);
     }
 
     // A clustered row may carry static cells (CQL writes them with the row).
@@ -472,21 +473,29 @@ pub(crate) fn merge_row_into_partition(
     // static row here, exactly as the flush does (crate::ordinal_space), and
     // every read before and after a flush sees the same partition.
     let new_row = lift_static_cells(partition, new_row, schema)?;
+    let static_delta = static_row_size(partition) - static_before;
 
     // Binary search by clustering key
     let pos = partition
         .rows
         .binary_search_by(|existing| existing.clustering.cmp(&new_row.clustering));
 
-    match pos {
+    let row_delta = match pos {
         // Row with same clustering key exists — merge cells
-        Ok(idx) => merge_into_existing_row(&mut partition.rows[idx], new_row, schema)?,
+        Ok(idx) => {
+            let existing = &mut partition.rows[idx];
+            let before = estimate_row_size(existing) as isize;
+            merge_into_existing_row(existing, new_row, schema)?;
+            estimate_row_size(existing) as isize - before
+        }
         Err(idx) => {
             // No row with this clustering key — insert at sorted position
+            let added = estimate_row_size(&new_row) as isize;
             partition.rows.insert(idx, new_row);
+            added
         }
-    }
-    Ok(())
+    };
+    Ok(static_delta + row_delta)
 }
 
 /// On a clustered table, move `row`'s static cells (flat ordinals
@@ -1581,5 +1590,94 @@ mod tests {
         assert_eq!(a_cells.len(), 1);
         assert_eq!(a_cells[0].1.value.as_deref(), Some(b"text".as_slice()));
         assert!(a_cells[0].1.path.is_none());
+    }
+
+    /// The size delta a merge returns (t_32b6670b: it replaced re-walking the
+    /// partition per write) must equal what the full walk would have said, for
+    /// every merge shape: new row, overwrite with a smaller value, static-row
+    /// marker, static cells lifted out of a clustered row, legacy collection
+    /// blob expansion, row and cell tombstones, and a partition tombstone.
+    #[test]
+    fn merge_size_delta_matches_the_full_partition_walk() {
+        let schema = TableSchema {
+            clustering_columns: vec![column("ck", "org.apache.cassandra.db.marshal.Int32Type")],
+            static_columns: vec![column("s", UTF8)],
+            regular_columns: vec![column("a", UTF8), column("l", LIST_OF_TEXT)],
+            ..test_schema()
+        };
+        let ck = |n: i32| n.to_be_bytes().to_vec();
+        let live =
+            |ordinal: u16, value: &[u8], ts: i64| (ordinal, CellValue::live(value.to_vec(), ts));
+        let clustered = |n: i32, cells: Vec<(u16, CellValue)>, ts: i64| Row {
+            clustering: ck(n),
+            cells,
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(ts),
+        };
+        let deletion = |ts: i64| DeletionTime {
+            local_deletion_time: 1,
+            marked_for_delete_at: ts,
+        };
+        let mut list_element = clustered(1, vec![], 30);
+        list_element.cells = complex_row(2, b"p1", b"element", 30).cells;
+        let mut blob = clustered(1, vec![], 40);
+        blob.cells = vec![live(2, &collection_blob(&[b"x", b"yy", b"zzz"]), 40)];
+        let mut row_tombstone = clustered(3, vec![], 60);
+        row_tombstone.deletion = deletion(60);
+        let shapes: Vec<(&str, Row)> = vec![
+            (
+                "new row",
+                clustered(1, vec![live(1, b"a-long-value", 10)], 10),
+            ),
+            ("second row", clustered(2, vec![live(1, b"b", 10)], 10)),
+            (
+                "smaller overwrite",
+                clustered(1, vec![live(1, b"a", 20)], 20),
+            ),
+            (
+                "static marker",
+                Row {
+                    clustering: vec![],
+                    cells: vec![live(0, b"static", 25)],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+                },
+            ),
+            (
+                "lifted static cell",
+                clustered(
+                    2,
+                    vec![live(0, b"static-longer", 26), live(1, b"bb", 26)],
+                    26,
+                ),
+            ),
+            ("list element", list_element),
+            ("legacy blob expansion", blob),
+            (
+                "cell tombstone",
+                clustered(2, vec![(1, CellValue::tombstone(50, 1))], 50),
+            ),
+            ("row tombstone (new row)", row_tombstone),
+            (
+                "partition tombstone",
+                Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: deletion(70),
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+                },
+            ),
+        ];
+
+        let mut p = empty_partition();
+        for (shape, row) in shapes {
+            let before = estimate_partition_size(&p) as isize;
+            let delta = merge_row_into_partition(&mut p, row, &schema).unwrap();
+            let after = estimate_partition_size(&p) as isize;
+            assert_eq!(delta, after - before, "{shape}: delta vs full walk");
+        }
+        assert!(
+            p.static_row.is_some() && p.rows.len() == 3 && p.deletion.marked_for_delete_at == 70
+        );
     }
 }

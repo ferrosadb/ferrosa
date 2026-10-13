@@ -16,6 +16,135 @@ use std::sync::Arc;
 
 const MAX_CLUSTER_MEMBER_MARKER_BYTES: usize = 4096;
 
+/// Everything the openraft `Config` is built from, besides the environment.
+pub(crate) struct OpenraftConfigInputs {
+    pub(crate) cluster_name: String,
+    pub(crate) heartbeat_ms: u64,
+    pub(crate) election_min_ms: u64,
+    pub(crate) election_max_ms: u64,
+    pub(crate) max_payload_entries: u64,
+    pub(crate) snapshot_logs_since_last: u64,
+    pub(crate) enable_pre_vote: bool,
+    pub(crate) check_quorum_ratio: f64,
+}
+
+/// Default per-chunk deadline for a Raft snapshot transfer, in milliseconds.
+///
+/// openraft's 200 ms default included the time a chunk waited in the Bulk
+/// lane queue, so on 2026-10-10 a backed-up lane timed out every chunk and the
+/// leader resent the same snapshot without end (F2, D2). 30 s covers a 3 MiB
+/// chunk at roughly 1 Mbit/s and stays below the Bulk lane's own 60 s timeout.
+pub(crate) const DEFAULT_INSTALL_SNAPSHOT_TIMEOUT_MS: u64 = 30_000;
+const INSTALL_SNAPSHOT_TIMEOUT_ENV: &str = "FERROSA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS";
+
+/// `FERROSA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`, or the default. An unusable
+/// value is refused with a warning naming it, as the other Raft overrides do.
+fn install_snapshot_timeout_ms(env: &impl Fn(&str) -> Option<String>) -> u64 {
+    let Some(raw) = env(INSTALL_SNAPSHOT_TIMEOUT_ENV) else {
+        return DEFAULT_INSTALL_SNAPSHOT_TIMEOUT_MS;
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 => ms,
+        Ok(_) => {
+            tracing::warn!(
+                "{INSTALL_SNAPSHOT_TIMEOUT_ENV} must be greater than zero, using default \
+                 {DEFAULT_INSTALL_SNAPSHOT_TIMEOUT_MS}"
+            );
+            DEFAULT_INSTALL_SNAPSHOT_TIMEOUT_MS
+        }
+        Err(e) => {
+            tracing::warn!(
+                %e,
+                value = %raw,
+                "{INSTALL_SNAPSHOT_TIMEOUT_ENV} parse error, using default \
+                 {DEFAULT_INSTALL_SNAPSHOT_TIMEOUT_MS}"
+            );
+            DEFAULT_INSTALL_SNAPSHOT_TIMEOUT_MS
+        }
+    }
+}
+
+/// Build this node's openraft `Config`. `env` reads an environment variable;
+/// tests pass a closure instead of mutating the process environment.
+///
+/// openraft's `ConfigError` is large by design (dictated by the crate).
+#[allow(clippy::result_large_err)]
+pub(crate) fn build_openraft_config(
+    inputs: OpenraftConfigInputs,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<openraft::Config, openraft::ConfigError> {
+    openraft::Config {
+        install_snapshot_timeout: install_snapshot_timeout_ms(&env),
+        cluster_name: inputs.cluster_name,
+        heartbeat_interval: inputs.heartbeat_ms,
+        // Data replication gets 10x the heartbeat timeout so followers
+        // have time for sled disk writes without blocking heartbeats.
+        replication_lag_timeout: inputs.heartbeat_ms * 10,
+        election_timeout_min: inputs.election_min_ms,
+        election_timeout_max: inputs.election_max_ms,
+        max_payload_entries: inputs.max_payload_entries,
+        snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(inputs.snapshot_logs_since_last),
+        enable_pre_vote: inputs.enable_pre_vote,
+        check_quorum_ratio: inputs.check_quorum_ratio,
+        ..Default::default()
+    }
+    .validate()
+}
+
+#[cfg(test)]
+mod openraft_config_tests {
+    use super::*;
+
+    fn inputs() -> OpenraftConfigInputs {
+        OpenraftConfigInputs {
+            cluster_name: "t".to_string(),
+            heartbeat_ms: 500,
+            election_min_ms: 3000,
+            election_max_ms: 6000,
+            max_payload_entries: 300,
+            snapshot_logs_since_last: 1000,
+            enable_pre_vote: true,
+            check_quorum_ratio: 0.0,
+        }
+    }
+
+    /// T-F2-6 (outage 2026-10-10, F2/D2). openraft's 200 ms default
+    /// `install_snapshot_timeout` covered the time a chunk spent queued on the
+    /// Bulk lane, so a backed-up lane timed out every chunk. The default must
+    /// cover a 3 MiB chunk at roughly 1 Mbit/s (about 25 s) and stay below the
+    /// Bulk lane's 60 s; an operator can override it.
+    #[test]
+    fn raft_config_sets_install_snapshot_timeout_above_chunk_transfer_budget() {
+        let config = build_openraft_config(inputs(), |_| None).expect("valid config");
+        assert_eq!(
+            config.install_snapshot_timeout, 30_000,
+            "default install_snapshot_timeout"
+        );
+        assert!(config.install_snapshot_timeout >= 10_000);
+        assert!(
+            u128::from(config.install_snapshot_timeout)
+                < ferrosa_net::codec::Lane::Bulk.timeout().as_millis()
+        );
+
+        let overridden = build_openraft_config(inputs(), |key| {
+            (key == "FERROSA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS").then(|| "45000".to_string())
+        })
+        .expect("valid config");
+        assert_eq!(overridden.install_snapshot_timeout, 45_000);
+
+        for bad in ["0", "soon"] {
+            let fallback = build_openraft_config(inputs(), |key| {
+                (key == "FERROSA_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS").then(|| bad.to_string())
+            })
+            .expect("valid config");
+            assert_eq!(
+                fallback.install_snapshot_timeout, 30_000,
+                "an unusable override ({bad:?}) falls back to the default"
+            );
+        }
+    }
+}
+
 struct SavedClusterMemberMarker {
     bytes: [u8; MAX_CLUSTER_MEMBER_MARKER_BYTES],
     len: usize,
@@ -1172,7 +1301,8 @@ impl ModeController {
         let has_recovered_topology_state = state_machine.has_topology_state();
 
         // 3. Create network factory
-        let network_factory = FerrosRaftNetworkFactory::new(peer_manager.clone());
+        let network_factory =
+            FerrosRaftNetworkFactory::new(peer_manager.clone(), self.replication_health.clone());
         let local_node_id = uuid_to_node_id(self.local_host_id);
 
         // Register node mappings for all peers
@@ -1415,6 +1545,7 @@ impl ModeController {
             .chain(peers.iter().map(|(uuid, _)| uuid_to_node_id(*uuid)))
             .collect();
         let cluster_name = self.config.cluster_name.clone();
+        let replication_health_for_pusher = self.replication_health.clone();
         let config_for_promotion = self.config.clone();
         let raft_heartbeat_ms = self.config.raft_heartbeat_ms;
         let raft_election_min_ms = self.config.raft_election_timeout_min_ms;
@@ -1974,24 +2105,19 @@ impl ModeController {
                 None => 1000,
             };
 
-            let raft_config = match (openraft::Config {
-                cluster_name,
-                heartbeat_interval: raft_heartbeat_ms,
-                // Data replication gets 10x the heartbeat timeout so followers
-                // have time for sled disk writes without blocking heartbeats.
-                replication_lag_timeout: raft_heartbeat_ms * 10,
-                election_timeout_min: raft_election_min_ms,
-                election_timeout_max: raft_election_max_ms,
-                max_payload_entries: raft_max_payload_entries,
-                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(
-                    raft_snapshot_logs_since_last,
-                ),
-                enable_pre_vote: raft_enable_pre_vote,
-                check_quorum_ratio: raft_check_quorum_ratio,
-                ..Default::default()
-            })
-            .validate()
-            {
+            let raft_config = match build_openraft_config(
+                OpenraftConfigInputs {
+                    cluster_name,
+                    heartbeat_ms: raft_heartbeat_ms,
+                    election_min_ms: raft_election_min_ms,
+                    election_max_ms: raft_election_max_ms,
+                    max_payload_entries: raft_max_payload_entries,
+                    snapshot_logs_since_last: raft_snapshot_logs_since_last,
+                    enable_pre_vote: raft_enable_pre_vote,
+                    check_quorum_ratio: raft_check_quorum_ratio,
+                },
+                |key| std::env::var(key).ok(),
+            ) {
                 Ok(cfg) => Arc::new(cfg),
                 Err(e) => {
                     tracing::error!(%e, "invalid raft config, staying in cluster mode without raft DDL");
@@ -2201,12 +2327,14 @@ impl ModeController {
                 use crate::raft::snapshot_pusher::run_snapshot_pusher;
                 let pusher_raft = raft_arc.clone();
                 let pusher_cancel = election_guard_cancel.clone();
+                let pusher_health = replication_health_for_pusher.clone();
                 ferrosa_net::task_pool::TaskPool::current("raft-snapshot-pusher").spawn(async move {
                     run_snapshot_pusher(
                         pusher_raft,
                         pusher_cancel,
                         5_000, // sweep every 5 s
                         10,    // lag_threshold: 10 entries
+                        pusher_health,
                     )
                     .await;
                 });

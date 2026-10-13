@@ -112,6 +112,37 @@ struct NodeRegistryInner {
     /// Node IDs that are isolated entirely — both inbound (delivery to
     /// the node) and outbound (calls from the node) error out.
     isolated: BTreeSet<u64>,
+    /// Every snapshot a node started delivering (first chunk handed to the
+    /// target's dispatcher), in order. Lets a test assert how many snapshots a
+    /// leader sent and which index each one carried.
+    snapshot_sends: Vec<SnapshotSend>,
+}
+
+/// One snapshot transfer the harness delivered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotSend {
+    pub from: u64,
+    pub to: u64,
+    /// `last_log_id.index` of the snapshot offered.
+    pub last_log_index: Option<u64>,
+}
+
+/// openraft knobs a test can override; everything else keeps the harness's
+/// fast-cycling defaults.
+#[derive(Clone, Debug)]
+pub struct HarnessRaftKnobs {
+    pub snapshot_policy: openraft::SnapshotPolicy,
+    pub max_in_snapshot_log_to_keep: u64,
+}
+
+impl Default for HarnessRaftKnobs {
+    fn default() -> Self {
+        Self {
+            snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
+            // openraft's own default.
+            max_in_snapshot_log_to_keep: 1000,
+        }
+    }
 }
 
 impl NodeRegistry {
@@ -152,6 +183,16 @@ impl NodeRegistry {
         let mut g = self.inner.lock().expect("registry lock");
         g.partitions.clear();
         g.isolated.clear();
+    }
+
+    fn record_snapshot_send(&self, send: SnapshotSend) {
+        let mut g = self.inner.lock().expect("registry lock");
+        g.snapshot_sends.push(send);
+    }
+
+    fn snapshot_sends(&self) -> Vec<SnapshotSend> {
+        let g = self.inner.lock().expect("registry lock");
+        g.snapshot_sends.clone()
     }
 }
 
@@ -241,6 +282,13 @@ impl RaftNetwork<FerrosRaftConfig> for InProcessNetwork {
                 "no registered receiver".into(),
             )))
         })?;
+        if rpc.offset == 0 {
+            self.registry.record_snapshot_send(SnapshotSend {
+                from: self.self_node_id,
+                to: self.target,
+                last_log_index: rpc.meta.last_log_id.map(|id| id.index),
+            });
+        }
         let (tx, rx) = oneshot::channel();
         sender
             .send(RpcEnvelope::InstallSnapshot { rpc, reply: tx })
@@ -554,16 +602,22 @@ impl MembershipNetwork for HarnessMembershipNetwork {
 impl TestCluster {
     /// Spin up an N-voter cluster and call `initialize` on node 0.
     pub async fn with_voters(n: usize) -> Self {
-        Self::build_voters(n, false).await
+        Self::build_voters(n, false, HarnessRaftKnobs::default()).await
     }
 
     /// Like [`Self::with_voters`], but every node applies committed DDL to its
     /// own real `StorageEngine` and `Schema` (see `TestNode::engine`).
     pub async fn with_voters_and_engines(n: usize) -> Self {
-        Self::build_voters(n, true).await
+        Self::build_voters(n, true, HarnessRaftKnobs::default()).await
     }
 
-    async fn build_voters(n: usize, with_engine: bool) -> Self {
+    /// Like [`Self::with_voters`], with the snapshot policy and the number of
+    /// logs kept behind a snapshot set by the test.
+    pub async fn with_voters_and_knobs(n: usize, knobs: HarnessRaftKnobs) -> Self {
+        Self::build_voters(n, false, knobs).await
+    }
+
+    async fn build_voters(n: usize, with_engine: bool, knobs: HarnessRaftKnobs) -> Self {
         assert!(n >= 1, "TestCluster requires at least 1 node");
 
         // Bound cross-binary oversubscription across the build + election window
@@ -589,7 +643,8 @@ impl TestCluster {
                 election_timeout_max: 400,
                 replication_lag_timeout: 500,
                 max_payload_entries: 64,
-                snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(10_000),
+                snapshot_policy: knobs.snapshot_policy,
+                max_in_snapshot_log_to_keep: knobs.max_in_snapshot_log_to_keep,
                 ..Default::default()
             }
             .validate()
@@ -937,6 +992,11 @@ impl TestCluster {
     /// Heal every recorded partition / isolation.
     pub fn heal(&self) {
         self.registry.heal_all();
+    }
+
+    /// Every snapshot transfer delivered so far, in order.
+    pub fn snapshot_sends(&self) -> Vec<SnapshotSend> {
+        self.registry.snapshot_sends()
     }
 
     /// Snapshot every node's openraft metrics for debugging.

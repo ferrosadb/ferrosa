@@ -88,7 +88,9 @@ pub use artifact_manifest::{
 };
 pub use remote_backend::{IndexBackendConfig, RemoteBackend, S3PathResolver};
 pub use scheduler::{
-    BuildPriority, ClusteringComponentRef, IndexBuildBackend, IndexBuildJob, IndexBuildResult,
-    IndexBuildScheduler, LocalBackend, PartitionKeyComponentRef,
+    BuildError, BuildPriority, ClusteringComponentRef, IndexBuildBackend, IndexBuildJob,
+    IndexBuildResult, IndexBuildScheduler, LocalBackend, PartitionKeyComponentRef,
 };
-pub use tracker::{BuildFailure, DueRetry, IndexState, IndexStateTracker, IndexStatus};
+pub use tracker::{
+    BuildFailure, BuildFailureKind, DueRetry, IndexState, IndexStateTracker, IndexStatus,
+};

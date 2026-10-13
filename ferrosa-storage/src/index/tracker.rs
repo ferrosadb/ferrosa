@@ -32,7 +32,20 @@ pub enum IndexStatus {
         error: String,
         /// When the next retry is scheduled.
         retry_at: Instant,
+        /// What kind of failure it was.
+        kind: BuildFailureKind,
     },
+}
+
+/// Why a build failed, so an operator can tell a missing object from a bug.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildFailureKind {
+    /// The build itself failed (I/O, decode, publish).
+    Build,
+    /// The generation is evicted and its object-store copy is unavailable
+    /// (deleted, or the store does not own it): retries cannot succeed until
+    /// the object is restored.
+    EvictedUnavailable,
 }
 
 /// Per-index build state.
@@ -275,6 +288,29 @@ impl IndexStateTracker {
         error: String,
         retry_delay: Duration,
     ) -> BuildFailure {
+        self.mark_failed_as(
+            keyspace,
+            table,
+            index_name,
+            sstable_id,
+            error,
+            retry_delay,
+            BuildFailureKind::Build,
+        )
+    }
+
+    /// [`Self::mark_failed`] recording what kind of failure it was.
+    #[allow(clippy::too_many_arguments)] // one per field of the recorded failure
+    pub fn mark_failed_as(
+        &self,
+        keyspace: &str,
+        table: &str,
+        index_name: &str,
+        sstable_id: &str,
+        error: String,
+        retry_delay: Duration,
+        kind: BuildFailureKind,
+    ) -> BuildFailure {
         let key = (
             keyspace.to_string(),
             table.to_string(),
@@ -292,6 +328,7 @@ impl IndexStateTracker {
         state.status = IndexStatus::Failed {
             error,
             retry_at: Instant::now() + retry_delay,
+            kind,
         };
         if first {
             BuildFailure::FirstFailure

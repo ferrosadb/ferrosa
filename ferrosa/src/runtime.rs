@@ -289,10 +289,12 @@ pub fn install_consensus_panic_hook(health: Arc<ferrosa_cluster::ConsensusHealth
                 .failure()
                 .map(ferrosa_cluster::ConsensusFailure::detail)
                 .unwrap_or("consensus failure detail unavailable");
-            eprintln!(
+            // Synchronous, so the line reaches the log file even if the
+            // process dies before the buffered writer drains.
+            crate::lifecycle::write_line(&format!(
                 "FATAL: consensus runtime failed; process remains alive in fail-closed mode; \
 readiness=503; CQL data operations=OVERLOADED; detail={detail}"
-            );
+            ));
         } else {
             previous(info);
         }

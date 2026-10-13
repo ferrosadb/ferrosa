@@ -32,6 +32,7 @@ pub(crate) mod descriptor;
 pub mod manifest;
 pub(crate) mod mutation;
 pub(crate) mod reader;
+pub mod replay_progress;
 pub(crate) mod segment;
 pub(crate) mod sync;
 
@@ -40,6 +41,10 @@ pub use config::{
     SyncStrategyConfig, TableId,
 };
 pub use mutation::{Mutation, CELL_REBIND_LIST_PATH_FLAG};
+pub use replay_progress::{
+    LogReplayProgress, ReplayProgress, ReplayProgressReport, REPLAY_PROGRESS_INTERVAL,
+};
+use replay_progress::{ReplayTally, SegmentRetirer};
 
 /// Retain at most this many segment-equivalents of dirty closed WAL data
 /// before asking the table that pins the oldest segment to flush.
@@ -647,6 +652,7 @@ impl CommitLog {
                 on_mutation(mutation)
             },
             || Ok(()),
+            None,
         )
     }
 
@@ -663,6 +669,7 @@ impl CommitLog {
         config: Config,
         on_mutation: F,
         segment_done: B,
+        progress: Option<&mut dyn ReplayProgress>,
     ) -> ferrosa_common::Result<Self>
     where
         F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
@@ -683,8 +690,16 @@ impl CommitLog {
         // The new log exists before replay so a replayed mutation can be
         // re-logged into it; see `ReplayRelog`.
         let log = Self::new_with_first_segment_id(config, first_segment_id)?;
-        if let Err(e) = log.replay_segments(&segment_files, &checkpoint, on_mutation, segment_done)
-        {
+        let replayed = ReplayTally::start(progress, &segment_files).and_then(|tally| {
+            log.replay_segments(
+                &segment_files,
+                &checkpoint,
+                on_mutation,
+                segment_done,
+                tally,
+            )
+        });
+        if let Err(e) = replayed {
             if let Err(stop) = log.shutdown() {
                 tracing::error!(%stop, "commitlog: shutting down the new log after a failed replay");
             }
@@ -713,28 +728,35 @@ impl CommitLog {
     }
 
     /// Streams the previous generation's `segment_files` to `on_mutation`,
-    /// deleting each one only after the mutations its consumer re-logged into
-    /// `self` are fsynced.
+    /// handing each one to the retire thread only after the mutations its
+    /// consumer re-logged into `self` are fsynced.
     fn replay_segments<F, B>(
         &self,
         segment_files: &[(u64, PathBuf)],
         checkpoint: &HashMap<TableId, CommitLogPosition>,
         mut on_mutation: F,
         mut segment_done: B,
+        mut tally: ReplayTally<'_>,
     ) -> ferrosa_common::Result<()>
     where
         F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
         B: FnMut() -> ferrosa_common::Result<()>,
     {
         let relog = ReplayRelog { log: self };
+        // Unlinking is the retire thread's job: on a large log the unlinks
+        // were a measurable share of replay time on the thread that gates
+        // startup. The hand-off below happens after the barrier, so the
+        // order "re-logged copy durable, then old segment gone" is unchanged.
+        let retirer = SegmentRetirer::spawn()?;
         // Stream segment by segment. The reader's `data` buffer (~segment_size)
         // and the per-segment entries Vec are dropped before the next iteration,
         // so peak memory is bounded by one segment regardless of how many
-        // segments exist on disk. Each fully-replayed segment file is deleted
-        // before moving on; on callback error, remaining segments are left
-        // intact for retry.
-        for (id, path) in segment_files {
+        // segments exist on disk. On callback error, remaining segments are
+        // left intact for retry.
+        for (index, (id, path)) in segment_files.iter().enumerate() {
             if Self::skip_torn_segment(*id, path)? {
+                retirer.retire(path.clone())?;
+                tally.segment_done(index);
                 continue;
             }
             {
@@ -744,8 +766,11 @@ impl CommitLog {
                 for (pos, mutation) in entries {
                     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
                     let dominated = checkpoint.get(&table_id).is_some_and(|cp| pos <= *cp);
-                    if !dominated {
+                    if dominated {
+                        tally.dominated();
+                    } else {
                         on_mutation(mutation, &relog)?;
+                        tally.delivered();
                     }
                 }
             }
@@ -758,14 +783,19 @@ impl CommitLog {
             // fsynced by `force_rotate`; this covers the active one.
             self.force_sync()?;
             segment_done()?;
-            if let Err(e) = fs::remove_file(path) {
-                tracing::warn!(%e, "commitlog: failed to remove segment file");
-            }
+            #[cfg(test)]
+            replay_progress::test_trace::record(replay_progress::test_trace::Event::Synced {
+                path: path.clone(),
+            });
+            retirer.retire(path.clone())?;
+            tally.segment_done(index);
         }
+        retirer.finish()?;
+        tally.finish();
         Ok(())
     }
 
-    /// Whether `path` is a torn segment to skip (and remove) on replay.
+    /// Whether `path` is a torn segment to skip on replay; the caller retires it.
     ///
     /// A too-short segment is the torn-create/torn-header state: the writer
     /// rolled to a new segment file, but was killed (OOM, kill -9, host
@@ -782,7 +812,7 @@ impl CommitLog {
                 path = %path.display(),
                 bytes = meta.len(),
                 "commitlog: skipping too-short segment on replay (torn create/header from previous crash); \
-                 file will be cleaned up below"
+                 the retire thread removes it"
             );
         } else if is_zeroed_segment_header(path)? {
             EMPTY_SEGMENT_SKIPPED_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -790,13 +820,10 @@ impl CommitLog {
                 segment_id = id,
                 path = %path.display(),
                 "commitlog: skipping segment with all-zero header on replay \
-                 (preallocated/torn segment from previous crash); file will be cleaned up below"
+                 (preallocated/torn segment from previous crash); the retire thread removes it"
             );
         } else {
             return Ok(false);
-        }
-        if let Err(e) = fs::remove_file(path) {
-            tracing::warn!(%e, "commitlog: failed to remove torn segment file");
         }
         Ok(true)
     }
@@ -2255,6 +2282,7 @@ mod tests {
                 Ok(())
             },
             || Ok(()),
+            None,
         )
         .unwrap();
         let [position] = retained[..] else {
@@ -2941,5 +2969,238 @@ mod tests {
             );
         }
         cl.shutdown().unwrap();
+    }
+
+    // -- Outage 2026-10-10 (F4/D5): replay progress and off-thread retirement --
+
+    /// Mutations per segment in [`write_replay_segments`].
+    const MUTATIONS_PER_SEGMENT: usize = 2;
+
+    /// A mutation with a distinct id, so replays can be compared by id.
+    fn numbered_mutation(n: usize) -> Mutation {
+        let mut id = [0u8; 16];
+        id[..8].copy_from_slice(&(n as u64).to_be_bytes());
+        id[15] = 0xF4;
+        Mutation {
+            mutation_id: id,
+            ..simple_mutation()
+        }
+    }
+
+    /// Write `segments` closed segments of [`MUTATIONS_PER_SEGMENT`] numbered
+    /// mutations each into a 512-byte-segment log, then shut it down. Returns
+    /// the segment files on disk, which include the empty active segment.
+    fn write_replay_segments(dir: &Path, segments: usize) -> Vec<(u64, PathBuf)> {
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir)
+        };
+        let cl = CommitLog::new(config).unwrap();
+        for s in 0..segments {
+            for m in 0..MUTATIONS_PER_SEGMENT {
+                cl.append(&numbered_mutation(s * MUTATIONS_PER_SEGMENT + m))
+                    .unwrap();
+            }
+            cl.force_rotate().unwrap();
+        }
+        cl.shutdown().unwrap();
+        CommitLog::scan_segment_files(dir).unwrap()
+    }
+
+    #[derive(Default)]
+    struct RecordingProgress {
+        interval: Duration,
+        reports: Vec<ReplayProgressReport>,
+        finished: Vec<ReplayProgressReport>,
+    }
+
+    impl ReplayProgress for RecordingProgress {
+        fn interval(&self) -> Duration {
+            self.interval
+        }
+        fn progress(&mut self, report: &ReplayProgressReport) {
+            self.reports.push(report.clone());
+        }
+        fn finished(&mut self, report: &ReplayProgressReport) {
+            self.finished.push(report.clone());
+        }
+    }
+
+    fn replay_with_progress(dir: &Path, progress: &mut RecordingProgress) -> Vec<[u8; 16]> {
+        let mut ids = Vec::new();
+        let config = CommitLogConfig {
+            segment_size: 512,
+            ..CommitLogConfig::test_config(dir)
+        };
+        let reopened = CommitLog::open_and_replay_streaming_with_barrier(
+            config,
+            |mutation, relog| {
+                relog.retain(&mutation)?;
+                ids.push(mutation.mutation_id);
+                Ok(())
+            },
+            || Ok(()),
+            Some(progress),
+        )
+        .unwrap();
+        reopened.shutdown().unwrap();
+        ids
+    }
+
+    /// T-F4-1: replay reports progress after segments and a final summary
+    /// whose totals match what was on disk.
+    ///
+    /// On 2026-10-10 node1 replayed for minutes with no log line, and was
+    /// restarted mid-replay by an operator who read the silence as a hang.
+    #[test]
+    fn replay_reports_progress_and_a_summary() {
+        const SEGMENTS: usize = 50;
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = write_replay_segments(dir.path(), SEGMENTS);
+        let bytes_on_disk: u64 = on_disk
+            .iter()
+            .map(|(_, p)| fs::metadata(p).unwrap().len())
+            .sum();
+
+        // A zero interval reports after every segment.
+        let mut progress = RecordingProgress::default();
+        let ids = replay_with_progress(dir.path(), &mut progress);
+        assert_eq!(ids.len(), SEGMENTS * MUTATIONS_PER_SEGMENT);
+
+        let done: Vec<usize> = progress.reports.iter().map(|r| r.segments_done).collect();
+        assert_eq!(
+            done,
+            (1..=on_disk.len()).collect::<Vec<_>>(),
+            "one report per segment, counting up"
+        );
+        for pair in progress.reports.windows(2) {
+            assert!(pair[0].mutations <= pair[1].mutations, "{pair:?}");
+            assert!(pair[0].bytes_done < pair[1].bytes_done, "{pair:?}");
+            assert!(pair[0].elapsed <= pair[1].elapsed, "{pair:?}");
+        }
+        assert!(progress
+            .reports
+            .iter()
+            .all(|r| r.segments_total == on_disk.len() && r.bytes_total == bytes_on_disk));
+
+        let [summary] = &progress.finished[..] else {
+            panic!("exactly one summary, got {:?}", progress.finished);
+        };
+        assert_eq!(
+            (
+                summary.segments_done,
+                summary.segments_total,
+                summary.bytes_done,
+                summary.bytes_total,
+                summary.mutations,
+                summary.dominated,
+            ),
+            (
+                on_disk.len(),
+                on_disk.len(),
+                bytes_on_disk,
+                bytes_on_disk,
+                (SEGMENTS * MUTATIONS_PER_SEGMENT) as u64,
+                0,
+            )
+        );
+    }
+
+    /// The default interval rate-limits progress: a sub-second replay emits
+    /// no progress line, only the summary.
+    #[test]
+    fn replay_progress_is_rate_limited_by_its_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        write_replay_segments(dir.path(), 10);
+        let mut progress = RecordingProgress {
+            interval: REPLAY_PROGRESS_INTERVAL,
+            ..Default::default()
+        };
+        replay_with_progress(dir.path(), &mut progress);
+        assert_eq!(progress.reports, vec![]);
+        assert_eq!(progress.finished.len(), 1);
+        assert_eq!(
+            progress.finished[0].mutations,
+            10 * MUTATIONS_PER_SEGMENT as u64
+        );
+    }
+
+    /// T-F4-2 (a): every replayed segment is unlinked on the retire thread,
+    /// never the replay thread, and only after its barrier completed.
+    #[test]
+    fn replayed_segments_are_deleted_after_the_barrier_off_the_replay_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_replay_segments(dir.path(), 50);
+        replay_with_progress(dir.path(), &mut RecordingProgress::default());
+
+        let events = replay_progress::test_trace::events_under(dir.path());
+        let mut unlinked = Vec::new();
+        for (i, event) in events.iter().enumerate() {
+            let replay_progress::test_trace::Event::Unlinked { path, thread } = event else {
+                continue;
+            };
+            assert_eq!(
+                thread.as_deref(),
+                Some(replay_progress::RETIRE_THREAD_NAME),
+                "{} was unlinked on the wrong thread",
+                path.display()
+            );
+            let synced_before = events[..i].iter().any(|e| {
+                matches!(e, replay_progress::test_trace::Event::Synced { path: p } if p == path)
+            });
+            assert!(
+                synced_before,
+                "{} was unlinked before its barrier",
+                path.display()
+            );
+            unlinked.push(path.clone());
+        }
+        let expected: Vec<PathBuf> = old.iter().map(|(_, p)| p.clone()).collect();
+        unlinked.sort();
+        let mut expected_sorted = expected.clone();
+        expected_sorted.sort();
+        assert_eq!(unlinked, expected_sorted, "every old segment, once");
+        for path in &expected {
+            assert!(!path.exists(), "{} survived replay", path.display());
+        }
+    }
+
+    /// T-F4-2 (b): a crash between replay and unlink leaves the replayed
+    /// segments behind; the next replay delivers them again together with
+    /// their re-logged copies, and loses nothing.
+    #[test]
+    fn a_crash_before_retirement_replays_the_segments_again_idempotently() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = write_replay_segments(dir.path(), 20);
+
+        replay_progress::test_trace::suppress(dir.path());
+        let first = replay_with_progress(dir.path(), &mut RecordingProgress::default());
+        replay_progress::test_trace::unsuppress(dir.path());
+        for (_, path) in &old {
+            assert!(path.exists(), "the crash left {}", path.display());
+        }
+
+        let second = replay_with_progress(dir.path(), &mut RecordingProgress::default());
+        let mut counts: HashMap<[u8; 16], usize> = HashMap::new();
+        for id in &second {
+            *counts.entry(*id).or_default() += 1;
+        }
+        assert_eq!(first.len(), 20 * MUTATIONS_PER_SEGMENT);
+        assert_eq!(
+            counts.keys().copied().collect::<HashSet<_>>(),
+            first.iter().copied().collect::<HashSet<_>>(),
+            "the second replay delivers exactly the first replay's mutations"
+        );
+        assert!(
+            counts.values().all(|&n| n == 2),
+            "each once from the old segment and once from its re-logged copy: {counts:?}"
+        );
+        for (_, path) in &old {
+            assert!(
+                !path.exists(),
+                "{} survived the second replay",
+                path.display()
+            );
+        }
     }
 }

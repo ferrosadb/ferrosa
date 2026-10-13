@@ -25,6 +25,7 @@ use ferrosa_net::error::NetError;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 
+use super::replication_health::ReplicationHealth;
 use super::FerrosRaftConfig;
 
 /// Delay before handing a transient reconnecting lane back to OpenRaft as
@@ -56,14 +57,18 @@ pub struct FerrosRaftNetworkFactory {
     /// under the lock.  This allows `register_node` to be called from both sync
     /// and async contexts without `block_on` / `block_in_place` gymnastics.
     node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+    /// Where snapshot-chunk send outcomes are recorded per target.
+    replication_health: Arc<ReplicationHealth>,
 }
 
 impl FerrosRaftNetworkFactory {
-    /// Create a new factory backed by `peer_manager`.
-    pub fn new(peer_manager: Arc<PeerManager>) -> Self {
+    /// Create a new factory backed by `peer_manager`, recording snapshot-send
+    /// outcomes into `replication_health`.
+    pub fn new(peer_manager: Arc<PeerManager>, replication_health: Arc<ReplicationHealth>) -> Self {
         Self {
             peer_manager,
             node_map: Arc::new(RwLock::new(HashMap::new())),
+            replication_health,
         }
     }
 
@@ -130,6 +135,7 @@ impl RaftNetworkFactory<FerrosRaftConfig> for FerrosRaftNetworkFactory {
             peer_manager: Arc::clone(&self.peer_manager),
             target,
             node_map: Arc::clone(&self.node_map),
+            replication_health: Arc::clone(&self.replication_health),
         }
     }
 }
@@ -153,6 +159,7 @@ pub struct FerrosRaftNetwork {
     peer_manager: Arc<PeerManager>,
     target: u64,
     node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+    replication_health: Arc<ReplicationHealth>,
 }
 
 impl FerrosRaftNetwork {
@@ -293,8 +300,65 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         }
     }
 
-    /// Forward an `InstallSnapshot` RPC chunk to the target node.
+    /// Forward an `InstallSnapshot` RPC chunk to the target node, recording
+    /// the outcome in the per-peer consecutive snapshot-send failure streak
+    /// (outage 2026-10-10, D4): ~160,000 failed cycles to one follower were
+    /// visible only by reading logs.
     async fn install_snapshot(
+        &mut self,
+        rpc: InstallSnapshotRequest<FerrosRaftConfig>,
+        option: RPCOption,
+    ) -> Result<
+        InstallSnapshotResponse<u64>,
+        RPCError<u64, BasicNode, RaftError<u64, InstallSnapshotError>>,
+    > {
+        let result = self.send_install_snapshot(rpc, option).await;
+        self.replication_health
+            .record_snapshot_send(self.target, result.is_ok());
+        if let Err(e) = &result {
+            tracing::debug!(
+                node_id = self.target,
+                consecutive_failures = self.replication_health.snapshot_send_failures(self.target),
+                error = %e,
+                "InstallSnapshot chunk failed"
+            );
+        }
+        result
+    }
+
+    /// Forward a `Vote` RPC to the target node.
+    async fn vote(
+        &mut self,
+        rpc: VoteRequest<u64>,
+        option: RPCOption,
+    ) -> Result<VoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        self.send_vote(rpc, option).await
+    }
+
+    /// Send a PreVote probe (Ongaro §9.6, ADR-012).
+    ///
+    /// Mirrors [`Self::vote`] but carries `Message::RaftPreVote`, so a peer
+    /// running a build without PreVote rejects the frame rather than
+    /// misreading a non-mutating probe as a real, term-advancing vote.
+    ///
+    /// A failure here is a "no", not an error to retry: `run_pre_vote_round`
+    /// counts anything that is not an explicit grant as a rejection and the
+    /// node stays a Follower. That is the safe direction — a missed pre-vote
+    /// costs one election timeout, while a false grant is what inflates terms.
+    async fn pre_vote(
+        &mut self,
+        rpc: PreVoteRequest<u64>,
+        option: RPCOption,
+    ) -> Result<PreVoteResponse<u64>, RPCError<u64, BasicNode, RaftError<u64>>> {
+        self.send_pre_vote(rpc, option).await
+    }
+}
+
+// The bodies of the `RaftNetwork` methods above. openraft's error types are
+// large by design (dictated by the crate), as on the trait methods themselves.
+#[allow(clippy::result_large_err)]
+impl FerrosRaftNetwork {
+    async fn send_install_snapshot(
         &mut self,
         rpc: InstallSnapshotRequest<FerrosRaftConfig>,
         option: RPCOption,
@@ -351,8 +415,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         }
     }
 
-    /// Forward a `Vote` RPC to the target node.
-    async fn vote(
+    async fn send_vote(
         &mut self,
         rpc: VoteRequest<u64>,
         option: RPCOption,
@@ -396,17 +459,7 @@ impl RaftNetwork<FerrosRaftConfig> for FerrosRaftNetwork {
         }
     }
 
-    /// Send a PreVote probe (Ongaro §9.6, ADR-012).
-    ///
-    /// Mirrors [`Self::vote`] but carries `Message::RaftPreVote`, so a peer
-    /// running a build without PreVote rejects the frame rather than
-    /// misreading a non-mutating probe as a real, term-advancing vote.
-    ///
-    /// A failure here is a "no", not an error to retry: `run_pre_vote_round`
-    /// counts anything that is not an explicit grant as a rejection and the
-    /// node stays a Follower. That is the safe direction — a missed pre-vote
-    /// costs one election timeout, while a false grant is what inflates terms.
-    async fn pre_vote(
+    async fn send_pre_vote(
         &mut self,
         rpc: PreVoteRequest<u64>,
         option: RPCOption,
@@ -519,7 +572,8 @@ mod tests {
     #[tokio::test]
     async fn factory_creates_network() {
         let pm = make_peer_manager();
-        let mut factory = FerrosRaftNetworkFactory::new(Arc::clone(&pm));
+        let mut factory =
+            FerrosRaftNetworkFactory::new(Arc::clone(&pm), Arc::new(ReplicationHealth::new()));
 
         let host_id = Uuid::new_v4();
         let node_id: u64 = 1;
@@ -538,7 +592,7 @@ mod tests {
     #[tokio::test]
     async fn factory_unknown_node_is_unresolved() {
         let pm = make_peer_manager();
-        let mut factory = FerrosRaftNetworkFactory::new(pm);
+        let mut factory = FerrosRaftNetworkFactory::new(pm, Arc::new(ReplicationHealth::new()));
 
         // No registration — the client exists but resolves to nothing, so
         // every RPC maps to Unreachable (openraft backs off and retries).
@@ -560,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn late_registration_heals_existing_client() {
         let pm = make_peer_manager();
-        let mut factory = FerrosRaftNetworkFactory::new(pm);
+        let mut factory = FerrosRaftNetworkFactory::new(pm, Arc::new(ReplicationHealth::new()));
 
         let node = BasicNode {
             addr: "127.0.0.1:7001".to_string(),
@@ -585,12 +639,61 @@ mod tests {
         );
     }
 
+    // -- snapshot-send failures feed the per-peer streak (outage 2026-10-10, D4)
+
+    #[tokio::test]
+    async fn failed_snapshot_chunks_are_counted_per_target() {
+        use openraft::{CommittedLeaderId, LogId, SnapshotMeta, Vote};
+        let health = Arc::new(ReplicationHealth::new());
+        let mut factory = FerrosRaftNetworkFactory::new(make_peer_manager(), Arc::clone(&health));
+        let node = BasicNode {
+            addr: "127.0.0.1:7001".to_string(),
+        };
+        // 7: never registered. 8: registered, but the peer manager has no
+        // connection to it, so the send itself fails.
+        factory.register_node(8, Uuid::new_v4());
+        let mut unregistered = factory.new_client(7, &node).await;
+        let mut unconnected = factory.new_client(8, &node).await;
+        let chunk = || InstallSnapshotRequest::<FerrosRaftConfig> {
+            vote: Vote::new_committed(3, 1),
+            meta: SnapshotMeta {
+                last_log_id: Some(LogId::new(CommittedLeaderId::new(3, 1), 47_870)),
+                last_membership: Default::default(),
+                snapshot_id: "47870-test".to_string(),
+            },
+            offset: 0,
+            data: vec![0; 16],
+            done: true,
+        };
+        let option = || RPCOption::new(Duration::from_millis(500));
+
+        for _ in 0..3 {
+            assert!(unregistered
+                .install_snapshot(chunk(), option())
+                .await
+                .is_err());
+        }
+        assert!(unconnected
+            .install_snapshot(chunk(), option())
+            .await
+            .is_err());
+
+        assert_eq!(health.snapshot_send_failures(7), 3);
+        assert_eq!(health.snapshot_send_failures(8), 1);
+        let mut out = String::new();
+        health.render_prometheus(&mut out);
+        assert!(
+            out.contains("ferrosa_raft_snapshot_send_consecutive_failures{peer=\"7\"} 3\n"),
+            "{out}"
+        );
+    }
+
     // -- node_map_registration ---------------------------------------------
 
     #[tokio::test]
     async fn node_map_registration() {
         let pm = make_peer_manager();
-        let factory = FerrosRaftNetworkFactory::new(pm);
+        let factory = FerrosRaftNetworkFactory::new(pm, Arc::new(ReplicationHealth::new()));
 
         let ids: Vec<(u64, Uuid)> = (0..5).map(|i| (i, Uuid::new_v4())).collect();
 
@@ -615,7 +718,7 @@ mod tests {
     #[tokio::test]
     async fn node_map_overwrite() {
         let pm = make_peer_manager();
-        let factory = FerrosRaftNetworkFactory::new(pm);
+        let factory = FerrosRaftNetworkFactory::new(pm, Arc::new(ReplicationHealth::new()));
 
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
