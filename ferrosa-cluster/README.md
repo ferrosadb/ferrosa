@@ -313,7 +313,7 @@ build; the codec's own cost is its delta against `none`.
   bound a leader that cannot reach a quorum held the await open until the CQL
   client's own 30 s deadline fired — the unexplained `Request execution
   exceeded a client timeout of 30000ms` on the Jepsen teardown DROP (t_e8abe81a,
-  CL-73). On expiry it returns
+  CL-74). On expiry it returns
   `ClusterError::DdlProposalNotAgreed { operation, required, alive, timeout_ms,
   elapsed_ms }`, which names the statement (`ddl_op_target`), the quorum it
   needed and the wait; `ferrosa-cql` maps it to the CQL unavailable class so
