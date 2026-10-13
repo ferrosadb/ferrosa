@@ -178,6 +178,18 @@ impl StagedAccordWriteSet {
         Arc::clone(&self.payloads)
     }
 
+    /// Consume the set, returning its routing index and its payload spill **by move**.
+    ///
+    /// The commit path drives the Accord driver from exactly these two: the staging
+    /// already holds the `(keyspace, partition key)` index the driver's conflict ordering
+    /// and participant set require, so the driver takes it OVER rather than the caller
+    /// cloning it into a second resident collection. `keys[i]`'s payload is
+    /// `payloads.entry(i)`.
+    #[must_use]
+    pub fn into_keys_and_payloads(self) -> (Vec<(String, Vec<u8>)>, Arc<WriteSetSpill>) {
+        (self.keys, self.payloads)
+    }
+
     /// Materialize the whole set into a resident `Vec<TransactionWrite>`. TEST ONLY: this
     /// is the shape the staged type exists to remove; production never calls it.
     #[doc(hidden)]
