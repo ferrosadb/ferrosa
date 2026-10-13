@@ -30,7 +30,6 @@
 
 #![cfg(unix)]
 
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -40,6 +39,9 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
+
+mod common;
+use common::ports::PortAllocator;
 
 /// The dropped table. The PG front end's default schema is `public`.
 const TABLE: &str = "drop_proc_tbl";
@@ -66,70 +68,20 @@ struct Ports {
     flight: u16,
 }
 
-/// Every port this test binary has handed out, process-wide.
-///
-/// `#[test]` functions run on separate threads of one process, each with its
-/// own `taken` set, so a per-test set alone lets two tests draw the SAME port:
-/// [`free_port`] binds `:0`, reads the port and drops the listener, and the
-/// port is then free for the other test to draw too. The global set closes that
-/// window. The sibling never-ready fixture is where it showed: its node's
-/// PostgreSQL listener reported `Address already in use` under load, because a
-/// port another test had been handed was still bound (t_4e9a3e61).
-fn reserved_ports() -> &'static std::sync::Mutex<HashSet<u16>> {
-    static RESERVED: std::sync::OnceLock<std::sync::Mutex<HashSet<u16>>> =
-        std::sync::OnceLock::new();
-    RESERVED.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
-}
-
-/// Whether a connection to `port` is REFUSED — i.e. nothing is listening on it
-/// right now.
-///
-/// The bind-then-drop in [`free_port`] proves the port was free a moment ago;
-/// this proves nothing holds it NOW. A stale listener (a container runtime's
-/// proxy, a peer test's node) answers the connect, and this node's own bind
-/// would then fail `Address already in use` — a harness accident reported as a
-/// product red.
-fn port_is_refused(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(50)).is_err()
-}
-
-/// A port no other test in this process holds and nothing is listening on.
-///
-/// Retries on every collision rather than taking the first ephemeral port the
-/// kernel offers: a port can be spoken for by this process, or already bound by
-/// something outside it.
-fn free_port(taken: &mut HashSet<u16>) -> u16 {
-    for _ in 0..500 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        // Genuinely free: refused now (nothing outside holds it) and not
-        // claimed by another test or an earlier allocation in this one.
-        if !port_is_refused(port) {
-            continue;
-        }
-        if !taken.insert(port) {
-            continue;
-        }
-        if !reserved_ports().lock().unwrap().insert(port) {
-            continue;
-        }
-        return port;
-    }
-    panic!("could not allocate a free port");
-}
-
-fn alloc_ports(taken: &mut HashSet<u16>) -> Ports {
+/// A band of eight ports for one node, from the shared allocator whose ports sit
+/// BELOW the kernel's ephemeral range (`tests/common/ports.rs`): a port inside that
+/// range can already be held by any outbound connection in the VM, which is how a
+/// node's SPARQL listener lost its port in CI on 2026-10-13.
+fn alloc_ports(alloc: &mut PortAllocator) -> Ports {
     Ports {
-        cql: free_port(taken),
-        web: free_port(taken),
-        internode: free_port(taken),
-        graph: free_port(taken),
-        bolt: free_port(taken),
-        pg: free_port(taken),
-        sparql: free_port(taken),
-        flight: free_port(taken),
+        cql: alloc.get(),
+        web: alloc.get(),
+        internode: alloc.get(),
+        graph: alloc.get(),
+        bolt: alloc.get(),
+        pg: alloc.get(),
+        sparql: alloc.get(),
+        flight: alloc.get(),
     }
 }
 
@@ -873,7 +825,7 @@ fn sabotage_table_dir(table_dir: &Path) -> RestoreDirMode {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects() {
     let cluster_name = format!("drop-proc-{}", std::process::id());
-    let mut taken: HashSet<u16> = HashSet::new();
+    let mut alloc = PortAllocator::new();
 
     // Allocate every node's ports up front, so each node can be given the others
     // as seeds. Every node seeds off the other two (a full mesh): that makes the
@@ -882,7 +834,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
     // quorum from. With the docker-compose star (node 0 has no seed) the keyspace
     // is RF=1 and an Accord write that resolves to the coordinator's own host
     // fails "unknown peer: <own host_id>" and never commits.
-    let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(&mut taken)).collect();
+    let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(&mut alloc)).collect();
     let internode: Vec<String> = all_ports
         .iter()
         .map(|p| format!("127.0.0.1:{}", p.internode))
@@ -1201,8 +1153,8 @@ fn a_node_exit_is_named_with_its_status_and_its_first_fatal_line() {
 /// fatal — the node keeps running, which is the case this test exists for.
 #[test]
 fn a_node_alive_but_never_ready_fails_the_wait_naming_its_condition() {
-    let mut taken: HashSet<u16> = HashSet::new();
-    let ports = alloc_ports(&mut taken);
+    let mut alloc = PortAllocator::new();
+    let ports = alloc_ports(&mut alloc);
     let dir = tempfile::tempdir().expect("node data dir");
     // Held for the whole test: the node can never bind it.
     let _held_pg = std::net::TcpListener::bind(("127.0.0.1", ports.pg))
@@ -1298,8 +1250,8 @@ fn panic_text(payload: Box<dyn std::any::Any + Send>) -> String {
 /// synchronous `FATAL:` line, and the process exits 70.
 #[test]
 fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
-    let mut taken: HashSet<u16> = HashSet::new();
-    let ports = alloc_ports(&mut taken);
+    let mut alloc = PortAllocator::new();
+    let ports = alloc_ports(&mut alloc);
     let dir = tempfile::tempdir().expect("node data dir");
     let host_id = "11111111-1111-1111-1111-111111111111".to_string();
     let mut node = spawn_node_with_env(
