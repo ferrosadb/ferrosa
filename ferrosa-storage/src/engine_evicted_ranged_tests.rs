@@ -664,3 +664,129 @@ async fn background_restore_respects_the_uploaded_cache_limit() {
     assert!(!has_local_data(&hot));
     engine.shutdown().unwrap();
 }
+
+/// THE INVARIANT. A generation that is VISIBLE in the table directory is
+/// COMPLETE.
+///
+/// `StorageEngine::list_generations_in_dir` keys a generation on the presence of
+/// `{gen}-Data.db`, and both consumers of that listing — the startup load loop
+/// and the self-heal corruption scan (`scan_table_dir_for_corrupt`) — discover
+/// generations exactly that way. So from the instant `{gen}-Data.db` exists,
+/// every required component (`Data.db`, `Partitions.db`, `Rows.db`, `Filter.db`,
+/// `flush::REQUIRED_SSTABLE_COMPONENTS`) must already be beside it. Anything
+/// else makes a generation that is visible and incomplete at the same time: the
+/// load loop excludes it, the self-heal scan reports it `corrupt`, and the
+/// generation is then permanently unavailable even though the flush that wrote
+/// it never crashed.
+///
+/// `install_s3_file_read_rehydration_hook` breaks that invariant. It publishes a
+/// rehydrated generation by renaming each component from its `.rehydrate.tmp`
+/// onto its **final live name**, one rename at a time, in `SSTABLE_COMPONENTS`
+/// order — **`Data.db` FIRST** — and its `NotFound` arm *tolerates* a missing
+/// `Partitions.db`/`Rows.db`/`Filter.db` while it does so. A process death
+/// between the first and the second rename therefore leaves a generation whose
+/// `Data.db` is live and whose index is not, and the hook still reports success.
+/// (The same shape arrives without any crash when one required object is absent
+/// from the store: the missing arm skips it and the `Data.db` that *was* there is
+/// already promoted.)
+///
+/// This test drives the real hook through `rehydrate_file` and interrupts the
+/// publication *between the first and the second rename* — the promote seam the
+/// ST-61 test already uses fires immediately before each promote, so the second
+/// fire is only reached once `Data.db` is live. Removing that component's staged
+/// temp file is the interruption; the bytes it leaves on disk are the bytes a
+/// kill in that window leaves.
+///
+/// RED as written: the interruption lands in that window and the assertion fails
+/// on TODAY's publication order — the generation is listed while its smoke test
+/// fails — rather than on a symbol that does not exist yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rehydrated_generation_is_never_visible_before_it_is_complete() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, table_dir, gen, _keys) =
+        engine_with_evicted_sstable(dir.path(), "test-rehydrate-visible-incomplete").await;
+
+    // The fixture must start from a fully evicted generation, so the invariant
+    // below is about what THIS publication makes visible.
+    let data_path = table_dir.join(format!("{gen}-Data.db"));
+    assert!(
+        !data_path.exists() && StorageEngine::list_generations_in_dir(&table_dir).is_empty(),
+        "the fixture must start evicted, found {:?}",
+        local_names(&table_dir)
+    );
+
+    // Interrupt the publication between the first and the second rename: the
+    // promote seam fires immediately before each component's rename, so the
+    // second fire is only reached once the first component is already published.
+    // Removing that component's staged temp file is the interruption — the bytes
+    // it leaves on disk are the bytes a kill in that window leaves.
+    let promotes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let promoted_names = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+    {
+        let promotes = Arc::clone(&promotes);
+        let promoted_names = Arc::clone(&promoted_names);
+        rehydrate_promote_seam::install(
+            &table_dir,
+            Arc::new(move |tmp_path| {
+                promoted_names.lock().push(
+                    tmp_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                );
+                if promotes.fetch_add(1, SeqCst) == 1 {
+                    std::fs::remove_file(tmp_path)
+                        .expect("the second component's staged temp file must exist");
+                }
+            }),
+        );
+    }
+
+    let interrupted = ferrosa_sstable::io::rehydrate_file(&data_path);
+    assert!(
+        !matches!(interrupted, Ok(true)),
+        "the publication must not report success: {interrupted:?}"
+    );
+    assert_eq!(
+        promotes.load(SeqCst),
+        2,
+        "the seam fires immediately before each promote; interrupting on the \
+         second fire means the first component was already published, in order \
+         {:?}",
+        promoted_names.lock()
+    );
+
+    // THE INVARIANT: every generation the table directory makes visible must
+    // open and pass the smoke test the startup loop and the self-heal scan run.
+    let visible_but_incomplete: Vec<(u64, String)> =
+        StorageEngine::list_generations_in_dir(&table_dir)
+            .into_iter()
+            .filter_map(|listed| {
+                StorageEngine::smoke_test_generation(&table_dir, listed)
+                    .err()
+                    .map(|e| (listed, e.to_string()))
+            })
+            .collect();
+    assert!(
+        visible_but_incomplete.is_empty(),
+        "a generation visible in the table directory must be COMPLETE. After the \
+         interrupted rehydration these are listed while their smoke test fails: \
+         {visible_but_incomplete:?}. Publication order was {:?}; on-disk files: {:?}",
+        promoted_names.lock(),
+        local_names(&table_dir)
+    );
+    engine.shutdown().unwrap();
+}
+
+/// The names directly inside `dir`, sorted — the evidence a failure message
+/// needs to name which component was published and which never arrived.
+fn local_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
