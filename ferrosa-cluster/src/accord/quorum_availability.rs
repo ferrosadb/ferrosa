@@ -490,6 +490,26 @@ async fn run_postgres_read(committer: &AccordTransactionCommitter) -> Result<(),
 /// predecessors on the single barrier key and failed "snapshot barrier
 /// dependencies were not applied locally" once the queue outlasted a fixed 5 s
 /// dependency wait — a timeout, not a missing quorum, decided its fate.
+///
+/// # Level: an in-process GUARD, not the red for nightly 38533936817
+///
+/// The nightly fuzz job DID fail this test on 2026-10-14 (panic at this file's
+/// `assert!`, one actor's `read begin` returning "PostgreSQL snapshot barrier
+/// dependencies were not applied locally" after 13.1 s): see run 38533936817,
+/// job 115752136092. That is a LOAD-SHAPED failure — the job ran it on a 2-4
+/// vCPU runner inside the whole workspace suite.
+///
+/// It did NOT reproduce here: 43 executions green (40 isolated under 24 CPU
+/// burners, plus once per full `-p ferrosa-cluster --all-features --lib` run at
+/// `--test-threads=4`; the only suite failure was the unrelated live-infra
+/// prerequisite panic in
+/// `range_read_stream::tests::real_typed_edges_paged_scan_delivers_every_distinct_row`).
+///
+/// So this test pins the INVARIANT — a live quorum must commit past a paused
+/// replica — but it is NOT a red for that defect. An in-process fixture whose
+/// barrier is bounded by `configured_barrier_timeout()` cannot prove an
+/// availability claim that surfaces only when the runtime is starved. The
+/// clustered acceptance for the claim is not covered by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_paused_replica_does_not_fail_postgres_transactions_while_a_quorum_is_live() {
     // The shape of `postgres_strict_serializable`: five actors on the two live
