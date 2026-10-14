@@ -1,0 +1,9 @@
+Picked up JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+Picked up JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+=== Elle list-append / strict-serializable ===
+history: /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T153158Z/elle-cql-20261013T153158Z.edn
+ops: 4800
+valid? true
+anomaly-types: nil
+output dir: nil
+anomalies dumped: /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T153158Z/elle-cql-20261013T153158Z.edn.anomalies.edn

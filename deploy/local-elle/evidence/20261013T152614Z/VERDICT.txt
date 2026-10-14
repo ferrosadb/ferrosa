@@ -1,0 +1,13 @@
+=== Elle list-append / strict-serializable ===
+history: /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T152614Z/elle-cql-20261013T152614Z.edn
+op breakdown: ok=2400 info=0 fail=0
+  of the :ok ops: appends=1600 reads=800
+Picked up JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+Picked up JAVA_TOOL_OPTIONS: -Djava.awt.headless=true
+=== Elle list-append / strict-serializable ===
+history: /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T152614Z/elle-cql-20261013T152614Z.edn
+ops: 4800
+valid? true
+anomaly-types: nil
+output dir: nil
+anomalies dumped: /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T152614Z/elle-cql-20261013T152614Z.edn.anomalies.edn
