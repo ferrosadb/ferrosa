@@ -14,6 +14,8 @@
 //! - [`decide::decide`] — the **pure** decision function. No clock/RNG/IO.
 //! - [`detector`] — corrupt-SSTable detector (loud WARN + metric, always).
 //! - [`action`] — quarantine executor with the FMEA #1 safety rail.
+//! - [`recover`] — object-store recovery of a generation excluded as corrupt:
+//!   the third source, for a node no peer can refill.
 //! - [`metrics`] — counters/gauges + the health surface.
 //! - [`SelfHealController`] — owns the ledger, builds snapshots each tick,
 //!   calls `decide`, executes one action, and re-publishes health.
@@ -30,6 +32,7 @@ pub mod config;
 pub mod decide;
 pub mod detector;
 pub mod metrics;
+pub mod recover;
 pub mod refill;
 pub mod snapshot;
 
@@ -45,6 +48,7 @@ use crate::TableId;
 pub use config::SelfHealConfig;
 pub use decide::{Action, EscalateReason};
 pub use metrics::{self_heal_health, self_heal_metrics, SelfHealHealth, SelfHealMetrics};
+pub use recover::RecoveryOutcome;
 pub use refill::{NoopRepairTrigger, RepairTrigger};
 pub use snapshot::{
     AttemptState, CorruptSstable, HealthSnapshot, IssueKind, ReplicaPosture, RingView, TableIssue,
@@ -446,6 +450,9 @@ impl SelfHealController {
         if let Action::RebuildVectorIndexes { table } = &action {
             return self.start_vector_rebuilds(snapshot, table);
         }
+        if let Action::RecoverCorrupt { table, generations } = &action {
+            return self.start_object_store_recovery(snapshot, table, generations);
+        }
         // Identify the (table, issue) this action targets so we can record an
         // attempt against the correct ledger entry.
         let (table, kind) = match &action {
@@ -454,6 +461,11 @@ impl SelfHealController {
             Action::RebuildVectorIndexes { table } => {
                 (table.clone(), IssueKind::InvalidVectorIndex)
             }
+            // Recovery is intercepted by the `if let` above and returns early;
+            // this arm exists only to keep the match exhaustive. It is the same
+            // issue kind the corrupt generation was recorded under, so if the
+            // interception is ever removed the ledger entry is still correct.
+            Action::RecoverCorrupt { table, .. } => (table.clone(), IssueKind::CorruptSstables),
         };
 
         let posture = self.cluster.replica_posture(&table);
@@ -490,6 +502,13 @@ impl SelfHealController {
                 entry.escalated = true;
             }
             ActionOutcome::VectorRebuildStarted { .. } => {}
+            // The recovery path recorded its own ledger attempt (and its own
+            // metrics); there is nothing to add here, and nothing to escalate:
+            // `decide` escalates when the attempts run out.
+            ActionOutcome::Recovered { .. } | ActionOutcome::RecoveryRefused { .. } => {}
+            ActionOutcome::Failed { .. } => {
+                entry.escalated = true;
+            }
         }
         Some(outcome)
     }
@@ -522,6 +541,52 @@ impl SelfHealController {
         })
     }
 
+    /// Attempt object-store recovery for each corrupt generation of `table`
+    /// (see [`recover`]). An attempt is recorded for every generation tried. When
+    /// none is re-admitted the issue is **not** escalated here: the corrupt files
+    /// are untouched and the attempt count rises, so `decide` retries after the
+    /// cooldown and escalates only once `max_attempts` run out (FMEA #5) — a store
+    /// outage must not be terminal on the first tick.
+    fn start_object_store_recovery(
+        &mut self,
+        snapshot: &HealthSnapshot,
+        table: &TableKey,
+        generations: &[u64],
+    ) -> Option<ActionOutcome> {
+        let tid = TableId::new(&table.keyspace, &table.table);
+        let mut recovered = Vec::new();
+        let mut reasons = Vec::new();
+        for &gen in generations {
+            match self.engine.recover_corrupt_generation(&tid, gen) {
+                RecoveryOutcome::Reinstated => recovered.push(gen),
+                refusal => reasons.push((gen, refusal.reason())),
+            }
+        }
+
+        let entry = self
+            .ledger
+            .entry((table.clone(), IssueKind::CorruptSstables))
+            .or_default();
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.last_attempt_tick = Some(snapshot.tick);
+
+        if !recovered.is_empty() {
+            metrics::inc_actions_executed();
+            // Not escalated: the next tick re-runs the detector to verify the
+            // issue cleared (verify-by-re-detection, FMEA #11).
+            return Some(ActionOutcome::Recovered {
+                table: table.clone(),
+                generations: recovered,
+            });
+        }
+        // Nothing was re-admitted and nothing was moved. `decide` escalates once
+        // the attempts run out; until then it retries after the cooldown.
+        Some(ActionOutcome::RecoveryRefused {
+            table: table.clone(),
+            reasons,
+        })
+    }
+
     /// Publish the health surface for this tick.
     fn publish_health(&self, snapshot: &HealthSnapshot, outcome: Option<&ActionOutcome>) {
         let mut entries = Vec::new();
@@ -539,6 +604,24 @@ impl SelfHealController {
             } else if matches!(outcome, Some(ActionOutcome::Quarantined { table, .. }) if *table == issue.table)
             {
                 "quarantined this tick".to_string()
+            } else if let Some(ActionOutcome::Recovered { table, generations }) = outcome {
+                if *table == issue.table {
+                    format!(
+                        "recovered {} generation(s) from the object store",
+                        generations.len()
+                    )
+                } else {
+                    format!("detected ({} attempt(s))", state.attempts)
+                }
+            } else if let Some(ActionOutcome::RecoveryRefused { table, reasons }) = outcome {
+                if *table == issue.table {
+                    format!(
+                        "object-store recovery refused for {} generation(s)",
+                        reasons.len()
+                    )
+                } else {
+                    format!("detected ({} attempt(s))", state.attempts)
+                }
             } else {
                 format!("detected ({} attempt(s))", state.attempts)
             };
