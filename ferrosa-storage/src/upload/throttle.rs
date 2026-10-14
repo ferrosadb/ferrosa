@@ -337,6 +337,22 @@ fn idle_bounded(
             }
         }
     })
+    // Fuse before handing the stream out. `futures::stream::unfold` PANICS if it
+    // is polled after returning `Poll::Ready(None)`, and its consumers do poll
+    // once past the end: `object_store::util::collect_bytes` — which backs
+    // `GetResult::bytes()`, the way every component download is read — awaits
+    // `stream.next()` a second time unconditionally to detect a single-chunk
+    // body. On a ZERO-LENGTH body the first `next()` is already `None`, so that
+    // second poll lands on a finished unfold and aborts the process.
+    //
+    // The trigger is therefore any empty object, and the writer emits exactly
+    // that: a zero-byte `Rows.db` for every table whose partitions need no row
+    // index (most of them). Downloading one during startup registration of
+    // evicted generations killed node2 on every restart, 0.35 s in, and killed
+    // node1 on a worker thread via the repair path (2026-10-14). Fusing latches
+    // completion, so a finished stream keeps reporting "no more data" — which is
+    // what every caller is entitled to assume — instead of aborting the node.
+    .fuse()
     .boxed()
 }
 
@@ -500,6 +516,39 @@ impl ObjectStore for ThrottledStore {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
+
+    /// A consumer that polls a finished stream once more must be told it is
+    /// finished.
+    ///
+    /// `futures::stream::unfold` PANICS when polled after it returned
+    /// `Poll::Ready(None)`, and `idle_bounded` handed out a bare `unfold`. That
+    /// panic aborts the whole process, and `object_store`'s
+    /// `GetResult::bytes()` drains this stream and polls once past the end — so
+    /// any component fetch during startup registration could kill the node.
+    /// Observed: node2, 2026-10-14, aborting every restart 0.35 s into
+    /// `register_evicted_sstables_remote` with `Unfold must not be polled after
+    /// it returned `Poll::Ready(None)``.
+    ///
+    /// Polling a completed stream is not an error: the caller is entitled to be
+    /// told there is no more data.
+    #[tokio::test]
+    async fn a_finished_idle_bounded_stream_reports_completion_instead_of_aborting() {
+        let stream = futures::stream::empty::<Result<Bytes>>().boxed();
+        let permit = Arc::new(Semaphore::new(1))
+            .acquire_owned()
+            .await
+            .expect("a test semaphore admits its one permit");
+        let mut bounded = idle_bounded(stream, permit, Duration::from_secs(1), Path::from("t"));
+
+        assert!(
+            bounded.next().await.is_none(),
+            "an empty body ends on its first poll"
+        );
+        assert!(
+            bounded.next().await.is_none(),
+            "polling a finished stream must report completion, never abort the process"
+        );
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_pacer_admits_no_more_than_its_rate() {
