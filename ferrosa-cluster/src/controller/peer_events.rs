@@ -598,6 +598,7 @@ impl InboundPeerCallback for ModeController {
         peer_id: PeerId,
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
+        capabilities: u32,
     ) {
         let (host_id, addr) = peer_id;
         if host_id == self.local_host_id {
@@ -636,6 +637,22 @@ impl InboundPeerCallback for ModeController {
         // recovered ring with unchanged metadata, so it returns early before
         // reaching any registration. Idempotent, and a no-op before formation.
         self.register_peer_in_raft_node_map(host_id);
+
+        // Record the capabilities this peer advertised on the handshake that
+        // just landed. Our outbound pool's snapshot was taken when WE dialled
+        // it and can predate the peer's restart, so without this a rolling
+        // upgrade never unlocks the jsonb DDL gate until the observer itself
+        // restarts (t_d853fa2a). An inbound handshake proves the peer runs that
+        // build NOW; latest-wins in the peer manager keeps it fail-closed.
+        if let Some(pm) = &**self.peer_manager.load() {
+            let pm = pm.clone();
+            let hid = host_id;
+            ferrosa_net::task_pool::TaskPool::current("peer-inbound-capabilities").spawn(
+                async move {
+                    pm.record_inbound_capabilities(hid, capabilities).await;
+                },
+            );
+        }
 
         // Store the peer's CQL broadcast address (from handshake) in PeerManager
         // so system.peers can return it instead of the container-internal IP.
