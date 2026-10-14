@@ -23,7 +23,10 @@
 //! A port **below** the range can never be handed out as a source port, so the
 //! race is removed rather than tolerated. The harness still proves every port it
 //! hands over is free at that instant, still never issues the same port twice
-//! within a process, and a node that loses one anyway still fails loud.
+//! within a process, and still leases each PROCESS its own slice of the band,
+//! because `cargo nextest run --tests` runs one process per test and several
+//! node-spawning harnesses are in flight at once; a node that loses a port anyway
+//! still fails loud.
 //!
 //! The band is deliberately below both platforms' floors and clear of every
 //! fixed port this repo uses (the dev cluster's 19042-19044/19090-19092/17474,
@@ -44,6 +47,80 @@ pub const BAND_START: u16 = 20_000;
 pub const BAND_END: u16 = 27_999;
 
 const BAND_LEN: u32 = (BAND_END as u32 - BAND_START as u32) + 1;
+
+/// Ports per slice. A fixture's widest case is a 5-node cluster taking 7 ports
+/// per node, so 200 leaves room for several fixtures' worth inside one slice.
+pub const SLICE_LEN: u16 = 200;
+
+/// How many processes may hold a disjoint slice of the band at once.
+///
+/// The number that matters is how many node-spawning tests the runner has in
+/// flight, not how many cores the machine has: `cargo nextest run --tests` runs
+/// **one process per test** and schedules them across every core, so the six
+/// harnesses in `ferrosa/tests/` can all be running at the same time, alongside
+/// every other test in the workspace.
+pub const SLICES: u16 = (BAND_LEN / SLICE_LEN as u32) as u16;
+
+/// Directory holding one lock file per slice, under the platform's temp dir —
+/// shared by every test process of the run, and unique to this machine.
+const SLICE_LOCK_DIR: &str = "ferrosa-test-port-band";
+
+/// The port this process starts its scan from: the first port of a slice it
+/// holds exclusively for as long as it lives.
+///
+/// A per-process allocator is correct only while one process runs at a time, and
+/// that is not how CI runs the suite. Measured on 2026-10-13: with every process
+/// starting at [`BAND_START`], `drop_table_replica_process` and
+/// `pg_public_keyspace_rf_process` ran concurrently and both handed their nodes
+/// `20000`/`20001`/`20002` — one node died with `failed to bind 127.0.0.1:20002:
+/// address in use` and the other spent 90 s waiting for a cluster whose third
+/// node had died the same way. Two harness binaries reproduce it locally in 10 s.
+///
+/// The lease is an OS file lock, so a process that is killed — the normal end of
+/// a panic — releases it in the kernel and leaves no stale claim for the next
+/// run to trip over.
+fn process_slice_start() -> u16 {
+    static START: OnceLock<u16> = OnceLock::new();
+    *START.get_or_init(|| {
+        if let Some(index) = claim_slice_lease() {
+            return BAND_START + index * SLICE_LEN;
+        }
+        // No lock could be taken — an unwritable temp dir, or a platform without
+        // file locks. Key the slice on this process's own id instead of falling
+        // back to `BAND_START`, so two processes still start from different
+        // ports rather than from the same one.
+        let slice = (std::process::id() as u32 % SLICES as u32) as u16;
+        BAND_START + slice * SLICE_LEN
+    })
+}
+
+/// Claims a slice by taking an exclusive lock on its file, and holds the lock —
+/// and the file descriptor under it — for the life of the process.
+fn claim_slice_lease() -> Option<u16> {
+    let dir = std::env::temp_dir().join(SLICE_LOCK_DIR);
+    std::fs::create_dir_all(&dir).ok()?;
+    for index in 0..SLICES {
+        let path = dir.join(format!("slice-{index:02}.lock"));
+        let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            // The file's CONTENT is irrelevant — it is a lock, not a record — so
+            // it must not be truncated: truncating on every claim would be a
+            // write against a file another process may be holding.
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+        else {
+            continue;
+        };
+        if file.try_lock().is_ok() {
+            // Deliberately leaked: dropping the handle would release the lock.
+            std::mem::forget(file);
+            return Some(index);
+        }
+    }
+    None
+}
 
 /// The kernel's ephemeral range floor: `net.ipv4.ip_local_port_range` on Linux,
 /// `net.inet.ip.portrange.first` on macOS/BSD.
@@ -106,11 +183,13 @@ fn process_reserved() -> &'static Mutex<HashSet<u16>> {
     RESERVED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-/// Hands out ports from [`BAND_START`]..=[`BAND_END`], skipping any that this
-/// process already owns or that something is listening on.
+/// Hands out ports from this process's slice of [`BAND_START`]..=[`BAND_END`],
+/// skipping any that this process already owns or that something is listening on.
 ///
-/// One allocator per test; the process-wide reservation is shared by all of
-/// them, so two tests running at once can never be given the same port.
+/// One allocator per test; the process-wide reservation is shared by all of them,
+/// so two tests running at once can never be given the same port — and
+/// [`process_slice_start`] leases each process its own slice, so two *processes*
+/// cannot either.
 pub struct PortAllocator {
     next: u16,
     taken: HashSet<u16>,
@@ -118,7 +197,7 @@ pub struct PortAllocator {
 
 impl PortAllocator {
     pub fn new() -> Self {
-        Self::beginning_at(BAND_START)
+        Self::beginning_at(process_slice_start())
     }
 
     /// An allocator whose scan starts at `port`. A test seam: it lets a test
