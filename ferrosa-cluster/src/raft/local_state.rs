@@ -40,6 +40,21 @@ pub enum LocalRaftState {
     /// and no local recovery exists. Only a snapshot from the leader can
     /// repair it.
     StrandedBehindPurge { last_applied: u64, last_purged: u64 },
+
+    /// The log has an INTERNAL HOLE: a contiguous block of indices is absent
+    /// *above* the purge point, so those entries were lost rather than
+    /// deliberately deleted.
+    ///
+    /// openraft requires a contiguous log and dies at boot on one that is not
+    /// (`try to get log at index N but got None`), which names an index and no
+    /// cause. Unlike [`Self::StrandedBehindPurge`] the applied/purged pair is
+    /// perfectly healthy here, which is why this shape went unnoticed: it
+    /// stranded node2 on 2026-10-14 with entries 48182..=49871 absent while the
+    /// log otherwise spanned 46864..50870.
+    ///
+    /// No local repair exists -- the entries are nowhere on this node -- so the
+    /// node must reset its Raft state and take a snapshot from the leader.
+    LogHasGap { from: u64, to: u64 },
 }
 
 impl LocalRaftState {
@@ -59,7 +74,17 @@ impl LocalRaftState {
 pub fn classify_local_raft_state(
     last_applied: Option<u64>,
     last_purged: Option<u64>,
+    log_gap: Option<(u64, u64)>,
 ) -> LocalRaftState {
+    // A hole dominates: it makes the log unreplayable however well the
+    // applied/purged pair agrees, because openraft reads the log in order and
+    // dies at the first absent index. Checked before the pair for exactly that
+    // reason -- this is the case where the pair looks healthy and the node
+    // nonetheless cannot start.
+    if let Some((from, to)) = log_gap {
+        return LocalRaftState::LogHasGap { from, to };
+    }
+
     let Some(last_purged) = last_purged else {
         // Nothing has been purged, so nothing can be missing.
         return LocalRaftState::Usable;
@@ -184,7 +209,7 @@ mod tests {
                  durable applied index {durable_applied}"
             );
             assert_eq!(
-                classify_local_raft_state(Some(durable_applied), Some(permitted)),
+                classify_local_raft_state(Some(durable_applied), Some(permitted), None),
                 LocalRaftState::Usable,
                 "a permitted purge to {permitted} left the node stranded"
             );
@@ -195,7 +220,7 @@ mod tests {
     #[test]
     fn last_applied_behind_the_purge_point_is_stranded() {
         assert_eq!(
-            classify_local_raft_state(Some(2905), Some(3065)),
+            classify_local_raft_state(Some(2905), Some(3065), None),
             LocalRaftState::StrandedBehindPurge {
                 last_applied: 2905,
                 last_purged: 3065,
@@ -210,7 +235,7 @@ mod tests {
     #[test]
     fn applied_exactly_to_the_purge_point_is_usable() {
         assert_eq!(
-            classify_local_raft_state(Some(3065), Some(3065)),
+            classify_local_raft_state(Some(3065), Some(3065), None),
             LocalRaftState::Usable
         );
     }
@@ -218,7 +243,7 @@ mod tests {
     #[test]
     fn applied_ahead_of_the_purge_point_is_usable() {
         assert_eq!(
-            classify_local_raft_state(Some(3100), Some(3065)),
+            classify_local_raft_state(Some(3100), Some(3065), None),
             LocalRaftState::Usable
         );
     }
@@ -227,7 +252,7 @@ mod tests {
     #[test]
     fn lost_last_applied_falls_back_to_the_purge_point() {
         assert_eq!(
-            classify_local_raft_state(None, Some(3065)),
+            classify_local_raft_state(None, Some(3065), None),
             LocalRaftState::NeedsPurgePointBaseline { purge_point: 3065 }
         );
     }
@@ -235,11 +260,11 @@ mod tests {
     #[test]
     fn nothing_purged_is_always_usable() {
         assert_eq!(
-            classify_local_raft_state(None, None),
+            classify_local_raft_state(None, None, None),
             LocalRaftState::Usable
         );
         assert_eq!(
-            classify_local_raft_state(Some(7), None),
+            classify_local_raft_state(Some(7), None, None),
             LocalRaftState::Usable
         );
     }
@@ -249,7 +274,7 @@ mod tests {
     #[test]
     fn stranded_is_never_reported_as_usable() {
         for applied in 0u64..3065 {
-            let state = classify_local_raft_state(Some(applied), Some(3065));
+            let state = classify_local_raft_state(Some(applied), Some(3065), None);
             assert!(
                 state.is_stranded(),
                 "applied={applied} is behind the purge point and must be \

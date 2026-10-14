@@ -1001,6 +1001,49 @@ impl SledLogStore {
         Self::load_meta(&self.meta, META_LAST_PURGED)
     }
 
+    /// The first hole in this log's surviving index range, if any.
+    ///
+    /// openraft requires a Raft log to be CONTIGUOUS above its purge point:
+    /// entries are appended in order, so an absent index between two present ones
+    /// means entries were lost rather than never written. openraft then dies at
+    /// boot with `try to get log at index N but got None`, which names an index
+    /// and no cause -- the shape that stranded node2 on 2026-10-14, where entries
+    /// 48182..=49871 were absent while the log otherwise spanned 46864..50870.
+    ///
+    /// Absence at or below `last_purged` is deliberate and is NOT a hole: those
+    /// entries were deleted on purpose once a snapshot covered them. Only absence
+    /// ABOVE that point -- a jump between two present indices, or a first entry
+    /// sitting past the purge point -- is loss.
+    ///
+    /// Returns the first such hole as an inclusive `(from, to)` index range.
+    pub fn log_gap(&self) -> Result<Option<(u64, u64)>, StorageIOError<u64>> {
+        let purge_point = self.last_purged_log_id()?.map(|log_id| log_id.index);
+        let mut previous: Option<u64> = None;
+
+        for item in self.log.iter() {
+            let (key, _value) = item.map_err(|e| StorageIOError::read_logs(to_any_error(e)))?;
+            let Some(index) = Self::index_from_key(&key) else {
+                continue;
+            };
+            match previous {
+                // Below the purge point, absence is deliberate, so only an entry
+                // sitting ABOVE it can reveal loss at the head of the range.
+                None => {
+                    if let Some(purged) = purge_point.filter(|purged| index > purged + 1) {
+                        return Ok(Some((purged + 1, index - 1)));
+                    }
+                }
+                Some(previous) if index != previous + 1 => {
+                    return Ok(Some((previous + 1, index - 1)));
+                }
+                Some(_) => {}
+            }
+            previous = Some(index);
+        }
+
+        Ok(None)
+    }
+
     /// Scan all log entries for the last `Membership` payload.
     ///
     /// Used during recovery when the state machine lost `last_membership`
@@ -1483,7 +1526,7 @@ mod tests {
         );
 
         assert_eq!(
-            crate::raft::local_state::classify_local_raft_state(Some(3), Some(3)),
+            crate::raft::local_state::classify_local_raft_state(Some(3), Some(3), None),
             crate::raft::local_state::LocalRaftState::Usable
         );
     }
@@ -2671,5 +2714,135 @@ mod tests {
             }
             other => panic!("golden entry 9 must be CreateIndex, got {other:?}"),
         }
+    }
+
+    /// Build a log holding exactly `indexes`, in one batch.
+    fn store_holding(indexes: impl IntoIterator<Item = u64>) -> (tempfile::TempDir, SledLogStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SledLogStore::new(dir.path()).unwrap();
+        let mut batch = sled::Batch::default();
+        for idx in indexes {
+            let entry = blank_entry(1, idx);
+            batch.insert(
+                &SledLogStore::index_key(idx),
+                SledLogStore::serialize_entry(&entry).unwrap(),
+            );
+        }
+        store.log.apply_batch(batch).unwrap();
+        (dir, store)
+    }
+
+    /// A log with an INTERNAL HOLE -- a contiguous block of entries missing from
+    /// the middle, above the purge point -- must not be reported as usable.
+    ///
+    /// This is the shape that stranded node2 on 2026-10-14: entries 48182..=49871
+    /// were absent while the log otherwise spanned 46864..50870, so openraft asked
+    /// for index 48866, got `None`, and failed Fatal at boot. The node then refused
+    /// every peer and stayed down while the cluster served on 2 of 3.
+    ///
+    /// The defect it pins: the applied/purged pair is perfectly healthy here, so a
+    /// classification that reads only those two calls this node usable and hands it
+    /// to openraft, which cannot replay a single entry past the gap.
+    #[test]
+    fn a_log_with_an_internal_hole_is_not_reported_usable() {
+        let (_dir, store) = store_holding((1u64..=4).chain(8u64..=10));
+
+        let purged = store
+            .last_purged_log_id()
+            .unwrap()
+            .map(|log_id| log_id.index);
+        assert_eq!(purged, None, "nothing was purged in this fixture");
+
+        // The store must surface the hole, and name its exact range.
+        let gap = store.log_gap().unwrap();
+        assert_eq!(
+            gap,
+            Some((5, 7)),
+            "entries 5..=7 are absent from a log spanning 1..=10"
+        );
+
+        // ...and the classification must act on it rather than on the healthy pair.
+        let verdict = crate::raft::local_state::classify_local_raft_state(Some(10), purged, gap);
+        assert_ne!(
+            verdict,
+            crate::raft::local_state::LocalRaftState::Usable,
+            "a node that cannot replay its log must not be told it is usable"
+        );
+        assert_eq!(
+            verdict,
+            crate::raft::local_state::LocalRaftState::LogHasGap { from: 5, to: 7 },
+            "the verdict must name the hole, so the boot log says what is wrong"
+        );
+    }
+
+    /// The negative control for the guard above. A detector that always answered
+    /// `Some` would satisfy the hole test while resetting the Raft state of every
+    /// healthy node at boot -- destroying state that had nothing wrong with it.
+    ///
+    /// Without this case the hole test proves only that the detector fires, never
+    /// that it stays silent when it should.
+    #[test]
+    fn a_contiguous_log_is_never_reported_as_gapped() {
+        let (_dir, store) = store_holding(1u64..=10);
+        assert_eq!(
+            store.log_gap().unwrap(),
+            None,
+            "every index from 1 to 10 is present, so there is no hole"
+        );
+    }
+
+    /// A purged prefix is DELIBERATE absence, not loss: those entries were deleted
+    /// once a snapshot covered them. Reporting it as a hole would reset a node that
+    /// is working correctly, which is the same failure as the false positive above.
+    #[tokio::test]
+    async fn a_purged_prefix_is_not_a_hole() {
+        use openraft::storage::RaftLogStorage;
+
+        let (_dir, mut store) = store_holding(5u64..=10);
+        store
+            .durable_applied
+            .store(10, std::sync::atomic::Ordering::Release);
+        store
+            .purge(LogId::new(CommittedLeaderId::new(1, 0), 4))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .last_purged_log_id()
+                .unwrap()
+                .map(|log_id| log_id.index),
+            Some(4),
+            "the purge point must be recorded for this fixture to mean anything"
+        );
+        assert_eq!(
+            store.log_gap().unwrap(),
+            None,
+            "entries 1..=4 were purged on purpose, so their absence is not a hole"
+        );
+    }
+
+    /// The head of the range: entries lost ABOVE the purge point but before the
+    /// first surviving one are a hole too, and are the shape a middle-only scan
+    /// would miss.
+    #[tokio::test]
+    async fn entries_lost_just_above_the_purge_point_are_a_hole() {
+        use openraft::storage::RaftLogStorage;
+
+        let (_dir, mut store) = store_holding(5u64..=10);
+        store
+            .durable_applied
+            .store(10, std::sync::atomic::Ordering::Release);
+        // Purge to 2, so 3 and 4 are expected but absent.
+        store
+            .purge(LogId::new(CommittedLeaderId::new(1, 0), 2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.log_gap().unwrap(),
+            Some((3, 4)),
+            "entries 3..=4 sit above the purge point and are absent"
+        );
     }
 }
