@@ -31,7 +31,6 @@
 
 #![cfg(unix)]
 
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -40,6 +39,9 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
+
+mod common;
+use common::ports::PortAllocator;
 
 const TABLE: &str = "txn_rt3";
 /// `base64("ferrosa_admin:ferrosa_admin")` — the seeded development superuser.
@@ -62,28 +64,20 @@ struct Ports {
     flight: u16,
 }
 
-fn free_port(taken: &mut HashSet<u16>) -> u16 {
-    for _ in 0..200 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        if taken.insert(port) {
-            return port;
-        }
-    }
-    panic!("could not allocate a free port");
-}
-
-fn alloc_ports(taken: &mut HashSet<u16>) -> Ports {
+/// A band of eight ports for one node, from the shared allocator whose ports sit
+/// BELOW the kernel's ephemeral range (`tests/common/ports.rs`): a port inside that
+/// range can already be held by any outbound connection in the VM, which is how a
+/// node's SPARQL listener lost its port in CI on 2026-10-13.
+fn alloc_ports(alloc: &mut PortAllocator) -> Ports {
     Ports {
-        cql: free_port(taken),
-        web: free_port(taken),
-        internode: free_port(taken),
-        graph: free_port(taken),
-        bolt: free_port(taken),
-        pg: free_port(taken),
-        sparql: free_port(taken),
-        flight: free_port(taken),
+        cql: alloc.get(),
+        web: alloc.get(),
+        internode: alloc.get(),
+        graph: alloc.get(),
+        bolt: alloc.get(),
+        pg: alloc.get(),
+        sparql: alloc.get(),
+        flight: alloc.get(),
     }
 }
 
@@ -224,10 +218,12 @@ const PORT_IN_USE: &str = "Address already in use";
 /// Why a node did not reach readiness.
 ///
 /// A listener that cannot bind is a HARNESS accident, not a product failure:
-/// [`free_port`] hands out a port that is free at that instant, and between then and the
-/// node's `bind` a concurrently running test target can take it — `cargo-nextest` runs
-/// many targets at once, all drawing from the same ephemeral range. The node then never
-/// reports ready, and reporting THAT as a red would be a false failure about the product.
+/// [`alloc_ports`] hands out a port that is free at that instant, and between then and the
+/// node's `bind` a concurrently running process can take it. The band it draws from sits
+/// BELOW the kernel's ephemeral range (`common::ports`), so the kernel can no longer hand
+/// a node's port to an outbound connection; this retry is the second line of defence
+/// against a process that binds inside the band. The node never reports ready when it
+/// loses a port, and reporting THAT as a red would be a false failure about the product.
 /// It is re-drawn and retried instead (see [`start_node_with`]).
 enum NotReady {
     /// The node log shows a listener that could not bind: its port was taken by another
@@ -270,22 +266,22 @@ fn wait_ready(node: &Node, timeout: Duration) -> Result<(), NotReady> {
 /// lost its port to a concurrent process. A node that never becomes ready for any other
 /// reason is reported with its log, exactly as before.
 fn start_node(
-    taken: &mut HashSet<u16>,
+    alloc: &mut PortAllocator,
     host_id: &str,
     cluster_name: &str,
     seed: Option<&str>,
 ) -> Node {
-    start_node_with(taken, host_id, cluster_name, seed, alloc_ports)
+    start_node_with(alloc, host_id, cluster_name, seed, alloc_ports)
 }
 
 /// [`start_node`] with the band allocator injected, so a test can hand the first attempt
 /// a band that is already taken and prove the retry rather than assert it.
 fn start_node_with(
-    taken: &mut HashSet<u16>,
+    alloc: &mut PortAllocator,
     host_id: &str,
     cluster_name: &str,
     seed: Option<&str>,
-    mut allocate: impl FnMut(&mut HashSet<u16>) -> Ports,
+    mut allocate: impl FnMut(&mut PortAllocator) -> Ports,
 ) -> Node {
     const ATTEMPTS: usize = 5;
     let mut last_log = String::new();
@@ -293,7 +289,7 @@ fn start_node_with(
         let dir = tempfile::tempdir().expect("node data dir");
         let node = spawn_node(
             dir,
-            allocate(taken),
+            allocate(alloc),
             host_id.to_string(),
             cluster_name,
             seed,
@@ -440,14 +436,14 @@ async fn read_value(client: &Client, aid: i32) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn simultaneous_transactions_each_carry_the_value_they_committed() {
     let cluster_name = format!("txnrt3-proc-{}", std::process::id());
-    let mut taken: HashSet<u16> = HashSet::new();
+    let mut alloc = PortAllocator::new();
 
     // Node 0 boots ALONE and must be ready before the others join it (it is the star's seed
     // hub). Each node is brought up through `start_node`, which re-draws its band and
     // restarts it if any listener lost its port to a concurrent test target — the harness
     // accident that made this test red in CI without the product ever being reached.
     let mut nodes: Vec<Node> = vec![start_node(
-        &mut taken,
+        &mut alloc,
         &node_host_id(0),
         &cluster_name,
         None,
@@ -455,7 +451,7 @@ async fn simultaneous_transactions_each_carry_the_value_they_committed() {
     let seed_hub = format!("127.0.0.1:{}", nodes[0].ports.internode);
     for i in 1..N_NODES {
         nodes.push(start_node(
-            &mut taken,
+            &mut alloc,
             &node_host_id(i),
             &cluster_name,
             Some(seed_hub.as_str()),
@@ -608,15 +604,22 @@ async fn simultaneous_transactions_each_carry_the_value_they_committed() {
 #[test]
 fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
     let cluster_name = format!("txnrt3-collide-{}", std::process::id());
-    let mut taken: HashSet<u16> = HashSet::new();
+    let mut alloc = PortAllocator::new();
     // A listener held for the whole test: this port is genuinely occupied, exactly as the
     // CI thief leaves the port it took.
-    let stolen = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
-    let stolen_port = stolen.local_addr().expect("local addr").port();
+    // Hold a port from the harness's OWN band: that is the class of loss the retry
+    // exists for now that allocation is out of the kernel's ephemeral range, and it
+    // must be re-drawn rather than reused.
+    let stolen_port = (common::ports::BAND_START..=common::ports::BAND_END)
+        .find(|p| !common::ports::reserved_in_process(*p) && common::ports::port_is_free(*p))
+        .expect("a free port in the harness band");
+    // Bound for the whole test — dropping it would release the port the retry
+    // must be seen to step over.
+    let _hold = std::net::TcpListener::bind(("127.0.0.1", stolen_port)).expect("hold a band port");
 
     let mut collided = false;
-    let node = start_node_with(&mut taken, &node_host_id(0), &cluster_name, None, |taken| {
-        let mut ports = alloc_ports(taken);
+    let node = start_node_with(&mut alloc, &node_host_id(0), &cluster_name, None, |alloc| {
+        let mut ports = alloc_ports(alloc);
         if !collided {
             collided = true;
             ports.sparql = stolen_port;

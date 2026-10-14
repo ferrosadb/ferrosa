@@ -23,6 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+mod common;
+use common::ports::PortAllocator;
+
 /// Well below the object store's ~180 s retry window and the 900 s default
 /// request timeout; far above the ~1 s the local boot actually takes (measured:
 /// the node reaches the object-store client ~0.3 s after `ferrosa starting`).
@@ -71,11 +74,6 @@ impl Drop for Blackhole {
     }
 }
 
-fn free_port() -> u16 {
-    let l = TcpListener::bind("127.0.0.1:0").unwrap();
-    l.local_addr().unwrap().port()
-}
-
 struct Node {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
@@ -99,14 +97,18 @@ impl Drop for Node {
 fn spawn_node(blackhole_s3_port: u16) -> Node {
     let dir = tempfile::tempdir().expect("node data dir");
     let data_dir = dir.path().to_path_buf();
-    let internode = free_port();
-    let cql = free_port();
-    let web = free_port();
-    let graph = free_port();
-    let bolt = free_port();
-    let pg = free_port();
-    let sparql = free_port();
-    let flight = free_port();
+    // Ports come from the shared band BELOW the kernel's ephemeral range: a
+    // port inside that range can be handed to any outbound connection in the
+    // VM before the node binds it (`tests/common/ports.rs`).
+    let mut alloc = PortAllocator::new();
+    let internode = alloc.get();
+    let cql = alloc.get();
+    let web = alloc.get();
+    let graph = alloc.get();
+    let bolt = alloc.get();
+    let pg = alloc.get();
+    let sparql = alloc.get();
+    let flight = alloc.get();
 
     let log = std::fs::File::create(data_dir.join("node.log")).expect("create node log");
     let stderr = log.try_clone().expect("clone log handle");
