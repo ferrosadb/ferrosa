@@ -122,7 +122,8 @@ impl StorageEngine {
     /// the store's copy passes the loader's own validation.
     ///
     /// This is the **third** recovery source. The first two are a healthy peer's
-    /// copy (`self_heal::action`, gated on [`ReplicaPosture::can_refill`]) and the
+    /// copy (`self_heal::action`, gated on
+    /// [`ReplicaPosture::can_refill`](crate::self_heal::snapshot::ReplicaPosture::can_refill)) and the
     /// quarantined files; a node whose table has no healthy replica on any peer
     /// has neither, and until this existed its corrupt generation stayed excluded
     /// for the lifetime of the process.
