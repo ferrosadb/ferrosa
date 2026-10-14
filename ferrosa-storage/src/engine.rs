@@ -4937,6 +4937,21 @@ impl StorageEngine {
         self.tables.load().get(table_id).cloned()
     }
 
+    /// Run `f` against `table_id`'s [`TableStore`], or `None` when the table is
+    /// not registered.
+    ///
+    /// `TableState` and `TableStore<FileFlushTarget>` are private to this module,
+    /// so this is the narrowest door a sibling module needs onto them:
+    /// `self_heal::recover` admits a generation recovered from the object store
+    /// into the live view through it.
+    pub(crate) fn with_table_store<R>(
+        &self,
+        table_id: &TableId,
+        f: impl FnOnce(&TableStore<FileFlushTarget>) -> R,
+    ) -> Option<R> {
+        self.table_state(table_id).map(|state| f(&state.store))
+    }
+
     /// [`Self::table_state`], failing loudly for an unregistered table.
     fn require_table(&self, table_id: &TableId) -> ferrosa_common::Result<Arc<TableState>> {
         self.table_state(table_id).ok_or_else(|| {
@@ -8352,7 +8367,7 @@ impl StorageEngine {
     /// answer `Ok` with the rows that remained; the caller marks the
     /// generation so those consults fail instead (ST-59). Data reads do not
     /// touch sidecars and keep working.
-    fn load_sidecars_for_generation(
+    pub(crate) fn load_sidecars_for_generation(
         table_dir: &std::path::Path,
         gen: u64,
         index_failures: &mut Vec<String>,
@@ -13134,7 +13149,7 @@ impl StorageEngine {
     }
 
     /// Opens an SSTable from component files in a directory.
-    fn open_sstable_from_dir(
+    pub(crate) fn open_sstable_from_dir(
         dir: &std::path::Path,
         gen: &str,
     ) -> ferrosa_common::Result<
@@ -14229,7 +14244,9 @@ impl StorageEngine {
     ///
     /// In test builds, checks `upload_store_override` first so that tests
     /// can inject an `InMemory` store without a real S3 endpoint.
-    fn resolve_store_and_prefix(&self) -> Option<(Arc<dyn object_store::ObjectStore>, String)> {
+    pub(crate) fn resolve_store_and_prefix(
+        &self,
+    ) -> Option<(Arc<dyn object_store::ObjectStore>, String)> {
         #[cfg(test)]
         if let Some((store, prefix)) = &self.upload_store_override {
             return Some((Arc::clone(store), prefix.clone()));
@@ -15786,7 +15803,7 @@ impl StorageEngine {
     /// parts and small ones with a single GET; a failed part is retried
     /// alone, and `NotFound` is not retried. A half-written file never
     /// outlives a failure. See [`crate::upload::download`].
-    async fn download_sstable_component_to_path(
+    pub(crate) async fn download_sstable_component_to_path(
         store: &dyn object_store::ObjectStore,
         s3_path: &object_store::path::Path,
         local_path: &std::path::Path,
