@@ -309,6 +309,56 @@ fn a_generation_missing_a_required_component_cannot_be_opened() {
     assert_eq!(outcome, QueryFetch::Missing);
 }
 
+/// A component that is present but EMPTY is not a component that is present.
+///
+/// The open path skipped the store for any local file that merely exists, so a
+/// `Rows.db` truncated to nothing — by a crash mid-write, by a page-cache
+/// eviction, or by a full disk — was trusted forever and never repaired from the
+/// object store, which still held the real index.
+#[test]
+fn a_zero_byte_local_component_is_refetched_from_the_store() {
+    let f = fixture(10, 100);
+    put_component(&f, "Partitions.db", b"partitions");
+    put_component(&f, "Rows.db", b"the real row index");
+    put_component(&f, "Filter.db", b"filter");
+    let dir = f.path.parent().unwrap().to_path_buf();
+    // The generation is marked evicted and already carries a 0-byte Rows.db.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("7-Rows.db"), b"").unwrap();
+
+    let outcome = f.reads.fetch_query_components(&dir, "7").unwrap();
+
+    assert_eq!(outcome, QueryFetch::Ready);
+    assert_eq!(
+        std::fs::read(dir.join("7-Rows.db")).unwrap(),
+        b"the real row index",
+        "a 0-byte local component must be replaced by the store's copy, not trusted"
+    );
+}
+
+/// A generation the store holds no `Rows.db` for must still open.
+///
+/// The writer emits a ZERO-BYTE `Rows.db` for every table whose partitions need
+/// no row index, and the reader treats a missing or empty one as "no row index"
+/// (`sstable_health::CRITICAL_COMPONENTS` deliberately excludes it). Listing it
+/// as required here made a store that never received that empty object — or
+/// dropped it — refuse to start the whole node.
+#[test]
+fn a_generation_whose_store_has_no_rows_db_still_opens() {
+    let f = fixture(10, 100);
+    put_component(&f, "Partitions.db", b"partitions");
+    put_component(&f, "Filter.db", b"filter"); // no Rows.db object at all
+    let dir = f.path.parent().unwrap();
+
+    let outcome = f.reads.fetch_query_components(dir, "7").unwrap();
+
+    assert_eq!(
+        outcome,
+        QueryFetch::Ready,
+        "a missing Rows.db is 'no row index', never a generation that cannot be opened"
+    );
+}
+
 /// A compaction output lives in `<table>/<gen>/` while the evictor writes its
 /// marker in the TABLE directory. The ranged-read open must look one level up,
 /// as `rehydrate_if_evicted` does; otherwise the marker is never found, the
