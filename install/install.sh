@@ -181,8 +181,13 @@ register_macos() {
   local plist="$HOME/Library/LaunchAgents/com.ferrosadb.ferrosa.plist"
   mkdir -p "$(dirname "$plist")"
   sed "s|__HOME__|$HOME|g" "$TMP/launchd/com.ferrosadb.ferrosa.plist" > "$plist"
-  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
+  # Registration must survive the bootout/bootstrap race, and must not report a
+  # success it did not get -- see launchd/register-agent.sh for why.
+  . "$TMP/launchd/register-agent.sh"
+  register_launchd_agent com.ferrosadb.ferrosa "$plist" || {
+    echo "launchd: could not register com.ferrosadb.ferrosa" >&2
+    return 1
+  }
   say "launchd: com.ferrosadb.ferrosa loaded; will start now and on every login"
 }
 
