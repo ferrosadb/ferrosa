@@ -2780,6 +2780,16 @@ impl StorageEngine {
         }
     }
 
+    /// Remove the staged `.rehydrate.tmp` files of a read-through rehydration that
+    /// will not be published. Called on every refusal path so a failed rehydrate
+    /// leaves nothing behind but the eviction marker — never a partially
+    /// published generation.
+    async fn discard_staged_components(staged: &[(std::path::PathBuf, std::path::PathBuf)]) {
+        for (tmp_path, _) in staged {
+            let _ = tokio::fs::remove_file(tmp_path).await;
+        }
+    }
+
     fn install_s3_file_read_rehydration_hook(
         data_dir: PathBuf,
         prefix: String,
@@ -2858,9 +2868,27 @@ impl StorageEngine {
             let result = Self::block_on_rehydration(async move {
                 let mut restored = 0usize;
                 let mut restored_bytes = 0u64;
+
+                // Stage every component that is not already local into its
+                // `.rehydrate.tmp` beside it and publish NOTHING until they are all
+                // on disk, each one verified against the size the store advertised,
+                // and every required component is present.
+                //
+                // `Data.db` is the generation's discovery marker: `list_generations_in_dir`
+                // keys a generation on it, and both the startup load loop and the
+                // self-heal corruption scan consume that listing. Publishing one
+                // component at a time in `SSTABLE_COMPONENTS` order made `Data.db`
+                // live FIRST, so a death between the first and the second rename left
+                // a generation that was visible and incomplete — and the hook still
+                // reported success. The invariant a reader depends on is: a
+                // generation that is VISIBLE is COMPLETE.
+                let mut staged: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+                let mut obtained: Vec<&str> = Vec::new();
+
                 for component_name in components {
                     let local_path = parent.join(format!("{async_sstable_id}-{component_name}"));
                     if local_path.exists() {
+                        obtained.push(component_name);
                         continue;
                     }
 
@@ -2881,6 +2909,7 @@ impl StorageEngine {
 
                     match store.get(&s3_path).await {
                         Ok(result) => {
+                            let expected = result.meta.size as u64;
                             let mut stream = result.into_stream();
                             let mut file =
                                 tokio::fs::File::create(&tmp_path).await.map_err(|e| {
@@ -2890,12 +2919,13 @@ impl StorageEngine {
                                     ))
                                 })?;
                             use tokio::io::AsyncWriteExt;
+                            let mut written = 0u64;
                             while let Some(chunk) = stream.try_next().await.map_err(|e| {
                                 ferrosa_common::Error::InvalidFormat(format!(
                                     "failed to stream SSTable component {s3_path}: {e}"
                                 ))
                             })? {
-                                restored_bytes = restored_bytes.saturating_add(chunk.len() as u64);
+                                written = written.saturating_add(chunk.len() as u64);
                                 file.write_all(&chunk).await.map_err(|e| {
                                     ferrosa_common::Error::InvalidFormat(format!(
                                         "failed to write SSTable rehydration temp file {}: {e}",
@@ -2903,48 +2933,110 @@ impl StorageEngine {
                                     ))
                                 })?;
                             }
-                            file.sync_data().await.map_err(|e| {
+                            // A body that ends early without a stream error is not a
+                            // short file on disk: refusing it here is what keeps a
+                            // silently truncated object from becoming a live
+                            // `{gen}-Data.db` shorter than the index beside it — the
+                            // `read_exact_at: wanted N bytes, got M` shape the live
+                            // clusters reported.
+                            if written != expected {
+                                let _ = tokio::fs::remove_file(&tmp_path).await;
+                                Self::discard_staged_components(&staged).await;
+                                tracing::error!(
+                                    table = async_table_id.as_str(),
+                                    sstable = async_sstable_id.as_str(),
+                                    component = component_name,
+                                    expected,
+                                    written,
+                                    "refusing to publish a rehydrated SSTable component whose \
+                                     object body is short; the generation stays evicted"
+                                );
+                                return Ok((false, 0, 0));
+                            }
+                            file.sync_all().await.map_err(|e| {
                                 ferrosa_common::Error::InvalidFormat(format!(
                                     "failed to sync SSTable rehydration temp file {}: {e}",
                                     tmp_path.display()
                                 ))
                             })?;
                             drop(file);
-                            #[cfg(test)]
-                            rehydrate_promote_seam::fire(&tmp_path);
-                            tokio::fs::rename(&tmp_path, &local_path)
-                                .await
-                                .map_err(|e| {
-                                    ferrosa_common::Error::InvalidFormat(format!(
-                                        "failed to promote SSTable rehydration temp file {} to {}: {e}",
-                                        tmp_path.display(),
-                                        local_path.display()
-                                    ))
-                            })?;
-                            restored += 1;
+                            restored_bytes = restored_bytes.saturating_add(written);
+                            staged.push((tmp_path, local_path));
+                            obtained.push(component_name);
                         }
-                        Err(object_store::Error::NotFound { .. })
-                            if component_name != "Data.db" =>
-                        {
+                        Err(object_store::Error::NotFound { .. }) => {
                             let _ = tokio::fs::remove_file(&tmp_path).await;
                             tracing::debug!(
                                 table = async_table_id.as_str(),
                                 sstable = async_sstable_id.as_str(),
                                 component = component_name,
-                                "optional SSTable component absent during read-through rehydration"
+                                "SSTable component absent from the object store during \
+                                 read-through rehydration"
                             );
-                        }
-                        Err(object_store::Error::NotFound { .. }) => {
-                            let _ = tokio::fs::remove_file(&tmp_path).await;
-                            return Ok((false, restored, restored_bytes));
                         }
                         Err(e) => {
                             let _ = tokio::fs::remove_file(&tmp_path).await;
+                            Self::discard_staged_components(&staged).await;
                             return Err(ferrosa_common::Error::InvalidFormat(format!(
                                 "failed to rehydrate SSTable component {s3_path}: {e}"
                             )));
                         }
                     }
+                }
+
+                // Every required component must be here before ANY name becomes
+                // live. `Rows.db` is legitimately zero bytes for a generation whose
+                // partitions need no per-partition row index; what is a defect is its
+                // ABSENCE (`REQUIRED_SSTABLE_COMPONENTS`, and `open_file_sstable`
+                // fails loud on it). Refusing here is what keeps an object store that
+                // lost one component from turning into a generation that is listed by
+                // `list_generations_in_dir`, excluded by the startup load loop, and
+                // reported `corrupt` by the self-heal scan.
+                let missing: Vec<&str> = REQUIRED_SSTABLE_COMPONENTS
+                    .iter()
+                    .copied()
+                    .filter(|component| !obtained.contains(component))
+                    .collect();
+                if !missing.is_empty() {
+                    Self::discard_staged_components(&staged).await;
+                    tracing::error!(
+                        table = async_table_id.as_str(),
+                        sstable = async_sstable_id.as_str(),
+                        missing = ?missing,
+                        "refusing to publish a rehydrated SSTable generation: required \
+                         components are absent from the object store; it stays evicted \
+                         and invisible rather than visible and incomplete"
+                    );
+                    return Ok((false, 0, 0));
+                }
+
+                // Publish: every component except the discovery marker first, then
+                // `Data.db` LAST — the order `promote_tmp_components` uses, so a death
+                // before the last rename leaves no discoverable generation at all.
+                staged.sort_by_key(|(_, local_path)| {
+                    local_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().ends_with("-Data.db"))
+                        .unwrap_or(false)
+                });
+                for (tmp_path, local_path) in &staged {
+                    #[cfg(test)]
+                    rehydrate_promote_seam::fire(tmp_path);
+                    tokio::fs::rename(tmp_path, local_path).await.map_err(|e| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "failed to promote SSTable rehydration temp file {} to {}: {e}",
+                            tmp_path.display(),
+                            local_path.display()
+                        ))
+                    })?;
+                    restored += 1;
+                }
+
+                // The component bytes were `sync_all`ed above; this makes their
+                // rename entries in the generation directory durable. Only after it
+                // returns is the generation both durable and complete.
+                if !staged.is_empty() {
+                    crate::flush::FileFlushTarget::fsync_dir(&parent)?;
                 }
 
                 // The fixed list above is the SSTable proper. The evictor also
@@ -4935,6 +5027,21 @@ impl StorageEngine {
     /// work that blocks, calls back, or runs long.
     fn table_state(&self, table_id: &TableId) -> Option<Arc<TableState>> {
         self.tables.load().get(table_id).cloned()
+    }
+
+    /// Run `f` against `table_id`'s [`TableStore`], or `None` when the table is
+    /// not registered.
+    ///
+    /// `TableState` and `TableStore<FileFlushTarget>` are private to this module,
+    /// so this is the narrowest door a sibling module needs onto them:
+    /// `self_heal::recover` admits a generation recovered from the object store
+    /// into the live view through it.
+    pub(crate) fn with_table_store<R>(
+        &self,
+        table_id: &TableId,
+        f: impl FnOnce(&TableStore<FileFlushTarget>) -> R,
+    ) -> Option<R> {
+        self.table_state(table_id).map(|state| f(&state.store))
     }
 
     /// [`Self::table_state`], failing loudly for an unregistered table.
@@ -8352,7 +8459,7 @@ impl StorageEngine {
     /// answer `Ok` with the rows that remained; the caller marks the
     /// generation so those consults fail instead (ST-59). Data reads do not
     /// touch sidecars and keep working.
-    fn load_sidecars_for_generation(
+    pub(crate) fn load_sidecars_for_generation(
         table_dir: &std::path::Path,
         gen: u64,
         index_failures: &mut Vec<String>,
@@ -13134,7 +13241,7 @@ impl StorageEngine {
     }
 
     /// Opens an SSTable from component files in a directory.
-    fn open_sstable_from_dir(
+    pub(crate) fn open_sstable_from_dir(
         dir: &std::path::Path,
         gen: &str,
     ) -> ferrosa_common::Result<
@@ -14229,7 +14336,9 @@ impl StorageEngine {
     ///
     /// In test builds, checks `upload_store_override` first so that tests
     /// can inject an `InMemory` store without a real S3 endpoint.
-    fn resolve_store_and_prefix(&self) -> Option<(Arc<dyn object_store::ObjectStore>, String)> {
+    pub(crate) fn resolve_store_and_prefix(
+        &self,
+    ) -> Option<(Arc<dyn object_store::ObjectStore>, String)> {
         #[cfg(test)]
         if let Some((store, prefix)) = &self.upload_store_override {
             return Some((Arc::clone(store), prefix.clone()));
@@ -15786,7 +15895,7 @@ impl StorageEngine {
     /// parts and small ones with a single GET; a failed part is retried
     /// alone, and `NotFound` is not retried. A half-written file never
     /// outlives a failure. See [`crate::upload::download`].
-    async fn download_sstable_component_to_path(
+    pub(crate) async fn download_sstable_component_to_path(
         store: &dyn object_store::ObjectStore,
         s3_path: &object_store::path::Path,
         local_path: &std::path::Path,
@@ -16039,6 +16148,26 @@ impl StorageEngine {
                 ));
             }
         }
+
+        // The staging directory now holds every component under its final name, and
+        // the next step makes it `<table>/<gen>/`. Its entries live in THAT inode:
+        // POSIX gives no ordering by which fsyncing the parent below makes a
+        // descendant directory's own entries durable, so the child must be synced
+        // here, before the rename. This is the pair of barriers both sibling
+        // publication paths already take (`download_sstables_into` and
+        // `RestoreManager::download_sstables` sync their staging dir, rename, then
+        // sync the table dir). Without it a host crash can persist the generation's
+        // NAME while losing the components inside it — a generation that is visible
+        // and incomplete — and the most exposed entry is the zero-byte `Rows.db` a
+        // no-clustering generation legitimately writes, whose whole content is its
+        // directory entry.
+        crate::flush::FileFlushTarget::fsync_dir(&staging_dir).map_err(|e| {
+            rollback_moved(&moved);
+            ferrosa_common::Error::InvalidFormat(format!(
+                "failed to fsync compaction promotion staging dir {}: {e}",
+                staging_dir.display()
+            ))
+        })?;
 
         if final_target.exists() {
             rollback_moved(&moved);
@@ -29721,6 +29850,75 @@ mod tests {
         assert!(
             dir_fsync_idx < unlink_idx,
             "the directory fsync must be recorded before any input is unlinked: {relevant:?}"
+        );
+    }
+
+    /// The same barrier, one level down. `promote_compaction_output` builds the
+    /// generation inside a hidden `.promote-<gen>-<nanos>` directory
+    /// (`temp_promotion_directory`) and publishes it by renaming that directory
+    /// onto `<table>/<gen>/`. The component entries — `<gen>-Rows.db` among them —
+    /// live in the STAGING inode, and POSIX gives no ordering by which the
+    /// parent's fsync makes a descendant directory's own entries durable; the
+    /// correct sequence is fsync the child once it is populated, rename it into
+    /// the parent, then fsync the parent. Both sibling publication paths already
+    /// take exactly that pair of barriers (`download_sstables_into`:
+    /// `sync_directory(&staging_dir)` then rename then `sync_directory(&table_dir)`;
+    /// `RestoreManager::download_sstables`: the same two). Promote took only the
+    /// second, so a host crash could persist `<table>/<gen>/` and lose the entries
+    /// inside it — a generation that is VISIBLE and INCOMPLETE, the invariant the
+    /// read-through rehydration test in `engine_evicted_ranged_tests.rs` pins at
+    /// the naming layer. A zero-byte `Rows.db` is the most exposed of those
+    /// entries: for a no-clustering generation its entire content IS its directory
+    /// entry.
+    ///
+    /// RED as written: no `DirFsync` of the `.promote-*` staging directory is ever
+    /// recorded, so this fails on the ABSENT durability barrier — the product's
+    /// behaviour — not on a symbol that does not exist yet.
+    #[tokio::test]
+    async fn compaction_promote_fsyncs_its_staging_directory_before_publishing_it() {
+        use crate::flush::fsync_probe::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (engine, _store, _prefix, tid) = make_engine_with_pending_compaction(&dir).await;
+        let sstable_dir = dir.path().join("sstables").join(tid.to_string());
+
+        let _probe = crate::flush::fsync_probe::exclusive();
+        for _ in 0..40 {
+            engine.poll_compactions().await;
+            if StorageEngine::scan_generations(&sstable_dir).len() == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let published: Vec<u64> = StorageEngine::scan_generations(&sstable_dir);
+        assert_eq!(published.len(), 1, "the compaction output must be promoted");
+
+        let events = crate::flush::fsync_probe::events();
+        let staging_fsync_idx = events
+            .iter()
+            .position(|event| match event {
+                Event::DirFsync(p) => p
+                    .file_name()
+                    .map(|name| name.to_string_lossy().starts_with(".promote-"))
+                    .unwrap_or(false),
+                _ => false,
+            })
+            .expect(
+                "the promotion must fsync the staging directory that becomes \
+                 <table>/<gen>/: fsyncing only its parent does not make the \
+                 component entries inside it durable",
+            );
+        let publish_rename_idx = events
+            .iter()
+            .position(|event| match event {
+                Event::Rename(p) => *p == sstable_dir.join(published[0].to_string()),
+                _ => false,
+            })
+            .expect("the staging directory must be renamed onto <table>/<gen>/");
+
+        assert!(
+            staging_fsync_idx < publish_rename_idx,
+            "the staging directory must be durable BEFORE it is published: {events:?}"
         );
     }
 

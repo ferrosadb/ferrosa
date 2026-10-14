@@ -4203,6 +4203,81 @@ impl<F: FlushTarget> TableStore<F> {
         }
     }
 
+    /// Admit generation `gen`, recovered from the object store, into the live
+    /// view so its rows are read again (`self_heal::recover`, invariant (c)).
+    ///
+    /// Returns whether the generation is live afterwards; `true` also when it
+    /// already was, since the caller's claim is about the resulting state.
+    /// `sidecars` are the generation's secondary-index readers — an empty map
+    /// admits it with no index postings, so a caller that could not open them
+    /// must [`Self::mark_index_unavailable`] as well (ST-59).
+    ///
+    /// The generation's components are already on disk: `generation_dir` is the
+    /// directory holding them (the table directory, or the generation's own).
+    /// The reader is seeded into the pool under this table's key, exactly as a
+    /// flushed generation's is.
+    ///
+    /// A read that failed over the corrupt generation before it was replaced may
+    /// have quarantined it (ST-56): the quarantine and the negative open cache
+    /// are both cleared afterwards, or every later read would keep failing over a
+    /// generation whose files are now good.
+    pub(crate) fn install_recovered_generation(
+        &self,
+        gen: &str,
+        generation_dir: std::path::PathBuf,
+        reader: Arc<SSTableReader<F::Reader>>,
+        sidecars: HashMap<String, SidecarReader>,
+    ) -> bool {
+        let desc = SstableDescriptor::from_reader(gen.to_string(), generation_dir.clone(), &reader);
+        self.seed_reader(&desc, reader);
+        let sidecars = Arc::new(sidecars);
+        let installed = match self.update_view("recover:install_generation", |current| {
+            if current.sstable_ids.iter().any(|(id, _)| id == gen) {
+                return (None, true);
+            }
+            // Newest first, as every other install keeps it (a flush prepends its
+            // output, compaction prepends its own), but a recovered generation can
+            // be older than everything live, so insert by generation number.
+            let num = desc.gen_num();
+            let at = current
+                .sstables
+                .iter()
+                .position(|sstable| sstable.gen_num() < num)
+                .unwrap_or(current.sstables.len());
+            let mut sstables: Vec<SstableDescriptor> = current.sstables.iter().cloned().collect();
+            sstables.insert(at, desc.clone());
+            let mut ids = (*current.sstable_ids).clone();
+            ids.insert(at, (gen.to_string(), generation_dir.clone()));
+            let mut sidecar_indexes = (*current.sidecar_indexes).clone();
+            sidecar_indexes.insert(at, Arc::clone(&sidecars));
+            let next = StoreView {
+                active: Arc::clone(&current.active),
+                flushing: Arc::clone(&current.flushing),
+                sstables: Arc::new(sstables),
+                sstable_ids: Arc::new(ids),
+                indexes: Arc::clone(&current.indexes),
+                sidecar_indexes: Arc::new(sidecar_indexes),
+                vector_indexes: Arc::clone(&current.vector_indexes),
+            };
+            (Some(next), true)
+        }) {
+            Ok(installed) => installed,
+            Err(e) => {
+                tracing::error!(
+                    gen,
+                    %e,
+                    "could not install the recovered generation into the live view; it stays \
+                     on disk and is adopted at the next load"
+                );
+                false
+            }
+        };
+        if installed {
+            self.resolve_sstable_quarantine(gen);
+        }
+        installed
+    }
+
     /// Mark `gen`'s quarantine resolved (repair refilled or restored it): it
     /// leaves the quarantine set and the negative open cache, so the next read
     /// probes it for real. Returns whether it was quarantined.
