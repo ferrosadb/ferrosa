@@ -244,6 +244,15 @@ impl crate::controller::ModeController {
             schema.set_jsonb_cluster_gate(JsonbClusterGate::Unknown);
             return;
         }
+        // Reading live connections is async, so it needs a runtime. A controller with none —
+        // a synchronous test driving the listener directly, or a handler that fires before
+        // the runtimes are installed — cannot read them at all, and that is unknown, not
+        // capable. It must not panic a peer event on a missing runtime either: connecting
+        // and disconnecting a peer is a mode-transition concern that predates this gate.
+        if tokio::runtime::Handle::try_current().is_err() && self.raft_runtime.get().is_none() {
+            schema.set_jsonb_cluster_gate(JsonbClusterGate::Unknown);
+            return;
+        }
         let peer_manager = self.peer_manager.load().clone();
         self.spawn_tracked(async move {
             let _ = publish_jsonb_cluster_gate(
