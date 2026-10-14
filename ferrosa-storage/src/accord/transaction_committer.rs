@@ -10,6 +10,7 @@
 //! layer — mirroring how `StorageApplier` is injected.
 
 use super::postgres_mvcc::PostgresMvccApplyObserver;
+use super::row_read_set::PgReadSet;
 use async_trait::async_trait;
 use ferrosa_common::accord::Timestamp;
 use std::sync::Arc;
@@ -175,6 +176,18 @@ impl StagedAccordWriteSet {
     #[must_use]
     pub fn payloads_arc(&self) -> Arc<WriteSetSpill> {
         Arc::clone(&self.payloads)
+    }
+
+    /// Consume the set, returning its routing index and its payload spill **by move**.
+    ///
+    /// The commit path drives the Accord driver from exactly these two: the staging
+    /// already holds the `(keyspace, partition key)` index the driver's conflict ordering
+    /// and participant set require, so the driver takes it OVER rather than the caller
+    /// cloning it into a second resident collection. `keys[i]`'s payload is
+    /// `payloads.entry(i)`.
+    #[must_use]
+    pub fn into_keys_and_payloads(self) -> (Vec<(String, Vec<u8>)>, Arc<WriteSetSpill>) {
+        (self.keys, self.payloads)
     }
 
     /// Materialize the whole set into a resident `Vec<TransactionWrite>`. TEST ONLY: this
@@ -349,12 +362,28 @@ pub trait TransactionCommitter: Send + Sync {
     }
 
     /// Commit PostgreSQL writes after checking the captured snapshot against
-    /// every table the transaction READ (scanned). Implementations must put the
-    /// read set into the DISTRIBUTED commit order, so a table the transaction read
-    /// and another transaction wrote after that snapshot is refused loudly. Write
-    /// tables are NOT passed here: a transaction's writes are already ordered by
-    /// their row-level keys, so registering a write table would re-serialize two
-    /// transactions on DISJOINT keys of one table (RT-2). The default fails closed.
+    /// everything the transaction READ. Implementations must put the read set into
+    /// the DISTRIBUTED commit order, so anything a transaction READ and another
+    /// transaction WROTE after that snapshot is refused loudly.
+    ///
+    /// `reads` is the HYBRID read set ([`PgReadSet`]), at the granularity each read
+    /// could be resolved to:
+    ///
+    /// - a wide scan that could NOT be resolved to keys stays TABLE-granular
+    ///   ([`PgReadSet::scan_tables`]) and keeps the table-level key — conservative, and
+    ///   what still catches a predicate phantom through the per-table WRITE WATERMARK;
+    /// - a keyed read that WAS resolved to keys is ROW-granular, and its visited row keys
+    ///   stream out of the staged set ([`PgReadSet::for_each_row_key`]) so they are never
+    ///   materialized. Two keyed readers of DISJOINT rows therefore register DISJOINT
+    ///   keys and both commit, while a concurrent writer of one of those rows still
+    ///   conflicts.
+    ///
+    /// Write tables are passed separately as `written_tables`: a transaction's writes are
+    /// already ordered by their row-level keys, so registering a write table as a
+    /// conflict key would re-serialize two transactions on DISJOINT keys of one table
+    /// (RT-2). The write table instead contributes a per-table WRITE WATERMARK that a
+    /// SCANNER of that table reads — so a stale scan is refused even when the writer never
+    /// read the table. The default fails closed.
     ///
     /// `writes` is a [`StagedAccordWriteSet`]: the payload bulk may live on disk behind a
     /// bounded buffer, so the committer must read payloads through it rather than assume a
@@ -363,7 +392,8 @@ pub trait TransactionCommitter: Send + Sync {
         &self,
         _keyspace: &str,
         _writes: StagedAccordWriteSet,
-        _tables: Vec<String>,
+        _reads: PgReadSet,
+        _written_tables: Vec<String>,
         _snapshot: Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         Err(CommitError {
@@ -493,7 +523,8 @@ impl TransactionCommitter for MockTransactionCommitter {
         &self,
         _keyspace: &str,
         writes: StagedAccordWriteSet,
-        _tables: Vec<String>,
+        _reads: PgReadSet,
+        _written_tables: Vec<String>,
         _snapshot: Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         // A test double: materialize the staged set so `committed()` can assert on it. This

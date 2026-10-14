@@ -52,6 +52,11 @@ use ferrosa_storage::{
 use indexmap::IndexMap;
 use uuid::Uuid;
 
+// A real PG listener over a real engine, so the read-set gate below drives the FRONT END
+// (wire → session → staged read set → COMMIT → committer), not a mock of it.
+#[path = "common/pg_server.rs"]
+mod pg_server;
+
 // --- peak-allocation tracker (scoped to this integration-test binary only) ---
 //
 // Mirrors `ferrosa-storage/tests/recovery_oom_memory_bound.rs`. Each
@@ -419,4 +424,240 @@ fn full_table_scan_returns_every_row_with_bounded_peak() {
     );
 
     engine.shutdown().expect("shutdown");
+}
+
+// ── the KEYED READ-SET residency gate (plan S3 / definition-of-done #3) ───────
+//
+// The scan gate above bounds the SCAN's peak. This one bounds the READ SET a
+// transaction accumulates as it performs KEYED reads, end to end through the
+// PostgreSQL front end: `BEGIN ISOLATION LEVEL SERIALIZABLE` → N point reads
+// (`WHERE id = <literal>`) → one write → `COMMIT`, where the front end hands the
+// read set it staged to the committer. The assertion is on the read set's OWN
+// resident bytes, so it is immune to the unrelated resident state a transaction
+// keeps (MVCC version tracking, the wire buffers) that a whole-process peak would
+// fold in and that no read-set design can move.
+//
+// The owner's requirement, verbatim in spirit: as the RECORDED ROW COUNT grows, the
+// read set's RESIDENT bytes stay FLAT. A resident `HashSet<RowKey>`/`Vec<RowKey>` read
+// set grows with the count and is FORBIDDEN on this fixed-4-GB-node path. That shape
+// is wired only as this gate's negative control (see the task report), never shipped.
+
+use std::sync::Mutex;
+
+use ferrosa_common::accord::Timestamp;
+use ferrosa_postgres::AccordAccess;
+use ferrosa_storage::accord::{
+    CommitError, CommitOutcome, PgReadSet, StagedAccordWriteSet, TransactionCommitter,
+    TransactionWrite,
+};
+use ferrosa_storage::write_set_stage::WRITE_SET_SPILL_THRESHOLD_ENV;
+
+/// Keyed reads in the SMALL transaction: they fit the read-set buffer, so the set
+/// stays resident — bounded by the buffer, never by the count.
+const SMALL_KEYED_READS: usize = 64;
+
+/// Keyed reads in the LARGE transaction: far past the buffer, so the set SPILLS and
+/// keeps NOTHING resident. `1024 * a ~33-byte key` is ~34 KiB — many times the 4 KiB
+/// detector buffer pinned below — so `resident_bytes == 0` is evidence of the SPILL,
+/// not of a small N (the miscalibration guard asserts this margin).
+const LARGE_KEYED_READS: usize = 1024;
+
+/// The detector's operating point for the SHARED read/write-set staging buffer
+/// ([`WRITE_SET_SPILL_THRESHOLD_ENV`]). This is a BUFFER SIZE, not a cap — a larger set
+/// SPILLS, it is never refused. Pinning it small lets the two counts straddle the spill
+/// boundary without a multi-hundred-thousand-row fixture. It is the DETECTOR's
+/// operating point, not a relaxed bound.
+const READ_SET_BUFFER_BYTES: u64 = 4096;
+
+/// What a `COMMIT` handed to the committer's read set: the count it recorded and the
+/// bytes of it still RESIDENT.
+#[derive(Clone, Copy, Debug)]
+struct ReadSetSample {
+    rows: usize,
+    resident_bytes: u64,
+    spilled: bool,
+}
+
+/// A test committer that records the RESIDENCY of the read set the FRONT END staged and
+/// handed on at `COMMIT`, then reports `Committed`. Nothing else about the commit is under
+/// test here; the point is that the front end's read-set staging is observable END TO END.
+#[derive(Default)]
+struct ReadSetResidencyProbe {
+    samples: Mutex<Vec<ReadSetSample>>,
+}
+
+impl ReadSetResidencyProbe {
+    fn samples(&self) -> Vec<ReadSetSample> {
+        self.samples.lock().expect("probe mutex").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl TransactionCommitter for ReadSetResidencyProbe {
+    async fn commit(&self, _writes: Vec<TransactionWrite>) -> Result<CommitOutcome, CommitError> {
+        Ok(CommitOutcome::Committed)
+    }
+
+    async fn begin_postgres_snapshot(&self, _keyspace: &str) -> Result<Timestamp, CommitError> {
+        Ok(Timestamp {
+            epoch: 0,
+            time: 1,
+            seq: 0,
+            node: 0,
+        })
+    }
+
+    async fn validate_postgres_snapshot(
+        &self,
+        _keyspace: &str,
+        _snapshot: Timestamp,
+    ) -> Result<bool, CommitError> {
+        Ok(true)
+    }
+
+    async fn commit_postgres(
+        &self,
+        _keyspace: &str,
+        _writes: StagedAccordWriteSet,
+        reads: PgReadSet,
+        _written_tables: Vec<String>,
+        _snapshot: Timestamp,
+    ) -> Result<CommitOutcome, CommitError> {
+        self.samples
+            .lock()
+            .expect("probe mutex")
+            .push(ReadSetSample {
+                rows: reads.row_key_count(),
+                resident_bytes: reads.resident_bytes(),
+                spilled: reads.spilled_to_disk(),
+            });
+        Ok(CommitOutcome::Committed)
+    }
+}
+
+/// One `BEGIN ISOLATION LEVEL SERIALIZABLE` … `n` keyed point reads … one write … `COMMIT`,
+/// over the real wire, returning what that COMMIT handed the committer's read set.
+async fn keyed_read_transaction(
+    client: &tokio_postgres::Client,
+    probe: &ReadSetResidencyProbe,
+    tag: &str,
+    n: usize,
+) -> ReadSetSample {
+    let before = probe.samples().len();
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL SERIALIZABLE")
+        .await
+        .expect("BEGIN");
+
+    for i in 0..n {
+        // A point read BY PARTITION KEY resolves to the ROW it visited, so the front end
+        // records one row key per read. The row need not exist: the registration is the key
+        // the read CONSULTED, which is exactly what a concurrent writer must conflict with.
+        let sql = format!("SELECT name FROM ks.t WHERE id = '{tag}{i:032}'");
+        let rows = client.simple_query(&sql).await.expect("keyed read");
+        drop(rows);
+    }
+
+    // A WRITE is required. A read-only transaction validates its snapshot and returns
+    // without ever handing the read set on, so the read set would be unobservable at the
+    // front end. One row is enough to route the COMMIT through the committer.
+    client
+        .batch_execute(&format!(
+            "INSERT INTO ks.t (id, ck, name, score) VALUES ('{tag}-write', 1, 'x', 0)"
+        ))
+        .await
+        .expect("write");
+
+    client.batch_execute("COMMIT").await.expect("COMMIT");
+
+    let samples = probe.samples();
+    assert_eq!(
+        samples.len(),
+        before + 1,
+        "COMMIT must hand exactly one read set to the committer"
+    );
+    samples[samples.len() - 1]
+}
+
+/// The read set of a transaction that performed `n` KEYED reads must keep its RESIDENT
+/// footprint FLAT in `n` — bounded by the shared spill buffer, and NONE of it once it
+/// spills. This is the transaction-level twin of
+/// `row_read_set::tests::residency_is_flat_across_widely_separated_row_counts`: a resident
+/// (in-memory) row-key read set passes THAT unit test only if it is the staged type, and
+/// fails THIS gate at the front end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyed_read_set_residency_stays_flat_through_the_postgres_front_end() {
+    // The read set shares the write-set's staging buffer, externalized through the env and
+    // read when a `Session` is built (once per connection), so it is set before the listener
+    // accepts. This integration-test binary is its own process: nothing else reads the var.
+    std::env::set_var(
+        WRITE_SET_SPILL_THRESHOLD_ENV,
+        READ_SET_BUFFER_BYTES.to_string(),
+    );
+
+    let probe = Arc::new(ReadSetResidencyProbe::default());
+    let committer: Arc<dyn TransactionCommitter> = probe.clone();
+    let server = pg_server::start_server_with_accord(
+        0,
+        ferrosa_postgres::PortalLimits::default(),
+        AccordAccess::fixed(committer),
+    )
+    .await;
+    let client = pg_server::connect(server.port).await;
+
+    let small = keyed_read_transaction(&client, &probe, "s", SMALL_KEYED_READS).await;
+    let large = keyed_read_transaction(&client, &probe, "l", LARGE_KEYED_READS).await;
+
+    // 1. EVERY keyed read is recorded. A bound that DROPS read registrations is not a fix:
+    //    it silently loses the conflict the read set exists to carry.
+    assert_eq!(
+        small.rows, SMALL_KEYED_READS,
+        "every keyed read must be recorded in the read set"
+    );
+    assert_eq!(
+        large.rows, LARGE_KEYED_READS,
+        "every keyed read must be recorded in the read set"
+    );
+
+    // 2. The two counts straddle the buffer: the small set fits and stays resident; the large
+    //    set's keys, were they resident, would be far past it. Guard the calibration so a
+    //    too-small LARGE_KEYED_READS cannot make assertion 3 pass for the wrong reason.
+    assert!(
+        !small.spilled,
+        "the small read set fits the {READ_SET_BUFFER_BYTES}-byte buffer and stays resident"
+    );
+    assert!(
+        small.resident_bytes > 0,
+        "the small read set must be resident, not empty"
+    );
+    assert!(
+        small.resident_bytes <= READ_SET_BUFFER_BYTES,
+        "the resident prefix is bounded by the buffer, but was {} bytes",
+        small.resident_bytes
+    );
+    let per_key = small.resident_bytes / small.rows as u64;
+    let large_if_resident = per_key * large.rows as u64;
+    assert!(
+        large_if_resident > READ_SET_BUFFER_BYTES * 2,
+        "test is miscalibrated: {LARGE_KEYED_READS} keys at {per_key} bytes is \
+         {large_if_resident}, which must exceed the {READ_SET_BUFFER_BYTES}-byte buffer by a \
+         wide margin, or `resident_bytes == 0` below would not be evidence of a spill"
+    );
+
+    // 3. THE INVARIANT. Residency is FLAT in the number of keyed reads: once the set spills,
+    //    NO row key stays resident. A resident `HashSet`/`Vec` read set — the shape the owner
+    //    FORBADE — would hold ~{large_if_resident} bytes here and FAILS at the front end, not
+    //    only in the `row_read_set` unit test.
+    assert_eq!(
+        large.resident_bytes, 0,
+        "the keyed read set kept {} row-key bytes resident across {} reads; residency must be \
+         FLAT in the read count (a resident row-key collection is forbidden on this path)",
+        large.resident_bytes, LARGE_KEYED_READS
+    );
+    assert!(
+        large.spilled,
+        "the large read set must have spilled to disk, not stayed in memory"
+    );
+
+    server.engine.shutdown().expect("shutdown");
 }

@@ -93,6 +93,71 @@ pub fn is_postgres_read_table_key(key: &[u8]) -> bool {
     key.starts_with(POSTGRES_READ_TABLE_KEY_PREFIX)
 }
 
+/// Prefix of the synthetic conflict key that carries a PostgreSQL transaction's
+/// WRITE of a whole table: one per table the transaction wrote rows into.
+///
+/// Registering it makes the table's WRITE watermark visible to a transaction that
+/// SCANNED that table: the scanner registers a READ of this key
+/// ([`postgres_read_key`]) and is refused `SnapshotStale` — fail loud, SQLSTATE
+/// `40001` — when a write to the table committed after the scanner's snapshot,
+/// **even when the writer never scanned the table itself**. That is the half the
+/// coarse table-level read cannot reach: a writer that never read the table
+/// registers no read-table key, so a stale scan against ITS write was caught only
+/// by the LOCAL check (FMEA CL-72 residual).
+///
+/// It is a WATERMARK, not a data key: a writer registers it but does not conflict
+/// on it, so two transactions writing DISJOINT rows of one table still commit
+/// concurrently (RT-2). Only a SCANNER consults it, through the READ registration.
+pub const POSTGRES_WRITE_TABLE_KEY_PREFIX: &[u8] = b"\0ferrosa:postgres:write-table:v1:";
+
+/// The synthetic whole-table WRITE watermark key for a fully-qualified
+/// `schema.table` ([`POSTGRES_WRITE_TABLE_KEY_PREFIX`]).
+#[must_use]
+pub fn postgres_write_table_key(qualified_table: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(POSTGRES_WRITE_TABLE_KEY_PREFIX.len() + qualified_table.len());
+    key.extend_from_slice(POSTGRES_WRITE_TABLE_KEY_PREFIX);
+    key.extend_from_slice(qualified_table.as_bytes());
+    key
+}
+
+/// Whether `key` is a synthetic whole-table WRITE watermark key
+/// ([`POSTGRES_WRITE_TABLE_KEY_PREFIX`]).
+#[must_use]
+pub fn is_postgres_write_table_key(key: &[u8]) -> bool {
+    key.starts_with(POSTGRES_WRITE_TABLE_KEY_PREFIX)
+}
+
+/// Prefix of a READ registration: a key a transaction CONSULTED without writing.
+///
+/// A read is registered under this prefix so it is distinguishable from a write:
+/// two READERS of one key register the same read key and, because the staleness
+/// check consults a read key's UNDERLYING key ([`postgres_read_lookup_key`]) and
+/// never the read key itself, they never conflict with each other. A reader does
+/// conflict with a WRITER of the key it read — that is the read-write conflict the
+/// distributed ordering must catch, and it is decided by the writer's own
+/// registration under the underlying key.
+pub const POSTGRES_READ_KEY_PREFIX: &[u8] = b"\0ferrosa:postgres:read:v1:";
+
+/// The READ registration key for the key `underlying` a transaction read.
+#[must_use]
+pub fn postgres_read_key(underlying: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(POSTGRES_READ_KEY_PREFIX.len() + underlying.len());
+    key.extend_from_slice(POSTGRES_READ_KEY_PREFIX);
+    key.extend_from_slice(underlying);
+    key
+}
+
+/// The key a staleness check must consult for `key`: the underlying key a READ
+/// registration named, or `key` itself when it is not a read registration.
+///
+/// This is what makes read registrations distinguishable: a reader consults what
+/// it READ (and so sees a writer of that key), while the read key it registered
+/// under is never itself consulted — so read-read never conflicts.
+#[must_use]
+pub fn postgres_read_lookup_key(key: &[u8]) -> &[u8] {
+    key.strip_prefix(POSTGRES_READ_KEY_PREFIX).unwrap_or(key)
+}
+
 /// Default pre-allocation hint for [`ConflictIndex::new`] — a starting buffer
 /// size for the hot maps, never a bound on how much they may hold.
 pub const DEFAULT_CONFLICT_INDEX_RESERVE: usize = 1024;
@@ -1147,6 +1212,40 @@ mod tests {
         assert!(
             !super::is_postgres_read_table_key(b"doctor-a"),
             "a row key must never be mistaken for a read-table key"
+        );
+    }
+
+    /// A READ registration is distinguishable from a WRITE, and that distinction is
+    /// load-bearing: two readers of one key must never conflict, while a reader must
+    /// still see a WRITER of the key it read. The read key is namespaced away from
+    /// the key it consults, and the staleness check resolves a read key back to the
+    /// key it named — never to the read key itself.
+    #[test]
+    fn a_read_registration_consults_the_key_it_read_not_the_read_key() {
+        let written = super::postgres_write_table_key("public.doctors");
+        let read = super::postgres_read_key(&written);
+        assert_ne!(
+            read, written,
+            "a read registration must be a distinct key from the write it observes"
+        );
+        assert_eq!(
+            super::postgres_read_lookup_key(&read),
+            written.as_slice(),
+            "a read consults the key it READ, so it sees a writer of that key"
+        );
+        assert_eq!(
+            super::postgres_read_lookup_key(&written),
+            written.as_slice(),
+            "a plain key is consulted as itself"
+        );
+        // Two readers register the SAME read key, and nothing consults a read key:
+        // so read-read can never conflict. (The lookup of a read key is its
+        // underlying key, which carries only WRITER registrations.)
+        let read_again = super::postgres_read_key(&written);
+        assert_eq!(read, read_again, "two readers register the same read key");
+        assert!(
+            !super::is_postgres_write_table_key(&read),
+            "a read registration must not be mistaken for the table-write watermark it consults"
         );
     }
 }

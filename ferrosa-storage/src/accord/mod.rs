@@ -22,6 +22,7 @@ pub mod framed_log;
 pub mod postgres_mvcc;
 pub mod protocol_log;
 pub mod read_2i;
+pub mod row_read_set;
 pub mod sidecar;
 pub mod sync_writer;
 pub mod transaction_committer;
@@ -43,6 +44,7 @@ pub use protocol_log::ProtocolLog;
 pub use read_2i::{
     ConsistencyMode, DepWaitOutcome, IndexResult, LayerId, Read2iMerger, Read2iQuery,
 };
+pub use row_read_set::{PgReadSet, RowReadSet, StagedRowReads};
 pub use sidecar::{AccordSidecar, SidecarUploadManifest, SIDECAR_EXTENSION};
 pub use sync_writer::{FileSyncWriter, MockSyncWriter, SyncWriteResult, SyncWriter};
 pub use transaction_committer::{

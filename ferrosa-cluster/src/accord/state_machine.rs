@@ -780,6 +780,9 @@ impl AccordStateMachine {
         // key's own HWM is past the snapshot) while disjoint keys commit
         // concurrently.
         if let Some(snapshot_ts) = snapshot_ts {
+            use ferrosa_storage::accord::conflict_index::{
+                is_postgres_write_table_key, postgres_read_lookup_key,
+            };
             let latest = keys
                 .iter()
                 .copied()
@@ -788,6 +791,17 @@ impl AccordStateMachine {
                         && *key
                             != ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_BARRIER_KEY
                 })
+                // A table's WRITE watermark is not a DATA key. A transaction that
+                // WROTE rows of a table registers it so a SCANNER of that table can
+                // see the write; but a writer must not conflict with another writer
+                // of a DISJOINT row on it (RT-2), so a plain watermark key is SKIPPED
+                // here. It is consulted only through a READ registration, below.
+                .filter(|key| !is_postgres_write_table_key(key))
+                // A READ registration consults the key it READ, never the read key
+                // itself: a reader sees a WRITER of that key, while two readers —
+                // which both register under the READ prefix — never conflict with
+                // each other.
+                .map(postgres_read_lookup_key)
                 .filter_map(|key| self.conflict_index.max_conflicting_timestamp(key))
                 .max();
             if latest.is_some_and(|latest| latest > snapshot_ts) {
@@ -837,7 +851,11 @@ impl AccordStateMachine {
                 accord_ts: Some(t),
                 status: TxnStatus::PreAccepted,
             };
+            let site = ferrosa_common::mem_probe::enter_site(
+                ferrosa_common::mem_probe::SITE_SM_CONFLICT_INDEX,
+            );
             self.conflict_index.register(key, entry);
+            ferrosa_common::mem_probe::exit_site(site);
         }
 
         // Track whether THIS call created the TxnState, so a persist failure can

@@ -73,7 +73,14 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   phase that caused it (see `PROFILE.md`, `FERROSA_PG_COMMIT_PROFILE`). The
   feature is OFF by default: without it the recording calls are empty and inline
   away, the binary uses jemalloc directly, and `installed()` is `false` so a
-  caller logs nothing rather than a fabricated zero.
+  caller logs nothing rather than a fabricated zero. A second seam in the same
+  module attributes the ALLOCATION of each key-sized buffer to its **call site**:
+  a site tags itself with `enter_site`/`exit_site` (indices named in `SITE_NAMES`),
+  and a counting allocator charges the buffer via `current_site` ->
+  `record_site_keyed_alloc`, so a residency finding names a `file:line` instead of
+  a hypothesis. It counts the ALLOCATION, not the lifetime (`dealloc` carries no
+  tag), so a site's retained SHARE of a peak is proven by removing that site and
+  re-measuring, never by the tag table alone.
 - **System-column key minting** — `timeuuid::v1_timeuuid(time_100ns, clock_seq,
   node)` builds the 16 bytes of a v1 TimeUUID (RFC 4122 §4.1.2) and
   `timeuuid::is_reserved_column_name` guards the `_sys_` prefix. Used for the

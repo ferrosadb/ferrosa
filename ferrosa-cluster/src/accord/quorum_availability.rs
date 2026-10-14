@@ -21,7 +21,9 @@ use ferrosa_net::error::NetError;
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
 use ferrosa_storage::accord::sync_writer::MockSyncWriter;
-use ferrosa_storage::accord::{CommitOutcome, TransactionCommitter, TransactionWrite};
+use ferrosa_storage::accord::{
+    CommitOutcome, PgReadSet, RowReadSet, StagedRowReads, TransactionCommitter, TransactionWrite,
+};
 use uuid::Uuid;
 
 use crate::accord::apply::{ApplyError, ApplyMutation, StorageApplier};
@@ -50,6 +52,25 @@ fn write(keyspace: &str, key: &str, mutation: &str) -> TransactionWrite {
         key: key.as_bytes().to_vec(),
         mutation: mutation.as_bytes().to_vec(),
     }
+}
+
+/// The ROW-granular half of a hybrid read set: the row keys a KEYED read VISITED,
+/// staged through the SAME write-set spill the write-set uses (here fully resident — a
+/// test set is tiny, so it never touches the disk). Two keyed readers of DISJOINT rows
+/// hand over DISJOINT keys and so do not conflict.
+fn row_reads(rows: &[&str]) -> StagedRowReads {
+    let mut set = RowReadSet::with_threshold(
+        std::env::temp_dir().join(format!("ferrosa-quorum-row-reads-{}", Uuid::new_v4())),
+        u64::MAX,
+    );
+    for row in rows {
+        set.record(row.as_bytes()).expect("record row read");
+    }
+    assert!(
+        !set.spilled_to_disk(),
+        "a small test read set stays resident"
+    );
+    set.finish().expect("finish row read set")
 }
 
 /// Records the payload of every mutation the apply engine persists, so a test can
@@ -431,7 +452,13 @@ async fn run_postgres_transaction(
             // table-level read participates in the Accord ordering, a shared
             // placeholder would make every actor conflict on one table and starve
             // the queue — which is not what this quorum-availability test measures.
-            .commit_postgres("ks", staged(vec![write]), Vec::new(), snapshot)
+            .commit_postgres(
+                "ks",
+                staged(vec![write]),
+                PgReadSet::empty(),
+                Vec::new(),
+                snapshot,
+            )
             .await
         {
             Ok(CommitOutcome::Committed) => return Ok(()),
@@ -622,7 +649,13 @@ async fn a_snapshot_barrier_and_a_commit_whose_preaccepts_cross_do_not_deadlock(
     };
     let commit = tokio::spawn(async move {
         commit_node
-            .commit_postgres("ks", staged(vec![write]), vec!["t".to_string()], snapshot)
+            .commit_postgres(
+                "ks",
+                staged(vec![write]),
+                PgReadSet::scans(vec!["t".to_string()]),
+                Vec::new(),
+                snapshot,
+            )
             .await
     });
     let barrier = barrier.await.expect("barrier task panicked");
@@ -671,12 +704,16 @@ async fn a_late_disjoint_writer_serializes_against_a_table_the_earlier_writer_ch
     // Both SELECT the table: doctor-a = 1, doctor-b = 1 — so both decide to move
     // their own doctor off call.
     let read_tables = vec!["public.doctors".to_string()];
+    // Both WRITE the table too, so each registers its whole-table WRITE watermark —
+    // the evidence a scanner of the table consults.
+    let written_tables = vec!["public.doctors".to_string()];
 
     let first = cluster.committers[0]
         .commit_postgres(
             "public",
             staged(vec![write("public", "doctor-a", "doctor-a=0")]),
-            read_tables.clone(),
+            PgReadSet::scans(read_tables.clone()),
+            written_tables.clone(),
             first_snapshot,
         )
         .await
@@ -693,7 +730,8 @@ async fn a_late_disjoint_writer_serializes_against_a_table_the_earlier_writer_ch
         .commit_postgres(
             "public",
             staged(vec![write("public", "doctor-b", "doctor-b=0")]),
-            read_tables.clone(),
+            PgReadSet::scans(read_tables.clone()),
+            written_tables.clone(),
             second_snapshot,
         )
         .await
@@ -734,15 +772,18 @@ async fn two_simultaneous_write_skew_writers_never_both_go_off_call() {
     cluster.arm_preaccept_crossing();
 
     let read_tables = vec!["public.doctors".to_string()];
+    let written_tables = vec!["public.doctors".to_string()];
     let first = tokio::spawn({
         let committer = Arc::clone(&cluster.committers[0]);
         let tables = read_tables.clone();
+        let written = written_tables.clone();
         async move {
             committer
                 .commit_postgres(
                     "public",
                     staged(vec![write("public", "doctor-a", "doctor-a=0")]),
-                    tables,
+                    PgReadSet::scans(tables),
+                    written,
                     first_snapshot,
                 )
                 .await
@@ -751,12 +792,14 @@ async fn two_simultaneous_write_skew_writers_never_both_go_off_call() {
     let second = tokio::spawn({
         let committer = Arc::clone(&cluster.committers[1]);
         let tables = read_tables.clone();
+        let written = written_tables.clone();
         async move {
             committer
                 .commit_postgres(
                     "public",
                     staged(vec![write("public", "doctor-b", "doctor-b=0")]),
-                    tables,
+                    PgReadSet::scans(tables),
+                    written,
                     second_snapshot,
                 )
                 .await
@@ -824,7 +867,13 @@ async fn a_slow_apply_ack_does_not_decide_an_oversized_commits_fate() {
 
     let started = Instant::now();
     let outcome = committer
-        .commit_postgres("ks", staged(writes), vec!["t".to_string()], snapshot)
+        .commit_postgres(
+            "ks",
+            staged(writes),
+            PgReadSet::scans(vec!["t".to_string()]),
+            Vec::new(),
+            snapshot,
+        )
         .await;
     assert!(
         matches!(outcome, Ok(CommitOutcome::Committed)),
@@ -876,7 +925,13 @@ async fn a_lost_apply_ack_still_converges_the_coordinators_own_shard() {
         .collect();
 
     let outcome = committer
-        .commit_postgres("ks", staged(writes), vec!["t".to_string()], snapshot)
+        .commit_postgres(
+            "ks",
+            staged(writes),
+            PgReadSet::scans(vec!["t".to_string()]),
+            Vec::new(),
+            snapshot,
+        )
         .await;
     let error = outcome.expect_err("an unreachable apply quorum must fail loud, never ack");
     assert!(
@@ -904,5 +959,143 @@ async fn a_lost_apply_ack_still_converges_the_coordinators_own_shard() {
     assert!(
         acked_read.is_ok(),
         "the acked replica's shard must be readable; got {acked_read:?}"
+    );
+}
+
+/// The absent-row half of a scan's read set: a transaction that INSERTs a row into
+/// a table a SERIALIZABLE transaction READ must still be refused, even though the
+/// INSERTer never scanned the table and so registers no table-level read key.
+///
+/// A scan's read set is not only the rows it SAW. Strict serializability must also
+/// catch a PHANTOM — a row INSERTED into the scanned range after the snapshot — and
+/// no set of visited rows can observe it. The table-level read key cannot either:
+/// only a SCANNER registers it, so a writer that never scanned is invisible to it,
+/// and the stale scan commits on the strength of a row it never saw (the FMEA CL-72 /
+/// PG-17 residual). The writer must instead leave EVIDENCE the scanner consults.
+///
+/// Both transactions write DISJOINT rows of `public.doctors`, and the reader's scan
+/// saw NEITHER. The reader BEGINs first, so its snapshot predates the insert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_insert_into_a_table_a_scanner_read_is_refused() {
+    let cluster = Cluster::three_nodes();
+
+    // The reader BEGINs first: its snapshot predates the insert.
+    let reader_snapshot = cluster.committers[0]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("reader BEGIN");
+
+    // A DISJOINT writer inserts one row of the SAME table. It never scans, so it
+    // carries no table-level read key.
+    let inserter_snapshot = cluster.committers[1]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("inserter BEGIN");
+    let inserted = cluster.committers[1]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "doctor-c", "doctor-c=1")]),
+            PgReadSet::empty(),
+            vec!["public.doctors".to_string()],
+            inserter_snapshot,
+        )
+        .await
+        .expect("inserter commit");
+    assert_eq!(
+        inserted,
+        CommitOutcome::Committed,
+        "the inserter reads nothing, so nothing it did can conflict"
+    );
+
+    // The reader COMMITs after the insert, having read the table at its earlier
+    // snapshot. The row it never saw is a phantom its snapshot is stale against.
+    let scanned = cluster.committers[0]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "doctor-d", "doctor-d=1")]),
+            PgReadSet::scans(vec!["public.doctors".to_string()]),
+            vec!["public.doctors".to_string()],
+            reader_snapshot,
+        )
+        .await
+        .expect("reader commit");
+    assert!(
+        matches!(scanned, CommitOutcome::Aborted { .. }),
+        "a transaction that read a table a later INSERT wrote into must be refused as a \
+         retryable serialization failure, not committed on the strength of a row it never \
+         saw; got {scanned:?}"
+    );
+}
+
+/// The false-refusal half of the hybrid read set: two SERIALIZABLE transactions that
+/// each READ a bounded RANGE that RESOLVES TO KEYS of one table, and WRITE DISJOINT
+/// rows of ANOTHER table, must BOTH commit.
+///
+/// A read registration is a READ, not a write: two READERS of one table do not
+/// conflict (there is no write to serialize against). Registered at TABLE granularity
+/// as a plain driven key (`postgres_read_table_key`), the second reader collided with
+/// the first reader's registration of that one shared table key and was refused
+/// `SnapshotStale` — the false conflict the owner names. It is what forced the CL-28
+/// fixture (`run_postgres_transaction`) to hand an EMPTY read set, because any shared
+/// table key starved the queue.
+///
+/// The hybrid resolves a keyed read to the ROW keys it VISITED, so the two readers
+/// register DISJOINT keys and both commit. RED, before the hybrid, the same two
+/// transactions with the read carried at table granularity:
+///
+///     left: Aborted { reason: "PostgreSQL transaction snapshot is stale" }
+///     right: Committed
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_serializable_range_readers_of_one_table_both_commit() {
+    let cluster = Cluster::three_nodes();
+
+    // Both BEGIN before either COMMITs, so neither can be excused by real time.
+    let first_snapshot = cluster.committers[0]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("first BEGIN");
+    let second_snapshot = cluster.committers[1]
+        .begin_postgres_snapshot("public")
+        .await
+        .expect("second BEGIN");
+
+    // Each transaction READS a bounded range of `public.doctors` — here the ranges
+    // resolve to DISJOINT keys (`doctor-a` vs `doctor-b`) — and WRITES a DISJOINT row of
+    // `public.appointments`. Neither writes the table it read, so no write makes either
+    // read stale, and the two reads do not overlap.
+    let written_tables = vec!["public.appointments".to_string()];
+
+    let first = cluster.committers[0]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "appt-a", "appt-a=1")]),
+            PgReadSet::with_row_keys(Vec::new(), row_reads(&["doctor-a"])),
+            written_tables.clone(),
+            first_snapshot,
+        )
+        .await
+        .expect("first commit");
+    assert_eq!(
+        first,
+        CommitOutcome::Committed,
+        "nothing was written against the range the first reader read, so it must commit"
+    );
+
+    let second = cluster.committers[1]
+        .commit_postgres(
+            "public",
+            staged(vec![write("public", "appt-b", "appt-b=1")]),
+            PgReadSet::with_row_keys(Vec::new(), row_reads(&["doctor-b"])),
+            written_tables.clone(),
+            second_snapshot,
+        )
+        .await
+        .expect("second commit");
+    assert_eq!(
+        second,
+        CommitOutcome::Committed,
+        "two READERS of one table at DISJOINT keys, writing DISJOINT rows of another, do \
+         not conflict: the second must commit, not be refused on a shared table read key; \
+         got {second:?}"
     );
 }

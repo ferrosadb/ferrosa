@@ -544,7 +544,7 @@ async fn multi_row_insert_persists_every_row_on_a_real_cluster() {
 /// storage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_key_commit_persists_every_key_on_every_node_rf3() {
-    use ferrosa_storage::accord::{CommitOutcome, TransactionCommitter};
+    use ferrosa_storage::accord::{CommitOutcome, PgReadSet, TransactionCommitter};
 
     let cluster = cluster(Placement::AllNodes).await;
     let committer = cluster.committers[0].clone();
@@ -561,6 +561,7 @@ async fn multi_key_commit_persists_every_key_on_every_node_rf3() {
         .commit_postgres(
             "public",
             staged_write_set(vec![transaction_write(&m1), transaction_write(&m2)]),
+            PgReadSet::scans(vec!["public.users".to_string()]),
             vec!["public.users".to_string()],
             snapshot,
         )
@@ -608,7 +609,7 @@ async fn multi_key_commit_persists_every_key_on_every_node_rf3() {
 /// while the commit still reports success (the live failure mode).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multi_key_commit_persists_each_key_on_its_owner_rf1() {
-    use ferrosa_storage::accord::{CommitOutcome, TransactionCommitter};
+    use ferrosa_storage::accord::{CommitOutcome, PgReadSet, TransactionCommitter};
 
     let cluster = cluster(Placement::OneNodePerKey).await;
     let committer = cluster.committers[0].clone();
@@ -624,6 +625,7 @@ async fn multi_key_commit_persists_each_key_on_its_owner_rf1() {
         .commit_postgres(
             "public",
             staged_write_set(vec![transaction_write(&m1), transaction_write(&m2)]),
+            PgReadSet::scans(vec!["public.users".to_string()]),
             vec!["public.users".to_string()],
             snapshot,
         )

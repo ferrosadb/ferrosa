@@ -59,6 +59,19 @@ and the coordinator's own apply borrows it the same way (see below — no owned
 never becomes a per-entry copy; small write-sets stay wholly resident. See FMEA
 `CL-51` and `ferrosa-storage`'s `write_set_spill`.
 
+Every conflict key the COMMIT path holds is IMMUTABLE, write-once bytes that are
+read and handed through to disk — so nothing needs to OWN a second copy. The two
+places that used to clone one key buffer per key now BORROW: the per-shard
+participant set is carried BY POSITION, aligned with the driver's write-set
+(`with_per_key_replica_sets_by_position` — the commit path resolves each key during
+its single walk and so builds no keyed index), and the `PreAcceptV2` wire key list
+is a borrowed `Vec<&[u8]>` serialized by `PreAcceptV2PayloadBorrowed`, whose frame is
+byte-identical to the owned one. Together they take the consumer's peak from 4.05 to
+3.04 key-sized buffers per conflict key, so the ratchet in
+`tests/pg_commit_path_consumer_residency.rs` tightened 4 -> 3, and
+`tests/pg_commit_path_key_attribution.rs` pins each site's own count (the per-key
+index site at ZERO). See FMEA `CL-73`.
+
 When the write-set is the **same for every peer** — no per-key resolver, or every
 key resolving to the same replica set (the `RF == node count` shape) — the payload
 is built and CAPNP-encoded ONCE (`borrowed_write_set_entries` borrows `(key, mutation)`
@@ -300,7 +313,7 @@ build; the codec's own cost is its delta against `none`.
   bound a leader that cannot reach a quorum held the await open until the CQL
   client's own 30 s deadline fired — the unexplained `Request execution
   exceeded a client timeout of 30000ms` on the Jepsen teardown DROP (t_e8abe81a,
-  CL-73). On expiry it returns
+  CL-74). On expiry it returns
   `ClusterError::DdlProposalNotAgreed { operation, required, alive, timeout_ms,
   elapsed_ms }`, which names the statement (`ddl_op_target`), the quorum it
   needed and the wait; `ferrosa-cql` maps it to the CQL unavailable class so
@@ -718,6 +731,35 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   once the table was written after the reader's snapshot — the write-skew the engine used to commit
   (EPIC t_27672375, FMEA CL-72). Row-level point reads are judged by the row they named and register
   no table key, so two disjoint-key writers still commit concurrently (RT-2).
+- **A scan also reads each scanned table's WRITE WATERMARK, so a PHANTOM is caught even when the
+  writer never scanned the table.** The table-level read key above is only ever registered *by*
+  scanners, so a transaction that WROTE the table without reading it was invisible to it and the
+  stale scan committed on the strength of a row it never saw (the residual CL-72 named). Now every
+  table a transaction WROTE contributes `postgres_write_table_key(t)`
+  (`POSTGRES_WRITE_TABLE_KEY_PREFIX`) — its whole-table WRITE watermark — and every table it SCANNED
+  contributes a READ registration of that watermark (`postgres_read_key(...)`,
+  `POSTGRES_READ_KEY_PREFIX`). A READ registration CONSULTS the key it read
+  (`postgres_read_lookup_key`) and is never itself consulted, so **read-read never conflicts** while
+  read-write does: two scanners of one table do not collide on the watermark, but a scanner is
+  refused as soon as any writer of that table committed after its snapshot. The watermark is a
+  watermark, not a data key — a plain watermark key is SKIPPED in a writer's own staleness check, so
+  two transactions writing DISJOINT rows of one table still commit concurrently (RT-2). A READ
+  registration is also ROUTED by the key it read, so its registration lands on the same replicas as
+  the writer's and the check cannot silently miss. Test (red first):
+  `quorum_availability::an_insert_into_a_table_a_scanner_read_is_refused`; the negative control — a
+  writer that registers no watermark — leaves the stale scan committing (`got Committed`).
+- **The read set `commit_postgres` receives is HYBRID and STREAMED, not a table list.** The
+  argument is a `ferrosa_storage::accord::PgReadSet`: `scan_tables` (the wide scans that could not be
+  resolved to keys, each driving the synthetic `POSTGRES_READ_TABLE_KEY_PREFIX` key above) PLUS the
+  keyed reads resolved to ROW keys, which are visited one at a time through
+  `PgReadSet::for_each_row_key` out of a spilled, memory-mapped staging region — never a resident
+  `Vec`. A keyed reader therefore registers the ROW it visited: two keyed readers of DISJOINT rows of
+  one table both commit, while a concurrent writer of one of those rows still conflicts (the reader
+  consults the key it read, `postgres_read_lookup_key`). The engine streams the row keys into the
+  driven read registrations rather than materializing them, which is what lets a fixed-4-GB node carry
+  a read set of any size. The staging is `ferrosa-storage`'s `row_read_set` (FMEA ST-WS-03); the
+  front-end gate is
+  `ferrosa-postgres/tests/pg_full_scan_memory_bound.rs::keyed_read_set_residency_stays_flat_through_the_postgres_front_end`.
 - `coordinator.rs` / `state_machine.rs` — PreAccept → {fast path | Accept} →
   Commit → [read-vote] → Apply, fast/slow quorum math, HLC timestamps + `TxnId`.
   Accept is dependency-monotonic: replicas retain dependencies seen locally

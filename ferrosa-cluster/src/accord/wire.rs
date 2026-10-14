@@ -117,6 +117,31 @@ pub(crate) struct PreAcceptV2Payload {
     pub(crate) snapshot_ts: Option<Timestamp>,
 }
 
+/// Serialize-only BORROWING mirror of [`PreAcceptV2Payload`]: identical fields in identical
+/// order, but `keys` borrows the driver's write-set key bytes instead of cloning one owned
+/// key buffer per conflict key (`refactor/borrow-the-commit-keys`).
+///
+/// The wire bytes are IDENTICAL, which is the whole point: bincode emits a sequence as a
+/// little-endian `u64` count followed by each element, and a `u8` element as a single byte,
+/// so a `Vec<Vec<u8>>` and a `&[&[u8]]` with the same keys serialize to the same frame — a
+/// `&[u8]` slice and a `Vec<u8>` both go through `serialize_seq`. `snapshot_ts`'s
+/// `#[serde(default)]` is a DESERIALIZE attribute and has no effect on the emitted bytes.
+/// `wire::tests::borrowed_preaccept_v2_keys_serialize_byte_identically` pins that equality,
+/// so the frame the replica decodes is unchanged.
+///
+/// There is deliberately no owned counterpart in the send path: the receiver still decodes
+/// `PreAcceptV2Payload`, so the wire contract does not move.
+#[derive(serde::Serialize)]
+pub(crate) struct PreAcceptV2PayloadBorrowed<'a> {
+    pub(crate) txn_id: TxnId,
+    pub(crate) t0: Timestamp,
+    /// Every partition key the transaction writes, BORROWED from the driver's write-set.
+    pub(crate) keys: &'a [&'a [u8]],
+    pub(crate) ballot: BallotNumber,
+    pub(crate) epoch: u64,
+    pub(crate) snapshot_ts: Option<Timestamp>,
+}
+
 // ---------------------------------------------------------------------------
 // Replica → Coordinator
 // ---------------------------------------------------------------------------
@@ -403,6 +428,82 @@ mod tests {
                 table: "t".into(),
             },
         });
+    }
+
+    /// INVARIANT (a) DATA PRESERVED / (c) ORDERING. The BORROWED-key PreAcceptV2 frame must be
+    /// BYTE-IDENTICAL to the owned one it replaces — the wire format does not move — including
+    /// when a key carries interior NULs (the protocol markers) and when the key list is
+    /// EMPTY. Key ORDER is preserved because both serializers walk the same `keys` slice.
+    ///
+    /// This is the guard `order_and_gate` relies on to drop the per-key owned copy; it is the
+    /// differential oracle for the refactor that removed
+    /// `order.preaccept_v2_keys`'s one-allocation-per-key cost.
+    #[test]
+    fn borrowed_preaccept_v2_keys_serialize_byte_identically() {
+        use super::{PreAcceptV2Payload, PreAcceptV2PayloadBorrowed};
+
+        let t0 = ts(7, 1_000, 2, 11);
+        let txn_id = txn(7, 1_000, 2, 11);
+
+        // Keys chosen to hit the awkward cases: empty, interior NULs (the markers), a
+        // length above 255 so the length field is multi-byte, and a UTF-8-free byte string.
+        let keys_owned: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"w00000000000000000000000000000000".to_vec(),
+            vec![0u8; 300],
+            b"\0ferrosa:postgres:marker".to_vec(),
+            b"\0ferrosa:postgres:barrier".to_vec(),
+        ];
+
+        for snapshot_ts in [None, Some(ts(3, 42, 0, 9))] {
+            let owned = PreAcceptV2Payload {
+                txn_id,
+                t0,
+                keys: keys_owned.clone(),
+                ballot: BallotNumber(7),
+                epoch: 3,
+                snapshot_ts,
+            };
+            let borrowed_keys: Vec<&[u8]> = keys_owned.iter().map(Vec::as_slice).collect();
+            let borrowed = PreAcceptV2PayloadBorrowed {
+                txn_id,
+                t0,
+                keys: &borrowed_keys,
+                ballot: BallotNumber(7),
+                epoch: 3,
+                snapshot_ts,
+            };
+            assert_eq!(
+                bincode::serialize(&owned).expect("owned encodes"),
+                bincode::serialize(&borrowed).expect("borrowed encodes"),
+                "the borrowed-key PreAcceptV2 frame must be byte-identical to the owned one \
+                 (snapshot_ts={snapshot_ts:?}) — the wire format must not move"
+            );
+        }
+
+        // The empty key list is the degenerate all-borrowed case (no key buffers at all).
+        let owned = PreAcceptV2Payload {
+            txn_id,
+            t0,
+            keys: Vec::new(),
+            ballot: BallotNumber(0),
+            epoch: 0,
+            snapshot_ts: None,
+        };
+        let borrowed_keys: Vec<&[u8]> = Vec::new();
+        let borrowed = PreAcceptV2PayloadBorrowed {
+            txn_id,
+            t0,
+            keys: &borrowed_keys,
+            ballot: BallotNumber(0),
+            epoch: 0,
+            snapshot_ts: None,
+        };
+        assert_eq!(
+            bincode::serialize(&owned).expect("owned encodes"),
+            bincode::serialize(&borrowed).expect("borrowed encodes"),
+            "an empty key list must serialize identically through both paths"
+        );
     }
 
     #[test]
