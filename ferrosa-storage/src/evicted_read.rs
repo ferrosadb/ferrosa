@@ -64,11 +64,17 @@ const SSTABLE_COMPONENTS: &[&str] = &[
     "CRC.db",
 ];
 
-/// Components needed to open a reader. The first three are required: a
-/// generation missing any of them cannot be opened.
+/// Components needed to open a reader. The first and third are required: a
+/// generation missing either cannot be opened.
+///
+/// `Rows.db` is deliberately NOT required, matching
+/// [`crate::sstable_health::CRITICAL_COMPONENTS`]: the writer emits a zero-byte
+/// `Rows.db` for partitions that need no row index, and the reader reads a
+/// missing or empty one as "no row index". Requiring it here made a store that
+/// never received that empty object refuse to start the whole node.
 const QUERY_COMPONENTS: &[(&str, bool)] = &[
     ("Partitions.db", true),
-    ("Rows.db", true),
+    ("Rows.db", false),
     ("Filter.db", true),
     ("Statistics.db", false),
     ("TOC.txt", false),
@@ -721,7 +727,12 @@ impl EvictedReadStore {
         let mut fetched_bytes = 0u64;
         for (component, required) in QUERY_COMPONENTS {
             let local = dir.join(format!("{gen}-{component}"));
-            if local.exists() {
+            // "Present" means present AND non-empty. A component truncated to
+            // zero bytes (a crash mid-write, a page-cache eviction, a full disk)
+            // holds nothing a reader can use, and trusting it left the generation
+            // permanently unrepaired while the store still held the real one.
+            let present = std::fs::metadata(&local).is_ok_and(|m| m.len() > 0);
+            if present {
                 continue;
             }
             let key = self.component_key(data_loc, component);

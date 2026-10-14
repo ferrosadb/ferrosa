@@ -634,7 +634,7 @@ impl ModeController {
     ///
     /// The old directory is retained rather than deleted: it is the only
     /// evidence of how the node got stranded.
-    pub(crate) fn reset_stranded_raft_state(
+    pub(crate) fn reset_unusable_raft_state(
         raft_dir: &std::path::Path,
     ) -> std::io::Result<Option<std::path::PathBuf>> {
         let marker = raft_dir.join(DeploymentMode::CLUSTER_MEMBER_MARKER);
@@ -1233,66 +1233,98 @@ impl ModeController {
         // with an index range and no cause. See `crate::raft::local_state`.
         match log_store.last_purged_log_id() {
             Ok(purge_point) => {
+                // Contiguity is the third durable fact that has to agree, and the
+                // one nothing checked until now: a hole leaves the applied/purged
+                // pair perfectly healthy while openraft cannot replay a single
+                // entry past it, so the node fails Fatal and stays down.
+                let log_gap = match log_store.log_gap() {
+                    Ok(gap) => gap,
+                    Err(e) => {
+                        tracing::warn!(%e, "failed to scan the Raft log for holes");
+                        None
+                    }
+                };
                 let classification = crate::raft::local_state::classify_local_raft_state(
                     state_machine.last_applied_index(),
                     purge_point.map(|log_id| log_id.index),
+                    log_gap,
                 );
-                match classification {
+                // Two shapes make the persisted log unusable, and they need the
+                // SAME repair, so they are collapsed into one reason and one reset
+                // rather than two copies of each.
+                let unusable_reason = match classification {
                     crate::raft::local_state::LocalRaftState::StrandedBehindPurge {
                         last_applied,
                         last_purged,
-                    } => {
-                        tracing::error!(
-                            last_applied,
-                            last_purged,
-                            missing = format!("{}..={}", last_applied + 1, last_purged),
-                            dir = %raft_dir.display(),
-                            "local Raft state is unusable: entries were purged before they \
-                             were applied, so this node holds no copy of them. Resetting \
-                             local Raft state (retained for inspection) and rejoining to \
-                             receive a snapshot from the leader."
-                        );
-                        match Self::reset_stranded_raft_state(&raft_dir) {
-                            Ok(backup) => {
-                                tracing::warn!(
-                                    backup = %backup.as_deref().unwrap_or(std::path::Path::new("<none>")).display(),
-                                    "stranded Raft state moved aside; rebuilding from the leader"
-                                );
-                                match SledLogStore::new(&raft_dir) {
-                                    Ok(fresh) => {
-                                        log_store = fresh;
-                                        state_machine =
-                                            FerrosStateMachine::with_side_effects_and_snapshot_path(
-                                                self.schema.clone(),
-                                                self.storage.clone(),
-                                                raft_dir.join("state-machine.snapshot.bin"),
-                                            );
-                                        state_machine.set_durable_applied_handle(
-                                            log_store.durable_applied_handle(),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(%e, "failed to recreate Raft log store after reset");
-                                        return;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(
-                                    %e,
-                                    "could not reset stranded Raft state; this node cannot \
-                                     rejoin and needs operator repair"
-                                );
-                                return;
-                            }
-                        }
+                    } => Some(format!(
+                        "entries {}..={} were purged before they were applied, so this \
+                         node holds no copy of them",
+                        last_applied + 1,
+                        last_purged
+                    )),
+                    crate::raft::local_state::LocalRaftState::LogHasGap { from, to } => {
+                        Some(format!(
+                            "entries {from}..={to} are absent from the log above the purge \
+                             point (a hole), so openraft cannot replay past them"
+                        ))
                     }
                     crate::raft::local_state::LocalRaftState::NeedsPurgePointBaseline {
                         ..
                     } => {
                         state_machine.recover_from_purge_point(purge_point);
+                        None
                     }
-                    crate::raft::local_state::LocalRaftState::Usable => {}
+                    crate::raft::local_state::LocalRaftState::Usable => None,
+                };
+
+                if let Some(reason) = unusable_reason {
+                    tracing::error!(
+                        dir = %raft_dir.display(),
+                        "local Raft state is unusable: {reason}. Resetting local Raft state \
+                         (retained for inspection) and rejoining to receive a snapshot from \
+                         the leader -- without this the node fails Fatal at boot and stays \
+                         down while the cluster serves on the remaining peers."
+                    );
+                    match Self::reset_unusable_raft_state(&raft_dir) {
+                        Ok(backup) => {
+                            tracing::warn!(
+                                backup = %backup
+                                    .as_deref()
+                                    .unwrap_or(std::path::Path::new("<none>"))
+                                    .display(),
+                                "unusable Raft state moved aside; rebuilding from the leader"
+                            );
+                            match SledLogStore::new(&raft_dir) {
+                                Ok(fresh) => {
+                                    log_store = fresh;
+                                    state_machine =
+                                        FerrosStateMachine::with_side_effects_and_snapshot_path(
+                                            self.schema.clone(),
+                                            self.storage.clone(),
+                                            raft_dir.join("state-machine.snapshot.bin"),
+                                        );
+                                    state_machine.set_durable_applied_handle(
+                                        log_store.durable_applied_handle(),
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        %e,
+                                        "failed to recreate Raft log store after reset"
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                %e,
+                                "could not reset unusable Raft state; this node cannot \
+                                 rejoin and needs operator repair"
+                            );
+                            return;
+                        }
+                    }
                 }
             }
             Err(e) => tracing::warn!(%e, "failed to read last_purged from log store"),

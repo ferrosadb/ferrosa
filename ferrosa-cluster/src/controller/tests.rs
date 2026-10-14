@@ -4104,7 +4104,7 @@ async fn a_refused_pair_transition_must_not_leave_a_pair_write_path() {
 
 /// A stranded node must not forget it was a cluster member while it repairs.
 ///
-/// `reset_stranded_raft_state` deletes the local Raft log so the leader can
+/// `reset_unusable_raft_state` deletes the local Raft log so the leader can
 /// resend it. If the `cluster-member` marker went with it, the node would come
 /// back as `Standalone`, form a pair with the first peer it meets, and start
 /// serving as a pair primary while still being a committed member of a Raft
@@ -4120,7 +4120,7 @@ async fn resetting_a_stranded_node_keeps_its_cluster_membership() {
     std::fs::write(&marker, b"member-since=whenever").unwrap();
     std::fs::write(raft_dir.join("db"), b"stranded log bytes").unwrap();
 
-    let backup = ModeController::reset_stranded_raft_state(&raft_dir).expect("reset must succeed");
+    let backup = ModeController::reset_unusable_raft_state(&raft_dir).expect("reset must succeed");
 
     assert!(
         DeploymentMode::was_cluster_member(&raft_dir),
@@ -4156,7 +4156,7 @@ fn resetting_a_stranded_node_rejects_an_oversized_membership_marker() {
     .unwrap();
     std::fs::write(raft_dir.join("db"), b"must remain untouched").unwrap();
 
-    let error = ModeController::reset_stranded_raft_state(&raft_dir)
+    let error = ModeController::reset_unusable_raft_state(&raft_dir)
         .expect_err("oversized marker must fail before resetting durable Raft state");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(
