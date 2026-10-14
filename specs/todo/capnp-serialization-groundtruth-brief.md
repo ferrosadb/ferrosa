@@ -44,6 +44,20 @@ Implement and test Cap'n Proto serialization for high-priority Ferrosa-private b
 - Preserve fail-loud decode errors; no `unwrap_or_default()` on protocol encode paths.
 - Verify with crate-level cargo tests and final `cargo build --all-targets`.
 
+## Landed 2026-10-14 (D32, the jsonb half)
+
+- `CAP_JSONB_V1` (`ferrosa-net/src/handshake.rs`) joined to `LOCAL_CAPABILITIES`.
+- The jsonb DDL gate is capability-based, not mode-based:
+  `jsonb_ddl_permitted(mode, cluster)`, a second live `ArcSwap` cell on `Schema`
+  (`jsonb_cluster_gate_handle()`) defaulting to `Unknown`, and a typed refusal
+  (`JsonbDdlRefusal`) that names the members lacking the bit.
+  `ferrosa-schema --test jsonb_ddl_gate`: 10 passed, 0 failed (3 new).
+- **Still owed on this item:** (a) the cluster controller does not yet compute and
+  publish that verdict from `peer_capabilities`, so a cluster still refuses in
+  production; (b) the transition half still reads `Unknown` deliberately; (c) the
+  schema op itself is still a bincode blob on the wire — scope item 2 below, the
+  Cap'n Proto schema-path frame, is untouched.
+
 ## Suggested task order
 
 1. Cap'n Proto schema/build infrastructure and codec helpers.

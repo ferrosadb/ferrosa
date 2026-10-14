@@ -79,6 +79,8 @@ pub enum SchemaError {
     JsonbDdlRefused {
         mode: ferrosa_common::deployment_mode::DeploymentMode,
         subject: String,
+        /// D32: which members lack jsonb, or that the view could not be read.
+        reason: crate::jsonb_rules::JsonbDdlRefusal,
     },
 }
 
@@ -154,12 +156,11 @@ impl fmt::Display for SchemaError {
                 column,
                 rule,
             } => write!(f, "column '{column}' of {keyspace}.{table}: {rule}"),
-            Self::JsonbDdlRefused { mode, subject } => write!(
-                f,
-                "jsonb DDL refused ({subject}): this node is in {mode} mode and jsonb columns \
-                 are allowed on a standalone node only until the capability ledger (D15a, \
-                 ferrosa.jsonb.v1) is available"
-            ),
+            Self::JsonbDdlRefused {
+                mode,
+                subject,
+                reason,
+            } => write!(f, "jsonb DDL refused ({subject}) in {mode} mode: {reason}"),
         }
     }
 }

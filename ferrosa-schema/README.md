@@ -51,13 +51,16 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   `alter_table[_internal]`, `alter_type_add_field`, `apply_snapshot` and the
   propose-side `check_create_table_jsonb` / `check_alter_table_jsonb`. Errors
   are `SchemaError::JsonbInKey` and `SchemaError::JsonbNesting`.
-- **jsonb DDL gate** (`jsonb_rules::check_jsonb_ddl_allowed`, T-300, D24) —
+- **jsonb DDL gate** (`jsonb_rules::check_jsonb_ddl_allowed`, T-300, D24; D32) —
   jsonb DDL (top level, nested, or through a UDT) is allowed on a standalone
-  node only until the D15a capability ledger lands; every other
-  `DeploymentMode` is refused with `SchemaError::JsonbDdlRefused`. The
-  `Schema` holds a live mode cell (`deployment_mode_handle()`, shared with the
-  cluster controller) and checks it at DDL entry and at every apply, including
-  `apply_snapshot`. `tables_with_jsonb()` names the tables that block leaving
+  node, or on a cluster whose every member advertises `CAP_JSONB_V1`; otherwise
+  it is refused with `SchemaError::JsonbDdlRefused`, whose reason names the
+  members that lack the capability, or says the member view could not be read.
+  The `Schema` holds two live cells shared with the cluster controller — the
+  mode (`deployment_mode_handle()`) and the cluster's jsonb readiness
+  (`jsonb_cluster_gate_handle()`), which defaults to `Unknown` so a node nobody
+  has told otherwise refuses exactly as it did before — and checks them at DDL
+  entry and at every apply, including `apply_snapshot`. `tables_with_jsonb()` names the tables that block leaving
   standalone. No flag bypasses it.
 - **Auth / RBAC** ([`auth/`](src/auth)) — `AuthContext`, `RoleMetadata`,
   Cassandra-style `Permission` (9 variants) and `Resource` hierarchy

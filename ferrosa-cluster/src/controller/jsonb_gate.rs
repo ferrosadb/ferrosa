@@ -17,7 +17,13 @@
 
 use std::sync::atomic::Ordering;
 
-pub use ferrosa_schema::jsonb_rules::{jsonb_ddl_permitted, JsonbDdlRefused};
+pub use ferrosa_schema::jsonb_rules::{jsonb_ddl_permitted, JsonbClusterGate, JsonbDdlRefused};
+
+/// The view this module's rule reads until the controller publishes the real one
+/// (D32): [`JsonbClusterGate::Unknown`] keeps the transition rule fail-closed, so a
+/// node holding jsonb still may not leave standalone. Wiring the controller's peer
+/// view in here is the follow-up slice, not a silent loosening now.
+const TRANSITION_VIEW: JsonbClusterGate = JsonbClusterGate::Unknown;
 
 use super::{DeploymentMode, ModeController};
 
@@ -65,7 +71,9 @@ impl ModeController {
         target: DeploymentMode,
     ) -> Result<(), JsonbTransitionRefused> {
         let current = self.mode();
-        if jsonb_ddl_permitted(current).is_err() || jsonb_ddl_permitted(target).is_ok() {
+        if jsonb_ddl_permitted(current, &TRANSITION_VIEW).is_err()
+            || jsonb_ddl_permitted(target, &TRANSITION_VIEW).is_ok()
+        {
             return Ok(());
         }
         self.check_jsonb_absent(target)
@@ -76,7 +84,7 @@ impl ModeController {
     /// jsonb columns. The caller exits non-zero on `Err`.
     pub fn check_startup_jsonb(&self) -> Result<(), JsonbTransitionRefused> {
         let current = self.mode();
-        let target = if jsonb_ddl_permitted(current).is_err() {
+        let target = if jsonb_ddl_permitted(current, &TRANSITION_VIEW).is_err() {
             current
         } else if !self.net_config.seeds.is_empty() {
             DeploymentMode::Pair
@@ -137,7 +145,7 @@ mod tests {
             DeploymentMode::DegradedPair,
             DeploymentMode::DegradedCluster,
         ] {
-            match jsonb_ddl_permitted(mode) {
+            match jsonb_ddl_permitted(mode, &TRANSITION_VIEW) {
                 Ok(()) => assert_eq!(mode, DeploymentMode::Standalone),
                 Err(refused) => {
                     assert_ne!(mode, DeploymentMode::Standalone);
