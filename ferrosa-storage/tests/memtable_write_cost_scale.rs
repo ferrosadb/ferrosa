@@ -10,7 +10,7 @@
 //! see it, but it is O(rows-in-partition) per write and O(N^2) to fill a
 //! partition, which is what commit-log replay does.
 //!
-//! ## Measured curve (the bound below comes from it)
+//! ## Measured curves
 //!
 //! Debug build (the profile this test runs under), 2,000 writes into one
 //! partition already holding N rows, on an M-series Mac, before the fix:
@@ -23,21 +23,54 @@
 //! | sharded  | overwrite | 116 us   | 596 us   | 485 us   | 971 us    | 8.4x     |
 //!
 //! Allocations per write were already flat (0 for append, 1 for overwrite:
-//! the reconciled cell's value) at every N. So the curve is linear in N
-//! (8x the rows, 6.4-8.4x the time), and an O(1) write predicts 1.0x plus
-//! the O(log N) binary search. The bound is a 2.5x ratio between N=40k and
-//! N=5k: far below the 6.4x the defect produces, far above the ~1x a
-//! correct write produces, so neither machine load nor a slower runner
-//! turns it into a coin flip. Each point is the fastest of several batches,
-//! which strips scheduling noise from the measurement instead of averaging
-//! it in.
+//! the reconciled cell's value) at every N. So the curve is linear in N (8x
+//! the rows, 6.4-8.4x the time) and an O(1) write predicts ~1.0x per doubling
+//! plus the O(log N) binary search. Each point is the fastest of several
+//! batches, which strips scheduling noise from the measurement instead of
+//! averaging it in.
 //!
 //! After the fix (the merge returns the size delta of the rows it touched),
 //! the same test's 500-write batches measured, at N = 5k / 10k / 20k / 40k:
-//! skip list 416 / 431 / 441 / 474 us (1.1x), sharded 367 / 391 / 408 /
-//! 416 us (1.1x); before it, 51.8 / 104.0 / 209.1 / 422.1 ms (8.1x). With
-//! the full walk restored in the sharded memtable alone, that memtable fails
-//! at 8.5x and the skip list passes.
+//! skip list 416 / 431 / 441 / 474 us, sharded 367 / 391 / 408 / 416 us;
+//! before it, 51.8 / 104.0 / 209.1 / 422.1 ms. With the full walk restored in
+//! the sharded memtable alone, that memtable fails and the skip list passes.
+//!
+//! ## Why growth is measured per doubling, and why the median
+//!
+//! This test was first written against the ratio between the two ENDPOINTS
+//! (N=40k / N=5k, bound 2.5x), on the reasoning that a ratio cancels out a
+//! slower or busier runner. That reasoning is wrong on CI, and it ejected a PR
+//! from the merge queue: `cargo nextest run` schedules one process per test
+//! across every core, so ~9,600 test processes contend while these four points
+//! are sampled seconds apart. The endpoints then measure the machine at two
+//! different moments, and a single inflated sample decides the ratio.
+//!
+//! Observed on the runner (skip list, us at N = 5k/10k/20k/40k): 1,972 /
+//! 2,038 / 2,146 / 5,331. Flat, flat, then the LAST point doubles and a half.
+//! That is not the shape of the defect: an O(N) walk doubles the cost at EVERY
+//! doubling, and the defect's own curve is 51.8 / 104.0 / 209.1 / 422.1 ms
+//! (2.0x per doubling). The last sample here is contention, and 5,331 us is
+//! still ~80x faster than the 422 ms the unfixed code costs.
+//!
+//! So the criterion is the MEDIAN growth per doubling — the shape of the
+//! curve, rather than two of its samples. A median discards one contaminated
+//! point; an endpoint ratio is decided by it. Measured:
+//!
+//! | curve                        | median growth per doubling | 40k / 5k |
+//! |------------------------------|----------------------------|----------|
+//! | correct, worst of 8 local    | 1.11                       | 1.26     |
+//! | correct, CI (contaminated)   | 1.05                       | 2.70     |
+//! | defect (full partition walk) | 2.01                       | 8.15     |
+//!
+//! The bound is 1.5x: 35% above every correct curve measured and 34% below the
+//! defect's, and no single sample can move a median across it.
+//!
+//! The blind spot, stated because it is a real loss of sensitivity: this
+//! criterion fails when the growth is typical of the whole curve, so a
+//! regression confined to the LARGEST size alone (40k slow, 5k-20k correct)
+//! would not move the median. That case is covered instead by
+//! `merge_size_delta_matches_the_full_partition_walk`, which pins the size
+//! accounting directly and cannot be affected by the clock at all.
 //!
 //! The allocation count is asserted too, for both memtables (the existing
 //! guard covers only the skip list): writes into a 40k-row partition must not
@@ -87,8 +120,8 @@ const SIZES: [i32; 4] = [5_000, 10_000, 20_000, 40_000];
 const BATCH: i32 = 500;
 /// Batches per point; the fastest is kept.
 const REPS: usize = 5;
-/// Allowed per-write time ratio between the largest and smallest partition.
-const MAX_TIME_RATIO: f64 = 2.5;
+/// Allowed median growth in per-write cost for each doubling of the partition.
+const MAX_DOUBLING_RATIO: f64 = 1.5;
 
 fn schema() -> TableSchema {
     TableSchema {
@@ -167,17 +200,28 @@ fn curve(make: &dyn Fn() -> Box<dyn Memtable>) -> Vec<Point> {
     SIZES.iter().map(|&n| measure(make().as_ref(), n)).collect()
 }
 
+/// The curve's typical growth in per-write cost for each doubling of the
+/// partition: the SHAPE of the curve, rather than two of its samples. A median
+/// discards one contaminated sample; an endpoint ratio is decided by it.
+fn growth_per_doubling(points: &[Point]) -> f64 {
+    let mut ratios: Vec<f64> = points
+        .windows(2)
+        .map(|w| w[1].fastest_batch.as_secs_f64() / w[0].fastest_batch.as_secs_f64())
+        .collect();
+    ratios.sort_by(|a, b| a.partial_cmp(b).expect("durations are never NaN"));
+    ratios[ratios.len() / 2]
+}
+
 /// What is wrong with one memtable's curve, if anything.
 fn violations(name: &str, points: &[Point]) -> Vec<String> {
     let (first, last) = (points[0], points[points.len() - 1]);
-    let ratio = last.fastest_batch.as_secs_f64() / first.fastest_batch.as_secs_f64();
+    let growth = growth_per_doubling(points);
     let mut found = Vec::new();
-    if ratio >= MAX_TIME_RATIO {
+    if growth >= MAX_DOUBLING_RATIO {
         found.push(format!(
-            "{name}: a write into a {}-row partition costs {ratio:.1}x one into a {}-row \
-             partition (bound {MAX_TIME_RATIO}x). The write walks the whole partition: \
-             O(N) per write, O(N^2) to replay a partition. Curve: {points:?}",
-            last.rows, first.rows
+            "{name}: each doubling of the partition costs {growth:.2}x more per write (bound \
+             {MAX_DOUBLING_RATIO}x). The write walks the whole partition: O(N) per write, \
+             O(N^2) to replay a partition. Curve: {points:?}"
         ));
     }
     if last.allocs_per_batch > first.allocs_per_batch + 2 {
