@@ -65,6 +65,33 @@ pub const SLICES: u16 = (BAND_LEN / SLICE_LEN as u32) as u16;
 /// shared by every test process of the run, and unique to this machine.
 const SLICE_LOCK_DIR: &str = "ferrosa-test-port-band";
 
+/// The slice this process leased from the OS, if a lease could be taken at all.
+/// Diagnostics: the allocator needs only the start port, but a guard that spans
+/// processes has to be able to say WHICH mechanism gave it its port.
+pub fn process_lease() -> Option<u16> {
+    *lease_index()
+}
+
+/// One line naming the mechanism behind this process's ports, for a guard's
+/// failure message.
+pub fn process_lease_state() -> String {
+    match process_lease() {
+        Some(index) => format!(
+            "lease=yes slice={index} band_start={}",
+            BAND_START + index * SLICE_LEN
+        ),
+        None => format!(
+            "lease=no slice={} (process-id fallback)",
+            process_slice_start().saturating_sub(BAND_START) / SLICE_LEN
+        ),
+    }
+}
+
+fn lease_index() -> &'static Option<u16> {
+    static LEASE: OnceLock<Option<u16>> = OnceLock::new();
+    LEASE.get_or_init(claim_slice_lease)
+}
+
 /// The port this process starts its scan from: the first port of a slice it
 /// holds exclusively for as long as it lives.
 ///
@@ -82,7 +109,7 @@ const SLICE_LOCK_DIR: &str = "ferrosa-test-port-band";
 fn process_slice_start() -> u16 {
     static START: OnceLock<u16> = OnceLock::new();
     *START.get_or_init(|| {
-        if let Some(index) = claim_slice_lease() {
+        if let Some(index) = *lease_index() {
             return BAND_START + index * SLICE_LEN;
         }
         // No lock could be taken — an unwritable temp dir, or a platform without

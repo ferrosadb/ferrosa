@@ -13,8 +13,8 @@ mod common;
 use std::collections::HashSet;
 
 use common::ports::{
-    kernel_ephemeral_floor, port_is_free, reserved_in_process, PortAllocator, BAND_END, BAND_START,
-    SLICES, SLICE_LEN,
+    kernel_ephemeral_floor, port_is_free, process_lease_state, reserved_in_process, PortAllocator,
+    BAND_END, BAND_START, SLICES, SLICE_LEN,
 };
 
 /// Invariant 5 — capacity, and the reason it needs its own guard: both halves of
@@ -138,36 +138,69 @@ fn a_port_a_listener_already_holds_is_never_handed_to_a_node() {
 fn concurrent_test_processes_are_never_handed_the_same_port() {
     const MARKER: &str = "FERROSA_PORT_BAND_PROBE";
     let exe = std::env::current_exe().expect("the test binary's own path");
-    let children: Vec<std::process::Child> = (0..4)
-        .map(|_| {
-            std::process::Command::new(&exe)
-                .args(["--exact", "port_band_process_probe", "--nocapture"])
-                .env(MARKER, "1")
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .expect("a probe process running this same binary")
-        })
-        .collect();
 
+    // One child at a time, reading each child's port BEFORE the next starts: every
+    // child then blocks on its stdin, so all four hold their leases AT ONCE.
+    // Spawning all four and waiting for them to EXIT measures nothing — an exited
+    // child has released its slice, so the next child is given that same slice
+    // legitimately. That protocol mistake made this guard fail in CI with
+    // `[20600, 20600, 20600, 20800]` — four LEASED slices, three of them released
+    // and re-let — while every harness in the same job passed.
+    let mut children: Vec<std::process::Child> = Vec::new();
     let mut handed = Vec::new();
-    for child in children {
-        let out = child.wait_with_output().expect("the probe process");
-        let text = String::from_utf8_lossy(&out.stdout).into_owned();
-        let port = text
-            .lines()
-            .find_map(|line| line.trim().strip_prefix("PROBE_PORT="))
-            .and_then(|value| value.trim().parse::<u16>().ok())
-            .unwrap_or_else(|| panic!("a probe process printed no PROBE_PORT: {text:?}"));
+    let mut states = Vec::new();
+    for _ in 0..4 {
+        let mut child = std::process::Command::new(&exe)
+            .args(["--exact", "port_band_process_probe", "--nocapture"])
+            .env(MARKER, "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("a probe process running this same binary");
+        let mut reader = std::io::BufReader::new(child.stdout.take().expect("piped stdout"));
+        // Scan past libtest's own banner: the child prints `running 1 test` and
+        // friends first, so only the PROBE_PORT line identifies the port — and the
+        // child blocks on its stdin right after printing it, holding its slice.
+        let mut seen = Vec::new();
+        let mut port = None;
+        let mut state = String::new();
+        for _ in 0..64 {
+            let mut line = String::new();
+            if std::io::BufRead::read_line(&mut reader, &mut line).unwrap_or(0) == 0 {
+                break;
+            }
+            seen.push(line.trim().to_string());
+            if let Some(rest) = line.trim().strip_prefix("PROBE_PORT=") {
+                port = rest
+                    .split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u16>().ok());
+                state = line.trim().to_string();
+                break;
+            }
+        }
+        let port = port.unwrap_or_else(|| {
+            panic!("a probe process printed no PROBE_PORT; its output was {seen:#?}")
+        });
         handed.push(port);
+        states.push(state);
+        children.push(child);
+    }
+
+    // All four are alive and holding their slices; releasing them is now safe.
+    for mut child in children {
+        drop(child.stdin.take());
+        let _ = child.wait();
     }
 
     let distinct: HashSet<u16> = handed.iter().copied().collect();
     assert_eq!(
         distinct.len(),
         handed.len(),
-        "two test PROCESSES were handed the same port, so their nodes bind it \
-         seconds later and one of them dies with `Address already in use`: {handed:?}"
+        "two test PROCESSES alive at the same time were handed the same port, so their \
+         nodes bind it seconds later and one of them dies with `Address already in \
+         use`: {handed:?}\n  {states:#?}"
     );
 }
 
@@ -179,7 +212,14 @@ fn port_band_process_probe() {
         return;
     }
     let mut alloc = PortAllocator::new();
-    println!("PROBE_PORT={}", alloc.get());
+    let port = alloc.get();
+    println!("PROBE_PORT={port} {}", process_lease_state());
+    // Hold the lease — and the port — until the parent closes this child's stdin.
+    // Returning here instead would release the slice, and the sibling that follows
+    // would be given it; that is the difference between a real collision and a
+    // released-and-re-let slice, and the guard exists to tell them apart.
+    let mut release = String::new();
+    let _ = std::io::stdin().read_line(&mut release);
 }
 
 #[test]
