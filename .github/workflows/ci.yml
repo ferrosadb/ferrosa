@@ -57,6 +57,13 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check the no-new-waivers guard
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
+      # Pins the smoke harness's client side: Phase 8's QUORUM write must walk
+      # every surviving contact point before it declares the cluster
+      # unreachable. Nightly 38533936817 failed because it did not — node1's
+      # CQL runtime froze for ~5s while node3 was stopped and the harness, whose
+      # only contact point was node1, never tried the healthy node2.
+      - name: Check the smoke harness's QUORUM contact points
+        run: python3 -m unittest -q tests/ci/test_smoke_quorum_write_failover.py
       # Pins the daily OOM-audit workflow: that it still runs on a schedule,
       # still enforces, and still runs byte-for-byte the same command as the
       # Clippy job's audit step below. A safety control whose nightly can be

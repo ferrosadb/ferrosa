@@ -324,6 +324,28 @@ cql_ok() {
     fi
 }
 
+# Helper: run one CQL statement against a list of contact points, and fail only
+# once none of them acknowledges it. cqlsh speaks to a single host:port and has
+# no client-side failover, so a node that accepts the socket and then does not
+# answer is indistinguishable from a dead cluster. That happens here for real:
+# a node's CQL request runtime freezes for seconds around the moment one of its
+# peers is stopped (ferrosa_sched_runtime_stall_*; 5s on node1 in nightly
+# 38533936817 while node3 was being reaped), and the surviving sibling — up,
+# healthy and idle — was never tried. Phases whose assertion is about *cluster*
+# availability walk the survivors; every contact point's error is reported when
+# all of them refuse, so an unreachable cluster still fails the run.
+cql_ok_any() {
+    local stmt=$1 description=$2; shift 2
+    local port out err=""
+    for port in "$@"; do
+        if out=$(cqlsh --connect-timeout=5 --request-timeout=10 localhost "$port" -e "$stmt" 2>&1); then
+            return 0
+        fi
+        err="${err}localhost:$port: ${out}; "
+    done
+    fail "$description: ${err}"
+}
+
 # Helper: the schema version a node holds, from its own membership snapshot.
 # Pair DDL stamps the primary's version on the secondary, and pair catch-up
 # acknowledges only after adopting it, so equal versions mean equal schemas.
@@ -662,10 +684,12 @@ sleep 5
 
 # Writes should succeed (2 of 3 alive, QUORUM = 2). The consistency level is
 # set explicitly: cqlsh defaults to ONE, under which this phase and Phase 9
-# assert nothing about quorum at all.
+# assert nothing about quorum at all. Both survivors are offered as contact
+# points: either is a legal coordinator, and the node that just lost a peer can
+# spend seconds with its CQL runtime frozen (ferrosa_sched_runtime_stall_*).
 info "Writing with 1 node down (QUORUM should succeed)..."
-cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('after_kill3', 'quorum_ok', 'node1')" \
-    "QUORUM write with 1 of 3 nodes down"
+cql_ok_any "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('after_kill3', 'quorum_ok', 'node1')" \
+    "QUORUM write with 1 of 3 nodes down" 9042 9043
 pass "Write succeeds with 1 node down (QUORUM met: 2 of 3)"
 
 # Reads should succeed
@@ -784,8 +808,8 @@ pass "[FMEA #20] DDL on follower succeeded and replicated"
 info "[FMEA #18] Stale data test: stop node3, write, restart, verify..."
 docker compose stop node3 >/dev/null 2>&1
 sleep 3
-cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('while_n3_down', 'catch_me', 'node1')" \
-    "[FMEA #18] QUORUM write while node3 is down"
+cql_ok_any "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('while_n3_down', 'catch_me', 'node1')" \
+    "[FMEA #18] QUORUM write while node3 is down" 9042 9043
 docker compose start node3 >/dev/null 2>&1
 wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 # CL=ONE coordinated by node3: only node3's own replica can answer if the
@@ -986,8 +1010,8 @@ sleep 5
 
 info "Writing 50 rows at QUORUM with node3 down (2 of 3 alive)..."
 for i in $(seq 101 150); do
-    cql_ok 9042 "CONSISTENCY QUORUM; INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i});" \
-        "[C4] QUORUM write r${i} with node3 down"
+    cql_ok_any "CONSISTENCY QUORUM; INSERT INTO c_test.rows (k, v, n) VALUES ('r${i}', 'val${i}', ${i});" \
+        "[C4] QUORUM write r${i} with node3 down" 9042 9043
 done
 pass "[C4] 50 QUORUM writes succeeded with node3 down"
 
