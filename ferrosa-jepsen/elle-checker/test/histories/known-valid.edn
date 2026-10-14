@@ -1,0 +1,10 @@
+;; Known-VALID Elle list-append history — the checker's positive control.
+;;
+;; One process appends 1 then reads the list back and sees exactly [1]. Under
+;; :strict-serializable this is a legal execution, so the checker must report
+;; :valid? true and exit 0. If it does not, the checker or its environment is
+;; broken and NO verdict from this machine may be trusted.
+[{:process 0 :type :invoke :f :txn :value [[:append 1 1]]}
+ {:process 0 :type :ok     :f :txn :value [[:append 1 1]]}
+ {:process 0 :type :invoke :f :txn :value [[:r 1 nil]]}
+ {:process 0 :type :ok     :f :txn :value [[:r 1 [1]]]}]
