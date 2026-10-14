@@ -13,7 +13,9 @@
 //!   never acted on again — it escalates instead (FMEA #5);
 //! - initiator: only the deterministic initiator for the table acts (FMEA #4);
 //! - quarantine safety: a corrupt-gen issue with no healthy replica is *never*
-//!   quarantined; it escalates to degraded instead (FMEA #1).
+//!   quarantined (FMEA #1). Its object-store recovery is attempted first
+//!   ([`Action::RecoverCorrupt`]); it escalates to degraded only when that
+//!   keeps refusing.
 
 use super::config::SelfHealConfig;
 use super::snapshot::{HealthSnapshot, IssueKind, TableIssue, TableKey};
@@ -33,6 +35,15 @@ pub enum Action {
     /// Rebuild the table's invalid vector-index generations from their rows
     /// (local, nothing is moved or lost; no replica posture needed).
     RebuildVectorIndexes { table: TableKey },
+    /// Re-fetch these corrupt generations from the OBJECT STORE and re-admit
+    /// them if the store's copy passes the loader's own validation. The third
+    /// recovery source, for a corrupt generation no peer can refill: local to
+    /// this node, so it needs no initiator and no replica, and a refusal leaves
+    /// the corrupt files exactly as they were (`self_heal::recover`).
+    RecoverCorrupt {
+        table: TableKey,
+        generations: Vec<u64>,
+    },
     /// The issue cannot be remediated safely or has exhausted its attempts.
     /// The controller logs a loud ERROR, marks health = degraded, and stops
     /// retrying this issue. Covers FMEA #1 (no healthy replica) and FMEA #5
@@ -75,11 +86,18 @@ fn action_for(issue: &TableIssue) -> Option<Action> {
     match issue.kind {
         IssueKind::CorruptSstables => {
             if !issue.replica_posture.can_refill() {
-                // FMEA #1: no healthy replica — escalate, never quarantine.
-                return Some(Action::Escalate {
+                // FMEA #1: no healthy replica — never quarantine. Try the object
+                // store first (see the pass-2 comment in `decide`); escalation
+                // follows only when that fails.
+                let mut generations: Vec<u64> = issue
+                    .corrupt_sstables
+                    .iter()
+                    .map(|c| c.generation)
+                    .collect();
+                generations.sort_unstable();
+                return Some(Action::RecoverCorrupt {
                     table: issue.table.clone(),
-                    kind: issue.kind,
-                    reason: EscalateReason::NoHealthyReplica,
+                    generations,
                 });
             }
             let mut generations: Vec<u64> = issue
@@ -154,14 +172,34 @@ pub fn decide(snapshot: &HealthSnapshot, cfg: &SelfHealConfig) -> Option<Action>
         if snapshot.attempt_state(issue).escalated {
             continue;
         }
-        // FMEA #1 escalation (no healthy replica) is allowed even if this node
-        // is not the initiator and even under cooldown — leaving a data-loss
-        // risk silently is worse. It is surfaced as soon as detected.
+        // FMEA #5/#10: respect the per-issue cooldown, for every remediation —
+        // including object-store recovery, whose attempts fetch whole
+        // generations: a failing attempt must back off, not re-download every
+        // tick. (This used to sit after the initiator check; for a non-initiator
+        // both orders continue, and for an initiator both reach the same gates.)
+        if cooldown_active(snapshot, issue, cfg) {
+            continue;
+        }
+        // A corrupt generation no peer can refill used to escalate here, at
+        // once and for the node's lifetime: the generation that was excluded at
+        // load was never reconsidered and its rows were lost from the readable
+        // set. The object store may still hold a complete copy of it, so that
+        // recovery is attempted first (FMEA #1's refusal to QUARANTINE is
+        // unchanged — nothing is moved until a verified replacement exists).
+        // Node-local, exactly like a vector-index rebuild below: this node's own
+        // corrupt generation, fetched from the store this node uploaded to, so no
+        // initiator and no peer is involved. Escalation follows (above, on
+        // exhausted attempts) when recovery keeps refusing.
         if issue.kind == IssueKind::CorruptSstables && !issue.replica_posture.can_refill() {
-            return Some(Action::Escalate {
+            let mut generations: Vec<u64> = issue
+                .corrupt_sstables
+                .iter()
+                .map(|c| c.generation)
+                .collect();
+            generations.sort_unstable();
+            return Some(Action::RecoverCorrupt {
                 table: issue.table.clone(),
-                kind: issue.kind,
-                reason: EscalateReason::NoHealthyReplica,
+                generations,
             });
         }
         // FMEA #4: only the deterministic initiator performs a remediation of
@@ -170,10 +208,6 @@ pub fn decide(snapshot: &HealthSnapshot, cfg: &SelfHealConfig) -> Option<Action>
         // the other replicas' ANN refusing forever.
         if issue.kind != IssueKind::InvalidVectorIndex && !snapshot.ring.is_initiator(&issue.table)
         {
-            continue;
-        }
-        // FMEA #5/#10: respect the per-issue cooldown.
-        if cooldown_active(snapshot, issue, cfg) {
             continue;
         }
         if let Some(action) = action_for(issue) {
@@ -266,18 +300,59 @@ mod tests {
         }
     }
 
+    /// FMEA #1's refusal to QUARANTINE is unchanged; what changed is that the
+    /// issue no longer escalates *instead of* any attempt. With no peer able to
+    /// refill, the object store is the only remaining source, so that recovery is
+    /// selected — and escalation follows on the next tick once its attempts are
+    /// exhausted (see `max_attempts_escalates_and_stops`). Before this, the
+    /// generation was condemned on the first tick.
     #[test]
-    fn no_healthy_replica_escalates_never_quarantines() {
+    fn no_healthy_replica_recovers_from_the_object_store_never_quarantines() {
         let cfg = SelfHealConfig::default();
         for posture in [ReplicaPosture::SingleNode, ReplicaPosture::NoHealthyReplica] {
             let snap = snapshot_with(vec![corrupt_issue(posture)]);
             match decide(&snap, &cfg) {
-                Some(Action::Escalate { reason, .. }) => {
-                    assert_eq!(reason, EscalateReason::NoHealthyReplica);
+                Some(Action::RecoverCorrupt { table, generations }) => {
+                    assert_eq!(table, TableKey::new("ks", "t"));
+                    assert_eq!(generations, vec![2, 5], "gens sorted deterministically");
                 }
-                other => panic!("expected escalate for {posture:?}, got {other:?}"),
+                other => panic!("expected object-store recovery for {posture:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_refused_recovery_escalates_once_its_attempts_are_exhausted() {
+        let cfg = SelfHealConfig {
+            max_attempts: 2,
+            ..SelfHealConfig::default()
+        };
+        let issue = corrupt_issue(ReplicaPosture::NoHealthyReplica);
+        let mut ledger = BTreeMap::new();
+        ledger.insert(
+            issue.ledger_key(),
+            AttemptState {
+                attempts: 2,
+                last_attempt_tick: Some(0),
+                escalated: false,
+            },
+        );
+        let snap = HealthSnapshot {
+            tick: 100,
+            issues: vec![issue],
+            ledger,
+            ring: RingView::single_node(1),
+        };
+        assert_eq!(
+            decide(&snap, &cfg),
+            Some(Action::Escalate {
+                table: TableKey::new("ks", "t"),
+                kind: IssueKind::CorruptSstables,
+                reason: EscalateReason::MaxAttemptsExhausted,
+            }),
+            "a refused recovery is not terminal on the first attempt; it escalates \
+             when the attempts run out"
+        );
     }
 
     #[test]

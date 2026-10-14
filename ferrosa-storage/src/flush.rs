@@ -36,9 +36,10 @@ use ferrosa_sstable::writer::{SSTableOutput, SSTableOutputFiles};
 /// `sstable_health::CRITICAL_COMPONENTS` does not treat a zero-byte Rows.db as
 /// corruption — but a row index for a wide partition is real data, so an ABSENT
 /// Rows.db is still a defect: the S3 download path requires it, the reader needs
-/// it to resolve a partition that advertises one, and it is healed on disk by
-/// `StorageEngine::repair_missing_empty_row_index_placeholder`, never silently
-/// accepted (FMEA ST-91).
+/// it to resolve a partition that advertises one, and `open_file_sstable` fails
+/// loud on its absence rather than accepting the generation (FMEA ST-91). No code
+/// path synthesises a replacement on disk — an absent Rows.db is a lost component
+/// and the generation is withheld.
 pub(crate) const REQUIRED_SSTABLE_COMPONENTS: [&str; 4] =
     ["Data.db", "Partitions.db", "Rows.db", "Filter.db"];
 
@@ -2047,9 +2048,8 @@ pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileRead
     let partitions = FileReadAt::open(required(partitions_component)?)?;
     // Rows.db is required to OPEN: the writer emits it for every live generation
     // (an empty placeholder for a simple generation, a real row index for a wide
-    // one). An absent file is healed on disk before this runs
-    // (`repair_missing_empty_row_index_placeholder`); failing loud here if it is
-    // still gone is correct, because a wide partition needs it to resolve.
+    // one). Nothing heals an absent one on disk, so failing loud here is correct:
+    // the file was lost, and a wide partition needs it to resolve.
     let rows = FileReadAt::open(required(rows_component)?)?;
 
     // `Filter.db` is ALWAYS written for a live SSTable (flush and compaction

@@ -26,9 +26,26 @@ pub enum ActionOutcome {
     /// The action could not be performed safely or hit an error. The issue
     /// is escalated: health = degraded, files left in place.
     Escalated { table: TableKey, reason: String },
+    /// A remediation the controller had to run itself (and could not) failed
+    /// before it changed anything. Files are left in place.
+    Failed { table: TableKey, reason: String },
     /// Rebuilds of `indexes` of the table's vector indexes were started; the
     /// next ticks verify they cleared.
     VectorRebuildStarted { table: TableKey, indexes: usize },
+    /// The object store's copies of these generations passed the loader's own
+    /// validation, were promoted into place, and the generations are live again.
+    /// The corrupt files they replaced are preserved under `quarantine/`.
+    Recovered {
+        table: TableKey,
+        generations: Vec<u64>,
+    },
+    /// No generation of the table could be re-admitted from the object store.
+    /// `reasons` names, per generation, why not. The corrupt files are exactly as
+    /// they were; the issue is retried until its attempts run out, then escalated.
+    RecoveryRefused {
+        table: TableKey,
+        reasons: Vec<(u64, String)>,
+    },
 }
 
 /// Resolve the on-disk table directory for an action. Injected so unit tests
@@ -154,6 +171,16 @@ pub fn execute_action(
         }
         // Executed by the controller, which holds the engine; reaching here
         // means a caller bypassed it. Refuse loudly rather than drop it.
+        Action::RecoverCorrupt { table, .. } => {
+            let reason = "object-store recovery dispatched to the wrong executor".to_string();
+            tracing::error!(
+                keyspace = %table.keyspace,
+                table = %table.table,
+                reason = %reason,
+                "self-heal: an object-store recovery reached execute_action, which cannot run it"
+            );
+            ActionOutcome::Failed { table, reason }
+        }
         Action::RebuildVectorIndexes { table } => {
             tracing::error!(
                 keyspace = %table.keyspace,
