@@ -73,6 +73,7 @@ done
 for entry in \
     "config/ferrosa.example.toml" \
     "launchd/com.ferrosadb.ferrosa.plist" \
+    "launchd/register-agent.sh" \
     "systemd/ferrosa.service"; do
   if [[ -f "$entry" ]]; then
     mkdir -p "${STAGE}/$(dirname "$entry")"

@@ -218,8 +218,13 @@ register_macos() {
       -e "s|__REPO_ROOT__|$INSTALL_ROOT|g" \
       -e "s|__CONFIG_PATH__|$CONFIG_DIR/ferrosa-memory.toml|g" \
       "$TMP/launchd/com.ferrosa-memory.mcp.plist" > "$plist"
-  launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$plist"
+  # Registration must survive the bootout/bootstrap race, and must not report a
+  # success it did not get -- see launchd/register-agent.sh for why.
+  . "$TMP/launchd/register-agent.sh"
+  register_launchd_agent com.ferrosa-memory.mcp "$plist" || {
+    echo "launchd: could not register com.ferrosa-memory.mcp" >&2
+    return 1
+  }
   say "launchd: com.ferrosa-memory.mcp loaded; will start on every login"
 }
 
