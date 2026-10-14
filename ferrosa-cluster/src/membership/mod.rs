@@ -444,6 +444,26 @@ impl<N: MembershipNetwork> MembershipChanger<N> {
             if m.current_leader.is_some() && m.current_leader != Some(node_id) {
                 return Ok(m.current_leader);
             }
+            // A node that does not hold leadership cannot give it away, and the
+            // answer for that condition is the one every other path already gives:
+            // NotLeader, carrying the leader we know of (possibly none yet).
+            //
+            // Reporting it as a RaftError instead made ONE condition -- "I am not
+            // the leader" -- return two different variants, decided by nothing but
+            // the timing between reading `metrics` and calling `transfer_to`. That
+            // is why `demote_voter_to_learner_transfers_leader_first_if_needed`
+            // failed on a loaded CI runner while passing 5/5 locally: the node had
+            // handed leadership away between the two, so `transfer_to` refused with
+            // "local node is not leader" and the caller was handed a RaftError it
+            // did not expect. `must_hand_off_leadership_first` is deliberately
+            // permissive here (a node removing itself must hand off first, even
+            // when its own metrics lag -- ferrosa#526), so the report is what has
+            // to be right, not the decision to try.
+            if m.state != openraft::ServerState::Leader {
+                return Err(MembershipError::NotLeader {
+                    leader_node_id: m.current_leader,
+                });
+            }
             if std::time::Instant::now() >= deadline {
                 return match transfer_result {
                     Ok(()) => Err(MembershipError::RaftError(format!(
