@@ -579,8 +579,28 @@ impl SelfHealController {
                 generations: recovered,
             });
         }
-        // Nothing was re-admitted and nothing was moved. `decide` escalates once
-        // the attempts run out; until then it retries after the cooldown.
+        // Nothing was re-admitted and nothing was moved: the corrupt files are
+        // exactly as they were, available for a later attempt.
+        //
+        // The node MUST report degraded here, on the tick the refusal is
+        // observed. `publish_health` derives `degraded` from `escalated`, and a
+        // node holding a generation it cannot read is not healthy. Deferring
+        // that signal until the attempts run out would have the node publish
+        // "healthy" while serving an incomplete table — the pre-existing
+        // contract (FMEA #1 escalate-and-stop) that this path must not weaken.
+        {
+            let entry = self
+                .ledger
+                .entry((table.clone(), IssueKind::CorruptSstables))
+                .or_default();
+            entry.escalated = true;
+        }
+        // RESIDUAL, deliberately accepted and named: `decide` never acts on an
+        // escalated issue again (FMEA #5), so a TRANSIENT object-store outage
+        // makes recovery terminal on the first tick rather than retrying after
+        // the cooldown. Recovery is still strictly better than the previous
+        // behaviour, which never attempted it at all; the escalation is what
+        // keeps the health signal honest, so the trade is deliberate.
         Some(ActionOutcome::RecoveryRefused {
             table: table.clone(),
             reasons,
