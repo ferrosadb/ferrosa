@@ -372,14 +372,13 @@ start_db_macos() {
   plist="$HOME/Library/LaunchAgents/com.ferrosadb.ferrosa.plist"
   mkdir -p "$(dirname "$plist")"
   sed "s|__HOME__|$HOME|g" "$DB_LAUNCHD_TEMPLATE" > "$plist"
-  launchctl bootout "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
-  if launchctl bootstrap "$domain" "$plist" 2>/dev/null; then
-    launchctl enable "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
-    launchctl kickstart -k "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
-  else
-    launchctl unload "$plist" 2>/dev/null || true
-    launchctl load "$plist" 2>/dev/null || return 1
-  fi
+  # Registration must survive the bootout/bootstrap race, and must not report a
+  # success it did not get -- see launchd/register-agent.sh. The helper ships
+  # beside the plist template this function already depends on.
+  . "$(dirname "$DB_LAUNCHD_TEMPLATE")/register-agent.sh"
+  register_launchd_agent com.ferrosadb.ferrosa "$plist" || return 1
+  launchctl enable "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
+  launchctl kickstart -k "${domain}/com.ferrosadb.ferrosa" 2>/dev/null || true
   say "launchd: ferrosa.service loaded; waiting for database readiness"
 }
 
@@ -485,21 +484,13 @@ start_server() {
   local domain; domain="gui/$(id -u)"
   mkdir -p "$(dirname "$LAUNCH_AGENT_PLIST")"
   render_launch_agent_plist "$LAUNCH_AGENT_PLIST"
-  # Idempotent: drop any existing instance, then load fresh. Don't error if it
-  # was never loaded. Prefer modern bootout/bootstrap; fall back to unload/load
-  # on older launchd that lacks them.
-  launchctl bootout "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
-  if launchctl bootstrap "${domain}" "$LAUNCH_AGENT_PLIST" 2>/dev/null; then
-    launchctl enable "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
-    launchctl kickstart -k "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
-  else
-    launchctl unload "$LAUNCH_AGENT_PLIST" 2>/dev/null || true
-    if ! launchctl load "$LAUNCH_AGENT_PLIST" 2>/dev/null; then
-      say "could not load the LaunchAgent automatically."
-      say "Start it manually: launchctl load $LAUNCH_AGENT_PLIST"
-      return 1
-    fi
-  fi
+  # Idempotent: drop any existing instance, then load fresh. Registration must
+  # survive the bootout/bootstrap race, and must not report a success it did not
+  # get -- see launchd/register-agent.sh.
+  . "$(dirname "$DB_LAUNCHD_TEMPLATE")/register-agent.sh"
+  register_launchd_agent "$LAUNCH_AGENT_LABEL" "$LAUNCH_AGENT_PLIST" || return 1
+  launchctl enable "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
+  launchctl kickstart -k "${domain}/${LAUNCH_AGENT_LABEL}" 2>/dev/null || true
   say "MCP server started via LaunchAgent ($LAUNCH_AGENT_PLIST)"
   say "  log: $LAUNCH_AGENT_LOG"
   say "  database: ready on $DB_HOST:$DB_PORT"
