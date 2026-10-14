@@ -22,8 +22,8 @@
 //! | sharded  | append    | 149 us   | 271 us   | 594 us   | 956 us    | 6.4x     |
 //! | sharded  | overwrite | 116 us   | 596 us   | 485 us   | 971 us    | 8.4x     |
 //!
-//! Allocations per write were already flat (0 for append, 1 for overwrite:
-//! the reconciled cell's value) at every N. So the curve is linear in N
+//! Allocations per write were flat (0 for append, and 0 for overwrite: the
+//! reconciled cell's value is moved, not cloned) at every N. So the curve is linear in N
 //! (8x the rows, 6.4-8.4x the time), and an O(1) write predicts 1.0x plus
 //! the O(log N) binary search. The bound is a 2.5x ratio between N=40k and
 //! N=5k: far below the 6.4x the defect produces, far above the ~1x a

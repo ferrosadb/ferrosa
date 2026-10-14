@@ -229,6 +229,59 @@ fn memtable_writes_do_not_allocate_per_write() {
          fill. On a live node this put 52% of commit-log replay into the allocator."
     );
 
+    // --- supersede (overwrite an EXISTING row): must not clone the winner ---
+    //
+    // The two batches above APPEND: every clustering key is new, so they take
+    // the insert path, which MOVES the owned row into place and allocates ~0.
+    // The overwrite/merge path was therefore never measured, and it pays one
+    // allocation per row written: `merge_row_into_partition` reconciles the
+    // incoming cell against the existing one, gets the last-write-wins winner
+    // back BY REFERENCE, and then CLONES it into place. When the incoming cell
+    // wins — the common case for a later write — that clone is pure waste: the
+    // row is already owned here (`new_row` is moved in, and the loop destructures
+    // `new_row.cells` by value), so the winner can be MOVED. The append path is
+    // the proof that this owned `Row`/`CellValue` needs no per-write allocation.
+    //
+    // The assertion is COMPARATIVE, per harness rule 2 (never assert an exact
+    // count): the supersede batch is measured against an append batch of the
+    // SAME size in the same window, so the zero floor is DERIVED from the append
+    // path rather than hardcoded, and the small `+ 2` tolerance absorbs the
+    // amortized `Vec` growth the insert path legitimately pays.
+    let sup_mem = SkipListMemtable::new();
+    let sup = key("supersede");
+    sup_mem.put(&sup, row(0, b"seed", 0), &schema).unwrap();
+    let appended = measure(&sup_mem, &sup, rows(1..=BATCH), &schema);
+
+    // Same clustering keys 1..=BATCH, newer timestamp (1000 > every seed ts,
+    // which is `ck`), different payload, so 1000 wins LWW for every row.
+    let superseding: Vec<Row> = (1..=BATCH).map(|ck| row(ck, b"payload2", 1000)).collect();
+    let supersede = measure(&sup_mem, &sup, superseding, &schema);
+
+    // Anti-vacuity: if the merge failed to find the existing rows it would
+    // INSERT them (the append path) and this shape would measure nothing. The
+    // partition must hold the seed plus the BATCH merged rows — NOT 2*BATCH + 1,
+    // which is what insert-instead-of-merge leaves behind.
+    let partition = sup_mem
+        .get(&sup)
+        .expect("get must succeed")
+        .expect("the superseded partition must exist");
+    assert_eq!(
+        partition.rows.len(),
+        BATCH as usize + 1,
+        "the supersede batch must MERGE into the {BATCH} existing rows, not insert \
+         duplicates; {} rows means the merge did not find them and this shape \
+         measures the insert path instead",
+        partition.rows.len()
+    );
+
+    assert!(
+        supersede <= appended + 2,
+        "superseding {BATCH} existing rows cost {supersede} allocations vs {appended} \
+         for appending the same batch of new rows. The merge CLONES the \
+         last-write-wins winner once per row written; the incoming cell is already \
+         owned and can be moved instead, which is why the append path costs nothing."
+    );
+
     // --- headline scale: filling one partition stays linear ---
     let big = SkipListMemtable::new();
     let bkey = key("bigpk");

@@ -568,8 +568,25 @@ fn merge_into_existing_row(
 
         match cell_pos {
             Ok(ci) => {
-                let existing_cell = &existing_row.cells[ci].1;
-                existing_row.cells[ci].1 = ferrosa_common::reconcile(existing_cell, &new_cell);
+                // The incoming cell is already owned: `new_row` was moved into
+                // this function and `cells` is destructured BY VALUE. So when
+                // the incoming cell wins last-write-wins we can MOVE it into
+                // place instead of cloning. `reconcile_ref` decides the winner
+                // by reference (never copying), and because it returns one of
+                // its two arguments the pointer-identity test below is exact
+                // for every arm — including the equal-timestamp tombstone and
+                // `a.max(b)` tiebreaks. When the existing cell wins, leaving it
+                // untouched is identical to cloning it back over itself.
+                let new_wins = {
+                    let existing_cell = &existing_row.cells[ci].1;
+                    std::ptr::eq(
+                        ferrosa_common::reconcile_ref(existing_cell, &new_cell),
+                        &new_cell,
+                    )
+                };
+                if new_wins {
+                    existing_row.cells[ci].1 = new_cell;
+                }
             }
             Err(ci) => {
                 // New (col_idx, path) — insert at sorted position.
