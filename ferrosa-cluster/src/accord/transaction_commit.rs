@@ -15,7 +15,7 @@
 //! 3. **unconditional apply** — a general transaction has no `IF`, so it runs in
 //!    [`ReadPredicate::Always`] mode (no read-vote; #190).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -258,12 +258,12 @@ impl TransactionCommitter for AccordTransactionCommitter {
         &self,
         keyspace: &str,
         writes: StagedAccordWriteSet,
-        tables: Vec<String>,
+        reads: ferrosa_storage::accord::PgReadSet,
+        written_tables: Vec<String>,
         snapshot: ferrosa_common::accord::Timestamp,
     ) -> Result<CommitOutcome, CommitError> {
         use ferrosa_storage::accord::conflict_index::{
-            postgres_read_table_key, POSTGRES_TRANSACTION_BARRIER_KEY,
-            POSTGRES_TRANSACTION_MARKER_KEY,
+            postgres_read_key, postgres_read_table_key, postgres_write_table_key,
         };
 
         // A table-level tombstone (TRUNCATE) is ONE reserved partition key. The per-key
@@ -287,46 +287,70 @@ impl TransactionCommitter for AccordTransactionCommitter {
         // staged region is therefore an exact PREFIX of the driven write-set; the driver reads
         // entries at/after the prefix from their resident (empty) mutation field.
         let staged_count = writes.len();
-        // The tables this transaction SCANNED are driven as one synthetic conflict
-        // key each, appended AFTER the staged payload region (so the staged region
-        // stays an exact prefix) and BEFORE the two protocol markers. That puts the
-        // READ into the DISTRIBUTED Accord ordering — PreAccept registration,
-        // dependency union, and the per-key execution high-water-mark — so a later
-        // writer that scanned the same table is refused (`SnapshotStale` -> Aborted
-        // -> SQLSTATE 40001) once the table was written after the reader's snapshot.
-        // Row-level point reads are judged by the row they named and never reach
-        // here (RT-2), so disjoint-key writers still commit concurrently.
-        let read_table_keys: Vec<Vec<u8>> = tables
+        // The tables this transaction SCANNED — the reads that could NOT be resolved to keys —
+        // are driven as one synthetic conflict key each, appended AFTER the staged payload
+        // region (so the staged region stays an exact prefix) and BEFORE the two protocol
+        // markers. That puts the READ into the DISTRIBUTED Accord ordering — PreAccept
+        // registration, dependency union, and the per-key execution high-water-mark — so a
+        // later writer that scanned the same table is refused (`SnapshotStale` -> Aborted ->
+        // SQLSTATE 40001) once the table was written after the reader's snapshot. A KEYED read
+        // is ROW-granular instead and is driven as a READ OF EACH ROW it visited, below, so
+        // disjoint-key readers and writers still commit concurrently (RT-2).
+        let read_table_keys: Vec<Vec<u8>> = reads
+            .scan_tables()
             .iter()
             .map(|table| postgres_read_table_key(table))
             .collect();
-        let mut resolve_inputs: Vec<(String, Vec<u8>)> =
-            Vec::with_capacity(staged_count + read_table_keys.len() + 2);
-        let mut write_set: Vec<(Vec<u8>, Vec<u8>)> =
-            Vec::with_capacity(staged_count + read_table_keys.len() + 2);
-        for (keyspace, key) in writes.keys() {
-            resolve_inputs.push((keyspace.clone(), key.clone()));
-            write_set.push((key.clone(), Vec::new()));
-        }
-        for key in read_table_keys {
-            resolve_inputs.push((keyspace.to_string(), key.clone()));
-            write_set.push((key, Vec::new()));
-        }
-        for marker in [
-            POSTGRES_TRANSACTION_BARRIER_KEY,
-            POSTGRES_TRANSACTION_MARKER_KEY,
-        ] {
-            resolve_inputs.push((keyspace.to_string(), marker.to_vec()));
-            write_set.push((marker.to_vec(), Vec::new()));
-        }
-
-        let payloads = writes.payloads_arc();
+        // The coarse table-level read catches a later SCANNER of the same table.
+        // It cannot catch a WRITER that never read the table, which registers no
+        // read-table key. So a scan ALSO reads each scanned table's WRITE WATERMARK
+        // (`postgres_read_key(postgres_write_table_key(t))`), and every table this
+        // transaction WROTE registers that watermark (`postgres_write_table_key(t)`,
+        // below). A scanner therefore sees a write to the table it scanned however
+        // that writer's own read set looked — the phantom/absence evidence the
+        // read-side key alone cannot supply. The read registration is namespaced, so
+        // two scanners of one table never conflict on the watermark; the watermark is
+        // skipped in a WRITER's own staleness check, so two writers of DISJOINT rows
+        // still commit concurrently (RT-2).
+        let read_watermark_keys: Vec<Vec<u8>> = reads
+            .scan_tables()
+            .iter()
+            .map(|table| postgres_read_key(&postgres_write_table_key(table)))
+            .collect();
+        let write_table_keys: Vec<Vec<u8>> = written_tables
+            .iter()
+            .map(|table| postgres_write_table_key(table))
+            .collect();
+        // The staged routing index is MOVED into the driver (never cloned into a second
+        // resident collection), and the appended keys below are handed over as a visitor
+        // ([`AppendedKeys`]) that streams the read-set row keys straight out of their
+        // staging. The staged region stays an exact PREFIX of the driven write-set.
+        let (staged_keys, payloads) = writes.into_keys_and_payloads();
+        let staged_entries: Vec<(String, Vec<u8>, Vec<u8>)> = staged_keys
+            .into_iter()
+            .map(|(keyspace, key)| (keyspace, key, Vec::new()))
+            .collect();
+        // ROW-granular reads, STREAMED out of the staged read set. Each visited row's key
+        // is registered as a READ OF THAT ROW (`postgres_read_key`), so a concurrent writer
+        // of the row sees the reader under the underlying key and conflicts, while two keyed
+        // readers of DISJOINT rows register DISJOINT keys and both commit — the false refusal
+        // the table-level key caused. The visited-key set is NEVER materialized as a resident
+        // collection anywhere on this path: `for_each_row_key` hands one key at a time out of
+        // the resident prefix or the staging memory map, and the driver consumes each one as
+        // it arrives.
+        let appended = AppendedKeys {
+            keyspace,
+            read_table_keys,
+            read_watermark_keys,
+            write_table_keys,
+            row_reads: &reads,
+        };
         match drive_accord_core(
             self,
-            resolve_inputs,
-            write_set,
+            staged_entries,
             Some(payloads),
             staged_count,
+            Some(&appended),
             ReadPredicate::Always,
             Some(snapshot),
         )
@@ -343,10 +367,113 @@ impl TransactionCommitter for AccordTransactionCommitter {
     }
 }
 
+/// The conflict keys a commit APPENDS after its staged write-set region, in the exact
+/// order the Accord driver requires:
+///
+/// 1. each SCANNED table's READ key;
+/// 2. that table's WRITE WATERMARK read;
+/// 3. each WRITTEN table's WRITE WATERMARK;
+/// 4. every visited ROW key of a keyed read — STREAMED out of the disk-backed read set;
+/// 5. the two protocol markers.
+///
+/// Region 4 is as unbounded as the rows a keyed read visits, so it is handed over one key
+/// at a time through [`Self::for_each_key`] and is NEVER collected. Regions 1-3 and 5 are one
+/// entry per TABLE plus two, so they are legitimately resident.
+struct AppendedKeys<'a> {
+    keyspace: &'a str,
+    read_table_keys: Vec<Vec<u8>>,
+    read_watermark_keys: Vec<Vec<u8>>,
+    write_table_keys: Vec<Vec<u8>>,
+    row_reads: &'a ferrosa_storage::accord::PgReadSet,
+}
+
+impl AppendedKeys<'_> {
+    /// Visit every appended key, in driver order, with the keyspace it routes by.
+    ///
+    /// Residency is ONE row key: a row key is a slice of the read set's memory map (or of
+    /// its resident prefix), never a collected copy.
+    ///
+    /// # Errors
+    ///
+    /// An error from `visit`, or a read-set staging read failure — never a silently
+    /// skipped row key.
+    fn for_each_key(
+        &self,
+        visit: &mut dyn FnMut(&str, &[u8]) -> ferrosa_common::Result<()>,
+    ) -> ferrosa_common::Result<()> {
+        use ferrosa_storage::accord::conflict_index::{
+            postgres_read_key, POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
+        };
+        for key in &self.read_table_keys {
+            visit(self.keyspace, key)?;
+        }
+        for key in &self.read_watermark_keys {
+            visit(self.keyspace, key)?;
+        }
+        for key in &self.write_table_keys {
+            visit(self.keyspace, key)?;
+        }
+        {
+            let keyspace = self.keyspace;
+            self.row_reads.for_each_row_key(&mut |row_key| {
+                let site = ferrosa_common::mem_probe::enter_site(
+                    ferrosa_common::mem_probe::SITE_APPENDED_ROW_READ_KEY,
+                );
+                let key = postgres_read_key(row_key);
+                ferrosa_common::mem_probe::exit_site(site);
+                visit(keyspace, &key)
+            })?;
+        }
+        for marker in [
+            POSTGRES_TRANSACTION_BARRIER_KEY,
+            POSTGRES_TRANSACTION_MARKER_KEY,
+        ] {
+            visit(self.keyspace, marker)?;
+        }
+        Ok(())
+    }
+
+    /// The number of keys this source will visit. A CAPACITY HINT for the driver's
+    /// write-set, never a bound on the data.
+    fn len_hint(&self) -> usize {
+        self.read_table_keys.len()
+            + self.read_watermark_keys.len()
+            + self.write_table_keys.len()
+            + self.row_reads.row_key_count()
+            + 2
+    }
+}
+
+/// Resolve one driven key's replica set. A READ registration is ROUTED by the key it READ,
+/// not by the read key's own bytes: the reader's registration must land on the SAME replicas
+/// as a writer's registration of that key, or the staleness check that consults the read key
+/// would run on a shard that never saw the write — and a missed conflict is silent.
+///
+/// Fails loud on an unplaceable key or an empty replica set (never a guessed placement).
+fn resolve_driven_key(
+    committer: &AccordTransactionCommitter,
+    keyspace: &str,
+    key: &[u8],
+) -> Result<Vec<Uuid>, AccordDriverError> {
+    let resolve_key = ferrosa_storage::accord::conflict_index::postgres_read_lookup_key(key);
+    let replicas = (committer.resolve)(keyspace, resolve_key).ok_or_else(|| {
+        AccordDriverError::Network(format!(
+            "no replicas resolved for a key in keyspace '{keyspace}' (cluster mode required)"
+        ))
+    })?;
+    if replicas.is_empty() {
+        return Err(AccordDriverError::Network(format!(
+            "empty replica set for a key in keyspace '{keyspace}'"
+        )));
+    }
+    Ok(replicas)
+}
+
 /// Drive ONE multi-key Accord transaction for a RESIDENT write-set (the small autocommit
 /// batch and the LWT/snapshot-barrier keys). A large PostgreSQL commit does NOT go through
-/// here: it builds an already-staged write-set and calls [`drive_accord_core`] directly, so
-/// its payload bulk is never resident.
+/// here: it stages its write-set, MOVES its routing index into [`drive_accord_core`], and
+/// streams its read-set row keys in with it, so neither the payload bulk nor the conflict-key
+/// set is ever duplicated.
 async fn drive_accord(
     committer: &AccordTransactionCommitter,
     mut writes: Vec<TransactionWrite>,
@@ -358,11 +485,6 @@ async fn drive_accord(
             "Accord transaction requires at least one conflict key".to_string(),
         ));
     }
-
-    let resolve_inputs: Vec<(String, Vec<u8>)> = writes
-        .iter()
-        .map(|w| (w.keyspace.clone(), w.key.clone()))
-        .collect();
 
     // Stage the payloads in local temp storage when the write-set is large enough to be the
     // commit's memory problem, so the coordinator never holds ~1.1M encoded mutations
@@ -393,77 +515,129 @@ async fn drive_accord(
             (None, 0)
         };
 
-    let write_set: Vec<(Vec<u8>, Vec<u8>)> =
-        writes.into_iter().map(|w| (w.key, w.mutation)).collect();
+    // The routing index and any remaining resident payload are MOVED into the driver —
+    // never cloned into a second resident collection.
+    let staged_entries: Vec<(String, Vec<u8>, Vec<u8>)> = writes
+        .into_iter()
+        .map(|write| (write.keyspace, write.key, write.mutation))
+        .collect();
     drive_accord_core(
         committer,
-        resolve_inputs,
-        write_set,
+        staged_entries,
         write_blobs,
         staged_prefix,
+        None,
         predicate,
         snapshot_ts,
     )
     .await
 }
 
-/// Drive one multi-key Accord transaction from an ALREADY-BUILT write-set.
+/// Drive one multi-key Accord transaction from an ALREADY-STAGED write-set.
 ///
-/// `resolve_inputs` supplies each key's `(keyspace, partition key)` for replica resolution;
-/// `write_set` is the `(partition key, payload)` the driver fans out. When `write_blobs` holds
-/// a staged spill, `staged_prefix` is the number of LEADING `write_set` entries whose payload
-/// lives in it — the rest carry their resident payload (the committer's barrier/marker keys).
-/// The large PostgreSQL commit calls this directly with the staged write-set, so the payload
-/// bulk is never resident on the coordinator.
+/// `staged_keys` is the staging's own `(keyspace, partition key)` routing index, taken **by
+/// move**: it IS the driver's conflict ordering and per-shard participant set, so the commit
+/// path must not clone it into a second resident collection. When `write_blobs` holds the
+/// staged payload spill, `staged_prefix` is the number of LEADING entries whose payload lives
+/// in it; the rest carry their (empty) resident payload. `appended` supplies the keys driven
+/// AFTER the staged region (table keys, watermarks, then every visited ROW key of a keyed
+/// read — STREAMED — then the two protocol markers); `None` drives the staged region alone.
+/// The large PostgreSQL commit calls this directly, so neither the payload bulk nor the
+/// conflict-key set is materialized by the caller.
+///
+/// The driver's write-set and its per-entry replica sets (carried BY POSITION, so an immutable
+/// conflict key is stored once) are built in ONE pass over the staged index and then over the
+/// appended keys, so no key is ever held in two resident collections at once.
 ///
 /// # Errors
 ///
-/// A key with no resolvable replica set (fail loud, never a guessed placement), or a driver
-/// failure that leaves the commit undecided.
+/// A key with no resolvable replica set (fail loud, never a guessed placement), a read-set
+/// staging read failure, or a driver failure that leaves the commit undecided.
 #[allow(clippy::too_many_arguments)]
 async fn drive_accord_core(
     committer: &AccordTransactionCommitter,
-    resolve_inputs: Vec<(String, Vec<u8>)>,
-    write_set: Vec<(Vec<u8>, Vec<u8>)>,
+    staged_entries: Vec<(String, Vec<u8>, Vec<u8>)>,
     write_blobs: Option<Arc<ferrosa_storage::write_set_spill::WriteSetSpill>>,
     staged_prefix: usize,
+    appended: Option<&AppendedKeys<'_>>,
     predicate: ReadPredicate,
     snapshot_ts: Option<ferrosa_common::accord::Timestamp>,
 ) -> Result<ferrosa_common::accord::Timestamp, AccordDriverError> {
+    // 1. Resolve every key's replicas AND build the driven write-set, in ONE pass: the staged
+    //    routing index (moved in), then the appended keys (streamed in). Fail loud on an
+    //    unplaceable key — never commit a write to a guessed/empty replica set.
+    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
+    let t_resolve = profile.then(std::time::Instant::now);
+    let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
+    // The per-entry replica sets, carried BY POSITION (aligned with `write_set`) rather than in
+    // a keyed index: a conflict key is immutable, write-once bytes, so it is stored ONCE (in
+    // `write_set`) and never cloned into a second collection merely to be looked up by its
+    // bytes. The driver resolves a replica set by the entry's position.
+    let mut participants: Vec<Vec<Uuid>> =
+        Vec::with_capacity(staged_entries.len() + appended.map_or(0, AppendedKeys::len_hint));
+    let mut write_set: Vec<(Vec<u8>, Vec<u8>)> =
+        Vec::with_capacity(staged_entries.len() + appended.map_or(0, AppendedKeys::len_hint));
+    for (keyspace, key, resident_mutation) in staged_entries {
+        let replicas = resolve_driven_key(committer, &keyspace, &key)?;
+        for r in &replicas {
+            replica_union.insert(*r);
+        }
+        participants.push(replicas);
+        // A STAGED entry (index < `staged_prefix`) reads its payload from the spill and is
+        // EMPTY here; an entry at/after the prefix carries its own resident payload.
+        write_set.push((key, resident_mutation));
+    }
+    if let Some(appended) = appended {
+        // The appended walk (which includes the disk-backed read set) is the only fallible
+        // part of the pass: capture its error and stop the walk rather than swallowing it.
+        let mut appended_error: Option<AccordDriverError> = None;
+        let walk = appended.for_each_key(&mut |keyspace, key| {
+            if appended_error.is_some() {
+                return Err(ferrosa_common::Error::InvalidData(
+                    "commit path: appended key walk stopped after an earlier failure".to_string(),
+                ));
+            }
+            match resolve_driven_key(committer, keyspace, key) {
+                Ok(replicas) => {
+                    for r in &replicas {
+                        replica_union.insert(*r);
+                    }
+                    participants.push(replicas);
+                    let write_set_site = ferrosa_common::mem_probe::enter_site(
+                        ferrosa_common::mem_probe::SITE_DRIVE_WRITE_SET,
+                    );
+                    write_set.push((key.to_vec(), Vec::new()));
+                    ferrosa_common::mem_probe::exit_site(write_set_site);
+                    Ok(())
+                }
+                Err(error) => {
+                    appended_error = Some(error);
+                    Err(ferrosa_common::Error::InvalidData(
+                        "commit path: an appended key could not be resolved".to_string(),
+                    ))
+                }
+            }
+        });
+        if let Some(error) = appended_error {
+            return Err(error);
+        }
+        walk.map_err(|error| {
+            AccordDriverError::Codec(format!(
+                "PostgreSQL transaction read set is unreadable: {error}"
+            ))
+        })?;
+    }
     if write_set.is_empty() {
         return Err(AccordDriverError::Network(
             "Accord transaction requires at least one conflict key".to_string(),
         ));
-    }
-
-    // 1. Resolve each key's replicas; fail loud on an unplaceable key (never
-    //    commit a write to a guessed/empty replica set).
-    let profile = std::env::var_os("FERROSA_PG_COMMIT_PROFILE").is_some();
-    let t_resolve = profile.then(std::time::Instant::now);
-    let mut replica_union: BTreeSet<Uuid> = BTreeSet::new();
-    let mut per_key: HashMap<Vec<u8>, Vec<Uuid>> = HashMap::new();
-    for (keyspace, key) in &resolve_inputs {
-        let replicas = (committer.resolve)(keyspace, key).ok_or_else(|| {
-            AccordDriverError::Network(format!(
-                "no replicas resolved for a key in keyspace '{keyspace}' (cluster mode required)"
-            ))
-        })?;
-        if replicas.is_empty() {
-            return Err(AccordDriverError::Network(format!(
-                "empty replica set for a key in keyspace '{keyspace}'"
-            )));
-        }
-        for r in &replicas {
-            replica_union.insert(*r);
-        }
-        per_key.insert(key.clone(), replicas);
     }
     let replica_ids: Vec<Uuid> = replica_union.into_iter().collect();
     let resolve_ns = t_resolve.map(|t| t.elapsed().as_nanos() as u64);
     if profile {
         tracing::info!(
             phase = "drive.resolve_done",
-            keys = per_key.len(),
+            keys = write_set.len(),
             live_mib = ferrosa_common::mem_probe::live_mib(),
             "accord drive residency"
         );
@@ -487,11 +661,6 @@ async fn drive_accord_core(
             "accord drive residency"
         );
     }
-    let per_key = Arc::new(per_key);
-    let pk = per_key.clone();
-    let participant_resolver =
-        move |k: &[u8]| -> Vec<Uuid> { pk.get(k).cloned().unwrap_or_default() };
-
     // 3. Drive one unconditional multi-key Accord transaction.
     let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
         committer.node_id,
@@ -501,7 +670,7 @@ async fn drive_accord_core(
         &committer.clock,
         write_set,
     )
-    .with_per_key_replicas(Arc::new(participant_resolver))
+    .with_per_key_replica_sets_by_position(participants)
     .with_local_applier(committer.applier.clone())
     .with_read_predicate(predicate);
     if let Some(blobs) = write_blobs {
@@ -553,6 +722,7 @@ async fn drive_accord_core(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use ferrosa_net::error::NetError;
@@ -1280,7 +1450,13 @@ mod tests {
         // Accord and (with no peers) fail, but the tombstone fan-out has already
         // run. The assertion is on the ROUTING, which is decided before Accord.
         let _ = committer
-            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .commit_postgres(
+                "ks",
+                staged(vec![tombstone_write()]),
+                ferrosa_storage::accord::PgReadSet::empty(),
+                vec![],
+                snapshot(),
+            )
             .await;
 
         assert_eq!(
@@ -1312,7 +1488,13 @@ mod tests {
         .with_marker_writer(recorder);
 
         let err = committer
-            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .commit_postgres(
+                "ks",
+                staged(vec![tombstone_write()]),
+                ferrosa_storage::accord::PgReadSet::empty(),
+                vec![],
+                snapshot(),
+            )
             .await
             .expect_err("a truncate that not every serving node acknowledged must be refused");
         let reason = err.reason.to_lowercase();
@@ -1330,13 +1512,102 @@ mod tests {
         let committer = committer_with(Uuid::from_u128(0xAA), Arc::new(RecordingApplier::new()));
 
         let err = committer
-            .commit_postgres("ks", staged(vec![tombstone_write()]), vec![], snapshot())
+            .commit_postgres(
+                "ks",
+                staged(vec![tombstone_write()]),
+                ferrosa_storage::accord::PgReadSet::empty(),
+                vec![],
+                snapshot(),
+            )
             .await
             .expect_err("a tombstone with no all-serving writer must be refused");
         assert!(
             err.reason.to_lowercase().contains("all-serving"),
             "got: {}",
             err.reason
+        );
+    }
+
+    /// INVARIANT: ORDERING. The keys a commit appends AFTER its staged region are visited in
+    /// the exact order the Accord driver requires: each scanned table's read key, then that
+    /// table's write watermark, then each written table's watermark, then every visited ROW
+    /// key of a keyed read (STREAMED, never collected), then the two protocol markers. The
+    /// driver depends on this order and on the staged region being an exact PREFIX of the
+    /// driven write-set.
+    ///
+    /// INVARIANT: RESULTS COMPLETE. The capacity hint counts every key the walk will visit —
+    /// it is a hint for a `Vec::with_capacity`, never a bound that could truncate the walk.
+    #[test]
+    fn appended_keys_are_visited_in_the_driver_order() {
+        use ferrosa_storage::accord::conflict_index::{
+            postgres_read_key, postgres_read_table_key, postgres_write_table_key,
+            POSTGRES_TRANSACTION_BARRIER_KEY, POSTGRES_TRANSACTION_MARKER_KEY,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "ferrosa-appended-keys-order-{}",
+            std::process::id()
+        ));
+        // A 16-byte buffer forces the row read set to spill, so the walk reads back out of
+        // the staging file rather than the resident prefix.
+        let mut rows = ferrosa_storage::accord::RowReadSet::with_threshold(&root, 16);
+        let row_keys: Vec<Vec<u8>> = (0..4u8).map(|i| format!("row-{i}").into_bytes()).collect();
+        for key in &row_keys {
+            rows.record(key).expect("record");
+        }
+        let staged_rows = rows.finish().expect("finish");
+        assert!(
+            staged_rows.spilled_to_disk(),
+            "the row read set must have spilled for this to exercise the streaming path"
+        );
+
+        let reads = ferrosa_storage::accord::PgReadSet::with_row_keys(
+            vec!["public.doctors".to_string(), "public.patients".to_string()],
+            staged_rows,
+        );
+        let appended = AppendedKeys {
+            keyspace: "ks",
+            read_table_keys: reads
+                .scan_tables()
+                .iter()
+                .map(|table| postgres_read_table_key(table))
+                .collect(),
+            read_watermark_keys: reads
+                .scan_tables()
+                .iter()
+                .map(|table| postgres_read_key(&postgres_write_table_key(table)))
+                .collect(),
+            write_table_keys: vec![postgres_write_table_key("public.doctors")],
+            row_reads: &reads,
+        };
+
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        appended
+            .for_each_key(&mut |_ks, key| {
+                seen.push(key.to_vec());
+                Ok(())
+            })
+            .expect("walk");
+
+        let mut expected: Vec<Vec<u8>> = vec![
+            postgres_read_table_key("public.doctors"),
+            postgres_read_table_key("public.patients"),
+            postgres_read_key(&postgres_write_table_key("public.doctors")),
+            postgres_read_key(&postgres_write_table_key("public.patients")),
+            postgres_write_table_key("public.doctors"),
+        ];
+        expected.extend(row_keys.iter().map(|key| postgres_read_key(key)));
+        expected.push(POSTGRES_TRANSACTION_BARRIER_KEY.to_vec());
+        expected.push(POSTGRES_TRANSACTION_MARKER_KEY.to_vec());
+
+        assert_eq!(
+            seen, expected,
+            "the appended keys must be driven in the exact order the Accord driver requires"
+        );
+        assert_eq!(
+            appended.len_hint(),
+            expected.len(),
+            "the capacity hint must count every key the walk visits"
         );
     }
 }

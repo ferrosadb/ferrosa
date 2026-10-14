@@ -40,6 +40,7 @@ use crate::query::{
 };
 use crate::result_stream::ResultStream;
 use crate::txn_write_set::TxnWriteSet;
+use ferrosa_storage::accord::row_read_set::{RowReadSet, StagedRowReads};
 
 /// What a prepared statement parses to: a table query, a no-`FROM` expression
 /// query (`SELECT version()`, `SELECT 1`), or parameterized DML (`INSERT` /
@@ -92,6 +93,16 @@ pub struct Session {
     txn_isolation: Option<ferrosa_sql::IsolationLevel>,
     txn_snapshot: Option<MvccSnapshot>,
     txn_read_tables: HashSet<String>,
+    /// The open transaction's ROW-level read set: the keyed reads, resolved to the ROW
+    /// keys they visited, staged through the SAME threshold-bounded write-set spill as
+    /// [`Self::txn_writes`] so residency never tracks the rows read (FMEA PG-12's sibling).
+    /// A read that could not be resolved to keys stays in [`Self::txn_read_tables`], which is
+    /// bounded by the schema. Read at COMMIT into a [`ferrosa_storage::accord::PgReadSet`] and
+    /// streamed into the distributed commit.
+    ///
+    /// A resident `HashSet<RowKey>` here is FORBIDDEN: it grows with the rows read, and the
+    /// OOM gate (`tests/pg_full_scan_memory_bound.rs`) is the detector.
+    txn_read_rows: RowReadSet,
     /// Buffered DML write-set for the open `BEGIN`/`COMMIT` block. DML inside a
     /// transaction is BUFFERED here instead of applied; `COMMIT` drives the whole
     /// set through the PostgreSQL MVCC manager atomically; `ROLLBACK`/`end_txn` clears it
@@ -151,6 +162,7 @@ impl Session {
             txn_isolation: None,
             txn_snapshot: None,
             txn_read_tables: HashSet::new(),
+            txn_read_rows: RowReadSet::default(),
             txn_writes: TxnWriteSet::default(),
             runs: HashMap::new(),
         }
@@ -328,6 +340,7 @@ impl Session {
     ) {
         self.txn_writes = TxnWriteSet::default();
         self.txn_read_tables.clear();
+        self.txn_read_rows = RowReadSet::default();
         if matches!(self.txn, TransactionStatus::Idle) {
             self.txn = TransactionStatus::InTransaction;
             self.txn_isolation = isolation;
@@ -346,6 +359,7 @@ impl Session {
         self.txn_isolation = None;
         self.txn_snapshot = None;
         self.txn_read_tables.clear();
+        self.txn_read_rows = RowReadSet::default();
         // Drop the whole staged write-set (resident prefix and spill) so a
         // committed or rolled-back transaction leaves nothing behind.
         self.txn_writes = TxnWriteSet::default();
@@ -414,6 +428,22 @@ impl Session {
 
     pub(crate) fn take_txn_read_tables(&mut self) -> HashSet<String> {
         std::mem::take(&mut self.txn_read_tables)
+    }
+
+    /// Mutable handle to the open transaction's staged ROW-level read set, for a KEYED read
+    /// (`WHERE <partition-key> = <literal>`) to record the row it resolved to.
+    pub(crate) fn txn_read_rows_mut(&mut self) -> &mut RowReadSet {
+        &mut self.txn_read_rows
+    }
+
+    /// Drain the staged row-level read set for COMMIT, memory-mapping any spilled region.
+    ///
+    /// # Errors
+    ///
+    /// A staging flush or map failure is surfaced, never swallowed — a read set that could
+    /// not be read back would silently lose the conflicts it must carry.
+    pub(crate) fn take_txn_read_rows(&mut self) -> Result<StagedRowReads, ferrosa_common::Error> {
+        std::mem::take(&mut self.txn_read_rows).finish()
     }
 
     /// Drain the staged write-set as a repeatable streaming source, leaving the

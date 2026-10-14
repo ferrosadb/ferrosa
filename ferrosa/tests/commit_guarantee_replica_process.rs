@@ -64,7 +64,7 @@
 
 #![cfg(unix)]
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -73,6 +73,9 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
+
+mod common;
+use common::ports::PortAllocator;
 
 /// `base64("ferrosa_admin:ferrosa_admin")` — the seeded development superuser.
 const ADMIN_BASIC: &str = "Basic ZmVycm9zYV9hZG1pbjpmZXJyb3NhX2FkbWlu";
@@ -126,28 +129,20 @@ struct Ports {
     flight: u16,
 }
 
-fn free_port(taken: &mut HashSet<u16>) -> u16 {
-    for _ in 0..200 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        if taken.insert(port) {
-            return port;
-        }
-    }
-    panic!("could not allocate a free port");
-}
-
-fn alloc_ports(taken: &mut HashSet<u16>) -> Ports {
+/// A band of eight ports for one node, from the shared allocator whose ports sit
+/// BELOW the kernel's ephemeral range (`tests/common/ports.rs`): a port inside that
+/// range can already be held by any outbound connection in the VM, which is how a
+/// node's SPARQL listener lost its port in CI on 2026-10-13.
+fn alloc_ports(alloc: &mut PortAllocator) -> Ports {
     Ports {
-        cql: free_port(taken),
-        web: free_port(taken),
-        internode: free_port(taken),
-        graph: free_port(taken),
-        bolt: free_port(taken),
-        pg: free_port(taken),
-        sparql: free_port(taken),
-        flight: free_port(taken),
+        cql: alloc.get(),
+        web: alloc.get(),
+        internode: alloc.get(),
+        graph: alloc.get(),
+        bolt: alloc.get(),
+        pg: alloc.get(),
+        sparql: alloc.get(),
+        flight: alloc.get(),
     }
 }
 
@@ -327,11 +322,13 @@ const PORT_IN_USE: &str = "Address already in use";
 
 /// Why a node did not reach readiness.
 ///
-/// A listener that cannot bind is a HARNESS accident, not a product failure:
-/// [`free_port`] hands out a port that is free at that instant, and between then
-/// and the node's `bind` a concurrently running test target can take it. The
-/// node then never reports ready, and reporting THAT as a red would be a false
-/// failure about the product. It is re-drawn and retried instead.
+/// A listener that cannot bind is a HARNESS accident, not a product failure: [`alloc_ports`]
+/// hands out a port that is free at that instant, and between then and the node's `bind` a
+/// concurrently running process can take it. The band it draws from sits BELOW the kernel's
+/// ephemeral range (`common::ports`), so the kernel can no longer hand a node's port to an
+/// outbound connection; this retry is the second line of defence against a process that
+/// binds inside the band. The node never reports ready when it loses a port, and reporting
+/// THAT as a red would be a false failure about the product. It is re-drawn and retried instead.
 enum NotReady {
     PortCollision,
     Timeout,
@@ -370,11 +367,11 @@ fn wait_ready(node: &Node, timeout: Duration) -> Result<(), NotReady> {
 /// exists. It is also why readiness must be waited for with all three up — every
 /// node is told `FERROSA_EXPECTED_CLUSTER_SIZE=3`, and a node alone does not report
 /// ready at the declared size.
-fn start_cluster(taken: &mut HashSet<u16>, cluster_name: &str) -> Vec<Node> {
+fn start_cluster(alloc: &mut PortAllocator, cluster_name: &str) -> Vec<Node> {
     const ATTEMPTS: usize = 5;
     let mut last_log = String::new();
     for attempt in 1..=ATTEMPTS {
-        let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(taken)).collect();
+        let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(alloc)).collect();
         let seed_hub = format!("127.0.0.1:{}", all_ports[0].internode);
 
         let mut nodes: Vec<Node> = Vec::with_capacity(N_NODES);
@@ -610,14 +607,14 @@ async fn a_committed_row_survives_a_sigkill_and_is_repaired_onto_the_restarted_r
     let run = std::process::id();
     let value = |id: i32| format!("run{run}:{id}");
 
-    let mut taken: HashSet<u16> = HashSet::new();
+    let mut alloc = PortAllocator::new();
 
     // ── 0. The cluster. The whole star is brought up together: every node
     //      declares `FERROSA_EXPECTED_CLUSTER_SIZE=3`, so (correctly) none reports
     //      ready until it sees the declared size, and the star is wired from the
     //      bands drawn before any node starts. A bind collision re-draws every
     //      band and restarts the lot, exactly as in the single-node case.
-    let mut nodes = start_cluster(&mut taken, &cluster_name);
+    let mut nodes = start_cluster(&mut alloc, &cluster_name);
     let seed_hub = format!("127.0.0.1:{}", nodes[0].ports.internode);
     for node in &nodes {
         assert!(

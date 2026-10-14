@@ -480,6 +480,19 @@ not land, and the parked red stays parked.
 
 ### RT-2 (a) — COMPLETE implementation spec; every shape resolved (2026-10-11)
 
+> **SUPERSEDED on one point (2026-10-13) — READ THIS FIRST.** The row-level read set in
+> steps 4–6 below is now SHIPPED, and it is **STAGED**, not a resident collection.
+> `Session.txn_read_rows` is a `ferrosa_storage::accord::row_read_set::RowReadSet` over the
+> SAME threshold-plus-spill stage the write-set uses (`ferrosa-storage`'s `write_set_stage`,
+> one spill path, one tunable `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES`). **A resident
+> `HashSet<RowKey>` / `Vec<RowKey>` read set — what steps 4 and 5 originally sketched — is
+> FORBIDDEN on this path**: it grows with the rows read and the node RAM is fixed at 4 GB.
+> It is wired only as the negative control of
+> `ferrosa-postgres/tests/pg_full_scan_memory_bound.rs::keyed_read_set_residency_stays_flat_through_the_postgres_front_end`,
+> which asserts `PgReadSet::resident_bytes()` stays FLAT in the recorded row count. Do NOT
+> implement the `HashSet<RowKey>` shape the steps below still describe; implement the staged
+> one the shipped code already has.
+
 Nothing below requires further recon.
 
 1. `mvcc.rs:233`  `struct RowKey { table: String, key: Vec<Value> }` — private. Make the struct AND both
@@ -502,22 +515,40 @@ Nothing below requires further recon.
 3. `mvcc.rs:460/463` and `:524/528`  the two callers pass the new set through;
    `MvccManager::commit` (`mvcc.rs:521`) gains `read_rows` too.
 
-4. `extended.rs:94`  add `txn_read_rows: HashSet<RowKey>` beside `txn_read_tables`, with
+4. `extended.rs:94`  add a **`txn_read_rows: RowReadSet`** beside `txn_read_tables`, with
    `txn_read_rows_mut()` / `take_txn_read_rows()` mirroring `:411`/`:415`.
+
+   **NOT a `HashSet<RowKey>`.** The visited-row list is as unbounded as the rows a keyed
+   read visits, so a resident collection here grows with the rows read and the node RAM is
+   fixed at 4 GB — it is FORBIDDEN on this path. `RowReadSet`
+   (`ferrosa-storage/src/accord/row_read_set.rs`) stages each resolved row key through the
+   SAME `WriteSetStage` the write-set uses: a bounded resident prefix plus a private staging
+   file, read back as a stream. There is NO second buffer and NO read-set-specific
+   threshold. The resident variant is the gate's negative control only.
 
 5. `server.rs:709` `track_select_reads` — after the table insert, add the point-read branch:
 
-       if let Some(ferrosa_sql::Expr::Compare { left: Operand::Column(col), op: CmpOp::Eq,
-                                                  value: Term::Literal(v) }) = &select.filter
-           && <col.name is select.from.table's partition key column>
-       { session.txn_read_rows_mut().insert(RowKey { table: "schema.table", key: vec![v.clone()] });
-         return; }   // a point read is row-granular: do NOT also record the table
+       if let Some(row) = point_read_row_key(ctx, select) {           // EXISTING judgement
+           if let Some(snapshot) = session.txn_snapshot() {
+               ctx.mvcc.record_point_read(snapshot, row);               // local MVCC half
+           }
+           let bytes = point_read_key_bytes(ctx, select).ok_or_else(/* 58000 */)?;
+           session.txn_read_rows_mut().record(&bytes)?;                // STAGED, not inserted
+           return Ok(());   // a point read is row-granular: do NOT also record the table
+       }
 
-   `CmpOp` is at `ferrosa-sql/src/exec.rs:626` (NOT ast.rs). The PK column comes from table metadata the
-   front end already holds — `server.rs:1952` shows `partition_key: vec!["k".to_string()]`.
+   Reuse the front end's EXISTING `point_read_row_key` judgement rather than writing a second
+   key resolver, and encode the row through the SAME canonical encoder the DML write path uses
+   (`ferrosa_row_bridge::build_decorated_key`, in `point_read_key_bytes`) so a reader's
+   registration lands on the key a writer of that row registers. `record(&bytes)` APPENDS to the
+   staged set; it does NOT `insert` into a resident set (see step 4 — that shape is forbidden).
+   Shipped as `server.rs::{track_select_reads, point_read_key_bytes}`.
 
-6. `server.rs:883` `take_txn_read_rows()` beside `take_txn_read_tables()`;
-   `query.rs:1789/1796` pass it into the mvcc commit.
+6. `server.rs:987` `take_txn_read_rows()` beside `take_txn_read_tables()`, and at COMMIT build
+   `ferrosa_storage::accord::PgReadSet::with_row_keys(scanned_tables, read_rows)` for the
+   distributed `commit_postgres`. The row keys STREAM out of the staged set
+   (`PgReadSet::for_each_row_key`) into the Accord read registrations; they are never collected
+   into a `Vec`. The local MVCC check keeps its table half.
 
 Then re-apply `rt2-disjoint-keys.patch` and the red goes GREEN with its control.
 

@@ -68,6 +68,15 @@ sprint-03-engine-transfer = []
 # setup instructions rather than silently passing (repo test policy).
 live-infra-tests = []
 
+# Turns on the allocation-SITE tag seam in `ferrosa_common::mem_probe` (see its
+# `enter_site`/`SITE_NAMES`), so the counting allocator in a test binary can charge
+# each key-sized allocation to the call site that made it. Off by default: with it
+# off every `enter_site` folds away and a production build pays nothing. It only
+# unlocks the ATTRIBUTION the `pg_commit_path_key_attribution` test prints; the
+# residency RATCHET it feeds lives in `pg_commit_path_consumer_residency`, which is
+# NOT gated and runs on every PR.
+alloc-probe = ["ferrosa-common/alloc-probe"]
+
 # ── test targets ────────────────────────────────────────────────────────
 # Absolute-measurement test binaries. Gated so a plain `cargo test -p
 # ferrosa-cluster` never runs a measurement of the host, exactly like the
@@ -87,3 +96,14 @@ live-infra-tests = []
 [[test]]
 name = "accord_apply_decode_residency"
 required-features = ["perf-tests"]
+
+# `tests/pg_commit_path_key_attribution.rs`: for the COMMIT path's key-sized
+# buffers, charges each one to the allocation SITE that made it and prints the
+# table, so a residency finding names a file:line instead of a hypothesis. It
+# needs the `alloc-probe` tag seam, so it is gated rather than skipped — a test
+# that silently self-skips when its requirement is absent is not evidence
+# (repo test policy; see `reproduction-validity`). Its assertions are counts of
+# key-sized allocations, which do not move with host load.
+[[test]]
+name = "pg_commit_path_key_attribution"
+required-features = ["alloc-probe"]

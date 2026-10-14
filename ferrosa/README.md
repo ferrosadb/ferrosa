@@ -219,6 +219,17 @@ config and auth bypass. The end-to-end boot path itself is exercised by the
 cluster/integration suites, not from here. One in-code `TODO` remains
 (`web/api.rs:475`). See [specs/fmea.md](specs/fmea.md).
 
+The real-process harnesses under `tests/` spawn three-node clusters, so each node
+is handed a band of eight listener ports drawn from a range **below the kernel's
+ephemeral port range** (the shared allocator in
+[`tests/common/ports.rs`](tests/common/ports.rs), guarded by
+[`tests/port_band.rs`](tests/port_band.rs)). A listening port taken from inside
+that range can already be held by any outbound connection in the VM — an image
+pull, a readiness probe, a peer's own sockets — so the node loses the port
+seconds later, never reports ready, and the harness reads the readiness timeout as
+a product failure. Keep harness ports, and every published host port (a `docker
+compose` mapping, a Jepsen topology), below that floor.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — composition-root model

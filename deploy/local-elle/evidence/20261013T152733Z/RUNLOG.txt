@@ -1,0 +1,31 @@
+
+[certify-cql] cluster up (image=localhost/ferrosa-elle-current:latest, compose=ferrosa-jepsen/tests/docker/elle-cluster-rf3.yml)
+
+[certify-cql] waiting for 3/3 nodes running AND ready (budget 240s)
+
+[certify-cql] cluster formed: 3/3 running and ready
+
+[certify-cql] building the CQL list-append generator
+
+[certify-cql] generator: keys=8 ops/worker=300 workers=8 rf=3 -> /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T152733Z/elle-cql-20261013T152733Z.edn
+
+[certify-cql] generator exit=0 (non-zero is expected only under faults; this leg injects none)
+pinning 8 workers across 3 node(s)
+wrote 4800 events to /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T152733Z/elle-cql-20261013T152733Z.edn (0 failures)
+
+[certify-cql] re-checking the cluster is whole
+
+[certify-cql] outcome breakdown
+  :ok    2400
+  :info  0
+  :fail  0
+
+[certify-cql] Elle check (lein, checker reused unchanged)
+
+[certify-cql] checker exit=0  (0 only on a definitive valid? true)
+
+[certify-cql] artifacts: /Users/bkearns/src/ferrosa-suite/.wt-elle-cert/deploy/local-elle/evidence/20261013T152733Z
+
+[certify-cql] REMINDER: read the op breakdown above before quoting the verdict — a green
+
+[certify-cql] verdict over an overwhelmingly :fail/:info history is VACUOUS, not a pass.

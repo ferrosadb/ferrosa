@@ -1,0 +1,16 @@
+;; Known-INVALID Elle list-append history — the checker's negative control.
+;;
+;; One process appends 1 then 2 (both :ok, so both are committed in real time
+;; before the read is invoked), then reads the list and sees [2 1] — the two
+;; committed elements reversed. No strict-serializable execution can produce
+;; that, so the checker MUST report :valid? false with an anomaly type (the
+;; elle-checker README records :G0-realtime for exactly this history) and exit
+;; non-zero. This is what proves the checker on this machine can still emit a
+;; RED verdict: without it, a later `valid? true` would only show that the
+;; checker never says no.
+[{:process 0 :type :invoke :f :txn :value [[:append 1 1]]}
+ {:process 0 :type :ok     :f :txn :value [[:append 1 1]]}
+ {:process 0 :type :invoke :f :txn :value [[:append 1 2]]}
+ {:process 0 :type :ok     :f :txn :value [[:append 1 2]]}
+ {:process 0 :type :invoke :f :txn :value [[:r 1 nil]]}
+ {:process 0 :type :ok     :f :txn :value [[:r 1 [2 1]]]}]

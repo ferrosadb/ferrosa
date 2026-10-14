@@ -43,7 +43,6 @@
 
 #![cfg(unix)]
 
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -52,6 +51,9 @@ use std::time::{Duration, Instant};
 
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
+
+mod common;
+use common::ports::PortAllocator;
 
 /// The table the red drives. The PG front end's default schema is `public`, so an
 /// unqualified name resolves into the keyspace whose factor is under test.
@@ -86,28 +88,20 @@ struct Ports {
     flight: u16,
 }
 
-fn free_port(taken: &mut HashSet<u16>) -> u16 {
-    for _ in 0..200 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        if taken.insert(port) {
-            return port;
-        }
-    }
-    panic!("could not allocate a free port");
-}
-
-fn alloc_ports(taken: &mut HashSet<u16>) -> Ports {
+/// A band of eight ports for one node, from the shared allocator whose ports sit
+/// BELOW the kernel's ephemeral range (`tests/common/ports.rs`): a port inside that
+/// range can already be held by any outbound connection in the VM, which is how a
+/// node's SPARQL listener lost its port in CI on 2026-10-13.
+fn alloc_ports(alloc: &mut PortAllocator) -> Ports {
     Ports {
-        cql: free_port(taken),
-        web: free_port(taken),
-        internode: free_port(taken),
-        graph: free_port(taken),
-        bolt: free_port(taken),
-        pg: free_port(taken),
-        sparql: free_port(taken),
-        flight: free_port(taken),
+        cql: alloc.get(),
+        web: alloc.get(),
+        internode: alloc.get(),
+        graph: alloc.get(),
+        bolt: alloc.get(),
+        pg: alloc.get(),
+        sparql: alloc.get(),
+        flight: alloc.get(),
     }
 }
 
@@ -461,11 +455,11 @@ async fn read_rows(client: &Client) -> Result<Vec<(i32, String)>, String> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn public_keyspace_covers_a_cluster_formed_without_a_configured_seed() {
     let cluster_name = format!("rf-proc-{}", std::process::id());
-    let mut taken: HashSet<u16> = HashSet::new();
+    let mut alloc = PortAllocator::new();
 
     // Every node binds its own band of eight ports before any is started, so the
     // star can be wired: node 0 has NO seed and nodes 1 and 2 seed off it.
-    let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(&mut taken)).collect();
+    let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(&mut alloc)).collect();
     let seed_hub = format!("127.0.0.1:{}", all_ports[0].internode);
 
     let mut nodes: Vec<Node> = Vec::new();

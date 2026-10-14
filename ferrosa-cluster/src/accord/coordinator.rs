@@ -669,7 +669,7 @@ pub struct AccordCoordinatorDriver {
     /// fans a per-replica [`Message::AccordApplyV2`](ferrosa_net::Message) (scoped
     /// to each replica's owned keys via [`Self::with_per_key_replicas`]) over this
     /// set, and the coordinator's own-replica Apply persists the keys it owns.
-    write_set: Vec<crate::accord::wire::WriteSetEntry>,
+    write_set: Arc<[crate::accord::wire::WriteSetEntry]>,
     /// How replicas should answer the Gap-4 read-vote: existence semantics for
     /// `INSERT IF NOT EXISTS` (the default) or a generic read-row-at-`t` whose
     /// IF predicate this coordinator evaluates after collecting F+1 agreed rows.
@@ -732,6 +732,20 @@ pub struct AccordCoordinatorDriver {
     /// [`Self::with_per_key_replicas`].
     #[allow(clippy::type_complexity)]
     per_key_replicas: Option<Arc<dyn Fn(&[u8]) -> Vec<uuid::Uuid> + Send + Sync>>,
+    /// Per-write-set-entry replica sets, ALIGNED BY POSITION with [`Self::write_set`].
+    ///
+    /// This is the per-entry resolver the Apply phase AND the local apply fan-out use. It
+    /// carries exactly the information [`Self::per_key_replicas`] returns for an entry's key,
+    /// but keyed by POSITION instead of by the key BYTES — so the driver never holds a second
+    /// owned copy of an immutable, write-once conflict key. This is the
+    /// "nothing owns an immutable key" change (`refactor/borrow-the-commit-keys`).
+    ///
+    /// Set by [`Self::with_per_key_replicas`] (materialized eagerly, by position, from the
+    /// byte-keyed closure) and directly by
+    /// [`Self::with_per_key_replica_sets_by_position`] (the PostgreSQL commit path, which
+    /// already resolves each key during its single walk and so never builds a keyed index).
+    /// `None` keeps the single-shard default — every replica owns every key.
+    write_set_participants: Option<Arc<[Vec<uuid::Uuid>]>>,
     /// Optional local staging of this transaction's write-set mutation payloads.
     ///
     /// When a write-set is large enough to be the commit's memory problem, its
@@ -989,10 +1003,11 @@ impl AccordCoordinatorDriver {
         // Keep `mutation` = the first entry so the single-key wire path (PreAccept
         // key, v1 Apply payload) is byte-identical for a one-entry write-set.
         let mutation = write_set[0].1.clone();
-        let write_set: Vec<crate::accord::wire::WriteSetEntry> = write_set
+        let write_set: Arc<[crate::accord::wire::WriteSetEntry]> = write_set
             .into_iter()
             .map(|(key, mutation)| crate::accord::wire::WriteSetEntry { key, mutation })
-            .collect();
+            .collect::<Vec<_>>()
+            .into();
 
         let coordinator = AccordCoordinator::new(txn_id, t0, key, node_id, rf, is_leaseholder);
 
@@ -1025,6 +1040,7 @@ impl AccordCoordinatorDriver {
             local_accord_state: None,
             condition_gate: None,
             per_key_replicas: None,
+            write_set_participants: None,
             write_blobs: None,
             staged_prefix: None,
         }
@@ -1144,7 +1160,45 @@ impl AccordCoordinatorDriver {
         mut self,
         resolve: Arc<dyn Fn(&[u8]) -> Vec<uuid::Uuid> + Send + Sync>,
     ) -> Self {
+        // Materialize the per-entry sets NOW, by POSITION, so the driver's per-entry lookups
+        // never need the key bytes again. Behaviour is unchanged: for every write-set entry
+        // this is exactly `resolve(entry.key)`. The byte-keyed closure is retained only for
+        // the single marker-key lookup in `snapshot_marker_replicas`, whose key is a
+        // `&'static` const — not a per-key copy.
+        self.write_set_participants = Some(
+            self.write_set
+                .iter()
+                .map(|e| resolve(&e.key))
+                .collect::<Vec<_>>()
+                .into(),
+        );
         self.per_key_replicas = Some(resolve);
+        self
+    }
+
+    /// Set the per-write-set-entry replica sets DIRECTLY, by POSITION.
+    ///
+    /// The counterpart of [`Self::with_per_key_replicas`] for a caller that has ALREADY
+    /// resolved each entry: the PostgreSQL commit path resolves every conflict key during its
+    /// single walk (`resolve_driven_key`), so it hands the sets in aligned with the write-set
+    /// and never builds a keyed index at all — no conflict key is stored a second time.
+    ///
+    /// `sets` MUST hold one entry per write-set entry, in write-set order; a misaligned call
+    /// is refused loudly rather than scoping an Apply frame to the wrong keys.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sets.len() != self.write_set.len()` (a caller bug, never a runtime input).
+    pub fn with_per_key_replica_sets_by_position(mut self, sets: Vec<Vec<uuid::Uuid>>) -> Self {
+        assert_eq!(
+            sets.len(),
+            self.write_set.len(),
+            "per-key replica sets must be one per write-set entry, in write-set order \
+             ({} sets for {} entries)",
+            sets.len(),
+            self.write_set.len()
+        );
+        self.write_set_participants = Some(sets.into());
         self
     }
 
@@ -1237,20 +1291,21 @@ impl AccordCoordinatorDriver {
         }
     }
 
-    /// Whether `replica` owns `key` under the current resolver.
+    /// Whether `replica` owns the write-set entry at `index`, under the current resolver.
     ///
-    /// With no resolver this is the single-shard default — every replica owns
-    /// every key (returns `true`). With a resolver, `replica` owns `key` iff it
-    /// is in the key's resolved replica set.
-    fn replica_owns_key(&self, replica: uuid::Uuid, key: &[u8]) -> bool {
-        match &self.per_key_replicas {
-            Some(resolve) => resolve(key).contains(&replica),
+    /// Keyed by POSITION, not by the key BYTES: the per-entry replica sets are aligned with
+    /// [`Self::write_set`] (see [`Self::write_set_participants`]), so an immutable conflict key
+    /// is never stored a second time just to answer this. With no resolver this is the
+    /// single-shard default — every replica owns every key (returns `true`).
+    fn replica_owns_index(&self, replica: uuid::Uuid, index: usize) -> bool {
+        match &self.write_set_participants {
+            Some(sets) => sets.get(index).is_some_and(|s| s.contains(&replica)),
             None => true,
         }
     }
 
-    /// Borrow the `(key, mutation)` bytes of every write-set entry matching `own`,
-    /// in write-set order.
+    /// Borrow the `(key, mutation)` bytes of every write-set entry for which `own` (called
+    /// with the entry's POSITION) returns true, in write-set order.
     ///
     /// The keys are already resident, and a STAGED payload resolves to a slice of the
     /// spill's memory map ([`ferrosa_storage::write_set_spill::WriteSetSpill::entry`]),
@@ -1266,12 +1321,12 @@ impl AccordCoordinatorDriver {
         own: F,
     ) -> Result<BorrowedWriteSetEntries<'_>, AccordDriverError>
     where
-        F: Fn(&[u8]) -> bool,
+        F: Fn(usize) -> bool,
     {
         self.write_set
             .iter()
             .enumerate()
-            .filter(|(_, e)| own(&e.key))
+            .filter(|(index, _)| own(*index))
             .map(|(index, e)| {
                 let mutation: &[u8] = self.write_set_payload(index)?;
                 Ok((e.key.as_slice(), mutation))
@@ -1291,12 +1346,11 @@ impl AccordCoordinatorDriver {
     /// peer's payload is genuinely its own scope, which is why the fan-out keeps
     /// the per-peer build when this returns false.
     fn apply_payload_is_uniform(&self) -> bool {
-        let Some(resolve) = &self.per_key_replicas else {
+        let Some(sets) = &self.write_set_participants else {
             return true;
         };
-        let mut reference: Option<Vec<uuid::Uuid>> = None;
-        for entry in &self.write_set {
-            let set = resolve(&entry.key);
+        let mut reference: Option<&Vec<uuid::Uuid>> = None;
+        for set in sets.iter() {
             match &reference {
                 None => reference = Some(set),
                 Some(first) => {
@@ -1319,12 +1373,8 @@ impl AccordCoordinatorDriver {
     /// replica sets via the resolver (genuine multi-shard) when present, else the
     /// single-shard default (every key → the full replica list).
     fn participant_set(&self) -> crate::accord::shard_quorum::ParticipantSet {
-        match &self.per_key_replicas {
-            Some(resolve) => {
-                let sets: Vec<Vec<uuid::Uuid>> =
-                    self.write_set.iter().map(|e| resolve(&e.key)).collect();
-                crate::accord::shard_quorum::ParticipantSet::from_per_key(&sets)
-            }
+        match &self.write_set_participants {
+            Some(sets) => crate::accord::shard_quorum::ParticipantSet::from_per_key(sets),
             None => self.single_shard_participant(),
         }
     }
@@ -1345,7 +1395,9 @@ impl AccordCoordinatorDriver {
             let writes: Vec<crate::accord::wire::WriteSetEntry> = self
                 .write_set
                 .iter()
-                .filter(|e| self.replica_owns_key(peer, &e.key))
+                .enumerate()
+                .filter(|(index, _)| self.replica_owns_index(peer, *index))
+                .map(|(_, e)| e)
                 .cloned()
                 .collect();
             let payload = crate::accord::wire::ApplyV2Payload { txn_id, writes };
@@ -1388,7 +1440,7 @@ impl AccordCoordinatorDriver {
     fn apply_v2_payload(&self) -> crate::accord::wire::ApplyV2Payload {
         crate::accord::wire::ApplyV2Payload {
             txn_id: self.coordinator.txn_id,
-            writes: self.write_set.clone(),
+            writes: self.write_set.to_vec(),
         }
     }
 
@@ -1562,7 +1614,7 @@ impl AccordCoordinatorDriver {
     async fn order_and_gate(&mut self) -> Result<(Timestamp, HashSet<TxnId>), AccordDriverError> {
         use crate::accord::wire::{
             AcceptOkPayload, AcceptPayload, CommitOkPayload, CommitPayload, LegacyAcceptOkPayload,
-            PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2Payload, ReadVoteOkPayload,
+            PreAcceptOkPayload, PreAcceptPayload, PreAcceptV2PayloadBorrowed, ReadVoteOkPayload,
             ReadVotePayload,
         };
 
@@ -1618,11 +1670,23 @@ impl AccordCoordinatorDriver {
                 .map_err(|e| AccordDriverError::Codec(e.to_string()))?;
             Message::AccordPreAccept(Bytes::from(pa_bytes))
         } else {
-            let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
-            let pa_payload = PreAcceptV2Payload {
+            // The PreAcceptV2 key list BORROWS the driver's write-set keys: a key is
+            // immutable, write-once bytes that are only read here and written to the wire,
+            // so nothing owns a second copy of it. `keys` is one small slice-of-slices
+            // buffer; `PreAcceptV2PayloadBorrowed` serializes BYTE-IDENTICALLY to the owned
+            // `PreAcceptV2Payload` the replica decodes (see
+            // `wire::tests::borrowed_preaccept_v2_keys_serialize_byte_identically`), so the
+            // wire format does not move. The owned form cloned one key buffer per conflict
+            // key — the `order.preaccept_v2_keys` attribution site.
+            let site = ferrosa_common::mem_probe::enter_site(
+                ferrosa_common::mem_probe::SITE_ORDER_PREACCEPT_KEYS,
+            );
+            let keys: Vec<&[u8]> = self.write_set.iter().map(|w| w.key.as_slice()).collect();
+            ferrosa_common::mem_probe::exit_site(site);
+            let pa_payload = PreAcceptV2PayloadBorrowed {
                 txn_id,
                 t0,
-                keys,
+                keys: &keys,
                 ballot: BallotNumber(0),
                 epoch: 0,
                 snapshot_ts: self.snapshot_ts,
@@ -1682,10 +1746,21 @@ impl AccordCoordinatorDriver {
         let snapshot_marker_replicas = self.snapshot_ts.map(|_| {
             let marker_key =
                 ferrosa_storage::accord::conflict_index::POSTGRES_TRANSACTION_MARKER_KEY;
+            // Prefer the byte-keyed resolver when one is set (unchanged behaviour for the
+            // test/legacy builder); otherwise resolve the marker by its POSITION — the commit
+            // path appends the marker, so it always has a write-set position and no separate
+            // keyed index is needed.
             self.per_key_replicas
                 .as_ref()
                 .map(|resolve| resolve(marker_key))
                 .filter(|replicas| !replicas.is_empty())
+                .or_else(|| {
+                    self.write_set
+                        .iter()
+                        .position(|e| e.key == marker_key)
+                        .and_then(|index| self.write_set_participants.as_ref()?.get(index).cloned())
+                        .filter(|replicas| !replicas.is_empty())
+                })
                 .unwrap_or_else(|| self.replica_ids.clone())
         });
         let snapshot_marker_quorum = snapshot_marker_replicas
@@ -1697,10 +1772,22 @@ impl AccordCoordinatorDriver {
             && (self_vote_cannot_short_circuit || postgres_snapshot_transaction)
         {
             if let Some(local_sm) = &self.local_accord_state {
-                let keys: Vec<Vec<u8>> = self.write_set.iter().map(|w| w.key.clone()).collect();
+                // The self-vote's keys are the driver's OWN write-set keys, so the key
+                // list is built INSIDE the closure out of an `Arc` the closure owns: the
+                // vote costs ONE borrowed-slice buffer rather than one owned key buffer
+                // per conflict key. `on_state_machine`'s `F: ... + 'static` bound
+                // constrains the closure's CAPTURES, not the payload representation — an
+                // `Arc<[WriteSetEntry]>` is `'static` and the keys are borrowed from it in
+                // the body. That is the same correction `entry_mutation`'s docs record
+                // against the older "structurally required owned copy" claim.
+                let write_set = Arc::clone(&self.write_set);
                 let snapshot_ts = self.snapshot_ts;
                 let resp = crate::accord::handlers::on_state_machine(local_sm, move |sm| {
-                    let keys: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+                    let site = ferrosa_common::mem_probe::enter_site(
+                        ferrosa_common::mem_probe::SITE_ORDER_SELF_VOTE_KEYS,
+                    );
+                    let keys: Vec<&[u8]> = write_set.iter().map(|w| w.key.as_slice()).collect();
+                    ferrosa_common::mem_probe::exit_site(site);
                     sm.handle_preaccept_multi_with_snapshot(
                         txn_id,
                         t0,
@@ -2640,7 +2727,7 @@ impl AccordCoordinatorDriver {
                 .write_set
                 .iter()
                 .enumerate()
-                .filter(|(_, e)| self.replica_owns_key(self_id, &e.key))
+                .filter(|(index, _)| self.replica_owns_index(self_id, *index))
                 .map(|(index, _)| index)
                 .collect();
             if txn_profile_enabled() && ferrosa_common::mem_probe::installed() {
@@ -2925,7 +3012,7 @@ impl AccordCoordinatorDriver {
             tracing::error!(
                 txn_id = ?txn_id,
                 ?state,
-                owned_write_count = self.write_set.iter().filter(|entry| self.replica_owns_key(self_id, &entry.key)).count(),
+                owned_write_count = self.write_set.iter().enumerate().filter(|(index, _)| self.replica_owns_index(self_id, *index)).count(),
                 ?bound,
                 "accord: coordinator local Apply did not reach Applied within the \
                  dependency-wait bound after the Apply quorum was secured"
@@ -3290,8 +3377,8 @@ impl AccordCoordinatorDriver {
                             // staged write-set the stored `mutation` is EMPTY, so the old
                             // clone would have shipped empty writes), then write the frame
                             // straight from those borrows.
-                            let entries = self.borrowed_write_set_entries(|key| {
-                                self.replica_owns_key(peer_id, key)
+                            let entries = self.borrowed_write_set_entries(|index| {
+                                self.replica_owns_index(peer_id, index)
                             })?;
                             let bytes = encode_frame(&entries)?;
                             if let Some(started) = t_build {

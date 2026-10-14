@@ -218,6 +218,17 @@ pub async fn start_server(rows: usize) -> TestServer {
 
 /// [`start_server`] with explicit suspended-portal limits.
 pub async fn start_server_with(rows: usize, limits: ferrosa_postgres::PortalLimits) -> TestServer {
+    start_server_with_accord(rows, limits, AccordAccess::disabled()).await
+}
+
+/// [`start_server_with`] with an explicit [`AccordAccess`]: a test committer (a
+/// `MockTransactionCommitter`, or a probe that observes the read set a `COMMIT` hands on) or
+/// a real in-process cluster. `AccordAccess::disabled()` is the standalone default.
+pub async fn start_server_with_accord(
+    rows: usize,
+    limits: ferrosa_postgres::PortalLimits,
+    accord: AccordAccess,
+) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = StorageEngine::new(engine_config(dir.path()), None).expect("engine");
     engine.register_table(storage_schema()).expect("register");
@@ -232,7 +243,7 @@ pub async fn start_server_with(rows: usize, limits: ferrosa_postgres::PortalLimi
         schema: Arc::new(schema_with_table()),
         default_schema: "ks".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
-        accord: AccordAccess::disabled(),
+        accord,
         ddl: None,
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Arc::clone(&portals),
