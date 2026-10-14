@@ -114,13 +114,22 @@ and refuses jsonb in key columns (any depth, UDTs resolved through the snapshot'
 type map) and the D21 nestings. Every schema-mutating entry point calls it, and
 `apply_snapshot` checks the whole snapshot before applying anything.
 
-## jsonb DDL gate (T-300)
+## jsonb DDL gate (T-300, superseded by D32)
 
-D24 lets jsonb ship on a single node before the capability ledger. `Schema`
-carries the node's live `DeploymentMode` (an `ArcSwap` cell the cluster
-controller adopts as its own, so it cannot lag). `jsonb_ddl_permitted` is an
-exhaustive match: `Standalone` passes, the other five modes are refused. The
-same rule runs at DDL entry (`check_create_table_jsonb`,
+D24 let jsonb ship on a single node before the capability ledger existed. D32
+replaces the mode test with the check it stood for: `jsonb_ddl_permitted(mode,
+cluster)` passes on `Standalone` — no peer can disagree — or when every member
+advertises `CAP_JSONB_V1`, and otherwise refuses with a reason that names either
+the members lacking the capability or that the member view could not be read.
+Both matches stay exhaustive with no wildcard, so a new `DeploymentMode` or a
+new `JsonbClusterGate` variant does not compile until someone decides it.
+
+`Schema` carries two live `ArcSwap` cells the cluster controller adopts as its
+own, so neither can lag: the node's `DeploymentMode` and the cluster's jsonb
+readiness (`JsonbClusterGate`), the latter defaulting to `Unknown` — refuse
+outside standalone. The same rule runs at DDL entry (`check_create_table_jsonb`,
 `check_alter_table_jsonb`, `check_create_type_jsonb`) and at apply (create and
 alter table and type, replicated or authed, and `apply_snapshot`). T-154b
-replaces the mode check with the ledger at these call sites.
+replaces the capability check with the ledger at these call sites, closing the
+residual that a member which is DOWN during the DDL and returns later with an
+older build leaves open.

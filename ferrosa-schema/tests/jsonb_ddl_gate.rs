@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 
 use ferrosa_common::deployment_mode::DeploymentMode;
 use ferrosa_common::CqlType;
-use ferrosa_schema::jsonb_rules::{check_jsonb_ddl_allowed, jsonb_ddl_refused_total, TypeMap};
+use ferrosa_schema::jsonb_rules::{
+    check_jsonb_ddl_allowed, jsonb_ddl_refused_total, JsonbClusterGate, TypeMap,
+};
 use ferrosa_schema::*;
 use indexmap::IndexMap;
 
@@ -111,6 +113,71 @@ fn assert_refused(err: SchemaError, mode: DeploymentMode) {
         SchemaError::JsonbDdlRefused { mode: m, .. } => assert_eq!(m, mode),
         other => panic!("expected JsonbDdlRefused in {mode}, got {other:?}"),
     }
+}
+
+/// D32: a cluster whose members ALL understand jsonb may hold a jsonb table.
+///
+/// RED as written: today `Cluster` is refused unconditionally by
+/// `jsonb_ddl_permitted`, whatever the members support — the gate has no input
+/// that can express "every member is capable", which is the gap. This assertion
+/// therefore fails on the GATE'S BEHAVIOUR (a refusal), not on a missing symbol,
+/// so it keeps its meaning once the capability input is added.
+#[test]
+fn a_cluster_whose_members_all_understand_jsonb_may_create_a_jsonb_table() {
+    let s = schema_in(DeploymentMode::Cluster);
+    s.set_jsonb_cluster_gate(JsonbClusterGate::Capable);
+    s.check_create_table_jsonb(&table("a", "jsonb"))
+        .expect("a cluster whose members all understand jsonb must accept a jsonb table");
+    s.create_table(table("a", "jsonb"), &su())
+        .expect("and the apply must accept it too");
+    // The column really is there, with its type, rather than the statement merely
+    // having returned Ok.
+    let snap = s.snapshot();
+    let t = &snap.tables[&("t_ks".to_string(), "a".to_string())];
+    assert_eq!(
+        t.columns["v"].column_type, "jsonb",
+        "the applied column must be jsonb"
+    );
+}
+
+/// A refusal must name what the operator has to change: the members that do not
+/// understand jsonb. A refusal that names only the mode sends them to the wrong fix
+/// (upgrade the node vs. re-run the statement somewhere else).
+#[test]
+fn a_cluster_refusal_names_the_members_that_lack_jsonb() {
+    let s = schema_in(DeploymentMode::Cluster);
+    s.set_jsonb_cluster_gate(JsonbClusterGate::Incapable {
+        members: vec!["node3".to_string(), "node4".to_string()],
+    });
+    let e = s
+        .check_create_table_jsonb(&table("a", "jsonb"))
+        .expect_err("refused while a member lacks it");
+    let msg = e.to_string();
+    assert!(
+        msg.contains("node3") && msg.contains("node4"),
+        "the refusal must name every member that lacks it, got: {msg}"
+    );
+    assert!(
+        !msg.contains("standalone"),
+        "the mode is no longer the reason, so it must not be offered as one, got: {msg}"
+    );
+}
+
+/// An unread member view must refuse, never assume the members are capable. The bit
+/// is read from live connections, so a member that could not be read is unknown, and
+/// unknown is not capable.
+#[test]
+fn an_unread_member_view_refuses_jsonb_ddl() {
+    let s = schema_in(DeploymentMode::Cluster);
+    // No verdict published: the state of a node whose controller has not yet
+    // established the member set.
+    let e = s
+        .check_create_table_jsonb(&table("a", "jsonb"))
+        .expect_err("an unread view is refused");
+    assert!(
+        e.to_string().contains("could not be read"),
+        "the refusal must say the view was unread, got: {e}"
+    );
 }
 
 #[test]
@@ -241,11 +308,25 @@ fn snapshot_carrying_jsonb_is_refused_on_a_cluster_node() {
 #[test]
 fn shared_gate_function_is_exposed_for_other_wires() {
     let types = TypeMap::new();
-    check_jsonb_ddl_allowed(DeploymentMode::Standalone, "ks", &["jsonb"], &types).expect("ok");
-    check_jsonb_ddl_allowed(DeploymentMode::Cluster, "ks", &["int", "text"], &types)
-        .expect("no jsonb, no refusal");
+    check_jsonb_ddl_allowed(
+        DeploymentMode::Standalone,
+        &JsonbClusterGate::Unknown,
+        "ks",
+        &["jsonb"],
+        &types,
+    )
+    .expect("ok");
+    check_jsonb_ddl_allowed(
+        DeploymentMode::Cluster,
+        &JsonbClusterGate::Unknown,
+        "ks",
+        &["int", "text"],
+        &types,
+    )
+    .expect("no jsonb, no refusal");
     let e = check_jsonb_ddl_allowed(
         DeploymentMode::Cluster,
+        &JsonbClusterGate::Unknown,
         "ks",
         &["frozen<list<jsonb>>"],
         &types,
@@ -254,8 +335,14 @@ fn shared_gate_function_is_exposed_for_other_wires() {
     let text = e.to_string();
     assert!(text.contains("D15a") && text.contains("cluster"), "{text}");
     assert!(!text.to_lowercase().contains("disable"), "{text}");
-    let bad = check_jsonb_ddl_allowed(DeploymentMode::Cluster, "ks", &["list<"], &types)
-        .expect_err("an unparseable type is an error, not a skip");
+    let bad = check_jsonb_ddl_allowed(
+        DeploymentMode::Cluster,
+        &JsonbClusterGate::Unknown,
+        "ks",
+        &["list<"],
+        &types,
+    )
+    .expect_err("an unparseable type is an error, not a skip");
     assert!(matches!(bad, SchemaError::InvalidSchema(_)), "{bad:?}");
 }
 
