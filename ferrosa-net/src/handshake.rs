@@ -65,6 +65,15 @@ pub const CAP_ACCORD_APPLY_REGION_COMPRESSED: u32 = 1 << 5;
 /// sent a jsonb schema, and jsonb DDL is refused while any member lacks it.
 pub const CAP_JSONB_V1: u32 = 1 << 6;
 
+/// The node decodes the Cap'n Proto `ForwardedRaftCommand` frame a non-leader
+/// sends the Raft leader inside `Message::ClusterMembershipForward` on
+/// `Lane::Data` (`ferrosa_cluster::raft_forward_codec`). The body keeps the same
+/// message kind either way; the frame is told from the shipped bincode body by a
+/// versioned magic prefix, so a sender chooses capnp ONLY for a peer that
+/// advertised this bit. A peer without it is sent the bincode body it already
+/// understands — a peer on the previous build would fail-loud refuse the frame.
+pub const CAP_RAFT_SCHEMA_CAPNP: u32 = 1 << 7;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
 pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY
@@ -73,7 +82,8 @@ pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY
     | CAP_ACCORD_CAPNP
     | CAP_ACCORD_APPLY_REGION
     | CAP_ACCORD_APPLY_REGION_COMPRESSED
-    | CAP_JSONB_V1;
+    | CAP_JSONB_V1
+    | CAP_RAFT_SCHEMA_CAPNP;
 
 /// Peer metadata learned from a completed handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]

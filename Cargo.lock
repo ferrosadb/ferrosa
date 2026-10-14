@@ -2314,6 +2314,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "bytes",
+ "capnp",
  "crc32fast",
  "dashmap",
  "ferrosa-cdc",
