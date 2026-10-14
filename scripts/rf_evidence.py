@@ -715,7 +715,7 @@ def verify_one_cluster(nodes: list[Node], report: Report, timeout: int) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--nodes", type=int, default=4)
-    ap.add_argument("--base-port", type=int, default=49200)
+    ap.add_argument("--base-port", type=int, default=26000)
     ap.add_argument("--binary", default="target/release/ferrosa")
     ap.add_argument("--data-root", default=None)  # data-dir-write-ok: scratch dir this harness creates and owns for its own throwaway nodes
     ap.add_argument("--rf", default="1,3,5")

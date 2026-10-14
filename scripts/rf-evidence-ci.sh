@@ -11,7 +11,7 @@
 #
 # Requirements: a release `ferrosa` binary and python3 with cassandra-driver.
 # Usage:
-#   scripts/rf-evidence-ci.sh [--nodes 4] [--base-port 49200] [--binary path]
+#   scripts/rf-evidence-ci.sh [--nodes 4] [--base-port 26000] [--binary path]
 #
 # NOTE: set CARGO_BUILD_JOBS low and stagger node starts when CI runs this
 # alongside other heavy jobs — the harness retries formation, but the machine
@@ -22,7 +22,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 NODES="${RF_NODES:-4}"
-BASE_PORT="${RF_BASE_PORT:-49200}"
+# 26000, not 49200: a base port inside the kernel's ephemeral range can already
+# be held by an outbound connection as its source port (see
+# ferrosa-jepsen/tests/host_port_band.rs), and 49200 is inside it on macOS too.
+BASE_PORT="${RF_BASE_PORT:-26000}"
 BINARY="${RF_BINARY:-${REPO_ROOT}/target/release/ferrosa}"
 PY="${RF_PYTHON:-python3}"
 OUT="${RF_OUT:-${REPO_ROOT}/target/rf-evidence/rf-evidence.json}"

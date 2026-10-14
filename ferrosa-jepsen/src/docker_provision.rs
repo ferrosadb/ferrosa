@@ -17,8 +17,14 @@ use tracing::{debug, info};
 
 use crate::config::Topology;
 
-// CQL ports assigned to each of the three Jepsen cluster nodes on localhost.
-const NODE_CQL_PORTS: [u16; 3] = [49042, 49043, 49044];
+// Host-side CQL ports assigned to each of the three Jepsen cluster nodes on
+// localhost. They must stay below the kernel's ephemeral range floor (32768) so
+// an outbound connection can never already hold one as its source port and make
+// `docker compose up` fail to publish the mapping. They must also match the CQL
+// host ports published by `tests/docker/jepsen-cluster.yml`; the
+// `host_port_band` test pins both, and uses the 29xxx band the multi-DC nightly
+// topology already uses.
+pub const NODE_CQL_PORTS: [u16; 3] = [29042, 29043, 29044];
 
 /// Detect whether `docker` or `podman` is usable and return the binary name.
 ///
@@ -420,9 +426,9 @@ mod tests {
     fn node_info_cql_address() {
         let node = NodeInfo {
             host: "localhost".to_string(),
-            cql_port: 49042,
+            cql_port: 29042,
         };
-        assert_eq!(node.cql_address(), "localhost:49042");
+        assert_eq!(node.cql_address(), "localhost:29042");
     }
 
     #[test]
@@ -431,15 +437,15 @@ mod tests {
             nodes: vec![
                 NodeInfo {
                     host: "localhost".to_string(),
-                    cql_port: 49042,
+                    cql_port: 29042,
                 },
                 NodeInfo {
                     host: "localhost".to_string(),
-                    cql_port: 49043,
+                    cql_port: 29043,
                 },
                 NodeInfo {
                     host: "localhost".to_string(),
-                    cql_port: 49044,
+                    cql_port: 29044,
                 },
             ],
             compose_file: Some(PathBuf::from("/tmp/fake.yml")),

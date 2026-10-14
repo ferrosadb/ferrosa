@@ -177,6 +177,16 @@ is what surfaces a stuck leader as that class rather than a 30 s hang.
    (`40001` for a transaction, `Unavailable`/0x1000 for the teardown DDL) is
    retryable; a client timeout's outcome is unknown and is reported, never
    re-issued. No retry count and no timeout is widened by any of this.
+10. **Fixed host ports stay below the kernel's ephemeral range floor.** Every
+   host port the harness or its compose publishes is below `32768` (Linux's
+   `net.ipv4.ip_local_port_range` floor), so the kernel can never already hold
+   one as an outbound connection's source port. A port inside the range makes
+   `docker compose up` fail to bind the mapping before any ferrosa code runs.
+   `tests/host_port_band.rs` walks every YAML in the repo plus the harness port
+   constants (`docker_provision::NODE_CQL_PORTS`, `chaos::DEFAULT_ADMIN_URL`,
+   and the `--base-port` / `RF_BASE_PORT` defaults in `scripts/`) and fails on
+   any host port at or above the floor; the single-DC Jepsen compose now uses
+   the same 29xxx band as the multi-DC nightly topology.
 
 ## Position in the dependency graph
 
