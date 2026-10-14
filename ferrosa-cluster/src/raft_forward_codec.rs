@@ -60,7 +60,7 @@ use uuid::Uuid;
 
 use crate::raft::{DataMovementEvidence, NodeInfo, NodeState, RaftCommand, RaftOp};
 
-/// Wire magic marking a Cap'n Proto [`ForwardedRaftCommand`] body: the ASCII
+/// Wire magic marking a Cap'n Proto `ForwardedRaftCommand` body: the ASCII
 /// bytes `FRWF` (forwarded raft wire frame), big-endian on the wire.
 ///
 /// Distinct from the Accord envelope's `Envelope.magic` (`0x4645_5231`, `FER1`)

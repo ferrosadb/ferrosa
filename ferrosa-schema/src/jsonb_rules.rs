@@ -327,9 +327,10 @@ pub fn check_added_columns(
 /// What this node knows about its cluster's ability to understand jsonb (D32).
 ///
 /// Published by the cluster controller from the peer capability view and read by the
-/// DDL gate, exactly as the deployment mode is. The default is [`Unknown`]: a node
-/// that has not been told otherwise refuses jsonb DDL outside standalone, which is
-/// the pre-D32 behaviour, so nothing loosens by accident.
+/// DDL gate, exactly as the deployment mode is. The default is
+/// [`JsonbClusterGate::Unknown`]: a node that has not been told otherwise refuses
+/// jsonb DDL outside standalone, which is the pre-D32 behaviour, so nothing loosens
+/// by accident.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum JsonbClusterGate {
     /// The member set, or a member's advertised capabilities, could not be read.
