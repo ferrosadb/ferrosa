@@ -3,7 +3,8 @@ set -euo pipefail
 
 # The release version is main's Cargo version ("main leads").
 #
-# Every PR bumps `[workspace.package] version` with scripts/semver-bump, so a
+# The release bot bumps `[workspace.package] version` on main after every merge
+# (.github/workflows/semver.yml, scripts/semver-bump --release), so a
 # release never computes its own version: it reads the one at HEAD (any
 # pre-release suffix such as -nightly is dropped) and checks it against the
 # latest stable `vX.Y.Z` tag. CalVer nightly tags (vYYYY.MM.DD.HHMM) and
@@ -69,12 +70,13 @@ fi
 highest="$(printf '%s\n%s\n' "${base_tag#v}" "$version" | sort -V | tail -n 1)"
 if [[ "$version" != "${base_tag#v}" && "$highest" != "$version" ]]; then
   echo "error: main's version ${version} is BELOW the latest stable tag ${base_tag}." >&2
-  echo "       Main leads: fix Cargo.toml on main (scripts/semver-bump --apply) instead of releasing backwards." >&2
+  echo "       Main leads: fix Cargo.toml on main with a PR instead of releasing backwards." >&2
   exit 1
 fi
 if [[ "$version" == "${base_tag#v}" ]]; then
   echo "error: main's version ${version} equals the latest stable tag ${base_tag} but ${commit_count} commit(s) landed since:" >&2
-  echo "       a change reached main not bumped (scripts/semver-bump --check should have refused it)." >&2
+  echo "       a change reached main not bumped. The release bot bumps main after every merge:" >&2
+  echo "       check the latest 'Semver / bump and tag main' run (.github/workflows/semver.yml)." >&2
   exit 1
 fi
 

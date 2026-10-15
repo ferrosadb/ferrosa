@@ -23,7 +23,7 @@ on:
     # the pair-mode smoke test to be killed before nodes became CQL-ready.
     - cron: '17 0 * * *'
   # No bump override: the version is main's [workspace.package] version, which
-  # every PR bumps with scripts/semver-bump ("main leads").
+  # the release bot bumps after every merge (semver.yml, "main leads").
   workflow_dispatch:
     inputs:
       force:
@@ -46,6 +46,11 @@ env:
 jobs:
   release:
     name: Bump version, tag, and dispatch release build
+    # On push, cut only from the release bot's `chore(release): vX.Y.Z` commit
+    # (semver.yml), which follows every merge. The merge push itself still
+    # carries the previous version, so cutting there would label the build
+    # with a stale version and then cut a second one when the bot pushes.
+    if: "github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release): v')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2

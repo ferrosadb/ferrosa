@@ -3,9 +3,9 @@
 # Install:  pre-commit install   (installs every default_install_hook_types entry)
 # Bypass:   FERROSA_SKIP_PREPUSH=1 git push    (or git push --no-verify)
 #
-# Versioning: commit-msg refuses a non-Conventional Commit header, and the
-# first pre-push hook refuses a branch whose version is not bumped as far as
-# its commits require. Fix with `scripts/semver-bump --apply`.
+# Versioning: commit-msg refuses a non-Conventional Commit header. There is no
+# local bump requirement: the release bot bumps main after merge
+# (.github/workflows/semver.yml; "Versioning" in CONTRIBUTING.md).
 #
 # Speed budget:
 #   - pre-commit must stay under ~5 seconds (developer commits frequently).
@@ -62,25 +62,15 @@ repos:
         types: [rust]
         pass_filenames: false
 
-      # commit-msg: the header must be a Conventional Commit, because the
-      # semver bump is computed from it (scripts/semver-bump). pre-commit
-      # passes the message file as the one argument.
+      # commit-msg: the header must be a Conventional Commit. The bump is set
+      # by the PR title (checked in CI), but conventional commits make good
+      # titles and keep rebase merges countable. pre-commit passes the
+      # message file as the one argument.
       - id: conventional-commit-msg
         name: Conventional Commit header (commit-msg)
         stages: [commit-msg]
         entry: python3 scripts/semver-bump --check-message
         language: system
-
-      # Pre-push, FIRST so it fails in a second instead of after the
-      # multi-minute test mirror below: the branch's version must be bumped
-      # as far as its commits require. Fix with `scripts/semver-bump --apply`.
-      - id: semver-bump
-        name: semver bump present (pre-push, scripts/semver-bump --check)
-        stages: [pre-push]
-        entry: python3 scripts/semver-bump --check --base origin/main
-        language: system
-        always_run: true
-        pass_filenames: false
 
       # Pre-push: mirror CI's `cargo test` invocation exactly (see
       # .github/workflows/ci.yml "Run tests" step). Same workspace,

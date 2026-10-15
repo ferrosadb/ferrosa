@@ -3,12 +3,12 @@ name: Promote Release to Stable
 # Promotes a CalVer nightly (vYYYY.MM.DD.HHMM, a prerelease) to a stable SemVer
 # release (vX.Y.Z). Because nightly and stable are now SEPARATE tags, promotion
 # is a recut, not a flag flip: we check out the nightly's commit, read main's
-# [workspace.package] version there (main leads: every PR bumps it), tag it,
+# [workspace.package] version there (main leads: the release bot bumps it after every merge), tag it,
 # and rebuild so the stable artifacts carry a clean SemVer (the nightly
 # binaries report `X.Y.Z-nightly`). release.yml publishes it as `--latest`.
 #
 # Main is never written: it already carries the version, so there is no
-# "sync main" PR (it used to LOWER main below its per-PR bumps).
+# "sync main" PR (it used to LOWER main below its bumps).
 
 on:
   workflow_dispatch:

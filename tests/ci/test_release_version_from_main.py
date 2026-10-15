@@ -1,8 +1,9 @@
 """Release versions come from main's Cargo version ("main leads").
 
-Every PR bumps `[workspace.package] version` (scripts/semver-bump), so the
-nightly and stable release workflows read that version instead of computing
-their own from tags. These tests pin the version script and both workflows.
+The release bot bumps `[workspace.package] version` on main after every merge
+(semver.yml, scripts/semver-bump --release), so the nightly and stable release
+workflows read that version instead of computing their own from tags. These
+tests pin the version script, both release workflows and the bot workflow.
 Run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
 """
 import os
@@ -17,6 +18,7 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 NIGHTLY = WORKFLOWS / "nightly-release.yml"
 PROMOTE = WORKFLOWS / "promote-release.yml"
 CI = WORKFLOWS / "ci.yml"
+SEMVER = WORKFLOWS / "semver.yml"
 
 
 class ScriptTest(unittest.TestCase):
@@ -151,6 +153,16 @@ class WorkflowContractTest(unittest.TestCase):
         self.assertIn('NIGHTLY_VERSION="${VERSION}-nightly"', wf)
         self.assertIn("gh workflow run release.yml --ref", wf)
 
+    def test_nightly_on_push_cuts_only_from_the_bot_release_commit(self):
+        # The merge push still carries the previous version; the bot's
+        # chore(release) push that follows it is the one to cut from.
+        wf = NIGHTLY.read_text(encoding="utf-8")
+        self.assertIn(
+            "if: \"github.event_name != 'push' || "
+            "startsWith(github.event.head_commit.message, 'chore(release): v')\"",
+            wf,
+        )
+
     def test_promotion_reads_main_and_never_opens_a_sync_pr(self):
         wf = PROMOTE.read_text(encoding="utf-8")
         self.assertIn("bash .github/scripts/release-version-from-main.sh promote", wf)
@@ -162,6 +174,38 @@ class WorkflowContractTest(unittest.TestCase):
 
     def test_tag_computing_script_is_gone(self):
         self.assertFalse((ROOT / ".github" / "scripts" / "next-release-version.sh").exists())
+
+
+class SemverWorkflowContractTest(unittest.TestCase):
+    """The bump happens after merge, by the bot; a PR needs only a conventional title."""
+
+    def setUp(self):
+        self.wf = SEMVER.read_text(encoding="utf-8")
+
+    def test_pr_checks_the_title_through_env_and_never_requires_a_bump(self):
+        self.assertIn("types: [opened, edited, synchronize, reopened]", self.wf)
+        self.assertIn("TITLE: ${{ github.event.pull_request.title }}", self.wf)
+        self.assertIn('python3 scripts/semver-bump --check-title "$TITLE"', self.wf)
+        self.assertNotIn("--check-title \"${{", self.wf)  # no interpolation into the script
+        self.assertNotIn("semver-bump --check ", self.wf)
+
+    def test_release_job_uses_the_app_and_fails_loud_without_it(self):
+        self.assertIn("group: semver-release", self.wf)
+        self.assertIn("vars.FERROSA_RELEASE_BOT_APP_ID", self.wf)
+        self.assertIn("secrets.FERROSA_RELEASE_BOT_PRIVATE_KEY", self.wf)
+        self.assertIn("::error::semver release cannot run", self.wf)
+        self.assertIn("actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1", self.wf)
+        self.assertIn("python3 scripts/semver-bump --release", self.wf)
+        self.assertIn("git push --atomic origin", self.wf)
+        self.assertNotIn("contents: write", self.wf)  # the push uses the App token
+
+    def test_release_refuses_a_tag_prefix_that_would_trigger_release_yml(self):
+        self.assertIn("v*) echo \"::error::tag_prefix", self.wf)
+
+    def test_no_local_bump_hook(self):
+        hooks = (ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("semver-bump --check --base", hooks)
+        self.assertIn("semver-bump --check-message", hooks)
 
 
 if __name__ == "__main__":
