@@ -1,30 +1,34 @@
 ---
 crate: ferrosa-graph
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-10-15
 ---
 
 # ferrosa-graph — Roadmap
+
+> Reviewed 2026-10-15 against `9e32e82a` (v0.22.3). FMEA G-3 and the G-7
+> metrics half are implemented and removed from the forward plan; the G-1
+> repair/error counters shipped, leaving only the non-zero production default
+> open.
 
 Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 `TODO`/`FIXME` markers exist), and the adjacency-consistency design.
 
 ## Now (highest value)
 
-- **Arm + observe adjacency reconciliation (FMEA G-1).** The synchronous observer
-  is the primary guarantee, but the background reconciler — the only thing that
-  catches dropped mutations and crash-recovery drift — is disabled by the default
-  `GraphConfig` (`reconciliation_interval = ZERO`). Ship a non-zero production
-  default and add an observable **adjacency-drift counter** (entries repaired per
-  pass), so the fallback firing is an alert, not a silent log line.
+- **Arm adjacency reconciliation in production (FMEA G-1).** The synchronous
+  observer is the primary guarantee, but the background reconciler — the only
+  thing that catches dropped mutations and crash-recovery drift — is still
+  disabled by the default `GraphConfig` (`reconciliation_interval = ZERO`). Ship
+  a non-zero production default. The observable half is already in place: pass
+  counters export as
+  `ferrosa_graph_adjacency_entries_{repaired,removed,rewritten}_total` and
+  `_reconcile_errors_total` on `/metrics`, so the fallback firing is an alert,
+  not a silent log line.
 - **Fail loud on unindexable edge tables (FMEA G-2).** When a `graph.type=edge`
   table lacks `graph.source` / `graph.target`, the observer and reconciler skip it
   silently and the edge is invisible to every traversal. Validate at registration
   (or DDL) time and reject/warn instead of producing a silently broken graph.
-- **Route reconciler writes through the keyspace replication strategy (FMEA G-3).**
-  Replace the hardcoded `ReplicationStrategy::Simple{rf:1}` / `ConsistencyLevel::One`
-  in `write_mutation` / `write_tombstone` with `graph_replication_strategy(schema, ks)`,
-  matching the query path so multi-replica keyspaces are repaired uniformly.
 
 ## Next
 
@@ -32,12 +36,6 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   them a typed error on the schema-less CREATE/MERGE path (FMEA G-11); the jsonb
   write replaces that error. Also fix `expr_to_column_bytes` integer/float widths.
 
-- **Reflect reconciler read failures in `ReconcileMetrics` (FMEA G-7).** The
-  discarded `Err(_) => continue` / `unwrap_or_default()` paths are gone — both
-  scans stream and log every failure with the table and how far it got
-  (t_bc5f0e6f). What remains is the metrics half: a caller reading
-  `ReconcileMetrics` still cannot distinguish a complete pass from one that
-  skipped a table.
 - **Stream phase A of `Expand` end to end (FMEA G-9, t_4ce82a3e).** The anchor
   SCAN no longer materializes, but the frontier it feeds still collects one
   `ExpandState` per surviving anchor row. That is bounded by the answer rather
@@ -66,6 +64,20 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 - **Property-test the adjacency invariant.** A round-trip property: for any edge
   mutation sequence, the derived adjacency set equals the reconciler's recomputed
   set — an invariant regression net independent of the executor.
+
+## Implemented since the last revision
+
+- **G-3 — reconciler writes at the keyspace replication strategy (2026-10-03).**
+  `write_mutation` / `write_tombstone` write the index at CL ALL under the
+  adjacency keyspace's own replication, and both reconcile scans run at CL ONE
+  under each keyspace's replication (`graph_replication_strategy`); no hardcoded
+  `Simple{rf:1}` / `ConsistencyLevel::One` remains (`adjacency/reconcile.rs`;
+  FMEA G-3).
+- **G-7 — reconciler read failures surface in `ReconcileMetrics` (2026-10-03).**
+  Both scans stream and log every failure — opening the scan and failing
+  mid-stream — with the table and how far it got, and each failure increments
+  `ReconcileMetrics::errors`; `is_complete()` lets the periodic pass and the
+  first-use heal treat an incomplete pass as not healed (t_bc5f0e6f; FMEA G-7).
 
 ## Non-goals
 

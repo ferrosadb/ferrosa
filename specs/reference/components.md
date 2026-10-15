@@ -1,80 +1,158 @@
 # Component Architecture
 
-> Last updated: 2026-06-19
+> Last updated: 2026-10-15
 > Status: Approved
+
+> **Revision note (2026-10-15):** crate count, dependency graph, and `ferrosa-graph` dependency set re-derived from `cargo metadata` at `origin/main` @ `9e32e82a` (release v0.22.3); `ferrosa-cql` LOC and the internode `MsgType` count re-measured against the same revision.
 
 ## Overview
 
-Ferrosa is a Cargo workspace of 25 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently. Three client surfaces sit over the same storage/schema/transaction core: **CQL** (`ferrosa-cql`, port 9042), the **PostgreSQL wire** front-end (`ferrosa-postgres`, port 5432, developer preview), and an **Arrow Flight** gRPC endpoint (`ferrosa-flight`). The graph (`ferrosa-graph`, Bolt/HTTP) and SPARQL (`ferrosa-sparql`) engines add query models on top.
+Ferrosa is a Cargo workspace of 28 crates with a clean, acyclic dependency graph. Each crate has a single responsibility and can be tested independently. Three client surfaces sit over the same storage/schema/transaction core: **CQL** (`ferrosa-cql`, port 9042), the **PostgreSQL wire** front-end (`ferrosa-postgres`, port 5432, developer preview), and an **Arrow Flight** gRPC endpoint (`ferrosa-flight`). The graph (`ferrosa-graph`, Bolt/HTTP) and SPARQL (`ferrosa-sparql`) engines add query models on top.
 
 ## Dependency Graph
 
 ```mermaid
 graph BT
-    Common[ferrosa-common<br/>Shared types]
-    SST[ferrosa-sstable<br/>SSTable read/write]
-    Index[ferrosa-index<br/>Secondary + vector indexes]
-    UDF[ferrosa-udf<br/>WASM UDF sandbox]
-    Net[ferrosa-net<br/>Internode protocol]
-    Storage[ferrosa-storage<br/>Write-behind S3 engine]
-    Schema[ferrosa-schema<br/>DDL, system keyspaces]
-    CQL[ferrosa-cql<br/>CQL protocol v5]
-    Graph[ferrosa-graph<br/>Graph query engine]
-    SPARQL[ferrosa-sparql<br/>SPARQL 1.1 endpoint]
-    PG[ferrosa-postgres<br/>PostgreSQL wire]
-    SQLEng[ferrosa-sql<br/>Bespoke SQL engine]
-    RowBridge[ferrosa-row-bridge<br/>Shared CQL row codec]
-    Flight[ferrosa-flight<br/>Arrow Flight gRPC]
+    Bin[ferrosa<br/>Binary]
     CDC[ferrosa-cdc<br/>Change-data bus]
     Cluster[ferrosa-cluster<br/>Raft, Routing, CL]
+    Common[ferrosa-common<br/>Shared types]
+    CQL[ferrosa-cql<br/>CQL protocol v5]
     Ctl[ferrosa-ctl<br/>CLI admin + TUI]
-    Bin[ferrosa<br/>Binary]
+    Flight[ferrosa-flight<br/>Arrow Flight gRPC]
+    Graph[ferrosa-graph<br/>Graph query engine]
+    Index[ferrosa-index<br/>Secondary + vector indexes]
+    IndexBuilder[ferrosa-index-builder<br/>Remote index build]
+    Jepsen[ferrosa-jepsen<br/>Jepsen harness]
+    Jsonb[ferrosa-jsonb<br/>JSONB value]
+    Loadgen[ferrosa-loadgen<br/>Load generator]
+    Net[ferrosa-net<br/>Internode protocol]
+    PG[ferrosa-postgres<br/>PostgreSQL wire]
+    RowBridge[ferrosa-row-bridge<br/>Shared CQL row codec]
+    Sched[ferrosa-sched<br/>Scheduler]
+    Schema[ferrosa-schema<br/>DDL, system keyspaces]
+    Session[ferrosa-session<br/>Session state]
+    Sim[ferrosa-sim<br/>Deterministic sim]
+    SPARQL[ferrosa-sparql<br/>SPARQL 1.1 endpoint]
+    SQLEng[ferrosa-sql<br/>Bespoke SQL engine]
+    SST[ferrosa-sstable<br/>SSTable read/write]
+    Storage[ferrosa-storage<br/>Write-behind S3 engine]
+    UDF[ferrosa-udf<br/>WASM UDF sandbox]
+    View[ferrosa-view<br/>Materialized-view primitives]
+    Worker[ferrosa-worker<br/>Background tasks]
+    Xtask[xtask<br/>Build tooling]
 
-    SST --> Common
-    Index --> Common
-    UDF --> Common
-    Net --> Common
-    Storage --> Common
-    Storage --> SST
-    Storage --> Index
-    Schema --> Common
-    Schema --> Index
-    CQL --> Common
-    CQL --> Schema
-    CQL --> Storage
-    CQL --> Index
-    Graph --> Common
-    Graph --> Schema
-    SPARQL --> Storage
-    SPARQL --> Schema
-    Graph --> SST
-    Graph --> Storage
-    Cluster --> Common
-    Cluster --> Net
-    Cluster --> Storage
-    Cluster --> Schema
-    Ctl --> CQL
-    SQLEng --> Common
-    RowBridge --> Common
-    RowBridge --> SST
-    CQL --> RowBridge
-    PG --> Common
-    PG --> Schema
-    PG --> Storage
-    PG --> SQLEng
-    PG --> RowBridge
-    Flight --> Common
-    Flight --> CQL
-    CDC --> Common
-    Storage --> CDC
-    Cluster --> CDC
-    CQL --> CDC
-    Bin --> CQL
-    Bin --> Graph
-    Bin --> PG
-    Bin --> Flight
+    Bin --> CDC
     Bin --> Cluster
     Bin --> Common
+    Bin --> CQL
+    Bin --> Flight
+    Bin --> Graph
+    Bin --> Jsonb
+    Bin --> Net
+    Bin --> PG
+    Bin --> Sched
+    Bin --> Schema
+    Bin --> Session
+    Bin --> SPARQL
+    Bin --> SST
+    Bin --> Storage
+    Bin --> UDF
+    CDC --> Common
+    CDC --> SST
+    Cluster --> CDC
+    Cluster --> Common
+    Cluster --> Index
+    Cluster --> Net
+    Cluster --> Schema
+    Cluster --> SST
+    Cluster --> Storage
+    Common --> Jsonb
+    CQL --> CDC
+    CQL --> Cluster
+    CQL --> Common
+    CQL --> Index
+    CQL --> Net
+    CQL --> RowBridge
+    CQL --> Sched
+    CQL --> Schema
+    CQL --> Session
+    CQL --> SST
+    CQL --> Storage
+    CQL --> UDF
+    Ctl --> Cluster
+    Ctl --> Common
+    Ctl --> CQL
+    Ctl --> SST
+    Ctl --> Storage
+    Flight --> Cluster
+    Flight --> Common
+    Flight --> CQL
+    Flight --> Net
+    Flight --> Schema
+    Graph --> Cluster
+    Graph --> Common
+    Graph --> Net
+    Graph --> Schema
+    Graph --> SST
+    Graph --> Storage
+    Index --> Common
+    IndexBuilder --> Common
+    IndexBuilder --> Index
+    IndexBuilder --> SST
+    IndexBuilder --> Storage
+    Jepsen --> Sim
+    Loadgen --> Common
+    Loadgen --> CQL
+    Loadgen --> Schema
+    Loadgen --> SST
+    Loadgen --> Storage
+    Net --> Common
+    PG --> Cluster
+    PG --> Common
+    PG --> Jsonb
+    PG --> Net
+    PG --> RowBridge
+    PG --> Schema
+    PG --> SQLEng
+    PG --> SST
+    PG --> Storage
+    RowBridge --> Common
+    RowBridge --> Jsonb
+    RowBridge --> Schema
+    RowBridge --> SST
+    Schema --> Common
+    Schema --> Index
+    Schema --> SST
+    Session --> Cluster
+    Session --> Common
+    Session --> Net
+    Session --> Schema
+    Session --> Storage
+    Session --> UDF
+    Sim --> Common
+    SPARQL --> Cluster
+    SPARQL --> Common
+    SPARQL --> Index
+    SPARQL --> Net
+    SPARQL --> Schema
+    SPARQL --> SST
+    SPARQL --> Storage
+    SQLEng --> Jsonb
+    SQLEng --> Storage
+    SST --> Common
+    Storage --> CDC
+    Storage --> Common
+    Storage --> Index
+    Storage --> RowBridge
+    Storage --> Sched
+    Storage --> Schema
+    Storage --> SST
+    UDF --> Common
+    View --> Schema
+    Worker --> Common
+    Worker --> Index
+    Worker --> SST
 ```
 
 ## Components
@@ -263,7 +341,7 @@ graph BT
 
 - **Purpose**: Graph query engine with Cypher support, adjacency index, HTTP endpoint
 - **Location**: `ferrosa-graph/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-sstable`, `ferrosa-storage`, `arc-swap`, `axum`, `axum-server` (TLS), `base64`, `hex`, `indexmap`, `phf`, `serde`, `serde_json`, `tokio`, `tower-http`, `tracing`, `uuid`
+- **Dependencies**: `ferrosa-common`, `ferrosa-schema`, `ferrosa-sstable`, `ferrosa-cluster`, `ferrosa-storage`, `ferrosa-net`, `arc-swap`, `async-stream`, `async-trait`, `axum`, `axum-server` (TLS), `base64`, `blake3`, `chrono`, `futures`, `hex`, `indexmap`, `parking_lot`, `phf`, `rustls`, `serde`, `serde_json`, `tokio`, `tokio-rustls`, `tokio-stream`, `tokio-util`, `tower-http`, `tracing`, `uuid`
 - **Status**: Phase 1 implemented — Cypher parser, logical/physical planners, hop-by-hop executor, adjacency index with async observer, HTTP endpoint with auth/TLS, background reconciliation
 - **Modules**:
   - `parser/` — Cypher lexer, recursive descent parser, AST types
@@ -280,6 +358,7 @@ graph BT
 - **Security mitigations**: T2 (HTTP auth), T3 (per-hop auth), T4 (timeout + fan-out limits), T5 (reconciliation), T6 (extension validation in schema), T7 (system table protection), T8 (error sanitization), T9 (observer backpressure), T10 (audit events), T11 (TLS)
 - **Recent fixes**: Property resolution via schema metadata (not hardcoded), Cypher double-quoted string literals, path assignment syntax (`p = (a)-[r]->(b)`), `COLLECT(DISTINCT ...)` aggregation, `NOT` pattern support in WHERE clauses, `variable_tables` for DELETE operations, tokio runtime check to avoid nested runtime panics.
 - **Design**: Data stored in normal CQL tables with `graph.*` extensions, accessed via system-managed adjacency index per keyspace
+- **MERGE key-column contract**: the executor refuses a Cypher `MERGE` that sets *some but not all* of a backing table's key columns (partition key ∪ clustering key); the partial case returns `GraphError::Validation` naming the table before any storage write. Implemented by `schema_merge_requires_hidden_key_resolution` (`ferrosa-graph/src/executor/expand.rs:4956`, call site `:4059`), error text at `expand.rs:4061-4064`. Setting all key columns is required; setting none is allowed (the executor derives the full key shape). This guard binds only the Cypher path — a raw-CQL writer bypasses it, and that gap is the graph/memory schema-level coupling recorded in [dsm-analysis.md](dsm-analysis.md).
 
 ### ferrosa-sparql
 
@@ -329,7 +408,7 @@ graph BT
 - **Location**: `ferrosa-row-bridge/`
 - **Dependencies**: `ferrosa-common`, `ferrosa-sstable`, `ferrosa-schema`
 - **Key interfaces**: `encode_value`/`decode_value` (CQL wire codec), `build_decorated_key`, `build_row`, `build_delete_row`, `encode_clustering`, `partition_to_rows*` (storage `Partition` → result rows)
-- **Boundary**: `ferrosa-cql` re-exports these so the CQL and Postgres write paths produce byte-identical storage rows; `ferrosa-postgres` reuses it **without** depending on the ~54k-LOC `ferrosa-cql`
+- **Boundary**: `ferrosa-cql` re-exports these so the CQL and Postgres write paths produce byte-identical storage rows; `ferrosa-postgres` reuses it **without** depending on `ferrosa-cql` (78,661 lines under `src/` at v0.22.3)
 
 ### ferrosa-flight
 
@@ -366,11 +445,11 @@ graph BT
 
 - **Purpose**: Custom internode protocol — transport, RPC, failure detection
 - **Location**: `ferrosa-net/`
-- **Dependencies**: `bytes`, `tokio`, `tokio-util`, `futures`, `hmac`, `sha2`, `rand`, `uuid`
-- **Status**: Phase 1 complete — 26 message types, PSK auth, priority-lane RPC, CQL broadcast propagation
-- **No dependency on ferrosa-common** (standalone crate)
+- **Dependencies**: `ferrosa-common`, `arc-swap`, `async-trait`, `bytes`, `capnp` (build-time `capnpc`), `dashmap`, `futures`, `hmac`, `lz4_flex`, `parking_lot`, `rand`, `rustls`, `rustls-pemfile`, `sha2`, `snap`, `tokio`, `tokio-rustls`, `tokio-util`, `tracing`, `uuid`, `zstd`
+- **Status**: Phase 1 complete — 87 message types, PSK auth, priority-lane RPC, CQL broadcast propagation
+- Its only internal dependency is `ferrosa-common` (shared types); it deliberately stays below the schema/storage layers
 - **Modules**:
-  - `codec.rs` — 12-byte frame header, `MsgType` enum (0x01-0x47), `InternodeCodec`
+  - `codec.rs` — 12-byte frame header, `MsgType` enum (0x01-0x83), `InternodeCodec`
   - `message.rs` — `Message` enum, encode/decode for all types including `ClusterInvite` (peer list with 10k cap) and `ClusterInviteAck`
   - `handshake.rs` — PSK-authenticated handshake (HMAC-SHA256), cluster name + protocol version + bidirectional CQL broadcast address exchange
   - `config.rs` — `NetConfig` with 12-factor env var support, `cql_broadcast: Option<String>` (`FERROSA_CQL_BROADCAST`)
@@ -519,7 +598,7 @@ gantt
 | 5 | ferrosa-cql | cqlsh connects and runs basic queries — **done** (full CQL lifecycle: parse, route, execute, prepared cache) |
 | 5b | ferrosa-graph | Graph queries via HTTP with auth — **done** (Phase 1: parser, planner, executor, adjacency index, HTTP) |
 | 5c | ferrosa-ctl | CLI admin connects and displays node status — **done** (subcommands, TUI monitor) |
-| 6 | ferrosa-net | Two nodes exchange messages — **done** (Phase 1: 24 msg types, PSK, RPC, pool) |
+| 6 | ferrosa-net | Two nodes exchange messages — **done** (Phase 1: 87 msg types, PSK, RPC, pool) |
 | 7 | ferrosa-cluster | Two-node pair mode with failover — **done** (Phase 1: write/DDL forwarding, catch-up, switchover) |
 | 8 | ferrosa (binary) | Pair-mode binary with CQL + cluster API — **done** |
 
