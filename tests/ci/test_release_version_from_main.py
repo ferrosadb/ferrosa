@@ -1,0 +1,168 @@
+"""Release versions come from main's Cargo version ("main leads").
+
+Every PR bumps `[workspace.package] version` (scripts/semver-bump), so the
+nightly and stable release workflows read that version instead of computing
+their own from tags. These tests pin the version script and both workflows.
+Run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
+"""
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / ".github" / "scripts" / "release-version-from-main.sh"
+WORKFLOWS = ROOT / ".github" / "workflows"
+NIGHTLY = WORKFLOWS / "nightly-release.yml"
+PROMOTE = WORKFLOWS / "promote-release.yml"
+CI = WORKFLOWS / "ci.yml"
+
+
+class ScriptTest(unittest.TestCase):
+    """The script in a throwaway repository."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.com")
+        self.git("config", "user.name", "t")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", *args], cwd=self.root, check=True, capture_output=True, text=True
+        ).stdout
+
+    def commit_version(self, version, msg="fix: x"):
+        (self.root / "Cargo.toml").write_text(
+            f'[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{version}"\nedition = "2021"\n'
+        )
+        self.git("add", "-A")
+        self.git("commit", "-q", "--allow-empty", "-m", msg)
+
+    def run_script(self, *args):
+        out_file = self.root / "out"
+        out_file.write_text("")
+        env = dict(os.environ, GITHUB_OUTPUT=str(out_file))
+        proc = subprocess.run(
+            ["bash", str(SCRIPT), *args], cwd=self.root, env=env, capture_output=True, text=True
+        )
+        outputs = dict(
+            line.split("=", 1) for line in out_file.read_text().splitlines() if "=" in line
+        )
+        return proc, outputs
+
+    def test_nightly_reports_mains_version(self):
+        self.commit_version("0.22.0")
+        self.git("tag", "v0.22.0")
+        self.commit_version("0.22.1")
+        proc, out = self.run_script("nightly")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("true", out["should_release"])
+        self.assertEqual("0.22.1", out["next_version"])
+        self.assertEqual("v0.22.1", out["next_tag"])
+        self.assertEqual("v0.22.0", out["base_tag"])
+
+    def test_pre_release_suffix_on_main_is_dropped(self):
+        self.commit_version("0.24.0-nightly")
+        proc, out = self.run_script("nightly")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("0.24.0", out["next_version"])
+
+    def test_calver_and_semver_bump_tags_are_not_the_stable_base(self):
+        self.commit_version("0.22.0")
+        self.git("tag", "v0.22.0")
+        self.commit_version("0.22.1")
+        self.git("tag", "v2026.10.15.0002")
+        self.git("tag", "semver-v0.99.0")
+        proc, out = self.run_script("nightly")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("v0.22.0", out["base_tag"])
+
+    def test_nothing_since_stable_skips_unless_forced(self):
+        self.commit_version("0.22.0")
+        self.git("tag", "v0.22.0")
+        proc, out = self.run_script("nightly")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("false", out["should_release"])
+
+    def test_main_below_latest_stable_refuses_loudly(self):
+        self.commit_version("0.21.0")
+        self.git("tag", "v0.22.0")
+        self.commit_version("0.21.1")
+        for mode in ("nightly", "promote"):
+            with self.subTest(mode=mode):
+                proc, out = self.run_script(mode)
+                self.assertNotEqual(0, proc.returncode)
+                self.assertIn("BELOW the latest stable tag v0.22.0", proc.stderr)
+                self.assertNotIn("next_version", out)
+
+    def test_change_without_a_bump_refuses_loudly(self):
+        self.commit_version("0.22.0")
+        self.git("tag", "v0.22.0")
+        self.commit_version("0.22.0", "fix: landed without a bump")
+        proc, out = self.run_script("nightly")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("not bumped", proc.stderr)
+
+    def test_promote_refuses_an_existing_stable_tag(self):
+        self.commit_version("0.22.0")
+        self.git("tag", "v0.21.0")
+        self.git("tag", "v0.22.0")  # already promoted at this version
+        self.commit_version("0.22.0-nightly", "chore(nightly): v2026.10.15.0002")
+        proc, out = self.run_script("promote")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertIn("v0.22.0 already exists", proc.stderr)
+        self.assertNotIn("next_version", out)
+
+    def test_promote_returns_mains_version(self):
+        self.commit_version("0.22.0")
+        self.git("tag", "v0.22.0")
+        self.commit_version("0.23.0-nightly")
+        proc, out = self.run_script("promote")
+        self.assertEqual(0, proc.returncode, proc.stderr)
+        self.assertEqual("0.23.0", out["next_version"])
+        self.assertEqual("v0.23.0", out["next_tag"])
+
+    def test_unknown_mode_refuses(self):
+        self.commit_version("0.22.0")
+        proc, _ = self.run_script("sideways")
+        self.assertEqual(2, proc.returncode)
+
+
+class WorkflowContractTest(unittest.TestCase):
+    def test_contract_runs_in_ci(self):
+        self.assertIn(
+            "python3 -m unittest -q tests/ci/test_release_version_from_main.py",
+            CI.read_text(encoding="utf-8"),
+        )
+
+    def test_nightly_takes_its_version_from_main(self):
+        wf = NIGHTLY.read_text(encoding="utf-8")
+        self.assertIn("bash .github/scripts/release-version-from-main.sh nightly", wf)
+        self.assertNotIn("next-release-version.sh", wf)
+        self.assertNotIn("bump:", wf)  # no override input: main's version is the version
+        # Artifact/tag naming is unchanged: CalVer nightly tags, built by release.yml.
+        self.assertIn('NIGHTLY_TAG="v$(date -u +%Y.%m.%d.%H%M)"', wf)
+        self.assertIn('NIGHTLY_VERSION="${VERSION}-nightly"', wf)
+        self.assertIn("gh workflow run release.yml --ref", wf)
+
+    def test_promotion_reads_main_and_never_opens_a_sync_pr(self):
+        wf = PROMOTE.read_text(encoding="utf-8")
+        self.assertIn("bash .github/scripts/release-version-from-main.sh promote", wf)
+        self.assertNotIn("next-release-version.sh", wf)
+        self.assertNotIn("gh pr create", wf)
+        self.assertNotIn("sync-version", wf)
+        self.assertNotIn("pull-requests: write", wf)
+        self.assertIn("gh workflow run release.yml --ref", wf)
+
+    def test_tag_computing_script_is_gone(self):
+        self.assertFalse((ROOT / ".github" / "scripts" / "next-release-version.sh").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

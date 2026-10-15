@@ -3,7 +3,7 @@
 
 # Tags created on main by .github/workflows/semver.yml: semver-v<version>.
 # NOT "v": release.yml builds and publishes on any pushed `v*` tag, and
-# .github/scripts/next-release-version.sh takes the newest `vX.Y.Z` tag as the
+# .github/scripts/release-version-from-main.sh takes the newest `vX.Y.Z` tag as the
 # stable base. A `semver-v` tag matches neither, so it can never cut a release or
 # move the stable version math.
 tag_prefix = "semver-v"

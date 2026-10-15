@@ -6,7 +6,7 @@ name: Semver
 #   - a push to main tags the merged version as `semver-v<version>`.
 #
 # The tag prefix is deliberately NOT `v`: release.yml publishes on any `v*`
-# tag and next-release-version.sh treats `vX.Y.Z` tags as the stable base, so
+# tag and release-version-from-main.sh treats `vX.Y.Z` tags as the stable base, so
 # a `v` tag here would cut or skew a release. `semver-v*` matches neither.
 #
 # Hosted runners, like every other small CI job in this public repository.

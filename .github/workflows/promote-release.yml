@@ -2,10 +2,13 @@ name: Promote Release to Stable
 
 # Promotes a CalVer nightly (vYYYY.MM.DD.HHMM, a prerelease) to a stable SemVer
 # release (vX.Y.Z). Because nightly and stable are now SEPARATE tags, promotion
-# is a recut, not a flag flip: we check out the nightly's commit, compute the
-# next stable SemVer from Conventional Commit history, tag it, and rebuild so
-# the stable artifacts carry a clean SemVer (the nightly binaries report
-# `X.Y.Z-nightly`). release.yml publishes it as `--latest`, not prerelease.
+# is a recut, not a flag flip: we check out the nightly's commit, read main's
+# [workspace.package] version there (main leads: every PR bumps it), tag it,
+# and rebuild so the stable artifacts carry a clean SemVer (the nightly
+# binaries report `X.Y.Z-nightly`). release.yml publishes it as `--latest`.
+#
+# Main is never written: it already carries the version, so there is no
+# "sync main" PR (it used to LOWER main below its per-PR bumps).
 
 on:
   workflow_dispatch:
@@ -18,7 +21,6 @@ on:
 permissions:
   contents: write
   actions: write
-  pull-requests: write
 
 concurrency:
   group: promote-release-${{ github.repository }}
@@ -38,7 +40,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
 
-      - name: Validate nightly tag and compute stable SemVer
+      - name: Validate nightly tag and read main's version
         id: calc
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,13 +56,12 @@ jobs:
             echo "error: tag ${TAG} not found in this checkout" >&2
             exit 1
           fi
-          # Compute the next stable SemVer relative to the nightly's COMMIT, so
-          # the bump reflects exactly what this nightly contains. Detach there
-          # first; the script only counts commits up to HEAD.
+          # Read the version at the nightly's COMMIT (main's version there,
+          # minus -nightly), so the stable tag names exactly what this nightly
+          # contains. Refuses loudly if it is below the latest stable tag or
+          # was already released.
           git checkout -q "refs/tags/${TAG}"
-          # force=true: a promotion is intentional even if the script's
-          # commits-since-stable guard would otherwise skip.
-          bash .github/scripts/next-release-version.sh auto true
+          bash .github/scripts/release-version-from-main.sh promote
 
       - name: Create stable commit and SemVer tag
         env:
@@ -87,28 +88,3 @@ jobs:
           NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
         # prerelease=false => release.yml marks it --latest (the stable channel).
         run: gh workflow run release.yml --ref "${NEXT_TAG}" -f prerelease=false
-
-      - name: Sync main's workspace version to the promoted release (PR)
-        env:
-          GH_TOKEN: ${{ github.token }}
-          NEXT_VERSION: ${{ steps.calc.outputs.next_version }}
-          NEXT_TAG: ${{ steps.calc.outputs.next_tag }}
-        # Keep main's [workspace.package] version in step with the released tag
-        # instead of letting it drift. main is protected, so this opens a PR and
-        # fails loudly if source/release state cannot be synchronized.
-        run: |
-          set -euo pipefail
-          git fetch origin main
-          git checkout -q -B "chore/sync-version-${NEXT_TAG}" origin/main
-          perl -0pi -e 's/(\[workspace\.package\]\s+version\s*=\s*)"[^"]+"/${1}"'"${NEXT_VERSION}"'"/s' Cargo.toml
-          cargo update -w >/dev/null 2>&1 || true
-          if git diff --quiet -- Cargo.toml Cargo.lock; then
-            echo "main already at ${NEXT_VERSION}; nothing to sync."
-            exit 0
-          fi
-          git add Cargo.toml Cargo.lock
-          git commit -m "chore(release): sync main version to ${NEXT_TAG}"
-          git push origin "chore/sync-version-${NEXT_TAG}"
-          gh pr create --base main --head "chore/sync-version-${NEXT_TAG}" \
-            --title "chore(release): sync main version to ${NEXT_TAG}" \
-            --body "Auto-opened by promote-release so main's version tracks stable ${NEXT_TAG} instead of drifting. Cosmetic; merge at convenience."
