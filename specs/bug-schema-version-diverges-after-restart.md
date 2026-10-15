@@ -107,6 +107,48 @@ cluster-wide. The topology contract test
 regression guard, not the red that produced the fix; the red is
 `apply_snapshot_adopts_the_persisted_schema_version` in `ferrosa-schema`.
 
+### What is now covered by a test
+
+- **Stale persisted version → committed version** —
+  `ferrosa-cluster/src/raft/state_machine.rs`,
+  `a_stale_persisted_schema_version_converges_to_the_committed_version`. A node
+  whose persisted `schema.json` names a STALE version and whose replicated Raft
+  state carries the committed one ends on the committed version (`Uuid`
+  equality, and asserted NOT equal to either the stale or the boot-minted
+  version). It drives the real boot-order functions — `Schema::apply_snapshot`
+  for boot step 4a, then `recover_from_persisted_snapshot` →
+  `sync_schema_and_engine_from_state` — so it fails if either leg stops doing its
+  job. **CONTROL:** with the version adoption in `apply_snapshot` disabled the
+  test fails at RUN TIME on the convergence assertion (`left` = the boot-minted
+  version, `right` = the committed version). It has no red of its own — the
+  adoption is already in the tree — so the CONTROL is what proves the test
+  exercises the mechanism.
+- `ferrosa-schema/src/registry.rs`,
+  `apply_snapshot_adopts_the_persisted_schema_version` — the registry-level red
+  that produced the fix.
+- `ferrosa-cluster/src/raft/state_machine.rs`,
+  `real_ddl_command_changes_the_schema_version` — the `apply` (log-replay) path
+  still moves the registry to the version a committed command carries.
+
+**Not covered:** a real crash, and the case where the node's persisted Raft
+snapshot PREDATES the DDL. Then only the commit log carries the committed
+version and convergence depends on re-applying the DDL entry through `apply`,
+not on `recover_from_persisted_snapshot`.
+
+## Known window (observed, not fixed)
+
+A restarted node can REPORT a stale `system.local.schema_version` before the Raft
+state-machine recovery runs. Boot step 4a lands the persisted `schema.json`
+version in the registry early (`ferrosa/src/main.rs`), while the step that
+re-adopts the committed version (`recover_from_persisted_snapshot` →
+`sync_schema_and_engine_from_state`) runs later, inside `transition_to_cluster`
+(`ferrosa-cluster/src/controller/cluster.rs`), which is gated on cluster
+formation. Between the two, `Schema::snapshot().version` — the value
+`system.local` reports (`ferrosa-schema/src/system/local.rs`) — is the STALE one.
+The convergence test asserts that intermediate state
+(`version_after_persisted_restore == stale_version`), which is the window; a read
+during it on a live cluster was not measured.
+
 ## Not acceptable as a fix
 
 - Making clients skip schema agreement, or treat a timeout as success. Agreement is how a client
