@@ -22,12 +22,12 @@
 //! | sharded  | append    | 149 us   | 271 us   | 594 us   | 956 us    | 6.4x     |
 //! | sharded  | overwrite | 116 us   | 596 us   | 485 us   | 971 us    | 8.4x     |
 //!
-//! Allocations per write were already flat (0 for append, 1 for overwrite:
-//! the reconciled cell's value) at every N. So the curve is linear in N (8x
-//! the rows, 6.4-8.4x the time) and an O(1) write predicts ~1.0x per doubling
-//! plus the O(log N) binary search. Each point is the fastest of several
-//! batches, which strips scheduling noise from the measurement instead of
-//! averaging it in.
+//! Allocations per write were flat (0 for append, and 0 for overwrite: the
+//! reconciled cell's value is moved, not cloned) at every N. So the curve is
+//! linear in N (8x the rows, 6.4-8.4x the time), and an O(1) write predicts
+//! ~1.0x per doubling plus the O(log N) binary search. Each point is the
+//! fastest of several batches, which strips scheduling noise from the
+//! measurement instead of averaging it in.
 //!
 //! After the fix (the merge returns the size delta of the rows it touched),
 //! the same test's 500-write batches measured, at N = 5k / 10k / 20k / 40k:
