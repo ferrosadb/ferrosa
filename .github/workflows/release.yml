@@ -368,6 +368,189 @@ jobs:
           first_tag=$(echo "${{ steps.tags.outputs.tags }}" | awk '{print $1}')
           docker buildx imagetools inspect "${first_tag}"
 
+  # ── Linux glibc (dynamic) binaries, built once for both glibc images ──
+  #
+  # Built here rather than inside the image build so the two glibc images share
+  # one compilation per arch, the same way Dockerfile.release consumes the musl
+  # tarballs instead of compiling. One variant is stripped (production), one
+  # deliberately is not (profiling, full DWARF).
+  build-linux-gnu:
+    name: Build Linux ${{ matrix.arch }} (glibc)
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The Dockerfile.glibc base is pinned to Debian trixie (glibc 2.41). A glibc
+      # binary built against a newer runtime links fine and then fails at RUN
+      # time, so the version the binary actually needs is asserted below rather
+      # than assumed from the runner. Bump this together with that digest.
+      GLIBC_RUNTIME_MAX: "2.41"
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Install glibc build dependencies
+        # libunwind-dev: jemalloc's heap profiler needs unw_backtrace. On glibc
+        # the distro headers and library satisfy its configure directly, unlike
+        # the musl target which has to hand-build libunwind.
+        run: sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
+
+      - name: Build production binaries (glibc, stripped)
+        run: |
+          set -euo pipefail
+          cargo build --locked --release --target ${{ matrix.target }} \
+            -p ferrosa -p ferrosa-ctl --features ferrosa/full
+          strip "target/${{ matrix.target }}/release/ferrosa" \
+                "target/${{ matrix.target }}/release/ferrosa-ctl"
+          file "target/${{ matrix.target }}/release/ferrosa"
+          if readelf --sections "target/${{ matrix.target }}/release/ferrosa" | grep -q '\.debug_info'; then
+            echo "::error::production binary still carries .debug_info; the strip step did not take" >&2
+            exit 1
+          fi
+          required="$(objdump -T "target/${{ matrix.target }}/release/ferrosa" \
+            | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -n1 | sed 's/^GLIBC_//')"
+          test -n "$required" || { echo "::error::could not read a GLIBC_ requirement from the binary" >&2; exit 1; }
+          echo "binary requires glibc ${required}; pinned runtime provides ${GLIBC_RUNTIME_MAX}"
+          if [ "$(printf '%s\n%s\n' "$GLIBC_RUNTIME_MAX" "$required" | sort -V | tail -n1)" != "$GLIBC_RUNTIME_MAX" ]; then
+            echo "::error::binary needs glibc ${required} but the pinned runtime base provides ${GLIBC_RUNTIME_MAX}" >&2
+            exit 1
+          fi
+
+      - name: Build profiling binary (glibc, full DWARF)
+        run: |
+          set -euo pipefail
+          # force-frame-pointers so perf and jemalloc's profiler can walk stacks
+          # through optimized code; [profile.profiling] keeps full DWARF while
+          # retaining release optimizations, and this binary is NOT stripped.
+          export RUSTFLAGS="${RUSTFLAGS:-} -C force-frame-pointers=yes"
+          cargo build --locked --profile profiling --target ${{ matrix.target }} \
+            -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling
+          profiling_binary="target/${{ matrix.target }}/profiling/ferrosa"
+          test -x "$profiling_binary"
+          readelf --sections "$profiling_binary" | grep -q '\.debug_info'
+          "$profiling_binary" --version
+          ldd "$profiling_binary" || true
+
+      - name: Stage both variants for the image build
+        run: |
+          set -euo pipefail
+          mkdir -p "dist/gnu/${{ matrix.arch }}/production" "dist/gnu/${{ matrix.arch }}/profiling"
+          install -m 0755 "target/${{ matrix.target }}/release/ferrosa"     "dist/gnu/${{ matrix.arch }}/production/ferrosa"
+          install -m 0755 "target/${{ matrix.target }}/release/ferrosa-ctl" "dist/gnu/${{ matrix.arch }}/production/ferrosa-ctl"
+          install -m 0755 "target/${{ matrix.target }}/profiling/ferrosa"   "dist/gnu/${{ matrix.arch }}/profiling/ferrosa"
+          tar -czf "dist/ferrosa-gnu-${{ matrix.arch }}.tar.gz" \
+            -C "dist/gnu/${{ matrix.arch }}" production profiling
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tarball-gnu-${{ matrix.arch }}
+          path: dist/ferrosa-gnu-${{ matrix.arch }}.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+  # ── glibc container images: production and profiling ─────────────────
+  docker-image-glibc:
+    name: Build & push glibc images (GHCR)
+    needs:
+      - build-linux-gnu
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download glibc binary artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash .github/scripts/download-run-artifacts.sh \
+            "${GITHUB_RUN_ID}" \
+            "${GITHUB_REPOSITORY}" \
+            artifacts
+
+      - name: Extract both variants per arch
+        run: |
+          set -euo pipefail
+          mkdir -p dist/amd64 dist/arm64
+          for arch in amd64 arm64; do
+            tarball=$(find artifacts -name "ferrosa-gnu-${arch}.tar.gz" -print -quit)
+            test -n "$tarball" || { echo "ERROR: glibc tarball for ${arch} not found" >&2; exit 1; }
+            tar -xzf "$tarball" -C "dist/${arch}"
+          done
+          ls -l dist/amd64/production dist/amd64/profiling dist/arm64/production dist/arm64/profiling
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/${{ github.repository_owner }}/ferrosa"
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          PRERELEASE="${{ github.event.inputs.prerelease }}"
+          if [ "${PRERELEASE}" = "false" ]; then
+            # Stable: the same tag set the musl image gets, suffixed so neither
+            # image can overwrite the other.
+            MAJOR="${VERSION%%.*}"
+            MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
+            PRODUCTION="${IMAGE}:latest-glibc ${IMAGE}:v${VERSION}-glibc ${IMAGE}:${MAJOR}.${MINOR}-glibc ${IMAGE}:${MAJOR}-glibc"
+            PROFILING="${IMAGE}:latest-glibc-profiling ${IMAGE}:v${VERSION}-glibc-profiling ${IMAGE}:${MAJOR}.${MINOR}-glibc-profiling ${IMAGE}:${MAJOR}-glibc-profiling"
+          else
+            # Nightly: moving channel tag plus the exact CalVer ref.
+            PRODUCTION="${IMAGE}:nightly-glibc ${IMAGE}:v${VERSION}-glibc"
+            PROFILING="${IMAGE}:nightly-glibc-profiling ${IMAGE}:v${VERSION}-glibc-profiling"
+          fi
+          echo "Production tags: ${PRODUCTION}"
+          echo "Profiling tags:  ${PROFILING}"
+          echo "production=${PRODUCTION}" >> "$GITHUB_OUTPUT"
+          echo "profiling=${PROFILING}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up buildx (multi-arch)
+        run: |
+          docker buildx create --name ferrosa-glibc-builder --use 2>/dev/null || docker buildx use ferrosa-glibc-builder
+          docker buildx inspect --bootstrap
+
+      - name: Build and push production glibc image
+        run: |
+          set -euo pipefail
+          tag_args=()
+          for t in ${{ steps.tags.outputs.production }}; do
+            tag_args+=(-t "${t}")
+          done
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --target production \
+            -f Dockerfile.glibc \
+            "${tag_args[@]}" \
+            --push \
+            .
+
+      - name: Build and push profiling glibc image
+        run: |
+          set -euo pipefail
+          tag_args=()
+          for t in ${{ steps.tags.outputs.profiling }}; do
+            tag_args+=(-t "${t}")
+          done
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --target profiling \
+            -f Dockerfile.glibc \
+            "${tag_args[@]}" \
+            --push \
+            .
+
   # ── Downloadable production and profiling OCI archives ───────────────
   publish-oci-downloads:
     name: Publish ${{ matrix.image }} OCI / ${{ matrix.arch }}
@@ -689,6 +872,23 @@ jobs:
           Additional packages:
           - `ferrosa_VERSION_amd64.deb` — Debian/Ubuntu package with systemd unit
           - `ferrosa-VERSION.arm64_sonoma.bottle.tar.gz` — Homebrew bottle for tap install
+
+          ### Container images
+
+          `ghcr.io/ferrosadb/ferrosa`, multi-arch (linux/amd64, linux/arm64):
+
+          | Tag | Runtime | Binary |
+          |-----|---------|--------|
+          | `vVERSION`, `nightly`/`latest` | Alpine (musl) | static, stripped |
+          | `vVERSION-glibc` | Debian (glibc 2.41) | dynamic, stripped |
+          | `vVERSION-glibc-profiling` | Debian (glibc 2.41) | dynamic, full DWARF, unstripped |
+
+          The `-glibc` images run the same engine on glibc rather than musl. The
+          `-glibc-profiling` image exists to make profiles resolvable: it is built
+          with `--profile profiling` (full DWARF, frame pointers) and shipped
+          unstripped, with `perf` for CPU flame graphs and `jeprof` for jemalloc
+          heap profiles. Use the production image for measurement and the
+          profiling image when you need to explain what a measurement is made of.
 
           ### Verifying downloads
 
