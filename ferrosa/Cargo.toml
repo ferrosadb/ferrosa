@@ -123,3 +123,9 @@ tower = { version = "0.5", features = ["util"] }
 # Real multi-node PROCESS test drives DROP TABLE over the PostgreSQL wire (there
 # is no cqlsh on this host), so the test needs a real Postgres client.
 tokio-postgres = "0.7"
+# The real-process replica-delete guard (tests/plain_delete_replica_process.rs)
+# drives real CQL — LWTs (`IF`) have no PostgreSQL-wire equivalent — and pins one
+# session per node with `SingleTargetLoadBalancingPolicy` so each read is
+# answered by that node's OWN storage. Same driver, and same version, the
+# live-infra and Jepsen suites already resolve from the workspace lock.
+scylla = "1.5"

@@ -333,6 +333,65 @@ about what a readiness failure must say:
   fix: 3.07 s idle, 27.84/31.74/31.74 s at 72 spinners, 70.60/70.60/72.05 s at 200, all
   three nodes ready every time and no node log carrying a log-store give-up.
 
+### Plain DELETE replica-atomicity (real-process)
+
+`tests/plain_delete_replica_process.rs` is the process-level guard for
+t_15b75033 / `ferrosa-cluster` FMEA **CL-38** — the owner instruction *"the full
+guaranteed replica delete, to make sure we do not have rows resurrected"*. It
+spawns **three real `ferrosa` binaries** in a full mesh (so the cluster is RF 3
+and every node owns every token range), creates the keyspace at
+`replication_factor: 3` explicitly and the table
+`t(id uuid PRIMARY KEY, version bigint, payload text)`, and drives real **CQL**
+through the scylla driver — LWTs (`IF`) have no PostgreSQL-wire equivalent.
+
+The four cases are the reported ones plus their controls: **A** plain INSERT then
+plain DELETE (the POSITIVE CONTROL: a fixture that deleted nothing would satisfy
+every absence assertion vacuously), **B** plain INSERT, `UPDATE … IF version=1`
+reporting `[applied]=true`, then plain DELETE, **C** `INSERT … IF NOT EXISTS`
+reporting `[applied]=true`, then plain DELETE, and **E** as B with the plain
+DELETE 3 s later (so a sub-second ordering race cannot be the explanation).
+
+Every case asserts the **effect** and not the status. Before the delete the row
+must be readable at its expected values from **every** replica's own store;
+afterwards it must be unreadable from each replica individually, asserting the
+values read back and never a lone count.
+
+**This is a regression guard, not a red.** The mechanism was fixed on
+2026-10-08 by `34acf0ef`, an ancestor of `main`: `accord_cell_timestamp` divided
+the agreed HLC time by 1000 so an LWT cell lands in the same microsecond domain
+as every plain write, and `cell_ts::normalize_cell_ts` maps values already on
+disk. On `main` all four cases are therefore GREEN, and the guard is proved
+non-vacuous by a **mirror control**: revert those two functions (raw
+nanoseconds; identity normalisation) and B, C and E go RED — the row is still
+served by every replica — while A stays green.
+
+Two things are load-bearing and easy to re-derive wrongly:
+
+- **A per-replica read is a `CL=ONE` read through a session pinned to that
+  node.** The session is pinned with `SingleTargetLoadBalancingPolicy`, so the
+  named node coordinates the statement; at `CL=ONE` with `RF == node_count`,
+  `remote_count_for_cl` returns **0**
+  (`ferrosa-cluster/src/coordinator/range_read_stream.rs`), so the coordinator
+  answers from its own storage alone. A `QUORUM` read could not show this, and
+  neither could a read through a node that does not own every range — hence the
+  asserted precondition that every node sees all three ring entries.
+- **The plain `DELETE` is issued at `CL=ALL`.** Its acknowledgement then means
+  every replica applied the tombstone, which is what makes the immediate
+  per-replica absence assertion exact rather than an over-claim. The window a
+  `QUORUM`-acked plain DELETE would additionally need — replication/hints
+  landing the tombstone on a non-quorum replica — is NOT covered here.
+
+The no-resurrection window is real, not a single read: every replica's own store
+is re-read, a `CL=ALL` full scan is issued through every node (the coordinator
+then gathers from every replica and compares their digests — the read path that
+performs read repair when replicas disagree, and whose merged answer shows the
+row if any replica still held it), the node's own anti-entropy trigger
+`POST /api/cluster/repair?keyspace=…&table=…&rf=3` is fired and its session
+summary required to show at least one successful session (a repair that ran
+nothing is not evidence), and only then is every replica re-read and required to
+STILL be absent. The production anti-entropy scheduler also runs inside the
+test's lifetime (`FERROSA_AUTO_REPAIR_INTERVAL_SECS=1`).
+
 ### PostgreSQL default-keyspace replication (real-process)
 
 `tests/pg_public_keyspace_rf_process.rs` is the process-level red for the
