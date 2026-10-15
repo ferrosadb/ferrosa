@@ -107,7 +107,7 @@ def write_version(kind: str, text: str, new: str, where: str) -> str:
         out, n = re.subn(r'^(\s{0,4}"version"\s*:\s*")[^"]*(")', rf"\g<1>{new}\g<2>", text, count=1, flags=re.M)
     else:
         # Line-based within the one table: values above `version` may contain brackets
-        # (authors = ["..."]), so a regex spanning the table would mis-match.
+        # (authors = ["..."]), so a regex spanning the table would match the wrong line.
         table = "workspace.package" if kind == "cargo-workspace" else "package"
         lines, inside, n = text.splitlines(keepends=True), False, 0
         for i, line in enumerate(lines):
@@ -232,8 +232,8 @@ def cmd_check(p: dict) -> int:
 
 
 def cmd_apply(p: dict, root: Path) -> int:
-    if cmd_check(p) == 0:
-        return 0
+    if not p["level"] or core(p["head_v"]) >= core(p["required"]):
+        return cmd_check(p)
     new = fmt(p["required"])
     changed = []
     for entry in p["cfg"]["file"]:
