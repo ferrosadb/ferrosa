@@ -90,11 +90,15 @@ jobs:
           fetch-tags: true
 
       # post_apply runs `cargo update --workspace --offline` to refresh
-      # Cargo.lock; offline needs the registry populated first. The toolchain
-      # comes from rust-toolchain.toml.
+      # Cargo.lock and ferrosa-jsonb-conformance/Cargo.lock (CI builds both
+      # with --locked); offline needs the registry populated first. The
+      # toolchain comes from rust-toolchain.toml.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Fetch locked dependencies
-        run: cargo fetch --locked
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path ferrosa-jsonb-conformance/Cargo.toml
 
       - name: Commit identity and tag prefix
         id: setup
