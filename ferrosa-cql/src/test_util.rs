@@ -61,6 +61,10 @@ pub struct StandaloneOptions {
     /// An internode peer manager, so the node can reach other test nodes
     /// (e.g. to forward a result-cursor page request).
     pub peer_manager: Option<Arc<ferrosa_net::peer::PeerManager>>,
+    /// A process HLC. `Some` is what makes a fixture able to route an LWT
+    /// through Accord at all: `route` refuses the Accord path with an explicit
+    /// error when the clock is unwired (p0-03 fail-loud policy).
+    pub accord_clock: Option<Arc<ferrosa_common::accord::HybridLogicalClock>>,
     /// Result-cursor tunables (TTL, cap, close grace).
     pub cursor_config: crate::result_cursor::ResultCursorConfig,
     /// Hard write-admission threshold: once the memtable reaches this, a write
@@ -79,6 +83,7 @@ impl Default for StandaloneOptions {
             flush_threshold_bytes: 4096,
             host_id: None,
             peer_manager: None,
+            accord_clock: None,
             cursor_config: crate::result_cursor::ResultCursorConfig::default(),
             memtable_backpressure_bytes: u64::MAX,
         }
@@ -93,6 +98,7 @@ pub fn standalone_for_test_with(data_dir: &Path, options: StandaloneOptions) -> 
         flush_threshold_bytes,
         host_id,
         peer_manager,
+        accord_clock,
         cursor_config,
         memtable_backpressure_bytes,
     } = options;
@@ -173,7 +179,7 @@ pub fn standalone_for_test_with(data_dir: &Path, options: StandaloneOptions) -> 
             mode_controller,
             auth_warn: false,
             peer_manager,
-            accord_clock: None,
+            accord_clock,
             accord_state: ferrosa_cluster::accord::empty_accord_state_slot(),
         }),
         prepared_cache: Arc::new(PreparedCache::new(10 * 1024 * 1024)),

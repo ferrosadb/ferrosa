@@ -335,6 +335,25 @@ incompatibility (Cassandra accepts any `long`); 1e18 microseconds is the year
 33658. `SELECT writetime()`/`TTL()` are not wired to cell metadata yet and
 return null (t_7987e84c).
 
+### A plain DELETE after an LWT (t_15b75033)
+
+A plain `DELETE` must remove a row whose last write came from an LWT. The
+mechanism that once made it fail was the Accord applier stamping every cell with
+the HLC's **nanoseconds** while every plain write stamps **microseconds**, so an
+LWT row sat ~1000x in the future and no plain `DELETE`, UPDATE or INSERT could
+shadow it (fixed 2026-10-08 by `accord_cell_timestamp`; `ferrosa-cluster` FMEA
+CL-38, CL-76). Because a conditional `DELETE ... IF EXISTS` is itself an LWT, its
+tombstone was stamped in the *same* nanosecond domain and still worked — which is
+why the failure looked selective.
+
+`tests/plain_delete_after_lwt.rs` pins every case of that report — the plain
+`INSERT`/`DELETE` positive control, `UPDATE ... IF` then `DELETE`,
+`INSERT ... IF NOT EXISTS` then `DELETE`, `DELETE ... IF EXISTS`, and the same
+with the `DELETE` 3 s later — through `router::route` on a two-node in-process
+cluster with a real `AccordStateMachine` per node. All five are RED with
+`accord_cell_timestamp` reverted to the raw nanoseconds and `normalize_cell_ts`
+reverted to the identity.
+
 ## Public API (key entry points)
 
 | Area | Entry points |
