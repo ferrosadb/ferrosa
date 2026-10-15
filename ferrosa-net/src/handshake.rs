@@ -60,11 +60,6 @@ pub const CAP_ACCORD_APPLY_REGION: u32 = 1 << 4;
 /// the coarse gate over a finer intersection.
 pub const CAP_ACCORD_APPLY_REGION_COMPRESSED: u32 = 1 << 5;
 
-/// The node understands `CqlType::Jsonb` end to end, so a schema that contains a
-/// jsonb column may be replicated to it (D32). A peer without the bit must never be
-/// sent a jsonb schema, and jsonb DDL is refused while any member lacks it.
-pub const CAP_JSONB_V1: u32 = 1 << 6;
-
 /// The node decodes the Cap'n Proto `ForwardedRaftCommand` frame a non-leader
 /// sends the Raft leader inside `Message::ClusterMembershipForward` on
 /// `Lane::Data` (`ferrosa_cluster::raft_forward_codec`). The body keeps the same
@@ -82,7 +77,6 @@ pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY
     | CAP_ACCORD_CAPNP
     | CAP_ACCORD_APPLY_REGION
     | CAP_ACCORD_APPLY_REGION_COMPRESSED
-    | CAP_JSONB_V1
     | CAP_RAFT_SCHEMA_CAPNP;
 
 /// Peer metadata learned from a completed handshake.

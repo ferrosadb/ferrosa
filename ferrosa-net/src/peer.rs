@@ -1420,11 +1420,12 @@ mod tests {
         assert_eq!(listener.disconnected_count.load(Ordering::Relaxed), 1);
     }
 
-    /// REGRESSION GUARD — written with the fix, after the behavioural red at
-    /// `ferrosa-cluster/tests/jsonb_capability_freshness.rs`. The bits a peer
-    /// advertises on its INBOUND handshake are reported by `peer_capabilities`
-    /// even though the peer has no outbound pool, and a peer advertising
-    /// WITHOUT the bit is reported as LACKING it (t_d853fa2a).
+    /// REGRESSION GUARD — the bits a peer advertises on its INBOUND handshake
+    /// are reported by `peer_capabilities` even though the peer has no outbound
+    /// pool, and a peer advertising WITHOUT the bit is reported as LACKING it
+    /// (t_d853fa2a). The bit chosen here is arbitrary: the advertisement path is
+    /// generic, and the jsonb capability bit it once used was removed with the
+    /// jsonb DDL gate (T-300/D32).
     #[tokio::test]
     async fn an_inbound_advertisement_is_reported_without_a_pool() {
         let config = Arc::new(NetConfig::default());
@@ -1438,11 +1439,11 @@ mod tests {
             "a registered peer with no pool and no advertisement is unknown"
         );
 
-        pm.record_inbound_capabilities(host_id, crate::handshake::CAP_JSONB_V1)
+        pm.record_inbound_capabilities(host_id, crate::handshake::CAP_RAFT_SCHEMA_CAPNP)
             .await;
         assert_eq!(
             pm.peer_capabilities(host_id).await,
-            Some(crate::handshake::CAP_JSONB_V1),
+            Some(crate::handshake::CAP_RAFT_SCHEMA_CAPNP),
             "the inbound advertisement must be reported without a pool"
         );
 

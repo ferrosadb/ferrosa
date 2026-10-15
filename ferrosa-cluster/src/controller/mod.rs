@@ -26,7 +26,6 @@ pub mod cluster_rejoin;
 pub mod data_movement;
 pub mod dissolution;
 mod invite;
-pub mod jsonb_gate;
 mod membership;
 mod operator;
 mod pair;
@@ -355,9 +354,6 @@ pub struct ModeController {
     /// witnesses (write-side monotonicity for strict-serializable list appends,
     /// t_813caf39). Empty until set.
     pub(super) accord_clock: std::sync::OnceLock<Arc<ferrosa_common::accord::HybridLogicalClock>>,
-    /// True while a departure from standalone is being refused because jsonb
-    /// columns exist (T-300). Only the edges are logged: refused, recovered.
-    pub(super) jsonb_gate_refusing: AtomicBool,
     /// Boot-state consensus gate — consensus must not start until the node's
     /// required state is loaded. See [`ConsensusBootGate`]. Default-open.
     pub(super) consensus_boot_gate: ConsensusBootGate,
@@ -539,7 +535,6 @@ impl ModeController {
             pending_raft_node_registrations: Mutex::new(std::collections::HashSet::new()),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
-            jsonb_gate_refusing: AtomicBool::new(false),
             consensus_boot_gate: ConsensusBootGate::default(),
         });
 
@@ -706,7 +701,6 @@ impl ModeController {
             pending_raft_node_registrations: Mutex::new(std::collections::HashSet::new()),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
-            jsonb_gate_refusing: AtomicBool::new(false),
             consensus_boot_gate: ConsensusBootGate::default(),
         })
     }
@@ -782,7 +776,6 @@ impl ModeController {
             pending_raft_node_registrations: Mutex::new(std::collections::HashSet::new()),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
-            jsonb_gate_refusing: AtomicBool::new(false),
             consensus_boot_gate: ConsensusBootGate::default(),
         })
     }
@@ -1346,12 +1339,6 @@ impl ModeController {
     }
 
     pub(super) fn try_transition_mode(&self, target: DeploymentMode) -> bool {
-        // T-300 backstop: leaving standalone with jsonb present is refused.
-        // Kept here rather than in the free function below because it needs
-        // `self` (the schema), while the state-machine check below does not.
-        if !self.leaving_standalone_permitted(target) {
-            return false;
-        }
         try_transition_mode_swap(&self.mode, target)
     }
 }

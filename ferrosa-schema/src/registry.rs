@@ -146,19 +146,12 @@ pub struct Schema {
     default_password_roles: Mutex<HashSet<String>>,
     /// Registry of virtual tables (e.g. system_observability views).
     virtual_table_registry: Arc<VirtualTableRegistry>,
-    /// The node's live deployment mode, read by the T-300 jsonb DDL gate at
-    /// every entry and apply. Starts `Standalone`; the cluster controller
-    /// shares this very handle as its own mode cell (see
-    /// [`Schema::deployment_mode_handle`]), so the gate can never lag the
-    /// controller's view of the node.
+    /// The node's live deployment mode. Kept as a shared live cell because the
+    /// cluster controller adopts this very handle as its own mode cell (see
+    /// [`Schema::deployment_mode_handle`]); the jsonb placement rule no longer
+    /// reads it (the T-300 capability gate that did is REMOVED), but other
+    /// mode-dependent behaviour still does.
     deployment_mode: Arc<ArcSwap<NodeMode>>,
-
-    /// The cluster's jsonb readiness as the DDL gate sees it (D32). Published by the
-    /// cluster controller from the peer capability view, exactly as the mode cell is
-    /// published, so the gate cannot lag the membership. The default is
-    /// [`JsonbClusterGate::Unknown`]: a node nobody has told otherwise refuses jsonb
-    /// DDL outside standalone, which is the pre-D32 behaviour.
-    jsonb_cluster_gate: Arc<ArcSwap<crate::jsonb_rules::JsonbClusterGate>>,
 }
 
 impl Schema {
@@ -242,9 +235,6 @@ impl Schema {
             default_password_roles: Mutex::new(HashSet::new()),
             virtual_table_registry: Arc::new(VirtualTableRegistry::new()),
             deployment_mode: Arc::new(ArcSwap::from_pointee(NodeMode::Standalone)),
-            jsonb_cluster_gate: Arc::new(ArcSwap::from_pointee(
-                crate::jsonb_rules::JsonbClusterGate::Unknown,
-            )),
         };
 
         // Built-in virtual tables.
@@ -400,24 +390,22 @@ impl Schema {
     /// DDL entry points that hand the change to a coordinator or to Raft call
     /// this first, so the client gets a typed refusal instead of a diverged
     /// apply. The apply paths re-check on their own (defense in depth).
+    ///
+    /// This is the PLACEMENT rule only (T-154a, D3, D21). jsonb is a first-class
+    /// data type, so there is no mode or capability input here: the former T-300
+    /// capability gate is REMOVED.
     pub fn check_create_table_jsonb(&self, table: &TableMetadata) -> crate::Result<()> {
         let types = &self.snapshot().types;
-        crate::jsonb_rules::check_table(table, types)?;
-        crate::jsonb_rules::check_table_ddl_allowed(
-            self.deployment_mode(),
-            &self.jsonb_cluster_gate(),
-            table,
-            types,
-        )
+        crate::jsonb_rules::check_table(table, types)
     }
 
-    /// The node's live deployment mode as the T-300 jsonb gate sees it.
+    /// The node's live deployment mode.
     pub fn deployment_mode(&self) -> NodeMode {
         **self.deployment_mode.load()
     }
 
-    /// Set the deployment mode the jsonb gate reads. Production code shares
-    /// the controller's cell via [`Self::deployment_mode_handle`] instead.
+    /// Set the deployment mode. Production code shares the controller's cell via
+    /// [`Self::deployment_mode_handle`] instead.
     pub fn set_deployment_mode(&self, mode: NodeMode) {
         self.deployment_mode.store(Arc::new(mode));
     }
@@ -426,46 +414,6 @@ impl Schema {
     /// own mode cell, so every controller transition is seen here at once.
     pub fn deployment_mode_handle(&self) -> Arc<ArcSwap<NodeMode>> {
         Arc::clone(&self.deployment_mode)
-    }
-
-    /// The cluster's jsonb readiness, as the DDL gate reads it (D32).
-    pub fn jsonb_cluster_gate(&self) -> crate::jsonb_rules::JsonbClusterGate {
-        (**self.jsonb_cluster_gate.load()).clone()
-    }
-
-    /// Publish the cluster's jsonb readiness. Production code shares the handle with
-    /// the cluster controller instead, so a membership or capability change is seen
-    /// here at once.
-    pub fn set_jsonb_cluster_gate(&self, gate: crate::jsonb_rules::JsonbClusterGate) {
-        self.jsonb_cluster_gate.store(Arc::new(gate));
-    }
-
-    /// The shared gate cell, adopted by the cluster controller.
-    pub fn jsonb_cluster_gate_handle(&self) -> Arc<ArcSwap<crate::jsonb_rules::JsonbClusterGate>> {
-        Arc::clone(&self.jsonb_cluster_gate)
-    }
-
-    /// Propose-side jsonb gate for CREATE TYPE (SCH-T300-04).
-    pub fn check_create_type_jsonb(
-        &self,
-        keyspace: &str,
-        name: &str,
-        fields: &[(String, CqlType)],
-    ) -> crate::Result<()> {
-        crate::jsonb_rules::check_udt_fields_ddl_allowed(
-            self.deployment_mode(),
-            &self.jsonb_cluster_gate(),
-            keyspace,
-            name,
-            fields,
-        )
-    }
-
-    /// `keyspace.table` of every user table holding jsonb (directly or through
-    /// a UDT): what a refused departure from standalone names (SCH-T300-05).
-    pub fn tables_with_jsonb(&self) -> crate::Result<Vec<String>> {
-        let snap = self.snapshot();
-        crate::jsonb_rules::tables_with_jsonb(snap.tables.values(), &snap.types)
     }
 
     /// Propose-side jsonb placement check for ALTER TABLE ADD (SCH-T154a-02).
@@ -493,55 +441,28 @@ impl Schema {
     ) -> crate::Result<()> {
         let mut types = current.types.clone();
         types.extend(incoming.types.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let mode = self.deployment_mode();
-        let cluster = self.jsonb_cluster_gate();
         for ((ks, _), table) in &incoming.tables {
             if is_system_keyspace(ks) {
                 continue;
             }
             crate::jsonb_rules::check_table(table, &types)?;
-            crate::jsonb_rules::check_table_ddl_allowed(mode, &cluster, table, &types)?;
-        }
-        for udt in incoming.types.values() {
-            crate::jsonb_rules::check_udt_fields_ddl_allowed(
-                mode,
-                &cluster,
-                &udt.keyspace,
-                &udt.name,
-                &udt.fields,
-            )?;
         }
         Ok(())
     }
 
-    /// Apply-time jsonb checks for a whole table: placement rules, then the
-    /// T-300 mode gate (SCH-T300-02).
+    /// Apply-time jsonb placement check for a whole table (SCH-T154a-01).
     fn check_table_jsonb(&self, table: &TableMetadata, types: &TypeMap) -> crate::Result<()> {
-        crate::jsonb_rules::check_table(table, types)?;
-        crate::jsonb_rules::check_table_ddl_allowed(
-            self.deployment_mode(),
-            &self.jsonb_cluster_gate(),
-            table,
-            types,
-        )
+        crate::jsonb_rules::check_table(table, types)
     }
 
-    /// Apply-time jsonb checks for ALTER TABLE ADD: placement rules, then the
-    /// T-300 mode gate (SCH-T300-02).
+    /// Apply-time jsonb placement check for ALTER TABLE ADD (SCH-T154a-02).
     fn check_added_jsonb(
         &self,
         existing: &TableMetadata,
         added: &[ColumnMetadata],
         types: &TypeMap,
     ) -> crate::Result<()> {
-        crate::jsonb_rules::check_added_columns(existing, added, types)?;
-        crate::jsonb_rules::check_added_columns_ddl_allowed(
-            self.deployment_mode(),
-            &self.jsonb_cluster_gate(),
-            existing,
-            added,
-            types,
-        )
+        crate::jsonb_rules::check_added_columns(existing, added, types)
     }
 
     /// Set the schema snapshot version to a specific UUID.
@@ -1840,13 +1761,6 @@ impl Schema {
         if !snap.keyspaces.contains_key(&udt.keyspace) {
             return Err(SchemaError::KeyspaceNotFound(udt.keyspace.clone()));
         }
-        crate::jsonb_rules::check_udt_fields_ddl_allowed(
-            self.deployment_mode(),
-            &self.jsonb_cluster_gate(),
-            &udt.keyspace,
-            &udt.name,
-            &udt.fields,
-        )?;
         snap.types.insert(key, udt.clone());
         self.inner.store(Arc::new(snap));
         Ok(())
@@ -1904,13 +1818,6 @@ impl Schema {
                 "field '{field_name}' of type {keyspace}.{name}: {rule}"
             ))
         })?;
-        crate::jsonb_rules::check_udt_fields_ddl_allowed(
-            self.deployment_mode(),
-            &self.jsonb_cluster_gate(),
-            keyspace,
-            name,
-            &[(field_name.to_string(), field_type.clone())],
-        )?;
         udt.fields.push((field_name.to_string(), field_type));
         crate::jsonb_rules::check_key_columns(
             snap.tables.values().filter(|t| !t.is_system),

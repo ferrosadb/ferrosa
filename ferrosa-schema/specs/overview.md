@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-schema
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-10-15
 executive_summary: >
   The authority for schema state in a Ferrosa node: keyspaces, tables, columns,
   roles, grants, indexes, UDTs/UDFs/UDAs, the system keyspaces, the audit
@@ -121,22 +121,16 @@ and refuses jsonb in key columns (any depth, UDTs resolved through the snapshot'
 type map) and the D21 nestings. Every schema-mutating entry point calls it, and
 `apply_snapshot` checks the whole snapshot before applying anything.
 
-## jsonb DDL gate (T-300, superseded by D32)
+## jsonb DDL capability gate — REMOVED (T-300, D24, D32, D15a)
 
-D24 let jsonb ship on a single node before the capability ledger existed. D32
-replaces the mode test with the check it stood for: `jsonb_ddl_permitted(mode,
-cluster)` passes on `Standalone` — no peer can disagree — or when every member
-advertises `CAP_JSONB_V1`, and otherwise refuses with a reason that names either
-the members lacking the capability or that the member view could not be read.
-Both matches stay exhaustive with no wildcard, so a new `DeploymentMode` or a
-new `JsonbClusterGate` variant does not compile until someone decides it.
+The interim jsonb DDL capability gate (D24/D32/D15a) was REMOVED from the tree,
+not disabled. jsonb is a first-class data type: it ships standalone, paired and
+clustered with no flag, env var, config key or operator action, and it cannot be
+turned off again. The engine already replicates graph materialization over Raft,
+so a column type is not special; a gate that can refuse a data type is itself the
+defect. The cluster jsonb-readiness cell, the entry and apply-time gate calls and
+the table scan that blocked leaving standalone were all deleted; nothing about a
+deployment shape can refuse jsonb now.
 
-`Schema` carries two live `ArcSwap` cells the cluster controller adopts as its
-own, so neither can lag: the node's `DeploymentMode` and the cluster's jsonb
-readiness (`JsonbClusterGate`), the latter defaulting to `Unknown` — refuse
-outside standalone. The same rule runs at DDL entry (`check_create_table_jsonb`,
-`check_alter_table_jsonb`, `check_create_type_jsonb`) and at apply (create and
-alter table and type, replicated or authed, and `apply_snapshot`). T-154b
-replaces the capability check with the ledger at these call sites, closing the
-residual that a member which is DOWN during the DDL and returns later with an
-older build leaves open.
+The only surviving jsonb constraint is the placement rule above (T-154a, D3,
+D21).

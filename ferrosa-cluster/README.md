@@ -115,10 +115,12 @@ records the bits the peer advertised (`PeerManager::record_inbound_capabilities`
 `PeerManager::peer_capabilities` then returns the NEWER of that advertisement and the
 outbound pool's snapshot — an inbound handshake proves the peer runs that build NOW,
 whereas our pool snapshot was taken when WE dialled and can predate the peer's restart.
-Latest-wins keeps the gate fail-closed: a peer on a build without a bit is still seen as
-lacking it. Without this, the jsonb DDL gate stayed refused after an ordinary rolling
-upgrade until the observer itself restarted (t_d853fa2a;
-`ferrosa-cluster/tests/jsonb_capability_freshness.rs`).
+Latest-wins keeps capability-gated peers fail-closed: a peer on a build without a bit is
+still seen as lacking it. This was introduced (t_d853fa2a) to stop the interim jsonb
+capability gate from staying refused after an ordinary rolling upgrade until the observer
+itself restarted. That gate has since been REMOVED (T-300/D24/D32) — jsonb is a
+first-class data type — so the freshness mechanism now serves only the surviving
+capability bits (e.g. the region-Apply wire below), never jsonb.
 
 ### The region-REFERENCE Apply wire (`AccordApplyV2Region`)
 
@@ -687,13 +689,14 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   bytes. A node older than this format refuses a complex cell with a decode
   error rather than flattening it, and the row-stream receiver fails a session
   whose payload does not decode (FMEA CL-32).
-- `controller/jsonb_gate.rs` (T-300, D24) — while any table holds jsonb, a
-  standalone node may not move to Pair, Forming or Cluster: the transition entry
-  points and `try_transition_mode` refuse, naming the tables and the D15a
-  ledger. `check_startup_jsonb` lets `main` fail startup for a non-standalone or
-  seeded node whose schema holds jsonb. The controller's mode cell is shared
-  with `Schema`, so the schema's DDL gate always sees the live mode. No flag
-  bypasses it; T-154b replaces it with the ledger.
+- **jsonb capability gate — REMOVED (T-300, D24, D32).** The interim controller
+  module that refused leaving standalone (and a non-standalone or seeded startup)
+  while any table held jsonb was removed from the tree, not disabled. jsonb is a
+  first-class data type: transitions and startup are no longer gated on it, and it
+  ships standalone, paired and clustered with no flag, env var, config key or
+  operator action. The engine already replicates graph materialization over Raft,
+  so a column type is not special; a gate that can refuse a data type is itself
+  the defect.
 
 ### Repair & hints (`repair/`, `hints/`)
 - `repair/merkle.rs` — depth-15 Merkle trees (32 768 leaves), content-aware

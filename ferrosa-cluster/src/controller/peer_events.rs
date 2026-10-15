@@ -458,10 +458,6 @@ impl PeerEventListener for ModeController {
             track_connected_peer(&mut peers, host_id, addr, super::MAX_CONNECTED_PEERS);
         }
 
-        // D32: this peer's advertised capabilities are now part of the member view, so
-        // recompute the cluster's jsonb readiness.
-        self.spawn_jsonb_cluster_gate_refresh();
-
         // Register this peer's host_id in the raft network factory's node_map so
         // the leader can route raft RPCs to it. Idempotent, and a no-op before
         // cluster formation. Critically this covers an already-committed member
@@ -521,10 +517,6 @@ impl PeerEventListener for ModeController {
             let mut peers = self.connected_peers.lock();
             peers.retain(|(id, _)| *id != host_id);
         }
-
-        // D32: a member just left the view, and a member we can no longer read is
-        // unknown rather than capable, so recompute the cluster's jsonb readiness.
-        self.spawn_jsonb_cluster_gate_refresh();
 
         // Hold the transition guard to prevent a disconnect handler from racing
         // with a connect handler during mode transition.
