@@ -1,8 +1,8 @@
 name: Release (on-merge + nightly)
 
 on:
-  # Release-on-merge: every push to `main` (i.e. a merged PR) cuts the next
-  # SemVer release derived from Conventional Commit history. The `should_release`
+  # Release-on-merge: every push to `main` (i.e. a merged PR) cuts a nightly
+  # at main's [workspace.package] version (main leads). The `should_release`
   # guard below skips when nothing releasable landed since the latest tag, so a
   # doc/CI-only change does not necessarily cut a build. Doc/spec-only pushes are
   # excluded outright via paths-ignore to avoid a full multi-platform build for
@@ -22,18 +22,10 @@ on:
     # source, which was consuming most of the 55-minute job timeout and causing
     # the pair-mode smoke test to be killed before nodes became CQL-ready.
     - cron: '17 0 * * *'
+  # No bump override: the version is main's [workspace.package] version, which
+  # the release bot bumps after every merge (semver.yml, "main leads").
   workflow_dispatch:
     inputs:
-      bump:
-        description: 'SemVer bump override. auto uses Conventional Commit history.'
-        required: true
-        default: auto
-        type: choice
-        options:
-          - auto
-          - patch
-          - minor
-          - major
       force:
         description: 'Create the next release even when there are no commits since the latest stable tag.'
         required: true
@@ -54,6 +46,11 @@ env:
 jobs:
   release:
     name: Bump version, tag, and dispatch release build
+    # On push, cut only from the release bot's `chore(release): vX.Y.Z` commit
+    # (semver.yml), which follows every merge. The merge push itself still
+    # carries the previous version, so cutting there would label the build
+    # with a stale version and then cut a second one when the bot pushes.
+    if: "github.event_name != 'push' || startsWith(github.event.head_commit.message, 'chore(release): v')"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -62,12 +59,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
 
-      - name: Compute next SemVer release
+      - name: Read main's version
         id: next
+        # Fails loud when main is below the latest stable tag, or when a change
+        # reached main without a bump.
         run: |
-          bump='${{ github.event.inputs.bump || 'auto' }}'
           force='${{ github.event.inputs.force || 'false' }}'
-          bash .github/scripts/next-release-version.sh "$bump" "$force"
+          bash .github/scripts/release-version-from-main.sh nightly "$force"
 
       - name: Stop when there is nothing new to release
         if: steps.next.outputs.should_release != 'true'
@@ -78,8 +76,8 @@ jobs:
         env:
           VERSION: ${{ steps.next.outputs.next_version }}
         run: |
-          # Nightlies carry a `-nightly` SemVer pre-release on the computed next
-          # version (e.g. 0.22.0-nightly). The release TAG is CalVer (see below);
+          # Nightlies carry a `-nightly` SemVer pre-release on main's version
+          # (e.g. 0.22.1-nightly). The release TAG is CalVer (see below);
           # the binary's --version reports this informative base. Promotion to
           # stable recuts a clean SemVer (see promote-release.yml).
           NIGHTLY_VERSION="${VERSION}-nightly"
@@ -92,15 +90,14 @@ jobs:
         env:
           NEXT_VERSION: ${{ steps.next.outputs.next_version }}
           BASE_TAG: ${{ steps.next.outputs.base_tag }}
-          BUMP: ${{ steps.next.outputs.bump }}
           COMMIT_COUNT: ${{ steps.next.outputs.commit_count }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           # Nightly tags are CalVer (vYYYY.MM.DD.HHMM, UTC) so they are visually
-          # distinct from stable SemVer (vX.Y.Z) in the releases list. The
-          # version math (next-release-version.sh) ignores 4-segment CalVer tags,
-          # so nightlies never pollute the stable base.
+          # distinct from stable SemVer (vX.Y.Z) in the releases list.
+          # release-version-from-main.sh ignores 4-segment CalVer tags when it
+          # finds the stable base, so nightlies never pollute it.
           NIGHTLY_TAG="v$(date -u +%Y.%m.%d.%H%M)"
           if git rev-parse -q --verify "refs/tags/${NIGHTLY_TAG}" >/dev/null; then
             echo "error: nightly tag ${NIGHTLY_TAG} already exists (two cuts in the same UTC minute); rerun shortly" >&2
@@ -116,7 +113,7 @@ jobs:
           git commit -m "chore(nightly): ${NIGHTLY_TAG} (${NEXT_VERSION}-nightly)"
           git tag -a "${NIGHTLY_TAG}" \
             -m "${NIGHTLY_TAG} nightly (${GITHUB_EVENT_NAME})" \
-            -m "${BUMP} bump target ${NEXT_VERSION} from ${BASE_TAG} after ${COMMIT_COUNT} commits."
+            -m "main's version ${NEXT_VERSION}; ${COMMIT_COUNT} commits since ${BASE_TAG}."
           # Push the tag only (the branch ruleset does not cover refs/tags/*).
           git push origin "${NIGHTLY_TAG}"
 

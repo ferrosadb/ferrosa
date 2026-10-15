@@ -1,0 +1,159 @@
+name: Semver
+
+# The semver bump happens AFTER merge, on main, committed by the
+# ferrosa-release-bot GitHub App, so it happens no matter who opened the PR
+# (scripts/semver-bump, configured by .semver-bump.toml):
+#   - a PR only needs a Conventional Commit TITLE (`semver-bump --check-title`):
+#     the merge queue merges with a merge commit whose body is that title, and
+#     the title sets the bump. Nothing on the PR requires a version bump;
+#   - the merge queue runs the semver-bump unit tests only (no title there; it
+#     was already checked on the PR);
+#   - a push to main runs `semver-bump --release`: it commits
+#     `chore(release): vX.Y.Z` when the changes since the last `semver-v*` tag
+#     call for it, tags `semver-v<version>` and pushes both atomically.
+#
+# The tag prefix is deliberately NOT `v`: release.yml publishes on any `v*`
+# tag and release-version-from-main.sh treats `vX.Y.Z` tags as the stable base, so
+# a `v` tag here would cut or skew a release. `semver-v*` matches neither.
+#
+# One-time setup (App, org variable/secret, ruleset bypass): "Versioning" in
+# CONTRIBUTING.md.
+#
+# Hosted runners, like every other small CI job in this public repository.
+
+on:
+  pull_request:
+    branches: [main]
+    # `edited` so a retitled PR is re-checked.
+    types: [opened, edited, synchronize, reopened]
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: semver bump present
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: semver-bump unit tests
+        run: python3 -m unittest discover -s scripts/tests
+      - name: PR title is a Conventional Commit
+        if: github.event_name == 'pull_request'
+        # Passed through env, never interpolated into the script: the title is
+        # attacker-controlled text.
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: python3 scripts/semver-bump --check-title "$TITLE"
+
+  release:
+    name: bump and tag main
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # The push uses the App token, not GITHUB_TOKEN.
+    permissions:
+      contents: read
+    concurrency:
+      group: semver-release
+      cancel-in-progress: false
+    steps:
+      - name: Release bot is configured
+        env:
+          APP_ID: ${{ vars.FERROSA_RELEASE_BOT_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.FERROSA_RELEASE_BOT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "$APP_ID" ] || missing="${missing} vars.FERROSA_RELEASE_BOT_APP_ID"
+          [ -n "$PRIVATE_KEY" ] || missing="${missing} secrets.FERROSA_RELEASE_BOT_PRIVATE_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::semver release cannot run: missing${missing}. Both FERROSA_RELEASE_BOT_APP_ID (org variable) and FERROSA_RELEASE_BOT_PRIVATE_KEY (org secret) are required; see 'Versioning > One-time setup' in CONTRIBUTING.md."
+            exit 1
+          fi
+
+      - name: Release bot token
+        id: app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ vars.FERROSA_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.FERROSA_RELEASE_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      # post_apply runs `cargo update --workspace --offline` to refresh
+      # Cargo.lock and ferrosa-jsonb-conformance/Cargo.lock (CI builds both
+      # with --locked); offline needs the registry populated first. The
+      # toolchain comes from rust-toolchain.toml.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Fetch locked dependencies
+        run: |
+          set -euo pipefail
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path ferrosa-jsonb-conformance/Cargo.toml
+
+      - name: Commit identity and tag prefix
+        id: setup
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          user_id="$(gh api "/users/${APP_SLUG}[bot]" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${user_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          prefix="$(python3 -c 'import tomllib; print(tomllib.load(open(".semver-bump.toml", "rb"))["tag_prefix"])')"
+          case "$prefix" in
+            v*) echo "::error::tag_prefix '${prefix}' would trigger release.yml (on: push tags v*); refusing" >&2; exit 1 ;;
+          esac
+          echo "prefix=${prefix}" >> "$GITHUB_OUTPUT"
+          echo "start=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Bump main if its changes call for it
+        id: bump
+        run: python3 scripts/semver-bump --release
+
+      - name: Tag and push
+        if: steps.bump.outputs.released == 'true' || steps.bump.outputs.bootstrap == 'true'
+        env:
+          PREFIX: ${{ steps.setup.outputs.prefix }}
+          START: ${{ steps.setup.outputs.start }}
+          VERSION: ${{ steps.bump.outputs.version }}
+          RELEASED: ${{ steps.bump.outputs.released }}
+        run: |
+          set -euo pipefail
+          tag="${PREFIX}${VERSION}"
+          git tag -a "$tag" -m "$tag" HEAD
+          if [ "$RELEASED" = "true" ]; then
+            refs=(HEAD:main "refs/tags/${tag}")
+          else
+            refs=("refs/tags/${tag}")   # bootstrap: the version is already on main
+          fi
+          if push_err="$(git push --atomic origin "${refs[@]}" 2>&1)"; then
+            echo "$push_err"
+            echo "pushed ${refs[*]} (${tag} at $(git rev-parse HEAD))"
+            exit 0
+          fi
+          echo "$push_err" >&2
+          git fetch origin main
+          now="$(git rev-parse origin/main)"
+          if [ "$now" != "$START" ] && git merge-base --is-ancestor "$START" "$now"; then
+            echo "::warning::main moved during the release; the run for the newer push releases both"
+            exit 0
+          fi
+          echo "::error::push of ${refs[*]} was rejected and main has not moved past ${START}: ${push_err}"
+          exit 1
+
+      - name: Nothing to release
+        if: steps.bump.outputs.released != 'true' && steps.bump.outputs.bootstrap != 'true'
+        env:
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: echo "main already declares ${VERSION}; no bump or tag needed."
