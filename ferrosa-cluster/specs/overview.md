@@ -49,7 +49,7 @@ machine but are otherwise loosely coupled:
 | `hints/` | per-peer hint segments, delivery/replay, CRC + crash recovery |
 | `accord/` | EPaxos-family transactions: coordinator, state machine, bounded decided-txn record (`finalized.rs`, CL-36), recovery, dep-wait, cross-shard/DC, electorate, durability, deterministic test cluster |
 | `state.rs` | `SingleNodeClusterState` / `PairClusterState` / `RaftClusterState` |
-| `write_path.rs`, `raft_forward.rs`, `ddl_path.rs`, `index_coordination.rs`, `streaming/`, `system_table_*` | write routing, leader forwarding, DDL routing, index build coordination, SSTable streaming, system-table persistence |
+| `write_path.rs`, `raft_forward.rs`, `raft_forward_codec.rs`, `ddl_path.rs`, `index_coordination.rs`, `streaming/`, `system_table_*` | write routing, leader forwarding (incl. the Cap'n Proto frame for the forwarded schema/membership `RaftCommand`), DDL routing, index build coordination, SSTable streaming, system-table persistence |
 
 ## Data flow (summary)
 

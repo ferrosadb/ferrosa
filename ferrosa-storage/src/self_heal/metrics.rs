@@ -25,6 +25,12 @@ static ACTIONS_EXECUTED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DEGRADED: AtomicU64 = AtomicU64::new(0);
 /// Controller ticks that panicked; the controller kept running.
 static TICK_PANICS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Corrupt generations re-admitted after the object store's copy passed the
+/// loader's own validation (self_heal::recover).
+static RECOVERED_GENERATIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Object-store recovery attempts that refused (no copy, a copy that still
+/// fails validation, or no store on this node). Never silent.
+static RECOVERY_REFUSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn set_corrupt_tables(n: u64) {
     CORRUPT_SSTABLE_TABLES.store(n, Ordering::Relaxed);
@@ -44,6 +50,12 @@ pub(crate) fn inc_escalated_max_attempts() {
 pub(crate) fn inc_actions_executed() {
     ACTIONS_EXECUTED_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
+pub(crate) fn inc_recovered(n: u64) {
+    RECOVERED_GENERATIONS_TOTAL.fetch_add(n, Ordering::Relaxed);
+}
+pub(crate) fn inc_recovery_refused() {
+    RECOVERY_REFUSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 pub(crate) fn inc_tick_panics() {
     TICK_PANICS_TOTAL.fetch_add(1, Ordering::Relaxed);
 }
@@ -62,6 +74,8 @@ pub struct SelfHealMetrics {
     pub actions_executed_total: u64,
     pub degraded: bool,
     pub tick_panics_total: u64,
+    pub recovered_generations_total: u64,
+    pub recovery_refused_total: u64,
 }
 
 /// Read all self-heal metrics atomically-ish (relaxed; counters are monotone).
@@ -76,6 +90,8 @@ pub fn self_heal_metrics() -> SelfHealMetrics {
         actions_executed_total: ACTIONS_EXECUTED_TOTAL.load(Ordering::Relaxed),
         degraded: DEGRADED.load(Ordering::Relaxed) != 0,
         tick_panics_total: TICK_PANICS_TOTAL.load(Ordering::Relaxed),
+        recovered_generations_total: RECOVERED_GENERATIONS_TOTAL.load(Ordering::Relaxed),
+        recovery_refused_total: RECOVERY_REFUSED_TOTAL.load(Ordering::Relaxed),
     }
 }
 
@@ -90,6 +106,8 @@ pub fn _reset_self_heal_metrics_for_tests() {
     ACTIONS_EXECUTED_TOTAL.store(0, Ordering::Relaxed);
     DEGRADED.store(0, Ordering::Relaxed);
     TICK_PANICS_TOTAL.store(0, Ordering::Relaxed);
+    RECOVERED_GENERATIONS_TOTAL.store(0, Ordering::Relaxed);
+    RECOVERY_REFUSED_TOTAL.store(0, Ordering::Relaxed);
 }
 
 /// One line on the health surface describing a current issue and the last

@@ -68,7 +68,12 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   decodes the region-REFERENCE Apply frame (`AccordApplyV2Region`, `0x7E`), so the
   coordinator prefers it (one bulk region instead of a capnp struct per entry) and
   falls back to the inline capnp frame — then bincode — for any peer without the
-  bit; `CAP_RESULT_CURSOR_PAGE`
+  bit; `CAP_RAFT_SCHEMA_CAPNP` (1<<7) — the peer decodes the capnproto
+  `ForwardedRaftCommand` frame a non-leader sends the leader inside
+  `ClusterMembershipForward` (`0x82`), so a forwarded schema/membership op travels
+  capnp and falls back to the shipped bincode body for any peer without the bit (a
+  versioned magic on the body tells the receiver which it is);
+  `CAP_RESULT_CURSOR_PAGE`
   `CAP_PAIR_DISSOLVE` gates `PairDissolve` / `PairDissolveAck` (0x4A/0x4B),
   phase 1 of the operator downgrade from cluster to pair (t_47bbeb66).
   (1<<1) — the peer serves `ResultCursorPage` (`0x68`) /
