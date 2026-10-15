@@ -97,15 +97,19 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_release_downloads_artifacts_without_node_actions(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        # Four jobs now take this run's artifacts through the mandated bash script
+        # (docker-image, docker-image-glibc, publish-oci-downloads, release). The
+        # invariant this test protects is the first two assertions: a download must
+        # never go through a node action or `gh` run download.
         self.assertNotIn("actions/download-artifact@", workflow)
         self.assertNotIn("gh run download", workflow)
         self.assertEqual(
-            3,
+            4,
             workflow.count(
                 'bash .github/scripts/download-run-artifacts.sh \\\n            "${GITHUB_RUN_ID}"'
             ),
         )
-        self.assertEqual(3, workflow.count("actions: read"))
+        self.assertEqual(4, workflow.count("actions: read"))
         docker_job = workflow.split("  docker-image:\n", 1)[1].split("\n  release:\n", 1)[0]
         release_job = workflow.split("  release:\n", 1)[1]
         self.assertIn(
