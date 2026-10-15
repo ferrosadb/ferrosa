@@ -629,7 +629,13 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   mint so the command carries the version it means to. A node that restarts
   re-adopts its PERSISTED version through `Schema::apply_snapshot`
   (ferrosa-schema), which is what makes `system.local.schema_version` agree with
-  the cluster after a restart.
+  the cluster after a restart. When that persisted version is STALE — a crash
+  between a DDL's commit and the next maintenance tick, which persists only on a
+  version CHANGE — the node converges to the committed version once the Raft state
+  machine recovers its state (`recover_from_persisted_snapshot` →
+  `sync_schema_and_engine_from_state`); pinned by
+  `a_stale_persisted_schema_version_converges_to_the_committed_version`
+  (`src/raft/state_machine.rs`).
 - `ModeController::expected_cluster_size()` (the operator's
   `FERROSA_EXPECTED_CLUSTER_SIZE` declaration) and `committed_cluster_size()`
   (the membership the node has actually committed to — itself plus the peers it
