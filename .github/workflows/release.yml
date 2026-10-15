@@ -948,3 +948,43 @@ jobs:
             https://api.github.com/repos/ferrosadb/homebrew-tap/dispatches \
             -d '{"event_type":"release-promoted"}'
           echo "Dispatched release-promoted to ferrosadb/homebrew-tap."
+
+  # Any failed job here means the release is missing or incomplete; tell the
+  # ops channel. Needs every job so a failure anywhere is reported.
+  alert-ops:
+    name: Alert the ops channel (release failed)
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-macos-aarch64
+      - docker-image
+      - publish-oci-downloads
+      - release
+    # Only for runs that were meant to release; PR / merge-queue checks report on the PR.
+    if: failure() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Post to Slack as the ops bot
+        env:
+          SLACK_TOKEN: ${{ secrets.FERROSA_OPS_SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.FERROSA_OPS_SLACK_CHANNEL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_TOKEN" ] || [ -z "$SLACK_CHANNEL" ]; then
+            echo "::error::${WORKFLOW} failed and the ops alert is not configured (FERROSA_OPS_SLACK_BOT_TOKEN / FERROSA_OPS_SLACK_CHANNEL); nobody was told"
+            exit 1
+          fi
+          text=":rotating_light: *${GITHUB_REPOSITORY}*: ${WORKFLOW} failed on \`${GITHUB_SHA::8}\` (${GITHUB_EVENT_NAME}, ${GITHUB_REF_NAME}). No release was produced. ${RUN_URL}"
+          body=$(jq -n --arg c "$SLACK_CHANNEL" --arg t "$text" '{channel: $c, text: $t, unfurl_links: false}')
+          # The token reaches curl on stdin, never on its command line.
+          resp=$(printf 'Authorization: Bearer %s\n' "$SLACK_TOKEN" | curl -sS --max-time 20 -H @- \
+            -H 'Content-Type: application/json; charset=utf-8' --data "$body" https://slack.com/api/chat.postMessage)
+          if [ "$(jq -r '.ok' <<<"$resp")" != true ]; then
+            echo "::error::the ops alert was NOT delivered: $(jq -r '.error // "no error field"' <<<"$resp")"
+            exit 1
+          fi
+          echo "ops alert posted"
