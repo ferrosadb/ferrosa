@@ -17,9 +17,12 @@
 //! the other two (a full mesh), so the auto-created `public` keyspace is RF=3.
 //! Each node binds its OWN band of eight ports (`ferrosa-node-isolation`).
 //!
-//! Gating (repo test policy): a real-process test, so it is `#[ignore]`d by
-//! default like the neighbouring `*_replica_process` harnesses; run it with
-//! `cargo test -p ferrosa --test jsonb_first_class_cluster_process -- --ignored`.
+//! Gating (repo test policy): like the neighbouring `*_replica_process` harnesses
+//! this test spawns its own nodes, so it runs in the normal suite by default and is
+//! NOT `#[ignore]`d -- a new waiver would be a landmine for future runs. It needs
+//! no external cluster, so the cluster job's `--ignored` selection filters it out.
+//! Run just it with:
+//!   cargo test -p ferrosa --test jsonb_first_class_cluster_process
 
 #![cfg(unix)]
 
@@ -320,7 +323,6 @@ async fn read_ids(client: &Client) -> Result<Vec<i32>, String> {
 /// A jsonb-carrying table's SCHEMA and DATA replicate across a real 3-node
 /// cluster and read back from a non-coordinator, with no flag or capability
 /// input.
-#[ignore = "real 3-process cluster test; run with -- --ignored"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jsonb_schema_and_data_replicate_across_a_real_cluster() {
     let cluster_name = format!("jsonb-first-class-{}", std::process::id());
@@ -445,9 +447,20 @@ async fn jsonb_schema_and_data_replicate_across_a_real_cluster() {
     restarted.restart(&cluster_name, Some(&seed));
     wait_ready(restarted, Duration::from_secs(90));
     let reader = pg_connect(restarted.ports.pg).await;
-    let ids = read_ids(&reader)
-        .await
-        .unwrap_or_else(|e| panic!("after restart the jsonb table must still be served: {e}"));
+    // `/readyz` means the node is up and has joined, not that it can already serve
+    // this table: a read the instant it flips ready can time out (CL=ONE,
+    // received=0). The invariant is that the replicated row SURVIVES the restart,
+    // so retry inside a deadline and still fail loud if it never becomes servable.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let ids = loop {
+        match read_ids(&reader).await {
+            Ok(ids) => break ids,
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("after restart the jsonb table must still be served: {e}"),
+        }
+    };
     assert_eq!(
         ids,
         vec![1],

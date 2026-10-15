@@ -7,8 +7,12 @@ repository.workspace = true
 description = "Query QoS scheduler core: bounded execution pool that reserves CPU headroom for consensus (Phase 0 of the fair scheduler)."
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+# "net" is not for sockets here: it is what compiles tokio's IO driver in at all.
+# The scan carrier's blocking tasks do IO (a producer reaches the object store and
+# sockets), and a runtime whose driver was never compiled in panics them with
+# "A Tokio 1.x context was found, but IO is disabled".
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time", "net"] }
 proptest = "1"
