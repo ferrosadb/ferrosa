@@ -8,10 +8,11 @@ consumes them.
 - **`main`'s version is bumped by every PR** with `scripts/semver-bump --apply`
   (enforced by hooks and `.github/workflows/semver.yml`, which tags merges
   `semver-v<version>`; see "Versioning" in `CONTRIBUTING.md`). Never hand-edit it.
-- **Release versions are still computed separately.** The release job derives the
-  next SemVer from Conventional Commit history since the last stable `vX.Y.Z`
-  tag and writes it onto the tag commit, ignoring `main`'s version. The two can
-  disagree until the release automation is changed to read `main`'s version.
+- **Main leads.** Releases never compute a version of their own: nightly and
+  stable both read `main`'s `[workspace.package] version`
+  (`.github/scripts/release-version-from-main.sh`). The script refuses loudly
+  when `main` is below the latest stable `vX.Y.Z` tag, when a change reached
+  `main` without a bump, or when promotion would re-release an existing `vX.Y.Z`.
 - **Releases cut on merge.** Every push to `main` (a merged PR) that carries a
   releasable commit cuts the next release automatically. A **nightly cron** runs
   as a safety-net for anything the merge path missed. Both paths share one
@@ -21,23 +22,21 @@ consumes them.
 - **Two channels, two tag schemes:**
   - **nightly** — every automatically cut release. Tagged **CalVer**
     `vYYYY.MM.DD.HHMM` (UTC) and marked a GitHub *prerelease*. The binary
-    reports `<next-semver>-nightly` (e.g. `0.22.0-nightly`).
+    reports `<main's version>-nightly` (e.g. `0.22.1-nightly`).
   - **stable** — a nightly a maintainer has *promoted*. Tagged **SemVer**
-    `vX.Y.Z`, marked *latest*, not prerelease. Promotion **recuts** a clean
-    SemVer from the nightly's commit (it is no longer a flag flip — the two are
-    separate tags), so stable artifacts carry a plain `X.Y.Z`.
+    `vX.Y.Z` where `X.Y.Z` is `main`'s version at the nightly's commit, marked
+    *latest*, not prerelease. Promotion **recuts** from the nightly's commit (it
+    is no longer a flag flip — the two are separate tags), so stable artifacts
+    carry a plain `X.Y.Z`.
   - The CalVer/SemVer split makes the channel obvious in the releases list.
-    `next-release-version.sh` only treats 3-segment `vX.Y.Z` tags as the stable
-    base, so CalVer nightlies never pollute the version math.
-- **Releases are tag-only.** The version-bump commit lives on the tag, never
-  directly on `main` (the `main` ruleset forbids direct pushes — see below). The
-  released artifact always carries the correct version.
-- **`main` is kept in step via a PR.** On a **stable promote**, `promote-release.yml`
-  opens a `chore(release): sync main version to vX.Y.Z` **pull request** that bumps
-  `main`'s `[workspace.package] version` to the promoted tag. This is cosmetic (the
-  release version is still derived from tags), but it stops `main` drifting behind
-  the latest release. Merge it at convenience; do **not** hand-edit the version in
-  an unrelated PR.
+    Only 3-segment `vX.Y.Z` tags count as the stable base; CalVer nightlies and
+    `semver-v*` merge tags never do.
+- **Releases are tag-only.** The `-nightly` / clean-version commit lives on the
+  tag, never directly on `main` (the `main` ruleset forbids direct pushes — see
+  below). The released artifact always carries the correct version.
+- **Promotion never writes `main`.** `main` already carries the version, so there
+  is no "sync main version" PR any more (it used to set `main` *below* its per-PR
+  bumps).
 - **`ferrosa-docs` `docs/LATEST` + the marketing-site version are release steps.** `ferrosa-docs` `docs/LATEST`
   (the plain-text tag the install scripts fetch from `ferrosadb.com/LATEST`) and the
   *descriptive* version strings on the site (`docs/index.html`, `docs/database/index.html`,
@@ -68,17 +67,17 @@ and push only the tag.
 
 ```
 nightly-release.yml  (on: push→main [merge], cron 08:17 UTC, or manual)
-  └─ next-release-version.sh        # next SemVer from Conventional Commits since last vX.Y.Z tag
+  └─ release-version-from-main.sh nightly  # main's version; refuses if <= last vX.Y.Z with commits since
   └─ should_release? (commits since last stable tag) — else skip
-  └─ bump Cargo.toml to <next>-nightly + commit (local only)
+  └─ set Cargo.toml to <main's version>-nightly + commit (local only)
   └─ git tag vYYYY.MM.DD.HHMM  →  git push origin <calver tag>   # CalVer, tag only, never main
   └─ gh workflow run release.yml -f prerelease=true # explicit: GITHUB_TOKEN tag
                                                     # pushes don't trigger on:push
 
 promote-release.yml  (manual: input = nightly CalVer tag)
   └─ git checkout <nightly tag>     # detach at the nightly's commit
-  └─ next-release-version.sh        # clean next SemVer relative to that commit
-  └─ set Cargo.toml to X.Y.Z + commit (local only)
+  └─ release-version-from-main.sh promote  # main's X.Y.Z there; refuses if below last vX.Y.Z or already tagged
+  └─ set Cargo.toml to X.Y.Z (drop -nightly) + commit (local only)
   └─ git tag vX.Y.Z  →  git push origin vX.Y.Z       # SemVer, tag only
   └─ gh workflow run release.yml -f prerelease=false # rebuild as stable (--latest)
 
@@ -88,16 +87,9 @@ release.yml  (per built tag — CalVer or SemVer)
   └─ gh release create … (--prerelease for nightly, --latest for stable)
 ```
 
-Conventional Commit → bump mapping (see `.github/scripts/next-release-version.sh`):
-
-| Commit                                   | Bump  |
-|------------------------------------------|-------|
-| `feat!:` / `BREAKING CHANGE:` in body    | major |
-| `feat:` / `feat(scope):`                 | minor |
-| anything else                            | patch |
-
-A PR with non-Conventional commit subjects silently degrades to a **patch**
-bump. Keep commit subjects conventional so the auto-bump is correct.
+The bump itself happens in each PR, not here: `scripts/semver-bump` maps the
+branch's Conventional Commits to major/minor/patch (see "Versioning" in
+`CONTRIBUTING.md`), and the commit-msg hook refuses a non-Conventional subject.
 
 ## Promoting nightly → stable
 
@@ -106,8 +98,8 @@ When a nightly build is validated, promote it by its **CalVer** tag:
 - **UI:** Actions → *Promote Release to Stable* → enter the nightly tag
   (e.g. `v2026.06.16.0817`).
 
-Promotion checks out that nightly's commit, computes the next stable SemVer from
-Conventional Commit history, tags `vX.Y.Z`, and dispatches `release.yml` with
+Promotion checks out that nightly's commit, reads `main`'s version there,
+tags `vX.Y.Z`, and dispatches `release.yml` with
 `prerelease=false` so it rebuilds and publishes as `--latest`. The **stable**
 channel (`/releases/latest`) then resolves to the new SemVer release.
 
@@ -182,7 +174,10 @@ docker run -d --name ferrosa \
 1. `gh run list --workflow=nightly-release.yml` → open the failed run.
 2. `GH013 … refs/heads/main` → the ruleset rejected a branch push. The workflow
    must push **tags only**; confirm no `git push origin HEAD:…main` remains.
-3. `computed tag … already exists` → a tag for the next version already exists
-   (e.g. a partial prior run). Delete the stray tag or bump past it.
-4. Version came out as `patch` when a `feat` landed → a PR used non-Conventional
-   commit subjects. Fix history hygiene; promotion/bump is commit-driven.
+3. `main's version … is BELOW the latest stable tag` → `main`'s Cargo version
+   was lowered or never caught up. Fix it on `main` with a PR
+   (`scripts/semver-bump --apply`); never release backwards.
+4. `equals the latest stable tag … not bumped` → a change reached `main` without
+   a bump (the `Semver` check was bypassed). Land a PR that bumps it.
+5. Promotion: `vX.Y.Z already exists` → that version is already stable; promote
+   a nightly cut after a later bump on `main`.
