@@ -137,5 +137,95 @@ class Repo(unittest.TestCase):
         self.assertEqual(self.run_tool("--check").returncode, 0)
 
 
+class Release(unittest.TestCase):
+    """--release on main: first-parent history since the last tag, whoever opened the PR."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.com")
+        self.git("config", "user.name", "t")
+        (self.root / "VERSION").write_text("0.3.1\n")
+        (self.root / ".semver-bump.toml").write_text('tag_prefix = "semver-v"\n[[file]]\npath = "VERSION"\nkind = "text"\n')
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", "chore: init")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def git(self, *a):
+        return subprocess.run(["git", *a], cwd=self.root, env=CLEAN_ENV, check=True, capture_output=True, text=True).stdout
+
+    def release(self):
+        r = subprocess.run(["python3", str(TOOL), "--release"], cwd=self.root, env=CLEAN_ENV, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln and " " not in ln), r.stderr
+
+    def merge_pr(self, number, title, branch_subject="wip"):
+        self.git("checkout", "-q", "-b", f"pr{number}")
+        (self.root / f"f{number}").write_text(title)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", branch_subject)
+        self.git("checkout", "-q", "main")
+        self.git("merge", "-q", "--no-ff", f"pr{number}", "-m", f"Merge pull request #{number} from org/pr{number}", "-m", title)
+
+    def squash(self, subject, name="s"):
+        (self.root / name).write_text(subject)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", subject)
+
+    def version(self):
+        return (self.root / "VERSION").read_text().strip()
+
+    def test_first_run_only_tags(self):
+        out, _ = self.release()
+        self.assertEqual(out, {"version": "0.3.1", "released": "false", "bootstrap": "true"})
+        self.assertEqual(self.git("log", "--format=%s").splitlines(), ["chore: init"])
+
+    def test_a_merge_commit_counts_its_pr_title_not_the_branch_commits(self):
+        self.git("tag", "semver-v0.3.1")
+        self.merge_pr(1, "feat(x): add y", branch_subject="did stuff")   # junk branch commit, good PR title
+        out, _ = self.release()
+        self.assertEqual(out["released"], "true")
+        self.assertEqual(self.version(), "0.4.0")
+        self.assertEqual(self.git("log", "-1", "--format=%s").strip(), "chore(release): v0.4.0")
+
+    def test_squash_and_rebase_subjects_count_and_the_highest_wins(self):
+        self.git("tag", "semver-v0.3.1")
+        self.squash("fix: a", "a")
+        self.squash("docs: b", "b")
+        out, _ = self.release()
+        self.assertEqual((out["version"], self.version()), ("0.3.2", "0.3.2"))
+
+    def test_a_non_conventional_title_is_a_patch_with_a_warning(self):
+        self.git("tag", "semver-v0.3.1")
+        self.squash("Update things")
+        out, err = self.release()
+        self.assertEqual(self.version(), "0.3.2")
+        self.assertIn("::warning::", err)
+
+    def test_nothing_since_the_tag_and_the_release_commit_itself_are_noops(self):
+        self.git("tag", "semver-v0.3.1")
+        self.assertEqual(self.release()[0]["released"], "false")
+        self.squash("feat: z")
+        self.release()
+        self.git("tag", "semver-v0.4.0")
+        out, _ = self.release()
+        self.assertEqual((out["released"], self.version()), ("false", "0.4.0"))
+
+    def test_a_pr_that_already_carried_its_bump_is_not_bumped_again(self):
+        self.git("tag", "semver-v0.3.1")
+        (self.root / "VERSION").write_text("0.4.0\n")
+        self.squash("feat: z")
+        out, _ = self.release()
+        self.assertEqual((out["released"], out["version"]), ("false", "0.4.0"))
+
+    def test_the_title_check(self):
+        ok = subprocess.run(["python3", str(TOOL), "--check-title", "fix(cql): close it"], capture_output=True, text=True)
+        bad = subprocess.run(["python3", str(TOOL), "--check-title", "Fixes the thing"], capture_output=True, text=True)
+        self.assertEqual((ok.returncode, bad.returncode), (0, 1))
+
+
 if __name__ == "__main__":
     unittest.main()

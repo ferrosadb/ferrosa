@@ -5,6 +5,8 @@
     scripts/semver-bump --apply  [--base origin/main]   write the required version and commit it
     scripts/semver-bump --print  [--base origin/main]   show base, commits, required and current
     scripts/semver-bump --check-message FILE            commit-msg hook: Conventional Commit header
+    scripts/semver-bump --check-title "TITLE"           PR check: the title main will record
+    scripts/semver-bump --release                       on main after a merge: bump since the last tag
 
 The bump comes from the Conventional Commits on the branch since it left the base (merge-base):
 
@@ -22,6 +24,15 @@ Configuration lives in .semver-bump.toml at the repository root:
     # kinds: cargo-workspace | cargo-package ([package].version) | json (top-level "version")
     #        | text (the whole file is the version)
 
+--release is what makes the bump independent of who opened the PR. It runs on main after every
+merge, reads main's FIRST-PARENT history since the newest <tag_prefix><version> tag (a merge commit
+contributes its PR title, a squash its subject, a rebased commit its own subject), and commits
+chore(release): vX.Y.Z when the version on main is below what those changes call for. A title that
+is not a Conventional Commit counts as a patch, with a warning: the release never stalls on wording,
+and --check-title on the PR is what keeps titles conventional. It prints `version=X.Y.Z` and
+`released=true|false` (also appended to $GITHUB_OUTPUT when set); the caller tags and pushes. With no
+tag yet it reports `bootstrap=true` and the current version, so the first run only tags.
+
 A pre-release suffix on the version (e.g. 0.23.0-nightly) is kept: the core is bumped, the suffix
 stays. This file is byte-identical in every Ferrosa repository; per-repo differences belong in the
 configuration, never here. Python standard library only.
@@ -35,6 +46,7 @@ import tomllib
 from pathlib import Path
 
 RELEASE_SUBJECT = re.compile(r"^chore\(release\): v\d+\.\d+\.\d+\S*$")
+PR_MERGE = re.compile(r"^Merge pull request #\d+ from \S+$")
 HEADER = re.compile(
     r"^(?P<type>feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)"
     r"(?:\([^()\s][^()]*\))?(?P<bang>!)?: \S.*$"
@@ -250,16 +262,96 @@ def cmd_apply(p: dict, root: Path) -> int:
     return 0
 
 
+CONVENTIONAL_HELP = ("use a Conventional Commit header, e.g.\n"
+                     "  feat(scope): add X     -> minor bump\n"
+                     "  fix(scope): correct Y  -> patch bump\n"
+                     "  feat(scope)!: change Z -> major bump (minor while 0.x)\n")
+
+
 def cmd_check_message(path: str) -> int:
     first = next((ln for ln in Path(path).read_text().splitlines() if ln.strip() and not ln.startswith("#")), "")
     if first.startswith(("Merge ", "Revert \"", "fixup! ", "squash! ", "amend! ")) or HEADER.match(first) or RELEASE_SUBJECT.match(first):
         return 0
-    print("commit-msg: use a Conventional Commit header, e.g.\n"
-          "  feat(scope): add X     -> minor bump\n"
-          "  fix(scope): correct Y  -> patch bump\n"
-          "  feat(scope)!: change Z -> major bump (minor while 0.x)\n"
-          f"Got: {first!r}", file=sys.stderr)
+    print("commit-msg: " + CONVENTIONAL_HELP + f"Got: {first!r}", file=sys.stderr)
     return 1
+
+
+def cmd_check_title(title: str) -> int:
+    title = title.strip()
+    if HEADER.match(title) or RELEASE_SUBJECT.match(title):
+        print(f"semver-bump: PR title ok ({level_of(title, '')} bump): {title}")
+        return 0
+    print("semver-bump: the PR title is what main records and what sets the version bump; "
+          + CONVENTIONAL_HELP + f"Got: {title!r}", file=sys.stderr)
+    return 1
+
+
+# ---- release on main -----------------------------------------------------------------------------
+def last_release_tag(prefix: str) -> str | None:
+    out = subprocess.run(["git", "describe", "--tags", "--first-parent", "--abbrev=0", "--match", f"{prefix}[0-9]*", "HEAD"],
+                         capture_output=True, text=True)
+    return out.stdout.strip() or None if out.returncode == 0 else None
+
+
+def mainline_changes(base: str) -> list[tuple[str, str, str]]:
+    """(sha, title, body) for each first-parent commit since base; a PR merge yields its PR title."""
+    raw = git("log", "--first-parent", "--format=%H%x1f%s%x1f%b%x1e", f"{base}..HEAD")
+    changes = []
+    for rec in raw.split("\x1e"):
+        rec = rec.strip("\n")
+        if not rec:
+            continue
+        sha, subject, body = (rec.split("\x1f") + ["", ""])[:3]
+        if PR_MERGE.match(subject):
+            lines = [ln for ln in body.splitlines() if ln.strip()]
+            subject, body = (lines[0], "\n".join(lines[1:])) if lines else (subject, "")
+        if RELEASE_SUBJECT.match(subject):
+            continue
+        changes.append((sha, subject, body))
+    return changes
+
+
+def emit(**kv: str) -> None:
+    lines = [f"{k}={v}" for k, v in kv.items()]
+    print("\n".join(lines))
+    out = __import__("os").environ.get("GITHUB_OUTPUT")
+    if out:
+        with open(out, "a") as f:
+            f.write("\n".join(lines) + "\n")
+
+
+def cmd_release(root: Path) -> int:
+    cfg = load_config(root)
+    prefix = cfg.get("tag_prefix", "v")
+    head_v = agreed(versions_at(cfg, None, root))
+    tag = last_release_tag(prefix)
+    if tag is None:
+        print(f"semver-bump: no {prefix}<version> tag on main yet; the first release only tags {fmt(head_v)}", file=sys.stderr)
+        emit(version=fmt(head_v), released="false", bootstrap="true")
+        return 0
+    base_v = agreed(versions_at(cfg, tag, root))
+    changes = mainline_changes(tag)
+    levels = []
+    for sha, title, body in changes:
+        lv = level_of(title, body)
+        if lv is None:
+            print(f"::warning::semver-bump: {sha[:12]} '{title}' is not a Conventional Commit; counted as a patch", file=sys.stderr)
+            lv = "patch"
+        levels.append(lv)
+    if not levels:
+        print(f"semver-bump: nothing merged since {tag}")
+        emit(version=fmt(head_v), released="false", bootstrap="false")
+        return 0
+    level = max(levels, key=lambda lv: LEVELS[lv])
+    required = bump(base_v, level)
+    if core(head_v) >= core(required):
+        print(f"semver-bump: main already declares {fmt(head_v)} (needs at least {fmt(required)}, a {level} bump from {tag})")
+        emit(version=fmt(head_v), released="false", bootstrap="false")
+        return 0
+    p = {"cfg": cfg, "level": level, "head_v": head_v, "required": required, "base_v": base_v}
+    cmd_apply(p, root)
+    emit(version=fmt(required), released="true", bootstrap="false")
+    return 0
 
 
 def main() -> int:
@@ -269,12 +361,18 @@ def main() -> int:
     g.add_argument("--apply", action="store_true")
     g.add_argument("--print", action="store_true")
     g.add_argument("--check-message", metavar="FILE")
+    g.add_argument("--check-title", metavar="TITLE")
+    g.add_argument("--release", action="store_true")
     ap.add_argument("--base", default="origin/main")
     a = ap.parse_args()
     try:
         if a.check_message:
             return cmd_check_message(a.check_message)
+        if a.check_title is not None:
+            return cmd_check_title(a.check_title)
         root = Path(git("rev-parse", "--show-toplevel").strip())
+        if a.release:
+            return cmd_release(root)
         p = plan(root, a.base)
         if a.print:
             return cmd_print(p, a.base)
