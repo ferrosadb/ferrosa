@@ -38,15 +38,15 @@ use ferrosa_common::CellValue;
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{CommitLogConfig, StorageEngine, StorageEngineConfig, TableId};
 
+use ferrosa_cluster::consistency::ConsistencyLevel;
+use ferrosa_cluster::coordinator::ClusterCoordinator;
+use ferrosa_cluster::raft::handlers::FulltextSearchHandler;
+use ferrosa_cluster::raft::{NodeInfo, NodeState};
 use ferrosa_cluster::repair::rpc::RepairMerkleRequestPayload;
 use ferrosa_cluster::repair::{
     LocalRepairExecutor, RemoteRepairStore, RepairMerkleHandler, RepairStore, SessionExecutor,
     StorageEngineRepairStore,
 };
-use ferrosa_cluster::consistency::ConsistencyLevel;
-use ferrosa_cluster::coordinator::ClusterCoordinator;
-use ferrosa_cluster::raft::handlers::FulltextSearchHandler;
-use ferrosa_cluster::raft::{NodeInfo, NodeState};
 use ferrosa_cluster::ring::TokenRing;
 use ferrosa_net::codec::{Lane, MsgType};
 use ferrosa_net::config::NetConfig;
@@ -795,7 +795,8 @@ fn repair_request_against_a_replica_that_cannot_read_is_answered_promptly() {
             range_start: i64::MIN,
             range_end: i64::MAX,
         };
-        let msg = Message::RepairMerkleRequest(bytes::Bytes::from(bincode::serialize(&req).unwrap()));
+        let msg =
+            Message::RepairMerkleRequest(bytes::Bytes::from(bincode::serialize(&req).unwrap()));
 
         // A short budget: a silent replica (the pre-fix behaviour) shows up as
         // the lane timeout it is, without waiting the production 60 s.
@@ -843,13 +844,15 @@ fn repair_session_against_a_refusing_source_fails_and_does_not_verify() {
             uuid::Uuid::new_v4(),
             Arc::new(NoopListener),
         ));
-        peers.ensure_peer(src_id, &src_addr.to_string()).await.unwrap();
+        peers
+            .ensure_peer(src_id, &src_addr.to_string())
+            .await
+            .unwrap();
         let remote: Arc<dyn RepairStore> = Arc::new(RemoteRepairStore {
             host_id: src_id,
             peer_manager: peers,
         });
-        let local_store: Arc<dyn RepairStore> =
-            Arc::new(StorageEngineRepairStore::new(local));
+        let local_store: Arc<dyn RepairStore> = Arc::new(StorageEngineRepairStore::new(local));
         let executor = LocalRepairExecutor {
             local: local_store,
             remotes: [(2u64, remote)].into_iter().collect(),
