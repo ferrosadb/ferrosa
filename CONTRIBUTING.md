@@ -75,6 +75,38 @@ Follow conventional-commit style:
 
 Body should explain *why*, not just *what*. The diff already shows the *what*.
 
+### Versioning
+
+Every change to `main` bumps `[workspace.package] version` in `Cargo.toml`, by
+the amount its commits call for. `scripts/semver-bump` computes it from the
+Conventional Commits on your branch since it left `main`:
+
+| Commits on the branch                         | Bump                         |
+| --------------------------------------------- | ---------------------------- |
+| `feat!:` / `fix(x)!:` / `BREAKING CHANGE:` footer | major (minor while `0.x`) |
+| `feat:` / `feat(scope):`                      | minor                        |
+| anything else (`fix`, `perf`, `docs`, `ci`, …) | patch                       |
+
+Do not edit the version by hand. Run:
+
+```bash
+scripts/semver-bump --print   # base, commits, required and current version
+scripts/semver-bump --apply   # write the version, refresh Cargo.lock, commit chore(release): vX.Y.Z
+```
+
+It is enforced in three places:
+
+- **commit-msg hook** — refuses a commit whose header is not a Conventional Commit.
+- **pre-push hook** (`semver-bump`, the first pre-push hook) — refuses a branch
+  that is not bumped far enough. Both are installed by `pre-commit install`.
+- **CI** (`.github/workflows/semver.yml`) — the same check on every PR and
+  merge-queue entry; after a merge, main is tagged `semver-v<version>`. These
+  tags never trigger `release.yml`, which only builds `v*` tags.
+
+If another PR bumps `main` before yours merges, rebase onto `main`, drop your
+old `chore(release): …` commit (or resolve the `Cargo.toml`/`Cargo.lock`
+conflict in favour of `main`), and run `scripts/semver-bump --apply` again.
+
 ### Test-Driven Development
 
 For new features and bug fixes, write the failing test first, then make it pass, then

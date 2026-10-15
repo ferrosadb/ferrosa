@@ -134,8 +134,8 @@ Agents MUST verify that all CI checks will pass locally before pushing to a remo
 
 See [specs/reference/release-process.md](specs/reference/release-process.md). Key rules:
 
-- **Never hand-edit `[workspace.package] version` in `Cargo.toml` in a PR.** The nightly release automation owns it and derives the next SemVer from Conventional Commit history; a manual bump is ignored and overwritten.
-- Use **Conventional Commit** subjects (`feat:`, `fix:`, `feat!:`/`BREAKING CHANGE:`) — the auto-bump level is computed from them, and sloppy subjects silently degrade a release to a `patch`.
+- **Every PR bumps `[workspace.package] version`, and only via `scripts/semver-bump --apply`** — never by hand. The commit-msg/pre-push hooks and the `Semver` CI workflow refuse a branch that is not bumped as far as its commits require; merges to main are tagged `semver-v<version>`. See "Versioning" in [CONTRIBUTING.md](CONTRIBUTING.md). The nightly/stable release tags are still computed separately by the release automation (below).
+- Use **Conventional Commit** subjects (`feat:`, `fix:`, `feat!:`/`BREAKING CHANGE:`) — the bump level is computed from them; the commit-msg hook refuses anything else.
 - Releases are **tag-only** (the `main` ruleset forbids direct pushes). Nightly cuts are GitHub **prereleases** (nightly channel); a maintainer **promotes** one to **stable** via the *Promote Release to Stable* workflow.
 
 ## Test Policy

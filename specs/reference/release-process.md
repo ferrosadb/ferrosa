@@ -5,10 +5,13 @@ consumes them.
 
 ## TL;DR
 
-- **Versioning is automatic.** The release job derives the next SemVer from
-  Conventional Commit history. **Do not hand-edit `[workspace.package] version`
-  in `Cargo.toml` in a PR** — it is owned by the release automation and is
-  overwritten.
+- **`main`'s version is bumped by every PR** with `scripts/semver-bump --apply`
+  (enforced by hooks and `.github/workflows/semver.yml`, which tags merges
+  `semver-v<version>`; see "Versioning" in `CONTRIBUTING.md`). Never hand-edit it.
+- **Release versions are still computed separately.** The release job derives the
+  next SemVer from Conventional Commit history since the last stable `vX.Y.Z`
+  tag and writes it onto the tag commit, ignoring `main`'s version. The two can
+  disagree until the release automation is changed to read `main`'s version.
 - **Releases cut on merge.** Every push to `main` (a merged PR) that carries a
   releasable commit cuts the next release automatically. A **nightly cron** runs
   as a safety-net for anything the merge path missed. Both paths share one

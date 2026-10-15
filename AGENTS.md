@@ -59,11 +59,12 @@ The crate-centric map (all crates + the runtime dependency graph) lives at
   (zero warnings), `cargo test`, and `cargo doc` with `-D warnings`, across the
   full workspace, must pass locally. Do not push and hope. (CI also requires
   these — the `main` merge queue gates on them.)
-- **Never commit to `main`** — feature branch + PR. Tag-only releases; the
-  version is owned by nightly automation (never hand-edit `[workspace.package]
-  version`).
-- **Conventional Commits** — the release bump level is computed from commit
-  subjects (`feat:`/`fix:`/`feat!:`).
+- **Never commit to `main`** — feature branch + PR. Tag-only releases.
+- **Every PR bumps the version** with `scripts/semver-bump --apply` (never by
+  hand); the pre-push hook and the `Semver` CI workflow refuse an unbumped
+  branch. See "Versioning" in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- **Conventional Commits** — the bump level is computed from commit subjects
+  (`feat:`/`fix:`/`feat!:`); the commit-msg hook refuses anything else.
 - **Fail loud, never fake** — prefer a clear error over a silent fallback that
   returns wrong/empty results. (This is also what the FMEAs in each crate's
   `specs/` exist to surface.)
