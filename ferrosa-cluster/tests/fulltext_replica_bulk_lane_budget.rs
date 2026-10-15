@@ -38,13 +38,19 @@ use ferrosa_common::CellValue;
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{CommitLogConfig, StorageEngine, StorageEngineConfig, TableId};
 
+use ferrosa_cluster::repair::rpc::RepairMerkleRequestPayload;
+use ferrosa_cluster::repair::{
+    LocalRepairExecutor, RemoteRepairStore, RepairMerkleHandler, RepairStore, SessionExecutor,
+    StorageEngineRepairStore,
+};
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::coordinator::ClusterCoordinator;
 use ferrosa_cluster::raft::handlers::FulltextSearchHandler;
 use ferrosa_cluster::raft::{NodeInfo, NodeState};
 use ferrosa_cluster::ring::TokenRing;
-use ferrosa_net::codec::MsgType;
+use ferrosa_net::codec::{Lane, MsgType};
 use ferrosa_net::config::NetConfig;
+use ferrosa_net::message::Message;
 use ferrosa_net::peer::{PeerEventListener, PeerManager};
 use ferrosa_net::rpc::handler::HandlerRegistry;
 use ferrosa_net::rpc::server::RpcServer;
@@ -695,5 +701,171 @@ fn replica_response_near_the_frame_limit_is_delivered_and_over_it_fails_the_quer
 
         near_srv.shutdown(Duration::from_millis(50)).await;
         over_srv.shutdown(Duration::from_millis(50)).await;
+    });
+}
+
+// ── Repair source refusal: answered on the Bulk lane, never left to time out ──
+//
+// Live signature (2026-10-15, a local 3-node launchd cluster): node1 (the
+// joining node) parked in `Joining` because its bootstrap's FIRST repair
+// session — against the leader, on `Lane::Bulk` — timed out:
+//
+// ```text
+// bootstrap NOT verified; … the node stays Joining … error=agent_memory.account_blueprints:
+//   stream to node 3689348814741910323 failed: bootstrap session [ … ): send:
+//   timeout: Bulk lane timeout
+// ```
+//
+// The source had NOT stalled: it received the request and failed it in ~2 s,
+// logging `RepairMerkleHandler: build_tree_for_range failed e=storage: corrupt
+// SSTable made the read unresolvable`. Its handler answered `None`, which the
+// RPC server reads as fire-and-forget, so the requester held the request for
+// the whole 60 s Bulk budget and then aborted the bootstrap on a timeout that
+// named nothing. The read-path handlers were given a typed error reply
+// (outage 2026-10-10, t_9113289f); the repair handlers were missed.
+
+/// An engine whose one table has a single flushed SSTable with its `Data.db`
+/// truncated — every range read over it fails with a typed corrupt-SSTable
+/// error. A deterministic stand-in for the live quarantined SSTable; the
+/// source replica cannot serve the range at all.
+fn repair_source_that_cannot_read(dir: &std::path::Path) -> Arc<StorageEngine> {
+    let engine = engine(dir);
+    let table = TableId::new(KS, TBL);
+    engine
+        .write(&table, &doc_key(0), row("unreadable", 1), 1)
+        .unwrap();
+    engine.flush(&table).unwrap();
+    let mut damaged = 0usize;
+    let mut pending = vec![dir.join("sstables")];
+    while let Some(next) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.to_string_lossy().ends_with("-Data.db") {
+                std::fs::write(&path, [0u8]).unwrap();
+                damaged += 1;
+            }
+        }
+    }
+    assert!(damaged > 0, "test setup: no flushed Data.db to damage");
+    engine
+}
+
+async fn spawn_repair_server(
+    config: &NetConfig,
+    storage: Arc<StorageEngine>,
+) -> (Arc<RpcServer>, std::net::SocketAddr, uuid::Uuid) {
+    let host_id = uuid::Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(
+        MsgType::RepairMerkleRequest,
+        Arc::new(RepairMerkleHandler::new(storage)),
+    );
+    let server = Arc::new(RpcServer::new(config.clone(), host_id, registry));
+    let addr = server.start_and_get_addr().await.unwrap();
+    (server, addr, host_id)
+}
+
+/// A repair source that cannot read its range must ANSWER the requester with
+/// its typed failure, naming itself — never stay silent. Silent, the request
+/// burns the caller's whole Bulk-lane budget and the joining node's bootstrap
+/// aborts on a `Bulk lane timeout` that names nothing.
+#[test]
+fn repair_request_against_a_replica_that_cannot_read_is_answered_promptly() {
+    multi_thread_rt().block_on(async {
+        let config = net_config();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = repair_source_that_cannot_read(dir.path());
+        let (srv, addr, host_id) = spawn_repair_server(&config, storage).await;
+
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(config.clone()),
+            uuid::Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        peers.ensure_peer(host_id, &addr.to_string()).await.unwrap();
+
+        let req = RepairMerkleRequestPayload {
+            keyspace: KS.to_string(),
+            table: TBL.to_string(),
+            range_start: i64::MIN,
+            range_end: i64::MAX,
+        };
+        let msg = Message::RepairMerkleRequest(bytes::Bytes::from(bincode::serialize(&req).unwrap()));
+
+        // A short budget: a silent replica (the pre-fix behaviour) shows up as
+        // the lane timeout it is, without waiting the production 60 s.
+        let budget = Duration::from_secs(3);
+        let start = Instant::now();
+        let err = peers
+            .send_with_timeout(host_id, msg, Lane::Bulk, budget)
+            .await
+            .expect_err("a replica that cannot serve the range must fail the request");
+        let elapsed = start.elapsed();
+        let message = err.to_string();
+        assert!(
+            message.contains("handler_failed") && message.contains("RepairMerkleHandler"),
+            "the refusal must be the replica's typed failure naming the handler, not a lane \
+             timeout; got after {elapsed:?}: {message}"
+        );
+        assert!(
+            elapsed < budget,
+            "the replica answered, so the request must not wait out its {budget:?} Bulk budget; \
+             took {elapsed:?}"
+        );
+
+        srv.shutdown(Duration::from_millis(50)).await;
+    });
+}
+
+/// Mirror control: a source that refuses is a FAILED session, never a verified
+/// one. The joiner must not read a source's refusal as "no divergence" (that
+/// would promote a node whose range was never compared), and the bootstrap
+/// aborts with the source's real reason instead of a bare timeout.
+#[test]
+fn repair_session_against_a_refusing_source_fails_and_does_not_verify() {
+    multi_thread_rt().block_on(async {
+        let config = net_config();
+        let src_dir = tempfile::tempdir().unwrap();
+        let src_storage = repair_source_that_cannot_read(src_dir.path());
+        let (src_srv, src_addr, src_id) = spawn_repair_server(&config, src_storage).await;
+
+        // The joiner's own storage: the same table, readable.
+        let local_dir = tempfile::tempdir().unwrap();
+        let local = engine(local_dir.path());
+
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(config.clone()),
+            uuid::Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        peers.ensure_peer(src_id, &src_addr.to_string()).await.unwrap();
+        let remote: Arc<dyn RepairStore> = Arc::new(RemoteRepairStore {
+            host_id: src_id,
+            peer_manager: peers,
+        });
+        let local_store: Arc<dyn RepairStore> =
+            Arc::new(StorageEngineRepairStore::new(local));
+        let executor = LocalRepairExecutor {
+            local: local_store,
+            remotes: [(2u64, remote)].into_iter().collect(),
+        };
+
+        let start = Instant::now();
+        let err = executor
+            .run_session(&TableId::new(KS, TBL), i64::MIN, i64::MAX, 2)
+            .await
+            .expect_err("a source that cannot read its range must fail the session, never verify");
+        assert!(
+            err.contains("RepairMerkleHandler") || err.contains("handler_failed"),
+            "the session failure must carry the source's reason, got after {:?}: {err}",
+            start.elapsed()
+        );
+
+        src_srv.shutdown(Duration::from_millis(50)).await;
     });
 }
