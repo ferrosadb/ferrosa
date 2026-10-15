@@ -230,7 +230,7 @@ async fn promote_from_degraded_pair_restores_writes() {
 
     // Enter pair mode via inbound connection. Lower host-id wins primary.
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(controller.role(), Some(PairRole::Primary));
 
@@ -279,7 +279,7 @@ async fn degraded_pair_serves_stale_reads() {
 
     // Enter pair mode
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
 
     // Peer disconnects → DegradedPair
@@ -386,7 +386,12 @@ async fn pair_mode_reaches_an_inbound_peer_at_its_advertised_internode_address()
     controller.set_peer_manager(pm);
 
     let ephemeral: SocketAddr = "127.0.0.1:49171".parse().unwrap();
-    controller.on_inbound_peer((peer_id, ephemeral), None, Some("127.0.0.1:29000".into()));
+    controller.on_inbound_peer(
+        (peer_id, ephemeral),
+        None,
+        Some("127.0.0.1:29000".into()),
+        0,
+    );
 
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     let pair_addr = controller
@@ -521,6 +526,7 @@ fn pair_formation_dials_the_advertised_address_on_any_co_located_layout() {
                 (peer, format!("127.0.0.1:{ephemeral}").parse().unwrap()),
                 None,
                 Some(advertised.to_string()),
+                0,
             );
             assert_eq!(controller.mode(), DeploymentMode::Pair);
             assert_eq!(controller.dial_target(peer), Some(advertised));
@@ -2316,6 +2322,7 @@ async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_que
         (peer2_id, std::net::SocketAddr::new(peer2_addr.ip(), 50318)),
         None,
         None,
+        0,
     );
 
     let pending = controller.pending_joins.lock();
@@ -2442,7 +2449,12 @@ fn self_connection_does_not_advance_cluster_formation() {
     );
 
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((local_id, "127.0.0.1:47000".parse().unwrap()), None, None);
+    controller.on_inbound_peer(
+        (local_id, "127.0.0.1:47000".parse().unwrap()),
+        None,
+        None,
+        0,
+    );
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
     assert!(controller.connected_peers.lock().is_empty());
 
@@ -2673,7 +2685,7 @@ async fn reverse_inbound_race_does_not_promote_joiner_to_primary() {
 
     // Live 38xxx shape: the seed's reverse inbound arrives on an ephemeral
     // port before the joiner's canonical outbound `:7000` peer-connected event.
-    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None, None);
+    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None, None, 0);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(
         controller.role(),
@@ -3066,7 +3078,7 @@ async fn standalone_inbound_peer_transitions_to_pair() {
 
     // Inbound connection — should also transition, not reject.
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None, None);
+    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None, None, 0);
 
     assert_eq!(
         controller.mode(),
@@ -4397,7 +4409,7 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
         ))));
 
     let addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
-    controller.on_inbound_peer((inbound_peer, addr), None, None);
+    controller.on_inbound_peer((inbound_peer, addr), None, None, 0);
 
     let map = controller
         .raft_node_map_snapshot()
@@ -5075,7 +5087,7 @@ async fn primary_paired_with(
         controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
-    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()));
+    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()), 0);
     assert_eq!(controller.role(), Some(PairRole::Primary));
     for _ in 0..100 {
         if pm.has_peer(peer_id) {

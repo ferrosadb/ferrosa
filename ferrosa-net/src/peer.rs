@@ -83,6 +83,10 @@ pub struct PeerManager {
     started_at: tokio::time::Instant,
     /// Serialises dead-pool replacement so concurrent requests share one dial.
     replace_lock: tokio::sync::Mutex<()>,
+    /// Monotonic observation order for capability advertisements, so the two
+    /// sources (an inbound handshake, an outbound pool install) can be ordered
+    /// and the newest wins. See [`Self::peer_capabilities`].
+    capability_seq: AtomicU64,
 }
 
 struct PeerState {
@@ -94,6 +98,18 @@ struct PeerState {
     /// replacement: the heartbeat loop re-dials such a peer until it answers
     /// or is removed (t_48d168ee).
     redial: Option<Arc<RedialState>>,
+    /// Capability bits (`handshake::CAP_*`) the peer advertised on its most
+    /// recent INBOUND handshake. An inbound handshake proves the peer's process
+    /// is alive NOW running that build, so it is strictly fresher than the
+    /// outbound pool's snapshot, which was taken when WE dialled and can
+    /// predate the peer's restart (the stale-verdict defect this field fixes).
+    advertised_capabilities: AtomicU32,
+    /// Observation order of [`Self::advertised_capabilities`]
+    /// ([`PeerManager::next_capability_seq`]); 0 means "never observed".
+    advertised_capabilities_seq: AtomicU64,
+    /// Observation order at which the outbound pool's snapshot was taken, so
+    /// the two sources can be ordered. 0 when there is no pool.
+    pool_capabilities_seq: AtomicU64,
 }
 
 /// Schedule and bookkeeping for re-dialing a peer that has no pool.
@@ -165,6 +181,9 @@ impl PeerState {
             last_activity_ms: AtomicU64::new(now_ms),
             missed_heartbeats: AtomicU32::new(0),
             redial: None,
+            advertised_capabilities: AtomicU32::new(0),
+            advertised_capabilities_seq: AtomicU64::new(0),
+            pool_capabilities_seq: AtomicU64::new(0),
         }
     }
 
@@ -183,6 +202,28 @@ impl PeerState {
 
     fn activity_elapsed(&self, now_ms: u64) -> Duration {
         Duration::from_millis(now_ms.saturating_sub(self.last_activity_ms.load(Ordering::Relaxed)))
+    }
+
+    /// Record the bits the peer advertised on an INBOUND handshake, at
+    /// observation order `seq`. See [`PeerManager::record_inbound_capabilities`].
+    fn record_inbound_capabilities(&self, capabilities: u32, seq: u64) {
+        self.advertised_capabilities
+            .store(capabilities, Ordering::Relaxed);
+        self.advertised_capabilities_seq
+            .store(seq, Ordering::Relaxed);
+    }
+
+    /// The bits from whichever source was observed LAST: the peer's inbound
+    /// advertisement, or the outbound pool's snapshot. Ties (neither observed)
+    /// yield `None`.
+    fn latest_capabilities(&self) -> Option<u32> {
+        let inbound_seq = self.advertised_capabilities_seq.load(Ordering::Acquire);
+        let pool_seq = self.pool_capabilities_seq.load(Ordering::Acquire);
+        if inbound_seq > pool_seq {
+            Some(self.advertised_capabilities.load(Ordering::Acquire))
+        } else {
+            self.pool.as_ref().map(|pool| pool.peer_capabilities())
+        }
     }
 }
 
@@ -211,6 +252,7 @@ impl PeerManager {
             data_runtime: OnceLock::new(),
             started_at: tokio::time::Instant::now(),
             replace_lock: tokio::sync::Mutex::new(()),
+            capability_seq: AtomicU64::new(0),
         }
     }
 
@@ -247,6 +289,14 @@ impl PeerManager {
 
     fn now_ms(&self) -> u64 {
         self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64
+    }
+
+    /// Next capability-observation sequence number. Monotonic, so the source
+    /// observed LAST is the one with the higher number.
+    fn next_capability_seq(&self) -> u64 {
+        self.capability_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
     }
 
     async fn pool_for_peer(
@@ -435,6 +485,12 @@ impl PeerManager {
                 .await;
         }
         let state = Arc::new(PeerState::new(peer_id, Some(Arc::new(pool)), self.now_ms()));
+        // Stamp the snapshot's observation order so a LATER inbound
+        // advertisement (a peer that restarted and dialled us) can be told
+        // apart from this one. See `PeerState::latest_capabilities`.
+        state
+            .pool_capabilities_seq
+            .store(self.next_capability_seq(), Ordering::Relaxed);
         let old_pool = {
             let mut peers = self.peers.write().await;
             if let Some(expected) = expect {
@@ -512,16 +568,50 @@ impl PeerManager {
             .unwrap_or(false)
     }
 
-    /// Capability bits (`handshake::CAP_*`) the peer advertised on its live
-    /// outbound connection, or `None` when there is no live connection to it.
-    /// A feature gated on a capability must check this before sending a
-    /// message type an older peer does not know.
+    /// Capability bits (`handshake::CAP_*`) the peer most recently advertised,
+    /// or `None` when it has never advertised any (no live outbound connection
+    /// and no inbound handshake seen). A feature gated on a capability must
+    /// check this before sending a message type an older peer does not know.
+    ///
+    /// This is the NEWEST of two sources: the outbound pool's snapshot, taken
+    /// when WE dialled the peer, and the peer's most recent INBOUND handshake.
+    /// An inbound handshake proves the peer's process is alive NOW running that
+    /// build, so it is strictly fresher than a snapshot that can predate the
+    /// peer's restart — which is what left the jsonb capability verdict stale
+    /// through a rolling upgrade (t_d853fa2a). Latest-wins still fails closed:
+    /// a peer that restarts with an OLDER build records a lower value and is
+    /// still seen as lacking.
     pub async fn peer_capabilities(&self, host_id: uuid::Uuid) -> Option<u32> {
         let peers = self.peers.read().await;
         peers
             .get(&host_id)
-            .and_then(|state| state.pool.as_ref())
-            .map(|pool| pool.peer_capabilities())
+            .and_then(|state| state.latest_capabilities())
+    }
+
+    /// Record the capability bits a peer advertised on an INBOUND handshake.
+    ///
+    /// The internode accept path calls this for every accepted peer. It
+    /// refreshes the peer's latest advertisement so [`Self::peer_capabilities`]
+    /// reflects a peer that restarted with a newer build WITHOUT the observer
+    /// restarting (t_d853fa2a). Idempotent, and never loosens the fail-closed
+    /// direction: the value recorded is exactly what the peer advertised, so a
+    /// peer on a build without a bit is still seen as lacking it.
+    ///
+    /// A host this manager has never registered has no entry to update, so the
+    /// advertisement is ignored (logged at debug). Such a peer stays `None`
+    /// from [`Self::peer_capabilities`] — unknown, and unknown is never
+    /// capable.
+    pub async fn record_inbound_capabilities(&self, host_id: uuid::Uuid, capabilities: u32) {
+        let seq = self.next_capability_seq();
+        let peers = self.peers.read().await;
+        match peers.get(&host_id) {
+            Some(state) => state.record_inbound_capabilities(capabilities, seq),
+            None => tracing::debug!(
+                peer = %host_id,
+                capabilities,
+                "inbound capability advertisement for an unregistered peer ignored"
+            ),
+        }
     }
 
     /// Return the last known socket address for `host_id`, even if this peer
@@ -1328,6 +1418,51 @@ mod tests {
         assert!(pm.get_peer_cql_broadcast(host_id).await.is_none());
         assert!(!pm.has_peer(host_id));
         assert_eq!(listener.disconnected_count.load(Ordering::Relaxed), 1);
+    }
+
+    /// REGRESSION GUARD — written with the fix, after the behavioural red at
+    /// `ferrosa-cluster/tests/jsonb_capability_freshness.rs`. The bits a peer
+    /// advertises on its INBOUND handshake are reported by `peer_capabilities`
+    /// even though the peer has no outbound pool, and a peer advertising
+    /// WITHOUT the bit is reported as LACKING it (t_d853fa2a).
+    #[tokio::test]
+    async fn an_inbound_advertisement_is_reported_without_a_pool() {
+        let config = Arc::new(NetConfig::default());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), Arc::new(TestListener::new()));
+        let host_id = uuid::Uuid::new_v4();
+        pm.add_peer_entry((host_id, "127.0.0.1:7000".parse().unwrap()))
+            .await;
+        assert_eq!(
+            pm.peer_capabilities(host_id).await,
+            None,
+            "a registered peer with no pool and no advertisement is unknown"
+        );
+
+        pm.record_inbound_capabilities(host_id, crate::handshake::CAP_JSONB_V1)
+            .await;
+        assert_eq!(
+            pm.peer_capabilities(host_id).await,
+            Some(crate::handshake::CAP_JSONB_V1),
+            "the inbound advertisement must be reported without a pool"
+        );
+
+        // MIRROR: advertising WITHOUT the bit reports the peer as lacking it.
+        pm.record_inbound_capabilities(host_id, 0).await;
+        assert_eq!(pm.peer_capabilities(host_id).await, Some(0));
+    }
+
+    /// An advertisement for a host this manager has never registered is
+    /// ignored: the verdict stays `None` — unknown, and unknown is never
+    /// capable — so a stale inbound advertisement cannot fabricate capability
+    /// for a peer the jsonb gate cannot otherwise see (t_d853fa2a).
+    #[tokio::test]
+    async fn an_inbound_advertisement_for_an_unregistered_peer_is_ignored() {
+        let config = Arc::new(NetConfig::default());
+        let pm = PeerManager::new(config, uuid::Uuid::new_v4(), Arc::new(TestListener::new()));
+        let host_id = uuid::Uuid::new_v4();
+        pm.record_inbound_capabilities(host_id, crate::handshake::LOCAL_CAPABILITIES)
+            .await;
+        assert_eq!(pm.peer_capabilities(host_id).await, None);
     }
 
     /// t_b4d09b65: removing a peer must retire its pool, or the lane-actor

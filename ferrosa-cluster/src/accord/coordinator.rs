@@ -2276,9 +2276,22 @@ impl AccordCoordinatorDriver {
                 )
             })?;
             let deps: Vec<TxnId> = commit_deps.iter().copied().collect();
+            // Register the coordinator's OWN txn under its own write-set keys in
+            // its OWN conflict index. This is idempotent: a replica whose PreAccept
+            // self-vote already indexed the txn (RF>=3) is left untouched, while at
+            // RF=2 (where the self-vote is deliberately skipped so it cannot
+            // short-circuit the remote fan-out) the txn is indexed HERE. Without it
+            // the read-vote this replica serves at a later `t` resolves NO
+            // dependency on the key and reads this not-yet-locally-applied (the
+            // local apply is deferred until the remote Apply quorum) write as
+            // absent, so the F+1 read votes disagree and the LWT is refused as
+            // non-linearizable instead of returning ConditionNotMet.
+            let write_set = Arc::clone(&self.write_set);
             let locally_committed =
                 crate::accord::handlers::on_state_machine(local_sm, move |sm| {
                     sm.handle_commit(txn_id, t0, commit_t, deps);
+                    let keys: Vec<&[u8]> = write_set.iter().map(|w| w.key.as_slice()).collect();
+                    sm.register_committed_conflicts(txn_id, t0, &keys, commit_t);
                     sm.get_state(&txn_id)
                         .map(|state| matches!(state.phase, TxnPhase::Committed | TxnPhase::Applied))
                         .unwrap_or(false)
