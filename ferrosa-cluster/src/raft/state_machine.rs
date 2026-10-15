@@ -2393,6 +2393,20 @@ mod tests {
         }
     }
 
+    /// Like [`make_entry`] but with an explicit `schema_version`, so a test can
+    /// assert the VALUE the state machine settles on.
+    fn make_entry_with_version(
+        term: u64,
+        index: u64,
+        op: RaftOp,
+        schema_version: Uuid,
+    ) -> Entry<FerrosRaftConfig> {
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(term, 0), index),
+            payload: EntryPayload::Normal(RaftCommand { op, schema_version }),
+        }
+    }
+
     fn table_map(tables: Vec<TableMetadata>) -> BTreeMap<(String, String), TableMetadata> {
         tables
             .into_iter()
@@ -2814,6 +2828,111 @@ mod tests {
 
         assert!(sm.state().members.contains_key(&node_id));
         assert_eq!(sm.state().members[&node_id].addr, "10.0.0.1:7000");
+    }
+
+    /// Positive control for the schema-version contract
+    /// (bug-schema-version-diverges-after-restart, t_7dda9421): a genuine
+    /// schema change DOES move the node's committed version to the version the
+    /// command carries. Without this control, a "fix" that simply never updated
+    /// the version would pass every topology guard below.
+    #[tokio::test]
+    async fn real_ddl_command_changes_the_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        let v1 = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        let v2 = Uuid::from_u128(0x9999_aaaa_bbbb_cccc_dddd_eeee_ffff_0001);
+
+        sm.apply(vec![make_entry_with_version(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("tks")),
+            v1,
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.state().schema_version, v1);
+        assert_eq!(schema.snapshot().version, v1);
+
+        sm.apply(vec![make_entry_with_version(
+            1,
+            2,
+            RaftOp::CreateTable(Box::new(simple_table("tks", "tbl"))),
+            v2,
+        )])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sm.state().schema_version,
+            v2,
+            "a real DDL must advance the committed schema version"
+        );
+        assert_eq!(schema.snapshot().version, v2);
+    }
+
+    /// bug-schema-version-diverges-after-restart (t_7dda9421), Expected:
+    /// "versions should differ only while a schema change is actually being
+    /// applied". A topology command changes no schema, so applying one must
+    /// leave the node's committed schema version exactly where a prior real DDL
+    /// put it — even when the command carries a freshly minted random version.
+    ///
+    /// Regression guard: the `schema_changed` gate in `apply_command` already
+    /// existed on main (from the auth-bootstrap stabilisation), so this case was
+    /// green before the schema-version fix. It is kept to hold the contract
+    /// down against a future topology arm that forgets to clear the gate.
+    #[tokio::test]
+    async fn topology_command_leaves_the_schema_version_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        engine.register_system_tables().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+
+        let ddl_version = Uuid::from_u128(0x1111_2222_3333_4444_5555_6666_7777_8888);
+        sm.apply(vec![make_entry_with_version(
+            1,
+            1,
+            RaftOp::CreateKeyspace(simple_keyspace("tks")),
+            ddl_version,
+        )])
+        .await
+        .unwrap();
+        assert_eq!(sm.state().schema_version, ddl_version);
+
+        let host_id = Uuid::new_v4();
+        let node = NodeInfo {
+            host_id,
+            addr: "10.0.0.1:7000".to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+        sm.apply(vec![make_entry_with_version(
+            1,
+            2,
+            RaftOp::JoinNode(node),
+            Uuid::new_v4(),
+        )])
+        .await
+        .unwrap();
+
+        assert_eq!(
+            sm.state().schema_version,
+            ddl_version,
+            "a topology command must not advance the committed schema version"
+        );
+        assert_eq!(
+            schema.snapshot().version,
+            ddl_version,
+            "the shared Schema must keep the committed version after a topology command"
+        );
     }
 
     /// Regression test for the system.peers empty-tokens bug:

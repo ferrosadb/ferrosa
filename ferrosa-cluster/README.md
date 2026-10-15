@@ -618,6 +618,18 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   Tests: `boot_gate_defers_cluster_transition_until_state_loaded`,
   `cluster_transition_proceeds_when_boot_gate_is_open`,
   `mark_boot_state_loaded_opens_the_gate_and_redrives_the_deferred_transition`.
+- **Schema version on non-schema operations** (t_7dda9421, bug
+  `schema-version-diverges-after-restart`). Topology (`JoinNode` /
+  `AssignTokens` / `UpdateNodeInfo`) and data-movement (`SetNodeState` /
+  `LeaveNode` through `ForwardingProposer`) commands change no schema, so the
+  controller now stamps them with the node's CURRENT committed `Schema` version
+  instead of minting `Uuid::new_v4()`. The state machine's `schema_changed` gate
+  (topology arms clear it) already kept the committed version where the last real
+  DDL put it, so a random version never propagated cluster-wide; this removes the
+  mint so the command carries the version it means to. A node that restarts
+  re-adopts its PERSISTED version through `Schema::apply_snapshot`
+  (ferrosa-schema), which is what makes `system.local.schema_version` agree with
+  the cluster after a restart.
 - `ModeController::expected_cluster_size()` (the operator's
   `FERROSA_EXPECTED_CLUSTER_SIZE` declaration) and `committed_cluster_size()`
   (the membership the node has actually committed to — itself plus the peers it

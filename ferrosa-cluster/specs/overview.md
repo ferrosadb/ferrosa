@@ -189,6 +189,16 @@ than a total wait budget (CL-63). See
     budget, peer-count maps, backoff, net lane capacities) remain and are census'd in
     the crate README (CL-56/57/58).
 
+13. **A command that changes no schema carries the CURRENT schema version.**
+    Topology (`JoinNode` / `AssignTokens` / `UpdateNodeInfo`) and data-movement
+    (`SetNodeState` / `LeaveNode`) commands mint no version: the controller
+    stamps them with the node's committed `Schema` version (`ForwardingProposer`,
+    `controller/membership.rs`). The state machine's `schema_changed` gate keeps
+    the committed version where the last real DDL put it. A restarted node
+    re-adopts its persisted version through `Schema::apply_snapshot`
+    (ferrosa-schema), so `system.local.schema_version` agrees with the cluster
+    after a restart instead of diverging until the next DDL (t_7dda9421).
+
 ## Correctness evidence (be honest)
 
 - **What exists:** ~1050 in-crate tests, including Accord state-machine/recovery

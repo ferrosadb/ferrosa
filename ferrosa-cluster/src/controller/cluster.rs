@@ -477,6 +477,9 @@ async fn rerun_local_bootstrap(
         raft,
         peer_manager,
         ring: ring_holder,
+        // Membership commands change no schema: carry the node's CURRENT
+        // version, never a fresh random one (t_7dda9421).
+        schema_version: schema.snapshot().version,
     };
     if let Err(e) = super::data_movement::bootstrap_verified(
         &proposer,

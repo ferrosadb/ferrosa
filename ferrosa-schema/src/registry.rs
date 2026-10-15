@@ -303,10 +303,27 @@ impl Schema {
     ///
     /// **Important:** Does NOT register tables with StorageEngine —
     /// caller must call `engine.register_table()` for each table separately.
+    ///
+    /// The snapshot's `version` is adopted: a snapshot NAMES a point-in-time
+    /// schema state, so the registry must re-adopt that name along with the
+    /// contents. See the inline note below.
     pub fn apply_snapshot(&self, snapshot: SchemaSnapshot) -> crate::Result<()> {
         let _lock = self.write_lock.lock().unwrap();
         let mut current = (**self.inner.load()).clone();
         self.check_snapshot_jsonb(&current, &snapshot)?;
+
+        // A snapshot names the schema state it holds, so applying one adopts its
+        // version as well as its contents. Without this a node restored from its
+        // persisted `schema.json` (boot step 4a in `ferrosa/src/main.rs`) kept
+        // the random version `SchemaSnapshot::new()` minted when the registry was
+        // constructed, so `system.local.schema_version` diverged from the cluster
+        // after every restart and drivers sat in schema-agreement until a real
+        // DDL happened to overwrite it (bug: schema_version diverges after
+        // restart, task t_7dda9421). The same adoption is what carries
+        // `state.schema_version` into the shared `Schema` when the Raft state
+        // machine installs a snapshot and reconciles state
+        // (`sync_schema_and_engine_from_state`).
+        let adopted_version = snapshot.version;
 
         for (name, ks) in &snapshot.keyspaces {
             if is_system_keyspace(name) {
@@ -370,6 +387,9 @@ impl Schema {
                 .or_insert_with(|| agg.clone());
         }
 
+        // Adopt the snapshot's version last: the jsonb check above can reject
+        // the snapshot, and a rejected snapshot must not move the version.
+        current.version = adopted_version;
         self.inner.store(Arc::new(current));
         tracing::info!("applied schema snapshot");
         Ok(())
@@ -2221,6 +2241,55 @@ mod tests {
         assert_eq!(
             deserialized.keyspaces["test_ks"].replication.strategy,
             "SimpleStrategy"
+        );
+    }
+
+    /// bug-schema-version-diverges-after-restart (task t_7dda9421): a schema
+    /// snapshot NAMES a point-in-time schema state, so applying one must adopt
+    /// its version along with its contents. Before the fix `apply_snapshot`
+    /// merged keyspaces/tables/roles but left the registry's own version — the
+    /// random one minted at boot by `SchemaSnapshot::new()` — so a node that
+    /// restarted from its persisted `schema.json` never re-adopted the version
+    /// it had persisted, and `system.local.schema_version` stayed divergent
+    /// from the cluster until a real DDL happened to overwrite it.
+    ///
+    /// RED as written: `apply_snapshot` returns `Ok` and the keyspace lands,
+    /// but the registry keeps the boot version, so the VALUE assertion below
+    /// fails. It fails on the restore behaviour, not on a missing symbol.
+    #[test]
+    fn apply_snapshot_adopts_the_persisted_schema_version() {
+        let schema = test_schema();
+        let boot_version = schema.snapshot().version;
+
+        let mut restored = SchemaSnapshot::new();
+        let persisted_version = Uuid::from_u128(0x5123_4567_89ab_cdef_0000_0000_0000_0001);
+        restored.version = persisted_version;
+        restored.keyspaces.insert(
+            "restored_ks".to_string(),
+            KeyspaceMetadata {
+                name: "restored_ks".to_string(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".to_string(),
+                    options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+                },
+            },
+        );
+
+        assert_ne!(
+            persisted_version, boot_version,
+            "the fixture's persisted version must differ from the boot version, or the assertion is vacuous"
+        );
+        schema.apply_snapshot(restored).expect("apply_snapshot");
+
+        assert!(
+            schema.snapshot().keyspaces.contains_key("restored_ks"),
+            "the snapshot's contents must still be applied"
+        );
+        assert_eq!(
+            schema.snapshot().version,
+            persisted_version,
+            "a node restored from a persisted snapshot must adopt that snapshot's schema version"
         );
     }
 

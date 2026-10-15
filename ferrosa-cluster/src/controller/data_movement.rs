@@ -119,6 +119,15 @@ pub trait MembershipProposer: Send + Sync {
 
 #[async_trait]
 impl MembershipProposer for crate::raft::FerrosRaft {
+    /// NOTE (t_7dda9421): this impl still mints a fresh `schema_version`. A bare
+    /// `openraft::Raft` handle holds no schema registry, so it cannot read the
+    /// node's actual committed version, and the membership / data-movement ops
+    /// it sends change no schema (the state machine's `schema_changed` gate
+    /// ignores the value). Production callers in `ferrosa-cluster` now use
+    /// [`ForwardingProposer`], which does carry the actual version; this impl is
+    /// left for callers that hold only the raft handle. The smallest change that
+    /// removes the mint entirely is a `schema_version: Uuid` parameter on
+    /// [`MembershipProposer::propose`], threaded from the caller's `Schema`.
     async fn propose(&self, op: RaftOp) -> Result<()> {
         self.client_write(crate::raft::RaftCommand {
             op,
@@ -660,6 +669,12 @@ pub struct ForwardingProposer {
     pub raft: std::sync::Arc<crate::raft::FerrosRaft>,
     pub peer_manager: std::sync::Arc<ferrosa_net::peer::PeerManager>,
     pub ring: std::sync::Arc<arc_swap::ArcSwap<Option<std::sync::Arc<TokenRing>>>>,
+    /// The node's CURRENT committed schema version, stamped on the membership /
+    /// data-movement commands this proposer sends. Those operations change no
+    /// schema, so they must carry the actual version, never a freshly minted
+    /// random one (bug: schema_version diverges after restart, t_7dda9421).
+    /// The caller reads it from the shared `Schema` it already holds.
+    pub schema_version: uuid::Uuid,
 }
 
 #[async_trait]
@@ -667,7 +682,7 @@ impl MembershipProposer for ForwardingProposer {
     async fn propose(&self, op: RaftOp) -> Result<()> {
         let cmd = crate::raft::RaftCommand {
             op,
-            schema_version: uuid::Uuid::new_v4(),
+            schema_version: self.schema_version,
         };
         let outcome = match self.raft.client_write(cmd.clone()).await {
             Ok(_) => Ok(()),
