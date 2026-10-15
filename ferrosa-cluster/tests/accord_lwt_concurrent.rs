@@ -1432,9 +1432,9 @@ async fn a_read_vote_that_cannot_reach_f_plus_one_still_refuses_loudly() {
         keyspace: E2E_KS.to_string(),
         table: E2E_TABLE.to_string(),
     })
-    .with_local_applier(Arc::new(ferrosa_cluster::accord::EngineStorageApplier::new(
-        node_a.engine.clone(),
-    )))
+    .with_local_applier(Arc::new(
+        ferrosa_cluster::accord::EngineStorageApplier::new(node_a.engine.clone()),
+    ))
     .with_local_reader(Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
         node_a.engine.clone(),
     )))
