@@ -157,3 +157,38 @@ jobs:
         env:
           VERSION: ${{ steps.bump.outputs.version }}
         run: echo "main already declares ${VERSION}; no bump or tag needed."
+
+  # A failed release run means no release was cut, and on 2026-10-15 nobody
+  # was told (this job's "bump and tag main" failed with GH013 silently).
+  # Needs only the push-only release job; `check` reports on the PR.
+  alert-ops:
+    name: Alert the ops channel (release failed)
+    needs: [release]
+    # Only for runs that were meant to release; PR / merge-queue checks report on the PR.
+    if: failure() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Post to Slack as the ops bot
+        env:
+          SLACK_TOKEN: ${{ secrets.FERROSA_OPS_SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL: ${{ vars.FERROSA_OPS_SLACK_CHANNEL }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SLACK_TOKEN" ] || [ -z "$SLACK_CHANNEL" ]; then
+            echo "::error::${WORKFLOW} failed and the ops alert is not configured (FERROSA_OPS_SLACK_BOT_TOKEN / FERROSA_OPS_SLACK_CHANNEL); nobody was told"
+            exit 1
+          fi
+          text=":rotating_light: *${GITHUB_REPOSITORY}*: ${WORKFLOW} failed on \`${GITHUB_SHA::8}\` (${GITHUB_EVENT_NAME}, ${GITHUB_REF_NAME}). No release was produced. ${RUN_URL}"
+          body=$(jq -n --arg c "$SLACK_CHANNEL" --arg t "$text" '{channel: $c, text: $t, unfurl_links: false}')
+          # The token reaches curl on stdin, never on its command line.
+          resp=$(printf 'Authorization: Bearer %s\n' "$SLACK_TOKEN" | curl -sS --max-time 20 -H @- \
+            -H 'Content-Type: application/json; charset=utf-8' --data "$body" https://slack.com/api/chat.postMessage)
+          if [ "$(jq -r '.ok' <<<"$resp")" != true ]; then
+            echo "::error::the ops alert was NOT delivered: $(jq -r '.error // "no error field"' <<<"$resp")"
+            exit 1
+          fi
+          echo "ops alert posted"
