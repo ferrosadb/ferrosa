@@ -3344,6 +3344,126 @@ mod tests {
             .expect("recovered Raft snapshot must also register the table with StorageEngine");
     }
 
+    /// A node that crashed just after a DDL restarts holding a STALE on-disk
+    /// `schema.json` version, and must CONVERGE to the committed version once it
+    /// reconciles from its own replicated Raft state.
+    ///
+    /// It drives the two REAL production steps a restart runs — in order, rather
+    /// than hand-assembling the end state — so it fails if either leg stops doing
+    /// its job:
+    ///
+    /// 1. **Boot step 4a** (`ferrosa/src/main.rs`, "Restore schema from local
+    ///    disk", `schema.apply_snapshot(local_schema_snapshot)`). The persisted
+    ///    `schema.json` lands in the registry naming the version it was written
+    ///    with. That version is STALE here: the maintenance loop rewrites the file
+    ///    only when the version CHANGED
+    ///    (`should_persist_schema(current, last) = current != last`,
+    ///    `ferrosa/src/maintenance.rs`), so a crash between a DDL's commit and the
+    ///    next maintenance tick leaves the file naming the pre-DDL version.
+    /// 2. **Raft state-machine recovery** (`ferrosa-cluster/src/controller/cluster.rs`,
+    ///    `transition_to_cluster`: `state_machine.recover_from_persisted_snapshot()`
+    ///    → `apply_snapshot_data` → `sync_schema_and_engine_from_state`). That
+    ///    builds a `SchemaSnapshot` whose `version` is `self.state.schema_version`
+    ///    — the REPLICATED, committed version — and applies it to the same
+    ///    registry.
+    ///
+    /// Scope: this exercises the registry call boot step 4a makes plus the state
+    /// machine's recovery step, not the whole `ferrosa` binary boot, and no real
+    /// crash is simulated. The stale file and the committed replicated state are
+    /// fixtures with fixed, DISTINCT versions, so a pass cannot come from the two
+    /// being accidentally equal.
+    #[tokio::test]
+    async fn a_stale_persisted_schema_version_converges_to_the_committed_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let snapshot_path = dir.path().join("state-machine.snapshot.bin");
+
+        // Two fixed, distinct versions: the one the stale schema.json names, and
+        // the one the cluster committed with the DDL.
+        let stale_version = Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111);
+        let committed_version = Uuid::from_u128(0x2222_2222_2222_2222_2222_2222_2222_2222);
+        assert_ne!(
+            stale_version, committed_version,
+            "the two fixtures must be distinct or every assertion here is vacuous"
+        );
+
+        // --- The replicated state: a DDL committed under `committed_version`. ---
+        let mut committed_node = FerrosStateMachine::with_snapshot_path(snapshot_path.clone());
+        committed_node
+            .apply(vec![make_entry_with_version(
+                1,
+                1,
+                RaftOp::CreateKeyspace(simple_keyspace("agent_memory")),
+                committed_version,
+            )])
+            .await
+            .unwrap();
+        assert_eq!(
+            committed_node.state().schema_version,
+            committed_version,
+            "precondition: the committed DDL must leave the replicated state on the test's \
+             committed version"
+        );
+        committed_node.build_snapshot().await.unwrap();
+
+        // --- The node that crashed and is now restarting. ---
+        let schema = Arc::new(test_schema_instance());
+        let engine = test_engine(dir.path());
+        let boot_version = schema.snapshot().version;
+        assert_ne!(
+            boot_version, committed_version,
+            "the boot-minted version must differ from the committed one or the assertion is vacuous"
+        );
+
+        // Leg 1 — boot step 4a: the STALE on-disk schema.json enters the registry.
+        let mut stale_disk = ferrosa_schema::SchemaSnapshot::new();
+        stale_disk.version = stale_version;
+        stale_disk.keyspaces.insert(
+            "stale_disk_ks".to_string(),
+            simple_keyspace("stale_disk_ks"),
+        );
+        schema
+            .apply_snapshot(stale_disk)
+            .expect("boot step 4a applies the persisted local snapshot");
+        let version_after_persisted_restore = schema.snapshot().version;
+
+        // Leg 2 — the replicated-state sync.
+        let mut restarted = FerrosStateMachine::with_side_effects_and_snapshot_path(
+            Arc::clone(&schema),
+            Arc::clone(&engine),
+            snapshot_path,
+        );
+        assert!(
+            restarted.recover_from_persisted_snapshot().unwrap(),
+            "the durable Raft snapshot must load on restart"
+        );
+
+        // The convergence claim is asserted FIRST, so a control that breaks the
+        // mechanism fails here rather than on the intermediate evidence.
+        assert_eq!(
+            schema.snapshot().version,
+            committed_version,
+            "a node restarted on a STALE persisted schema version must converge to the \
+             COMMITTED version carried by its replicated Raft state"
+        );
+        assert_ne!(
+            schema.snapshot().version,
+            stale_version,
+            "the node must not keep serving the stale on-disk version"
+        );
+        assert_ne!(
+            schema.snapshot().version,
+            boot_version,
+            "the node must not keep the random version minted when the registry was constructed"
+        );
+
+        // Evidence that leg 1 really did land the stale version, so the pass
+        // above is convergence and not the stale file never having been applied.
+        assert_eq!(
+            version_after_persisted_restore, stale_version,
+            "the persisted restore must adopt the on-disk version — else nothing was stale to fix"
+        );
+    }
+
     /// REGRESSION: a Raft snapshot must be able to CORRECT the columns of a
     /// table the engine has already registered, not just introduce new tables.
     ///
