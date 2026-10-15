@@ -1,0 +1,76 @@
+name: Semver
+
+# Every change to main carries the semver bump its Conventional Commits call
+# for (scripts/semver-bump, configured by .semver-bump.toml):
+#   - a PR / merge-queue entry must already be bumped (`semver-bump --check`);
+#   - a push to main tags the merged version as `semver-v<version>`.
+#
+# The tag prefix is deliberately NOT `v`: release.yml publishes on any `v*`
+# tag and next-release-version.sh treats `vX.Y.Z` tags as the stable base, so
+# a `v` tag here would cut or skew a release. `semver-v*` matches neither.
+#
+# Hosted runners, like every other small CI job in this public repository.
+
+on:
+  pull_request:
+    branches: [main]
+  merge_group:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: semver bump present
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: semver-bump unit tests
+        run: python3 -m unittest discover -s scripts/tests
+      - name: Version bumped as far as the commits require
+        # merge_group has no base_ref; its base is always main.
+        run: python3 scripts/semver-bump --check --base "origin/${{ github.base_ref || 'main' }}"
+
+  tag:
+    name: tag the merged version
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: semver-tag-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Create semver-v<version> if it does not exist
+        run: |
+          set -euo pipefail
+          prefix="$(python3 -c 'import tomllib; print(tomllib.load(open(".semver-bump.toml", "rb"))["tag_prefix"])')"
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')"
+          tag="${prefix}${version}"
+          case "$tag" in
+            v*) echo "error: tag ${tag} would trigger release.yml (on: push tags v*); refusing" >&2; exit 1 ;;
+          esac
+          git fetch --tags --force origin
+          if existing="$(git rev-parse -q --verify "refs/tags/${tag}^{commit}")"; then
+            # Never move a tag. A second push at the same version is a missed
+            # bump that CI should have refused; say so instead of hiding it.
+            if [ "$existing" = "$GITHUB_SHA" ]; then
+              echo "${tag} already points at ${GITHUB_SHA}; nothing to do."
+            else
+              echo "::warning::${tag} already exists at ${existing}; ${GITHUB_SHA} carries the same version and is left untagged."
+            fi
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag" "$GITHUB_SHA"
+          git push origin "refs/tags/${tag}"
+          echo "created ${tag} at ${GITHUB_SHA}"

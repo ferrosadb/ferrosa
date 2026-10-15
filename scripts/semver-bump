@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""semver-bump: every change to main carries the semver bump its commits call for.
+
+    scripts/semver-bump --check  [--base origin/main]   verify this branch is bumped (hook, CI)
+    scripts/semver-bump --apply  [--base origin/main]   write the required version and commit it
+    scripts/semver-bump --print  [--base origin/main]   show base, commits, required and current
+    scripts/semver-bump --check-message FILE            commit-msg hook: Conventional Commit header
+
+The bump comes from the Conventional Commits on the branch since it left the base (merge-base):
+
+    breaking ("type!:" or a BREAKING CHANGE footer) -> major   (minor while the major is 0)
+    feat                                            -> minor
+    anything else (fix, perf, refactor, docs, ...)  -> patch   every change to main bumps
+
+Configuration lives in .semver-bump.toml at the repository root:
+
+    tag_prefix = "v"              # tags created on main by CI: <prefix><version>
+    post_apply = [["cargo", "update", "--workspace", "--offline"]]   # e.g. refresh Cargo.lock
+    [[file]]                      # the FIRST file is the source of truth; all must agree
+    path = "Cargo.toml"
+    kind = "cargo-workspace"      # [workspace.package].version
+    # kinds: cargo-workspace | cargo-package ([package].version) | json (top-level "version")
+    #        | text (the whole file is the version)
+
+A pre-release suffix on the version (e.g. 0.23.0-nightly) is kept: the core is bumped, the suffix
+stays. This file is byte-identical in every Ferrosa repository; per-repo differences belong in the
+configuration, never here. Python standard library only.
+"""
+import argparse
+import json
+import re
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+RELEASE_SUBJECT = re.compile(r"^chore\(release\): v\d+\.\d+\.\d+\S*$")
+HEADER = re.compile(
+    r"^(?P<type>feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)"
+    r"(?:\([^()\s][^()]*\))?(?P<bang>!)?: \S.*$"
+)
+SEMVER = re.compile(r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)(?P<suffix>[-+]\S*)?$")
+LEVELS = {"patch": 0, "minor": 1, "major": 2}
+
+
+class Fail(Exception):
+    """A refusal with a message for the person at the terminal."""
+
+
+def git(*args: str, check: bool = True) -> str:
+    out = subprocess.run(["git", *args], capture_output=True, text=True)
+    if check and out.returncode != 0:
+        raise Fail(f"git {' '.join(args)} failed: {out.stderr.strip() or out.stdout.strip()}")
+    return out.stdout
+
+
+def parse_version(text: str, where: str) -> tuple[int, int, int, str]:
+    m = SEMVER.match(text.strip())
+    if not m:
+        raise Fail(f"{where}: '{text.strip()}' is not a semantic version (X.Y.Z[-suffix])")
+    return int(m["major"]), int(m["minor"]), int(m["patch"]), m["suffix"] or ""
+
+
+def fmt(v: tuple[int, int, int, str]) -> str:
+    return f"{v[0]}.{v[1]}.{v[2]}{v[3]}"
+
+
+def core(v: tuple[int, int, int, str]) -> tuple[int, int, int]:
+    return v[0], v[1], v[2]
+
+
+def bump(v: tuple[int, int, int, str], level: str) -> tuple[int, int, int, str]:
+    major, minor, patch, suffix = v
+    if level == "major":
+        return (0, minor + 1, 0, suffix) if major == 0 else (major + 1, 0, 0, suffix)
+    if level == "minor":
+        return major, minor + 1, 0, suffix
+    return major, minor, patch + 1, suffix
+
+
+# ---- version files -------------------------------------------------------------------------------
+def read_version(kind: str, text: str, where: str) -> str:
+    if kind == "text":
+        return text.strip()
+    if kind == "json":
+        try:
+            return str(json.loads(text)["version"])
+        except (ValueError, KeyError) as e:
+            raise Fail(f"{where}: no top-level \"version\" ({e})") from e
+    if kind in ("cargo-workspace", "cargo-package"):
+        table = "workspace.package" if kind == "cargo-workspace" else "package"
+        data = tomllib.loads(text)
+        node = data
+        for part in table.split("."):
+            node = node.get(part, {})
+        if "version" not in node:
+            raise Fail(f"{where}: no [{table}].version")
+        return str(node["version"])
+    raise Fail(f"{where}: unknown kind '{kind}'")
+
+
+def write_version(kind: str, text: str, new: str, where: str) -> str:
+    if kind == "text":
+        return new + "\n"
+    if kind == "json":
+        # Replace only the first top-level "version" value, preserving the file's formatting.
+        out, n = re.subn(r'^(\s{0,4}"version"\s*:\s*")[^"]*(")', rf"\g<1>{new}\g<2>", text, count=1, flags=re.M)
+    else:
+        # Line-based within the one table: values above `version` may contain brackets
+        # (authors = ["..."]), so a regex spanning the table would mis-match.
+        table = "workspace.package" if kind == "cargo-workspace" else "package"
+        lines, inside, n = text.splitlines(keepends=True), False, 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith("["):
+                inside = stripped == f"[{table}]"
+                continue
+            if inside and n == 0:
+                new_line, k = re.subn(r'^(\s*version\s*=\s*")[^"]*(")', rf"\g<1>{new}\g<2>", line, count=1)
+                if k:
+                    lines[i], n = new_line, 1
+        out = "".join(lines)
+    if n != 1:
+        raise Fail(f"{where}: could not locate the version to rewrite")
+    if read_version(kind, out, where) != new:
+        raise Fail(f"{where}: rewrite did not produce version {new}")
+    return out
+
+
+def load_config(root: Path) -> dict:
+    path = root / ".semver-bump.toml"
+    if not path.is_file():
+        raise Fail(f"no {path.name} at the repository root")
+    cfg = tomllib.loads(path.read_text())
+    if not cfg.get("file"):
+        raise Fail(f"{path.name} lists no [[file]] entries")
+    return cfg
+
+
+def versions_at(cfg: dict, rev: str | None, root: Path) -> list[tuple[str, str]]:
+    found = []
+    for entry in cfg["file"]:
+        p, kind = entry["path"], entry["kind"]
+        if rev is None:
+            text = (root / p).read_text()
+            where = p
+        else:
+            text = git("show", f"{rev}:{p}", check=False)
+            if not text:
+                raise Fail(f"{p} does not exist at {rev}")
+            where = f"{p}@{rev[:12]}"
+        found.append((where, read_version(kind, text, where)))
+    return found
+
+
+def agreed(found: list[tuple[str, str]]) -> tuple[int, int, int, str]:
+    distinct = {v for _, v in found}
+    if len(distinct) != 1:
+        raise Fail("version files disagree: " + ", ".join(f"{w}={v}" for w, v in found))
+    where, value = found[0]
+    return parse_version(value, where)
+
+
+# ---- commits -------------------------------------------------------------------------------------
+def branch_commits(base: str) -> list[tuple[str, str, str]]:
+    raw = git("log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", f"{base}..HEAD")
+    commits = []
+    for rec in raw.split("\x1e"):
+        rec = rec.strip("\n")
+        if not rec:
+            continue
+        sha, subject, body = (rec.split("\x1f") + ["", ""])[:3]
+        if RELEASE_SUBJECT.match(subject):
+            continue  # this tool's own bump commits do not ask for another bump
+        commits.append((sha, subject, body))
+    return commits
+
+
+def level_of(subject: str, body: str) -> str | None:
+    m = HEADER.match(subject)
+    if not m:
+        return None
+    if m["bang"] or re.search(r"^BREAKING[ -]CHANGE: ", body, re.M):
+        return "major"
+    return "minor" if m["type"] == "feat" else "patch"
+
+
+def required_level(commits: list[tuple[str, str, str]]) -> str | None:
+    bad = [(s, subj) for s, subj, _ in commits if level_of(subj, "") is None]
+    if bad:
+        lines = "\n".join(f"  {s[:12]} {subj}" for s, subj in bad)
+        raise Fail("these commits are not Conventional Commits, so the bump cannot be computed:\n"
+                   f"{lines}\nReword them (git rebase -i) as type(scope): summary, e.g. 'fix(cql): ...'.")
+    levels = [level_of(subj, body) for _, subj, body in commits]
+    return max(levels, key=lambda lv: LEVELS[lv]) if levels else None
+
+
+# ---- commands ------------------------------------------------------------------------------------
+def plan(root: Path, base_ref: str) -> dict:
+    cfg = load_config(root)
+    base = git("merge-base", base_ref, "HEAD").strip()
+    commits = branch_commits(base)
+    level = required_level(commits)
+    base_v = agreed(versions_at(cfg, base, root))
+    head_v = agreed(versions_at(cfg, None, root))
+    required = bump(base_v, level) if level else base_v
+    return {"cfg": cfg, "base": base, "commits": commits, "level": level,
+            "base_v": base_v, "head_v": head_v, "required": required}
+
+
+def cmd_print(p: dict, base_ref: str) -> int:
+    print(f"base      {base_ref} @ {p['base'][:12]}  version {fmt(p['base_v'])}")
+    for sha, subj, body in p["commits"]:
+        print(f"  {level_of(subj, body):5}  {sha[:12]} {subj}")
+    print(f"required  {fmt(p['required'])}" + (f"  ({p['level']})" if p["level"] else "  (no changes)"))
+    print(f"current   {fmt(p['head_v'])}")
+    return 0
+
+
+def cmd_check(p: dict) -> int:
+    if not p["level"]:
+        print("semver-bump: no changes since the base; nothing to bump")
+        return 0
+    head, need, base = core(p["head_v"]), core(p["required"]), core(p["base_v"])
+    if head >= need:
+        print(f"semver-bump: ok, {fmt(p['head_v'])} (required at least {fmt(p['required'])}, a {p['level']} bump from {fmt(p['base_v'])})")
+        return 0
+    why = "not bumped" if head == base else f"bumped too little ({fmt(p['head_v'])})"
+    print(f"semver-bump: version {why}. These commits need {fmt(p['required'])} "
+          f"(a {p['level']} bump from {fmt(p['base_v'])}).\n  Run: scripts/semver-bump --apply", file=sys.stderr)
+    return 1
+
+
+def cmd_apply(p: dict, root: Path) -> int:
+    if cmd_check(p) == 0:
+        return 0
+    new = fmt(p["required"])
+    changed = []
+    for entry in p["cfg"]["file"]:
+        path = root / entry["path"]
+        path.write_text(write_version(entry["kind"], path.read_text(), new, entry["path"]))
+        changed.append(entry["path"])
+    for argv in p["cfg"].get("post_apply", []):
+        out = subprocess.run(argv, cwd=root, capture_output=True, text=True)
+        if out.returncode != 0:
+            raise Fail(f"post_apply {' '.join(argv)} failed: {out.stderr.strip()[-600:]}")
+    git("add", "--", *changed, *[x for x in p["cfg"].get("also_commit", [])])
+    git("commit", "-m", f"chore(release): v{new}", "--no-verify")
+    print(f"semver-bump: committed chore(release): v{new}")
+    return 0
+
+
+def cmd_check_message(path: str) -> int:
+    first = next((ln for ln in Path(path).read_text().splitlines() if ln.strip() and not ln.startswith("#")), "")
+    if first.startswith(("Merge ", "Revert \"", "fixup! ", "squash! ", "amend! ")) or HEADER.match(first) or RELEASE_SUBJECT.match(first):
+        return 0
+    print("commit-msg: use a Conventional Commit header, e.g.\n"
+          "  feat(scope): add X     -> minor bump\n"
+          "  fix(scope): correct Y  -> patch bump\n"
+          "  feat(scope)!: change Z -> major bump (minor while 0.x)\n"
+          f"Got: {first!r}", file=sys.stderr)
+    return 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--check", action="store_true")
+    g.add_argument("--apply", action="store_true")
+    g.add_argument("--print", action="store_true")
+    g.add_argument("--check-message", metavar="FILE")
+    ap.add_argument("--base", default="origin/main")
+    a = ap.parse_args()
+    try:
+        if a.check_message:
+            return cmd_check_message(a.check_message)
+        root = Path(git("rev-parse", "--show-toplevel").strip())
+        p = plan(root, a.base)
+        if a.print:
+            return cmd_print(p, a.base)
+        if a.check:
+            return cmd_check(p)
+        return cmd_apply(p, root)
+    except Fail as e:
+        print(f"semver-bump: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
