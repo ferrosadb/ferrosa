@@ -1948,6 +1948,127 @@ async fn on_peer_connected_registers_peer_host_id_in_raft_node_map() {
     );
 }
 
+/// Regression: a peer whose host_id is learned on a connection that lands
+/// BEFORE the raft node_map is published must still be raft-routable once the
+/// map exists.
+///
+/// Live wedge, 2026-10-15 (node1, 0.23.0-nightly):
+///
+///    02:09:22.630  peer connected peer=22222222 (node2)   <- map does not exist yet
+///    02:09:23.451  peer connected peer=33333333 (node3)   <- likewise
+///    02:09:27.978  mode transition: pair -> cluster (raft init spawned) peers=1
+///                                                          <- the map is published HERE
+///    02:09:27.979  peer connected peer=33333333 (node3)   <- node3 reconnects -> registered
+///                  (node2 never appears again -> never registered)
+///    02:09:31.755  ERROR UnresolvedRaftTarget: raft node 2459565876494606882 has no
+///                  registered host_id yet -> Vote returned as Unreachable
+///
+/// node2 connected 5.3 s before formation and never reconnected, so its
+/// registration was dropped: `register_peer_in_raft_node_map` is a no-op while
+/// `raft_node_map` is `None` (`controller/mod.rs`). node3 survived only because it
+/// happened to reconnect 1.6 ms AFTER the publish. A peer learned before
+/// publication must be retained and applied when the map lands.
+#[tokio::test]
+async fn a_peer_learned_before_the_raft_node_map_exists_is_routable_once_it_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let early_peer = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+
+    // A seed dial lands during boot, before raft exists. Its host_id is learned
+    // here — this is the real entry point (`on_peer_connected`).
+    let early_addr: SocketAddr = "127.0.0.1:17001".parse().unwrap();
+    controller.on_peer_connected((early_peer, early_addr));
+    assert!(
+        controller.raft_node_map_snapshot().is_none(),
+        "precondition: the raft node_map does not exist this early in boot"
+    );
+
+    // Formation publishes the map. The snapshot handed to it need not contain the
+    // peer that connected early — in the wedge it was `peers=1`.
+    controller.transition_to_cluster(Vec::new());
+
+    let map = controller
+        .raft_node_map_snapshot()
+        .expect("formation publishes the raft node_map");
+    let node_id = crate::raft::uuid_to_node_id(early_peer);
+    assert_eq!(
+        map.get(&node_id),
+        Some(&early_peer),
+        "a host_id learned before the map existed must be routable once it does; otherwise every \
+         raft RPC to it is UnresolvedRaftTarget (\"raft node {node_id} has no registered host_id \
+         yet\") returned as Unreachable, and the node can never form. map={map:?}"
+    );
+}
+
+/// Mirror control for the regression above: the fix must not register peers
+/// that were never learned. A peer that never connects stays absent from the
+/// map, so routing to it still yields `UnresolvedRaftTarget` — which is what
+/// makes the fail-loud formation timeout fire on a genuinely stuck boot.
+#[tokio::test]
+async fn a_peer_that_never_connects_is_absent_from_the_raft_node_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let never_connected = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+
+    controller.transition_to_cluster(Vec::new());
+
+    let map = controller
+        .raft_node_map_snapshot()
+        .expect("formation publishes the raft node_map");
+    let node_id = crate::raft::uuid_to_node_id(never_connected);
+    assert!(
+        !map.contains_key(&node_id),
+        "a peer that never connected must NOT be routable — an unconditionally-populated map \
+         would hide a genuinely stuck boot instead of failing loudly. map={map:?}"
+    );
+}
+
 #[tokio::test]
 async fn existing_cluster_member_does_not_queue_duplicate_join() {
     let dir = tempfile::tempdir().unwrap();
