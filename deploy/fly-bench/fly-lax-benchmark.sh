@@ -575,7 +575,28 @@ create_ferrosa_cluster() {
     --env "FERROSA_WEB_BIND=[::]:9090"
     --env "FERROSA_INTERNODE_BIND=[::]:17000"
     --env "FERROSA_CLUSTER_NAME=ferrosa-lax-bench"
-    --env "FERROSA_GRAPH_ENABLED=false"
+    # Every subsystem is measured, so every listener is bound. Each client
+    # listener's engine default is 127.0.0.1 (DEFAULT_*_BIND in
+    # ferrosa/src/main.rs), which no bench client can reach over the private
+    # network: a campaign that binds only what it happens to use leaves the rest
+    # silently running on loopback, which is how the graph came to be measured
+    # nowhere. Bind them all explicitly.
+    #   graph: up by default, opted out with =false. The flag is set explicitly so
+    #     this config does not depend on an engine default. Bolt takes its HOST
+    #     from the graph bind and its PORT from FERROSA_BOLT_PORT, so the two ports
+    #     must differ or the Bolt listener collides with the graph listener.
+    #   sparql: enabled by default (resolve_sparql_enabled falls through to true).
+    #   postgresql: always enabled.
+    # Arrow Flight is NOT compiled into this image -- ferrosa's default features
+    # are empty and this Dockerfile builds `-p ferrosa` with no --features, while
+    # the shipped image uses `full`. FERROSA_FLIGHT_ENABLED would be a no-op here,
+    # so Flight stays out until the bench image is built like the shipped one.
+    --env "FERROSA_GRAPH_ENABLED=true"
+    --env "FERROSA_GRAPH_BIND=[::]:7474"
+    --env "FERROSA_BOLT_PORT=7687"
+    --env "FERROSA_SPARQL_ENABLED=true"
+    --env "FERROSA_SPARQL_BIND=[::]:8080"
+    --env "FERROSA_POSTGRES_BIND=[::]:5432"
     --env "FERROSA_AUTH_ENABLED=false"
     --env "FERROSA_CACHE_MAX_BYTES=${FERROSA_CACHE_MAX_BYTES:-402653184}"
     --env "FERROSA_CACHE_MIN_BYTES=${FERROSA_CACHE_MIN_BYTES:-0}"
