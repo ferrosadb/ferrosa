@@ -957,7 +957,9 @@ jobs:
       - build-linux-x86_64
       - build-linux-aarch64
       - build-macos-aarch64
+      - build-linux-gnu
       - docker-image
+      - docker-image-glibc
       - publish-oci-downloads
       - release
     # Only for runs that were meant to release; PR / merge-queue checks report on the PR.
