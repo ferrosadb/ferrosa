@@ -391,6 +391,23 @@ build; the codec's own cost is its delta against `none`.
 - `multi_dc_apply.rs` / `group_id.rs` — per-DC Raft groups (UUID-v5 group ids),
   HLC reorder buffer + applied-txn ledger for cross-DC Accord apply (ADR-015).
 - `raft_forward.rs` — forward client writes / membership updates to the leader.
+- `raft_forward_codec.rs` — the Cap'n Proto frame for the forwarded `RaftCommand`
+  (`ForwardedRaftCommand` in `ferrosa-net`'s `envelope.capnp`). The
+  `ClusterMembershipForward` body today is a bincode blob on a shipped contract
+  (`raft/mod.rs`'s `raft_op_variant_tag_stability` pins `RaftOp`'s bincode variant
+  tags), so the frame is ADDED ALONGSIDE it and the receiver DUAL-READS: the body
+  carries a versioned magic (`[magic:u32 BE][version:u8]`, `FORWARD_RAFT_FRAME_MAGIC`
+  = `FRWF`) that tells a capnp frame from a bincode blob, because a Cap'n Proto
+  message's segment framing conceals a leading struct field. The sender chooses the
+  frame only for a peer that advertised `CAP_RAFT_SCHEMA_CAPNP` AND for an op the
+  family covers — the DDL subset that carries schema metadata (`CreateKeyspace`,
+  `DropKeyspace`, `CreateTable`, `DropTable`, `AlterKeyspace`, `AlterTable`) plus the
+  membership ops the same path carries (`JoinNode`, `UpdateNodeInfo`, `ApproveNode`,
+  `SetNodeState`, `RecordBootstrapComplete`). Every other admin variant keeps the
+  bincode body. A body that carries the magic but does not parse is refused by name
+  (`ForwardFrameError::Malformed` / `UnsupportedVersion` / `Truncated` / `BadMagic`)
+  and is never retried as bincode, so a torn frame can never become a half-parsed
+  command.
 
 ### Coordination (`coordinator/`, `consistency.rs`, `write_path.rs`)
 - `ConsistencyLevel` — full CQL CL set incl. `Serial`/`LocalSerial`; `block_for` /
@@ -1045,7 +1062,9 @@ runs real two-node LWTs over data the old build wrote.
 `ferrosa`, `ferrosa-cql`, `ferrosa-ctl`, `ferrosa-flight`, `ferrosa-graph`,
 `ferrosa-session`, `ferrosa-sparql`.
 
-External: `openraft` (pinned fork), `sled`, `tokio`, `arc-swap`, `dashmap`,
+External: `openraft` (pinned fork), `sled`, `tokio`, `arc-swap`, `capnp`
+(the forwarded Raft schema/membership frame's codec — `raft_forward_codec`; the
+schema lives in `ferrosa-net`'s `envelope.capnp`), `dashmap`, `indexmap`,
 `parking_lot`, `bincode`, `crc32fast`, `uuid`, `serde`, `tracing`.
 
 ## Tests

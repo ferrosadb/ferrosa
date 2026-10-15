@@ -622,3 +622,255 @@ struct PgMvccRowChanges {
   # One partition's `Vec<RowChange>`.
   changes @0 :List(PgMvccRowChange);
 }
+
+# ---------------------------------------------------------------------------
+# Forwarded Raft schema/membership command family (CAP_RAFT_SCHEMA_CAPNP).
+#
+# A non-leader node forwards a `RaftCommand` to the elected leader inside
+# `ferrosa-net`'s `Message::ClusterMembershipForward` on `Lane::Data`. The body
+# is today a bare bincode blob (ferrosa-cluster/src/raft_forward.rs). This
+# family frames the operations whose payload is STRUCTURED SCHEMA METADATA —
+# the DDL subset plus the node-membership ops the same path carries — as Cap'n
+# Proto, so the leader decodes into the SAME owned structures the bincode frame
+# produced (ferrosa-schema `TableMetadata`/`KeyspaceMetadata`,
+# ferrosa-cluster `NodeInfo`/`NodeState`/`DataMovementEvidence`).
+#
+# Codec: `ferrosa_cluster::raft_forward_codec`. Bincode is a SHIPPED wire
+# contract — `ferrosa-cluster/src/raft/mod.rs` pins `RaftOp`'s bincode variant
+# tags by test (`raft_op_variant_tag_stability`), and a peer on the previous
+# build sends bincode only — so the capnp frame is ADDED ALONGSIDE it and the
+# receiver DUAL-READS. The two are told apart by a versioned magic prefix on the
+# wire, a fixed `[magic:u32 BE][version:u8]` header, because a Cap'n Proto
+# message's segment framing conceals a leading struct field, so the receiver
+# cannot tell a capnp frame from a bincode blob by peeking the payload.
+# `magic`/`version` repeat the marker INSIDE the struct, mirroring the Accord
+# family's `Envelope.magic`, and are validated on decode. An unreadable or
+# unknown frame is refused by name; there is no silent fallback to a
+# half-parsed command.
+#
+# The remaining admin variants (role/grant/index/type/function/aggregate,
+# `UpdateConfig`, `LeaveNode`, `AssignTokens`, `AccordApply`) are not framed:
+# those commands keep the bincode body, and the absence of the wire magic is
+# what says so.
+#
+# Append-only: these are NEW types at new ordinals; no existing ordinal is
+# reused and no existing field is renumbered.
+# ---------------------------------------------------------------------------
+
+struct FwdKvPair {
+  key @0 :Text;
+  value @1 :Text;
+}
+
+struct FwdOptionalText {
+  # `Option<String>`: `present` distinguishes `Some("")` from `None`.
+  present @0 :Bool;
+  value @1 :Text;
+}
+
+struct FwdOptionalBool {
+  # `Option<bool>`: `present` distinguishes `Some(false)` from `None`.
+  present @0 :Bool;
+  value @1 :Bool;
+}
+
+struct FwdStringMap {
+  # `HashMap<String, String>`. A NULL pointer (absent field) is `None`; a
+  # present struct with an empty `entries` list is `Some(empty)`.
+  entries @0 :List(FwdKvPair);
+}
+
+struct FwdReplicationParams {
+  # ferrosa-schema `ReplicationParams`.
+  strategy @0 :Text;
+  options @1 :List(FwdKvPair);
+}
+
+struct FwdKeyspaceMetadata {
+  # ferrosa-schema `KeyspaceMetadata`.
+  name @0 :Text;
+  durableWrites @1 :Bool;
+  replication @2 :FwdReplicationParams;
+}
+
+struct FwdAlterKeyspace {
+  # `RaftOp::AlterKeyspace { name, updates }` (`KeyspaceUpdates`).
+  name @0 :Text;
+  # Present (`hasReplication()`) is `Some(ReplicationParams)`; absent is `None`.
+  replication @1 :FwdReplicationParams;
+  durableWrites @2 :FwdOptionalBool;
+}
+
+enum FwdColumnKind {
+  partitionKey @0;
+  clustering @1;
+  regular @2;
+  static @3;
+}
+
+enum FwdClusteringOrder {
+  asc @0;
+  desc @1;
+  none @2;
+}
+
+struct FwdColumnMask {
+  # ferrosa-schema `ColumnMask`.
+  functionName @0 :Text;
+  arguments @1 :List(Text);
+}
+
+struct FwdColumnMetadata {
+  # ferrosa-schema `ColumnMetadata`.
+  name @0 :Text;
+  kind @1 :FwdColumnKind;
+  position @2 :Int32;
+  columnType @3 :Text;
+  clusteringOrder @4 :FwdClusteringOrder;
+  # Present (`hasMask()`) is `Some(ColumnMask)`; absent is `None`.
+  mask @5 :FwdColumnMask;
+}
+
+struct FwdCachingParams {
+  # ferrosa-schema `CachingParams`.
+  keys @0 :Text;
+  rowsPerPartition @1 :Text;
+}
+
+struct FwdTableParams {
+  # ferrosa-schema `TableParams`.
+  bloomFilterFpChance @0 :Float64;
+  caching @1 :FwdCachingParams;
+  comment @2 :Text;
+  compaction @3 :List(FwdKvPair);
+  compression @4 :List(FwdKvPair);
+  crcCheckChance @5 :Float64;
+  defaultTimeToLive @6 :Int32;
+  gcGraceSeconds @7 :Int32;
+  maxIndexInterval @8 :Int32;
+  minIndexInterval @9 :Int32;
+  memtableFlushPeriodInMs @10 :Int32;
+  speculativeRetry @11 :Text;
+  additionalWritePolicy @12 :Text;
+  cdc @13 :Bool;
+  readRepair @14 :Text;
+  allowAutoSnapshot @15 :Bool;
+  incrementalBackups @16 :Bool;
+}
+
+enum FwdTableFlag {
+  compound @0;
+  counter @1;
+  dense @2;
+  super @3;
+}
+
+struct FwdClusteringKey {
+  # One entry of `TableMetadata::clustering_key` (`(String, ClusteringOrder)`).
+  name @0 :Text;
+  order @1 :FwdClusteringOrder;
+}
+
+struct FwdTableUpdates {
+  # ferrosa-schema `TableUpdates`.
+  # Present (`hasParams()`) is `Some(TableParams)`; absent is `None`.
+  params @0 :FwdTableParams;
+  addColumns @1 :List(FwdColumnMetadata);
+  dropColumns @2 :List(Text);
+  # Present (`hasExtensions()`) is `Some(HashMap)`; absent is `None`.
+  extensions @3 :FwdStringMap;
+}
+
+struct FwdAlterTable {
+  # `RaftOp::AlterTable { keyspace, table, updates }`.
+  keyspace @0 :Text;
+  table @1 :Text;
+  updates @2 :FwdTableUpdates;
+}
+
+struct FwdDropTable {
+  # `RaftOp::DropTable { keyspace, table }`.
+  keyspace @0 :Text;
+  table @1 :Text;
+}
+
+struct FwdTableMetadata {
+  # ferrosa-schema `TableMetadata`.
+  keyspace @0 :Text;
+  name @1 :Text;
+  # 16 raw `Uuid` bytes (`TableMetadata::id`).
+  id @2 :Data;
+  columns @3 :List(FwdColumnMetadata);
+  partitionKey @4 :List(Text);
+  clusteringKey @5 :List(FwdClusteringKey);
+  params @6 :FwdTableParams;
+  flags @7 :List(FwdTableFlag);
+  extensions @8 :List(FwdKvPair);
+  isSystem @9 :Bool;
+}
+
+struct FwdNodeState {
+  # ferrosa-cluster `NodeState`.
+  state :union {
+    joining @0 :Void;
+    normal @1 :Void;
+    leaving @2 :Void;
+    decommissioned @3 :Void;
+    # `Learner { owns_tokens }`.
+    learner @4 :Bool;
+  }
+}
+
+struct FwdNodeInfo {
+  # ferrosa-cluster `NodeInfo`.
+  # 16 raw `Uuid` bytes (`NodeInfo::host_id`).
+  hostId @0 :Data;
+  addr @1 :Text;
+  dataCenter @2 :Text;
+  rack @3 :Text;
+  state @4 :FwdNodeState;
+  # `Option<String>`: `present` distinguishes `Some("")` from `None`.
+  cqlBroadcast @5 :FwdOptionalText;
+}
+
+struct FwdSetNodeState {
+  # `RaftOp::SetNodeState { node_id, state }`.
+  nodeId @0 :UInt64;
+  state @1 :FwdNodeState;
+}
+
+struct FwdDataMovementEvidence {
+  # ferrosa-cluster `DataMovementEvidence`.
+  sessions @0 :UInt64;
+  ranges @1 :UInt64;
+  partitions @2 :UInt64;
+}
+
+struct FwdRecordBootstrapComplete {
+  # `RaftOp::RecordBootstrapComplete { node_id, evidence }`.
+  nodeId @0 :UInt64;
+  evidence @1 :FwdDataMovementEvidence;
+}
+
+struct ForwardedRaftCommand {
+  # The root of a forwarded `RaftCommand` frame. See the family banner above.
+  # The versioned magic repeats here so the capnp frame is self-describing even
+  # if the wire prefix were stripped; `raft_forward_codec` validates both.
+  magic @0 :UInt32;
+  version @1 :UInt16;
+  # 16 raw `Uuid` bytes (`RaftCommand::schema_version`).
+  schemaVersion @2 :Data;
+  op :union {
+    createKeyspace @3 :FwdKeyspaceMetadata;
+    dropKeyspace @4 :Text;
+    createTable @5 :FwdTableMetadata;
+    dropTable @6 :FwdDropTable;
+    alterKeyspace @7 :FwdAlterKeyspace;
+    alterTable @8 :FwdAlterTable;
+    joinNode @9 :FwdNodeInfo;
+    updateNodeInfo @10 :FwdNodeInfo;
+    approveNode @11 :Data;
+    setNodeState @12 :FwdSetNodeState;
+    recordBootstrapComplete @13 :FwdRecordBootstrapComplete;
+  }
+}
