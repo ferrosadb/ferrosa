@@ -108,6 +108,18 @@ wire** (an offset+length into a shared/mapped buffer rather than inline bytes). 
 mapping), which removes the ~1.1M per-entry seek+read+mutex that was the bulk of (a).
 The 10 s bound was NOT raised.
 
+### Peer capability verdicts stay fresh across a rolling upgrade
+
+`ModeController` implements `InboundPeerCallback`, so every accepted inbound handshake
+records the bits the peer advertised (`PeerManager::record_inbound_capabilities`).
+`PeerManager::peer_capabilities` then returns the NEWER of that advertisement and the
+outbound pool's snapshot — an inbound handshake proves the peer runs that build NOW,
+whereas our pool snapshot was taken when WE dialled and can predate the peer's restart.
+Latest-wins keeps the gate fail-closed: a peer on a build without a bit is still seen as
+lacking it. Without this, the jsonb DDL gate stayed refused after an ordinary rolling
+upgrade until the observer itself restarted (t_d853fa2a;
+`ferrosa-cluster/tests/jsonb_capability_freshness.rs`).
+
 ### The region-REFERENCE Apply wire (`AccordApplyV2Region`)
 
 The inline frame above copies every entry's key+mutation into the capnp arena on the
