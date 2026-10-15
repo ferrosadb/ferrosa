@@ -58,7 +58,14 @@ It is a near-leaf in the dependency graph: it depends only on `ferrosa-common`
   (`NetConfig::advertised_capabilities`, default `LOCAL_CAPABILITIES`), so the
   initiator and the acceptor each learn the other's (`HandshakePeer::capabilities`,
   `PeerManager::peer_capabilities`). A pre-capability peer sends none (read as
-  0) and ignores ours. A feature that adds a message type or frame kind gates
+  0) and ignores ours. `peer_capabilities` reports the NEWEST advertisement:
+  the outbound pool's snapshot, taken when WE dialled, or the peer's most
+  recent INBOUND handshake, recorded by the accept path
+  (`InboundPeerCallback::on_inbound_peer` → `PeerManager::record_inbound_capabilities`).
+  An inbound handshake proves the peer runs that build NOW, so a peer that
+  restarts with a newer build is visible without the observer restarting
+  (t_d853fa2a); latest-wins keeps it fail-closed, because a peer on a build
+  without the bit is still seen as lacking it. A feature that adds a message type or frame kind gates
   sending it on the peer's bit, because an older node drops the whole connection
   on an unknown type byte. Bits: `CAP_RPC_ERROR_REPLY` (1<<0) — the peer
   understands error-reply frames (`FLAG_RPC_ERROR`); `CAP_ACCORD_CAPNP` (1<<3) —

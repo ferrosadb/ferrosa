@@ -1369,3 +1369,114 @@ async fn a_committed_lwt_that_fails_its_read_vote_does_not_poison_the_key() {
         .shutdown(std::time::Duration::from_millis(100))
         .await;
 }
+
+// ---------------------------------------------------------------------------
+// MIRROR CONTROL for the concurrent-INSERT-IF-NOT-EXISTS read-vote fix.
+// ---------------------------------------------------------------------------
+
+/// The read-vote dep-wait fix makes a concurrent LWT LOSER WAIT for the winner's
+/// apply to become visible on the quorum instead of refusing on a
+/// half-propagated apply. "Always wait" is NOT the fix: the fail-loud arm was
+/// REPLACED, not removed. A read-vote that genuinely cannot reach F+1 agreement —
+/// here the remote replica is unreachable for the read-vote (its `AccordRead`
+/// RPC times out, the production fault where a replica is down after the
+/// transaction committed) — must STILL refuse LOUDLY with the SAME named
+/// non-linearizable-LWT error, and must never fabricate agreement or fall through
+/// to the Apply phase.
+///
+/// The transaction still commits: `PreAccept`/`Accept`/`Commit` are forwarded, so
+/// the ONLY step that fails is the read-vote's F+1 agreement. With two replicas
+/// (slow quorum 2) the coordinator holds just its OWN read, so F+1 is
+/// unreachable and the refusal is mandatory. This is the arm the dep-wait fix
+/// must preserve.
+#[tokio::test]
+async fn a_read_vote_that_cannot_reach_f_plus_one_still_refuses_loudly() {
+    let id_a = uuid::Uuid::from_bytes([0xF1; 16]);
+    let id_b = uuid::Uuid::from_bytes([0xF2; 16]);
+
+    let node_a = start_engine_test_node(id_a).await;
+    let node_b = start_engine_test_node(id_b).await;
+
+    node_a
+        .peer_manager
+        .ensure_peer(id_b, &node_b.local_addr.to_string())
+        .await
+        .expect("node_a -> node_b connect");
+    node_b
+        .peer_manager
+        .ensure_peer(id_a, &node_a.local_addr.to_string())
+        .await
+        .expect("node_b -> node_a connect");
+
+    let replica_ids = vec![id_a, id_b];
+    let pk = "unreachable-readvote-key";
+    let key = pk.as_bytes().to_vec();
+
+    // The remote replica is unreachable for the read-vote only: every other RPC
+    // is forwarded, so the txn commits and only the F+1 read-vote agreement fails.
+    let clock = HybridLogicalClock::new(node_a.node_id, 1_100_000_000);
+    let faulty: Arc<dyn ferrosa_cluster::accord::transport::AccordTransport> =
+        Arc::new(ReadVoteTimesOut {
+            peers: Arc::clone(&node_a.peer_manager),
+        });
+
+    let mut driver = AccordCoordinatorDriver::new_multi_with_transport(
+        node_a.node_id,
+        replica_ids.clone(),
+        faulty,
+        false,
+        &clock,
+        vec![(key.clone(), e2e_mutation_bytes(pk, 7, 1))],
+    )
+    .with_read_predicate(ferrosa_cluster::accord::ReadPredicate::ReadRow {
+        keyspace: E2E_KS.to_string(),
+        table: E2E_TABLE.to_string(),
+    })
+    .with_local_applier(Arc::new(
+        ferrosa_cluster::accord::EngineStorageApplier::new(node_a.engine.clone()),
+    ))
+    .with_local_reader(Arc::new(ferrosa_cluster::accord::EngineStorageReader::new(
+        node_a.engine.clone(),
+    )))
+    .with_local_accord_state(node_a.accord_state.clone())
+    .with_condition_gate(if_not_exists_gate());
+
+    let res = driver.run_transaction().await;
+
+    // The refusal must be the SAME named error, at the read-vote arm — never a
+    // fabricated agreement, never ConditionNotMet, never a silent apply.
+    match res {
+        Err(AccordDriverError::Network(m)) => {
+            assert!(
+                m.contains("lacked F+1") && m.contains("refusing a non-linearizable LWT"),
+                "a read-vote that cannot reach F+1 must refuse with the SAME named \
+                 non-linearizable-LWT error, got {m:?}"
+            );
+        }
+        other => panic!(
+            "expected a loud non-linearizable-LWT refusal when the read-vote cannot \
+             reach F+1; got {other:?}"
+        ),
+    }
+
+    // Load-bearing: the refusal must not have written anything.
+    assert_eq!(
+        engine_v(node_a.engine.clone(), &key),
+        None,
+        "an F+1-less read-vote must not fall through to the Apply phase"
+    );
+    assert_eq!(
+        engine_v(node_b.engine.clone(), &key),
+        None,
+        "no replica may hold a row from a read-vote that never reached F+1"
+    );
+
+    node_a
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+    node_b
+        .server
+        .shutdown(std::time::Duration::from_millis(100))
+        .await;
+}

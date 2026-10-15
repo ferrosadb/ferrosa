@@ -444,6 +444,17 @@ impl ConflictIndex {
         deps
     }
 
+    /// Whether `key` already carries an in-flight entry for `txn_id`.
+    ///
+    /// Used to make [`ConflictIndex::register`] on the coordinator's OWN commit
+    /// path idempotent: a replica that already indexed the txn at PreAccept must
+    /// not index it a second time at Commit.
+    pub fn has_write(&self, key: &[u8], txn_id: &TxnId) -> bool {
+        self.single_key
+            .get(key)
+            .is_some_and(|entry| entry.writes.iter().any(|w| w.txn_id == *txn_id))
+    }
+
     /// Remove a completed transaction from all indexes.
     ///
     /// Scans single-key, range, and indexed-write maps for entries

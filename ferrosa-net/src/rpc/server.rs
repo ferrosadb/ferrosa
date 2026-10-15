@@ -26,11 +26,17 @@ use crate::task_pool::TaskPool;
 
 /// Callback invoked when the server accepts an inbound peer connection.
 pub trait InboundPeerCallback: Send + Sync {
+    /// `capabilities` are the bits the peer advertised on the inbound
+    /// handshake (`handshake::CAP_*`); `0` for a peer whose build predates
+    /// them. The callback records them so a peer that restarted with a newer
+    /// build is visible to capability-gated features without the observer
+    /// restarting (t_d853fa2a).
     fn on_inbound_peer(
         &self,
         peer_id: PeerId,
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
+        capabilities: u32,
     );
 }
 
@@ -345,7 +351,12 @@ impl RpcServer {
 
         // Notify callback about inbound peer
         if let Some(cb) = &self.inbound_callback {
-            cb.on_inbound_peer(peer_id, peer.cql_broadcast, peer.internode_broadcast);
+            cb.on_inbound_peer(
+                peer_id,
+                peer.cql_broadcast,
+                peer.internode_broadcast,
+                peer.capabilities,
+            );
         }
 
         let error_replies = peer.capabilities & CAP_RPC_ERROR_REPLY != 0;

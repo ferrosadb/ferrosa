@@ -28,12 +28,16 @@ use uuid::Uuid;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
-use ferrosa_net::rpc::handler::{PeerId, RpcHandler};
+use ferrosa_net::rpc::error_reply::RemoteFailureKind;
+use ferrosa_net::rpc::handler::{HandlerOutcome, PeerId, RpcHandler};
 use ferrosa_sstable::types::Partition;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
-use crate::raft::handlers::{partition_from_wire, partition_to_wire, PartitionWire};
+use crate::raft::handlers::{
+    decode_request, partition_from_wire, partition_to_wire, reply_outcome, storage_failure,
+    unexpected_message, PartitionWire,
+};
 
 use super::merkle::MerkleTree;
 use super::RepairStore;
@@ -132,17 +136,19 @@ impl RepairMerkleHandler {
 
 #[async_trait]
 impl RpcHandler for RepairMerkleHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "RepairMerkleHandler";
         let bytes = match msg {
             Message::RepairMerkleRequest(b) => b,
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
-        let req: RepairMerkleRequestPayload = match bincode::deserialize(&bytes) {
+        let req: RepairMerkleRequestPayload = match decode_request(HANDLER, &bytes) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%e, "RepairMerkleHandler: failed to deserialize request");
-                return None;
-            }
+            Err(failed) => return *failed,
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
         // Share the same build budget as the initiator path —
@@ -154,8 +160,10 @@ impl RpcHandler for RepairMerkleHandler {
         let _permit = match super::REPAIR_BUILD_SEMAPHORE.acquire().await {
             Ok(p) => p,
             Err(e) => {
-                tracing::warn!(%e, "RepairMerkleHandler: build semaphore closed");
-                return None;
+                return HandlerOutcome::fail(
+                    RemoteFailureKind::NotReady,
+                    format!("{HANDLER}: build semaphore closed: {e}"),
+                )
             }
         };
         let tree = match super::build_tree_for_range(
@@ -167,17 +175,20 @@ impl RpcHandler for RepairMerkleHandler {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(%e, ?table_id, "RepairMerkleHandler: build_tree_for_range failed");
-                return None;
+                // Answer the refusal instead of staying silent (outage
+                // 2026-10-10, t_9113289f). A silent source holds the
+                // requester's whole Bulk-lane budget (60 s) and the joining
+                // node's bootstrap then aborts on a `Bulk lane timeout` that
+                // names nothing; the read-path handlers were given this typed
+                // error reply, the repair handlers were missed.
+                return storage_failure(HANDLER, "merkle build", e);
             }
         };
-        let resp = RepairMerkleResponsePayload { tree };
-        match bincode::serialize(&resp) {
-            Ok(body) => Some(Message::RepairMerkleResponse(Bytes::from(body))),
-            Err(e) => {
-                tracing::warn!(%e, "RepairMerkleHandler: failed to serialize response");
-                None
-            }
-        }
+        reply_outcome(
+            HANDLER,
+            &RepairMerkleResponsePayload { tree },
+            Message::RepairMerkleResponse,
+        )
     }
 }
 
@@ -195,17 +206,19 @@ impl RepairFetchHandler {
 
 #[async_trait]
 impl RpcHandler for RepairFetchHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "RepairFetchHandler";
         let bytes = match msg {
             Message::RepairFetchRequest(b) => b,
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
-        let req: RepairFetchRequestPayload = match bincode::deserialize(&bytes) {
+        let req: RepairFetchRequestPayload = match decode_request(HANDLER, &bytes) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%e, "RepairFetchHandler: failed to deserialize request");
-                return None;
-            }
+            Err(failed) => return *failed,
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
         // Token-bounded chunked read: the client loops calling
@@ -232,7 +245,10 @@ impl RpcHandler for RepairFetchHandler {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!(%e, ?table_id, "RepairFetchHandler: read_token_range_bounded failed");
-                return None;
+                // Answer the refusal rather than staying silent: see
+                // `RepairMerkleHandler`. A silent source costs the requester
+                // its whole Bulk-lane budget.
+                return storage_failure(HANDLER, "range read", e);
             }
         };
         // Emit the response with the borrowed serializer: no `Vec<PartitionWire>`
@@ -250,12 +266,15 @@ impl RpcHandler for RepairFetchHandler {
                 crate::raft::handlers::serialize_partition_to_wire_borrowed(&mut body, partition)
             {
                 tracing::warn!(%e, "RepairFetchHandler: failed to serialize response");
-                return None;
+                return HandlerOutcome::fail(
+                    RemoteFailureKind::ResponseEncodeFailed,
+                    format!("{HANDLER}: response failed to serialize: {e}"),
+                );
             }
         }
         bincode::serialize_into(&mut body, &next_cursor)
             .expect("RepairFetchResponsePayload cursor serialization is infallible");
-        Some(Message::RepairFetchResponse(Bytes::from(body)))
+        HandlerOutcome::Reply(Message::RepairFetchResponse(Bytes::from(body)))
     }
 }
 
@@ -273,17 +292,19 @@ impl RepairApplyHandler {
 
 #[async_trait]
 impl RpcHandler for RepairApplyHandler {
-    async fn handle(&self, _from: PeerId, msg: Message) -> Option<Message> {
+    async fn handle(&self, from: PeerId, msg: Message) -> Option<Message> {
+        self.handle_outcome(from, msg).await.into_reply()
+    }
+
+    async fn handle_outcome(&self, _from: PeerId, msg: Message) -> HandlerOutcome {
+        const HANDLER: &str = "RepairApplyHandler";
         let bytes = match msg {
             Message::RepairApplyRequest(b) => b,
-            _ => return None,
+            other => return unexpected_message(HANDLER, &other),
         };
-        let req: RepairApplyRequestPayload = match bincode::deserialize(&bytes) {
+        let req: RepairApplyRequestPayload = match decode_request(HANDLER, &bytes) {
             Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%e, "RepairApplyHandler: failed to deserialize request");
-                return None;
-            }
+            Err(failed) => return *failed,
         };
         let table_id = TableId::new(&req.keyspace, &req.table);
         let mut applied: u64 = 0;
@@ -305,13 +326,7 @@ impl RpcHandler for RepairApplyHandler {
             applied,
             error: last_err,
         };
-        match bincode::serialize(&resp) {
-            Ok(body) => Some(Message::RepairApplyResponse(Bytes::from(body))),
-            Err(e) => {
-                tracing::warn!(%e, "RepairApplyHandler: failed to serialize response");
-                None
-            }
-        }
+        reply_outcome(HANDLER, &resp, Message::RepairApplyResponse)
     }
 }
 
