@@ -581,22 +581,35 @@ create_ferrosa_cluster() {
     # network: a campaign that binds only what it happens to use leaves the rest
     # silently running on loopback, which is how the graph came to be measured
     # nowhere. Bind them all explicitly.
-    #   graph: up by default, opted out with =false. The flag is set explicitly so
-    #     this config does not depend on an engine default. Bolt takes its HOST
-    #     from the graph bind and its PORT from FERROSA_BOLT_PORT, so the two ports
-    #     must differ or the Bolt listener collides with the graph listener.
+    #
+    # Ports: one dedicated band (13377-13380), because the engine defaults are
+    # deliberately the *native* products' defaults -- CQL 9042 is Cassandra's,
+    # graph 7474 and Bolt 7687 are Neo4j's, 5432 is PostgreSQL's, 8080/9090 are
+    # generic. On a comparison bench that is backwards: the subject and the
+    # control would fight over one port. The band stays below 32768 on purpose,
+    # because Linux hands 32768-60999 out as *source* ports, so a listener parked
+    # in there can lose its bind to a random outbound socket and leave a half-up
+    # node (see task-level/ferrosa-node-isolation).
+    #
+    #   graph: up by default, opted out with =false; stated explicitly so this
+    #     config does not ride on an engine default. Bolt takes its HOST from the
+    #     graph bind and its PORT from FERROSA_BOLT_PORT, so the two must differ.
     #   sparql: enabled by default (resolve_sparql_enabled falls through to true).
     #   postgresql: always enabled.
-    # Arrow Flight is NOT compiled into this image -- ferrosa's default features
+    #
+    # CQL, web and internode keep the campaign's existing ports: their broadcast
+    # addresses are derived from hardcoded defaults in ferrosa-entrypoint.sh
+    # (9042 and 17000), so moving them means moving that file in the same change.
+    # Arrow Flight is not compiled into this image -- ferrosa's default features
     # are empty and this Dockerfile builds `-p ferrosa` with no --features, while
-    # the shipped image uses `full`. FERROSA_FLIGHT_ENABLED would be a no-op here,
-    # so Flight stays out until the bench image is built like the shipped one.
+    # the shipped image uses `full` -- so FERROSA_FLIGHT_ENABLED would be a no-op,
+    # not an enablement. 13381-13384 are left free for those four if they move.
     --env "FERROSA_GRAPH_ENABLED=true"
-    --env "FERROSA_GRAPH_BIND=[::]:7474"
-    --env "FERROSA_BOLT_PORT=7687"
+    --env "FERROSA_GRAPH_BIND=[::]:13377"
+    --env "FERROSA_BOLT_PORT=13378"
     --env "FERROSA_SPARQL_ENABLED=true"
-    --env "FERROSA_SPARQL_BIND=[::]:8080"
-    --env "FERROSA_POSTGRES_BIND=[::]:5432"
+    --env "FERROSA_SPARQL_BIND=[::]:13379"
+    --env "FERROSA_POSTGRES_BIND=[::]:13380"
     --env "FERROSA_AUTH_ENABLED=false"
     --env "FERROSA_CACHE_MAX_BYTES=${FERROSA_CACHE_MAX_BYTES:-402653184}"
     --env "FERROSA_CACHE_MIN_BYTES=${FERROSA_CACHE_MIN_BYTES:-0}"
