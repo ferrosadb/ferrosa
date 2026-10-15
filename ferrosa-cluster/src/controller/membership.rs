@@ -145,9 +145,17 @@ impl ModeController {
             cql_broadcast: None,
         };
 
+        // Topology commands change no schema, so they must carry the node's
+        // CURRENT schema version — never a freshly minted random one (bug:
+        // schema_version diverges after restart, t_7dda9421). The state
+        // machine's `schema_changed` gate keeps the committed version where the
+        // last real DDL put it; a random version here would be wrong even though
+        // that gate currently ignores it.
+        let schema_version = self.schema.snapshot().version;
+
         let join_cmd = RaftCommand {
             op: RaftOp::JoinNode(node_info),
-            schema_version: Uuid::new_v4(),
+            schema_version,
         };
         raft.client_write(join_cmd)
             .await
@@ -159,7 +167,7 @@ impl ModeController {
                 node_id: peer_node_id,
                 tokens,
             },
-            schema_version: Uuid::new_v4(),
+            schema_version,
         };
         raft.client_write(assign_cmd)
             .await
@@ -222,18 +230,22 @@ impl ModeController {
                 .map(|r| r.map(Arc::unwrap_or_clone))
                 .boxed()
         };
+        // Membership / data-movement commands change no schema, so this proposer
+        // carries the node's CURRENT schema version rather than minting one
+        // (bug: schema_version diverges after restart, t_7dda9421).
+        let proposer = super::data_movement::ForwardingProposer {
+            raft,
+            peer_manager: peer_manager.clone(),
+            ring: self.ring.clone(),
+            schema_version: self.schema.snapshot().version,
+        };
         let streamer = super::data_movement::StreamSenderStreamer {
             peer_manager,
             ring: ring.clone(),
             source_node: node_id,
         };
         super::data_movement::decommission_verified(
-            raft.as_ref(),
-            &ring,
-            node_id,
-            &tables,
-            scan,
-            &streamer,
+            &proposer, &ring, node_id, &tables, scan, &streamer,
         )
         .await
         .map(|_| ())
@@ -329,8 +341,12 @@ impl ModeController {
         // Ring is needed for resolving the Raft leader's u64 NodeId back to a
         // ferrosa Uuid when openraft asks us to forward a non-leader proposal.
         let ring_holder = self.ring.clone();
+        // Topology commands built in this task carry the CURRENT schema version
+        // (they change no schema); read it from the shared registry here.
+        let schema = self.schema.clone();
 
         self.spawn_tracked(async move {
+            let schema_version = schema.snapshot().version;
             if let Some(pm) = peer_manager.as_ref() {
                 let current_addr = pm.peer_addr(host_id).await;
                 let desired_addr = addr.to_string();
@@ -447,7 +463,7 @@ impl ModeController {
                         state: existing.state,
                         cql_broadcast: cql_broadcast.or(existing.cql_broadcast),
                     }),
-                    schema_version: Uuid::new_v4(),
+                    schema_version,
                 };
 
                 let refresh_result = raft.client_write(refresh_cmd.clone()).await;
@@ -535,7 +551,7 @@ impl ModeController {
 
             let join_cmd = RaftCommand {
                 op: RaftOp::JoinNode(node_info),
-                schema_version: Uuid::new_v4(),
+                schema_version,
             };
             if let Err(e) = raft.client_write(join_cmd).await {
                 clear_pending_join(&pending_joins, host_id);
@@ -554,7 +570,7 @@ impl ModeController {
                     node_id: peer_node_id,
                     tokens,
                 },
-                schema_version: Uuid::new_v4(),
+                schema_version,
             };
             if let Err(e) = raft.client_write(assign_cmd).await {
                 clear_pending_join(&pending_joins, host_id);

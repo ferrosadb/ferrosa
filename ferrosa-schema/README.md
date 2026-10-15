@@ -41,7 +41,11 @@ SSTable rows for `system_schema.*` / `system_auth.*` are written by
   `apply_snapshot` bulk-loads a snapshot (skips system keyspaces) and
   refuses the whole snapshot, before applying any of it, when a table breaks
   the jsonb placement rules. It only INSERTS what is missing; an existing
-  table is kept as is. `replace_table_internal` overwrites a table definition
+  table is kept as is. It also adopts the snapshot's `version`, so a node
+  restored from its persisted `schema.json` (or brought up to a peer's snapshot)
+  holds that state's version rather than the random one minted at construction
+  (bug: schema_version diverges after restart, t_7dda9421).
+  `replace_table_internal` overwrites a table definition
   (same validation and jsonb checks as create), which pair catch-up uses to
   apply an ALTER the receiver missed (ferrosa-cluster CL-33).
 - **jsonb placement rules** ([`jsonb_rules.rs`](src/jsonb_rules.rs), T-154a,

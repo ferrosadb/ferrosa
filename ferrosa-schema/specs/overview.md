@@ -62,9 +62,12 @@ blocks.
 **Replication path** (Raft/pair-mode → registry): the leader-applied entry calls
 the matching `*_internal` method, which skips `check_permission` and audit and
 applies the change idempotently. `set_schema_version` is then called so all
-nodes converge on one `version` UUID. Note: `apply_snapshot` and
-`create_table_internal` do **not** register the table with the `StorageEngine` —
-the caller must do that separately.
+nodes converge on one `version` UUID. `apply_snapshot` takes the version from the
+snapshot it is handed (a snapshot names the state it holds), so a node restored
+from its persisted `schema.json` — or brought up to a peer's snapshot in pair
+catch-up — adopts that state's version rather than keeping the random UUID minted
+at construction. Note: `apply_snapshot` and `create_table_internal` do **not**
+register the table with the `StorageEngine` — the caller must do that separately.
 
 **Auth path** (login): `Schema::authenticate` checks the rate limiter *before*
 hashing (DoS guard), verifies the password against the role's `salted_hash`
@@ -80,6 +83,10 @@ configured algorithm differs, and returns an `AuthContext`.
    `version = Uuid::new_v4()` so CQL clients (cqlsh) detect schema changes.
    `*_internal` paths deliberately do **not** bump; the Raft state machine sets
    the version explicitly via `set_schema_version` for cross-node convergence.
+   `apply_snapshot` adopts the version of the snapshot it is applied, so a
+   restored or caught-up node holds the version its state actually names rather
+   than the random one minted when the registry was constructed
+   (bug: schema_version diverges after restart, t_7dda9421).
 3. **System keyspaces/tables are protected.** `is_system_keyspace` and
    `TableMetadata::is_system` reject user DDL on `system`, `system_schema`,
    `system_auth`, `system_observability`.

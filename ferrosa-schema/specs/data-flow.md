@@ -60,9 +60,12 @@ sequenceDiagram
 
 The Raft / pair-mode path does **not** re-run auth or audit. It calls
 `create_table_internal(table)` (or `apply_snapshot`), which clones, inserts
-idempotently, and stores — but skips steps 2–6 above and does **not** bump
+idempotently, and stores — but skips steps 2–6 above and does **not** mint a new
 `version` (the Raft state machine calls `set_schema_version` separately so all
-nodes converge). It also does **not** register the table with the
+nodes converge). `apply_snapshot` instead ADOPTS the `version` carried by the
+snapshot it is given, so a node restored from its persisted `schema.json` holds
+that state's version rather than the random one minted at construction (t_7dda9421).
+It also does **not** register the table with the
 `StorageEngine`; the caller must do that (see FMEA SC-3).
 
 ## Notes on concurrency
