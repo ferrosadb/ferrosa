@@ -15,6 +15,11 @@ spec = importlib.util.spec_from_loader("semver_bump", loader)
 sb = importlib.util.module_from_spec(spec)
 loader.exec_module(sb)
 
+# Git hooks export GIT_DIR, GIT_INDEX_FILE and friends. Inherited, they point every git command
+# in the throwaway repository below at the REAL repository: its config, its HEAD, its index.
+# So the end-to-end tests run git with every GIT_* variable removed.
+CLEAN_ENV = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
 
 class Pure(unittest.TestCase):
     def test_levels(self):
@@ -80,7 +85,7 @@ class Repo(unittest.TestCase):
         self.tmp.cleanup()
 
     def git(self, *a):
-        return subprocess.run(["git", *a], cwd=self.root, check=True, capture_output=True, text=True).stdout
+        return subprocess.run(["git", *a], cwd=self.root, env=CLEAN_ENV, check=True, capture_output=True, text=True).stdout
 
     def commit(self, msg, name="f"):
         (self.root / name).write_text(msg)
@@ -88,7 +93,7 @@ class Repo(unittest.TestCase):
         self.git("commit", "-q", "-m", msg)
 
     def run_tool(self, *a):
-        return subprocess.run(["python3", str(TOOL), *a, "--base", "main"], cwd=self.root, capture_output=True, text=True)
+        return subprocess.run(["python3", str(TOOL), *a, "--base", "main"], cwd=self.root, env=CLEAN_ENV, capture_output=True, text=True)
 
     def test_unbumped_fails_then_apply_fixes(self):
         self.commit("feat(x): add y")
@@ -113,6 +118,20 @@ class Repo(unittest.TestCase):
         r = self.run_tool("--check")
         self.assertEqual(r.returncode, 2)
         self.assertIn("not Conventional Commits", r.stderr)
+
+    def test_hook_environment_cannot_reach_another_repository(self):
+        # Run an end-to-end test the way a pre-push hook would: GIT_DIR names another repository.
+        decoy = Path(self.tmp.name) / "decoy"
+        subprocess.run(["git", "init", "-q", str(decoy)], env=CLEAN_ENV, check=True)
+        env = dict(CLEAN_ENV, GIT_DIR=str(decoy / ".git"))
+        r = subprocess.run(["python3", "-m", "unittest", "-q", "test_semver_bump.Repo.test_no_changes_passes"],
+                           cwd=HERE, env=env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        config = (decoy / ".git" / "config").read_text()
+        self.assertNotIn("t@example.com", config)
+        heads = subprocess.run(["git", "-C", str(decoy), "rev-parse", "--verify", "-q", "HEAD"],
+                               env=CLEAN_ENV, capture_output=True, text=True)
+        self.assertNotEqual(heads.returncode, 0, "the decoy repository gained a commit")
 
     def test_no_changes_passes(self):
         self.assertEqual(self.run_tool("--check").returncode, 0)
