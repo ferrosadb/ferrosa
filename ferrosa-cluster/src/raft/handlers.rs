@@ -108,7 +108,7 @@ where
 }
 
 /// Decode a data-path request body, or the typed failure that answers it.
-fn decode_request<T: serde::de::DeserializeOwned>(
+pub(crate) fn decode_request<T: serde::de::DeserializeOwned>(
     handler: &'static str,
     bytes: &[u8],
 ) -> Result<T, Box<HandlerOutcome>> {
@@ -125,7 +125,7 @@ fn decode_request<T: serde::de::DeserializeOwned>(
 /// Never an EMPTY payload in place of a failure: an empty reply is
 /// indistinguishable from a replica that legitimately matched nothing, so the
 /// coordinator would serve a short answer as a complete one.
-fn reply_outcome<T: Serialize>(
+pub(crate) fn reply_outcome<T: Serialize>(
     handler: &'static str,
     payload: &T,
     wrap: fn(Bytes) -> Message,
@@ -144,7 +144,7 @@ fn reply_outcome<T: Serialize>(
 /// that stays silent costs the coordinator its whole lane deadline (10 s per
 /// read in the outage) before it tries another replica, and one that answers
 /// "nothing here" is a confident wrong answer.
-fn storage_failure(
+pub(crate) fn storage_failure(
     handler: &'static str,
     operation: &str,
     error: impl std::fmt::Display,
@@ -157,7 +157,7 @@ fn storage_failure(
 
 /// A Raft handler was routed a message type it does not handle: a
 /// registration bug, answered rather than left to the sender's deadline.
-fn unexpected_message(handler: &'static str, msg: &Message) -> HandlerOutcome {
+pub(crate) fn unexpected_message(handler: &'static str, msg: &Message) -> HandlerOutcome {
     HandlerOutcome::fail(
         RemoteFailureKind::HandlerFailed,
         format!("{handler}: unexpected message type {:?}", msg.msg_type()),

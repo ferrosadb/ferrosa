@@ -1050,9 +1050,51 @@ impl AccordStateMachine {
         SmResponse::None
     }
 
-    // -----------------------------------------------------------------------
-    // Apply handler
-    // -----------------------------------------------------------------------
+    /// Register the conflict-index entries for a transaction this replica
+    /// COMMITTED but whose PreAccept it never processed.
+    ///
+    /// The coordinator's OWN replica drives its Commit/Apply directly and, when
+    /// its PreAccept self-vote was skipped (RF=2, where `fast_quorum_size(2) == 1`
+    /// would let a lone local vote short-circuit the remote fan-out), never
+    /// registered its own txn under its own write-set keys. The replica then holds
+    /// the txn's [`TxnState`] (so the commit is durable) but no key→txn index
+    /// entry, and the ReadVote dep-wait
+    /// ([`Self::unapplied_conflicts_before`], via
+    /// [`ConflictIndex::deps_before_t`](ferrosa_storage::accord::conflict_index::ConflictIndex::deps_before_t))
+    /// resolves NO dependency on the key. A ReadVote this replica serves at a later
+    /// `t` therefore reads the replica's own committed-but-not-yet-applied (the
+    /// local apply is DEFERRED until the remote Apply quorum) write as ABSENT —
+    /// while a remote replica that DID register it (via the inbound PreAccept) and
+    /// already applied the broadcast reads the row. The two F+1 read votes then
+    /// disagree and the LWT is refused as non-linearizable
+    /// (`lacked F+1 agreement`) instead of returning `ConditionNotMet`.
+    ///
+    /// Registering at COMMIT (with the finalized `t`) restores the symmetry with a
+    /// remote replica without perturbing the PreAccept/Accept quorum: it neither
+    /// counts a self-vote nor witnesses a timestamp. Idempotent — a key already
+    /// carrying this txn (the RF>=3 self-vote path) is left untouched.
+    pub fn register_committed_conflicts(
+        &mut self,
+        txn_id: TxnId,
+        t0: Timestamp,
+        keys: &[&[u8]],
+        t: Timestamp,
+    ) {
+        for key in keys {
+            if self.conflict_index.has_write(key, &txn_id) {
+                continue;
+            }
+            self.conflict_index.register(
+                key,
+                InFlightWrite {
+                    txn_id,
+                    t0,
+                    accord_ts: Some(t),
+                    status: TxnStatus::Committed,
+                },
+            );
+        }
+    }
 
     /// Handle an Apply (fire-and-forget) — **dep-ordered** at the replica.
     ///

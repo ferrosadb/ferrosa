@@ -230,7 +230,7 @@ async fn promote_from_degraded_pair_restores_writes() {
 
     // Enter pair mode via inbound connection. Lower host-id wins primary.
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(controller.role(), Some(PairRole::Primary));
 
@@ -279,7 +279,7 @@ async fn degraded_pair_serves_stale_reads() {
 
     // Enter pair mode
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
 
     // Peer disconnects → DegradedPair
@@ -386,7 +386,12 @@ async fn pair_mode_reaches_an_inbound_peer_at_its_advertised_internode_address()
     controller.set_peer_manager(pm);
 
     let ephemeral: SocketAddr = "127.0.0.1:49171".parse().unwrap();
-    controller.on_inbound_peer((peer_id, ephemeral), None, Some("127.0.0.1:29000".into()));
+    controller.on_inbound_peer(
+        (peer_id, ephemeral),
+        None,
+        Some("127.0.0.1:29000".into()),
+        0,
+    );
 
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     let pair_addr = controller
@@ -521,6 +526,7 @@ fn pair_formation_dials_the_advertised_address_on_any_co_located_layout() {
                 (peer, format!("127.0.0.1:{ephemeral}").parse().unwrap()),
                 None,
                 Some(advertised.to_string()),
+                0,
             );
             assert_eq!(controller.mode(), DeploymentMode::Pair);
             assert_eq!(controller.dial_target(peer), Some(advertised));
@@ -1942,6 +1948,127 @@ async fn on_peer_connected_registers_peer_host_id_in_raft_node_map() {
     );
 }
 
+/// Regression: a peer whose host_id is learned on a connection that lands
+/// BEFORE the raft node_map is published must still be raft-routable once the
+/// map exists.
+///
+/// Live wedge, 2026-10-15 (node1, 0.23.0-nightly):
+///
+///    02:09:22.630  peer connected peer=22222222 (node2)   <- map does not exist yet
+///    02:09:23.451  peer connected peer=33333333 (node3)   <- likewise
+///    02:09:27.978  mode transition: pair -> cluster (raft init spawned) peers=1
+///                                                          <- the map is published HERE
+///    02:09:27.979  peer connected peer=33333333 (node3)   <- node3 reconnects -> registered
+///                  (node2 never appears again -> never registered)
+///    02:09:31.755  ERROR UnresolvedRaftTarget: raft node 2459565876494606882 has no
+///                  registered host_id yet -> Vote returned as Unreachable
+///
+/// node2 connected 5.3 s before formation and never reconnected, so its
+/// registration was dropped: `register_peer_in_raft_node_map` is a no-op while
+/// `raft_node_map` is `None` (`controller/mod.rs`). node3 survived only because it
+/// happened to reconnect 1.6 ms AFTER the publish. A peer learned before
+/// publication must be retained and applied when the map lands.
+#[tokio::test]
+async fn a_peer_learned_before_the_raft_node_map_exists_is_routable_once_it_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let early_peer = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+
+    // A seed dial lands during boot, before raft exists. Its host_id is learned
+    // here — this is the real entry point (`on_peer_connected`).
+    let early_addr: SocketAddr = "127.0.0.1:17001".parse().unwrap();
+    controller.on_peer_connected((early_peer, early_addr));
+    assert!(
+        controller.raft_node_map_snapshot().is_none(),
+        "precondition: the raft node_map does not exist this early in boot"
+    );
+
+    // Formation publishes the map. The snapshot handed to it need not contain the
+    // peer that connected early — in the wedge it was `peers=1`.
+    controller.transition_to_cluster(Vec::new());
+
+    let map = controller
+        .raft_node_map_snapshot()
+        .expect("formation publishes the raft node_map");
+    let node_id = crate::raft::uuid_to_node_id(early_peer);
+    assert_eq!(
+        map.get(&node_id),
+        Some(&early_peer),
+        "a host_id learned before the map existed must be routable once it does; otherwise every \
+         raft RPC to it is UnresolvedRaftTarget (\"raft node {node_id} has no registered host_id \
+         yet\") returned as Unreachable, and the node can never form. map={map:?}"
+    );
+}
+
+/// Mirror control for the regression above: the fix must not register peers
+/// that were never learned. A peer that never connects stays absent from the
+/// map, so routing to it still yields `UnresolvedRaftTarget` — which is what
+/// makes the fail-loud formation timeout fire on a genuinely stuck boot.
+#[tokio::test]
+async fn a_peer_that_never_connects_is_absent_from_the_raft_node_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let never_connected = Uuid::new_v4();
+
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+
+    controller.transition_to_cluster(Vec::new());
+
+    let map = controller
+        .raft_node_map_snapshot()
+        .expect("formation publishes the raft node_map");
+    let node_id = crate::raft::uuid_to_node_id(never_connected);
+    assert!(
+        !map.contains_key(&node_id),
+        "a peer that never connected must NOT be routable — an unconditionally-populated map \
+         would hide a genuinely stuck boot instead of failing loudly. map={map:?}"
+    );
+}
+
 #[tokio::test]
 async fn existing_cluster_member_does_not_queue_duplicate_join() {
     let dir = tempfile::tempdir().unwrap();
@@ -2195,6 +2322,7 @@ async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_que
         (peer2_id, std::net::SocketAddr::new(peer2_addr.ip(), 50318)),
         None,
         None,
+        0,
     );
 
     let pending = controller.pending_joins.lock();
@@ -2321,7 +2449,12 @@ fn self_connection_does_not_advance_cluster_formation() {
     );
 
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((local_id, "127.0.0.1:47000".parse().unwrap()), None, None);
+    controller.on_inbound_peer(
+        (local_id, "127.0.0.1:47000".parse().unwrap()),
+        None,
+        None,
+        0,
+    );
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
     assert!(controller.connected_peers.lock().is_empty());
 
@@ -2552,7 +2685,7 @@ async fn reverse_inbound_race_does_not_promote_joiner_to_primary() {
 
     // Live 38xxx shape: the seed's reverse inbound arrives on an ephemeral
     // port before the joiner's canonical outbound `:7000` peer-connected event.
-    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None, None);
+    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None, None, 0);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(
         controller.role(),
@@ -2945,7 +3078,7 @@ async fn standalone_inbound_peer_transitions_to_pair() {
 
     // Inbound connection — should also transition, not reject.
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None, None);
+    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None, None, 0);
 
     assert_eq!(
         controller.mode(),
@@ -4276,7 +4409,7 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
         ))));
 
     let addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
-    controller.on_inbound_peer((inbound_peer, addr), None, None);
+    controller.on_inbound_peer((inbound_peer, addr), None, None, 0);
 
     let map = controller
         .raft_node_map_snapshot()
@@ -4954,7 +5087,7 @@ async fn primary_paired_with(
         controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
-    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()));
+    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()), 0);
     assert_eq!(controller.role(), Some(PairRole::Primary));
     for _ in 0..100 {
         if pm.has_peer(peer_id) {

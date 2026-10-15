@@ -1398,7 +1398,13 @@ impl ModeController {
         // (re)connecting peer's host_id — the leader must learn a reconnecting
         // committed member's host_id even when no `JoinNode` fires, or raft RPCs
         // to it stay "registration pending" forever.
-        self.raft_node_map.store(Some(node_map_for_ddl.clone()));
+        //
+        // Publication also applies every host_id learned BEFORE this point: a
+        // seed dial can land seconds before formation, and a bare `store` here
+        // would start the map without it. In the 2026-10-15 wedge node2 connected
+        // 5.3 s early, was never re-registered, and stayed `UnresolvedRaftTarget`
+        // for the whole run, so the node could not form.
+        self.publish_raft_node_map(node_map_for_ddl.clone());
         // Clone peer_manager for DdlPath::Cluster forwarding (ClusterCoordinator
         // will consume `peer_manager` below).
         let peer_manager_for_ddl = peer_manager.clone();

@@ -331,6 +331,16 @@ pub struct ModeController {
     /// leader restarted (no `JoinNode`, so the leader would otherwise never learn
     /// its host_id → "registration pending" forever). Empty until formation.
     pub(super) raft_node_map: arc_swap::ArcSwapOption<std::sync::RwLock<HashMap<u64, uuid::Uuid>>>,
+    /// Host IDs learned on a connection BEFORE [`Self::raft_node_map`] was
+    /// published (it appears at `transition_to_cluster`, i.e. at formation).
+    ///
+    /// A seed dial can land seconds before formation — in the 2026-10-15 wedge
+    /// node2 connected 5.3 s early and never reconnected — so a registration
+    /// arriving while the map is `None` must be RETAINED, not dropped.
+    /// [`Self::publish_raft_node_map`] drains this set into the map the moment it
+    /// lands. Discarding it is what stranded node2: every raft RPC to it stayed
+    /// `UnresolvedRaftTarget` → `Unreachable`, so the node could never form.
+    pub(super) pending_raft_node_registrations: Mutex<std::collections::HashSet<uuid::Uuid>>,
     /// Shared slot publishing this node's live `AccordState` to the session
     /// layer. Empty in standalone/pair; filled in `transition_to_cluster` with
     /// the SAME state the node's `AccordHandler` serves, so the transaction
@@ -526,6 +536,7 @@ impl ModeController {
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
             raft_node_map: arc_swap::ArcSwapOption::empty(),
+            pending_raft_node_registrations: Mutex::new(std::collections::HashSet::new()),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
             jsonb_gate_refusing: AtomicBool::new(false),
@@ -567,19 +578,62 @@ impl ModeController {
     /// Register a (re)connecting peer's `host_id` in the raft network factory's
     /// shared node_map so the leader can resolve it and route raft RPCs to it.
     ///
-    /// Idempotent (`HashMap` insert). A no-op before cluster formation (the map
-    /// is captured in `transition_to_cluster`). This is what lets an
-    /// already-committed member that reconnects *after the leader restarted*
-    /// become raft-routable again: such a reconnect triggers no `JoinNode`, so
-    /// the leader's join-time registration never fires and — without this — the
-    /// peer stays "registration pending" forever, wedging replication.
+    /// Idempotent (`HashMap` insert). Before the map is published the host_id is
+    /// retained in [`Self::pending_raft_node_registrations`] and applied by
+    /// [`Self::publish_raft_node_map`], because a peer can connect seconds before
+    /// formation and never reconnect. This is what lets an already-committed
+    /// member that reconnects *after the leader restarted* become raft-routable
+    /// again: such a reconnect triggers no `JoinNode`, so the leader's join-time
+    /// registration never fires and — without this — the peer stays
+    /// "registration pending" forever, wedging replication.
     pub(super) fn register_peer_in_raft_node_map(&self, host_id: uuid::Uuid) {
-        if let Some(map) = self.raft_node_map.load_full() {
-            let node_id = crate::raft::uuid_to_node_id(host_id);
-            map.write()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(node_id, host_id);
+        match self.raft_node_map.load_full() {
+            Some(map) => Self::insert_raft_node(&map, host_id),
+            None => {
+                // Formation has not published the map yet. Retain the
+                // registration: dropping it here is the defect that stranded a
+                // peer which connected before formation and never came back.
+                self.pending_raft_node_registrations.lock().insert(host_id);
+            }
         }
+    }
+
+    /// Publish the raft network factory's `node_id → host_id` map at cluster
+    /// formation, applying every registration that arrived while it did not exist.
+    ///
+    /// Replaces a bare `raft_node_map.store(..)`: the map must be complete with
+    /// respect to the peers this node actually holds a connection to, otherwise a
+    /// peer that connected before formation (and never reconnects) is absent from
+    /// the map the Raft network resolves against, and every RPC to it is
+    /// `UnresolvedRaftTarget`.
+    pub(super) fn publish_raft_node_map(
+        &self,
+        map: Arc<std::sync::RwLock<HashMap<u64, uuid::Uuid>>>,
+    ) {
+        // Seed from the live connected set: the map must cover every peer this
+        // node is connected to, not only the snapshot formation was handed.
+        for (host_id, _addr) in self.connected_peers.lock().iter() {
+            Self::insert_raft_node(&map, *host_id);
+        }
+        let pending: Vec<uuid::Uuid> = self
+            .pending_raft_node_registrations
+            .lock()
+            .drain()
+            .collect();
+        for host_id in pending {
+            Self::insert_raft_node(&map, host_id);
+        }
+        self.raft_node_map.store(Some(map));
+    }
+
+    /// Insert one `node_id → host_id` pair into the shared raft node_map.
+    fn insert_raft_node(
+        map: &Arc<std::sync::RwLock<HashMap<u64, uuid::Uuid>>>,
+        host_id: uuid::Uuid,
+    ) {
+        map.write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(crate::raft::uuid_to_node_id(host_id), host_id);
     }
 
     /// Test-only snapshot of the raft node_map contents (`None` before formation).
@@ -649,6 +703,7 @@ impl ModeController {
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
             raft_node_map: arc_swap::ArcSwapOption::empty(),
+            pending_raft_node_registrations: Mutex::new(std::collections::HashSet::new()),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
             jsonb_gate_refusing: AtomicBool::new(false),
@@ -724,6 +779,7 @@ impl ModeController {
             raft_runtime: std::sync::OnceLock::new(),
             data_runtime: std::sync::OnceLock::new(),
             raft_node_map: arc_swap::ArcSwapOption::empty(),
+            pending_raft_node_registrations: Mutex::new(std::collections::HashSet::new()),
             accord_state_slot: crate::accord::empty_accord_state_slot(),
             accord_clock: std::sync::OnceLock::new(),
             jsonb_gate_refusing: AtomicBool::new(false),
