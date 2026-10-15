@@ -134,8 +134,8 @@ Agents MUST verify that all CI checks will pass locally before pushing to a remo
 
 See [specs/reference/release-process.md](specs/reference/release-process.md). Key rules:
 
-- **Every PR bumps `[workspace.package] version`, and only via `scripts/semver-bump --apply`** — never by hand. The commit-msg/pre-push hooks and the `Semver` CI workflow refuse a branch that is not bumped as far as its commits require; merges to main are tagged `semver-v<version>`. See "Versioning" in [CONTRIBUTING.md](CONTRIBUTING.md). **Main leads:** nightly (`<version>-nightly`) and stable (`vX.Y.Z`) releases take main's version as-is and refuse to release below the latest stable tag.
-- Use **Conventional Commit** subjects (`feat:`, `fix:`, `feat!:`/`BREAKING CHANGE:`) — the bump level is computed from them; the commit-msg hook refuses anything else.
+- **Do not bump `[workspace.package] version` in a PR**, and never by hand. After every merge the `ferrosa-release-bot` App bumps main (`scripts/semver-bump --release` in `.github/workflows/semver.yml`) and tags it `semver-v<version>`. See "Versioning" in [CONTRIBUTING.md](CONTRIBUTING.md). **Main leads:** nightly (`<version>-nightly`) and stable (`vX.Y.Z`) releases take main's version as-is and refuse to release below the latest stable tag.
+- Give the PR a **Conventional Commit title** (`feat:`, `fix:`, `feat!:`) — it sets the bump, and the `Semver` check refuses anything else. Commit subjects are conventional too (the commit-msg hook).
 - Releases are **tag-only** (the `main` ruleset forbids direct pushes). Nightly cuts are GitHub **prereleases** (nightly channel); a maintainer **promotes** one to **stable** via the *Promote Release to Stable* workflow.
 
 ## Test Policy

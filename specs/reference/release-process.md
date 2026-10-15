@@ -5,16 +5,19 @@ consumes them.
 
 ## TL;DR
 
-- **`main`'s version is bumped by every PR** with `scripts/semver-bump --apply`
-  (enforced by hooks and `.github/workflows/semver.yml`, which tags merges
-  `semver-v<version>`; see "Versioning" in `CONTRIBUTING.md`). Never hand-edit it.
+- **`main`'s version is bumped after every merge** by the `ferrosa-release-bot`
+  App (`.github/workflows/semver.yml` runs `scripts/semver-bump --release`,
+  commits `chore(release): vX.Y.Z` to `main` as a ruleset bypass actor and tags
+  it `semver-v<version>`). PRs carry no bump; their Conventional title sets it.
+  See "Versioning" in `CONTRIBUTING.md`. Never hand-edit it.
 - **Main leads.** Releases never compute a version of their own: nightly and
   stable both read `main`'s `[workspace.package] version`
   (`.github/scripts/release-version-from-main.sh`). The script refuses loudly
   when `main` is below the latest stable `vX.Y.Z` tag, when a change reached
   `main` without a bump, or when promotion would re-release an existing `vX.Y.Z`.
-- **Releases cut on merge.** Every push to `main` (a merged PR) that carries a
-  releasable commit cuts the next release automatically. A **nightly cron** runs
+- **Releases cut on merge.** Every merged PR cuts the next release
+  automatically, from the bot's `chore(release)` commit that follows it (the
+  merge push itself still carries the previous version, so it is skipped). A **nightly cron** runs
   as a safety-net for anything the merge path missed. Both paths share one
   workflow (`nightly-release.yml`) and the same tag-only mechanics. Doc/spec-only
   merges are excluded (`paths-ignore`) so prose changes don't trigger a full
@@ -35,7 +38,7 @@ consumes them.
   tag, never directly on `main` (the `main` ruleset forbids direct pushes — see
   below). The released artifact always carries the correct version.
 - **Promotion never writes `main`.** `main` already carries the version, so there
-  is no "sync main version" PR any more (it used to set `main` *below* its per-PR
+  is no "sync main version" PR any more (it used to set `main` *below* its
   bumps).
 - **`ferrosa-docs` `docs/LATEST` + the marketing-site version are release steps.** `ferrosa-docs` `docs/LATEST`
   (the plain-text tag the install scripts fetch from `ferrosadb.com/LATEST`) and the
@@ -49,8 +52,9 @@ consumes them.
 
 ## Why tag-only (the bug this fixed)
 
-`main` has a repository **ruleset** (`pull_request` + `required_linear_history`,
-no bypass actors) that rejects any direct branch push:
+`main` has a repository **ruleset** (`pull_request` + merge queue; its only
+bypass actor is the `ferrosa-release-bot` App, for the version bump) that
+rejects any other direct branch push:
 
 ```
 remote: error: GH013: Repository rule violations found for refs/heads/main.
@@ -87,9 +91,10 @@ release.yml  (per built tag — CalVer or SemVer)
   └─ gh release create … (--prerelease for nightly, --latest for stable)
 ```
 
-The bump itself happens in each PR, not here: `scripts/semver-bump` maps the
-branch's Conventional Commits to major/minor/patch (see "Versioning" in
-`CONTRIBUTING.md`), and the commit-msg hook refuses a non-Conventional subject.
+The bump itself happens on `main` after each merge, not here:
+`semver.yml`'s `bump and tag main` job maps each merged PR's Conventional title
+to major/minor/patch (see "Versioning" in `CONTRIBUTING.md`), and the PR check
+refuses a non-Conventional title.
 
 ## Promoting nightly → stable
 
@@ -175,9 +180,11 @@ docker run -d --name ferrosa \
 2. `GH013 … refs/heads/main` → the ruleset rejected a branch push. The workflow
    must push **tags only**; confirm no `git push origin HEAD:…main` remains.
 3. `main's version … is BELOW the latest stable tag` → `main`'s Cargo version
-   was lowered or never caught up. Fix it on `main` with a PR
-   (`scripts/semver-bump --apply`); never release backwards.
-4. `equals the latest stable tag … not bumped` → a change reached `main` without
-   a bump (the `Semver` check was bypassed). Land a PR that bumps it.
+   was lowered or never caught up. Fix it on `main` with a PR; never release
+   backwards.
+4. `equals the latest stable tag … not bumped` → a change reached `main` and the
+   release bot did not bump it. Open the latest `Semver` / `bump and tag main`
+   run (`gh run list --workflow=semver.yml --branch main`); a missing App
+   variable/secret is reported there as an `::error::`.
 5. Promotion: `vX.Y.Z already exists` → that version is already stable; promote
    a nightly cut after a later bump on `main`.

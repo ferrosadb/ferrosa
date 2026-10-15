@@ -78,34 +78,63 @@ Body should explain *why*, not just *what*. The diff already shows the *what*.
 ### Versioning
 
 Every change to `main` bumps `[workspace.package] version` in `Cargo.toml`, by
-the amount its commits call for. `scripts/semver-bump` computes it from the
-Conventional Commits on your branch since it left `main`:
+the amount it calls for. **You do not bump it in your PR.** After a merge, the
+`ferrosa-release-bot` GitHub App bumps `main` itself
+(`.github/workflows/semver.yml`, job `bump and tag main`), so the bump happens
+no matter who opened the PR. What you provide is a **Conventional Commit PR
+title**: the merge queue records it as the merge commit's message, and it sets
+the bump:
 
-| Commits on the branch                         | Bump                         |
-| --------------------------------------------- | ---------------------------- |
-| `feat!:` / `fix(x)!:` / `BREAKING CHANGE:` footer | major (minor while `0.x`) |
-| `feat:` / `feat(scope):`                      | minor                        |
-| anything else (`fix`, `perf`, `docs`, `ci`, …) | patch                       |
+| PR title                                       | Bump                       |
+| ---------------------------------------------- | -------------------------- |
+| `feat!:` / `fix(x)!:` (or a `BREAKING CHANGE:` footer) | major (minor while `0.x`) |
+| `feat:` / `feat(scope):`                       | minor                      |
+| anything else (`fix`, `perf`, `docs`, `ci`, …) | patch                      |
 
-Do not edit the version by hand. Run:
+Checks:
 
-```bash
-scripts/semver-bump --print   # base, commits, required and current version
-scripts/semver-bump --apply   # write the version, refresh Cargo.lock, commit chore(release): vX.Y.Z
-```
+- **PR title** — the `semver bump present` job runs
+  `scripts/semver-bump --check-title` on every PR (re-run when you retitle).
+  In the merge queue it runs only the tool's unit tests.
+- **commit-msg hook** — refuses a commit whose header is not a Conventional
+  Commit (installed by `pre-commit install`). It keeps titles easy; it does not
+  set the version.
 
-It is enforced in three places:
+Never edit the version by hand, and never add a `chore(release): …` commit to a
+PR.
 
-- **commit-msg hook** — refuses a commit whose header is not a Conventional Commit.
-- **pre-push hook** (`semver-bump`, the first pre-push hook) — refuses a branch
-  that is not bumped far enough. Both are installed by `pre-commit install`.
-- **CI** (`.github/workflows/semver.yml`) — the same check on every PR and
-  merge-queue entry; after a merge, main is tagged `semver-v<version>`. These
-  tags never trigger `release.yml`, which only builds `v*` tags.
+**Reading the release run.** Each push to `main` runs `bump and tag main`.
+`scripts/semver-bump --release` reads `main`'s first-parent history since the
+newest `semver-v<version>` tag (a merge contributes its PR title), and prints
+`version=`, `released=` and `bootstrap=`:
 
-If another PR bumps `main` before yours merges, rebase onto `main`, drop your
-old `chore(release): …` commit (or resolve the `Cargo.toml`/`Cargo.lock`
-conflict in favour of `main`), and run `scripts/semver-bump --apply` again.
+- `released=true` — it committed `chore(release): vX.Y.Z`; the job tags
+  `semver-vX.Y.Z` and pushes the commit and tag atomically.
+- `bootstrap=true` — no `semver-v*` tag existed yet; it tags the current version
+  only.
+- both `false` — `main` already declares a high enough version (for example the
+  run triggered by the bot's own release commit); nothing is pushed.
+- `::warning::main moved during the release` — another merge landed while it
+  ran; the run for that newer push releases both. Not an error.
+- A non-Conventional title is counted as a patch with a `::warning::`; the
+  release never stalls on wording.
+
+`semver-v*` tags never trigger `release.yml`, which only builds `v*` tags.
+
+#### One-time setup
+
+The release job fails with an `::error::` until all of these exist:
+
+1. A GitHub App named `ferrosa-release-bot`, installed on this repository with
+   **Contents: read and write** (and Metadata: read).
+2. Org variable `FERROSA_RELEASE_BOT_APP_ID` — the App's ID.
+3. Org secret `FERROSA_RELEASE_BOT_PRIVATE_KEY` — a private key generated for
+   the App.
+4. The App as a **bypass actor** on `main`'s ruleset, so its release commit can
+   reach `main` without a PR or the merge queue.
+
+See [GitHub: authenticating with a GitHub App in Actions](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/making-authenticated-api-requests-with-a-github-app-in-a-github-actions-workflow)
+and [ruleset bypass](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository#granting-bypass-permissions-for-your-ruleset).
 
 ### Test-Driven Development
 

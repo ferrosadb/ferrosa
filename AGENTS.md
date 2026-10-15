@@ -60,11 +60,12 @@ The crate-centric map (all crates + the runtime dependency graph) lives at
   full workspace, must pass locally. Do not push and hope. (CI also requires
   these — the `main` merge queue gates on them.)
 - **Never commit to `main`** — feature branch + PR. Tag-only releases.
-- **Every PR bumps the version** with `scripts/semver-bump --apply` (never by
-  hand); the pre-push hook and the `Semver` CI workflow refuse an unbumped
-  branch. See "Versioning" in [`CONTRIBUTING.md`](CONTRIBUTING.md).
-- **Conventional Commits** — the bump level is computed from commit subjects
-  (`feat:`/`fix:`/`feat!:`); the commit-msg hook refuses anything else.
+- **Do not bump the version in a PR** (and never by hand): the release bot
+  bumps `main` after every merge. See "Versioning" in
+  [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- **Conventional Commits** — the **PR title** sets the bump
+  (`feat:`/`fix:`/`feat!:`) and the `Semver` CI check refuses a title that is
+  not one; the commit-msg hook refuses non-conventional commit headers.
 - **Fail loud, never fake** — prefer a clear error over a silent fallback that
   returns wrong/empty results. (This is also what the FMEAs in each crate's
   `specs/` exist to surface.)
