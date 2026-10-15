@@ -39,7 +39,10 @@ fn test_storage(dir: &std::path::Path) -> Arc<StorageEngine> {
     Arc::new(StorageEngine::new(config, None).unwrap())
 }
 
-fn test_schema() -> Arc<Schema> {
+/// The controller's own schema fixture. `pub(crate)` so the in-crate test modules of
+/// sibling controller files (the D32 gate tests) build their precondition the same way
+/// this module does, rather than inventing a second schema builder.
+pub(crate) fn test_schema() -> Arc<Schema> {
     use ferrosa_schema::{
         AuthMethod, DeploymentMode as SchemaDeploymentMode, LogAuditSink, PasswordHasher,
         PasswordPolicy, RateLimitConfig, SchemaConfig,

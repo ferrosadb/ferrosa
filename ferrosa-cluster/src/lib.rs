@@ -20,6 +20,7 @@ pub mod pair;
 pub(crate) mod partition_state_fixture;
 pub mod raft;
 pub mod raft_forward;
+pub mod raft_forward_codec;
 pub mod rebalance;
 pub mod repair;
 pub mod ring;

@@ -67,8 +67,21 @@ Done: type threading. Remaining: None for T-150.
 
 ## T-300 follow-ups
 
-- T-154b replaces `jsonb_ddl_permitted` with the `ferrosa.jsonb.v1` ledger check
-  at the same call sites and lifts the standalone-only rule.
+- **D32 done:** the standalone-only mode check is replaced by a capability check.
+  jsonb DDL is permitted on a standalone node, or where every member advertises
+  `CAP_JSONB_V1`; otherwise it is refused, naming the members that lack it. The
+  gate reads a second live cell (`jsonb_cluster_gate_handle()`), defaulting to
+  `Unknown` (refuse outside standalone), and its reason is typed
+  (`JsonbDdlRefusal`). Regression: `tests/jsonb_ddl_gate.rs`.
+- **D32 not done — the verdict is never published.** The cluster controller does
+  not yet compute `JsonbClusterGate` from the peer capability view
+  (`ferrosa-net`'s `peer_capabilities`), so in production a cluster still refuses;
+  and the transition half (`ferrosa-cluster/src/controller/jsonb_gate.rs`) still
+  reads `Unknown` deliberately, keeping leaving-standalone fail-closed.
+- T-154b replaces the capability check with the `ferrosa.jsonb.v1` ledger check at
+  the same call sites. The capability bit is read from LIVE connections, not
+  persisted in the replicated log, so a member that is down during the DDL and
+  later returns with an older build is the residual the ledger closes.
 - `jsonb_ddl_refused_total{mode}` is an in-process counter
   (`jsonb_rules::jsonb_ddl_refused_total`); exporting it to Prometheus is not
   wired yet.
