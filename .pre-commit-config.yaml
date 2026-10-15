@@ -1,7 +1,11 @@
 # pre-commit + pre-push hooks for the ferrosa workspace.
 #
-# Install:  pre-commit install --hook-type pre-commit --hook-type pre-push
+# Install:  pre-commit install   (installs every default_install_hook_types entry)
 # Bypass:   FERROSA_SKIP_PREPUSH=1 git push    (or git push --no-verify)
+#
+# Versioning: commit-msg refuses a non-Conventional Commit header. There is no
+# local bump requirement: the release bot bumps main after merge
+# (.github/workflows/semver.yml; "Versioning" in CONTRIBUTING.md).
 #
 # Speed budget:
 #   - pre-commit must stay under ~5 seconds (developer commits frequently).
@@ -14,7 +18,13 @@
 
 default_install_hook_types:
   - pre-commit
+  - commit-msg
   - pre-push
+
+# Hooks without their own `stages:` run where they always did (commit and push).
+# Without this, installing commit-msg would also run every such hook a second
+# time against the commit message.
+default_stages: [pre-commit, pre-push, manual]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -51,6 +61,16 @@ repos:
         language: system
         types: [rust]
         pass_filenames: false
+
+      # commit-msg: the header must be a Conventional Commit. The bump is set
+      # by the PR title (checked in CI), but conventional commits make good
+      # titles and keep rebase merges countable. pre-commit passes the
+      # message file as the one argument.
+      - id: conventional-commit-msg
+        name: Conventional Commit header (commit-msg)
+        stages: [commit-msg]
+        entry: python3 scripts/semver-bump --check-message
+        language: system
 
       # Pre-push: mirror CI's `cargo test` invocation exactly (see
       # .github/workflows/ci.yml "Run tests" step). Same workspace,
