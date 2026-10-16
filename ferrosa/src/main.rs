@@ -861,6 +861,23 @@ async fn ensure_postgres_default_keyspace(
     Ok(true)
 }
 
+/// Publish the committed topology in the node-local view the CQL layer serves.
+///
+/// `ferrosa_schema::NodeConfig` is a second copy of this node's own topology:
+/// `system.local.data_center` / `.rack` are read straight out of it
+/// (`ferrosa-schema/src/system/local.rs`), and `ferrosa-cql` takes its local DC
+/// for `LOCAL_*` quorum routing from the same field. Both must be the DC the
+/// node's ring commits, so seed them from [`ferrosa_cluster::ClusterConfig`] —
+/// the one place `FERROSA_DATA_CENTER` is resolved — rather than leaving the
+/// `NodeConfig::default()` placeholder (`datacenter1`) in place.
+fn seed_local_topology(
+    node: &mut ferrosa_schema::NodeConfig,
+    cluster: &ferrosa_cluster::ClusterConfig,
+) {
+    node.data_center = cluster.data_center.clone();
+    node.rack = cluster.rack.clone();
+}
+
 /// Apply TOML `[internode]` overrides to a `NetConfig`.
 ///
 /// Precedence is **TOML wins** over env (see [`config_val`]): the base
@@ -2728,8 +2745,10 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         )),
     );
 
+    // Kept alive for the node-local view published below: one resolved value
+    // (`FERROSA_DATA_CENTER`), every copy of it.
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
-        cluster_config,
+        cluster_config.clone(),
         net_config.clone(),
         host_id,
         storage.clone(),
@@ -3010,7 +3029,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             .into_iter()
             .map(|t| t.to_string())
             .collect();
-    let node_config = Arc::new(ferrosa_schema::NodeConfig {
+    let mut node_config = ferrosa_schema::NodeConfig {
         rpc_address: cql_broadcast_addr,
         rpc_port: cql_broadcast_port,
         internal_rpc_address: net_config.broadcast_addr.ip(),
@@ -3022,7 +3041,15 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         listen_port: internode_addr.port(),
         tokens,
         ..ferrosa_schema::NodeConfig::default()
-    });
+    };
+    // `system.local.data_center`/`rack` and the coordinator's local DC for
+    // `LOCAL_*` routing both read THIS struct, so it must report the data center
+    // the node actually runs as — not the `NodeConfig::default()` placeholder.
+    // Left unseeded, a node started with `FERROSA_DATA_CENTER=us-west-2` answers
+    // `datacenter1` in `system.local` and routes `LOCAL_QUORUM` from a data
+    // center it does not belong to.
+    seed_local_topology(&mut node_config, &cluster_config);
+    let node_config = Arc::new(node_config);
     let connection_tracker =
         Arc::new(ferrosa_cql::virtual_tables::connections::ConnectionTracker::new());
     let query_tracker =
@@ -5031,6 +5058,42 @@ mod tests {
             err.contains("not-an-addr"),
             "the error must name the offending value so an operator can fix it: {err}"
         );
+    }
+
+    /// The node-local view (`system.local`, and the coordinator's local DC for
+    /// `LOCAL_*` routing) publishes the committed topology, not the
+    /// `NodeConfig::default()` placeholder. RED against the pre-fix wiring: a
+    /// node started with `FERROSA_DATA_CENTER=us-west-2` answers `datacenter1`.
+    #[test]
+    fn local_node_view_publishes_the_committed_topology() {
+        let cluster = ferrosa_cluster::ClusterConfig {
+            data_center: "us-west-2".to_string(),
+            rack: "rack-usw2-b".to_string(),
+            ..ferrosa_cluster::ClusterConfig::default()
+        };
+        let mut node = ferrosa_schema::NodeConfig::default();
+        assert_eq!(
+            node.data_center, "datacenter1",
+            "the placeholder is what the bug shipped"
+        );
+
+        seed_local_topology(&mut node, &cluster);
+
+        assert_eq!(node.data_center, "us-west-2");
+        assert_eq!(node.rack, "rack-usw2-b");
+    }
+
+    /// An unset `FERROSA_DATA_CENTER` publishes the same named default the ring
+    /// commits, so a single-DC cluster is unchanged by the seeding.
+    #[test]
+    fn local_node_view_follows_the_default_cluster_config() {
+        let cluster = ferrosa_cluster::ClusterConfig::default();
+        let mut node = ferrosa_schema::NodeConfig::default();
+
+        seed_local_topology(&mut node, &cluster);
+
+        assert_eq!(node.data_center, cluster.data_center);
+        assert_eq!(node.rack, cluster.rack);
     }
 
     /// A malformed `[internode].broadcast` must also be fatal for the same
