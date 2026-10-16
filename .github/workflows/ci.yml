@@ -298,10 +298,18 @@ jobs:
           #
           # `--exclude` / `--lib` / `--tests` / `--all-features` take the same
           # values in both runners. The `--` separator is the only difference.
-          # NOTE: `binary(~_process)` excludes the real-process cluster harnesses,
-          # which now run in their own step below -- each spawns three real node
-          # processes, and inside this ~9,700-test run one of them can be starved
-          # for its entire readiness budget (indistinguishable from a hang).
+          # NOTE: the real-process cluster harnesses are excluded by their SIX
+          # EXACT binary names, and they run in their own step below -- each
+          # spawns three real node processes, and inside this ~9,700-test run one
+          # of them can be starved for its entire readiness budget
+          # (indistinguishable from a hang).
+          #
+          # Do NOT switch this back to a `binary(~_process)` regex. It looks
+          # equivalent and is not: the same expression selected 13 tests under one
+          # nextest version and excluded none at all in CI, so the harnesses ran
+          # inside the big suite anyway -- which is the starvation this exclusion
+          # exists to prevent. Exact names are unambiguous in every version, and
+          # are the idiom already used for accord_apply_decode_residency.
           # Keep shell comments ABOVE this command, never between its backslash
           # continuations: a `#` line ends the logical line, silently dropping
           # every flag after it -- including the whole `--skip` list below, which
@@ -348,7 +356,7 @@ jobs:
         # indistinguishable from a hang from the outside, so no harness-side budget
         # rule can tell the two apart, and lengthening the budget would only mask it.
         # The step above excludes these binaries; this one gives them the machine.
-        # Named as explicit `--test` targets rather than a `binary(~_process)`
+        # Named as explicit `--test` targets rather than a binary-name
         # filterset: this step carries no `--skip` list, so anything it selects
         # by accident RUNS, and the file-IO-heavy tests (differential_oracle,
         # cassandra_reads_compacted, compaction_end_to_end_pipeline, lazyfs
