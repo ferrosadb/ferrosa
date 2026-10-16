@@ -90,6 +90,22 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
    non-vacuous multi-DC test — a single-DC test passes with the bug present),
    `peer_topology_*`, `seed_join_node_info_*`.
 
+6. **CL-17 (RPN 96)** — cross-DC delivery (ADR-015) has no production caller
+   yet, so a multi-DC cluster's far DC is only reached by the data path's
+   per-replica fan-out: a schema/membership commit that lands in the local DC's
+   Raft group is delivered to another DC only when the data path happens to
+   address one of its nodes. Exposure: silent cross-DC divergence (the local DC
+   committed, the far DC did not). Implemented and proven in isolation —
+   `accord/cross_dc_dispatch.rs` with `tests/cross_dc_dispatch.rs` on three real
+   3-voter Raft groups: exactly one copy per remote DC, each receiving DC's own
+   mesh replicating that copy to all its voters, N-1 links per DC (2 DCs → 1
+   each way, 3 → 2, 4 → 3), a refusing DC retried without re-sending to a
+   delivered one, and an unacknowledged DC reported + counted rather than
+   dropped. Detection: `CROSS_DC_SENDS_TOTAL`, `CROSS_DC_RETRIES_TOTAL`,
+   `CROSS_DC_SEND_FAILURES_TOTAL`. Remaining: call it from the coordinator after
+   `route_for_cl` selects `CrossDcAccord`, and stop the data path's per-NODE
+   remote fan-out.
+
 ## Detection assets
 - `ELECTION_STORM_TERM_JUMPS_TOTAL`, `INSTALLSNAPSHOT_PUSHES_TOTAL` (Raft health).
 - `LEADER_ELECTION_TIMEOUTS`, `FORMATION_REDUCED_DURABILITY_WRITES`,
