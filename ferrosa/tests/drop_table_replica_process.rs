@@ -295,7 +295,7 @@ fn spawn_node_redrawing(
             spec.seed,
             spec.extra_env,
         );
-        match wait_ready_outcome(&mut node, spec.ready_timeout) {
+        match wait_ready_watching(&mut node, spec.ready_timeout, true) {
             Ok(()) => return node,
             Err(message) => {
                 if !log_shows_port_collision(&message) {
@@ -398,7 +398,7 @@ fn start_mesh_cluster(alloc: &mut PortAllocator, cluster_name: &str) -> Vec<Node
 
         let mut collision: Option<String> = None;
         for node in spawned.iter_mut() {
-            if let Err(message) = wait_ready_outcome(node, Duration::from_secs(90)) {
+            if let Err(message) = wait_ready_watching(node, Duration::from_secs(90), true) {
                 if log_shows_port_collision(&message) {
                     collision = Some(message);
                     break;
@@ -691,12 +691,53 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
 ///   retried by [`spawn_node_redrawing`] and [`start_mesh_cluster`];
 /// * a node that is alive but never ready — a product failure, reported.
 fn wait_ready_outcome(node: &mut Node, timeout: Duration) -> Result<(), String> {
+    wait_ready_watching(node, timeout, false)
+}
+
+/// Readiness wait with a LOG WATCH: a node whose log already shows that a listener
+/// could not take its port is reported AT ONCE, instead of at the deadline.
+///
+/// The retry paths ( [`spawn_node_redrawing`], [`start_mesh_cluster`] ) want this:
+/// a lost port is re-drawn in about a second rather than after the whole budget,
+/// which is what makes a collision cheap to survive on a loaded runner — where a
+/// node can take seconds just to REACH its listeners. Note the CI failure that
+/// prompted this: with the check only at the deadline, a node that took ~5 s to
+/// bind had not yet logged anything about the taken port when a short budget
+/// expired, so the collision looked like a product failure.
+///
+/// The strict tests do NOT want it: a node that is alive but never ready has to be
+/// seen to spend its whole budget, so `wait_ready` keeps the un-watched semantics
+/// and that guard stays honest.
+fn wait_ready_watching(
+    node: &mut Node,
+    timeout: Duration,
+    watch_for_lost_port: bool,
+) -> Result<(), String> {
     let started = Instant::now();
     let deadline = started + timeout;
     let mut last_probe: Option<Probe> = None;
+    let mut polls: u32 = 0;
     loop {
         if let Some(message) = node_gone_message(node, started) {
             return Err(message);
+        }
+        // Every 5 polls (~500 ms): has the node already said a listener could not
+        // take its port? A failed bind is terminal for that listener, so this is
+        // not a race with recovery.
+        if watch_for_lost_port {
+            polls += 1;
+            if polls.is_multiple_of(5) {
+                let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+                if log_shows_port_collision(&log) {
+                    return Err(format!(
+                        "node {} lost a listener port: a port in its band was taken by a \
+                         concurrent process after allocation, so it can never become ready. \
+                         log tail:\n{}",
+                        node.host_id,
+                        tail(&log, 20)
+                    ));
+                }
+            }
         }
         let raw = http_get(node.ports.web, "/readyz", None, PROBE_READ_TIMEOUT);
         // An exit DURING the probe must not wait for the next tick. The probe
@@ -1465,6 +1506,7 @@ fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
     let _held = std::net::TcpListener::bind(("127.0.0.1", taken.pg))
         .expect("occupy a port in the first attempt's band");
 
+    let started = Instant::now();
     let mut allocations = 0usize;
     let node = spawn_node_redrawing(
         &mut alloc,
@@ -1473,9 +1515,10 @@ fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
             cluster_name: &format!("redraw-{}", std::process::id()),
             seed: None,
             extra_env: &[],
-            // Short: the first attempt cannot become ready, and the point is the
-            // re-draw, not how long a never-ready node is waited on.
-            ready_timeout: Duration::from_secs(6),
+            // The standard budget: with the log watch, a lost port is detected in
+            // about a second, so this covers a slow-but-healthy boot on a loaded
+            // runner rather than being burned on the node that cannot bind.
+            ready_timeout: Duration::from_secs(90),
         },
         |alloc| {
             allocations += 1;
@@ -1487,9 +1530,15 @@ fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
         },
     );
 
+    let elapsed = started.elapsed();
     assert!(
         allocations > 1,
         "the first attempt must have been handed the taken band, or this test proves nothing"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the lost port must be detected as soon as the node logs it, not by burning the \
+         budget: the first attempt took {elapsed:?}"
     );
     assert_ne!(
         node.ports.pg, taken.pg,
