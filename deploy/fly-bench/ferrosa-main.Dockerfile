@@ -1,8 +1,13 @@
 FROM rust:1.94 AS builder
 WORKDIR /build
 
+# libunwind-dev provides the headers jemalloc's configure needs for
+# --enable-prof-libunwind, and the heap profiler resolves stacks through
+# libunwind's unw_backtrace. The release workflow's glibc job installs it for
+# the same reason. No runtime-side change is needed: the runtime stage already
+# carries libunwind.so.8 transitively, since `linux-perf` Depends on libunwind8.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends capnproto \
+    && apt-get install -y --no-install-recommends capnproto libunwind-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock ./
@@ -56,7 +61,7 @@ ENV CARGO_BUILD_JOBS=4
 ENV RUSTFLAGS="-C force-frame-pointers=yes -C debuginfo=1"
 # Dependency-cache layer. Same feature set as the real build below, or the cache
 # would miss and be discarded. Best-effort by design (|| true).
-RUN cargo build --release -p ferrosa --features ferrosa/full 2>&1 || true
+RUN cargo build --release -p ferrosa --features "ferrosa/full ferrosa/profiling" 2>&1 || true
 
 COPY . .
 RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
@@ -71,7 +76,13 @@ RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
 # otherwise, so the env var is silently a no-op unless the feature is built in.
 # Telemetry stays off at runtime regardless: it needs an explicit
 # FERROSA_TELEMETRY_ENABLED=true, so compiling otel in has no side effect.
-RUN cargo build --release -p ferrosa -p ferrosa-loadgen --features ferrosa/full
+#
+# ferrosa/profiling => jemalloc's heap profiler with the libunwind unwinder
+# (tikv-jemallocator/profiling_libunwind), so MALLOC_CONF=prof:true,prof_prefix=...
+# can dump heap profiles for allocation flame graphs. Inert unless MALLOC_CONF
+# opts in at runtime. The historical segfault with this feature was musl-only;
+# this image's runtime stage is Debian trixie (glibc).
+RUN cargo build --release -p ferrosa -p ferrosa-loadgen --features "ferrosa/full ferrosa/profiling"
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
