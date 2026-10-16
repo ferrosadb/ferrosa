@@ -118,6 +118,10 @@ fn check_table_permission(
 /// Determine the permission needed for a statement.
 fn permission_for_statement(stmt: &Statement) -> Permission {
     match stmt {
+        // An UNWIND that drives an update clause writes; its inner clause is also
+        // validated separately (the engine orchestrates it one element at a
+        // time), so this is a conservative safety net for a direct check.
+        Statement::Unwind { write: Some(_), .. } => Permission::Modify,
         Statement::Match { .. }
         | Statement::MatchWith { .. }
         | Statement::MatchWithOptional { .. }
@@ -294,6 +298,17 @@ fn resolve_pattern_labels(
                                 .to_string(),
                         ));
                     }
+                } else if labels.len() == 1 {
+                    // An ANONYMOUS relationship still needs its edge table reachable.
+                    // The write planner resolves a MERGE relationship BY LABEL among
+                    // `bindings` VALUES, so dropping the resolved table here is what
+                    // made `MATCH (a:L {..}), (b:L {..}) MERGE (a)-[:R {..}]->(b)` fail
+                    // with "MERGE relationship with type 'R' has no resolved binding".
+                    // A NAMED variable always worked, which is why the defect read as a
+                    // MATCH/MERGE interaction rather than a binding gap. The key is
+                    // ':'-prefixed because a colon is not a valid variable name, so it
+                    // cannot shadow one; the lookup matches the table's LABEL, not key.
+                    bindings.insert(format!(":{rel_type_str}"), resolved_labels.remove(0));
                 }
             }
         }

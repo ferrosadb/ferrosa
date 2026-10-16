@@ -63,10 +63,16 @@ pub struct CreateOp {
 ///
 /// For relationship MergeOps (`table.graph_type == "edge"`), `src_match_props`
 /// and `dst_match_props` hold the source and destination node match properties
-/// so that `execute_merge` can derive the correct partition and clustering keys:
+/// so that `execute_merge` can bind the edge to the rows the MATCH selected:
 ///
-/// - `partition key = content_addressed_key(src_match_props)`  — the source vertex key
-/// - `clustering    = content_addressed_key(dst_match_props)`  — the destination vertex key
+/// - `partition key = the source vertex's storage key`
+/// - `clustering    = the destination vertex's storage key`
+///
+/// The endpoints' own MergeOps resolve those keys by reading (see
+/// `infer_schema_aware_merge_shape`); `execute_merge` threads their raw bytes
+/// into the edge shape. `content_addressed_key(src_match_props)` /
+/// `content_addressed_key(dst_match_props)` is only the schemaless fallback the
+/// shared helpers start from, and is not the vertex key.
 ///
 /// The adjacency observer reads `mutation.key` as the source vertex ID and
 /// `row.clustering` as the target vertex ID.  Without these fields, hop queries
@@ -203,6 +209,10 @@ pub enum PhysicalPlan {
         /// update the matched label table rather than a table named after the
         /// Cypher variable.
         variable_tables: HashMap<String, String>,
+        /// Optional trailing RETURN, projected over the selected rows *after* the
+        /// assignments are applied. `None` keeps the `updated N vertices` status
+        /// row.
+        return_clause: Option<ReturnClause>,
     },
     /// Unset properties / drop labels on matched nodes/rels (Cypher `REMOVE`).
     RemoveProperties {
@@ -321,13 +331,25 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             expr,
             var,
             with_pipeline,
+            write,
             return_clause,
-        } => Ok(PhysicalPlan::Unwind {
-            expr: expr.clone(),
-            var: var.clone(),
-            with_pipeline: with_pipeline.clone(),
-            return_clause: return_clause.clone(),
-        }),
+        } => {
+            // A writing UNWIND is orchestrated by the engine (one inner-clause
+            // execution per element) before planning, exactly like FOREACH; one
+            // reaching the planner is an internal invariant violation.
+            if write.is_some() {
+                return Err(GraphError::Validation(
+                    "UNWIND with an update clause must be expanded by the engine before planning"
+                        .to_string(),
+                ));
+            }
+            Ok(PhysicalPlan::Unwind {
+                expr: expr.clone(),
+                var: var.clone(),
+                with_pipeline: with_pipeline.clone(),
+                return_clause: return_clause.clone(),
+            })
+        }
         Statement::Return { return_clause } => Ok(PhysicalPlan::ReturnOnly {
             return_clause: return_clause.clone(),
         }),
@@ -378,7 +400,14 @@ pub fn plan(logical: LogicalPlan) -> Result<PhysicalPlan> {
             pattern,
             where_clause,
             assignments,
-        } => plan_set(pattern, &logical.bindings, where_clause, assignments),
+            return_clause,
+        } => plan_set(
+            pattern,
+            &logical.bindings,
+            where_clause,
+            assignments,
+            return_clause.as_ref(),
+        ),
         Statement::Remove {
             pattern,
             where_clause,
@@ -1054,13 +1083,28 @@ fn plan_set(
     bindings: &std::collections::HashMap<String, ResolvedTable>,
     where_clause: &Option<Expr>,
     assignments: &[Assignment],
+    return_clause: Option<&ReturnClause>,
 ) -> Result<PhysicalPlan> {
     let filters = extract_filters(where_clause);
 
-    // Build a dummy return clause that returns all variables from the
-    // assignments so that the expand plan can find matching vertices.
-    let return_vars: Vec<String> = assignments.iter().map(|a| a.var.clone()).collect();
-    let return_clause = ReturnClause {
+    // The inner expand has to bind every variable the trailing RETURN reads (not
+    // just the ones being assigned): `MATCH (a:P), (b:P) SET a.age = 1 RETURN
+    // b.name` needs both. Pattern variables are collected in pattern order, then
+    // any assignment target not already bound.
+    let mut return_vars: Vec<String> = Vec::new();
+    for pattern in patterns {
+        collect_pattern_vars(pattern, &mut return_vars);
+    }
+    for assignment in assignments {
+        if !return_vars.iter().any(|v| v == &assignment.var) {
+            return_vars.push(assignment.var.clone());
+        }
+    }
+
+    // The dummy projection only exists so the expand plan binds the variables;
+    // its columns are what the SET loop matches assignments against. The caller's
+    // `return_clause` (the statement's trailing RETURN) is carried separately.
+    let bind_clause = ReturnClause {
         distinct: false,
         items: return_vars
             .iter()
@@ -1073,7 +1117,7 @@ fn plan_set(
         limit: None,
     };
 
-    let expand = plan_match(patterns, bindings, filters, return_clause)?;
+    let expand = plan_match(patterns, bindings, filters, bind_clause)?;
     let assignment_tuples: Vec<(String, String, Expr)> = assignments
         .iter()
         .map(|a| (a.var.clone(), a.property.clone(), a.value.clone()))
@@ -1090,7 +1134,34 @@ fn plan_set(
                     .map(|rt| (a.var.clone(), rt.table.clone()))
             })
             .collect(),
+        return_clause: return_clause.cloned(),
     })
+}
+
+/// Collect the variable names a pattern binds, in source order, without
+/// duplicates.
+fn collect_pattern_vars(pattern: &Pattern, out: &mut Vec<String>) {
+    match pattern {
+        Pattern::Node { var, .. } => {
+            if let Some(var) = var {
+                if !out.iter().any(|v| v == var) {
+                    out.push(var.clone());
+                }
+            }
+        }
+        Pattern::Rel { var, .. } => {
+            if let Some(var) = var {
+                if !out.iter().any(|v| v == var) {
+                    out.push(var.clone());
+                }
+            }
+        }
+        Pattern::Path(elements) => {
+            for element in elements {
+                collect_pattern_vars(element, out);
+            }
+        }
+    }
 }
 
 /// Variable referenced by a REMOVE item.
@@ -1819,6 +1890,7 @@ mod tests {
                     property: "name".into(),
                     value: Expr::Literal(crate::parser::Literal::String("Bob".into())),
                 }],
+                return_clause: None,
             },
             keyspace: "social".to_string(),
         };
@@ -1829,6 +1901,7 @@ mod tests {
                 expand,
                 assignments,
                 variable_tables,
+                ..
             } => {
                 assert!(matches!(*expand, PhysicalPlan::Expand { .. }));
                 assert_eq!(assignments.len(), 1);

@@ -104,6 +104,14 @@ resolved port.
 - **Property write encoding** (`executor/expand.rs`) — schema-less CREATE/MERGE
   accept literal values only; a map, list or computed expression returns
   `GraphError::Validation` rather than storing empty bytes (FMEA G-11).
+- **Relationship write keys** (`executor/expand.rs`) — a MERGE relationship's
+  storage key is its endpoints' keys: partition = source vertex key, clustering =
+  destination vertex key (the shape `DELETE` and the hop read reconstruct, and
+  what `find_vertex_match` byte-compares). `execute_merge` threads the raw key
+  bytes the endpoints' own MergeOps resolved by reading, so a relationship merged
+  after a `MATCH` lands on the same key the traversal reads — and a `uuid`
+  key/clustering column receives its 16 raw bytes, not the 36-byte printable
+  form.
 - **Aggregations** (`executor/aggregate.rs`) — `count`, `sum`, `avg`, `min`,
   `max`, `collect`, with `max_groups` / `max_collect_size` caps.
 - **Adjacency index** (`adjacency/`) — `schema` (table layout + naming),
