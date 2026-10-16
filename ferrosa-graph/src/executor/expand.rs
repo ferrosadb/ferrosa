@@ -683,6 +683,7 @@ async fn execute_buffered<'a>(
             expand,
             assignments,
             variable_tables,
+            return_clause,
         } => {
             execute_set(
                 write_path,
@@ -690,6 +691,7 @@ async fn execute_buffered<'a>(
                 keyspace,
                 &assignments,
                 &variable_tables,
+                return_clause.as_ref(),
                 config,
                 virtual_tables,
                 start,
@@ -5207,8 +5209,21 @@ fn projection_reads_storage(plan: &PhysicalPlan) -> bool {
         .any(|item| expr_has_pattern_comprehension(&item.expr))
 }
 
-/// Execute a SET plan: run the expand to find matching vertices, then write
-/// updated cells for each one.
+/// Execute a SET plan: run the inner expand to find matching vertices, apply the
+/// assignments, and — when the statement carries a trailing RETURN — project the
+/// selected rows with the assignments applied.
+///
+/// Assignment right-hand sides are **evaluated against the matched row**, so
+/// `SET n.age = n.age + 1` reads the row it is updating (a raw, unevaluated
+/// expression cannot be encoded as a cell). Every RHS in the list is evaluated
+/// against the row *as the MATCH selected it*, before any property of that row is
+/// written: `SET n.a = 1, n.b = n.a` reads the old `n.a`, matching openCypher.
+///
+/// The optional trailing RETURN sees the **post-SET** state (`... SET n.age = 31
+/// RETURN n.age` yields 31) and produces one row per matched row, so a SET that
+/// matches nothing returns nothing. DISTINCT / ORDER BY / LIMIT are applied over
+/// the projected rows. Without a trailing RETURN the statement keeps its
+/// `updated N vertices` status row.
 #[allow(clippy::too_many_arguments)]
 async fn execute_set(
     write_path: &WritePath,
@@ -5216,6 +5231,7 @@ async fn execute_set(
     keyspace: &str,
     assignments: &[(String, String, Expr)],
     variable_tables: &HashMap<String, String>,
+    return_clause: Option<&ReturnClause>,
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
     start: Instant,
@@ -5256,22 +5272,48 @@ async fn execute_set(
 
     let timestamp = now_micros();
     let strategy = graph_replication_strategy(schema, keyspace)?;
+    let mut projected_rows: Vec<Vec<serde_json::Value>> = Vec::new();
 
     // For each matched vertex, apply the assignments.
     // The expand result rows contain vertex IDs (hex-encoded).
     // We need to reconstruct the partition key from the hex ID.
     while let Some(row_values) = rows_stream.next().await {
         let row_values = row_values?;
-        for (col_idx, col_name) in columns.iter().enumerate() {
-            // Find assignments that target this variable.
-            let matching_assignments: Vec<&(String, String, Expr)> = assignments
-                .iter()
-                .filter(|(var, _prop, _val)| col_name == var)
-                .collect();
 
-            if matching_assignments.is_empty() {
+        // The matched row, by column name: every assignment RHS and the trailing
+        // RETURN evaluate against this.
+        let bindings: HashMap<String, serde_json::Value> = columns
+            .iter()
+            .zip(row_values.iter())
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+
+        // Evaluate each assignment once, against the row as the MATCH selected
+        // it, and only for variables this row actually binds. Evaluating the
+        // whole list before writing any cell is what makes `SET n.a = 1,
+        // n.b = n.a` read the old `n.a`.
+        let mut assigned_values: HashMap<&str, Vec<(&str, serde_json::Value)>> = HashMap::new();
+        for (var, property, value_expr) in assignments {
+            if !columns.iter().any(|name| name == var) {
                 continue;
             }
+            let value = eval::eval_expr(value_expr, &bindings)
+                .map_err(|e| GraphError::Validation(format!("SET {var}.{property}: {e}")))?;
+            assigned_values
+                .entry(var.as_str())
+                .or_default()
+                .push((property.as_str(), value));
+        }
+
+        // The row's post-SET bindings, for the trailing RETURN. Only variables
+        // whose cells were actually written are patched; a SET that resolved no
+        // cell leaves the row exactly as the MATCH projected it.
+        let mut post_set: HashMap<String, serde_json::Value> = HashMap::new();
+
+        for (col_idx, col_name) in columns.iter().enumerate() {
+            let Some(row_assignments) = assigned_values.get(col_name.as_str()) else {
+                continue;
+            };
 
             // Get the vertex ID from the row. `RETURN n`/`Expr::Var` produces a
             // JSON object with `_id`; older/simple projections can still be a
@@ -5323,8 +5365,8 @@ async fn execute_set(
                     Vec::new()
                 };
 
-                let mut cells = Vec::with_capacity(matching_assignments.len());
-                for (_var, prop, val) in matching_assignments {
+                let mut cells = Vec::with_capacity(row_assignments.len());
+                for (prop, value) in row_assignments {
                     let Some(column_idx) =
                         regular_column_index_for_property(schema, keyspace, table_name, prop)
                     else {
@@ -5342,8 +5384,19 @@ async fn execute_set(
                             prop, keyspace, table_name
                         )));
                     };
-                    let bytes =
-                        encode_property_value_for_table(schema, keyspace, table_name, prop, val)?;
+                    let value_expr = json_value_to_expr(value).ok_or_else(|| {
+                        GraphError::Validation(format!(
+                            "execute_set: SET {col_name}.{prop} evaluated to {value}, which is \
+                             not a scalar property value"
+                        ))
+                    })?;
+                    let bytes = encode_property_value_for_table(
+                        schema,
+                        keyspace,
+                        table_name,
+                        prop,
+                        &value_expr,
+                    )?;
                     cells.push((column_idx, CellValue::live(bytes, timestamp)));
                 }
 
@@ -5369,11 +5422,55 @@ async fn execute_set(
                     )
                     .await?;
                 stats.vertices_written += 1;
+
+                // Mirror the write into the row's bindings so the trailing RETURN
+                // reports the value the statement just wrote.
+                let mut patched = row_values
+                    .get(col_idx)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                if let serde_json::Value::Object(map) = &mut patched {
+                    for (prop, value) in row_assignments {
+                        map.insert((*prop).to_string(), value.clone());
+                    }
+                }
+                post_set.insert(col_name.clone(), patched);
             }
+        }
+
+        if let Some(return_clause) = return_clause {
+            let mut row_bindings = bindings;
+            for (name, value) in post_set {
+                row_bindings.insert(name, value);
+            }
+            let mut row = Vec::with_capacity(return_clause.items.len());
+            for item in &return_clause.items {
+                row.push(eval::eval_expr(&item.expr, &row_bindings)?);
+            }
+            projected_rows.push(row);
         }
     }
 
     stats.execution_ms = start.elapsed().as_millis() as u64;
+
+    if let Some(return_clause) = return_clause {
+        let columns = build_columns(return_clause);
+        // DISTINCT: dedup whole projected rows, preserving first-seen order.
+        if return_clause.distinct {
+            let mut seen: HashSet<String> = HashSet::new();
+            projected_rows
+                .retain(|row| seen.insert(serde_json::to_string(row).unwrap_or_default()));
+        }
+        sort_rows(&mut projected_rows, &columns, &return_clause.order_by);
+        if let Some(limit) = return_clause.limit {
+            projected_rows.truncate(limit.max(0) as usize);
+        }
+        return Ok(GraphResult {
+            columns,
+            rows: projected_rows,
+            stats,
+        });
+    }
 
     Ok(GraphResult {
         columns: vec!["status".to_string()],

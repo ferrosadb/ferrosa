@@ -158,11 +158,41 @@ impl<'input> Parser<'input> {
         } else {
             None
         };
-        let return_clause = self.parse_return_clause()?;
+        // Optional update clause: the write-side counterpart of UNWIND. Each list
+        // element is bound to `var` and the clause runs once per element, in list
+        // order, uniting the rows every iteration projects (each inner clause
+        // carries its own optional trailing RETURN). This is the batch-load
+        // shape: `UNWIND $rows AS row CREATE (n:Person {name: row.name})`.
+        let write = if matches!(
+            self.lexer.peek()?.kind,
+            TokenKind::Keyword(Keyword::Create)
+                | TokenKind::Keyword(Keyword::Merge)
+                | TokenKind::Keyword(Keyword::Set)
+                | TokenKind::Keyword(Keyword::Remove)
+                | TokenKind::Keyword(Keyword::Delete)
+                | TokenKind::Keyword(Keyword::Detach)
+        ) {
+            Some(Box::new(self.parse_statement()?))
+        } else {
+            None
+        };
+        // A writing UNWIND takes its projection from the inner clause, so the
+        // trailing RETURN here belongs to that clause, not to the UNWIND.
+        let return_clause = if write.is_some() {
+            ReturnClause {
+                distinct: false,
+                items: vec![],
+                order_by: vec![],
+                limit: None,
+            }
+        } else {
+            self.parse_return_clause()?
+        };
         Ok(Statement::Unwind {
             expr,
             var,
             with_pipeline,
+            write,
             return_clause,
         })
     }
@@ -191,19 +221,92 @@ impl<'input> Parser<'input> {
             patterns.push(self.parse_pattern()?);
         }
 
-        // Optional trailing SET clause.
+        let (set_clause, return_clause) = self.parse_merge_tail()?;
+
+        Ok(Statement::Merge {
+            patterns,
+            set_clause,
+            return_clause,
+        })
+    }
+
+    /// The tail shared by every MERGE form: `[SET assignment_list] [RETURN ...]`.
+    fn parse_merge_tail(&mut self) -> ParseResult<(Vec<Assignment>, Option<ReturnClause>)> {
         let set_clause = if self.lexer.eat(&TokenKind::Keyword(Keyword::Set))? {
             self.parse_assignment_list()?
         } else {
             vec![]
         };
 
-        // Optional RETURN clause.
         let return_clause = if self.lexer.peek()?.kind == TokenKind::Keyword(Keyword::Return) {
             Some(self.parse_return_clause()?)
         } else {
             None
         };
+
+        Ok((set_clause, return_clause))
+    }
+
+    /// Parse `MATCH <pattern-list> MERGE <pattern> [MERGE <pattern>] [SET ...] [RETURN ...]`,
+    /// a read-then-upsert: the MERGE clauses run against the rows the MATCH selected.
+    ///
+    /// The MATCH's node patterns are folded into the MERGE pattern list, which is
+    /// exactly the chained-MERGE upsert shape the planner already executes:
+    ///
+    /// ```text
+    /// MATCH (a:Person {id: $x}), (b:Person {id: $y}) MERGE (a)-[:KNOWS {since: $t}]->(b)
+    /// ```
+    ///
+    /// is planned as
+    ///
+    /// ```text
+    /// MERGE (a:Person {id: $x}) MERGE (b:Person {id: $y}) MERGE (a)-[:KNOWS {since: $t}]->(b)
+    /// ```
+    ///
+    /// Each folded pattern carries the properties that identify its node, so the
+    /// MERGE neither creates a node the MATCH did not select nor needs a second
+    /// lookup. Three shapes cannot be represented this way and fail loud instead of
+    /// being silently reinterpreted:
+    ///
+    /// - a `WHERE` on the MATCH (a `Statement::Merge` has nowhere to carry it),
+    /// - a relationship inside the MATCH patterns (folding it would MERGE that
+    ///   relationship as well, which the query never asked for),
+    /// - an endpoint node that no property-identified pattern pins down — a bare
+    ///   `(a)` has no storage key to derive, so `MATCH (a:L), (b:L) MERGE
+    ///   (a)-[:R]->(b)` cannot select which of the matched `L` rows the MERGE
+    ///   refers to.
+    fn parse_match_then_merge(
+        &mut self,
+        match_pattern: Vec<Pattern>,
+        where_clause: Option<Expr>,
+        span: Span,
+    ) -> ParseResult<Statement> {
+        if where_clause.is_some() {
+            return Err(ParseError::new(
+                "MERGE after MATCH does not support a WHERE clause on the MATCH: filter the \
+                 merged endpoints by their properties instead, e.g. `MATCH (a:Person {id: $x}) \
+                 MERGE (a)-[:KNOWS]->(b:Person {id: $y})`"
+                    .to_string(),
+                span,
+            ));
+        }
+        if match_pattern.iter().any(pattern_contains_relationship) {
+            return Err(ParseError::new(
+                "MERGE after MATCH supports node-only MATCH patterns: folding a relationship \
+                 from the MATCH into the MERGE would upsert that relationship too"
+                    .to_string(),
+                span,
+            ));
+        }
+
+        self.lexer.expect(&TokenKind::Keyword(Keyword::Merge))?;
+        let mut patterns = match_pattern;
+        patterns.push(self.parse_pattern()?);
+        while self.lexer.eat(&TokenKind::Keyword(Keyword::Merge))? {
+            patterns.push(self.parse_pattern()?);
+        }
+        ensure_merge_endpoints_identified(&patterns, span)?;
+        let (set_clause, return_clause) = self.parse_merge_tail()?;
 
         Ok(Statement::Merge {
             patterns,
@@ -224,7 +327,11 @@ impl<'input> Parser<'input> {
         };
 
         // Check what follows: RETURN, OPTIONAL MATCH, SET, DELETE, DETACH DELETE.
-        let tok = self.lexer.peek()?;
+        // The token is CLONED rather than borrowed: `peek` takes `&mut self` and
+        // returns a reference tied to that borrow, so holding it across this match
+        // would make the `MATCH ... MERGE` arm below (which needs `&mut self`) a
+        // second mutable borrow of `self` (E0499).
+        let tok = self.lexer.peek()?.clone();
         match &tok.kind {
             TokenKind::Keyword(Keyword::Return) => {
                 let return_clause = self.parse_return_clause()?;
@@ -248,11 +355,12 @@ impl<'input> Parser<'input> {
                 self.lexer.next_token()?;
                 self.lexer.expect(&TokenKind::Keyword(Keyword::Match))?;
                 let optional_pattern = self.parse_pattern_list()?;
-                let optional_where_clause = if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
-                    Some(self.parse_expr()?)
-                } else {
-                    None
-                };
+                let optional_where_clause =
+                    if self.lexer.eat(&TokenKind::Keyword(Keyword::Where))? {
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
                 let return_clause = self.parse_return_clause()?;
                 Ok(Statement::MatchWithOptional {
                     pattern,
@@ -265,10 +373,19 @@ impl<'input> Parser<'input> {
             TokenKind::Keyword(Keyword::Set) => {
                 self.lexer.next_token()?;
                 let assignments = self.parse_assignment_list()?;
+                // Optional trailing RETURN: projects the selected rows with the
+                // assignments already applied.
+                let return_clause =
+                    if self.lexer.peek()?.kind == TokenKind::Keyword(Keyword::Return) {
+                        Some(self.parse_return_clause()?)
+                    } else {
+                        None
+                    };
                 Ok(Statement::Set {
                     pattern,
                     where_clause,
                     assignments,
+                    return_clause,
                 })
             }
             TokenKind::Keyword(Keyword::Remove) => {
@@ -314,14 +431,21 @@ impl<'input> Parser<'input> {
                 };
                 self.parse_call_subquery(outer)
             }
-            TokenKind::Keyword(Keyword::Foreach)
-            | TokenKind::Keyword(Keyword::Load) => Err(ParseError::new(
-                format!("unsupported Cypher clause: {:?}", tok.kind),
-                tok.span,
-            )),
+            TokenKind::Keyword(Keyword::Foreach) | TokenKind::Keyword(Keyword::Load) => {
+                Err(ParseError::new(
+                    format!("unsupported Cypher clause: {:?}", tok.kind),
+                    tok.span,
+                ))
+            }
+            // `MATCH ... MERGE ...` — a read-then-upsert: the MERGE clauses run
+            // against the rows the MATCH selected.
+            TokenKind::Keyword(Keyword::Merge) => {
+                self.parse_match_then_merge(pattern, where_clause, tok.span)
+            }
             _ => Err(ParseError::new(
                 format!(
-                    "expected RETURN, OPTIONAL MATCH, WITH, SET, REMOVE, DELETE, DETACH DELETE, or CALL after MATCH, got {:?}",
+                    "expected RETURN, OPTIONAL MATCH, WITH, SET, MERGE, REMOVE, DELETE, \
+                     DETACH DELETE, or CALL after MATCH, got {:?}",
                     tok.kind
                 ),
                 tok.span,
@@ -1851,6 +1975,89 @@ impl<'input> Parser<'input> {
     }
 }
 
+/// Whether `pattern` contains a relationship (directly or inside a path).
+///
+/// Used to reject `MATCH` patterns containing a relationship from the
+/// `MATCH ... MERGE ...` fold (see [`Parser::parse_match_then_merge`]).
+fn pattern_contains_relationship(pattern: &Pattern) -> bool {
+    match pattern {
+        Pattern::Rel { .. } => true,
+        Pattern::Path(elements) => elements.iter().any(pattern_contains_relationship),
+        Pattern::Node { .. } => false,
+    }
+}
+
+/// Collect the variables that some node pattern in `patterns` pins down with at
+/// least one property — the variables whose storage key a MERGE can derive.
+fn property_identified_vars(patterns: &[Pattern], identified: &mut Vec<String>) {
+    for pattern in patterns {
+        match pattern {
+            Pattern::Node {
+                var: Some(var),
+                props,
+                ..
+            } if !props.is_empty() => {
+                if !identified.iter().any(|v| v == var) {
+                    identified.push(var.clone());
+                }
+            }
+            Pattern::Path(elements) => property_identified_vars(elements, identified),
+            Pattern::Node { .. } | Pattern::Rel { .. } => {}
+        }
+    }
+}
+
+/// Walk `pattern` and record, in `missing`, the first node it contains that no
+/// property-identified node pattern pins down.
+fn find_unidentified_node(pattern: &Pattern, identified: &[String], missing: &mut Option<String>) {
+    match pattern {
+        Pattern::Node { var, props, .. } => {
+            if !props.is_empty() || missing.is_some() {
+                return;
+            }
+            match var {
+                Some(var) if identified.iter().any(|v| v == var) => {}
+                Some(var) => *missing = Some(format!("`{var}`")),
+                None => *missing = Some("an endpoint without a variable".to_string()),
+            }
+        }
+        Pattern::Path(elements) => {
+            for element in elements {
+                find_unidentified_node(element, identified, missing);
+            }
+        }
+        Pattern::Rel { .. } => {}
+    }
+}
+
+/// Require every node pattern in a folded `MATCH ... MERGE ...` pattern list to be
+/// property-identified.
+///
+/// A MERGE derives a row's storage key from the pattern's properties; a bare
+/// `(a)` therefore has no key to derive, and the MERGE would be unable to refer
+/// to the row the MATCH selected. Fail loud with the shape that works instead of
+/// planning an upsert against an arbitrary row.
+fn ensure_merge_endpoints_identified(patterns: &[Pattern], span: Span) -> ParseResult<()> {
+    let mut identified = Vec::new();
+    property_identified_vars(patterns, &mut identified);
+    let mut missing = None;
+    for pattern in patterns {
+        find_unidentified_node(pattern, &identified, &mut missing);
+    }
+    match missing {
+        None => Ok(()),
+        Some(what) => Err(ParseError::new(
+            format!(
+                "MERGE after MATCH: {what} has no properties to identify it, so the merged \
+                 endpoint cannot be bound to a row the MATCH selected. Give every merged \
+                 endpoint the properties that select it, e.g. `MATCH (a:Person {{id: $x}}), \
+                 (b:Person {{id: $y}}) MERGE (a)-[:KNOWS {{since: $t}}]->(b)`"
+            ),
+            span,
+        )),
+    }
+}
+
 /// Parse a complete Cypher statement from source text.
 pub fn parse(input: &str) -> ParseResult<Statement> {
     let mut parser = Parser::new(input);
@@ -2119,6 +2326,122 @@ mod tests {
         } else {
             panic!("expected Set");
         }
+    }
+
+    #[test]
+    fn parse_set_with_trailing_return() {
+        let stmt = parse("MATCH (n:Person) SET n.age = n.age + 1 RETURN n.age AS v").unwrap();
+        match stmt {
+            Statement::Set {
+                assignments,
+                return_clause,
+                ..
+            } => {
+                assert_eq!(assignments.len(), 1);
+                let return_clause = return_clause.expect("SET must carry its trailing RETURN");
+                assert_eq!(return_clause.items.len(), 1);
+                assert_eq!(return_clause.items[0].alias.as_deref(), Some("v"));
+                assert!(
+                    matches!(return_clause.items[0].expr, Expr::Property { ref var, .. } if var == "n")
+                );
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unwind_with_create_clause() {
+        let stmt =
+            parse("UNWIND $rows AS row CREATE (n:Person {name: row.name}) RETURN 1 AS v").unwrap();
+        match stmt {
+            Statement::Unwind {
+                var,
+                write: Some(inner),
+                ..
+            } => {
+                assert_eq!(var, "row");
+                assert!(
+                    matches!(
+                        *inner,
+                        Statement::Create {
+                            return_clause: Some(_),
+                            ..
+                        }
+                    ),
+                    "the update clause keeps its own trailing RETURN, got {inner:?}"
+                );
+            }
+            other => panic!("expected a writing Unwind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_unwind_with_merge_clause() {
+        let stmt = parse("UNWIND $rows AS row MERGE (n:Person {name: row.name})").unwrap();
+        match stmt {
+            Statement::Unwind {
+                write: Some(inner), ..
+            } => assert!(matches!(*inner, Statement::Merge { .. })),
+            other => panic!("expected a writing Unwind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_match_then_merge_folds_the_match_nodes_into_the_merge() {
+        let stmt = parse(
+            "MATCH (a:Person {id: 1}), (b:Person {id: 2}) \
+             MERGE (a)-[:KNOWS {since: 2024}]->(b) RETURN 1 AS v",
+        )
+        .unwrap();
+        match stmt {
+            Statement::Merge {
+                patterns,
+                return_clause,
+                ..
+            } => {
+                assert_eq!(
+                    patterns.len(),
+                    3,
+                    "the two matched nodes fold in ahead of the merged path"
+                );
+                assert!(matches!(patterns[2], Pattern::Path(_)));
+                assert!(return_clause.is_some());
+            }
+            other => panic!("expected Merge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_match_then_merge_requires_identifying_properties() {
+        let err = parse("MATCH (a:Person), (b:Person) MERGE (a)-[:KNOWS]->(b)").unwrap_err();
+        assert!(
+            err.message.contains("has no properties to identify it"),
+            "expected the boundary explained, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_match_then_merge_rejects_a_match_relationship() {
+        let err =
+            parse("MATCH (a:Person {id: 1})-[:KNOWS]->(b:Person {id: 2}) MERGE (a)-[:LIKES]->(b)")
+                .unwrap_err();
+        assert!(
+            err.message.contains("node-only MATCH patterns"),
+            "expected a loud rejection, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn parse_match_then_merge_rejects_a_match_where_clause() {
+        let err =
+            parse("MATCH (a:Person {id: 1}) WHERE a.age > 30 MERGE (a)-[:KNOWS]->(a)").unwrap_err();
+        assert!(
+            err.message.contains("does not support a WHERE clause"),
+            "expected a loud rejection, got: {}",
+            err.message
+        );
     }
 
     // --- REMOVE ---
