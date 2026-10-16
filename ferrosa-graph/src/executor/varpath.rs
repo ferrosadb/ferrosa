@@ -279,6 +279,17 @@ pub async fn execute_var_length(
                             let partition = partition?;
                             stats.edges_read += partition.rows.len();
                             for row in &partition.rows {
+                                // The adjacency arm above skips a deleted edge via
+                                // `traversable_neighbor_id`; this relationship-table
+                                // fallback must too, or a deleted edge (a row
+                                // tombstone that reads still return) is walked as
+                                // if it were live. `neighbors_found == 0` is also
+                                // true when adjacency exists but every entry is a
+                                // tombstone, so the fallback is reached exactly
+                                // after a delete.
+                                if crate::adjacency::schema::row_is_deleted(row) {
+                                    continue;
+                                }
                                 let source = extract_column_bytes_from_row(
                                     &meta,
                                     partition.key.key.as_bytes(),
