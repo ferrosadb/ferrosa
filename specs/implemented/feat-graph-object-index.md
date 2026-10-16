@@ -1,6 +1,6 @@
 ---
 title: The graph's object index is never created, so object-bound patterns full-scan
-status: landed, awaiting independent verification
+status: implemented, awaiting independent verification
 updated: 2026-10-16
 ---
 
@@ -96,19 +96,58 @@ the declaration cannot drift.
 
 ## NOT DONE
 
-- **The declared-but-not-current window.** The `ObjectScan` arm tests
-  `declares_index_locally` only; it does not test index currency.
-  `read_by_index_each_after` refuses an index that is not current
-  (`ferrosa-storage/src/engine.rs:10536-10541`), so a node that boots with
-  SSTables and is still backfilling the newly declared index answers an
-  object-bound query with a loud error instead of the scan it used to run. The
-  window is bounded by backfill completion, and it is the same window a
-  CQL-issued `CREATE INDEX` on `rdf_triples(object)` has always had — but
-  declaring the index by default makes it reachable without an operator asking
-  for it. Closing it needs an `index_is_current` accessor on
-  `WritePath` (`ferrosa-cluster/src/write_path.rs`, alongside
-  `declares_index_locally` at line 1261) AND-ed into the arm's guard, which is
-  outside this change's crate set.
+- [x] **The declared-but-not-current window — CLOSED** in the same pull request
+  (`353ff3b3`), not deferred. The arm now chooses the index only when the index is
+  both declared **and** current; `WritePath::index_is_current` mirrors
+  `declares_index_locally` over the same engine handle, and a declared index whose
+  backfill is still pending falls back to the existing scan with its own WARN
+  naming the window. A genuinely undeclared index keeps its scan chosen up front
+  and an index read of it is still refused.
 - **The bench-cluster number.** Local proof is structural (index declared; the
   read path completes under a row bound a scan cannot). The measured scan→index
-  throughput belongs to the perf lane.
+  throughput belongs to the perf lane and is still outstanding.
+
+## Implementation Notes
+
+Landed in three commits, merged as `80bdb00c`: `588d1bc7` (declare the index at
+registration), `353ff3b3` (scan while it is not current), `09c54f5e` (qualify the
+intra-doc link that reds the Docs job).
+
+**"Always created or repaired" — verified already true, no production change.**
+
+Recon on the existing machinery, then probes, then pinned tests, show the declared
+object index reaches `is_current == true` with no operator action in every
+constructible shape:
+
+- **Created:** all three registration paths — eager `SparqlEngine::new`, lazy
+  `ensure_table_registered`, and a node opening over pre-existing SSTables.
+- **Repaired after a failure:** `mark_failed_as` stamps `retry_at = now + 60s`,
+  `take_due_retries` refuses it before then, and `resubmit_backfill` re-drives it;
+  a later success clears pending via `mark_indexed` → `recompute_status` → `Current`.
+  The healer runs every compaction tick (`ferrosa/src/maintenance.rs`,
+  `heal_secondary_index_backfills`).
+- **Repaired after an interruption:** a half-written sidecar is not trusted —
+  completion is decided by the tracker's `indexed_sstables`, never by a file
+  existing on disk — because the boot tracker starts empty and the declaration
+  marks the generation pending regardless of what is on disk.
+- **No silent degradation:** a failing build is named (table, index, sstable) in
+  `publish_index_backfill_status`, in the gauges, and in an ERROR log line, while
+  the object-bound read keeps returning correct rows by scanning.
+
+Pinned by the four cases added in `test(sparql): pin that the graph object index
+converges...` plus `a_failed_clustering_index_backfill_converges_through_the_retry`
+in `ferrosa-storage`.
+
+**Two findings, recorded rather than fixed here:**
+
+1. Every boot re-marks every live generation of every declared clustering index
+   pending and rebuilds it. Idempotent and correct — and it is precisely the
+   mechanism that makes repair unconditional. It is also wasteful.
+2. `ferrosa-ctl index rebuild` resolves **partition-key** indexes only and refuses
+   the rest, so for a clustering-column index (this one) the healer retry is the
+   *only* repair that exists. Pinned on a clustering index deliberately, not
+   reused from the existing cell-index case.
+
+**Gates on the final head** (`62f0c476`): fmt 0, clippy 0 findings, docs 0 errors,
+`ferrosa-sparql` 173 passed / 0 failed, `ferrosa-storage` 2045 passed / 0 failed,
+`ferrosa-cluster` 1764 passed / 0 failed.
