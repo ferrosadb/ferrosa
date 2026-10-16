@@ -1284,7 +1284,8 @@ impl WritePath {
     /// turns the window between a declaration and its completed build into a
     /// failed read, where the scan below would have returned the right rows.
     ///
-    /// Resolved from the same handle [`declares_index_locally`] and
+    /// Resolved from the same handle
+    /// [`declares_index_locally`](Self::declares_index_locally) and
     /// [`index_read_stream`](Self::index_read_stream) use, so the three cannot
     /// disagree about which engine's index this is.
     pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
