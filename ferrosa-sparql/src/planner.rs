@@ -30,15 +30,49 @@ pub struct TripleScope {
     /// Selects the `rdf_triples` TABLE. Comes from the caller's keyspace.
     pub keyspace: String,
     /// The graph component of the partition key. Comes from the SPARQL graph
-    /// name — `"default"` for the default graph, the IRI for a named graph.
+    /// name — the default graph's storage component for the default scope, the
+    /// IRI for a named graph.
     pub graph: String,
+    /// Whether a scan must ISOLATE this scope's graph — skip every partition
+    /// whose graph component differs from `graph`.
+    ///
+    /// True for the deployed engine's scopes and for explicit `GRAPH <iri>`
+    /// blocks. False only for scopes built by [`Self::new`], whose callers (the
+    /// planner-direct invariant suites) read the table without graph isolation;
+    /// keeping the default there is what lets those suites stay green while the
+    /// served path isolates graphs.
+    pub isolated_graph: bool,
 }
 
 impl TripleScope {
+    /// A scope that reads the table without isolating a graph.
+    ///
+    /// Used by callers that address a table directly (the planner-direct
+    /// invariant suites). The served path builds [`Self::isolated`] scopes.
     pub fn new(keyspace: impl Into<String>, graph: impl Into<String>) -> Self {
         Self {
             keyspace: keyspace.into(),
             graph: graph.into(),
+            isolated_graph: false,
+        }
+    }
+
+    /// A scope whose scans are isolated to `graph`'s partitions.
+    pub fn isolated(keyspace: impl Into<String>, graph: impl Into<String>) -> Self {
+        Self {
+            keyspace: keyspace.into(),
+            graph: graph.into(),
+            isolated_graph: true,
+        }
+    }
+
+    /// Re-scope an existing scope onto a named graph, keeping its keyspace and
+    /// isolating the new graph.
+    pub fn with_isolated_graph(&self, graph: impl Into<String>) -> Self {
+        Self {
+            keyspace: self.keyspace.clone(),
+            graph: graph.into(),
+            isolated_graph: true,
         }
     }
 }
@@ -375,6 +409,36 @@ fn collect_ops(
                 left, scope, ops, projection, limit, offset, distinct, order_by, filters,
             )?;
             tracing::warn!("OPTIONAL (LeftJoin) right side not yet evaluated");
+        }
+        GraphPattern::Graph { name, inner } => {
+            // `GRAPH <iri> { … }` re-scopes its inner patterns onto that named
+            // graph. The storage already keys rows by (graph, subject), so a
+            // subject-bound pattern inside the block becomes a graph-isolated
+            // point read; graph-isolated scans skip every other graph's
+            // partitions. A variable graph is not addressable.
+            match name {
+                NamedNodePattern::NamedNode(n) => {
+                    let inner_scope = scope.with_isolated_graph(n.as_str());
+                    collect_ops(
+                        inner,
+                        &inner_scope,
+                        ops,
+                        projection,
+                        limit,
+                        offset,
+                        distinct,
+                        order_by,
+                        filters,
+                    )?;
+                }
+                NamedNodePattern::Variable(v) => {
+                    return Err(SparqlError::Plan(format!(
+                        "GRAPH ?{} (variable-bound graph read) is not supported: name the \
+                         graph with an IRI",
+                        v.as_str()
+                    )));
+                }
+            }
         }
         _ => {
             return Err(SparqlError::Plan(format!(
