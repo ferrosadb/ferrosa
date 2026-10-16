@@ -301,6 +301,10 @@ jobs:
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
             -E 'not binary(accord_apply_decode_residency)' \
+            # The real-process cluster harnesses are their own step below: each
+            # spawns three node processes, and inside this ~9,650-test run one of
+            # them can be starved for its whole readiness budget.
+            -E 'not binary(~_process)' \
             -- --skip ::slow:: --skip accord::perf --skip conflict_index_residency_projection_absolute \
                --skip apply_writeset_peak_stays_within_the_input_size \
                --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
@@ -325,6 +329,19 @@ jobs:
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
+
+      - name: Run the real-process cluster harnesses (isolated)
+        # Each of these spawns THREE real `ferrosa` node processes and asserts on
+        # leader election, snapshot barriers and restart repair. Measured 5/5 green
+        # locally in 13-23 s each, but inside the ~9,650-test run above a node can be
+        # starved for its entire 90 s readiness budget and never bind its listener --
+        # indistinguishable from a hang from the outside, so no harness-side budget
+        # rule can tell the two apart, and lengthening the budget would only mask it.
+        # The step above excludes these binaries; this one gives them the machine.
+        run: |
+          cargo nextest run --all-features --workspace --lib --tests \
+            --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+            -E 'binary(~_process)'
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
