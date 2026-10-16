@@ -1,10 +1,14 @@
 ---
 crate: ferrosa-graph
 doc: data-flow
-last_updated: 2026-06-19
+last_updated: 2026-10-15
 ---
 
 # ferrosa-graph — Data Flow
+
+> Updated 2026-10-15 against `origin/main` (commit `9e32e82a`, release v0.22.3).
+> The read path now reflects the streaming entry points, incremental aggregation,
+> and external-sort spill; see [overview.md](overview.md) for the module map.
 
 Two paths matter for understanding the crate: a **read** (a Cypher `MATCH` that
 expands through the adjacency index) and a **write** (an edge create that keeps
@@ -22,19 +26,20 @@ scans the edge table to traverse.
 ```mermaid
 sequenceDiagram
     participant C as Client (HTTP 7474 / Bolt 7687)
-    participant E as GraphEngine.execute
+    participant E as GraphEngine.execute_stream_with_params
     participant P as parser + planner
     participant A as auth (check_permission)
-    participant X as expand executor
+    participant X as expand executor (streaming)
     participant W as WritePath (ferrosa-cluster)
     participant S as StorageEngine
 
-    C->>E: Cypher MATCH ... RETURN b.name
-    E->>P: parse + bind params
-    P->>A: validate: resolve labels, authorize (Select)
+    C->>E: Cypher MATCH ... RETURN count(b)
+    E->>E: parse + bind_statement_params; FOREACH / CALL {} materialized
+    E->>P: validate: resolve labels, authorize (Select)
+    P->>A: check_permission (per statement)
     A-->>P: ok (AuthContext permits)
-    P->>P: logical plan then physical Expand plan
-    E->>X: execute(Expand, keyspace, config)
+    P->>P: logical plan then physical plan (Expand / Aggregate)
+    E->>X: execute_streaming_owned -> execute_streaming_inner
     X->>W: range_read_stream_all(Person)  %% anchor scan, lazy
     W->>S: pull one anchor partition
     S-->>X: anchor rows (filter name='alice'), one partition at a time
@@ -43,21 +48,40 @@ sequenceDiagram
         W->>S: read adjacency partition
         S-->>X: neighbor_id rows (capped by max_fan_out_per_hop)
         X->>W: read(Person, key=neighbor_id)  %% hydrate b
-        W-->>X: b row then row_to_json
+        W-->>X: b row
     end
-    X-->>E: GraphResult (rows, columns, QueryStats)
-    E-->>C: JSON / Bolt RECORD stream
+    Note over X: aggregate folds rows incrementally (per-group state, bounded by max_groups);<br/>ORDER BY + LIMIT spills to disk when over the memory budget
+    X-->>E: RowStream (columns, rows, QueryStats)
+    E-->>C: streamed JSON body / Bolt RECORD stream
 ```
 
-Notes: the anchor is **streamed** with `range_read_stream_all` — a partition
-that fails the anchor predicates is dropped before the next is read, so an
-unanchored `MATCH` costs one partition of memory rather than the whole table
-(t_bc5f0e6f). Each hop reads the adjacency index for
-`(direction, edge_label, neighbor_id)`. Limits (`max_fan_out_per_hop`,
-`max_result_rows`, `query_timeout`, and `max_var_path_visited` for `[*]`) bound
-cost. Because traversal reads the index rather than the edge table, an
+Notes: the entry point is `execute_stream_with_params`, which first expands and
+**materializes** `FOREACH` and `CALL {}` (engine.rs:976, 982) before a single
+statement flows through `execute_statement_streaming` → `validate` → `plan` →
+`execute_streaming_owned` (engine.rs:1016, executor/expand.rs:280). The anchor is
+**streamed** with `range_read_stream_all` — a partition that fails the anchor
+predicates is dropped before the next is read, so an unanchored `MATCH` costs one
+partition of memory rather than the whole table (t_bc5f0e6f). Each hop reads the
+adjacency index for `(direction, edge_label, neighbor_id)`. Limits
+(`max_fan_out_per_hop`, `max_result_rows`, `query_timeout`, and
+`max_var_path_visited` for `[*]`) bound cost. Aggregation does **not** materialize
+its input: `execute_aggregate` (executor/expand.rs:6046) folds each row into
+per-group `Accumulator`s, so `RETURN count(n)` keeps state proportional to the
+number of groups (bounded by `config.max_groups`), not the input row count.
+`ORDER BY` (with optional `LIMIT`) spills to disk via `executor::spill`
+(spill.rs:303). Because traversal reads the index rather than the edge table, an
 adjacency-index desync (FMEA G-1/G-2) shows up here as **missing rows, not an
 error** — which is exactly why the consistency invariant below matters.
+
+### Measured read-path cost (2026-10-15)
+
+On a local development cluster on 2026-10-15 (v0.22.3, `9e32e82a`):
+`MATCH (n:Entity) RETURN count(n)` returned 105,873 in 5.88 s and
+`MATCH (n:Fold) RETURN count(n)` returned 1,784 in 0.17 s — roughly linear per
+returned row. The aggregate node is not the cost (it folds incrementally,
+executor/expand.rs:6046); the dominant cost is in the scan/hydration path, though
+these numbers do not attribute its cause. See [overview.md](overview.md) Open
+Questions.
 
 ## 2. Write: an edge create keeping the adjacency index consistent
 

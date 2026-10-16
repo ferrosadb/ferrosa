@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-graph
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-10-15
 executive_summary: >
   The property-graph query engine for ferrosa. Parses Cypher, authorizes it
   against the schema, plans and executes traversals over data stored in ordinary
@@ -13,6 +13,12 @@ executive_summary: >
 ---
 
 # ferrosa-graph — Architecture Overview
+
+> Updated 2026-10-15 against `origin/main` (commit `9e32e82a`, release v0.22.3).
+> Documented the streaming query entry points (`execute_stream_with_params` →
+> `execute_statement_streaming` → `execute_streaming_owned`/`execute_streaming`),
+> streaming aggregation, and external-sort spill; refreshed the module line
+> counts. See [data-flow.md](data-flow.md) for the full sequence.
 
 ## Purpose & boundary
 
@@ -43,29 +49,45 @@ resolved Bolt port.
 
 | Module | Responsibility |
 |--------|----------------|
-| `parser` (`lexer`, `token`, `ast`, `parse_impl`, ~4.4k LoC) | Cypher lexing + recursive-descent parse to `Statement` AST |
-| `planner::logical` (~595 LoC) | label→table resolution, property validation, **per-statement authorization** (`check_permission`) |
-| `planner::physical` (~2.7k LoC) | anchor selection; `Expand` / `ExpandVarLength` / `Create` / `Merge` / `Subscribe` / `Union` plans |
-| `executor::expand` (~7.2k LoC) | anchor lookup, per-hop adjacency reads, eval, aggregation, write clauses, DoS limits |
+| `parser` (`lexer`, `token`, `ast`, `parse_impl`, ~4.5k LoC) | Cypher lexing + recursive-descent parse to `Statement` AST |
+| `planner::logical` (~610 LoC) | label→table resolution (`resolve_label`, `graph.label`, case-insensitive; logical.rs:66), property validation, **per-statement authorization** (`check_permission`, logical.rs:110) |
+| `planner::physical` (~2.7k LoC) | anchor selection; `plan` entry (physical.rs:282) and `plan_match` (physical.rs:1349); `Expand` / `ExpandVarLength` / `Aggregate` (physical.rs:179) / `WcoJoin` / `MergeUpsert` / `Create` / `Subscribe` / `Union` plans |
+| `executor::expand` (~9.8k LoC) | streaming dispatch hub: `execute_streaming` (expand.rs:207) / `execute_streaming_owned` (expand.rs:280) → `execute_streaming_inner` (expand.rs:371); anchor lookup, per-hop adjacency reads, eval, aggregation, write clauses, DoS limits |
+| `executor::aggregate` | incremental `Accumulator` framework (aggregate.rs:11) for `count`/`sum`/`avg`/`min`/`max`/`collect` — folds row by row, no materialization of the input |
+| `executor::spill` | external-sort spill for `ORDER BY` (+ `LIMIT`): streams the smallest rows in order, bounds sort memory (spill.rs:303) |
 | `executor::varpath` + `leapfrog` | variable-length `[*min..max]` BFS with visited-set + vertex budget |
-| `executor::aggregate` | `count`/`sum`/`avg`/`min`/`max`/`collect` accumulators with caps |
 | `executor::eval` | expression evaluation, WHERE filtering, partition→JSON |
 | `executor::subscribe` | per-connection `SubscriptionRegistry` (cap enforcement) |
-| `adjacency::schema` | adjacency table metadata + keyspace naming + direction constants |
-| `adjacency::observer` | `AdjacencyIndexObserver` — synchronous index maintenance on edge writes |
+| `adjacency::schema` | adjacency table metadata + keyspace naming (`system_graph_<ks>`, schema.rs:49) + direction constants |
+| `adjacency::observer` | `AdjacencyIndexObserver` — synchronous (`ObserverMode::Sync`, observer.rs:42) index maintenance on edge writes |
 | `adjacency::reconcile` | background safety-net scan (repair missing, tombstone orphans) |
-| `engine` (~3.2k LoC) | composition root: orchestrates parse→plan→exec, lazy adjacency setup, FOREACH / CALL {} expansion, DDL coordinators |
-| `http` | axum HTTP/JSON endpoint, Basic auth, TLS, body limit, SSE for SUBSCRIBE |
+| `engine` (~3.6k LoC) | composition root: `execute_with_params` (engine.rs:929) / `execute_stream_with_params` (engine.rs:968) → `execute_statement_streaming` (engine.rs:1016); orchestrates parse→plan→exec, lazy adjacency setup, FOREACH / CALL {} expansion, DDL coordinators |
+| `http` | axum HTTP/JSON endpoint (POST `/graph/query`, http.rs:1002), Basic auth, TLS, body limit, streamed JSON response body (http.rs:660), SSE for SUBSCRIBE |
 | `bolt` | Bolt v5 handshake, PackStream codec (nesting depth capped at 128, counts validated against remaining input), message dispatch, TCP server |
 
 ## Data flow (summary)
 
-**Query path:** `execute_with_params` → `parse` → `bind_statement_params` →
-(FOREACH / CALL {} expanded by the engine) → `validate` (resolve labels +
-authorize) → `plan` → `execute`. Anchor partitions are **streamed** via
+**Query path:** a transport calls `GraphEngine::execute_stream_with_params`
+(engine.rs:968). It binds params, then expands the two orchestration forms
+first — `FOREACH` (engine.rs:976) and `CALL {}` (engine.rs:982) — each
+materialized. A single statement then runs through `execute_statement_streaming`
+(engine.rs:1016): lazy adjacency setup when the statement needs it
+(`statement_requires_adjacency` / `ensure_adjacency_ready`, engine.rs:1022) →
+`validate` (resolve labels + authorize, planner/logical.rs:145) → `plan`
+(planner/physical.rs:282) → `execute_streaming_owned` (executor/expand.rs:280),
+which calls straight through to `execute_streaming` → `execute_streaming_inner`
+(executor/expand.rs:207, 371) — one dispatch, no second executor. The result is
+`(columns, RowStream<'static>, QueryStats)`; the HTTP transport writes the row
+stream straight into the response body (`Body::from_stream`, http.rs:660) and
+Bolt streams records the same way. Anchor partitions are **streamed** via
 `WritePath::range_read_stream_all` — one partition per pull, never the whole
 table at once (t_bc5f0e6f); each hop reads `system_graph_<ks>.adjacency` to find
-neighbors; results are evaluated/aggregated/sorted into a `GraphResult`.
+neighbors. **Aggregation is incremental:** `execute_aggregate`
+(executor/expand.rs:6046) streams its inner plan and folds each row into per-group
+`Accumulator`s, so `count()` memory is proportional to the number of groups
+(bounded by `config.max_groups`), never to the input row count. `ORDER BY` (with
+optional `LIMIT`) spills to disk through `executor::spill` when the sort would
+exceed the memory budget.
 
 **Write path:** a `CREATE`/`MERGE`/`SET`/`DELETE` plan writes the edge/vertex row
 through `WritePath`. Because the `AdjacencyIndexObserver` is registered on the
@@ -115,6 +137,28 @@ full sequence.
    via the same path as a typed traversal. Missing/unresolvable endpoint metadata
    is **fail-loud** (a `400`, naming the edge + missing key), never a null
    endpoint — so a mis-declared edge is exposed, not silently empty.
+
+## Measured query-path behaviour
+
+Measurements taken on a local development cluster on 2026-10-15 (v0.22.3,
+`9e32e82a`) — stated as observed results, not as mechanism:
+
+- `MATCH (n:Entity) RETURN count(n)` returned 105,873 in 5.88 s.
+- `MATCH (n:Fold) RETURN count(n)` returned 1,784 in 0.17 s.
+- An unlabelled `MATCH (n) RETURN count(n)` is rejected immediately as invalid.
+
+Cost is roughly linear per returned row, so the dominant cost sits in the
+scan/hydration path rather than in the aggregate node — consistent with
+`execute_aggregate` folding rows incrementally with memory proportional to group
+count, not input size (executor/expand.rs:6046). The *cause* of the per-row scan
+cost is not established by these numbers; see Open Questions.
+
+## Open Questions
+
+- [ ] What dominates the per-row cost in the scan/hydration path (≈5.88 s for
+  105,873 rows vs ≈0.17 s for 1,784)? The measurement shows linear per-row cost
+  but does not attribute it — a profile of the anchor-scan/hydration path is
+  required before naming a mechanism.
 
 ## Position in the dependency graph
 
