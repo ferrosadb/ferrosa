@@ -64,6 +64,23 @@ debug = 2
 split-debuginfo = "off"
 strip = "none"
 
+# Password KDFs (bcrypt/argon2) compile unoptimised in dev and test builds,
+# which made one cost-12 hash cost ~1080 ms instead of ~150 ms. Node boot hashes
+# the three seed-role passwords before it reports readiness, so that cost
+# dominated a fresh node's boot, and CPU contention (a shared CI runner, the full
+# ~9,700-test suite) stretched it past the readiness budget the cluster harnesses
+# allow. Optimising the KDF crates changes only their speed: algorithm, cost
+# factor and hash format are untouched, and
+# `ferrosa-schema/tests/password_hash_boot_cost.rs` asserts exactly that.
+[profile.dev.package.bcrypt]
+opt-level = 3
+
+[profile.dev.package.blowfish]
+opt-level = 3
+
+[profile.dev.package.argon2]
+opt-level = 3
+
 [workspace.package]
 version = "0.23.0"
 edition = "2021"

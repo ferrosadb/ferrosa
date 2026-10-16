@@ -358,8 +358,9 @@ async fn pg_ddl_create_table_key_mapping_and_if_not_exists() {
 }
 
 /// T-161a lifted the jsonb refusal: `jsonb` and `json` (stored as jsonb, D11)
-/// columns create a CQL `jsonb` column. Standalone-vs-cluster gating (T-300) is
-/// `pg_ddl_create_table_jsonb_refused_off_standalone`.
+/// columns create a CQL `jsonb` column. The T-300 mode gate is REMOVED, so such
+/// DDL is permitted off a standalone node too — see
+/// `pg_ddl_create_table_jsonb_is_permitted_off_standalone`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pg_ddl_create_table_jsonb_and_json_create_jsonb_columns() {
     let fx = start().await;
@@ -375,40 +376,25 @@ async fn pg_ddl_create_table_jsonb_and_json_create_jsonb_columns() {
     assert_eq!(types, vec![("id", "int"), ("a", "jsonb"), ("b", "jsonb")]);
 }
 
-/// T-300 (D24) on the PG path (t_57fa8a9e): off a standalone node, a jsonb or
-/// json column is refused with `0A000` naming the mode and the D15a ledger, and
-/// nothing is created. A table with no jsonb column is unaffected.
+/// T-300 gate REMOVED (t_57fa8a9e): off a standalone node a jsonb or json
+/// column is still created as a CQL `jsonb` column — there is no mode gate.
+/// The surviving constraint is the T-154a placement rule (see the PRIMARY KEY
+/// case below).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn pg_ddl_create_table_jsonb_refused_off_standalone() {
+async fn pg_ddl_create_table_jsonb_is_permitted_off_standalone() {
     let fx = start().await;
     fx.schema
         .set_deployment_mode(ferrosa_common::deployment_mode::DeploymentMode::Cluster);
-    for sql in [
-        "CREATE TABLE g (id int PRIMARY KEY, doc jsonb)",
-        "CREATE TABLE g (id int PRIMARY KEY, doc json)",
-    ] {
-        let error = fx
-            .client
-            .batch_execute(sql)
-            .await
-            .expect_err("jsonb DDL is refused in cluster mode");
-        let db = error.as_db_error().expect("db error");
-        assert_eq!(db.code().code(), "0A000", "{sql}: {}", db.message());
-        assert!(
-            db.message().contains("D15a"),
-            "names the ledger requirement: {}",
-            db.message()
-        );
-    }
-    assert!(!fx
-        .schema
-        .snapshot()
-        .tables
-        .contains_key(&("public".to_string(), "g".to_string())));
     fx.client
-        .batch_execute("CREATE TABLE plain (id int PRIMARY KEY, v text)")
+        .batch_execute("CREATE TABLE g (id int PRIMARY KEY, doc jsonb, j json)")
         .await
-        .expect("non-jsonb DDL is unaffected by the jsonb gate");
+        .expect("jsonb DDL is permitted off a standalone node");
+    let cols = columns_of(&fx.schema, "g");
+    let types: Vec<(&str, &str)> = cols
+        .iter()
+        .map(|(n, _, _, t)| (n.as_str(), t.as_str()))
+        .collect();
+    assert_eq!(types, vec![("id", "int"), ("doc", "jsonb"), ("j", "jsonb")]);
 }
 
 /// T-154a (D3): jsonb in a PRIMARY KEY column is refused with `42P16`

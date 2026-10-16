@@ -74,14 +74,6 @@ pub enum SchemaError {
         column: String,
         rule: ferrosa_common::cql_type::names::JsonbNestingError,
     },
-    /// jsonb DDL on a node that is not standalone: refused until the D15a
-    /// capability ledger lands (T-300, D24). `subject` names what was refused.
-    JsonbDdlRefused {
-        mode: ferrosa_common::deployment_mode::DeploymentMode,
-        subject: String,
-        /// D32: which members lack jsonb, or that the view could not be read.
-        reason: crate::jsonb_rules::JsonbDdlRefusal,
-    },
 }
 
 impl fmt::Display for SchemaError {
@@ -156,11 +148,6 @@ impl fmt::Display for SchemaError {
                 column,
                 rule,
             } => write!(f, "column '{column}' of {keyspace}.{table}: {rule}"),
-            Self::JsonbDdlRefused {
-                mode,
-                subject,
-                reason,
-            } => write!(f, "jsonb DDL refused ({subject}) in {mode} mode: {reason}"),
         }
     }
 }

@@ -143,10 +143,6 @@ impl ModeController {
         //
         // Callers hold `transition_guard`, so the mode cannot change between
         // this check and the commit below.
-        // T-300: no departure from standalone while jsonb columns exist.
-        if !self.leaving_standalone_permitted(DeploymentMode::Pair) {
-            return;
-        }
         let current = **self.mode.load();
         if !operator_override && !current.can_transition_to(DeploymentMode::Pair) {
             tracing::error!(

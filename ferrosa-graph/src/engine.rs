@@ -219,6 +219,7 @@ fn statement_requires_adjacency(statement: &Statement) -> bool {
         Statement::Unwind {
             expr,
             with_pipeline,
+            write,
             return_clause,
             ..
         } => {
@@ -226,6 +227,7 @@ fn statement_requires_adjacency(statement: &Statement) -> bool {
                 || with_pipeline
                     .as_ref()
                     .is_some_and(with_pipeline_requires_adjacency)
+                || write.as_deref().is_some_and(statement_requires_adjacency)
                 || return_clause_requires_adjacency(return_clause)
         }
         Statement::Union { arms, .. } => arms.iter().any(statement_requires_adjacency),
@@ -257,12 +259,16 @@ fn statement_requires_adjacency(statement: &Statement) -> bool {
             pattern,
             where_clause,
             assignments,
+            return_clause,
         } => {
             pattern.iter().any(pattern_requires_adjacency)
                 || where_clause.as_ref().is_some_and(expr_requires_adjacency)
                 || assignments
                     .iter()
                     .any(|assignment| expr_requires_adjacency(&assignment.value))
+                || return_clause
+                    .as_ref()
+                    .is_some_and(return_clause_requires_adjacency)
         }
         Statement::Remove {
             pattern,
@@ -991,6 +997,18 @@ impl GraphEngine {
                 .await?;
             return Ok(buffered_as_stream(result));
         }
+        if let Statement::Unwind {
+            expr,
+            var,
+            write: Some(inner),
+            ..
+        } = &statement
+        {
+            let result = self
+                .execute_unwind_write(expr, var, inner, keyspace, auth)
+                .await?;
+            return Ok(buffered_as_stream(result));
+        }
         self.execute_statement_streaming(statement, keyspace, auth)
             .await
     }
@@ -1051,6 +1069,64 @@ impl GraphEngine {
             virtual_tables: Some(self.schema.virtual_tables_arc()),
             schema: Some(Arc::clone(&self.schema)),
         }
+    }
+
+    /// Execute `UNWIND <list> AS var <update clause>`: run the update clause once
+    /// per list element, with `var` bound to that element.
+    ///
+    /// Each element is materialized into the clause (the same value-substitution
+    /// the FOREACH and `CALL {}` orchestrators use), which is then validated,
+    /// planned, and executed per iteration, in list order. The rows every
+    /// iteration projects are united, so `UNWIND $rows AS row CREATE (n:L {k:
+    /// row.k}) RETURN 1` yields one row per element and writes all N — no silent
+    /// truncation, and every element writes or the failing element's error
+    /// surfaces.
+    ///
+    /// This is the batch-load path a real Bolt workload uses: the parameterised
+    /// list of maps and the equivalent inline list behave identically, because
+    /// both reach this loop as the same list expression (a parameter binds to the
+    /// expression its JSON value denotes — see `json_param_to_expr`).
+    async fn execute_unwind_write(
+        &self,
+        expr: &Expr,
+        var: &str,
+        inner: &Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<GraphResult> {
+        let list_value = eval_expr(expr, &HashMap::new())
+            .map_err(|e| GraphError::Validation(format!("UNWIND list expression: {e}")))?;
+        let elements = match list_value {
+            Value::Array(items) => items,
+            Value::Null => Vec::new(),
+            other => {
+                return Err(GraphError::Validation(format!(
+                    "UNWIND expects a list expression, got {other}"
+                )));
+            }
+        };
+
+        let mut columns: Option<Vec<String>> = None;
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut stats = QueryStats::default();
+        for element in &elements {
+            let replacement = value_to_expr(element)?;
+            let bound = subst_var_statement(inner.clone(), var, &replacement);
+            let result = self.execute_statement(bound, keyspace, auth).await?;
+            stats.vertices_written += result.stats.vertices_written;
+            stats.vertices_read += result.stats.vertices_read;
+            stats.edges_read += result.stats.edges_read;
+            stats.vertices_deleted += result.stats.vertices_deleted;
+            stats.edges_deleted += result.stats.edges_deleted;
+            set_or_check_columns(&mut columns, &result.columns)?;
+            rows.extend(result.rows);
+        }
+
+        Ok(GraphResult {
+            columns: columns.unwrap_or_default(),
+            rows,
+            stats,
+        })
     }
 
     /// Execute `FOREACH (var IN list | body...)`: run each body update clause
@@ -1423,6 +1499,34 @@ impl Drop for GraphEngine {
     }
 }
 
+/// Convert a query parameter's JSON value into the expression the parameter
+/// stands for.
+///
+/// Scalars become literals; a JSON array becomes a list expression and a JSON
+/// object a map expression, so a structured parameter (e.g. the list of maps a
+/// batch load passes to `UNWIND $rows AS row`) binds to exactly the expression
+/// the equivalent inline literal would produce. Binding only scalars here is what
+/// made `UNWIND $rows` fail while `UNWIND [{...}]` worked.
+fn json_param_to_expr(name: &str, value: &Value) -> Result<Expr> {
+    match value {
+        Value::Null | Value::Bool(_) | Value::String(_) | Value::Number(_) => {
+            json_param_to_literal(name, value).map(Expr::Literal)
+        }
+        Value::Array(items) => Ok(Expr::List(
+            items
+                .iter()
+                .map(|item| json_param_to_expr(name, item))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        Value::Object(map) => Ok(Expr::Map(
+            map.iter()
+                .map(|(key, item)| Ok((key.clone(), json_param_to_expr(name, item)?)))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    }
+}
+/// Convert a scalar query parameter's JSON value into a literal. Callers holding
+/// a possibly-structured value go through [`json_param_to_expr`].
 fn json_param_to_literal(name: &str, value: &Value) -> Result<Literal> {
     match value {
         Value::Null => Ok(Literal::Null),
@@ -1451,7 +1555,7 @@ fn bind_expr_params(expr: Expr, params: &HashMap<String, Value>) -> Result<Expr>
             let value = params.get(&name).ok_or_else(|| {
                 GraphError::Validation(format!("missing required query parameter ${name}"))
             })?;
-            Expr::Literal(json_param_to_literal(&name, value)?)
+            json_param_to_expr(&name, value)?
         }
         Expr::Function { name, args } => Expr::Function {
             name,
@@ -1662,6 +1766,7 @@ fn bind_statement_params(
             expr,
             var,
             with_pipeline,
+            write,
             return_clause,
         } => Statement::Unwind {
             expr: bind_expr_params(expr, params)?,
@@ -1676,6 +1781,9 @@ fn bind_statement_params(
                             .transpose()?,
                     })
                 })
+                .transpose()?,
+            write: write
+                .map(|inner| bind_statement_params(*inner, params).map(Box::new))
                 .transpose()?,
             return_clause: bind_return_clause_params(return_clause, params)?,
         },
@@ -1731,12 +1839,16 @@ fn bind_statement_params(
             pattern,
             where_clause,
             assignments,
+            return_clause,
         } => Statement::Set {
             pattern: bind_patterns_params(pattern, params)?,
             where_clause: where_clause
                 .map(|expr| bind_expr_params(expr, params))
                 .transpose()?,
             assignments: bind_assignments_params(assignments, params)?,
+            return_clause: return_clause
+                .map(|clause| bind_return_clause_params(clause, params))
+                .transpose()?,
         },
         Statement::Remove {
             pattern,
@@ -1856,9 +1968,9 @@ fn statement_is_returning(stmt: &Statement) -> bool {
         | Statement::Union { .. } => true,
         Statement::Create { return_clause, .. } => return_clause.is_some(),
         Statement::Merge { return_clause, .. } => return_clause.is_some(),
+        Statement::Set { return_clause, .. } => return_clause.is_some(),
         Statement::CallSubquery { return_clause, .. } => return_clause.is_some(),
-        Statement::Set { .. }
-        | Statement::Remove { .. }
+        Statement::Remove { .. }
         | Statement::Delete { .. }
         | Statement::Foreach { .. }
         | Statement::Subscribe { .. }
@@ -2135,7 +2247,7 @@ fn value_to_expr(value: &Value) -> Result<Expr> {
                 Expr::Literal(Literal::Float(f))
             } else {
                 return Err(GraphError::Validation(
-                    "FOREACH element number cannot be represented".to_string(),
+                    "number cannot be represented".to_string(),
                 ));
             }
         }
@@ -2349,6 +2461,7 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
             pattern,
             where_clause,
             assignments,
+            return_clause,
         } => Statement::Set {
             pattern: pattern
                 .into_iter()
@@ -2363,6 +2476,7 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
                     value: subst_var_expr(a.value, var, replacement),
                 })
                 .collect(),
+            return_clause: return_clause.map(|rc| subst_var_return_clause(rc, var, replacement)),
         },
         // Nested FOREACH: the inner loop var shadows the outer one inside its body.
         Statement::Foreach {
@@ -2420,6 +2534,7 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
             expr,
             var: unwind_var,
             with_pipeline,
+            write,
             return_clause,
         } => {
             // The UNWIND alias shadows the imported var inside the rest of the query.
@@ -2429,6 +2544,7 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
                     expr,
                     var: unwind_var,
                     with_pipeline,
+                    write,
                     return_clause,
                 }
             } else {
@@ -2437,6 +2553,8 @@ fn subst_var_statement(stmt: Statement, var: &str, replacement: &Expr) -> Statem
                     var: unwind_var,
                     with_pipeline: with_pipeline
                         .map(|wp| subst_var_with_pipeline(wp, var, replacement)),
+                    write: write
+                        .map(|inner| Box::new(subst_var_statement(*inner, var, replacement))),
                     return_clause: subst_var_return_clause(return_clause, var, replacement),
                 }
             }
@@ -2594,6 +2712,7 @@ fn fold_constants_statement(stmt: Statement) -> Result<Statement> {
             pattern,
             where_clause,
             assignments,
+            return_clause,
         } => Statement::Set {
             pattern,
             where_clause,
@@ -2607,6 +2726,7 @@ fn fold_constants_statement(stmt: Statement) -> Result<Statement> {
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
+            return_clause,
         },
         // Read clauses and others: no folding needed (executor evaluates exprs).
         other => other,
@@ -2698,12 +2818,17 @@ fn format_plan(plan: &PhysicalPlan) -> String {
             expand,
             assignments,
             variable_tables,
+            return_clause,
         } => {
             let mut out = String::new();
             out.push_str("SetProperties {\n");
             out.push_str(&format!("  expand: {}\n", format_plan(expand)));
             out.push_str(&format!("  assignments: {}\n", assignments.len()));
             out.push_str(&format!("  variable_tables: {:?}\n", variable_tables));
+            match return_clause {
+                Some(rc) => out.push_str(&format!("  return: {} item(s)\n", rc.items.len())),
+                None => out.push_str("  return: none (status row)\n"),
+            }
             out.push('}');
             out
         }
@@ -3092,6 +3217,100 @@ mod tests {
             0,
             "scalar RETURN must not force lazy adjacency registration for unrelated edge tables"
         );
+    }
+
+    #[test]
+    fn parameter_list_of_maps_binds_to_the_inline_list_expression() {
+        // The parameterised and inline forms must reach the executor as the same
+        // expression, so every downstream behaviour (rows, writes, stats) is
+        // shared rather than re-implemented.
+        let params = HashMap::from([(
+            "rows".to_string(),
+            serde_json::json!([{"id": 1, "k": "t"}, {"id": 2, "k": "u"}]),
+        )]);
+        let bound = bind_statement_params(
+            parse("UNWIND $rows AS row RETURN row.id AS v").unwrap(),
+            &params,
+        )
+        .unwrap();
+        let inline =
+            parse("UNWIND [{id: 1, k: 't'}, {id: 2, k: 'u'}] AS row RETURN row.id AS v").unwrap();
+
+        match (bound, inline) {
+            (Statement::Unwind { expr: bound, .. }, Statement::Unwind { expr: inline, .. }) => {
+                assert_eq!(
+                    bound, inline,
+                    "a list-of-maps parameter must bind to the inline list's expression"
+                )
+            }
+            other => panic!("expected two UNWIND statements, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameter_map_binds_to_the_inline_map_expression() {
+        let params = HashMap::from([(
+            "m".to_string(),
+            serde_json::json!({"name": "Alice", "age": 30}),
+        )]);
+        let bound = bind_statement_params(parse("RETURN $m AS v").unwrap(), &params).unwrap();
+        let inline = parse("RETURN {name: 'Alice', age: 30} AS v").unwrap();
+        // Entry ORDER is not part of the equivalence and cannot be: the parameter
+        // arrives as a JSON object (key-sorted) while an inline literal keeps source
+        // order. A map literal evaluates to the same value either way, so compare the
+        // key/value SET — asserting on order would pin a property the engine never
+        // promised for parameters.
+        match (bound, inline) {
+            (Statement::Return { return_clause: b }, Statement::Return { return_clause: i }) => {
+                assert_eq!(b.items.len(), i.items.len(), "same number of return items");
+                assert_eq!(b.items[0].alias, i.items[0].alias, "same alias");
+                assert_eq!(
+                    sorted_map_entries(&b.items[0].expr),
+                    sorted_map_entries(&i.items[0].expr),
+                    "the bound parameter must carry the inline literal's key/value set"
+                );
+            }
+            other => panic!("expected two RETURN statements, got {other:?}"),
+        }
+    }
+
+    /// The `(key, value)` pairs of a map expression, sorted by key, so two maps with
+    /// the same content compare equal regardless of their entry order.
+    fn sorted_map_entries(expr: &Expr) -> Vec<(String, String)> {
+        match expr {
+            Expr::Map(entries) => {
+                let mut pairs: Vec<(String, String)> = entries
+                    .iter()
+                    .map(|(k, v)| (k.clone(), format!("{v:?}")))
+                    .collect();
+                pairs.sort();
+                pairs
+            }
+            other => panic!("expected a map expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_return_clause_gets_its_parameters_bound() {
+        let params = HashMap::from([("v".to_string(), serde_json::json!("q"))]);
+        let bound = bind_statement_params(
+            parse("MATCH (n:Person) SET n.value = $v RETURN n.value AS v").unwrap(),
+            &params,
+        )
+        .unwrap();
+        match bound {
+            Statement::Set { return_clause, .. } => {
+                let return_clause = return_clause.expect("trailing RETURN");
+                assert_eq!(
+                    return_clause.items[0].expr,
+                    Expr::Property {
+                        var: "n".into(),
+                        name: "value".into()
+                    }
+                );
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
     }
 
     #[test]

@@ -14,30 +14,25 @@
 //! error, never a skipped check (FMEA SCH-T154a-04). Column types are stored
 //! as strings, so this module carries its own tiny type-string reader.
 //!
-//! T-300 (D24) and D32: the capability gate. jsonb DDL is permitted on a
-//! standalone node — no peer can disagree with it — or when every member of the
-//! cluster advertises `CAP_JSONB_V1`, and otherwise refused with a reason that
-//! names the members that lack the capability, or says the member view could not
-//! be read (fail closed). The mode test T-300 shipped was a stand-in for exactly
-//! this check: schema agreement requires every node to understand the schema it
-//! receives, and there was no way to ask whether it does.
+//! T-300 (D24, D32) REMOVED: jsonb is a FIRST-CLASS data type. This module used
+//! to also carry a capability gate that permitted jsonb DDL only on a standalone
+//! node or on a cluster whose every member advertised the jsonb capability bit,
+//! refusing otherwise and naming the members that lacked it. That gate is GONE,
+//! not disabled, and must never be reintroduced: the engine already replicates
+//! graph materialization over Raft, so a column type is not special, and a gate
+//! that can REFUSE a data type is itself the defect. There is no flag, no env
+//! var, no config key and no operator action that can turn jsonb off again.
 //!
-//! Both matches are exhaustive with no wildcard, so a new `DeploymentMode` — or a
-//! new [`JsonbClusterGate`] verdict — does not compile until it has a rule. No
-//! config key, env var or flag bypasses it. The verdict is read from a live cell
-//! the cluster controller publishes; it defaults to `Unknown`, which refuses
-//! outside standalone, so an unpublished or unreadable view is never permissive.
-//! T-154b replaces this with the D15a ledger at the same call sites; that ledger
-//! closes the residual of a member that is DOWN during the DDL and returns later
-//! with an older build.
-//! Last revised: 2026-10-14
-//! Last changed: Mode gate replaced by the capability gate (D32).
+//! What survives is the placement rule above (T-154a, D3, D21): jsonb is refused
+//! where the engine cannot give it a stable key-byte order. That is a property of
+//! jsonb itself, not of the node's mode or its peers' capabilities, so it applies
+//! in every `DeploymentMode` with no capability input.
+//! Last revised: 2026-10-15
+//! Last changed: The jsonb DDL capability gate was REMOVED (T-300, D24, D32).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ferrosa_common::cql_type::names::{check_jsonb_nesting, JSONB_MARSHAL_CLASS};
-use ferrosa_common::deployment_mode::DeploymentMode;
 use ferrosa_common::CqlType;
 
 use crate::error::SchemaError;
@@ -324,304 +319,9 @@ pub fn check_added_columns(
     Ok(())
 }
 
-/// What this node knows about its cluster's ability to understand jsonb (D32).
-///
-/// Published by the cluster controller from the peer capability view and read by the
-/// DDL gate, exactly as the deployment mode is. The default is
-/// [`JsonbClusterGate::Unknown`]: a node that has not been told otherwise refuses
-/// jsonb DDL outside standalone, which is the pre-D32 behaviour, so nothing loosens
-/// by accident.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum JsonbClusterGate {
-    /// The member set, or a member's advertised capabilities, could not be read.
-    /// Fail closed: an unread member is never assumed capable.
-    #[default]
-    Unknown,
-    /// Every member, and this node, advertises jsonb support.
-    Capable,
-    /// These members do not advertise it.
-    Incapable { members: Vec<String> },
-}
-
-/// Why jsonb DDL was refused (D32): each variant names what the operator must change.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum JsonbDdlRefusal {
-    /// The cluster's member capabilities could not be read, so jsonb cannot be shown
-    /// to be safe for every member.
-    ClusterViewUnknown,
-    /// These members do not advertise jsonb support.
-    MembersLackCapability { members: Vec<String> },
-}
-
-impl std::fmt::Display for JsonbDdlRefusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::ClusterViewUnknown => write!(
-                f,
-                "the cluster's member capabilities could not be read, and jsonb requires \
-                 every member to understand it (D15a, ferrosa.jsonb.v1); retry once the \
-                 member set is known"
-            ),
-            Self::MembersLackCapability { members } => write!(
-                f,
-                "these members do not understand jsonb (D15a, ferrosa.jsonb.v1): {}; \
-                 upgrade them first",
-                members.join(", ")
-            ),
-        }
-    }
-}
-
-/// The typed refusal: jsonb DDL on a node in `mode` (T-300, D24, D15a, D32).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JsonbDdlRefused {
-    pub mode: DeploymentMode,
-    pub reason: JsonbDdlRefusal,
-}
-
-impl std::fmt::Display for JsonbDdlRefused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "jsonb DDL is refused in {} mode: {}",
-            self.mode, self.reason
-        )
-    }
-}
-
-impl std::error::Error for JsonbDdlRefused {}
-
-/// The jsonb DDL gate (T-300, D24; superseded by D32).
-///
-/// Permitted when the node is standalone — no peer can disagree with it — or when
-/// every member of the cluster advertises jsonb support. Refused, naming what must
-/// change, when a member does not advertise it or the member view cannot be read.
-/// Both matches are exhaustive on purpose (SCH-T300-01): adding a `DeploymentMode`
-/// variant, or a `JsonbClusterGate` variant, fails to compile until someone decides.
-pub fn jsonb_ddl_permitted(
-    mode: DeploymentMode,
-    cluster: &JsonbClusterGate,
-) -> Result<(), JsonbDdlRefused> {
-    match mode {
-        DeploymentMode::Standalone => Ok(()),
-        DeploymentMode::Pair
-        | DeploymentMode::Forming
-        | DeploymentMode::Cluster
-        | DeploymentMode::DegradedPair
-        | DeploymentMode::DegradedCluster => match cluster {
-            JsonbClusterGate::Capable => Ok(()),
-            JsonbClusterGate::Incapable { members } => Err(JsonbDdlRefused {
-                mode,
-                reason: JsonbDdlRefusal::MembersLackCapability {
-                    members: members.clone(),
-                },
-            }),
-            JsonbClusterGate::Unknown => Err(JsonbDdlRefused {
-                mode,
-                reason: JsonbDdlRefusal::ClusterViewUnknown,
-            }),
-        },
-    }
-}
-
-/// Refusals so far, per mode: the source of `jsonb_ddl_refused_total{mode}`.
-static REFUSED: [AtomicU64; 6] = [
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-    AtomicU64::new(0),
-];
-
-/// Exhaustive slot for [`REFUSED`]; a new mode must be given one.
-fn mode_slot(mode: DeploymentMode) -> usize {
-    match mode {
-        DeploymentMode::Standalone => 0,
-        DeploymentMode::Pair => 1,
-        DeploymentMode::Forming => 2,
-        DeploymentMode::Cluster => 3,
-        DeploymentMode::DegradedPair => 4,
-        DeploymentMode::DegradedCluster => 5,
-    }
-}
-
-/// `jsonb_ddl_refused_total{mode}` for `mode`, since process start.
-pub fn jsonb_ddl_refused_total(mode: DeploymentMode) -> u64 {
-    REFUSED[mode_slot(mode)].load(Ordering::Relaxed)
-}
-
-/// Gate a statement on `subject` (a table, type or column) whose jsonb-ness
-/// is `has_jsonb`. One WARN and one counter tick per refusal (SCH-T300-02).
-fn gate(
-    mode: DeploymentMode,
-    cluster: &JsonbClusterGate,
-    subject: String,
-    has_jsonb: bool,
-) -> crate::Result<()> {
-    if !has_jsonb {
-        return Ok(());
-    }
-    let Err(refused) = jsonb_ddl_permitted(mode, cluster) else {
-        return Ok(());
-    };
-    REFUSED[mode_slot(refused.mode)].fetch_add(1, Ordering::Relaxed);
-    tracing::warn!(
-        mode = %refused.mode,
-        %subject,
-        reason = %refused.reason,
-        "jsonb DDL refused"
-    );
-    Err(SchemaError::JsonbDdlRefused {
-        mode: refused.mode,
-        subject,
-        reason: refused.reason,
-    })
-}
-
-/// True when any of `column_types` is or nests jsonb. An unparseable type is
-/// an error, never a skipped check (SCH-T300-03).
-fn any_jsonb(column_types: &[&str], keyspace: &str, types: &TypeMap) -> crate::Result<bool> {
-    for ty in column_types {
-        let node = parse(ty).map_err(|reason| {
-            SchemaError::InvalidSchema(format!(
-                "type '{ty}' cannot be checked for jsonb placement: {reason}"
-            ))
-        })?;
-        if node_contains_jsonb(&node, keyspace, types) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// The one public gate, shared by the CQL and PG DDL paths: refuse when any of
-/// `column_types` (CQL type strings, e.g. `frozen<list<jsonb>>`, or UDT names
-/// resolved through `types`) is or nests jsonb and `mode` is not standalone.
-pub fn check_jsonb_ddl_allowed(
-    mode: DeploymentMode,
-    cluster: &JsonbClusterGate,
-    keyspace: &str,
-    column_types: &[&str],
-    types: &TypeMap,
-) -> crate::Result<()> {
-    if jsonb_ddl_permitted(mode, cluster).is_ok() {
-        return Ok(());
-    }
-    let has = any_jsonb(column_types, keyspace, types)?;
-    gate(
-        mode,
-        cluster,
-        format!("column types in keyspace {keyspace}"),
-        has,
-    )
-}
-
-/// Gate CREATE TABLE and every apply of a whole table (SCH-T300-02).
-pub fn check_table_ddl_allowed(
-    mode: DeploymentMode,
-    cluster: &JsonbClusterGate,
-    table: &TableMetadata,
-    types: &TypeMap,
-) -> crate::Result<()> {
-    if jsonb_ddl_permitted(mode, cluster).is_ok() {
-        return Ok(());
-    }
-    let tys: Vec<&str> = table
-        .columns
-        .values()
-        .map(|c| c.column_type.as_str())
-        .collect();
-    let has = any_jsonb(&tys, &table.keyspace, types)?;
-    gate(
-        mode,
-        cluster,
-        format!("table {}.{}", table.keyspace, table.name),
-        has,
-    )
-}
-
-/// Gate ALTER TABLE ADD (SCH-T300-02).
-pub fn check_added_columns_ddl_allowed(
-    mode: DeploymentMode,
-    cluster: &JsonbClusterGate,
-    table: &TableMetadata,
-    added: &[ColumnMetadata],
-    types: &TypeMap,
-) -> crate::Result<()> {
-    if jsonb_ddl_permitted(mode, cluster).is_ok() {
-        return Ok(());
-    }
-    let tys: Vec<&str> = added.iter().map(|c| c.column_type.as_str()).collect();
-    let has = any_jsonb(&tys, &table.keyspace, types)?;
-    gate(
-        mode,
-        cluster,
-        format!("ALTER TABLE {}.{} ADD", table.keyspace, table.name),
-        has,
-    )
-}
-
-/// Gate CREATE TYPE and ALTER TYPE ADD: a field that is or nests jsonb
-/// (SCH-T300-04).
-pub fn check_udt_fields_ddl_allowed(
-    mode: DeploymentMode,
-    cluster: &JsonbClusterGate,
-    keyspace: &str,
-    name: &str,
-    fields: &[(String, CqlType)],
-) -> crate::Result<()> {
-    if jsonb_ddl_permitted(mode, cluster).is_ok() {
-        return Ok(());
-    }
-    let has = fields.iter().any(|(_, t)| cql_contains_jsonb(t));
-    gate(mode, cluster, format!("type {keyspace}.{name}"), has)
-}
-
-/// `keyspace.table` of every non-system table that holds jsonb, directly or
-/// through a UDT: what the leaving-standalone refusal names (SCH-T300-05).
-pub fn tables_with_jsonb<'a>(
-    tables: impl IntoIterator<Item = &'a TableMetadata>,
-    types: &TypeMap,
-) -> crate::Result<Vec<String>> {
-    let mut named = Vec::new();
-    for table in tables.into_iter().filter(|t| !t.is_system) {
-        let tys: Vec<&str> = table
-            .columns
-            .values()
-            .map(|c| c.column_type.as_str())
-            .collect();
-        if any_jsonb(&tys, &table.keyspace, types)? {
-            named.push(format!("{}.{}", table.keyspace, table.name));
-        }
-    }
-    Ok(named)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn jsonb_ddl_permitted_only_standalone_unit() {
-        assert!(
-            jsonb_ddl_permitted(DeploymentMode::Standalone, &JsonbClusterGate::Unknown).is_ok()
-        );
-        // D32: a fully capable cluster is permitted too.
-        assert!(jsonb_ddl_permitted(DeploymentMode::Cluster, &JsonbClusterGate::Capable).is_ok());
-        for mode in [
-            DeploymentMode::Pair,
-            DeploymentMode::Forming,
-            DeploymentMode::Cluster,
-            DeploymentMode::DegradedPair,
-            DeploymentMode::DegradedCluster,
-        ] {
-            let e = jsonb_ddl_permitted(mode, &JsonbClusterGate::Unknown)
-                .expect_err("an unread member view is refused");
-            assert_eq!(e.mode, mode);
-            assert!(e.to_string().contains("D15a"));
-        }
-    }
 
     #[test]
     fn reader_parses_nested_generics_and_dimension() {

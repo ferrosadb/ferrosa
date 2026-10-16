@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-cluster
 doc: roadmap
-last_updated: 2026-10-11
+last_updated: 2026-10-15
 ---
 
 # ferrosa-cluster — Roadmap
@@ -33,10 +33,12 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   frame. `frame_bytes` shrinks (test: `region_apply_frame_is_smaller_than_the_inline_capnp_frame`).
   Still to measure on the same 4 GB nodes at N=1e6: `frame_bytes`, `serialize_ms`,
   `fanout_ms`, `max_ack_ms`, peer apply and per-node RSS.
-- **Interim jsonb gate on leaving standalone (T-300, D24).** Transitions out of
-  standalone and non-standalone startup are refused while jsonb columns exist.
-  Follow-ups: show the refusal on `/readyz` (`jsonb_gate_refusing()` is the
-  hook); T-154b replaces the mode rule with the ledger and removes this gate.
+- **Interim jsonb gate on leaving standalone — REMOVED (T-300, D24).**
+  Transitions out of standalone and non-standalone startup are no longer refused
+  on account of jsonb columns: jsonb is a first-class data type and replicates on
+  every topology with no flag. The `/readyz` follow-up is moot, and the T-154b
+  ledger replacement is dropped — the gate was removed as the defect, so there is
+  nothing to surface or replace.
 
 - **Wide-partition scan / write lane isolation (CL-17, t_82052066).** Remote
   unbounded partition pages now use `Lane::Bulk`, leaving `Lane::Data` for

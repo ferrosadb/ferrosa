@@ -1,7 +1,7 @@
 ---
 title: Graph streaming (pull-based) executor — design + increment plan
-status: Proposed
-last_revised: 2026-07-25
+status: Partially implemented
+last_revised: 2026-10-15
 executive_summary: >
   The ferrosa-graph query executor materializes its full result set (and full
   per-hop fan-out) into Vecs, then applies ORDER BY / DISTINCT / LIMIT by
@@ -12,9 +12,11 @@ executive_summary: >
   Schema / Hop / Row per neighbor (defeating the documented "Send is not general
   enough" wall via inline-driven `FuturesUnordered` of borrowed futures, not
   `buffer_unordered`'s `'static` clones). Rows stream to the transport (HTTP
-  chunked, Bolt incremental PULL) so an unbounded hub query cannot OOM. Delivered
-  as 7 behavior-preserving increments, each keeping the existing ~95 integration
-  tests green.
+  chunked, Bolt incremental PULL) so an unbounded hub query cannot OOM. Planned
+  as 7 behavior-preserving increments, each keeping the existing integration tests
+  green; for which have actually landed see the Status table in section 5 (as of
+  2026-10-15: increment 1 and increment 7-HTTP done, increment 2 a scaffold,
+  increment 3 partial, Bolt not started).
 ---
 
 # Graph streaming (pull-based) executor — design + increment plan
@@ -23,7 +25,15 @@ executive_summary: >
 > no per-neighbor data clones, no materialized result sets. Do not hand-build
 > clone/concurrency hacks in the current loop.
 
-## 1. Current model and why it must change
+## 1. Pre-streaming model, and why it had to change
+
+> **Revision note (2026-10-15).** This section describes the model as it stood at
+> the 2026-07-25 revision, which is why its `expand.rs:NNN` references no longer
+> resolve: the file has grown to roughly 9.7k lines and the cited sites moved
+> (`execute` is at `expand.rs:149`, not `:115`; `hydrate_hop_neighbor` is at
+> `:3570`, not `:2595`). It is kept because it is the rationale the streaming work
+> answers. Current entry points and status are in section 5. Line numbers in this
+> section and in section 6b are pinned to the revision named in the header.
 
 `executor::execute()` (`expand.rs:115`) dispatches to `execute_*` fns that each
 build a full `GraphResult { columns, rows: Vec<Vec<Value>>, stats }`
@@ -343,7 +353,7 @@ by the data. The ones that actually scale with graph data:
 |---|---|---|---|
 | `expand.rs:1079` anchor `states` | every anchor partition (**full table scan**) | none | inc 2 — use `WritePath::range_read_stream_all*` (already exists) |
 | `expand.rs:1225` `pairs` collect | one vertex's full adjacency (**hub degree**) | `max_fan_out_per_hop` | inc 3/4 (concurrency+early-stop done; still collects) |
-| `expand.rs:1384-85` `rows`/`result_states` | **entire result set** | `max_result_rows` (silent truncate — see §7) | inc 3 (streamed projection) + inc 7 (HTTP transport) — **done for the HTTP path**; still buffered for Bolt and for ORDER BY / aggregate / DELETE / varpath / leapfrog |
+| `expand.rs:1384-85` `rows`/`result_states` | **entire result set** | `max_result_rows` (silent truncate — see §7) | inc 3 (streamed projection) + inc 7 (HTTP transport) — **done for the HTTP path**; still buffered for Bolt and for ORDER BY / DELETE / varpath / leapfrog. `Aggregate` is NOT in this list — see the correction below |
 | `expand.rs:1328` `kept` (post-filters) | full frontier | none | inc 5 |
 | `expand.rs:471` `next_frontier` (pattern predicate) | BFS frontier | none | inc 5 |
 | `expand.rs:1857` edge-anchored `states` | edge-anchor scan | none | inc 2 |
@@ -352,6 +362,16 @@ by the data. The ones that actually scale with graph data:
 | `engine.rs:910-915` CALL subquery `out_rows` | **outer result + every inner result** (nested-loop join) | none | inc 5 |
 | `http.rs:510` SUBSCRIBE diff | **two full result sets** (previous + current) | none | see §7 — needs a design decision |
 | `stream.rs:69/91` collect bridges | migration scaffolding | caller's | inc 7 — **HTTP no longer collects**; the bridges remain for Bolt, `execute()`, FOREACH/`CALL {}`, and every non-converted variant |
+
+> **Corrected 2026-10-15.** The `Aggregate` variant was listed above as still
+> buffered. It is not. `execute_aggregate` (the `PhysicalPlan::Aggregate` arm of
+> `execute_streaming_inner`, `executor/expand.rs`) streams its inner plan and folds
+> each row as it arrives, keeping only one row per group, so memory is
+> proportional to the number of GROUPS and bounded by `config.max_groups`. The
+> function's own comment records the earlier shape it replaced (buffering every
+> input row and grouping references to all of them, which held the whole input to
+> produce one number). Where the cost of a large `count()` actually goes is an
+> open question — see section 6d.
 
 Note the storage layer already went through this discipline and has a source
 tripwire enforcing it (`ferrosa-cluster/src/write_path.rs` test: *"unbounded local
@@ -386,6 +406,40 @@ Three questions the inventory surfaced, and the answers this work implements:
 
 The through-line: prefer removing a bound over converting it into an error, when
 streaming or spilling makes the bound unnecessary.
+
+## 6d. Measured behaviour (2026-10-15), and what it does NOT establish
+
+Measured against the graph HTTP endpoint on the operator's local development
+cluster (three nodes, release v0.22.3, same keyspace as the sections above):
+
+| Query | Result | Time |
+|---|---|---|
+| `MATCH (n:Entity) RETURN count(n)` | 105,873 | 5.88s |
+| `MATCH (n:Fold) RETURN count(n)` | 1,784 | 0.17s |
+| `MATCH (n) RETURN count(n)` (unlabelled) | rejected immediately as invalid | — |
+
+Two readings, and only one of them is established:
+
+- **Established:** cost is roughly linear in the number of rows scanned
+  (about 55 us/row at 105,873 rows, about 95 us/row at 1,784). The aggregate node
+  is not the source of that cost — see the correction in section 6b.
+- **NOT established:** the mechanism. No profile has been taken at any revision, so
+  every statement about where the per-row time goes (row decoding, per-row
+  `serde_json::Value` construction, adjacency hydration, read-path shape) is a
+  hypothesis. Record it as a question to answer with a measurement, never as a
+  finding.
+
+Questions this raises, in the order they are worth answering:
+
+1. What share of the per-row cost is the executor, and what share is the storage
+   read path underneath it? This needs a profile at a recorded revision.
+2. Is a bare `count(n)` over a label pushable to a server-side aggregate, the way
+   the storage engine's own `SELECT count(*)` is? If so, the graph path need not
+   read rows at all to answer it. Whether the graph executor's storage seam
+   exposes such a call is unverified.
+3. A label resolves to a whole table (`resolve_label` via the `graph.label`
+   extension), so a label scan reads every row of that table. Whether that is
+   avoidable is a schema and planner design question, not a defect.
 
 ## 7. Non-goals / risks
 

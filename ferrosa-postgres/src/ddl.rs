@@ -7,12 +7,12 @@
 //! There is no second path: [`ClusterDdl`] is a thin adapter over `DdlPath`.
 //! Correctness: every refusal is a typed SQLSTATE naming the cause. A type with
 //! no `pg_types` mapping is `42704`; `json`/`jsonb` create a CQL `jsonb` column
-//! (T-161a; `json` is stored as jsonb, D11), gated by `Schema::check_create_table_jsonb` (T-154a key rules plus the T-300
-//! standalone-only rule)
-//! (T-300); nothing is stored under a guessed type.
-//! Last revised: 2026-09-28
-//! Last changed: jsonb refused in PRIMARY KEY columns, 42P16 (T-154a); T-161a lifted the
-//! jsonb/json column refusal (was T-132a).
+//! (T-161a; `json` is stored as jsonb, D11), checked by
+//! `Schema::check_create_table_jsonb` (the T-154a placement rule only — the
+//! T-300 jsonb DDL gate is REMOVED); nothing is stored under a guessed type.
+//! Last revised: 2026-10-15
+//! Last changed: the T-300 jsonb DDL gate was REMOVED, so the propose-side check
+//! is placement-only (T-154a).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -771,15 +771,13 @@ fn refuse_jsonb_primary_key(
 }
 
 /// Map a refusal from `Schema::check_create_table_jsonb` (the propose-side
-/// check: T-154a key placement plus the T-300 standalone-only gate) to its
-/// SQLSTATE (t_57fa8a9e).
+/// jsonb PLACEMENT check, T-154a) to its SQLSTATE (t_57fa8a9e).
 fn schema_refusal(error: &ferrosa_schema::SchemaError) -> BackendMessage {
     use ferrosa_schema::SchemaError;
     let code = match error {
         SchemaError::JsonbInKey { .. } => "42P16",
-        // jsonb nesting that is never allowed, and jsonb DDL outside a
-        // standalone node until the D15a ledger (D24): both unsupported here.
-        SchemaError::JsonbNesting { .. } | SchemaError::JsonbDdlRefused { .. } => "0A000",
+        // A jsonb nesting that is never allowed: unsupported here.
+        SchemaError::JsonbNesting { .. } => "0A000",
         // A column type string we generated ourselves failed to parse.
         SchemaError::InvalidSchema(_) => "XX000",
         // `SchemaError` is `#[non_exhaustive]`, so a wildcard is mandatory here

@@ -2737,10 +2737,11 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         registry.clone(),
     );
 
-    // T-300 (D24, D15a) jsonb startup refusal and the production security gate
-    // now run after the internode listener binds, once a cold-start S3 bootstrap
-    // has restored the schema (see the "deferred object-store boot work" block
-    // below). They are still checked before the node serves data or starts Raft.
+    // The production security gate now runs after the internode listener binds,
+    // once a cold-start S3 bootstrap has restored the schema (see the "deferred
+    // object-store boot work" block below). It is still checked before the node
+    // serves data or starts Raft. (The former T-300 jsonb startup refusal that
+    // ran here is REMOVED: jsonb is a first-class data type.)
 
     // OpenRaft starts only after the controller exists. Install supervision
     // now so a panic can atomically close readiness and CQL data admission
@@ -2835,10 +2836,6 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         net_config.require_tls,
         !ferrosa_schema::auth::bootstrap::admin_password_is_default(&schema),
     );
-    if let Err(refused) = mode_controller.check_startup_jsonb() {
-        tracing::error!(%refused, "FATAL: persisted schema holds jsonb columns outside standalone mode");
-        return Err(refused.into());
-    }
 
     // 7c. The node now holds the state it is required to hold. Open the gate and
     // re-drive any transition a peer requested while it was closed.
@@ -3309,7 +3306,18 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // default. The resolved address is the one passed to the listener.
     let web_config = resolve_web_config(&file_config, &listener_tls_inputs.web);
     tracing::info!(bind_addr = %web_config.bind_addr, "web console bind configured");
-    let web_addr = web::start_web_server(&web_config, web_state).await?;
+    let web_addr = web::start_web_server(&web_config, web_state)
+        .await
+        .map_err(|e| {
+            // Name the listener and the address. The bare
+            // `server error: I/O error: Address already in use` this produced
+            // named neither, so a reader of a red could not tell which of the
+            // node's eight listeners collided -- a port collision read as a hang.
+            format!(
+                "web console listener bind {} failed: {e}",
+                web_config.bind_addr
+            )
+        })?;
     tracing::info!(%web_addr, "web console listening");
 
     // 10. Graph engine — FERROSA_GRAPH_ENABLED env var, then [graph] enabled

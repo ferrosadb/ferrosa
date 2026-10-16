@@ -3,6 +3,8 @@
 > The property-graph query engine for ferrosa: a Cypher endpoint over data
 > stored in ordinary CQL tables, kept traversable by a system-managed
 > adjacency index.
+>
+> Last reviewed 2026-10-15 against `9e32e82a` (v0.22.3).
 
 ## What this crate is
 
@@ -42,22 +44,37 @@ resolved port.
 - **Physical planner** (`planner/physical.rs`) — anchor selection + `Expand` /
   `ExpandVarLength` / `Create` / `Merge` / `Subscribe` / `Union` plans.
 - **Expand executor** (`executor/expand.rs`) — anchor lookup, per-hop adjacency
-  reads, property evaluation, aggregation, write clauses; honors DoS limits
-  (`max_fan_out_per_hop`, `max_result_rows`, `query_timeout`).
+  reads, property evaluation, aggregation, write clauses; honors the DoS limits
+  enforced per operator (`max_fan_out_per_hop`, `query_timeout`, plus
+  `max_groups` / `max_collect_size` / `max_var_path_visited` in aggregation and
+  var-length paths). `max_result_rows` is a deprecated field that no
+  executor path enforces: result truncation was removed and an unbounded
+  `ORDER BY` spills instead (`executor/spill.rs`).
 - **Streaming entry point** (`executor/stream.rs`, `executor/expand.rs`) —
   `execute_streaming()` returns `(columns, RowStream<'a>, QueryStats)`;
   `execute()` is a thin `collect` over it, so there is one executor, not two.
   Streaming today: `Subscribe`, `Union { all: true }` (via `chain_streams`),
-  `ReturnOnly`, and the **Expand projection** — one `project_state` per pull, so
-  `LIMIT k` projects k states instead of projecting everything and truncating.
-  `DISTINCT` composes as `dedup_stream`. SET/REMOVE consume their inner expand
-  as a stream (their own output is one summary row, so it cannot stream). Every
-  other variant computes the buffered `GraphResult` and is wrapped with
-  `stream_from_rows`. `UNION` without `ALL` (whole-result dedup), `ORDER BY`
-  (pipeline breaker), `DELETE` (two passes over the matched rows — validate,
-  then tombstone), `Aggregate`, `WcoJoin`, `ExpandVarLength` and the
-  virtual-table anchor are deliberately excluded. The hop loop is still fully
-  materializing. See `specs/streaming-executor-design.md` §5.
+  `ReturnOnly`, the **Expand projection** — one `project_state` per pull, so
+  `LIMIT k` projects k states instead of projecting everything and truncating —
+  and **`WcoJoin`** (its accumulator already spilled while accumulating; only
+  the final `finish_rows()` pulled the result back into memory, so
+  `leapfrog::execute_wco_join_streaming` now hands back the spill-backed stream
+  of the smallest rows in order). `DISTINCT` composes as `dedup_stream`.
+  SET/REMOVE consume their inner expand as a stream (their own output is one
+  summary row, so it cannot stream). `ORDER BY` on a streamed plan is no longer
+  a whole-result buffer: the spilling external merge sort takes each projected
+  row as it arrives and streams the merged output (`executor/spill.rs`; the
+  Expand tail in `executor/expand.rs`). Every other variant computes the buffered
+  `GraphResult` and is wrapped with `stream_from_rows`: `UNION` without `ALL`
+  (whole-result dedup), `DELETE` (two passes over the matched rows — validate,
+  then tombstone), `ExpandVarLength`, `Unwind`, `Create` / `Merge`, and the
+  virtual-table anchor. `Aggregate` is deliberately **not** in that materializing
+  set: `execute_aggregate` streams its inner plan and folds each row as it
+  arrives, so its memory is proportional to the number of GROUPS (bounded by
+  `config.max_groups`) rather than to the input — a `count(n)` over a billion
+  rows holds group state, not the billion (the buffered form is what used to hold
+  the input). The hop loop is still fully materializing. See
+  `specs/streaming-executor-design.md` §5.
 - **Owned-handle entry point** (`executor/expand.rs`) — `execute_streaming_owned(plan,
   OwnedExecCtx)` returns `(columns, RowStream<'static>, QueryStats)`. Same
   dispatch as `execute_streaming()`, but the handles are owned
@@ -87,8 +104,10 @@ resolved port.
   deliberately when DISTINCT became a streaming dedup; earlier releases returned
   string-repr sorted rows. The set of rows is the same. Add an explicit
   `ORDER BY` if you need a particular order. `DISTINCT` on a variable-length
-  path (`varpath.rs`) still returns sorted order. The dedup set is **unbounded**
-  in memory — a high-cardinality `DISTINCT` can still exhaust it.
+  path (`varpath.rs`) now behaves the same way: it dedups preserving order
+  instead of re-sorting by string representation, so it returns first-seen (BFS
+  discovery) order unless the query names an `ORDER BY`. The dedup set is
+  **unbounded** in memory — a high-cardinality `DISTINCT` can still exhaust it.
 - **Label-agnostic expansion** (`executor/expand.rs`) — traversals may omit the
   relationship type and/or the target-node label (`(a)-[r]->(n)`, `(a)<-[r]-(n)`,
   `-[r:T]->(n)`, `-[r]->(n:L)`). When a hop lacks a plan-time edge or vertex
@@ -104,6 +123,14 @@ resolved port.
 - **Property write encoding** (`executor/expand.rs`) — schema-less CREATE/MERGE
   accept literal values only; a map, list or computed expression returns
   `GraphError::Validation` rather than storing empty bytes (FMEA G-11).
+- **Relationship write keys** (`executor/expand.rs`) — a MERGE relationship's
+  storage key is its endpoints' keys: partition = source vertex key, clustering =
+  destination vertex key (the shape `DELETE` and the hop read reconstruct, and
+  what `find_vertex_match` byte-compares). `execute_merge` threads the raw key
+  bytes the endpoints' own MergeOps resolved by reading, so a relationship merged
+  after a `MATCH` lands on the same key the traversal reads — and a `uuid`
+  key/clustering column receives its 16 raw bytes, not the 36-byte printable
+  form.
 - **Aggregations** (`executor/aggregate.rs`) — `count`, `sum`, `avg`, `min`,
   `max`, `collect`, with `max_groups` / `max_collect_size` caps.
 - **Adjacency index** (`adjacency/`) — `schema` (table layout + naming),
@@ -276,6 +303,26 @@ Should an edge ever lack them (e.g. legacy data, or the referenced vertex table
 was dropped), a label-agnostic expansion **fails loud** with a `400` naming the
 edge and the missing key rather than returning a null endpoint.
 
+## Performance notes
+
+Measured 2026-10-15 on a single-node local development cluster (release build):
+
+| Query | Rows scanned | Wall time |
+|-------|--------------|-----------|
+| `MATCH (n:Entity) RETURN count(n)` | 105,873 | 5.88 s |
+| `MATCH (n:Fold) RETURN count(n)` | 1,784 | 0.17 s |
+
+Both queries return a single aggregate row, so wall time tracks the rows
+**scanned**, not the rows returned: the 105,873-row scan dominates its 1-row
+result, and cost is roughly linear per scanned row across the two. An unlabelled
+`MATCH (n) RETURN count(n)` is rejected at planning time as invalid — a pattern
+needs at least one labelled node to anchor to a table (`planner/physical.rs`).
+
+**Open question.** These are measurements, not a mechanism: what the per-row cost
+is *made of* — anchor scan, per-row projection/hydration, or the streaming fold —
+is not attributed here. A profile, or a scan-versus-return comparison on the same
+label, is what would attribute it.
+
 ## Public API (key entry points)
 
 | Area | Item |
@@ -318,17 +365,19 @@ External: `axum`/`axum-server` (`tls-rustls-no-provider`), `rustls`, `tokio-rust
 
 ## Tests
 
-353 in-crate unit/`tokio` tests plus four integration suites under `tests/`
-(`adjacency_replication.rs`, `graph_http_integration.rs`, `parser_proptest.rs`,
+425 in-crate `#[test]` / `#[tokio::test]` functions plus seven integration
+suites under `tests/` (`adjacency_replication.rs`, `graph_http_integration.rs`,
+`parser_proptest.rs`, `parser_depth.rs` — parser nesting depth,
 `listener_tls.rs` — graph HTTP and Bolt over TLS, plaintext refused,
-`require_tls` without a certificate refuses to start), and
-`adjacency_deploy_heal.rs` — the index damage left by the pre-330a0c29
+`require_tls` without a certificate refuses to start, and
+`graph_range_read_memory_bound.rs` — peak heap must not scale with table size),
+and `adjacency_deploy_heal.rs` — the index damage left by the pre-330a0c29
 reconcile, reproduced with main's own reconcile code, healed before the first
 traversal answers, on one node and across two replicas; its
 `slow::deploy_heal_at_memory_cluster_scale` (feature `slow-tests`) measures
 the heal at the memory cluster's size.
-No `#[ignore]`, no `TODO`/`FIXME` markers in source. Highest coverage:
-`parser/parse_impl.rs` (81), `executor/eval.rs` (47), `executor/expand.rs` (44).
+No `#[ignore]`, no `TODO`/`FIXME` markers in source. Most test functions:
+`parser/parse_impl.rs` (81), `executor/expand.rs` (80), `executor/eval.rs` (47).
 
 ## Specs
 

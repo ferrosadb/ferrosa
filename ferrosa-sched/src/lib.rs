@@ -654,7 +654,11 @@ fn scan_carrier() -> &'static tokio::runtime::Runtime {
             .worker_threads(1)
             .max_blocking_threads(scan_carrier_capacity())
             .thread_name("ferrosa-scan")
-            .enable_time()
+            // enable_all, not enable_time: a blocking task on this pool does IO
+            // (scan producers reach sockets and the object store), and a carrier
+            // without the IO driver panics such a task with "IO is disabled",
+            // which joins as JoinError::Panic and fails the whole scan.
+            .enable_all()
             .build()
             // Fail loud at the first scan: without carrier threads no scan
             // can run at all, and there is no meaningful fallback.
@@ -1378,5 +1382,30 @@ mod tests {
             .and_then(|v| v.parse().ok())
             .expect("headroom value is a number");
         assert!(value >= 1, "global pool headroom is always >= 1 core");
+    }
+
+    /// The scan carrier exists for its blocking pool, but a blocking task on it CAN
+    /// do IO: a scan producer reaches sockets and the object store. A carrier built
+    /// without the IO driver makes such a task panic with "A Tokio 1.x context was
+    /// found, but IO is disabled. Call `enable_io` ...", which joins as
+    /// JoinError::Panic and fails the whole scan for the client.
+    #[test]
+    fn scan_carrier_blocking_tasks_can_create_io_resources() {
+        let rt = scan_carrier();
+        let bound = rt.block_on(async {
+            tokio::task::spawn_blocking(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(async { tokio::net::TcpListener::bind("127.0.0.1:0").await })
+                    .expect("binding inside a blocking task must succeed")
+                    .local_addr()
+                    .is_ok()
+            })
+            .await
+            .expect("a blocking task on the scan carrier must not panic")
+        });
+        assert!(
+            bound,
+            "blocking tasks on the carrier must be able to create IO resources"
+        );
     }
 }

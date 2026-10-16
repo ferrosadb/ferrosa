@@ -94,12 +94,12 @@ high. Entries below reflect gaps found in the code, not hypotheticals.
 |---|---|---|---|---|---|---|---|
 | CQL-T154a-01 | A jsonb placement refusal surfaces as ConfigError (0x2300) or ServerError | Client cannot tell a bad statement from a server fault | 5 | 3 | 2 | 30 | `From<SchemaError>` maps `JsonbInKey` / `JsonbNesting` to `Invalid` (0x2200) naming column and rule; `route_create_table` / `route_alter_table` check before any DDL path. |
 
-## T-300 interim jsonb DDL gate
+## T-300 interim jsonb DDL gate — REMOVED
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
-| CQL-T300-01 | Outside standalone the refusal surfaces as ServerError, or hints at disabling a safety feature | Client retries or bypasses | 5 | 3 | 2 | 30 | `From<SchemaError>` maps `JsonbDdlRefused` to `Invalid` (0x2200); the message names the mode and D15a and offers no bypass. Test: `jsonb_ddl_is_refused_outside_standalone_as_invalid_request`. |
-| CQL-T300-02 | CREATE TYPE with a jsonb field reaches the Raft or pair path on a non-standalone node | Divergent apply | 8 | 2 | 2 | 32 | `route_create_type` calls `check_create_type_jsonb` before any DDL path; ALTER TYPE ADD is refused inside `alter_type_add_field`. |
+| CQL-T300-01 | **REMOVED (obsolete).** A jsonb DDL refusal outside standalone surfaced as a request error. | — (obsolete: the refusal is gone) | 5 | 3 | 2 | 30 | **REMOVED (obsolete), not disabled.** The jsonb capability gate (T-300/D24/D32) was REMOVED from the source tree entirely; jsonb is a first-class data type. The engine ALREADY replicates graph materialization over Raft, so a column type is not special — a gate that could REFUSE a data type was itself the defect. No DDL path can now refuse jsonb for being off standalone. Test renamed to the positive case: `jsonb_ddl_is_permitted_in_every_deployment_mode`. |
+| CQL-T300-02 | **REMOVED (obsolete).** `CREATE TYPE` with a jsonb field was refused on a non-standalone node. | — (obsolete: the refusal is gone) | 8 | 2 | 2 | 32 | **REMOVED (obsolete), not disabled.** The jsonb capability gate was REMOVED, not disabled; a `CREATE TYPE` carrying a jsonb field is now accepted in every deployment mode (standalone, paired and clustered) — the engine already replicates the materialization over Raft. The only surviving jsonb constraint is the placement rule (T-154a, D3): jsonb is still refused as a partition/clustering key, a set element, a map key, or a vector element. |
 
 ## Result cursors (ORDER BY / DISTINCT / function-projection paging)
 

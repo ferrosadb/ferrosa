@@ -141,8 +141,8 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
-| PG-T154a-01 | `CREATE TABLE t (doc jsonb PRIMARY KEY)` accepted or answered with a vague error | jsonb in key bytes, or a client cannot tell why (D3) | 9 | 3 | 2 | 54 | `plan_create_table` refuses jsonb/json in any PRIMARY KEY column with `42P16` naming the column, ahead of the general `0A000` jsonb refusal. `tests/pg_ddl_create_table.rs`. |
-| PG-T154a-02 | The registry's jsonb rules bypassed once the general jsonb refusal lifts (T-300) | jsonb in a key through PG | 9 | 2 | 2 | 36 | `execute_create_table` runs `Schema::check_create_table_jsonb` before the executor; `JsonbInKey` maps to `42P16`, other jsonb refusals to `0A000`. |
+| PG-T154a-01 | `CREATE TABLE t (doc jsonb PRIMARY KEY)` accepted or answered with a vague error | jsonb in key bytes, or a client cannot tell why (D3) | 9 | 3 | 2 | 54 | `plan_create_table` refuses jsonb/json in any PRIMARY KEY column with `42P16` naming the column. This is the surviving placement rule (T-154a, D3); jsonb is a first-class type everywhere else. `tests/pg_ddl_create_table.rs`. |
+| PG-T154a-02 | The registry's jsonb placement rules bypassed on the PG DDL path | jsonb in a key through PG | 9 | 2 | 2 | 36 | `execute_create_table` runs `Schema::check_create_table_jsonb` before the executor; a jsonb key (`JsonbInKey`) maps to `42P16`. This placement rule is the ONLY surviving jsonb DDL constraint (T-154a, D3): the former general refusal off a standalone node (T-300/D24/D32) was REMOVED — jsonb is a first-class data type. |
 
 ## T-161a jsonb on the wire
 
@@ -154,7 +154,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 | PG-T161a-04 | Limits substituted with a default in the PG front end | Operator-set limits silently ignored | 6 | 2 | 3 | 36 | `QueryContext::jsonb_limits` has no default; `main.rs` passes the resolved value. Constructors must name it (compile error otherwise). |
 | PG-T161a-05 | Duplicate keys dropped silently (D6b) | Data differs from input with no trace | 5 | 3 | 3 | 45 | `EdgeLog` writes a `jsonb_duplicate_keys_dropped` warn line per document. Test: `pg_jsonb_literal_and_text_param_round_trip` (last-wins). **Residual:** no counter in this crate. |
 | PG-T161a-06 | jsonb column missing from the catalog or reported with the wrong OID | Drivers pick the wrong codec | 6 | 2 | 2 | 24 | `pg_type_of_column` maps the column to 3802. Tests: `pg_type_and_pg_attribute_report_jsonb_3802`, `pg_jsonb_describe_reports_3802`. |
-| PG-T161a-07 | jsonb DDL allowed in cluster mode before the D15a ledger exists | Cluster nodes disagree about the type | 7 | 1 | 2 | 14 | Mitigated (T-300, t_57fa8a9e): `Schema::check_create_table_jsonb` refuses jsonb DDL off a standalone node with `0A000` before the executor, and schema apply re-checks. Test: `pg_ddl_create_table_jsonb_refused_off_standalone`. |
+| PG-T161a-07 | **REMOVED (obsolete).** jsonb DDL was refused off a standalone node pending a capability ledger. | — (obsolete: the refusal is gone) | 7 | 1 | 2 | 14 | **REMOVED (obsolete), not disabled.** The jsonb capability gate (T-300/D24/D32) was REMOVED from the source tree entirely; jsonb is a first-class data type in every deployment mode and DDL no longer needs a ledger. The only surviving jsonb DDL constraint is the placement rule (T-154a). Test renamed to the positive case: `pg_ddl_create_table_jsonb_is_permitted_off_standalone`. |
 
 ## T-301 jsonb slice acceptance
 

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-schema
 doc: roadmap
-last_updated: 2026-09-17
+last_updated: 2026-10-15
 ---
 
 # ferrosa-schema — Roadmap
@@ -65,29 +65,26 @@ exist in the source — the gaps below come from code review, not grep.
 
 Done: type threading. Remaining: None for T-150.
 
-## T-300 follow-ups
+## T-300 / D24 / D32 — REMOVED
 
-- **D32 done:** the standalone-only mode check is replaced by a capability check.
-  jsonb DDL is permitted on a standalone node, or where every member advertises
-  `CAP_JSONB_V1`; otherwise it is refused, naming the members that lack it. The
-  gate reads a second live cell (`jsonb_cluster_gate_handle()`), defaulting to
-  `Unknown` (refuse outside standalone), and its reason is typed
-  (`JsonbDdlRefusal`). Regression: `tests/jsonb_ddl_gate.rs`.
-- **D32 not done — the verdict is never published.** The cluster controller does
-  not yet compute `JsonbClusterGate` from the peer capability view
-  (`ferrosa-net`'s `peer_capabilities`), so in production a cluster still refuses;
-  and the transition half (`ferrosa-cluster/src/controller/jsonb_gate.rs`) still
-  reads `Unknown` deliberately, keeping leaving-standalone fail-closed.
-- T-154b replaces the capability check with the `ferrosa.jsonb.v1` ledger check at
-  the same call sites. The capability bit is read from LIVE connections, not
-  persisted in the replicated log, so a member that is down during the DDL and
-  later returns with an older build is the residual the ledger closes.
-- `jsonb_ddl_refused_total{mode}` is an in-process counter
-  (`jsonb_rules::jsonb_ddl_refused_total`); exporting it to Prometheus is not
-  wired yet.
+The interim jsonb DDL capability gate (D24, D32, D15a) was REMOVED from the
+source tree, not disabled. jsonb is a first-class data type: it ships standalone,
+paired and clustered with no flag, env var, config key or operator action, and it
+cannot be turned off again. The engine already replicates graph materialization
+over Raft, so a column type is not special; a gate that can refuse a data type is
+itself the defect.
+
+The follow-ups this section used to track are all moot and closed: there is no
+gate verdict to publish, no capability-check call sites to replace with a ledger,
+and no per-refusal counter to export. The surviving jsonb constraint is the
+placement rule (T-154a, D3, D21) — jsonb is refused in partition/clustering keys
+(any depth), as a set element, as a map key and as a vector element. See
+[fmea.md](fmea.md) T-154a.
 
 ## T-154a follow-ups
 
-- T-154b: the `ferrosa.jsonb.v1` capability gate at propose and apply.
+- T-154b: (withdrawn) it proposed a jsonb capability ledger at propose and apply,
+  to replace the interim gate. That gate was REMOVED as the defect, so the ledger
+  replacement is dropped — jsonb needs no ledger.
 - ALTER ... TYPE to or from jsonb is not applied by any path yet (the CQL router
   rejects ALTER TYPE outright), so no rule exists for it here.

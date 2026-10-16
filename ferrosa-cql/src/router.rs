@@ -15653,12 +15653,6 @@ async fn route_create_type(
         fields: resolved_fields,
     };
 
-    // T-300: a field that is or nests jsonb is standalone-only until D15a.
-    // Refused at entry, before any path (direct, pair or Raft) sees it.
-    state
-        .schema
-        .check_create_type_jsonb(&ks, &name, &udt.fields)?;
-
     let ddl_guard = state.ddl_path.load();
     let ddl = &**ddl_guard;
     match ddl {
@@ -22633,69 +22627,54 @@ mod tests {
         }
     }
 
-    /// T-300 (CQL-T300-01): jsonb DDL is InvalidRequest naming the mode and the
-    /// D15a ledger in every non-standalone mode, and allowed when standalone.
+    /// T-300 gate REMOVED (CQL-T300-01): jsonb DDL is permitted in EVERY
+    /// deployment mode with no capability input. The former "refused outside
+    /// standalone, naming the mode and the D15a ledger" rule is gone.
     #[tokio::test]
-    async fn jsonb_ddl_is_refused_outside_standalone_as_invalid_request() {
+    async fn jsonb_ddl_is_permitted_in_every_deployment_mode() {
         use ferrosa_common::deployment_mode::DeploymentMode;
         let (state, _dir) = jsonb_ddl_setup().await;
-        for setup_cql in [
-            "CREATE TABLE ks.t (k int PRIMARY KEY)",
-            "CREATE TYPE ks.u (a int)",
-        ] {
-            let stmt = crate::parser::parse(setup_cql).unwrap();
-            let ctx = RequestContext {
-                auth: &dev_auth(),
-                current_keyspace: &Some("ks".into()),
-                consistency: ConsistencyLevel::One,
-                serial_consistency: None,
-                paging: crate::paging::PagingParams::default(),
-                client_address: String::new(),
-                protocol_version: 4,
-            };
-            route(&state, &ctx, stmt).await.unwrap();
-        }
-        let cases = [
-            "CREATE TABLE ks.j (k int PRIMARY KEY, doc jsonb)",
-            "CREATE TABLE ks.jl (k int PRIMARY KEY, doc list<jsonb>)",
-            "ALTER TABLE ks.t ADD doc jsonb",
-            "CREATE TYPE ks.uj (a jsonb)",
-            "ALTER TYPE ks.u ADD doc jsonb",
-        ];
-        for mode in [
-            DeploymentMode::Pair,
-            DeploymentMode::Forming,
-            DeploymentMode::Cluster,
-            DeploymentMode::DegradedPair,
-            DeploymentMode::DegradedCluster,
-        ] {
-            state.schema.set_deployment_mode(mode);
-            for cql in cases {
-                let err = jsonb_ddl_error(&state, cql).await;
-                assert_eq!(err.error_code(), 0x2200, "{mode} {cql}: {err}");
-                let msg = err.to_string();
-                assert!(
-                    msg.contains("D15a") && msg.contains(&mode.to_string()),
-                    "{msg}"
-                );
-                assert!(!msg.to_lowercase().contains("disable"), "{msg}");
-            }
-        }
-        state.schema.set_deployment_mode(DeploymentMode::Standalone);
-        let ctx = RequestContext {
+        let ks_name: Option<String> = Some("ks".into());
+        let ks_ctx = RequestContext {
             auth: &dev_auth(),
-            current_keyspace: &Some("ks".into()),
+            current_keyspace: &ks_name,
             consistency: ConsistencyLevel::One,
             serial_consistency: None,
             paging: crate::paging::PagingParams::default(),
             client_address: String::new(),
             protocol_version: 4,
         };
-        for cql in cases {
-            let stmt = crate::parser::parse(cql).unwrap();
-            route(&state, &ctx, stmt)
-                .await
-                .unwrap_or_else(|e| panic!("standalone must allow {cql}: {e}"));
+        // A plain table and type to ALTER, created once.
+        for setup in [
+            "CREATE TABLE ks.t (k int PRIMARY KEY)",
+            "CREATE TYPE ks.u (a int)",
+        ] {
+            let stmt = crate::parser::parse(setup).unwrap();
+            route(&state, &ks_ctx, stmt).await.unwrap();
+        }
+        let modes = [
+            DeploymentMode::Standalone,
+            DeploymentMode::Pair,
+            DeploymentMode::Forming,
+            DeploymentMode::Cluster,
+            DeploymentMode::DegradedPair,
+            DeploymentMode::DegradedCluster,
+        ];
+        for (i, mode) in modes.into_iter().enumerate() {
+            state.schema.set_deployment_mode(mode);
+            let cases = [
+                format!("CREATE TABLE ks.j{i} (k int PRIMARY KEY, doc jsonb)"),
+                format!("CREATE TABLE ks.jl{i} (k int PRIMARY KEY, doc list<jsonb>)"),
+                format!("ALTER TABLE ks.t ADD doc{i} jsonb"),
+                format!("CREATE TYPE ks.uj{i} (a jsonb)"),
+                format!("ALTER TYPE ks.u ADD f{i} jsonb"),
+            ];
+            for cql in cases {
+                let stmt = crate::parser::parse(&cql).unwrap();
+                route(&state, &ks_ctx, stmt)
+                    .await
+                    .unwrap_or_else(|e| panic!("{mode}: jsonb DDL must be permitted: {cql}: {e}"));
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-schema
 doc: fmea
-last_updated: 2026-09-17
+last_updated: 2026-10-15
 ---
 
 # ferrosa-schema — FMEA / Known Issues
@@ -65,14 +65,25 @@ aspirations.
 | SCH-T154a-04 | A column type string the checker cannot read is treated as clean | The rule silently not applied | 8 | 2 | 2 | 32 | An unparseable type is `SchemaError::InvalidSchema`, never skipped. |
 | SCH-T154a-05 | ALTER TYPE ADD FIELD jsonb on a UDT a key already uses | jsonb enters a key through the UDT (D21) | 8 | 2 | 3 | 48 | `alter_type_add_field` re-checks every key column against the changed type map and refuses; a jsonb-nesting field type is refused too. |
 
-## T-300 interim jsonb DDL gate (D24, D15a, FM-23)
+## T-300 jsonb DDL capability gate — REMOVED (D24, D32, D15a, FM-23)
+
+The interim jsonb DDL capability gate (T-300, D24, D32, D15a) was REMOVED from
+the source tree, not disabled. jsonb is a first-class data type: it ships
+standalone, paired and clustered with no flag, env var, config key or operator
+action, and it cannot be turned off again. The engine already replicates graph
+materialization over Raft, so a column type is not special; a gate that can
+REFUSE a data type is itself the defect. The gate, its verdict type, its entry
+and apply-time checks, its per-refusal counter and the jsonb-table scan it used
+are gone. Every failure mode it carried is closed; the rows below are re-marked
+REMOVED with the residual risk stated as closed. The only surviving jsonb
+constraint is the placement rule (T-154a, D3, D21) above.
 
 | ID | Failure mode | Effect | S | O | D | RPN | Mitigation |
 |---|---|---|---|---|---|---|---|
-| SCH-T300-01 | A new `DeploymentMode` — or a new `JsonbClusterGate` variant — is added and silently permits jsonb DDL | jsonb replicated without the capability ledger | 9 | 2 | 1 | 18 | `jsonb_ddl_permitted` and `mode_slot` are exhaustive matches with no wildcard on the mode, and the gate match on `JsonbClusterGate` is exhaustive too: neither a new mode nor a new gate verdict compiles until decided. |
-| SCH-T300-07 | The published member view is STALE (a member left, or was upgraded while holding no connection) and jsonb DDL is permitted against it | jsonb replicated to a member that cannot understand it | 9 | 2 | 3 | 54 | The verdict is a live cell the controller republishes on every membership or capability change, and `Unknown` — including "never published" — refuses outside standalone, so a node that cannot see its member set fails closed rather than assuming capability. Residual: a member DOWN during the DDL that returns later with a build predating the bit; that is closed by T-154b's persisted ledger, not by this check. **Freshness (t_d853fa2a):** the per-member read no longer stays stale across a rolling upgrade — `PeerManager::peer_capabilities` returns the newest of the outbound pool's snapshot and the peer's most recent INBOUND handshake, so a member that restarted with a newer build is seen as advertising `CAP_JSONB_V1` without the observer restarting; latest-wins keeps an un-upgraded member seen as lacking, and a member never connected to stays `None` (unknown, never capable). |
-| SCH-T300-02 | jsonb DDL reaches a non-standalone node by a path that skips the entry check (replicated apply, Raft apply, authed and internal create/alter, snapshot apply) | A node without the ledger holds jsonb | 9 | 3 | 2 | 54 | The gate runs at entry (`check_create_table_jsonb`, `check_alter_table_jsonb`, `check_create_type_jsonb`) and again in `create_table[_internal]`, `alter_table[_internal]`, `create_type_internal`, `alter_type_add_field` and `apply_snapshot` (whole snapshot, tables and types, before any of it applies). One WARN and one `jsonb_ddl_refused_total{mode}` tick per refusal. `tests/jsonb_ddl_gate.rs`. |
-| SCH-T300-03 | An unparseable column type is treated as not-jsonb by the gate | The gate silently not applied | 8 | 2 | 2 | 32 | `any_jsonb` returns `InvalidSchema`; never skipped. |
-| SCH-T300-04 | A UDT field that is or nests jsonb, or a column typed by such a UDT, slips past | Nested jsonb outside standalone | 8 | 2 | 2 | 32 | `check_udt_fields_ddl_allowed` on CREATE TYPE / ALTER TYPE ADD; column types resolve UDTs through the type map. |
-| SCH-T300-05 | A node leaves standalone while jsonb columns exist | Cluster with jsonb and no ledger | 9 | 2 | 2 | 36 | `tables_with_jsonb` names the tables; the cluster controller refuses the transition and the process refuses to start (see ferrosa-cluster). |
-| SCH-T300-06 | The scan for jsonb tables fails and is read as "none" | Departure allowed with jsonb present | 9 | 1 | 2 | 18 | `tables_with_jsonb` returns the error; the controller treats it as a refusal (fail closed). |
+| SCH-T300-01 | A new deployment mode or a new gate verdict silently permits jsonb DDL | jsonb replicated "without the capability ledger" | — | — | — | — | **REMOVED (T-300/D24/D32).** The gate and its verdict type were deleted, so no mode/verdict match remains to decide anything and no default can silently permit or refuse jsonb. Residual closed: a column type is no longer gated on deployment shape. |
+| SCH-T300-07 | A stale published member view permits jsonb DDL | jsonb replicated to a member that cannot understand it | — | — | — | — | **REMOVED (t_d853fa2a).** The member-view read that fed the gate was deleted with it. Residual closed: jsonb is first-class, so a member on an older build is no longer a reason to refuse, and graph materialization already replicates over Raft. (The general peer-capability freshness mechanism survives for other capability bits; it no longer serves jsonb.) |
+| SCH-T300-02 | jsonb DDL reaches a non-standalone node by a path that skips the entry check | A node without the ledger holds jsonb | — | — | — | — | **REMOVED.** The entry checks and every apply-time gate call were deleted; each create/alter/type path and `apply_snapshot` now carry only the placement rule. Residual closed: jsonb needs no ledger to replicate. |
+| SCH-T300-03 | An unparseable column type is treated as clean | The rule silently not applied | 8 | 2 | 2 | 32 | **Folded into the placement rule (see SCH-T154a-04).** The placement reader returns `SchemaError::InvalidSchema` for an unreadable type string; never skipped. No gate is involved. |
+| SCH-T300-04 | A UDT field that is or nests jsonb, or a column typed by such a UDT, slips past | Nested jsonb outside standalone | — | — | — | — | **REMOVED.** The UDT-field allow-check and its type-map resolution were deleted. The surviving placement rule still refuses jsonb (or a jsonb-nesting field type) entering a key through a UDT (SCH-T154a-05). |
+| SCH-T300-05 | A node leaves standalone while jsonb columns exist | Cluster with jsonb and no ledger | — | — | — | — | **REMOVED.** Leaving standalone is no longer refused on account of jsonb columns; the departure check and its table scan were deleted with the gate. Residual closed: jsonb replicates on every topology (see ferrosa-cluster). |
+| SCH-T300-06 | A scan for jsonb tables fails and is read as "none" | Departure allowed with jsonb present | — | — | — | — | **REMOVED.** The jsonb-table scan was deleted; nothing reads its result and nothing turns its error into a refusal. Departure is not gated on jsonb, so there is no residual. |

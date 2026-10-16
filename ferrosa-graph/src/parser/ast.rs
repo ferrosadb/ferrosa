@@ -293,11 +293,24 @@ pub enum Statement {
     Return {
         return_clause: ReturnClause,
     },
-    /// `UNWIND expr AS var RETURN ...`
+    /// `UNWIND expr AS var [<update clause>] RETURN ...`
+    ///
+    /// Two shapes:
+    /// - **Projecting** (`write` is `None`): the list is expanded and the trailing
+    ///   `RETURN` projects one row per element.
+    /// - **Writing** (`write` is `Some`): each element is bound to `var` and the
+    ///   contained update clause (`CREATE` / `MERGE` / `SET` / `REMOVE` /
+    ///   `DELETE` / `DETACH DELETE`, with its own optional trailing `RETURN`)
+    ///   runs once per element, in list order. Rows from every iteration are
+    ///   united, so `UNWIND $rows AS row CREATE (n:L {k: row.k}) RETURN 1`
+    ///   yields one row per element. This is the batch-load shape: it is the
+    ///   write-side counterpart of the read-only UNWIND above.
     Unwind {
         expr: Expr,
         var: String,
         with_pipeline: Option<WithPipeline>,
+        /// Update clause executed once per element, with `var` bound to it.
+        write: Option<Box<Statement>>,
         return_clause: ReturnClause,
     },
     Union {
@@ -316,11 +329,17 @@ pub enum Statement {
         patterns: Vec<Pattern>,
         return_clause: Option<ReturnClause>,
     },
-    /// `MATCH pattern [WHERE expr] SET assignments`
+    /// `MATCH pattern [WHERE expr] SET assignments [RETURN ...]`
+    ///
+    /// The `RETURN` is optional and projects over the rows the `MATCH` selected
+    /// *after* the assignments were applied, so `MATCH (n:P) SET n.age = n.age + 1
+    /// RETURN n.age` sees the updated value. Without it the statement reports the
+    /// number of rows it updated.
     Set {
         pattern: Vec<Pattern>,
         where_clause: Option<Expr>,
         assignments: Vec<Assignment>,
+        return_clause: Option<ReturnClause>,
     },
     /// `MATCH pattern [WHERE expr] REMOVE items`
     Remove {

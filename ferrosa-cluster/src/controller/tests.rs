@@ -5625,3 +5625,177 @@ async fn a_second_cluster_transition_is_refused_at_once() {
          the bounded re-open schedule (a further 3 s) before it gives up (took {elapsed:?})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// jsonb is a FIRST-CLASS data type (T-300 gate REMOVED).
+//
+// The engine already replicates graph materialization over Raft, so a column
+// type is not special, and a gate that can REFUSE a data type is itself the
+// defect. Carrying jsonb columns must therefore never block a node from leaving
+// standalone, at any of the former gate call sites.
+// ---------------------------------------------------------------------------
+
+/// Install `t_ks.docs` — an `int` key and a regular `jsonb` column — so the
+/// node under test "carries jsonb columns".
+fn install_jsonb_table(schema: &Schema) {
+    use ferrosa_schema::metadata::column::{ClusteringOrder, ColumnKind, ColumnMetadata};
+    use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+    use ferrosa_schema::metadata::table::{TableMetadata, TableParams};
+    schema
+        .create_keyspace_internal(KeyspaceMetadata {
+            name: "t_ks".to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: [("replication_factor".to_string(), "1".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        })
+        .expect("keyspace");
+    let column = |name: &str, kind: ColumnKind, ty: &str| ColumnMetadata {
+        name: name.to_string(),
+        kind,
+        position: 0,
+        column_type: ty.to_string(),
+        clustering_order: ClusteringOrder::None,
+        mask: None,
+    };
+    let mut columns = indexmap::IndexMap::new();
+    columns.insert(
+        "pk".to_string(),
+        column("pk", ColumnKind::PartitionKey, "int"),
+    );
+    columns.insert(
+        "body".to_string(),
+        column("body", ColumnKind::Regular, "jsonb"),
+    );
+    schema
+        .create_table_internal(TableMetadata {
+            keyspace: "t_ks".to_string(),
+            name: "docs".to_string(),
+            id: Uuid::new_v4(),
+            columns,
+            partition_key: vec!["pk".to_string()],
+            clustering_key: vec![],
+            params: TableParams::default(),
+            flags: std::collections::HashSet::new(),
+            extensions: HashMap::new(),
+            is_system: false,
+        })
+        .expect("a jsonb table installs");
+}
+
+/// Driving the mode-transition backstop (`try_transition_mode`, mod.rs): a node
+/// carrying jsonb columns leaves standalone for Pair and for Cluster with no
+/// capability input.
+///
+/// Before the gate was removed this failed in BOTH cases: the mode cell never
+/// moved, because the transition guard refused to leave standalone while jsonb
+/// existed. `can_transition_to` allows both Standalone -> Pair and the legacy
+/// direct Standalone -> Cluster, so the refusal here was the jsonb gate and
+/// nothing else.
+#[tokio::test]
+async fn jsonb_columns_do_not_block_try_transition_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = test_schema();
+    install_jsonb_table(&schema);
+    let controller = ModeController::standalone_for_test(schema.clone(), test_storage(dir.path()));
+
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    assert!(
+        controller.try_transition_mode(DeploymentMode::Pair),
+        "carrying jsonb columns must not block Standalone -> Pair"
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+
+    let dir2 = tempfile::tempdir().unwrap();
+    let controller2 = ModeController::standalone_for_test(schema, test_storage(dir2.path()));
+    assert!(
+        controller2.try_transition_mode(DeploymentMode::Cluster),
+        "carrying jsonb columns must not block Standalone -> Cluster"
+    );
+    assert_eq!(controller2.mode(), DeploymentMode::Cluster);
+}
+
+/// Driving the pair path (`transition_to_pair`, pair.rs): a node carrying jsonb
+/// columns forms a pair with a peer instead of silently staying standalone.
+///
+/// Before the gate was removed, the pair transition returned early on the
+/// leaving-standalone jsonb guard and the mode never left Standalone.
+#[tokio::test]
+async fn jsonb_columns_do_not_block_the_pair_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_jsonb_table(&schema);
+
+    let config = Arc::new(ClusterConfig {
+        raft_data_dir: Some(dir.path().join("raft")),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        config,
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net_config,
+        local_id,
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+
+    let peer_id = Uuid::new_v4();
+    let peer_addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
+    controller.transition_to_pair(peer_id, peer_addr, false);
+
+    assert_eq!(
+        controller.mode(),
+        DeploymentMode::Pair,
+        "carrying jsonb columns must not block the pair transition"
+    );
+}
+
+/// A controller built the way `main` builds it — seeds configured and a schema
+/// that already holds jsonb — initializes and can make its startup transition
+/// instead of exiting.
+///
+/// `main` used to call the startup jsonb refusal here and return a non-zero
+/// error for a seeded start. The refusal is gone: this constructs the same
+/// controller shape and shows the startup transition to Pair proceeds.
+#[tokio::test]
+async fn a_seeded_controller_carrying_jsonb_initializes_and_leaves_standalone() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_jsonb_table(&schema);
+
+    let net_config = Arc::new(NetConfig {
+        seeds: vec!["127.0.0.1:7000".parse().unwrap()],
+        ..NetConfig::default()
+    });
+    let local_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net_config.clone(),
+        local_id,
+        storage,
+        schema,
+        registry,
+    );
+
+    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    assert!(
+        controller.try_transition_mode(DeploymentMode::Pair),
+        "a seeded node carrying jsonb must be able to leave standalone"
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
+}

@@ -298,9 +298,25 @@ jobs:
           #
           # `--exclude` / `--lib` / `--tests` / `--all-features` take the same
           # values in both runners. The `--` separator is the only difference.
+          # NOTE: EVERY exclusion must live in ONE `-E` expression.
+          #
+          # nextest does NOT AND repeated `-E` flags: pass two and filtering is
+          # silently disabled altogether. Measured on a two-binary probe crate --
+          # `-E 'not binary(alpha_process)' -E 'not binary(beta)'` listed BOTH
+          # tests, while the same two clauses joined by `and` in a single `-E`
+          # listed neither. This step carried two `-E` flags for a long time, so
+          # NO exclusion here ever took effect: the real-process cluster harnesses
+          # (six binaries, each spawning three real node processes) ran inside the
+          # ~9,700-test suite and were starved for their whole readiness budget,
+          # which is exactly the ~96 s failure the isolated step below exists to
+          # prevent. Keep one expression; never split it into a second flag.
+          # Keep shell comments ABOVE this command, never between its backslash
+          # continuations: a `#` line ends the logical line, silently dropping
+          # every flag after it -- including the whole `--skip` list below, which
+          # is how this step once ran 9,740 tests and failed six of them.
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -E 'not binary(accord_apply_decode_residency)' \
+            -E 'not binary(accord_apply_decode_residency) and not binary(commit_guarantee_replica_process) and not binary(drop_table_replica_process) and not binary(jsonb_first_class_cluster_process) and not binary(pg_public_keyspace_rf_process) and not binary(pg_select_cluster_read_process) and not binary(pg_txn_value_process)' \
             -- --skip ::slow:: --skip accord::perf --skip conflict_index_residency_projection_absolute \
                --skip apply_writeset_peak_stays_within_the_input_size \
                --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
@@ -325,6 +341,29 @@ jobs:
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \
+
+      - name: Run the real-process cluster harnesses (isolated)
+        # Each of these spawns THREE real `ferrosa` node processes and asserts on
+        # leader election, snapshot barriers and restart repair. Measured 5/5 green
+        # locally in 13-23 s each, but inside the ~9,650-test run above a node can be
+        # starved for its entire 90 s readiness budget and never bind its listener --
+        # indistinguishable from a hang from the outside, so no harness-side budget
+        # rule can tell the two apart, and lengthening the budget would only mask it.
+        # The step above excludes these binaries; this one gives them the machine.
+        # Named as explicit `--test` targets rather than a binary-name
+        # filterset: this step carries no `--skip` list, so anything it selects
+        # by accident RUNS, and the file-IO-heavy tests (differential_oracle,
+        # cassandra_reads_compacted, compaction_end_to_end_pipeline, lazyfs
+        # promote, the typed-edge count merger) fail in ~0.1s without their
+        # infrastructure. A target list cannot over-select.
+        run: |
+          cargo nextest run --all-features -p ferrosa \
+            --test commit_guarantee_replica_process \
+            --test drop_table_replica_process \
+            --test jsonb_first_class_cluster_process \
+            --test pg_public_keyspace_rf_process \
+            --test pg_select_cluster_read_process \
+            --test pg_txn_value_process
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no

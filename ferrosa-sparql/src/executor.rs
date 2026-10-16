@@ -552,6 +552,11 @@ struct Scan<'a, F> {
     limits: &'a ExecutionLimits,
     sink: F,
     rows_read: usize,
+    /// When set, a partition whose graph component is not this value is skipped
+    /// whole — it never reaches the row loop, so it costs neither a solution
+    /// nor a row of the scan budget. `None` for scopes that do not isolate a
+    /// graph (see [`TripleScope::isolated_graph`]).
+    graph_filter: Option<String>,
 }
 
 impl<F> Scan<'_, F>
@@ -564,7 +569,17 @@ where
     /// and dropped before the next one is touched.
     fn feed(&mut self, partition: &Partition) -> Result<ControlFlow<()>, SparqlError> {
         // BUG-S3 fix: decode composite partition key (graph, subject) properly.
-        let subject = extract_subject_from_partition_key(partition.key.key.as_bytes());
+        let key_bytes = partition.key.key.as_bytes();
+        // Graph isolation: a `GRAPH <iri>` scope (or the served default-graph
+        // scope) reads one graph's partitions only. Checking the graph here —
+        // before any row is counted or decoded — is what makes a named-graph
+        // scan exact without materializing the other graphs' rows.
+        if let Some(expected) = self.graph_filter.as_deref() {
+            if extract_composite_component(key_bytes, 0).as_deref() != Some(expected) {
+                return Ok(ControlFlow::Continue(()));
+            }
+        }
+        let subject = extract_subject_from_partition_key(key_bytes);
         for row in &partition.rows {
             self.rows_read += 1;
             if self.rows_read > self.limits.max_rows {
@@ -619,6 +634,11 @@ where
         limits,
         sink,
         rows_read: 0,
+        graph_filter: if scope.isolated_graph {
+            Some(scope.graph.clone())
+        } else {
+            None
+        },
     };
 
     match op {

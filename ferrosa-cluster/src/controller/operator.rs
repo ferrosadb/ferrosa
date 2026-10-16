@@ -219,13 +219,6 @@ impl ModeController {
                     .into(),
             );
         };
-        // Check what the pair transition would refuse BEFORE stopping Raft, so a
-        // refusal can never leave a node with no Raft and no pair path.
-        if !self.leaving_standalone_permitted(DeploymentMode::Pair) {
-            return refuse(
-                "the T-300 jsonb guard refuses this transition (see the node log)".into(),
-            );
-        }
         if self.peer_manager.load().is_none() {
             return refuse("downgrade to pair refused: no peer manager installed".into());
         }

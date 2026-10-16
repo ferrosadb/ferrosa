@@ -44,32 +44,33 @@ Implement and test Cap'n Proto serialization for high-priority Ferrosa-private b
 - Preserve fail-loud decode errors; no `unwrap_or_default()` on protocol encode paths.
 - Verify with crate-level cargo tests and final `cargo build --all-targets`.
 
-## Landed 2026-10-14 (D32, the jsonb half)
+## jsonb DDL gate (D32) — REMOVED 2026-10-15
 
-- `CAP_JSONB_V1` (`ferrosa-net/src/handshake.rs`) joined to `LOCAL_CAPABILITIES`.
-- The jsonb DDL gate is capability-based, not mode-based:
-  `jsonb_ddl_permitted(mode, cluster)`, a second live `ArcSwap` cell on `Schema`
-  (`jsonb_cluster_gate_handle()`) defaulting to `Unknown`, and a typed refusal
-  (`JsonbDdlRefusal`) that names the members lacking the bit.
-  `ferrosa-schema --test jsonb_ddl_gate`: 10 passed, 0 failed (3 new).
-- **Scope item 2 recon is finished and recorded** (see the working brief beside this repo):
-  the forwarded schema op is a bincode blob inside `Message::ClusterMembershipForward`
-  (`ferrosa-cluster/src/raft_forward.rs:128` encode, `:205` decode), not an openraft log encoding;
-  the Cap'n Proto family belongs in `ferrosa-net/schema/ferrosa/internode/envelope.capnp` beside the
-  Accord family, with a versioned magic and bincode dual-read because `raft/mod.rs` pins the bincode
-  variant tags by test as a shipped contract.
-- **(a) DONE 2026-10-14:** the controller computes and publishes the verdict from the
-  live member view and each member's advertised bits, on every peer connect and
-  disconnect (`controller/jsonb_gate.rs`: `verdict_from_member_caps`,
-  `publish_jsonb_cluster_gate`, `spawn_jsonb_cluster_gate_refresh`);
-  `ferrosa-cluster --lib jsonb_gate` 8 passed, the crate 1521 passed. Fail-closed:
-  an unreadable member, or an unestablished view, is unknown, and unknown is never
-  capable. A controller with no runtime publishes unknown rather than panicking a
-  peer event that never needed a runtime before.
-- **Still owed on this item:** (b) the transition half still reads `Unknown`
-  deliberately, keeping leaving-standalone fail-closed; (c) scope item 2 below — the
-  Cap'n Proto frame for the forwarded schema op — is scoped to the code but not
-  implemented.
+- The jsonb DDL capability gate (T-300/D24/D32) was **REMOVED from the source
+  tree entirely — not disabled.** Deleted: the schema-side permission check and
+  its cluster-verdict cell, the controller's cluster jsonb gate module (the
+  verdict computed from member bits, its publisher, its refresh spawner, and the
+  leaving-standalone and startup refusals), the `SchemaError` jsonb-refusal
+  variant, the CQL and PostgreSQL refusal call sites, and the handshake
+  capability bit that carried it. `main` no longer runs any startup jsonb
+  refusal; `ferrosa-postgres`'s DDL path maps only the placement refusal, not a
+  mode refusal.
+- **Why:** the engine ALREADY replicates graph materialization over Raft, so a
+  column type is not special — a gate that can REFUSE a data type is itself the
+  defect. jsonb must work standalone, paired and clustered with no flag, env
+  var, config key or operator action, and must never be turned off again.
+- **Surviving constraint:** only the placement rule (T-154a, D3, D21) remains —
+  jsonb is still refused in partition/clustering key columns (any depth), as a
+  set element, as a map key, and as a vector element.
+- **Scope item 2 recon is unchanged and still stands** (see the working brief
+  beside this repo): the forwarded schema op is a bincode blob inside
+  `Message::ClusterMembershipForward` (`ferrosa-cluster/src/raft_forward.rs:128`
+  encode, `:205` decode), not an openraft log encoding; the Cap'n Proto family
+  belongs in `ferrosa-net/schema/ferrosa/internode/envelope.capnp` beside the
+  Accord family, with a versioned magic and bincode dual-read because
+  `raft/mod.rs` pins the bincode variant tags by test as a shipped contract.
+- **Still owed on this brief:** scope item 2 — the Cap'n Proto frame for the
+  forwarded schema op — is scoped to the code but not implemented.
 
 ## Suggested task order
 
