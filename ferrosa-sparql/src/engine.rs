@@ -226,12 +226,14 @@ impl SparqlEngine {
         let limits = ExecutionLimits {
             max_rows: config.max_rows,
         };
-        Self {
+        let engine = Self {
             storage,
             write_path,
             config,
             limits,
-        }
+        };
+        engine.ensure_object_index(&engine.config.default_graph);
+        engine
     }
 
     /// Ensure the rdf_triples table is registered for a given keyspace.
@@ -242,6 +244,78 @@ impl SparqlEngine {
         if let Err(e) = self.storage.register_table(schema) {
             // register_table returns Ok(()) if already registered.
             tracing::debug!(%e, keyspace, "rdf_triples table registration");
+        }
+        // A keyspace registered here rather than in `new` needs the index just
+        // as much: an object-bound pattern against it would otherwise scan.
+        self.ensure_object_index(keyspace);
+    }
+
+    /// Declare the object index for `keyspace`'s `rdf_triples` table.
+    ///
+    /// [`TripleOp::ObjectScan`](crate::planner::TripleOp::ObjectScan) reads
+    /// through `rdf_triples_object_idx` and streams a full table scan when this
+    /// node does not declare it — and nothing else creates that index for
+    /// `rdf_triples`, so every `?s ?p <o>` pattern read the whole table. The
+    /// declaration goes through the same engine-level path a `CREATE INDEX` and
+    /// a post-restart reload use ([`StorageEngine::register_index_in_engine`]),
+    /// which also builds sidecars for any SSTable that predates the index and
+    /// keeps the write path maintaining it from then on.
+    ///
+    /// `object` is a CLUSTERING column, not a cell, so its value has to come out
+    /// of the clustering key; `register_index_in_engine` resolves that from the
+    /// table's own schema instead of a hardcoded component index.
+    ///
+    /// Idempotent, and called from both registration sites — the eager one in
+    /// [`SparqlEngine::new`] and the lazy one in
+    /// [`SparqlEngine::ensure_table_registered`].
+    fn ensure_object_index(&self, keyspace: &str) {
+        let table_id = crate::triple_store::triples_table_id(keyspace);
+        if self
+            .storage
+            .declares_index(&table_id, crate::executor::OBJECT_INDEX_NAME)
+        {
+            return;
+        }
+        let options = std::collections::HashMap::new();
+        let declaration = self.storage.register_index_in_engine(
+            &table_id,
+            ferrosa_storage::engine::IndexToRegister {
+                index_name: crate::executor::OBJECT_INDEX_NAME,
+                index_type: ferrosa_index::IndexType::BTree,
+                target_col: crate::triple_store::OBJECT_COLUMN,
+                // The storage `TableSchema` carries only the composite key TYPE,
+                // and `object` is not a partition-key column anyway.
+                partition_key_columns: &[],
+                filter_predicate: None,
+                options: &options,
+                // The table is registered above, so an absent one is a real
+                // failure rather than a `CREATE INDEX` outrunning its table.
+                defer_until_table_exists: false,
+                site: "rdf_triples registration",
+            },
+        );
+        match declaration {
+            Ok(true) => tracing::debug!(
+                keyspace,
+                index = crate::executor::OBJECT_INDEX_NAME,
+                "declared the rdf_triples object index"
+            ),
+            // Registered and refused are different failures, and both leave
+            // object-bound patterns on the scan; say so rather than leaving the
+            // operator to infer it from a slow query.
+            Ok(false) => tracing::warn!(
+                keyspace,
+                index = crate::executor::OBJECT_INDEX_NAME,
+                "rdf_triples object index was NOT declared; object-bound patterns will \
+                 stream a full table scan with filtering"
+            ),
+            Err(e) => tracing::warn!(
+                %e,
+                keyspace,
+                index = crate::executor::OBJECT_INDEX_NAME,
+                "failed to declare the rdf_triples object index; object-bound patterns will \
+                 stream a full table scan with filtering"
+            ),
         }
     }
 

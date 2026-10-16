@@ -15,6 +15,8 @@ pub mod clock_validation;
 pub mod compression;
 pub mod coordinator;
 pub mod cross_dc_adapter;
+/// Cross-DC delivery: exactly one copy per remote DC, retried.
+pub mod cross_dc_dispatch;
 pub mod cross_shard;
 pub mod ddl_drain;
 pub mod dep_wait;

@@ -162,7 +162,7 @@ pub async fn replay_round(target: &ReplayTarget<'_>, ops: Vec<LabeledDdl>) -> Ro
         let result = match (leader, leader_uuid) {
             (None, _) => Err(ClusterError::NotLeader { leader_id: None }),
             (Some(lid), _) if lid == target.local_node_id => {
-                crate::ddl_path::execute_via_raft(target.raft, ddl.op.clone())
+                crate::ddl_path::execute_via_raft(target.raft, &ddl.op)
                     .await
                     .map(|_| ())
             }
@@ -171,14 +171,11 @@ pub async fn replay_round(target: &ReplayTarget<'_>, ops: Vec<LabeledDdl>) -> Ro
             ))),
             // Bootstrap schema hand-off, not a client DDL: no
             // read-your-writes wait needed.
-            (Some(_), Some(uuid)) => crate::ddl_path::forward_ddl_to_leader(
-                None,
-                target.peer_manager,
-                uuid,
-                ddl.op.clone(),
-            )
-            .await
-            .map(|_| ()),
+            (Some(_), Some(uuid)) => {
+                crate::ddl_path::forward_ddl_to_leader(None, target.peer_manager, uuid, &ddl.op)
+                    .await
+                    .map(|_| ())
+            }
         };
         if let Err(e) = result {
             if is_retryable_forward_error(&e) {

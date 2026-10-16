@@ -50,6 +50,20 @@ pub struct NetConfig {
     pub tls_ca_path: Option<String>,
     /// If true, reject startup when no TLS cert/key are configured.
     pub require_tls: bool,
+    /// This node's data center, advertised to peers during the internode
+    /// handshake so they can classify it for NetworkTopologyStrategy and
+    /// LOCAL_* quorum accounting (Cassandra-style application state on the
+    /// wire). Empty means "do not announce" — an older peer, or a node whose
+    /// operator set no DC, must keep the pre-existing behaviour of being
+    /// treated as a local-DC peer.
+    ///
+    /// Source of truth is the same `FERROSA_DATA_CENTER` variable
+    /// `ClusterConfig::data_center` reads; the two must not
+    /// diverge, so keep this seeded from `ClusterConfig` wherever both exist.
+    pub data_center: String,
+    /// This node's rack within [`Self::data_center`], advertised alongside it.
+    /// Empty means "do not announce" (see [`Self::data_center`]).
+    pub rack: String,
     /// CQL broadcast address advertised to peers during handshake.
     /// Peers use this for `system.peers.native_address`.
     pub cql_broadcast: Option<String>,
@@ -91,6 +105,8 @@ impl Default for NetConfig {
             tls_key_path: None,
             tls_ca_path: None,
             require_tls: false,
+            data_center: String::new(),
+            rack: String::new(),
             cql_broadcast: None,
             internode_broadcast: None,
             advertised_capabilities: crate::handshake::LOCAL_CAPABILITIES,
@@ -317,6 +333,16 @@ impl NetConfig {
         }
         if let Some(v) = r.raw("FERROSA_CQL_BROADCAST") {
             cfg.cql_broadcast = Some(v);
+        }
+        // Announce this node's logical topology on the wire. Reads the SAME
+        // `FERROSA_DATA_CENTER` / `FERROSA_RACK` variables
+        // `ferrosa_cluster::ClusterConfig` reads, so the DC the ring commits
+        // for this node and the DC it advertises to peers cannot diverge.
+        if let Some(v) = r.raw("FERROSA_DATA_CENTER") {
+            cfg.data_center = v;
+        }
+        if let Some(v) = r.raw("FERROSA_RACK") {
+            cfg.rack = v;
         }
 
         (cfg, r.issues)

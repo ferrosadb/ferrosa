@@ -10,6 +10,15 @@ use ferrosa_storage::TableId;
 /// Table name for RDF triples within a keyspace.
 pub const RDF_TRIPLES_TABLE: &str = "rdf_triples";
 
+/// The `object` column: clustering component 1 of the `(predicate, object)`
+/// clustering key.
+///
+/// A clustering column's value is not a row cell — it lives in the clustering-key
+/// bytes — so an index on it has to be declared through the clustering-column
+/// path. Naming it in one place keeps the schema below and the index the SPARQL
+/// engine declares on registration from drifting apart.
+pub const OBJECT_COLUMN: &str = "object";
+
 /// Column positions in the rdf_triples table schema.
 pub const COL_OBJECT_TYPE: u16 = 0;
 pub const COL_DATATYPE: u16 = 1;
@@ -34,7 +43,7 @@ pub fn rdf_triples_schema(keyspace: &str) -> TableSchema {
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             },
             ColumnDefinition {
-                name: "object".to_string(),
+                name: OBJECT_COLUMN.to_string(),
                 type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
             },
         ],

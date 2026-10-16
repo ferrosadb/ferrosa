@@ -93,6 +93,15 @@ pub struct HandshakePeer {
     /// predates them. Learned on both sides: from the Handshake when accepting,
     /// from the HandshakeAck when initiating.
     pub capabilities: u32,
+    /// The peer's advertised data center, if it announced one. `None` means
+    /// the peer did not advertise a DC (an older peer, or none configured);
+    /// callers must treat that as "same DC as local" — the behaviour before
+    /// DC advertisement existed, so a rolling upgrade does not reclassify
+    /// live peers.
+    pub data_center: Option<String>,
+    /// The peer's advertised rack, if it announced one. `None` = not
+    /// advertised; see [`Self::data_center`].
+    pub rack: Option<String>,
 }
 
 /// Compute PSK auth token: HMAC-SHA256(key=psk, data=cluster_name|host_id|nonce).
@@ -149,6 +158,8 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
         cql_broadcast: config.cql_broadcast.clone(),
         internode_broadcast: config.internode_broadcast.clone(),
         capabilities: config.advertised_capabilities,
+        data_center: advertised(config.data_center.as_str()),
+        rack: advertised(config.rack.as_str()),
     };
     let mut body = BytesMut::new();
     handshake.encode(&mut body)?;
@@ -178,6 +189,8 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
             cql_broadcast,
             internode_broadcast,
             capabilities,
+            data_center,
+            rack,
             ..
         } => {
             if accepted {
@@ -186,6 +199,8 @@ pub async fn initiate_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite 
                     cql_broadcast,
                     internode_broadcast,
                     capabilities,
+                    data_center,
+                    rack,
                 })
             } else {
                 Err(NetError::HandshakeFailed(reason))
@@ -219,6 +234,8 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
         peer_cql_broadcast,
         peer_internode_broadcast,
         peer_capabilities,
+        peer_data_center,
+        peer_rack,
     ) = match hs {
         Message::Handshake {
             cluster_name,
@@ -228,6 +245,8 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             cql_broadcast,
             internode_broadcast,
             capabilities,
+            data_center,
+            rack,
             ..
         } => (
             host_id,
@@ -237,6 +256,8 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             cql_broadcast,
             internode_broadcast,
             capabilities,
+            data_center,
+            rack,
         ),
         _ => return Err(NetError::Protocol("expected Handshake".into())),
     };
@@ -246,47 +267,20 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             "cluster mismatch: expected '{}', got '{}'",
             config.cluster_name, peer_cluster
         );
-        send_handshake_ack(
-            framed,
-            local_host_id,
-            false,
-            &reason,
-            &config.cql_broadcast,
-            &config.internode_broadcast,
-            config.advertised_capabilities,
-        )
-        .await?;
+        send_handshake_ack(framed, local_host_id, false, &reason, config).await?;
         return Err(NetError::HandshakeFailed(reason));
     }
 
     if peer_version != PROTOCOL_VERSION {
         let reason = format!("unsupported protocol version: {}", peer_version);
-        send_handshake_ack(
-            framed,
-            local_host_id,
-            false,
-            &reason,
-            &config.cql_broadcast,
-            &config.internode_broadcast,
-            config.advertised_capabilities,
-        )
-        .await?;
+        send_handshake_ack(framed, local_host_id, false, &reason, config).await?;
         return Err(NetError::HandshakeFailed(reason));
     }
 
     if let Some(psk) = &config.psk {
         if peer_token.len() < 40 {
             let reason = "auth token too short".to_string();
-            send_handshake_ack(
-                framed,
-                local_host_id,
-                false,
-                &reason,
-                &config.cql_broadcast,
-                &config.internode_broadcast,
-                config.advertised_capabilities,
-            )
-            .await?;
+            send_handshake_ack(framed, local_host_id, false, &reason, config).await?;
             return Err(NetError::HandshakeFailed(reason));
         }
         let nonce = u64::from_be_bytes(peer_token[..8].try_into().unwrap());
@@ -298,36 +292,31 @@ pub async fn accept_handshake<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + 
             &peer_token[8..],
         ) {
             let reason = "PSK authentication failed".to_string();
-            send_handshake_ack(
-                framed,
-                local_host_id,
-                false,
-                &reason,
-                &config.cql_broadcast,
-                &config.internode_broadcast,
-                config.advertised_capabilities,
-            )
-            .await?;
+            send_handshake_ack(framed, local_host_id, false, &reason, config).await?;
             return Err(NetError::HandshakeFailed(reason));
         }
     }
 
-    send_handshake_ack(
-        framed,
-        local_host_id,
-        true,
-        "",
-        &config.cql_broadcast,
-        &config.internode_broadcast,
-        config.advertised_capabilities,
-    )
-    .await?;
+    send_handshake_ack(framed, local_host_id, true, "", config).await?;
     Ok(HandshakePeer {
         host_id: peer_host_id,
         cql_broadcast: peer_cql_broadcast,
         internode_broadcast: peer_internode_broadcast,
         capabilities: peer_capabilities,
+        data_center: peer_data_center,
+        rack: peer_rack,
     })
+}
+
+/// `Some(text)` when the node has a non-empty value to advertise, else `None`.
+///
+/// An empty DC/rack is "unset", not a real topology name: announcing `""`
+/// would let a peer record the empty string as a DC name, which is neither
+/// "known" nor "absent" and would make it a permanent member of a DC that
+/// cannot exist. `None` keeps it on the pre-advertisement path (treated as
+/// local), which is what an operator who set no DC gets today.
+fn advertised(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
 }
 
 async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
@@ -335,9 +324,7 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
     host_id: Uuid,
     accepted: bool,
     reason: &str,
-    cql_broadcast: &Option<String>,
-    internode_broadcast: &Option<String>,
-    capabilities: u32,
+    config: &NetConfig,
 ) -> Result<()> {
     use futures::SinkExt;
     let ack = Message::HandshakeAck {
@@ -346,9 +333,11 @@ async fn send_handshake_ack<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Un
         chosen_compression: 0,
         accepted,
         reason: reason.to_string(),
-        cql_broadcast: cql_broadcast.clone(),
-        internode_broadcast: internode_broadcast.clone(),
-        capabilities,
+        cql_broadcast: config.cql_broadcast.clone(),
+        internode_broadcast: config.internode_broadcast.clone(),
+        capabilities: config.advertised_capabilities,
+        data_center: advertised(config.data_center.as_str()),
+        rack: advertised(config.rack.as_str()),
     };
     let mut body = BytesMut::new();
     ack.encode(&mut body)?;
@@ -611,6 +600,8 @@ mod tests {
             cql_broadcast: None,
             internode_broadcast: None,
             capabilities: 0,
+            data_center: None,
+            rack: None,
         };
         use futures::SinkExt;
         let mut body = BytesMut::new();
@@ -633,6 +624,79 @@ mod tests {
             server_fut.await,
             Err(NetError::HandshakeFailed(_))
         ));
+    }
+
+    /// The DC/rack application state rides the handshake in both directions:
+    /// each side learns the DC the OTHER node advertised, not its own. Without
+    /// this a peer is indistinguishable from a local-DC node.
+    #[tokio::test]
+    async fn handshake_exchanges_data_center_and_rack() {
+        let (client_io, server_io) = duplex(8192);
+        let mut client_config = test_config("ferrosa", None);
+        client_config.data_center = "dc1".into();
+        client_config.rack = "rack-a".into();
+        let mut server_config = test_config("ferrosa", None);
+        server_config.data_center = "dc2".into();
+        server_config.rack = "rack-b".into();
+
+        let client_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+
+        let mut client_framed = Framed::new(
+            client_io,
+            InternodeCodec::new(client_config.max_frame_body_size),
+        );
+        let mut server_framed = Framed::new(
+            server_io,
+            InternodeCodec::new(server_config.max_frame_body_size),
+        );
+
+        let client_fut = initiate_handshake(&mut client_framed, &client_config, client_id);
+        let server_fut = accept_handshake(&mut server_framed, &server_config, server_id);
+
+        let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+
+        // The client learns the SERVER's topology.
+        let client_peer = client_res.unwrap();
+        assert_eq!(client_peer.host_id, server_id);
+        assert_eq!(client_peer.data_center.as_deref(), Some("dc2"));
+        assert_eq!(client_peer.rack.as_deref(), Some("rack-b"));
+
+        // The server learns the CLIENT's topology — never its own.
+        let server_peer = server_res.unwrap();
+        assert_eq!(server_peer.host_id, client_id);
+        assert_eq!(server_peer.data_center.as_deref(), Some("dc1"));
+        assert_eq!(server_peer.rack.as_deref(), Some("rack-a"));
+    }
+
+    /// A node with no configured DC must advertise nothing rather than the
+    /// empty string: an empty DC name is neither "known" nor "absent" and would
+    /// classify the peer into a data center that cannot exist.
+    #[tokio::test]
+    async fn handshake_without_configured_dc_advertises_nothing() {
+        let (client_io, server_io) = duplex(8192);
+        let config = test_config("ferrosa", None);
+        assert!(config.data_center.is_empty() && config.rack.is_empty());
+
+        let client_id = Uuid::new_v4();
+        let server_id = Uuid::new_v4();
+
+        let mut client_framed =
+            Framed::new(client_io, InternodeCodec::new(config.max_frame_body_size));
+        let mut server_framed =
+            Framed::new(server_io, InternodeCodec::new(config.max_frame_body_size));
+
+        let (client_res, server_res) = tokio::join!(
+            initiate_handshake(&mut client_framed, &config, client_id),
+            accept_handshake(&mut server_framed, &config, server_id)
+        );
+
+        let client_peer = client_res.unwrap();
+        assert_eq!(client_peer.data_center, None);
+        assert_eq!(client_peer.rack, None);
+        let server_peer = server_res.unwrap();
+        assert_eq!(server_peer.data_center, None);
+        assert_eq!(server_peer.rack, None);
     }
 
     #[test]

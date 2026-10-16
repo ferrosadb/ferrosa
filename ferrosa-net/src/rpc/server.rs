@@ -31,12 +31,19 @@ pub trait InboundPeerCallback: Send + Sync {
     /// them. The callback records them so a peer that restarted with a newer
     /// build is visible to capability-gated features without the observer
     /// restarting (t_d853fa2a).
+    ///
+    /// `data_center`/`rack` are the inbound peer's advertised topology, if it
+    /// announced any (`None` = an older peer or none configured; the callee
+    /// must treat that as "same DC as local", exactly as before this carried
+    /// a payload).
     fn on_inbound_peer(
         &self,
         peer_id: PeerId,
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
         capabilities: u32,
+        data_center: Option<String>,
+        rack: Option<String>,
     );
 }
 
@@ -274,6 +281,11 @@ impl RpcServer {
                             cql_broadcast: None,
                             internode_broadcast: None,
                             capabilities: config.advertised_capabilities,
+                            // A refused handshake advertises no topology: the
+                            // peer is not admitted, so telling it where we live
+                            // would be information it cannot use.
+                            data_center: None,
+                            rack: None,
                         };
                         let mut body = bytes::BytesMut::new();
                         if let Err(e) = ack.encode(&mut body) {
@@ -356,6 +368,8 @@ impl RpcServer {
                 peer.cql_broadcast,
                 peer.internode_broadcast,
                 peer.capabilities,
+                peer.data_center,
+                peer.rack,
             );
         }
 
@@ -1215,6 +1229,8 @@ mod tests {
                     cql_broadcast: None,
                     internode_broadcast: None,
                     capabilities: 0,
+                    data_center: None,
+                    rack: None,
                 })
             }
         }
@@ -1527,12 +1543,22 @@ mod tests {
                 cql_broadcast: None,
                 internode_broadcast: None,
                 capabilities: 0,
+                data_center: None,
+                rack: None,
             };
             let mut body = BytesMut::new();
             handshake.encode(&mut body).unwrap();
-            let old_len = body.len() - 4;
-            assert_eq!(&body[old_len..], &[0, 0, 0, 0], "capabilities must trail");
-            body.truncate(old_len);
+            // Layout is [..][capability u32][dc marker][rack marker]; both
+            // topology markers are the 1-byte "absent" form here, so the
+            // pre-capability body ends where the capability u32 starts.
+            let topology_markers = 2;
+            let caps_start = body.len() - topology_markers - 4;
+            assert_eq!(
+                &body[caps_start..caps_start + 4],
+                &[0, 0, 0, 0],
+                "capabilities keep their offset ahead of the topology markers"
+            );
+            body.truncate(caps_start);
             body.freeze()
         }
 
@@ -1636,8 +1662,10 @@ mod tests {
                     reason: String::new(),
                     cql_broadcast: None,
                     internode_broadcast: None,
-                    // An old server advertises no capabilities.
+                    // An old server advertises no capabilities and no topology.
                     capabilities: 0,
+                    data_center: None,
+                    rack: None,
                 };
                 framed
                     .send(raw_frame(MsgType::HandshakeAck, 0, 0, encoded(&ack)))

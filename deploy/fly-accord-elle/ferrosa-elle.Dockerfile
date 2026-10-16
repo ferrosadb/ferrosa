@@ -55,6 +55,10 @@ COPY . .
 RUN find . -name "lib.rs" -o -name "main.rs" | xargs touch
 RUN cargo build --release -p ferrosa
 RUN cargo build --release -p ferrosa-jepsen --example elle_list_append
+# `cql_exec` runs one-off CQL statements (see the example's docs). The multi-DC
+# invariant harness asserts with it: `USE <keyspace>` is a boolean for "this node
+# has this schema", and a SELECT's row count is a boolean for a node's own view.
+RUN cargo build --release -p ferrosa-jepsen --example cql_exec
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -72,6 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # uses `tc qdisc ... netem`). Without them the dual-DC fault injection can't run.
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/
 COPY --from=builder /build/target/release/examples/elle_list_append /usr/local/bin/
+COPY --from=builder /build/target/release/examples/cql_exec /usr/local/bin/
 COPY deploy/fly-bench/ferrosa-entrypoint.sh /usr/local/bin/
 EXPOSE 9042 7000 9090
 ENV FERROSA_DATA_DIR=/var/lib/ferrosa

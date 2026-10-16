@@ -56,3 +56,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
+# Scrapes the executor's own WARN line out of an in-process subscriber, so the
+# object-index fallback can be shown to still announce that it is scanning.
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
