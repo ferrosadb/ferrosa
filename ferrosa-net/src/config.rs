@@ -58,7 +58,7 @@ pub struct NetConfig {
     /// treated as a local-DC peer.
     ///
     /// Source of truth is the same `FERROSA_DATA_CENTER` variable
-    /// [`ferrosa_cluster::ClusterConfig::data_center`] reads; the two must not
+    /// `ClusterConfig::data_center` reads; the two must not
     /// diverge, so keep this seeded from `ClusterConfig` wherever both exist.
     pub data_center: String,
     /// This node's rack within [`Self::data_center`], advertised alongside it.

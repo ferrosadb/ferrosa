@@ -1151,7 +1151,7 @@ impl ModeController {
     /// Idempotent: re-recording overwrites the prior entry. Pass the peer's
     /// `rack` as configured at the peer (matches `FERROSA_RACK` on that node).
     ///
-    /// [`peer_topology`]: super::cluster::peer_topology
+    /// [`peer_topology`]: cluster::peer_topology
     pub fn record_peer_rack(&self, host_id: Uuid, rack_name: impl Into<String>) {
         self.peer_racks.lock().insert(host_id, rack_name.into());
     }

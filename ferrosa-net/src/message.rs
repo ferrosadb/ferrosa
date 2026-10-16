@@ -124,8 +124,8 @@ pub enum Message {
         /// exactly as before this field existed. Written AFTER `capabilities`,
         /// which keeps its trailer position for peers that predate this field.
         data_center: Option<String>,
-        /// This node's rack within [`Self::data_center`]. `None` = not
-        /// advertised; see [`Self::data_center`].
+        /// This node's rack within `data_center`. `None` = not
+        /// advertised; see `data_center`.
         rack: Option<String>,
     },
     HandshakeAck {
