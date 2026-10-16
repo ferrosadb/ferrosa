@@ -298,31 +298,25 @@ jobs:
           #
           # `--exclude` / `--lib` / `--tests` / `--all-features` take the same
           # values in both runners. The `--` separator is the only difference.
-          # NOTE: the real-process cluster harnesses are excluded by their SIX
-          # EXACT binary names, and they run in their own step below -- each
-          # spawns three real node processes, and inside this ~9,700-test run one
-          # of them can be starved for its entire readiness budget
-          # (indistinguishable from a hang).
+          # NOTE: EVERY exclusion must live in ONE `-E` expression.
           #
-          # Do NOT switch this back to a `binary(~_process)` regex. It looks
-          # equivalent and is not: the same expression selected 13 tests under one
-          # nextest version and excluded none at all in CI, so the harnesses ran
-          # inside the big suite anyway -- which is the starvation this exclusion
-          # exists to prevent. Exact names are unambiguous in every version, and
-          # are the idiom already used for accord_apply_decode_residency.
+          # nextest does NOT AND repeated `-E` flags: pass two and filtering is
+          # silently disabled altogether. Measured on a two-binary probe crate --
+          # `-E 'not binary(alpha_process)' -E 'not binary(beta)'` listed BOTH
+          # tests, while the same two clauses joined by `and` in a single `-E`
+          # listed neither. This step carried two `-E` flags for a long time, so
+          # NO exclusion here ever took effect: the real-process cluster harnesses
+          # (six binaries, each spawning three real node processes) ran inside the
+          # ~9,700-test suite and were starved for their whole readiness budget,
+          # which is exactly the ~96 s failure the isolated step below exists to
+          # prevent. Keep one expression; never split it into a second flag.
           # Keep shell comments ABOVE this command, never between its backslash
           # continuations: a `#` line ends the logical line, silently dropping
           # every flag after it -- including the whole `--skip` list below, which
           # is how this step once ran 9,740 tests and failed six of them.
           cargo nextest run --all-features --workspace --lib --tests \
             --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
-            -E 'not binary(accord_apply_decode_residency)' \
-            -E 'not binary(commit_guarantee_replica_process)' \
-            -E 'not binary(drop_table_replica_process)' \
-            -E 'not binary(jsonb_first_class_cluster_process)' \
-            -E 'not binary(pg_public_keyspace_rf_process)' \
-            -E 'not binary(pg_select_cluster_read_process)' \
-            -E 'not binary(pg_txn_value_process)' \
+            -E 'not binary(accord_apply_decode_residency) and not binary(commit_guarantee_replica_process) and not binary(drop_table_replica_process) and not binary(jsonb_first_class_cluster_process) and not binary(pg_public_keyspace_rf_process) and not binary(pg_select_cluster_read_process) and not binary(pg_txn_value_process)' \
             -- --skip ::slow:: --skip accord::perf --skip conflict_index_residency_projection_absolute \
                --skip apply_writeset_peak_stays_within_the_input_size \
                --skip apply_writeset_borrowed_does_not_hold_the_decoded_batch_resident \
