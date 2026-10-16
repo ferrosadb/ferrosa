@@ -17,7 +17,7 @@ use socket2::SockRef;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::Framed;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::error::CqlError;
 use crate::frame::{
@@ -274,7 +274,15 @@ impl CqlServer {
             let listener = match TcpListener::bind(bind_addr).await {
                 Ok(listener) => listener,
                 Err(e) => {
-                    let _ = addr_tx.send(Err(CqlError::from(e)));
+                    // Name the listener and the address: a bare
+                    // `I/O error: Address already in use` here reads as an
+                    // anonymous failure, so a reader of a red cannot tell which
+                    // of the node's listeners collided.
+                    error!("CQL listener bind failed e={e} cql_bind={bind_addr}");
+                    let _ = addr_tx.send(Err(CqlError::from(std::io::Error::new(
+                        e.kind(),
+                        format!("CQL listener bind {bind_addr}: {e}"),
+                    ))));
                     return;
                 }
             };

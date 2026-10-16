@@ -3306,7 +3306,18 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // default. The resolved address is the one passed to the listener.
     let web_config = resolve_web_config(&file_config, &listener_tls_inputs.web);
     tracing::info!(bind_addr = %web_config.bind_addr, "web console bind configured");
-    let web_addr = web::start_web_server(&web_config, web_state).await?;
+    let web_addr = web::start_web_server(&web_config, web_state)
+        .await
+        .map_err(|e| {
+            // Name the listener and the address. The bare
+            // `server error: I/O error: Address already in use` this produced
+            // named neither, so a reader of a red could not tell which of the
+            // node's eight listeners collided -- a port collision read as a hang.
+            format!(
+                "web console listener bind {} failed: {e}",
+                web_config.bind_addr
+            )
+        })?;
     tracing::info!(%web_addr, "web console listening");
 
     // 10. Graph engine — FERROSA_GRAPH_ENABLED env var, then [graph] enabled
