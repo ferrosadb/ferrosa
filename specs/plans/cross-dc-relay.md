@@ -34,6 +34,25 @@ Status: in progress. Owner: Ben. Decisions from the design grill (2026-10-16).
 | I8 | A retried copy that already applied is a no-op (Accord `txn_id` ledger; schema `schema_version`) | existing: `multi_dc_apply` ledger tests + `cross_dc_dispatch` dedupe note |
 | I9 | A relayed DML op leaves the same rows in the remote DC as a local write (data preserved, no duplication) | to be written with the DML slice |
 
+### Slice 4 invariants (DML fan-out), stated before any write-path change
+
+The DDL slice relays through `DdlPath`; DML is harder because the fan-out lives on
+the hot path (`coordinate_write_nts`), so these are written first, one test each:
+
+| id | invariant | why it could break |
+|---|---|---|
+| I10 | A DML operation addresses **at most one node per remote DC** (N DCs ⇒ ≤ N−1 cross-DC sends), never one per replica node | the existing path enumerates replicas and would enumerate remote ones |
+| I11 | The receiving DC resolves **its own** replica set for the token; the sender never names a remote replica | else placement logic leaks across the WAN and DC-local placement stops being DC-local |
+| I12 | DML is **data-preserving**: the same rows land in the remote DC, no loss and no duplication, and a retried copy is a no-op | a retry after a lost ack must not double-apply (idempotency is by the Accord `txn_id` the engine already dedupes on) |
+| I13 | The client's consistency level is unchanged by the relay: only `EACH_QUORUM`/`ALL`/`SERIAL` wait on a remote DC; `LOCAL_*`/`QUORUM` do not | a WAN hop must never become part of a local quorum's latency |
+| I14 | The relayed payload is the existing encoding on the hot path — the Accord write-set / capnp frames the path already uses, never a new bincode or JSON per row | hot-path serialization is capnp by rule; a JSON row image already rides inside the Accord write-set |
+
+I10–I12 are the reason this slice is not started yet: which node in the receiving
+DC the copy goes to (its registry contact, rotated per I3) and how that node
+places the rows for its own ring (I11) interact with the CL-76 finding — a DC that
+cannot accept clients still applies relayed internode work, which is exactly the
+shape a DML copy needs, but it must not be *chosen* by placement logic.
+
 ## Slices
 
 1. **DC registry + live-candidate rotation** — done (`e5a3086b`).
