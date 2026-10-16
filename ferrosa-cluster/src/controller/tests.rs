@@ -5129,7 +5129,14 @@ async fn primary_paired_with(
         controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
-    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()), 0);
+    controller.on_inbound_peer(
+        (peer_id, peer.addr),
+        None,
+        Some(peer.addr.to_string()),
+        0,
+        None,
+        None,
+    );
     assert_eq!(controller.role(), Some(PairRole::Primary));
     for _ in 0..100 {
         if pm.has_peer(peer_id) {

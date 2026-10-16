@@ -1074,6 +1074,8 @@ mod tests {
             cql_broadcast: None,
             internode_broadcast: Some("h:17000".into()),
             capabilities: 0x1,
+            data_center: None,
+            rack: None,
         };
         let mut new_format = BytesMut::new();
         msg.encode(&mut new_format).unwrap();
@@ -1166,9 +1168,16 @@ mod tests {
 
         // v0.23 format: capability u32 present, DC/rack absent.
         let v023 = Message::HandshakeAck {
+            host_id: Uuid::new_v4(),
+            protocol_version: 1,
+            chosen_compression: 0,
+            accepted: true,
+            reason: String::new(),
+            cql_broadcast: None,
+            internode_broadcast: Some("n:17000".into()),
+            capabilities: crate::handshake::CAP_RESULT_CURSOR_PAGE,
             data_center: None,
             rack: None,
-            ..new.clone()
         };
         let mut v023_buf = BytesMut::new();
         v023.encode(&mut v023_buf).unwrap();
@@ -1301,9 +1310,10 @@ mod tests {
         put_bytes(&mut buf, &[]).unwrap();
         buf.put_u8(0); // no cql_broadcast
         buf.put_u8(0); // no internode_broadcast
+        buf.put_u32(0); // capability bits keep their offset ahead of the topology
         buf.put_u8(1); // data_center present
         put_string(&mut buf, "dc7").unwrap();
-        // No rack marker.
+        // No rack marker: the body ends, so the rack decodes to `None`.
 
         let decoded = Message::decode(MsgType::Handshake, &mut buf.freeze()).unwrap();
         match decoded {
