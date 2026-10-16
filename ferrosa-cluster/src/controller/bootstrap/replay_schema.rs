@@ -171,14 +171,11 @@ pub async fn replay_round(target: &ReplayTarget<'_>, ops: Vec<LabeledDdl>) -> Ro
             ))),
             // Bootstrap schema hand-off, not a client DDL: no
             // read-your-writes wait needed.
-            (Some(_), Some(uuid)) => crate::ddl_path::forward_ddl_to_leader(
-                None,
-                target.peer_manager,
-                uuid,
-                &ddl.op,
-            )
-            .await
-            .map(|_| ()),
+            (Some(_), Some(uuid)) => {
+                crate::ddl_path::forward_ddl_to_leader(None, target.peer_manager, uuid, &ddl.op)
+                    .await
+                    .map(|_| ())
+            }
         };
         if let Err(e) = result {
             if is_retryable_forward_error(&e) {

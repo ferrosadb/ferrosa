@@ -794,12 +794,7 @@ impl InboundPeerCallback for ModeController {
         {
             self.connected_peers.rcu(|current| {
                 let mut next = (**current).clone();
-                track_connected_peer(
-                    &mut next,
-                    host_id,
-                    reverse_addr,
-                    super::MAX_CONNECTED_PEERS,
-                );
+                track_connected_peer(&mut next, host_id, reverse_addr, super::MAX_CONNECTED_PEERS);
                 next
             });
         }

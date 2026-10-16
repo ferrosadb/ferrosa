@@ -497,7 +497,11 @@ mod tests {
             }
         }
 
-        fn refusing_dc(registry: &BTreeMap<String, super::DcLink>, dc: &str, refusals: u32) -> Self {
+        fn refusing_dc(
+            registry: &BTreeMap<String, super::DcLink>,
+            dc: &str,
+            refusals: u32,
+        ) -> Self {
             let mut sender = Self::for_registry(registry);
             sender
                 .refuse_first

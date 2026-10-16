@@ -6239,7 +6239,10 @@ fn a_peer_topology_snapshot_does_not_change_under_a_later_recording() {
          snapshot that mutates under the reader is not a snapshot"
     );
     assert_eq!(
-        controller.peer_dcs_snapshot().get(&peer).map(String::as_str),
+        controller
+            .peer_dcs_snapshot()
+            .get(&peer)
+            .map(String::as_str),
         Some("eu-west-1"),
         "and a snapshot taken after it must see the recording"
     );
@@ -6279,7 +6282,10 @@ fn reading_the_peer_topology_maps_does_not_copy_them() {
         controller.peer_racks_snapshot(),
         controller.peer_racks_snapshot(),
     );
-    assert!(Arc::ptr_eq(&rack_first, &rack_second), "racks mirror the DCs");
+    assert!(
+        Arc::ptr_eq(&rack_first, &rack_second),
+        "racks mirror the DCs"
+    );
 
     controller.record_peer_dc(other, "eu-west-1");
 

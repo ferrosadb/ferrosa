@@ -748,50 +748,88 @@ fn ddl_op_to_raft_command(op: &DdlOperation) -> RaftCommand {
         DdlOperation::CreateKeyspace(ks) => RaftOp::CreateKeyspace(ks.clone()),
         DdlOperation::DropKeyspace(name) => RaftOp::DropKeyspace(name.clone()),
         DdlOperation::CreateTable(table) => RaftOp::CreateTable(table.clone()),
-        DdlOperation::DropTable { keyspace, table } => RaftOp::DropTable { keyspace: keyspace.clone(), table: table.clone() },
-        DdlOperation::AlterKeyspace { name, updates } => RaftOp::AlterKeyspace { name: name.clone(), updates: updates.clone() },
+        DdlOperation::DropTable { keyspace, table } => RaftOp::DropTable {
+            keyspace: keyspace.clone(),
+            table: table.clone(),
+        },
+        DdlOperation::AlterKeyspace { name, updates } => RaftOp::AlterKeyspace {
+            name: name.clone(),
+            updates: updates.clone(),
+        },
         DdlOperation::AlterTable {
             keyspace,
             table,
             updates,
-        } => RaftOp::AlterTable { keyspace: keyspace.clone(), table: table.clone(), updates: updates.clone() },
+        } => RaftOp::AlterTable {
+            keyspace: keyspace.clone(),
+            table: table.clone(),
+            updates: updates.clone(),
+        },
         DdlOperation::CreateRole(role) => RaftOp::CreateRole(role.clone()),
-        DdlOperation::AlterRole { name, updates } => RaftOp::AlterRole { name: name.clone(), updates: updates.clone() },
+        DdlOperation::AlterRole { name, updates } => RaftOp::AlterRole {
+            name: name.clone(),
+            updates: updates.clone(),
+        },
         DdlOperation::DropRole(name) => RaftOp::DropRole(name.clone()),
         DdlOperation::Grant(entry) => RaftOp::Grant(entry.clone()),
         DdlOperation::Revoke {
             role,
             resource,
             permission,
-        } => RaftOp::Revoke { role: role.clone(), resource: resource.clone(), permission: permission.clone() },
+        } => RaftOp::Revoke {
+            role: role.clone(),
+            resource: resource.clone(),
+            permission: permission.clone(),
+        },
         DdlOperation::GrantRole {
             member,
             granted_role,
-        } => RaftOp::GrantRole { member: member.clone(), granted_role: granted_role.clone() },
+        } => RaftOp::GrantRole {
+            member: member.clone(),
+            granted_role: granted_role.clone(),
+        },
         DdlOperation::RevokeRole {
             member,
             granted_role,
-        } => RaftOp::RevokeRole { member: member.clone(), granted_role: granted_role.clone() },
+        } => RaftOp::RevokeRole {
+            member: member.clone(),
+            granted_role: granted_role.clone(),
+        },
         DdlOperation::CreateIndex(idx) => RaftOp::CreateIndex(idx.clone()),
         DdlOperation::DropIndex {
             keyspace,
             table,
             index,
-        } => RaftOp::DropIndex { keyspace: keyspace.clone(), table: table.clone(), index: index.clone() },
+        } => RaftOp::DropIndex {
+            keyspace: keyspace.clone(),
+            table: table.clone(),
+            index: index.clone(),
+        },
         DdlOperation::CreateType(udt) => RaftOp::CreateType(udt.clone()),
-        DdlOperation::DropType { keyspace, name } => RaftOp::DropType { keyspace: keyspace.clone(), name: name.clone() },
+        DdlOperation::DropType { keyspace, name } => RaftOp::DropType {
+            keyspace: keyspace.clone(),
+            name: name.clone(),
+        },
         DdlOperation::CreateFunction(func) => RaftOp::CreateFunction(func.clone()),
         DdlOperation::DropFunction {
             keyspace,
             name,
             arg_types,
-        } => RaftOp::DropFunction { keyspace: keyspace.clone(), name: name.clone(), arg_types: arg_types.clone() },
+        } => RaftOp::DropFunction {
+            keyspace: keyspace.clone(),
+            name: name.clone(),
+            arg_types: arg_types.clone(),
+        },
         DdlOperation::CreateAggregate(agg) => RaftOp::CreateAggregate(agg.clone()),
         DdlOperation::DropAggregate {
             keyspace,
             name,
             arg_types,
-        } => RaftOp::DropAggregate { keyspace: keyspace.clone(), name: name.clone(), arg_types: arg_types.clone() },
+        } => RaftOp::DropAggregate {
+            keyspace: keyspace.clone(),
+            name: name.clone(),
+            arg_types: arg_types.clone(),
+        },
         DdlOperation::JoinNode(node_info) => RaftOp::JoinNode(node_info.clone()),
     };
     RaftCommand {
