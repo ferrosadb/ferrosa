@@ -68,6 +68,7 @@ use parking_lot::Mutex;
 use arc_swap::ArcSwap;
 use uuid::Uuid;
 
+mod cross_dc;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::rpc::HandlerRegistry;
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};

@@ -6189,3 +6189,57 @@ fn seed_join_node_info_falls_back_to_local_for_a_silent_peer() {
     assert_eq!(info.data_center, "dc1");
     assert_eq!(info.rack, "rack1");
 }
+
+/// The registry is how one DC reaches another: it holds the *other* DC's known
+/// nodes, keeps out of its own, and never invents a DC for a peer that announced
+/// none. Built from what the node learned at runtime, not from configuration.
+#[test]
+fn cross_dc_registry_holds_the_other_dcs_and_not_this_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) =
+        ModeController::new(config, net_config, local_id, storage, schema, registry);
+
+    let west = Uuid::new_v4();
+    let east_a = Uuid::new_v4();
+    let east_b = Uuid::new_v4();
+    let unplaced = Uuid::new_v4();
+    controller.set_connected_peers_for_test(vec![
+        (west, "127.0.0.1:7001".parse().unwrap()),
+        (east_a, "127.0.0.1:7002".parse().unwrap()),
+        (east_b, "127.0.0.1:7003".parse().unwrap()),
+        (unplaced, "127.0.0.1:7004".parse().unwrap()),
+    ]);
+    controller.record_peer_dc(west, "us-west-2");
+    controller.record_peer_dc(east_a, "eu-west-1");
+    controller.record_peer_dc(east_b, "eu-west-1");
+
+    let links = controller.cross_dc_registry();
+
+    assert_eq!(
+        links.keys().cloned().collect::<Vec<_>>(),
+        vec!["eu-west-1".to_string()],
+        "one link, to the other DC: a same-DC peer is not a relay target"
+    );
+    assert_eq!(
+        links["eu-west-1"].candidates.len(),
+        2,
+        "every node the other DC announced is a candidate"
+    );
+    assert!(
+        links["eu-west-1"]
+            .candidates
+            .iter()
+            .all(|candidate| candidate.host_id != unplaced),
+        "a peer that announced no DC is never addressed as a remote DC — it is \
+         treated as local everywhere else"
+    );
+}

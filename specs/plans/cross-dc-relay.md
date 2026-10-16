@@ -36,14 +36,24 @@ Status: in progress. Owner: Ben. Decisions from the design grill (2026-10-16).
 
 ## Slices
 
-1. **DC registry + live-candidate rotation** (this slice).
+1. **DC registry + live-candidate rotation** — done (`e5a3086b`).
    `dc_registry()` replaces the single-contact rule: every known node of a remote
    DC is a candidate (deterministic order), the relay tries them in turn, and a
    DC is delivered by whichever candidate acknowledges.
-2. **CL-dependent delivery**: `EACH_QUORUM`/`ALL` wait for every remote DC; the
-   others commit and record a pending delivery for repair.
-3. **Wire the relay into the per-DC Raft commit path** (DDL/schema, membership):
-   after the local group commits, one copy per remote DC. Real-process 2-DC proof.
+2. **CL-dependent delivery** — done (`aabd7235`): `EACH_QUORUM`/`ALL`/`SERIAL`
+   wait for every remote DC; the others commit and record a pending delivery for
+   repair (`CROSS_DC_PENDING_REPAIRS_TOTAL`).
+3. **Wire the relay into the per-DC Raft commit path** — in progress. The runtime
+   half is in: `ModeController::cross_dc_registry()` (built from `connected_peers`
+   + announced DCs) and `ModeController::relay_ddl()`, which hands a committed DDL
+   to every remote DC over the existing `Message::PairDdlForward`, so the
+   receiving node's `ClusterDdlForwardHandler` puts the copy into *its* DC's
+   group — no new protocol surface. Proven on real 3-voter groups in
+   `tests/cross_dc_ddl_relay.rs` (one copy → every voter in the receiving DC has
+   the keyspace).
+   Remaining: the CQL router call site (after a successful DDL commit) and a
+   real-process 2-DC CQL proof (create keyspace on `us-west-2`, read it on
+   `eu-west-1`).
 4. **DML DC-granularity**: the coordinator sends one copy per remote DC; the
    receiving DC fans out to its own replicas.
 5. **3-DC real-process ring**: each DC relays to the other two; kill/partition

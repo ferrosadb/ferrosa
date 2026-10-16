@@ -324,6 +324,45 @@ pub enum CrossDcOutcome {
     },
 }
 
+/// The outcome for a delivery report, given what the level demands.
+///
+/// The CL policy lives here alone so every call site — including one that could
+/// not even build a transport — reaches the same verdict, and an asynchronous
+/// level accrues its repair debt in exactly one place.
+pub fn outcome_for_report(
+    report: FanoutReport,
+    cl: ConsistencyLevel,
+    remote_dcs: usize,
+) -> CrossDcOutcome {
+    if remote_dcs == 0 {
+        return CrossDcOutcome::SingleDc;
+    }
+    if report.failed.is_empty() {
+        return CrossDcOutcome::Complete(report);
+    }
+    match delivery_for_cl(cl, remote_dcs) {
+        // The level needs every DC's share: the operation is NOT satisfied and
+        // must not be reported to the client as committed.
+        CrossDcDelivery::AllDcs => CrossDcOutcome::NotSatisfied {
+            missing: report.failed.clone(),
+            report,
+        },
+        // Satisfied inside this DC already: the copy is owed, counted, repaired.
+        CrossDcDelivery::Async => {
+            CROSS_DC_PENDING_REPAIRS_TOTAL.fetch_add(report.failed.len() as u64, Ordering::Relaxed);
+            tracing::warn!(
+                owed = ?report.failed,
+                cl = ?cl,
+                "cross-DC copies owed: recorded for repair, client satisfied locally"
+            );
+            CrossDcOutcome::PendingLocally {
+                owed: report.failed.clone(),
+                report,
+            }
+        }
+    }
+}
+
 /// Process-global count of remote DCs left owed a copy by an asynchronous
 /// delivery — the repair debt a `QUORUM`/`LOCAL_*` client never waits on.
 pub static CROSS_DC_PENDING_REPAIRS_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -347,36 +386,9 @@ impl CrossDcDispatch {
         Op: Send + Sync,
         S: CrossDcSender<Op>,
     {
-        if registry.is_empty() {
-            return CrossDcOutcome::SingleDc;
-        }
+        let remote_dcs = registry.len();
         let report = self.fan_out_registry(sender, op, registry).await;
-        if report.failed.is_empty() {
-            return CrossDcOutcome::Complete(report);
-        }
-        match delivery_for_cl(cl, registry.len()) {
-            // The level needs every DC's share: the operation is NOT satisfied,
-            // and must not be reported to the client as committed.
-            CrossDcDelivery::AllDcs => CrossDcOutcome::NotSatisfied {
-                missing: report.failed.clone(),
-                report,
-            },
-            // Satisfied inside this DC already: the copy is owed, counted, and
-            // repaired — the client is not held behind a WAN.
-            CrossDcDelivery::Async => {
-                CROSS_DC_PENDING_REPAIRS_TOTAL
-                    .fetch_add(report.failed.len() as u64, Ordering::Relaxed);
-                tracing::warn!(
-                    owed = ?report.failed,
-                    cl = ?cl,
-                    "cross-DC copies owed: recorded for repair, client satisfied locally"
-                );
-                CrossDcOutcome::PendingLocally {
-                    owed: report.failed.clone(),
-                    report,
-                }
-            }
-        }
+        outcome_for_report(report, cl, remote_dcs)
     }
 }
 
