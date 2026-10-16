@@ -501,8 +501,14 @@ impl PeerEventListener for ModeController {
 
         // Track this peer
         {
-            let mut peers = self.connected_peers.lock();
-            track_connected_peer(&mut peers, host_id, addr, super::MAX_CONNECTED_PEERS);
+            // R-C-U: the tracked set is republished whole, so a reader (a mode
+            // transition, a peer plan, the DC registry) never takes a lock and
+            // never sees a half-updated list.
+            self.connected_peers.rcu(|current| {
+                let mut next = (**current).clone();
+                track_connected_peer(&mut next, host_id, addr, super::MAX_CONNECTED_PEERS);
+                next
+            });
         }
 
         // Register this peer's host_id in the raft network factory's node_map so
@@ -519,7 +525,7 @@ impl PeerEventListener for ModeController {
         let guard_start = std::time::Instant::now();
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        let all_peers = self.connected_peers.lock().clone();
+        let all_peers = self.connected_peers.load_full();
         let (cql_broadcast, internode_broadcast) =
             if matches!(current_mode, DeploymentMode::Cluster) {
                 let pm = self.peer_manager.load();
@@ -536,7 +542,7 @@ impl PeerEventListener for ModeController {
             host_id,
             addr,
             inbound: false,
-            connected_peers_after_track: all_peers.clone(),
+            connected_peers_after_track: (*all_peers).clone(),
             committed_cluster_size: self
                 .committed_cluster_size
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -561,8 +567,11 @@ impl PeerEventListener for ModeController {
 
         // Remove from tracked peers
         {
-            let mut peers = self.connected_peers.lock();
-            peers.retain(|(id, _)| *id != host_id);
+            self.connected_peers.rcu(|current| {
+                let mut next = (**current).clone();
+                next.retain(|(id, _)| *id != host_id);
+                next
+            });
         }
 
         // Hold the transition guard to prevent a disconnect handler from racing
@@ -577,7 +586,7 @@ impl PeerEventListener for ModeController {
                 // Check if remaining connected peers can form a quorum.
                 // Use committed cluster size (not dynamic connected count)
                 // to prevent premature quorum claims after partitions.
-                let connected = self.connected_peers.lock().len();
+                let connected = self.connected_peers.load().len();
                 let committed = self
                     .committed_cluster_size
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -783,18 +792,21 @@ impl InboundPeerCallback for ModeController {
 
         // Track this peer
         {
-            let mut peers = self.connected_peers.lock();
-            track_connected_peer(
-                &mut peers,
-                host_id,
-                reverse_addr,
-                super::MAX_CONNECTED_PEERS,
-            );
+            self.connected_peers.rcu(|current| {
+                let mut next = (**current).clone();
+                track_connected_peer(
+                    &mut next,
+                    host_id,
+                    reverse_addr,
+                    super::MAX_CONNECTED_PEERS,
+                );
+                next
+            });
         }
 
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        let all_peers = self.connected_peers.lock().clone();
+        let all_peers = self.connected_peers.load_full();
         let plan = peer_plan::plan_peer_connected(PeerConnectPlanInput {
             mode: current_mode,
             host_id,
@@ -805,7 +817,7 @@ impl InboundPeerCallback for ModeController {
             // distinct ports (t_7c01df7e).
             addr: reverse_addr,
             inbound: true,
-            connected_peers_after_track: all_peers.clone(),
+            connected_peers_after_track: (*all_peers).clone(),
             committed_cluster_size: self
                 .committed_cluster_size
                 .load(std::sync::atomic::Ordering::Relaxed),

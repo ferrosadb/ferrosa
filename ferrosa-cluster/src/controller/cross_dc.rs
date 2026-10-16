@@ -48,7 +48,7 @@ impl ModeController {
     pub fn cross_dc_registry(&self) -> BTreeMap<String, DcLink> {
         // Same idiom as `connected_peers_for_test`: a `parking_lot`-style guard,
         // so no poisoning to handle.
-        let peers: Vec<(Uuid, SocketAddr)> = self.connected_peers.lock().clone();
+        let peers: Arc<Vec<(Uuid, SocketAddr)>> = self.connected_peers.load_full();
         dc_registry(&peers, &self.peer_dcs_snapshot(), &self.config.data_center)
     }
 

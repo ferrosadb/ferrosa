@@ -10,15 +10,15 @@
 
 mod common;
 
-use std::collections::HashMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::raft_harness::TestCluster;
 
 use ferrosa_cluster::accord::cross_dc_dispatch::{
     cross_dc_pending_repairs_total, dc_registry, CrossDcDispatch, CrossDcOutcome,
-    CrossDcRetryPolicy, CrossDcSender, DcContact,
+    CrossDcRetryPolicy, CrossDcSender, DcContact, DcLink,
 };
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::raft::{RaftCommand, RaftOp, RaftResponse};
@@ -70,31 +70,44 @@ fn east_registry(
 /// side of the relay — so the copy enters that DC's own group.
 struct DcForwardSender<'a> {
     cluster: &'a TestCluster,
-    sends_per_dc: Mutex<HashMap<String, usize>>,
+    /// One atomic per DC, resolved from the registry BEFORE the first send.
+    ///
+    /// A `Mutex<HashMap>` here is a lock plus an entry insert on the very path
+    /// this harness exists to observe: the fan-out would be measuring its own
+    /// harness's contention, and every assertion below asks only for a COUNT.
+    sends_per_dc: Vec<(String, AtomicUsize)>,
 }
 
 impl<'a> DcForwardSender<'a> {
-    fn new(cluster: &'a TestCluster) -> Self {
+    fn new(cluster: &'a TestCluster, registry: &BTreeMap<String, DcLink>) -> Self {
         Self {
             cluster,
-            sends_per_dc: Mutex::new(HashMap::new()),
+            sends_per_dc: registry
+                .keys()
+                .map(|dc| (dc.clone(), AtomicUsize::new(0)))
+                .collect(),
+        }
+    }
+
+    fn count_send(&self, dc: &str) {
+        if let Some((_, count)) = self.sends_per_dc.iter().find(|(name, _)| name == dc) {
+            count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     fn sends_for(&self, dc: &str) -> usize {
-        *self.sends_per_dc.lock().unwrap().get(dc).unwrap_or(&0)
+        self.sends_per_dc
+            .iter()
+            .find(|(name, _)| name == dc)
+            .map(|(_, count)| count.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 }
 
 #[async_trait::async_trait]
 impl CrossDcSender<RaftCommand> for DcForwardSender<'_> {
     async fn send_to_contact(&self, contact: &DcContact, op: &RaftCommand) -> Result<(), String> {
-        *self
-            .sends_per_dc
-            .lock()
-            .unwrap()
-            .entry(contact.dc.clone())
-            .or_insert(0) += 1;
+        self.count_send(&contact.dc);
         // Whichever node of the receiving DC was contacted, the DDL enters that
         // DC's own group through its leader — what the production handler does.
         self.cluster.require_leader(Duration::from_secs(10)).await;
@@ -167,7 +180,7 @@ async fn one_ddl_copy_reaches_the_remote_dcs_own_quorum() {
         "the link holds all three of dc2's nodes"
     );
 
-    let sender = DcForwardSender::new(&east);
+    let sender = DcForwardSender::new(&east, &registry);
     let report = CrossDcDispatch::default()
         .fan_out_registry(&sender, &ddl, &registry)
         .await;

@@ -162,7 +162,7 @@ pub async fn replay_round(target: &ReplayTarget<'_>, ops: Vec<LabeledDdl>) -> Ro
         let result = match (leader, leader_uuid) {
             (None, _) => Err(ClusterError::NotLeader { leader_id: None }),
             (Some(lid), _) if lid == target.local_node_id => {
-                crate::ddl_path::execute_via_raft(target.raft, ddl.op.clone())
+                crate::ddl_path::execute_via_raft(target.raft, &ddl.op)
                     .await
                     .map(|_| ())
             }
@@ -175,7 +175,7 @@ pub async fn replay_round(target: &ReplayTarget<'_>, ops: Vec<LabeledDdl>) -> Ro
                 None,
                 target.peer_manager,
                 uuid,
-                ddl.op.clone(),
+                &ddl.op,
             )
             .await
             .map(|_| ()),

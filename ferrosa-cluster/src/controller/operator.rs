@@ -32,7 +32,7 @@ impl ModeController {
         );
         self.force_promoted.store(true, Ordering::Release);
         *self.pair_context.lock() = None;
-        self.connected_peers.lock().clear();
+        self.connected_peers.store(Arc::new(Vec::new()));
         tracing::info!(epoch, "force promoted to standalone primary");
         Ok(())
     }
@@ -176,7 +176,7 @@ impl ModeController {
                 "downgrade to pair refused: {partner} is not a cluster member"
             ));
         }
-        let peers = self.connected_peers.lock().clone();
+        let peers = self.connected_peers.load_full();
         let is_up = |host: Uuid| peers.iter().any(|(id, _)| *id == host);
         let down: Vec<Uuid> = ring
             .node_ids()

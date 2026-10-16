@@ -205,7 +205,7 @@ impl DdlPath {
                 node_map,
                 relay,
             } => {
-                let committed = match execute_via_raft(raft, op.clone()).await {
+                let committed = match execute_via_raft(raft, &op).await {
                     // Leader applied the DDL (client_write awaits leader apply),
                     // so read-your-writes already holds on this node.
                     Ok(_committed_index) => Ok(()),
@@ -224,7 +224,7 @@ impl DdlPath {
                             // for THIS node to apply before returning, so the
                             // client sees its own write on this follower.
                             Some(uuid) => {
-                                forward_ddl_to_leader(Some(raft), peer_manager, uuid, op.clone())
+                                forward_ddl_to_leader(Some(raft), peer_manager, uuid, &op)
                                     .await
                                     .map(|_committed| ())
                             }
@@ -667,8 +667,12 @@ pub(crate) async fn forward_ddl_to_leader(
     local_raft: Option<&FerrosRaft>,
     peer_manager: &PeerManager,
     leader_uuid: Uuid,
-    op: DdlOperation,
+    op: &DdlOperation,
 ) -> Result<u64> {
+    // Borrowed, never taken: a caller on the commit path relays the SAME
+    // operation to the other DCs after forwarding it, and this function only
+    // serialises it -- an owned parameter forces a whole-operation clone at
+    // every site for no reason.
     let body = op.to_bytes()?;
     let resp = match peer_manager
         .send(
@@ -736,82 +740,59 @@ pub(crate) async fn forward_ddl_to_leader(
 ///
 /// The leader generates a fresh `schema_version` UUID here so that all
 /// followers replicate exactly the same version after applying the log entry.
-fn ddl_op_to_raft_command(op: DdlOperation) -> RaftCommand {
+/// Borrows the operation: the caller (the commit path) still needs it to relay
+/// the same operation to the other DCs, and only the payload the command owns
+/// is cloned here -- one field, not the whole operation.
+fn ddl_op_to_raft_command(op: &DdlOperation) -> RaftCommand {
     let raft_op = match op {
-        DdlOperation::CreateKeyspace(ks) => RaftOp::CreateKeyspace(ks),
-        DdlOperation::DropKeyspace(name) => RaftOp::DropKeyspace(name),
-        DdlOperation::CreateTable(table) => RaftOp::CreateTable(table),
-        DdlOperation::DropTable { keyspace, table } => RaftOp::DropTable { keyspace, table },
-        DdlOperation::AlterKeyspace { name, updates } => RaftOp::AlterKeyspace { name, updates },
+        DdlOperation::CreateKeyspace(ks) => RaftOp::CreateKeyspace(ks.clone()),
+        DdlOperation::DropKeyspace(name) => RaftOp::DropKeyspace(name.clone()),
+        DdlOperation::CreateTable(table) => RaftOp::CreateTable(table.clone()),
+        DdlOperation::DropTable { keyspace, table } => RaftOp::DropTable { keyspace: keyspace.clone(), table: table.clone() },
+        DdlOperation::AlterKeyspace { name, updates } => RaftOp::AlterKeyspace { name: name.clone(), updates: updates.clone() },
         DdlOperation::AlterTable {
             keyspace,
             table,
             updates,
-        } => RaftOp::AlterTable {
-            keyspace,
-            table,
-            updates,
-        },
-        DdlOperation::CreateRole(role) => RaftOp::CreateRole(role),
-        DdlOperation::AlterRole { name, updates } => RaftOp::AlterRole { name, updates },
-        DdlOperation::DropRole(name) => RaftOp::DropRole(name),
-        DdlOperation::Grant(entry) => RaftOp::Grant(entry),
+        } => RaftOp::AlterTable { keyspace: keyspace.clone(), table: table.clone(), updates: updates.clone() },
+        DdlOperation::CreateRole(role) => RaftOp::CreateRole(role.clone()),
+        DdlOperation::AlterRole { name, updates } => RaftOp::AlterRole { name: name.clone(), updates: updates.clone() },
+        DdlOperation::DropRole(name) => RaftOp::DropRole(name.clone()),
+        DdlOperation::Grant(entry) => RaftOp::Grant(entry.clone()),
         DdlOperation::Revoke {
             role,
             resource,
             permission,
-        } => RaftOp::Revoke {
-            role,
-            resource,
-            permission,
-        },
+        } => RaftOp::Revoke { role: role.clone(), resource: resource.clone(), permission: permission.clone() },
         DdlOperation::GrantRole {
             member,
             granted_role,
-        } => RaftOp::GrantRole {
-            member,
-            granted_role,
-        },
+        } => RaftOp::GrantRole { member: member.clone(), granted_role: granted_role.clone() },
         DdlOperation::RevokeRole {
             member,
             granted_role,
-        } => RaftOp::RevokeRole {
-            member,
-            granted_role,
-        },
-        DdlOperation::CreateIndex(idx) => RaftOp::CreateIndex(idx),
+        } => RaftOp::RevokeRole { member: member.clone(), granted_role: granted_role.clone() },
+        DdlOperation::CreateIndex(idx) => RaftOp::CreateIndex(idx.clone()),
         DdlOperation::DropIndex {
             keyspace,
             table,
             index,
-        } => RaftOp::DropIndex {
-            keyspace,
-            table,
-            index,
-        },
-        DdlOperation::CreateType(udt) => RaftOp::CreateType(udt),
-        DdlOperation::DropType { keyspace, name } => RaftOp::DropType { keyspace, name },
-        DdlOperation::CreateFunction(func) => RaftOp::CreateFunction(func),
+        } => RaftOp::DropIndex { keyspace: keyspace.clone(), table: table.clone(), index: index.clone() },
+        DdlOperation::CreateType(udt) => RaftOp::CreateType(udt.clone()),
+        DdlOperation::DropType { keyspace, name } => RaftOp::DropType { keyspace: keyspace.clone(), name: name.clone() },
+        DdlOperation::CreateFunction(func) => RaftOp::CreateFunction(func.clone()),
         DdlOperation::DropFunction {
             keyspace,
             name,
             arg_types,
-        } => RaftOp::DropFunction {
-            keyspace,
-            name,
-            arg_types,
-        },
-        DdlOperation::CreateAggregate(agg) => RaftOp::CreateAggregate(agg),
+        } => RaftOp::DropFunction { keyspace: keyspace.clone(), name: name.clone(), arg_types: arg_types.clone() },
+        DdlOperation::CreateAggregate(agg) => RaftOp::CreateAggregate(agg.clone()),
         DdlOperation::DropAggregate {
             keyspace,
             name,
             arg_types,
-        } => RaftOp::DropAggregate {
-            keyspace,
-            name,
-            arg_types,
-        },
-        DdlOperation::JoinNode(node_info) => RaftOp::JoinNode(node_info),
+        } => RaftOp::DropAggregate { keyspace: keyspace.clone(), name: name.clone(), arg_types: arg_types.clone() },
+        DdlOperation::JoinNode(node_info) => RaftOp::JoinNode(node_info.clone()),
     };
     RaftCommand {
         op: raft_op,
@@ -972,11 +953,11 @@ pub async fn wait_for_local_apply(
 /// machine folds a storage failure into `RaftResponse::Error`), this returns an
 /// error: a DROP that did not take effect must not be reported as success.
 #[doc(hidden)]
-pub async fn execute_via_raft(raft: &FerrosRaft, op: DdlOperation) -> Result<u64> {
+pub async fn execute_via_raft(raft: &FerrosRaft, op: &DdlOperation) -> Result<u64> {
     // Name the statement for the failure path before the op is consumed: a DDL
     // that cannot be committed has to say which statement was left unconfirmed.
-    let operation = ddl_op_target(&op);
-    let cmd = ddl_op_to_raft_command(op);
+    let operation = ddl_op_target(op);
+    let cmd = ddl_op_to_raft_command(&op);
 
     // The proposal is **bounded**. openraft's `client_write` has no deadline of
     // its own, and it does not notify a pending proposal when the leader stops
@@ -1118,7 +1099,7 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
             },
         };
 
-        match execute_via_raft(&self.raft, op.clone()).await {
+        match execute_via_raft(&self.raft, &op).await {
             Ok(committed_index) => {
                 // P0-21: after a successful JoinNode commit, promote the new
                 // node to openraft voter via change_membership so the leader
@@ -1245,7 +1226,7 @@ impl ferrosa_net::rpc::handler::RpcHandler for ClusterDdlForwardHandler {
 
                 match leader_uuid {
                     Some(uuid) => {
-                        match forward_ddl_to_leader(Some(&self.raft), &self.peer_manager, uuid, op)
+                        match forward_ddl_to_leader(Some(&self.raft), &self.peer_manager, uuid, &op)
                             .await
                         {
                             // Relay the leader's committed index back to the
@@ -1758,7 +1739,7 @@ mod tests {
     fn ddl_op_to_raft_command_create_keyspace() {
         let ks = simple_keyspace("raft_ks");
         let op = DdlOperation::CreateKeyspace(ks);
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         match cmd.op {
             RaftOp::CreateKeyspace(ks) => assert_eq!(ks.name, "raft_ks"),
             other => panic!("expected CreateKeyspace, got {other:?}"),
@@ -1769,7 +1750,7 @@ mod tests {
     fn ddl_op_to_raft_command_create_table() {
         let table = simple_table("ks", "tbl");
         let op = DdlOperation::CreateTable(Box::new(table));
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         match cmd.op {
             RaftOp::CreateTable(t) => {
                 assert_eq!(t.keyspace, "ks");
@@ -1782,7 +1763,7 @@ mod tests {
     #[test]
     fn ddl_op_to_raft_command_drop_keyspace() {
         let op = DdlOperation::DropKeyspace("bye_ks".into());
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::DropKeyspace(ref n) if n == "bye_ks"));
     }
 
@@ -1792,7 +1773,7 @@ mod tests {
             keyspace: "ks".into(),
             table: "tbl".into(),
         };
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(
             cmd.op,
             RaftOp::DropTable {
@@ -2007,14 +1988,10 @@ mod tests {
 
         peer_manager.add_peer_entry((leader_uuid, addr)).await;
 
-        forward_ddl_to_leader(
-            None,
-            &peer_manager,
-            leader_uuid,
-            DdlOperation::CreateKeyspace(simple_keyspace("fwd_ks")),
-        )
-        .await
-        .unwrap();
+        let op = DdlOperation::CreateKeyspace(simple_keyspace("fwd_ks"));
+        forward_ddl_to_leader(None, &peer_manager, leader_uuid, &op)
+            .await
+            .unwrap();
 
         assert!(
             peer_manager.has_peer(leader_uuid),
@@ -2539,7 +2516,7 @@ mod tests {
             name: "ks".into(),
             updates,
         };
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::AlterKeyspace { ref name, .. } if name == "ks"));
     }
 
@@ -2556,7 +2533,7 @@ mod tests {
             table: "tbl".into(),
             updates,
         };
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(
             cmd.op,
             RaftOp::AlterTable { ref keyspace, ref table, .. }
@@ -2575,14 +2552,14 @@ mod tests {
             scram: None,
         };
         let op = DdlOperation::CreateRole(role);
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::CreateRole(ref r) if r.name == "role1"));
     }
 
     #[test]
     fn ddl_op_to_raft_command_drop_role() {
         let op = DdlOperation::DropRole("role1".into());
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::DropRole(ref n) if n == "role1"));
     }
 
@@ -2598,7 +2575,7 @@ mod tests {
             options: HashMap::new(),
         };
         let op = DdlOperation::CreateIndex(idx);
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::CreateIndex(ref i) if i.name == "idx1"));
     }
 
@@ -2609,7 +2586,7 @@ mod tests {
             table: "tbl".into(),
             index: "idx1".into(),
         };
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(
             cmd.op,
             RaftOp::DropIndex { ref keyspace, ref table, ref index }
@@ -2626,7 +2603,7 @@ mod tests {
             permissions: std::iter::once(Permission::Select).collect(),
         };
         let op = DdlOperation::Grant(entry);
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::Grant(ref e) if e.role == "user1"));
     }
 
@@ -2638,7 +2615,7 @@ mod tests {
             resource: Resource::AllKeyspaces,
             permission: Permission::Select,
         };
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(
             cmd.op,
             RaftOp::Revoke { ref role, .. } if role == "user1"
@@ -2658,7 +2635,7 @@ mod tests {
             name: "r1".into(),
             updates,
         };
-        let cmd = ddl_op_to_raft_command(op);
+        let cmd = ddl_op_to_raft_command(&op);
         assert!(matches!(cmd.op, RaftOp::AlterRole { ref name, .. } if name == "r1"));
     }
 }
@@ -2671,7 +2648,8 @@ mod relay_after_commit_tests {
     use super::*;
     use crate::accord::cross_dc_dispatch::{CrossDcOutcome, FanoutReport};
     use crate::consistency::ConsistencyLevel;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
 
     fn a_ddl(name: &str) -> DdlOperation {
         use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
@@ -2687,18 +2665,34 @@ mod relay_after_commit_tests {
         })
     }
 
-    /// Answers with a scripted outcome and records how it was called.
+    /// Answers with a scripted outcome and counts how it was called.
+    ///
+    /// Counting, not recording: the contract this stands in for is "one copy per
+    /// remote DC" -- a COUNT -- so a lock-free `AtomicUsize` carries the
+    /// assertion, and the one level the caller passed is kept in a `OnceLock`
+    /// (a CAS, not a lock). A `Mutex<Vec<_>>` would allocate on every call and
+    /// invite an assertion about an ORDER the relay never promised.
     struct RecordingRelay {
-        calls: Mutex<Vec<ConsistencyLevel>>,
+        calls: AtomicUsize,
+        last_cl: OnceLock<ConsistencyLevel>,
         outcome: CrossDcOutcome,
     }
 
     impl RecordingRelay {
         fn answering(outcome: CrossDcOutcome) -> Arc<Self> {
             Arc::new(Self {
-                calls: Mutex::new(Vec::new()),
+                calls: AtomicUsize::new(0),
+                last_cl: OnceLock::new(),
                 outcome,
             })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn last_cl(&self) -> Option<&ConsistencyLevel> {
+            self.last_cl.get()
         }
     }
 
@@ -2709,7 +2703,9 @@ mod relay_after_commit_tests {
             _op: &DdlOperation,
             cl: ConsistencyLevel,
         ) -> CrossDcOutcome {
-            self.calls.lock().unwrap().push(cl);
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            // First level wins; the assertions read the level actually asked for.
+            let _ = self.last_cl.set(cl);
             self.outcome.clone()
         }
     }
@@ -2739,8 +2735,13 @@ mod relay_after_commit_tests {
 
         assert!(outcome.is_ok(), "outcome: {outcome:?}");
         assert_eq!(
-            relay.calls.lock().unwrap().as_slice(),
-            &[ConsistencyLevel::EachQuorum],
+            relay.calls(),
+            1,
+            "exactly one copy is asked for, whatever the DC count"
+        );
+        assert_eq!(
+            relay.last_cl(),
+            Some(&ConsistencyLevel::EachQuorum),
             "the caller's level is what the relay is asked for"
         );
     }
@@ -2795,7 +2796,7 @@ mod relay_after_commit_tests {
             outcome.is_ok(),
             "LOCAL_QUORUM committed here; the far DC's copy is a repair debt, not a failure"
         );
-        assert_eq!(relay.calls.lock().unwrap().len(), 1);
+        assert_eq!(relay.calls(), 1);
     }
 
     /// Single-DC and pair modes have no other DC, so a committed DDL owes

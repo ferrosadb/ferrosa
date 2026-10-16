@@ -662,10 +662,10 @@ fn connected_peers_tracked_and_cleared() {
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
     controller.on_peer_connected((peer_id, peer_addr));
 
-    assert_eq!(controller.connected_peers.lock().len(), 1);
+    assert_eq!(controller.connected_peers.load().len(), 1);
 
     controller.on_peer_disconnected((peer_id, peer_addr));
-    assert_eq!(controller.connected_peers.lock().len(), 0);
+    assert_eq!(controller.connected_peers.load().len(), 0);
 }
 
 /// Helper: create a ModeController in cluster mode with raft init spawned.
@@ -2470,7 +2470,7 @@ fn self_connection_does_not_advance_cluster_formation() {
         "a self-connection must not be counted as a peer or trigger pair mode"
     );
     assert!(
-        controller.connected_peers.lock().is_empty(),
+        controller.connected_peers.load().is_empty(),
         "self must not enter the connected-peer formation set"
     );
 
@@ -2484,7 +2484,7 @@ fn self_connection_does_not_advance_cluster_formation() {
         None,
     );
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
-    assert!(controller.connected_peers.lock().is_empty());
+    assert!(controller.connected_peers.load().is_empty());
 
     let real_peer = Uuid::from_u128(2);
     controller.on_peer_connected((real_peer, "127.0.0.2:7000".parse().unwrap()));
@@ -2494,7 +2494,7 @@ fn self_connection_does_not_advance_cluster_formation() {
         DeploymentMode::Pair,
         "one real peer plus self must remain pair, never advance to trio formation"
     );
-    let peers = controller.connected_peers.lock();
+    let peers = controller.connected_peers.load();
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0].0, real_peer);
 }
@@ -3561,7 +3561,7 @@ fn concurrent_mode_transitions_serialize() {
 
     // The connected_peers list should contain both peers (both calls
     // appended through the mutex, no lost updates).
-    let peers = controller.connected_peers.lock();
+    let peers = controller.connected_peers.load();
     assert_eq!(
         peers.len(),
         2,
@@ -4761,7 +4761,13 @@ fn install_downgrade_ring(controller: &ModeController, peer: Uuid, others: &[Uui
 
 fn connect(controller: &ModeController, peer: Uuid) {
     let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.connected_peers.lock().push((peer, addr));
+    // Same publication as production: the test helper republishes the list
+    // rather than mutating a shared one in place.
+    controller.connected_peers.rcu(|current| {
+        let mut next = (**current).clone();
+        next.push((peer, addr));
+        next
+    });
 }
 
 // Ben's rule (t_ad872ac7): "to become a pair an operator needs to bring one
@@ -6188,6 +6194,153 @@ fn seed_join_node_info_falls_back_to_local_for_a_silent_peer() {
     );
     assert_eq!(info.data_center, "dc1");
     assert_eq!(info.rack, "rack1");
+}
+
+// ---------------------------------------------------------------------------
+// The peer-topology maps are PUBLISHED, not locked.
+//
+// The peers surface reads `peer_dcs`/`peer_racks` once per ROW (it authors
+// `system.peers` and `system.local`), so a mutex there serialises every CQL
+// reader against every handshake, and a snapshot taken under it deep-copies the
+// map for every row. These pin the properties that make the published map safe
+// to rely on instead: readers see a whole immutable map, reading does not copy
+// it, and two peers announcing at once cannot lose each other.
+// ---------------------------------------------------------------------------
+
+/// A snapshot is an immutable view. If a recording could change a map an
+/// already-taken snapshot points at, a reader rendering one row could pair a
+/// peer's old DC with its new rack — the two maps are read separately.
+#[test]
+fn a_peer_topology_snapshot_does_not_change_under_a_later_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let peer = Uuid::new_v4();
+
+    controller.record_peer_dc(peer, "us-west-2");
+    let before = controller.peer_dcs_snapshot();
+
+    controller.record_peer_dc(peer, "eu-west-1");
+
+    assert_eq!(
+        before.get(&peer).map(String::as_str),
+        Some("us-west-2"),
+        "the snapshot taken before the recording must still read the old DC; a \
+         snapshot that mutates under the reader is not a snapshot"
+    );
+    assert_eq!(
+        controller.peer_dcs_snapshot().get(&peer).map(String::as_str),
+        Some("eu-west-1"),
+        "and a snapshot taken after it must see the recording"
+    );
+}
+
+/// Reading must not copy. The peers surface snapshots these maps per row, so a
+/// deep copy per read is an allocation per row on the CQL path.
+#[test]
+fn reading_the_peer_topology_maps_does_not_copy_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let (peer, other) = (Uuid::new_v4(), Uuid::new_v4());
+    controller.record_peer_dc(peer, "eu-west-1");
+    controller.record_peer_rack(peer, "rack-east-a");
+
+    let (first, second) = (
+        controller.peer_dcs_snapshot(),
+        controller.peer_dcs_snapshot(),
+    );
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "two reads with no recording between them must observe the same map — \
+         a deep copy per read allocates once per peers row"
+    );
+    let (rack_first, rack_second) = (
+        controller.peer_racks_snapshot(),
+        controller.peer_racks_snapshot(),
+    );
+    assert!(Arc::ptr_eq(&rack_first, &rack_second), "racks mirror the DCs");
+
+    controller.record_peer_dc(other, "eu-west-1");
+
+    let third = controller.peer_dcs_snapshot();
+    assert!(
+        !Arc::ptr_eq(&first, &third),
+        "a recording must publish a NEW map, or the change is invisible"
+    );
+    assert_eq!(
+        third.get(&other).map(String::as_str),
+        Some("eu-west-1"),
+        "…and the published map must carry the recording"
+    );
+}
+
+/// Concurrent announcements must all land. A load-then-store write loses one of
+/// them silently; the write is read-copy-update for exactly this reason.
+#[test]
+fn concurrent_peer_topology_recordings_do_not_lose_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let peers: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+
+    std::thread::scope(|scope| {
+        for (index, peer) in peers.iter().enumerate() {
+            let controller = Arc::clone(&controller);
+            scope.spawn(move || {
+                controller.record_peer_dc(*peer, format!("dc-{index}"));
+                controller.record_peer_rack(*peer, format!("rack-{index}"));
+            });
+        }
+    });
+
+    let dcs = controller.peer_dcs_snapshot();
+    let racks = controller.peer_racks_snapshot();
+    for (index, peer) in peers.iter().enumerate() {
+        let expected_dc = format!("dc-{index}");
+        let expected_rack = format!("rack-{index}");
+        assert_eq!(
+            dcs.get(peer).map(String::as_str),
+            Some(expected_dc.as_str()),
+            "every concurrent recording must be present (all {})",
+            peers.len()
+        );
+        assert_eq!(
+            racks.get(peer).map(String::as_str),
+            Some(expected_rack.as_str()),
+            "…in the rack map too"
+        );
+    }
 }
 
 /// The registry is how one DC reaches another: it holds the *other* DC's known

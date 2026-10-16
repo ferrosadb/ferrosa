@@ -942,7 +942,7 @@ impl ModeController {
             return;
         };
         let local_host_id = self.local_host_id;
-        let connected_peers = self.connected_peers.lock().clone();
+        let connected_peers = self.connected_peers.load_full();
         let Some(plan) =
             super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
                 local_host_id,
@@ -2862,7 +2862,7 @@ impl ModeController {
                         let raft_for_drain = raft_arc.clone();
                         let replayed = drain_ddl_queue(rx, |op| {
                             let raft = raft_for_drain.clone();
-                            async move { execute_via_raft(&raft, op).await.map(|_| ()) }
+                            async move { execute_via_raft(&raft, &op).await.map(|_| ()) }
                         })
                         .await;
                         if replayed > 0 {

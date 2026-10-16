@@ -90,7 +90,7 @@ async fn ddl_proposal_on_a_leader_that_cannot_commit_fails_bounded_and_names_the
     let started = Instant::now();
     let outcome = tokio::time::timeout(
         TEST_WINDOW,
-        execute_via_raft(&raft, DdlOperation::CreateKeyspace(keyspace())),
+        execute_via_raft(&raft, &DdlOperation::CreateKeyspace(keyspace())),
     )
     .await;
     let elapsed = started.elapsed();

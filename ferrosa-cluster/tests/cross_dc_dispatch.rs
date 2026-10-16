@@ -16,7 +16,7 @@
 mod common;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::raft_harness::TestCluster;
@@ -50,7 +50,9 @@ fn noop_command(tag: &str) -> RaftCommand {
 /// rather than sockets.
 struct RealDcSender<'a> {
     clusters: HashMap<String, &'a TestCluster>,
-    sends_per_dc: Mutex<HashMap<String, usize>>,
+    /// One atomic per DC, seeded from the clusters this sender can reach: a send
+    /// costs one increment, not a lock plus a HashMap entry insert.
+    sends_per_dc: Vec<(String, AtomicUsize)>,
 }
 
 impl<'a> RealDcSender<'a> {
@@ -60,24 +62,32 @@ impl<'a> RealDcSender<'a> {
                 .iter()
                 .map(|(dc, c)| ((*dc).to_string(), *c))
                 .collect(),
-            sends_per_dc: Mutex::new(HashMap::new()),
+            sends_per_dc: clusters
+                .iter()
+                .map(|(dc, _)| ((*dc).to_string(), AtomicUsize::new(0)))
+                .collect(),
+        }
+    }
+
+    fn count_send(&self, dc: &str) {
+        if let Some((_, count)) = self.sends_per_dc.iter().find(|(name, _)| name == dc) {
+            count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
     fn sends_for(&self, dc: &str) -> usize {
-        *self.sends_per_dc.lock().unwrap().get(dc).unwrap_or(&0)
+        self.sends_per_dc
+            .iter()
+            .find(|(name, _)| name == dc)
+            .map(|(_, count)| count.load(Ordering::SeqCst))
+            .unwrap_or(0)
     }
 }
 
 #[async_trait::async_trait]
 impl CrossDcSender<RaftCommand> for RealDcSender<'_> {
     async fn send_to_contact(&self, contact: &DcContact, op: &RaftCommand) -> Result<(), String> {
-        *self
-            .sends_per_dc
-            .lock()
-            .unwrap()
-            .entry(contact.dc.clone())
-            .or_insert(0) += 1;
+        self.count_send(&contact.dc);
         let cluster = self
             .clusters
             .get(&contact.dc)

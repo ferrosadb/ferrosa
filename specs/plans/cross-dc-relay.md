@@ -53,6 +53,72 @@ places the rows for its own ring (I11) interact with the CL-76 finding — a DC 
 cannot accept clients still applies relayed internode work, which is exactly the
 shape a DML copy needs, but it must not be *chosen* by placement logic.
 
+## CL-76 — a DC's group must converge (evidence first, then invariants)
+
+The six-process acceptance test (`data_center_process::a_ddl_created_in_one_dc_reaches_the_other`)
+fails today: dc1 (`us-west-2`) becomes ready, dc2 (`eu-west-1`) never does. Retained node logs
+(`FERROSA_TEST_KEEP_NODE_LOGS`) give the mechanism, and it is not discovery:
+
+| node | DC | is seed | `raft.initialize` members | membership changes |
+|---|---|---|---|---|
+| 3333 | us-west-2 | yes | `{1111, 3333}` (2) | `add_learner` + `change_membership(AddVoterIds)` for 2222 |
+| 1111, 2222 | us-west-2 | no | — | — (waited for leader) |
+| 4444 | eu-west-1 | **yes** | `{4444}` (1) | **none** |
+| 5555 | eu-west-1 | **yes** | `{5555}` (1) | **none** |
+| 6666 | eu-west-1 | **yes** | `{6666}` (1) | **none** |
+
+Every dc2 node connected to the seed and to its own DC's peers (the log shows inbound peers
+`5555`/`6666` and `peer_count=0` at seed time), so the peers were reachable and known — later.
+Two defects compound:
+
+1. **The seed test is vacuously true on an empty same-DC peer set.** The rule is "the node with
+   the highest UUID among all members (self + peers)", so a node that knows no peer of its own DC
+   computes `max({self}) == self` and initialises a **one-voter group**. dc2 produced three of
+   them; dc1 produced one group that then converged.
+2. **Nothing adds a same-DC peer that arrives after initialisation.** dc1 recovered only because
+   a committed `JoinNode` runs the learner→voter promotion; on dc2 no promotion ever ran, so the
+   groups stayed at one voter forever and `committed_voters >= expected` could never hold.
+
+### Invariants for the fix (one test each)
+
+| id | invariant | how it is violated today |
+|---|---|---|
+| I-A | within a DC exactly one node initialises its group, and only from a **complete** same-DC membership (self + known same-DC peers), never from an empty peer set | `max({self}) == self` makes every lone node the seed |
+| I-B | a node in cluster mode whose local voter set is missing a **known same-DC** peer adds it (learner → voter), so the group converges to every node of its DC even when a peer connects after initialisation | no path fires; the voter set is fixed at initialisation |
+| I-C | no membership change ever adds a peer of another DC (ADR-015 stands; the cross-DC surface is the registry) | holds today — must keep holding |
+| I-D | readiness is unchanged: ready ⟺ raft leader ∧ committed_voters ≥ `expected_cluster_size` | holds; the fix must not lower or fake it |
+| I-E | repeated connections for a peer already in the voter set issue no membership change, and the pending/promoted bookkeeping is pruned | must not regress into a promotion storm |
+| I-F | membership changes are consensus metadata only: no token-ring/placement change, no data deletion or rewrite, no ordering change | must not regress |
+
+`I-A` is proven red by a unit test on the seed decision with an empty same-DC peer set; `I-B` by
+the six-process test plus a real-openraft test that initialises `{A}` and then connects a same-DC
+`B` in cluster mode and asserts the voter set becomes `{A, B}`; `I-C`/`I-E` by the new path's own
+tests; `I-D`/`I-F` by the existing suite staying green.
+
+### Attempt 1 (reverted) — what it taught, and why the fix is not just `I-A`
+
+`I-A` and `I-B` were implemented and measured on the six-process test. Retained logs from that run:
+
+- Both DCs' seeds took the late path (`CL-76: this node is the seed and its DC's declared
+  membership is complete`) — 3333 for `us-west-2`, 6666 for `eu-west-1` — so gating on a complete
+  membership does reach the right node in both DCs.
+- **No node called `raft.initialize` at all** (`RaftMsg::Initialize` appears zero times in all six
+  logs), and the hook ran **15 times** on one node. So the late path is blocked downstream by the
+  existing "only the seed initialises, and only from a recovered-membership-free state" guard, and
+  re-entering `transition_to_cluster` per peer event is a churn regression.
+- dc1 — the DC that *worked* before — stopped working: node 1111 hit
+  `cluster formation timed out ... attempting to add self to existing cluster voter set (P0-21)`
+  with `peer_count=1`.
+
+The lesson, and the thing to design against for attempt 2: **the mesh is genuinely incomplete at
+formation time** (a node sees one same-DC peer, not two), and in the working case the full voter set
+is reached through the formation-timeout → `cluster_rejoin` (`JoinNode` → `add_learner` →
+`change_membership`) path — the one that already fires for dc1. So `I-A` alone is wrong: it turns a
+working (if late) formation into a wait. The fix has to make **`I-B` converge for a DC whose seed saw
+an incomplete set**, reusing the existing rejoin promotion, and must fire **once** (no per-event
+`transition_to_cluster`), not replace the seed rule with a completeness gate.
+
+
 ## Slices
 
 1. **DC registry + live-candidate rotation** — done (`e5a3086b`).

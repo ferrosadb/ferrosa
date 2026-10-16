@@ -445,7 +445,7 @@ pub async fn fan_out_raft_command_to_remote_dcs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
     fn addr(port: u16) -> SocketAddr {
         format!("127.0.0.1:{port}").parse().unwrap()
@@ -462,80 +462,125 @@ mod tests {
             .collect()
     }
 
-    /// A sender that records every attempt, and can refuse by DC or by NODE —
+    /// A sender that COUNTS every attempt, and can refuse by DC or by NODE —
     /// the rotation case needs the node granularity.
-    #[derive(Default)]
+    ///
+    /// Counted, not recorded: every assertion here asks "how many copies went to
+    /// this DC" / "did it rotate to another node", which are counts. Each send is
+    /// a few atomic increments against counters resolved from the registry up
+    /// front, and each refusal budget is an atomic countdown — so the fan-out
+    /// under test is not serialised by a lock plus a HashMap/Vec entry insert on
+    /// the very path it exists to observe running free.
     struct RecordingSender {
-        attempts: Mutex<Vec<(String, Uuid)>>,
-        refuse_first: Mutex<HashMap<String, u32>>,
-        refuse_first_host: Mutex<HashMap<Uuid, u32>>,
+        per_dc: Vec<(String, AtomicUsize)>,
+        per_host: Vec<(Uuid, AtomicUsize)>,
+        total: AtomicUsize,
+        refuse_first: Vec<(String, AtomicU32)>,
+        refuse_first_host: Vec<(Uuid, AtomicU32)>,
     }
 
     impl RecordingSender {
-        fn with_refusals(dc: &str, refusals: u32) -> Self {
-            let sender = Self::default();
+        fn for_registry(registry: &BTreeMap<String, super::DcLink>) -> Self {
+            Self {
+                per_dc: registry
+                    .keys()
+                    .map(|dc| (dc.clone(), AtomicUsize::new(0)))
+                    .collect(),
+                per_host: registry
+                    .values()
+                    .flat_map(|link| link.candidates.iter().map(|contact| contact.host_id))
+                    .map(|host_id| (host_id, AtomicUsize::new(0)))
+                    .collect(),
+                total: AtomicUsize::new(0),
+                refuse_first: Vec::new(),
+                refuse_first_host: Vec::new(),
+            }
+        }
+
+        fn refusing_dc(registry: &BTreeMap<String, super::DcLink>, dc: &str, refusals: u32) -> Self {
+            let mut sender = Self::for_registry(registry);
             sender
                 .refuse_first
-                .lock()
-                .unwrap()
-                .insert(dc.to_string(), refusals);
+                .push((dc.to_string(), AtomicU32::new(refusals)));
             sender
         }
 
-        fn with_refusals_for_host(host_id: Uuid, refusals: u32) -> Self {
-            let sender = Self::default();
+        fn refusing_host(
+            registry: &BTreeMap<String, super::DcLink>,
+            host_id: Uuid,
+            refusals: u32,
+        ) -> Self {
+            let mut sender = Self::for_registry(registry);
             sender
                 .refuse_first_host
-                .lock()
-                .unwrap()
-                .insert(host_id, refusals);
+                .push((host_id, AtomicU32::new(refusals)));
             sender
+        }
+
+        fn count(&self, dc: &str, host_id: Uuid) {
+            self.total.fetch_add(1, Ordering::SeqCst);
+            if let Some((_, count)) = self.per_dc.iter().find(|(name, _)| name == dc) {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+            if let Some((_, count)) = self.per_host.iter().find(|(id, _)| *id == host_id) {
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        /// Spends one refusal from this DC's budget, if any is left.
+        fn refuse_dc(&self, dc: &str) -> bool {
+            self.refuse_first
+                .iter()
+                .find(|(name, _)| name == dc)
+                .is_some_and(|(_, remaining)| {
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                })
+        }
+
+        /// …and from this node's budget, if any is left.
+        fn refuse_host(&self, host_id: Uuid) -> bool {
+            self.refuse_first_host
+                .iter()
+                .find(|(id, _)| *id == host_id)
+                .is_some_and(|(_, remaining)| {
+                    remaining
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                        .is_ok()
+                })
         }
 
         fn sends_for(&self, dc: &str) -> usize {
-            self.attempts
-                .lock()
-                .unwrap()
+            self.per_dc
                 .iter()
-                .filter(|(attempted_dc, _)| attempted_dc == dc)
-                .count()
+                .find(|(name, _)| name == dc)
+                .map(|(_, count)| count.load(Ordering::SeqCst))
+                .unwrap_or(0)
         }
 
         fn sends_to_host(&self, host_id: Uuid) -> usize {
-            self.attempts
-                .lock()
-                .unwrap()
+            self.per_host
                 .iter()
-                .filter(|(_, attempted_host)| *attempted_host == host_id)
-                .count()
+                .find(|(id, _)| *id == host_id)
+                .map(|(_, count)| count.load(Ordering::SeqCst))
+                .unwrap_or(0)
         }
 
         fn total_attempts(&self) -> usize {
-            self.attempts.lock().unwrap().len()
+            self.total.load(Ordering::SeqCst)
         }
     }
 
     #[async_trait]
     impl CrossDcSender<u64> for RecordingSender {
         async fn send_to_contact(&self, contact: &DcContact, op: &u64) -> Result<(), String> {
-            self.attempts
-                .lock()
-                .unwrap()
-                .push((contact.dc.clone(), contact.host_id));
-            let mut refusals = self.refuse_first.lock().unwrap();
-            if let Some(remaining) = refusals.get_mut(&contact.dc) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Err("not acknowledged".to_string());
-                }
+            self.count(&contact.dc, contact.host_id);
+            if self.refuse_dc(&contact.dc) {
+                return Err("not acknowledged".to_string());
             }
-            drop(refusals);
-            let mut host_refusals = self.refuse_first_host.lock().unwrap();
-            if let Some(remaining) = host_refusals.get_mut(&contact.host_id) {
-                if *remaining > 0 {
-                    *remaining -= 1;
-                    return Err("this node did not acknowledge".to_string());
-                }
+            if self.refuse_host(contact.host_id) {
+                return Err("this node did not acknowledge".to_string());
             }
             let _ = op;
             Ok(())
@@ -660,7 +705,7 @@ mod tests {
             (Uuid::from_u128(5), "dc3"),
         ]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::default();
+        let sender = RecordingSender::for_registry(&registry);
 
         let report = CrossDcDispatch::default()
             .fan_out_registry(&sender, &7u64, &registry)
@@ -687,7 +732,7 @@ mod tests {
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::with_refusals("dc3", 1);
+        let sender = RecordingSender::refusing_dc(&registry, "dc3", 1);
 
         let report = CrossDcDispatch::default()
             .fan_out_registry(&sender, &9u64, &registry)
@@ -716,7 +761,7 @@ mod tests {
             (Uuid::from_u128(5), "dc3"),
         ]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::with_refusals_for_host(Uuid::from_u128(2), u32::MAX);
+        let sender = RecordingSender::refusing_host(&registry, Uuid::from_u128(2), u32::MAX);
 
         let report = CrossDcDispatch::default()
             .fan_out_registry(&sender, &9u64, &registry)
@@ -752,7 +797,7 @@ mod tests {
             (Uuid::from_u128(5), "dc3"),
         ]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::with_refusals("dc2", u32::MAX);
+        let sender = RecordingSender::refusing_dc(&registry, "dc2", u32::MAX);
         let dispatch = CrossDcDispatch::with_policy(CrossDcRetryPolicy {
             max_attempts: 3,
             backoff: Duration::from_millis(1),
@@ -805,7 +850,7 @@ mod tests {
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::with_refusals("dc3", u32::MAX);
+        let sender = RecordingSender::refusing_dc(&registry, "dc3", u32::MAX);
         let dispatch = CrossDcDispatch::with_policy(CrossDcRetryPolicy {
             max_attempts: 2,
             backoff: Duration::from_millis(1),
@@ -836,7 +881,7 @@ mod tests {
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::with_refusals("dc3", u32::MAX);
+        let sender = RecordingSender::refusing_dc(&registry, "dc3", u32::MAX);
         let dispatch = CrossDcDispatch::with_policy(CrossDcRetryPolicy {
             max_attempts: 2,
             backoff: Duration::from_millis(1),
@@ -872,7 +917,7 @@ mod tests {
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::default();
+        let sender = RecordingSender::for_registry(&registry);
         let before = cross_dc_pending_repairs_total();
 
         for cl in [ConsistencyLevel::EachQuorum, ConsistencyLevel::LocalQuorum] {
@@ -901,7 +946,7 @@ mod tests {
         let peers = [peer(1, 7001)];
         let dcs = with_dcs(&[(Uuid::from_u128(1), "dc1")]);
         let registry = dc_registry(&peers, &dcs, "dc1");
-        let sender = RecordingSender::default();
+        let sender = RecordingSender::for_registry(&registry);
 
         for cl in [ConsistencyLevel::EachQuorum, ConsistencyLevel::LocalQuorum] {
             let outcome = CrossDcDispatch::default()
@@ -924,7 +969,7 @@ mod tests {
         let registry = dc_registry(&peers, &dcs, "dc1");
         assert!(registry.is_empty());
 
-        let sender = RecordingSender::default();
+        let sender = RecordingSender::for_registry(&registry);
         let report = CrossDcDispatch::default()
             .fan_out_registry(&sender, &1u64, &registry)
             .await;
