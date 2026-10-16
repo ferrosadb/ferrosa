@@ -1,6 +1,7 @@
 import os
 import subprocess
 import tempfile
+import re
 import unittest
 from pathlib import Path
 
@@ -97,15 +98,28 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_release_downloads_artifacts_without_node_actions(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        # Stated as a relationship, not a tally: adding a job to this workflow must
+        # not require editing this test, but forgetting to give an artifact-consuming
+        # job `actions: read` must still fail it.
         self.assertNotIn("actions/download-artifact@", workflow)
         self.assertNotIn("gh run download", workflow)
         self.assertEqual(
-            3,
-            workflow.count(
-                'bash .github/scripts/download-run-artifacts.sh \\\n            "${GITHUB_RUN_ID}"'
-            ),
+            workflow.count("bash .github/scripts/download-run-artifacts.sh"),
+            workflow.count("actions: read"),
+            "every job that takes this run's artifacts must declare `actions: read`, "
+            "and no job should declare it without taking them",
         )
-        self.assertEqual(3, workflow.count("actions: read"))
+        # Same shape for the failure alert: a job that publishes to the registry has
+        # to be in alert-ops.needs, or its failure pages nobody.
+        jobs_text = workflow.split("\njobs:\n", 1)[1]
+        parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):\n", jobs_text)
+        publishers = [n for n, b in zip(parts[1::2], parts[2::2]) if "packages: write" in b]
+        alert_needs = re.split(r"(?m)^  [A-Za-z0-9_-]+:\n", workflow.split("  alert-ops:\n", 1)[1])[0]
+        for job in publishers:
+            self.assertIn(
+                f"      - {job}\n", alert_needs,
+                f"{job} publishes an image but alert-ops does not watch it",
+            )
         docker_job = workflow.split("  docker-image:\n", 1)[1].split("\n  release:\n", 1)[0]
         release_job = workflow.split("  release:\n", 1)[1]
         self.assertIn(
