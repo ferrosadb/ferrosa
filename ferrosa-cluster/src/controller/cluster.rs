@@ -2196,6 +2196,8 @@ impl ModeController {
 
         let bootstrap_complete_counter = bootstrap_complete_count;
         let consensus_health = self.consensus_health();
+        // Taken here, not inside the task: the task must not borrow `self`.
+        let ddl_relay = self.relay_handle();
         self.spawn_tracked(async move {
             // Deliver ClusterInvite to all peers BEFORE starting Raft.
             // This ensures peers transition to cluster mode and register
@@ -2848,6 +2850,9 @@ impl ModeController {
                         raft: raft_arc.clone(),
                         peer_manager: peer_manager_for_ddl,
                         node_map: node_map_for_ddl,
+                        // A DDL committed into this DC is relayed to the other
+                        // DCs — one copy each — by the controller's relay.
+                        relay: ddl_relay.clone(),
                     }));
 
 

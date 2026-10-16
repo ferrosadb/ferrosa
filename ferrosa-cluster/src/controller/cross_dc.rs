@@ -89,6 +89,13 @@ impl ModeController {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::ddl_path::DdlRelay for ModeController {
+    async fn relay_committed_ddl(&self, op: &DdlOperation, cl: ConsistencyLevel) -> CrossDcOutcome {
+        self.relay_ddl(op, cl).await
+    }
+}
+
 /// Hands a relayed DDL to a node in the remote DC over the ordinary internode
 /// message the intra-DC leader forward uses.
 ///

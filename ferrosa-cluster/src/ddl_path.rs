@@ -86,6 +86,22 @@ pub(crate) const FORMING_DDL_QUEUE_CAPACITY: usize = 128;
 
 /// The active DDL path. Swapped atomically via `ArcSwap` when
 /// the deployment mode changes (standalone → pair → cluster).
+/// The relay a committed DDL uses to tell the OTHER data centers.
+///
+/// Implemented by `ModeController`. A trait rather than a concrete type so the
+/// call site's contract — what a DDL does about a DC it could not reach — is
+/// testable without a transport, which is the part that decides whether a client
+/// is told its DDL succeeded.
+#[async_trait::async_trait]
+pub trait DdlRelay: Send + Sync {
+    /// Deliver this DDL to every remote DC, at the standard `cl` demands.
+    async fn relay_committed_ddl(
+        &self,
+        op: &DdlOperation,
+        cl: crate::consistency::ConsistencyLevel,
+    ) -> crate::accord::cross_dc_dispatch::CrossDcOutcome;
+}
+
 pub enum DdlPath {
     /// Standalone: DDL applied directly to local schema + storage.
     Direct {
@@ -109,6 +125,11 @@ pub enum DdlPath {
         /// so that both the Raft transport and the DDL forwarding path use
         /// the same up-to-date mapping without a separate sync mechanism.
         node_map: Arc<RwLock<HashMap<u64, Uuid>>>,
+        /// Tells the other data centers about a DDL this one committed.
+        ///
+        /// `None` when this controller has no relay handle (single-DC and pair
+        /// modes): there is no other DC, so a committed DDL owes nobody.
+        relay: Option<Arc<dyn DdlRelay>>,
     },
     /// Forming: cluster formation in progress.
     ///
@@ -148,6 +169,22 @@ impl DdlPath {
     ///   [`PeerManager`] so the CQL client never sees a `NotLeader` error.
     /// - `Unavailable`: returns an error immediately.
     pub async fn execute(&self, op: DdlOperation) -> Result<()> {
+        // DDL runs at a level that does not make the client wait on a WAN: the
+        // local DC's agreement is the client's write, and a remote DC that is
+        // owed the copy is counted for repair. A caller that needs every DC to
+        // acknowledge before the client is told (EACH_QUORUM/ALL) uses
+        // `execute_with_cl`.
+        self.execute_with_cl(op, crate::consistency::ConsistencyLevel::Quorum)
+            .await
+    }
+
+    /// Execute a DDL and deliver it to the other DCs at the standard `cl`
+    /// demands.
+    pub async fn execute_with_cl(
+        &self,
+        op: DdlOperation,
+        cl: crate::consistency::ConsistencyLevel,
+    ) -> Result<()> {
         match self {
             Self::Direct { schema, engine } => {
                 // Reuse DdlCoordinator's local-apply logic by constructing a
@@ -166,8 +203,9 @@ impl DdlPath {
                 raft,
                 peer_manager,
                 node_map,
+                relay,
             } => {
-                match execute_via_raft(raft, op.clone()).await {
+                let committed = match execute_via_raft(raft, op.clone()).await {
                     // Leader applied the DDL (client_write awaits leader apply),
                     // so read-your-writes already holds on this node.
                     Ok(_committed_index) => Ok(()),
@@ -185,9 +223,11 @@ impl DdlPath {
                             // Forward to the leader; `forward_ddl_to_leader` waits
                             // for THIS node to apply before returning, so the
                             // client sees its own write on this follower.
-                            Some(uuid) => forward_ddl_to_leader(Some(raft), peer_manager, uuid, op)
-                                .await
-                                .map(|_committed| ()),
+                            Some(uuid) => {
+                                forward_ddl_to_leader(Some(raft), peer_manager, uuid, op.clone())
+                                    .await
+                                    .map(|_committed| ())
+                            }
                             None => {
                                 // Leader UUID unknown — cannot forward.
                                 Err(ClusterError::Internal(format!(
@@ -204,7 +244,12 @@ impl DdlPath {
                         ))
                     }
                     Err(other) => Err(other),
-                }
+                };
+                // Committed in THIS data center — that is the client's write.
+                // The other DCs are told afterwards, one copy each, and only a
+                // level that requires every DC can make that a failure here.
+                committed?;
+                relay_after_commit(relay.as_ref(), &op, cl).await
             }
             Self::Forming { queue } => {
                 // Queue the operation for replay after leader election.
@@ -569,6 +614,40 @@ fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>)
 // ---------------------------------------------------------------------------
 // Leader forwarding
 // ---------------------------------------------------------------------------
+
+/// What a DDL that already committed in its own DC owes the other DCs.
+///
+/// One copy per remote DC is the relay's business; this is what the DDL's own
+/// outcome means for the caller:
+///
+/// - no relay (single-DC / pair mode): there is no other DC, so nothing is owed.
+/// - `Complete` / `SingleDc`: every remote DC has it, or there is none.
+/// - `PendingLocally`: the level does not require a remote DC, so the client is
+///   satisfied — the copy is owed and already counted for repair.
+/// - `NotSatisfied`: the level DID require every DC and one did not take the
+///   DDL. That must not be reported as success: the DDL is committed here and
+///   missing there, and the operator has to know.
+pub async fn relay_after_commit(
+    relay: Option<&Arc<dyn DdlRelay>>,
+    op: &DdlOperation,
+    cl: crate::consistency::ConsistencyLevel,
+) -> Result<()> {
+    let Some(relay) = relay else {
+        return Ok(());
+    };
+    match relay.relay_committed_ddl(op, cl).await {
+        crate::accord::cross_dc_dispatch::CrossDcOutcome::NotSatisfied { missing, .. } => {
+            Err(ClusterError::Internal(format!(
+                "DDL committed in this data center but {} did not take it at {cl:?}: \
+                 the schema is now divergent until that DC is repaired",
+                missing.join(", ")
+            )))
+        }
+        crate::accord::cross_dc_dispatch::CrossDcOutcome::Complete(_)
+        | crate::accord::cross_dc_dispatch::CrossDcOutcome::PendingLocally { .. }
+        | crate::accord::cross_dc_dispatch::CrossDcOutcome::SingleDc => Ok(()),
+    }
+}
 
 /// Forward a [`DdlOperation`] to the Raft leader node.
 ///
@@ -2581,5 +2660,160 @@ mod tests {
         };
         let cmd = ddl_op_to_raft_command(op);
         assert!(matches!(cmd.op, RaftOp::AlterRole { ref name, .. } if name == "r1"));
+    }
+}
+
+/// The call-site contract: what a DDL that has already committed in its own DC
+/// does about the other DCs. This is the decision that tells a CQL client whether
+/// its DDL succeeded, so it is pinned here — with a recording relay, no transport.
+#[cfg(test)]
+mod relay_after_commit_tests {
+    use super::*;
+    use crate::accord::cross_dc_dispatch::{CrossDcOutcome, FanoutReport};
+    use crate::consistency::ConsistencyLevel;
+    use std::sync::Mutex;
+
+    fn a_ddl(name: &str) -> DdlOperation {
+        use ferrosa_schema::metadata::keyspace::{KeyspaceMetadata, ReplicationParams};
+        let mut options = std::collections::HashMap::new();
+        options.insert("replication_factor".to_string(), "3".to_string());
+        DdlOperation::CreateKeyspace(KeyspaceMetadata {
+            name: name.to_string(),
+            durable_writes: true,
+            replication: ReplicationParams {
+                strategy: "NetworkTopologyStrategy".to_string(),
+                options,
+            },
+        })
+    }
+
+    /// Answers with a scripted outcome and records how it was called.
+    struct RecordingRelay {
+        calls: Mutex<Vec<ConsistencyLevel>>,
+        outcome: CrossDcOutcome,
+    }
+
+    impl RecordingRelay {
+        fn answering(outcome: CrossDcOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                outcome,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DdlRelay for RecordingRelay {
+        async fn relay_committed_ddl(
+            &self,
+            _op: &DdlOperation,
+            cl: ConsistencyLevel,
+        ) -> CrossDcOutcome {
+            self.calls.lock().unwrap().push(cl);
+            self.outcome.clone()
+        }
+    }
+
+    fn report(delivered: &[&str], failed: &[&str]) -> FanoutReport {
+        FanoutReport {
+            delivered: delivered.iter().map(|dc| (*dc).to_string()).collect(),
+            failed: failed.iter().map(|dc| (*dc).to_string()).collect(),
+            ..FanoutReport::default()
+        }
+    }
+
+    /// Every remote DC took the DDL → the client's DDL is done, and the relay was
+    /// asked at the level the caller gave.
+    #[tokio::test]
+    async fn a_ddl_every_dc_took_is_success_and_relays_at_the_given_level() {
+        let relay =
+            RecordingRelay::answering(CrossDcOutcome::Complete(report(&["eu-west-1"], &[])));
+        let handle: Arc<dyn DdlRelay> = relay.clone();
+
+        let outcome = relay_after_commit(
+            Some(&handle),
+            &a_ddl("relayed_at_each_quorum"),
+            ConsistencyLevel::EachQuorum,
+        )
+        .await;
+
+        assert!(outcome.is_ok(), "outcome: {outcome:?}");
+        assert_eq!(
+            relay.calls.lock().unwrap().as_slice(),
+            &[ConsistencyLevel::EachQuorum],
+            "the caller's level is what the relay is asked for"
+        );
+    }
+
+    /// A strict level that missed a DC must fail the DDL: the schema is committed
+    /// here and missing there, and a client told 'created' would have been lied to.
+    #[tokio::test]
+    async fn a_strict_ddl_that_missed_a_dc_fails_and_names_it() {
+        let relay = RecordingRelay::answering(CrossDcOutcome::NotSatisfied {
+            missing: vec!["eu-west-1".to_string()],
+            report: report(&[], &["eu-west-1"]),
+        });
+        let handle: Arc<dyn DdlRelay> = relay.clone();
+
+        let outcome = relay_after_commit(
+            Some(&handle),
+            &a_ddl("strict_missed"),
+            ConsistencyLevel::EachQuorum,
+        )
+        .await;
+
+        let err = outcome.expect_err("a missed DC at EACH_QUORUM must not be success");
+        let message = err.to_string();
+        assert!(
+            message.contains("eu-west-1"),
+            "the error must name the DC that did not take the DDL: {message}"
+        );
+        assert!(
+            message.contains("EachQuorum"),
+            "and the level that required it: {message}"
+        );
+    }
+
+    /// A level that does not span DCs is satisfied by the local commit: the copy
+    /// is owed (the relay already counted it) and the client is not held.
+    #[tokio::test]
+    async fn a_ddl_owed_to_a_remote_dc_does_not_fail_the_client() {
+        let relay = RecordingRelay::answering(CrossDcOutcome::PendingLocally {
+            owed: vec!["eu-west-1".to_string()],
+            report: report(&[], &["eu-west-1"]),
+        });
+        let handle: Arc<dyn DdlRelay> = relay.clone();
+
+        let outcome = relay_after_commit(
+            Some(&handle),
+            &a_ddl("owed_to_dc2"),
+            ConsistencyLevel::LocalQuorum,
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "LOCAL_QUORUM committed here; the far DC's copy is a repair debt, not a failure"
+        );
+        assert_eq!(relay.calls.lock().unwrap().len(), 1);
+    }
+
+    /// Single-DC and pair modes have no other DC, so a committed DDL owes
+    /// nobody — and no relay is required for the path to work.
+    #[tokio::test]
+    async fn a_ddl_with_no_relay_and_a_single_dc_owes_nobody() {
+        let outcome =
+            relay_after_commit(None, &a_ddl("single_dc"), ConsistencyLevel::EachQuorum).await;
+        assert!(outcome.is_ok(), "outcome: {outcome:?}");
+
+        let relay = RecordingRelay::answering(CrossDcOutcome::SingleDc);
+        let handle: Arc<dyn DdlRelay> = relay.clone();
+        let outcome = relay_after_commit(
+            Some(&handle),
+            &a_ddl("no_other_dc"),
+            ConsistencyLevel::EachQuorum,
+        )
+        .await;
+        assert!(outcome.is_ok(), "outcome: {outcome:?}");
     }
 }

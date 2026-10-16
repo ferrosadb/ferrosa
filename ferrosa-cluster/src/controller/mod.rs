@@ -224,6 +224,11 @@ pub struct ModeController {
     /// a partition, the node with the higher promote_epoch wins primary role.
     /// Prevents split-brain when both nodes force_promote independently.
     pub(super) promote_epoch: std::sync::atomic::AtomicU64,
+    /// Handle to this controller for components it OWNS and that must call back
+    /// into it — the DDL path's cross-DC relay. A weak handle because the
+    /// controller owns those components: a strong reference would be a cycle.
+    /// Set once at construction, from the `Arc<Self>` the constructor makes.
+    pub(super) self_weak: std::sync::OnceLock<std::sync::Weak<ModeController>>,
     /// All connected peers, tracked across mode transitions.
     pub(super) connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
     /// Whether this node's cluster was dissolved into a pair (t_47bbeb66).
@@ -508,6 +513,7 @@ impl ModeController {
         // lag a transition the controller has made.
         schema.set_deployment_mode(initial_mode);
         let controller = Arc::new(Self {
+            self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: schema.deployment_mode_handle(),
@@ -561,6 +567,10 @@ impl ModeController {
             cluster_state,
             ddl_path,
         };
+
+        // Published at construction, before anything can ask for it, so a
+        // component built later (the DDL path's cross-DC relay) always finds it.
+        let _ = controller.self_weak.set(Arc::downgrade(&controller));
 
         (controller, handles)
     }
@@ -672,6 +682,7 @@ impl ModeController {
         let hint_store = Arc::new(HintStore::new(hint_config.clone()).expect("test hint store"));
 
         Arc::new(Self {
+            self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: {
@@ -748,6 +759,7 @@ impl ModeController {
         };
 
         Arc::new(Self {
+            self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: {
@@ -809,6 +821,16 @@ impl ModeController {
     /// Returns `None` until `set_peer_manager` has been called — typically
     /// during early bootstrap before networking comes up. Used by the
     /// `/admin/membership-snapshot` endpoint (Sprint 2 W2.3).
+    /// The relay a component this controller owns uses to reach the other DCs.
+    ///
+    /// `None` while the controller is not (yet) behind an `Arc` — every literal
+    /// constructor publishes it immediately, so this is only None on paths that
+    /// never relay (single-node and pair modes, where there is no other DC).
+    pub fn relay_handle(&self) -> Option<Arc<dyn crate::ddl_path::DdlRelay>> {
+        let controller = self.self_weak.get()?.upgrade()?;
+        Some(controller as Arc<dyn crate::ddl_path::DdlRelay>)
+    }
+
     pub fn peer_manager_arc(&self) -> Option<Arc<ferrosa_net::peer::PeerManager>> {
         self.peer_manager.load().as_ref().clone()
     }
