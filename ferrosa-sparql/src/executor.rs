@@ -513,7 +513,11 @@ type FetchedTriple = (
 );
 
 /// Name of the secondary index on the object column.
-const OBJECT_INDEX_NAME: &str = "rdf_triples_object_idx";
+///
+/// `pub(crate)` because registration declares it: the `ObjectScan` arm below
+/// reads through this index and falls back to a scan when the node does not
+/// declare it, so the declaration site and the read site must name one thing.
+pub(crate) const OBJECT_INDEX_NAME: &str = "rdf_triples_object_idx";
 
 /// The graph a storage-backed op reads from. `None` for `PropertyPath`, which
 /// is evaluated by [`evaluate_path_op`] and never reaches the scan.
