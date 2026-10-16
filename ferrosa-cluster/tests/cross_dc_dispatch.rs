@@ -22,7 +22,7 @@ use std::time::Duration;
 use common::raft_harness::TestCluster;
 
 use ferrosa_cluster::accord::cross_dc_dispatch::{
-    dc_contacts, CrossDcDispatch, CrossDcSender, DcContact,
+    dc_registry, CrossDcDispatch, CrossDcSender, DcContact,
 };
 use ferrosa_cluster::raft::{RaftCommand, RaftOp, RaftResponse};
 
@@ -162,11 +162,15 @@ async fn one_copy_per_remote_dc_reaches_that_dcs_own_quorum() {
         }
     }
 
-    let contacts = dc_contacts(&peers, &peer_dcs, "dc1");
+    let registry = dc_registry(&peers, &peer_dcs, "dc1");
     assert_eq!(
-        contacts.keys().cloned().collect::<Vec<_>>(),
+        registry.keys().cloned().collect::<Vec<_>>(),
         vec!["dc2".to_string(), "dc3".to_string()],
         "a 3-DC cluster holds one link per other DC, not one per remote node"
+    );
+    assert!(
+        registry.values().all(|link| !link.candidates.is_empty()),
+        "every remote DC is reachable through at least one known node"
     );
 
     let dc1_before = applied(&dc1);
@@ -175,10 +179,10 @@ async fn one_copy_per_remote_dc_reaches_that_dcs_own_quorum() {
 
     let sender = RealDcSender::new(&[("dc2", &dc2), ("dc3", &dc3)]);
     let report = CrossDcDispatch::default()
-        .fan_out(&sender, &noop_command("fanout"), &contacts)
+        .fan_out_registry(&sender, &noop_command("fanout"), &registry)
         .await;
 
-    assert!(report.is_complete(&contacts), "report: {report:?}");
+    assert!(report.is_complete(&registry), "report: {report:?}");
     assert_eq!(
         sender.sends_for("dc2"),
         1,
@@ -223,14 +227,14 @@ async fn two_dcs_hold_one_link_each_way() {
         }
     }
 
-    let from_dc1 = dc_contacts(&peers, &peer_dcs, "dc1");
-    let from_dc2 = dc_contacts(&peers, &peer_dcs, "dc2");
+    let from_dc1 = dc_registry(&peers, &peer_dcs, "dc1");
+    let from_dc2 = dc_registry(&peers, &peer_dcs, "dc2");
 
     assert_eq!(from_dc1.len(), 1);
     assert_eq!(
-        from_dc1["dc2"].host_id,
+        from_dc1["dc2"].candidates[0].host_id,
         uuid::Uuid::from_u128((2u128 << 32) | 1),
-        "dc2's contact is its lowest host id"
+        "the first candidate tried in dc2 is its lowest host id"
     );
     assert_eq!(from_dc2.len(), 1);
     assert!(
@@ -242,7 +246,7 @@ async fn two_dcs_hold_one_link_each_way() {
     let dc1_before = applied(&dc1);
     let sender = RealDcSender::new(&[("dc1", &dc1)]);
     let report = CrossDcDispatch::default()
-        .fan_out(&sender, &noop_command("reverse"), &from_dc2)
+        .fan_out_registry(&sender, &noop_command("reverse"), &from_dc2)
         .await;
     assert!(report.is_complete(&from_dc2));
     let (_, target) = *dc1_before.iter().max_by_key(|(id, _)| *id).unwrap();

@@ -57,19 +57,29 @@ pub struct DcContact {
     pub addr: SocketAddr,
 }
 
-/// Resolve ONE contact per remote DC from the peers this node knows.
+/// One remote DC's relay link: every node we know there, in the order we try
+/// them, so a DC is reachable through ANY live node in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DcLink {
+    /// The remote data center.
+    pub dc: String,
+    /// Its known nodes, deterministic order (lowest host id first) so a retry is
+    /// reproducible, with every live node of the DC after it.
+    pub candidates: Vec<DcContact>,
+}
+
+/// The DC-level relay registry: one link per remote DC, holding that DC's
+/// candidate nodes.
 ///
-/// Peers whose announced DC is unknown (an older build, or a peer that
-/// announced nothing) are NOT targets: an unplaceable peer is treated as local
-/// everywhere else in the codebase, and inventing a remote DC for it here would
-/// send a cross-DC copy to a node that is probably in this very DC. Local-DC
-/// peers are the mesh, not the fan-out.
-pub fn dc_contacts(
+/// A DC's ring holds only its own members, so the registry — not the ring — is
+/// how one DC reaches another. It is built from what peers ANNOUNCED (the
+/// handshake DC/rack), which is why a peer that announced no DC is not in it.
+pub fn dc_registry(
     peers: &[(Uuid, SocketAddr)],
     peer_dcs: &HashMap<Uuid, String>,
     local_dc: &str,
-) -> BTreeMap<String, DcContact> {
-    let mut contacts: BTreeMap<String, DcContact> = BTreeMap::new();
+) -> BTreeMap<String, DcLink> {
+    let mut registry: BTreeMap<String, DcLink> = BTreeMap::new();
     for (host_id, addr) in peers {
         let Some(dc) = peer_dcs.get(host_id) else {
             continue;
@@ -77,19 +87,23 @@ pub fn dc_contacts(
         if dc == local_dc {
             continue;
         }
-        let candidate = DcContact {
+        let link = registry.entry(dc.clone()).or_insert_with(|| DcLink {
+            dc: dc.clone(),
+            candidates: Vec::new(),
+        });
+        link.candidates.push(DcContact {
             dc: dc.clone(),
             host_id: *host_id,
             addr: *addr,
-        };
-        match contacts.get(&candidate.dc) {
-            Some(existing) if existing.host_id <= candidate.host_id => {}
-            _ => {
-                contacts.insert(candidate.dc.clone(), candidate);
-            }
-        }
+        });
     }
-    contacts
+    for link in registry.values_mut() {
+        // Deterministic order, so which node is tried first (and which gets the
+        // operation on the common path) does not depend on peer-learn order.
+        link.candidates.sort_by_key(|candidate| candidate.host_id);
+        link.candidates.dedup_by_key(|candidate| candidate.host_id);
+    }
+    registry
 }
 
 /// Process-global count of successful cross-DC deliveries (one per remote DC).
@@ -136,12 +150,15 @@ pub struct FanoutReport {
     pub failed: Vec<String>,
     /// Attempts after the first, summed over every DC.
     pub retries: u32,
+    /// The node that actually delivered each DC — evidence that a DC was
+    /// reached through *a* live node, and which one.
+    pub delivered_by: BTreeMap<String, Uuid>,
 }
 
 impl FanoutReport {
     /// True when every remote DC acknowledged.
-    pub fn is_complete(&self, contacts: &BTreeMap<String, DcContact>) -> bool {
-        self.failed.is_empty() && self.delivered.len() == contacts.len()
+    pub fn is_complete(&self, registry: &BTreeMap<String, DcLink>) -> bool {
+        self.failed.is_empty() && self.delivered.len() == registry.len()
     }
 }
 
@@ -175,55 +192,65 @@ impl CrossDcDispatch {
         Self { policy }
     }
 
-    /// Send `op` to every remote DC in `contacts`, at most once per attempt per
-    /// DC, retrying a DC that fails until it acknowledges or the attempt budget
-    /// runs out. A DC that acknowledges is never sent a second copy.
-    pub async fn fan_out<Op, S>(
+    /// Deliver one copy per remote DC through the registry, rotating to another
+    /// live node of that DC when one refuses.
+    pub async fn fan_out_registry<Op, S>(
         &self,
         sender: &S,
         op: &Op,
-        contacts: &BTreeMap<String, DcContact>,
+        registry: &BTreeMap<String, DcLink>,
     ) -> FanoutReport
     where
         Op: Send + Sync,
         S: CrossDcSender<Op>,
     {
         let mut report = FanoutReport::default();
-        for contact in contacts.values() {
+        for link in registry.values() {
+            if link.candidates.is_empty() {
+                continue;
+            }
             let mut attempt = 1;
             let mut backoff = self.policy.backoff;
+            let mut rotation = 0usize;
             loop {
+                // Rotate through the DC's known nodes: a DC that refuses this
+                // copy through one node is still reachable through another, and
+                // the DC — not the node — is the unit of delivery.
+                let contact = &link.candidates[rotation % link.candidates.len()];
                 match sender.send_to_contact(contact, op).await {
                     Ok(()) => {
                         CROSS_DC_SENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        report.delivered.push(contact.dc.clone());
+                        report.delivered.push(link.dc.clone());
+                        report.delivered_by.insert(link.dc.clone(), contact.host_id);
                         break;
                     }
                     Err(reason) => {
                         if attempt >= self.policy.max_attempts {
                             CROSS_DC_SEND_FAILURES_TOTAL.fetch_add(1, Ordering::Relaxed);
                             tracing::error!(
-                                dc = %contact.dc,
-                                host = %contact.host_id,
+                                dc = %link.dc,
+                                candidates = link.candidates.len(),
                                 attempts = attempt,
                                 %reason,
                                 "cross-DC delivery failed: this DC did not receive the operation"
                             );
-                            report.failed.push(contact.dc.clone());
+                            report.failed.push(link.dc.clone());
                             break;
                         }
                         CROSS_DC_RETRIES_TOTAL.fetch_add(1, Ordering::Relaxed);
                         report.retries += 1;
                         tracing::warn!(
-                            dc = %contact.dc,
+                            dc = %link.dc,
                             host = %contact.host_id,
                             attempt,
+                            candidates = link.candidates.len(),
                             %reason,
-                            "cross-DC delivery not acknowledged; retrying"
+                            "cross-DC delivery not acknowledged; trying another live node in that DC"
                         );
                         tokio::time::sleep(backoff).await;
                         backoff = backoff.saturating_mul(2);
                         attempt += 1;
+                        rotation += 1;
                     }
                 }
             }
@@ -263,13 +290,13 @@ pub async fn fan_out_raft_command_to_remote_dcs(
     peer_dcs: &HashMap<Uuid, String>,
     local_dc: &str,
 ) -> Result<FanoutReport, ClusterError> {
-    let contacts = dc_contacts(peers, peer_dcs, local_dc);
-    if contacts.is_empty() {
+    let registry = dc_registry(peers, peer_dcs, local_dc);
+    if registry.is_empty() {
         return Ok(FanoutReport::default());
     }
     let sender = RaftCommandDcSender { peer_manager };
     let dispatch = CrossDcDispatch::default();
-    Ok(dispatch.fan_out(&sender, cmd, &contacts).await)
+    Ok(dispatch.fan_out_registry(&sender, cmd, &registry).await)
 }
 
 #[cfg(test)]
@@ -292,22 +319,34 @@ mod tests {
             .collect()
     }
 
-    /// A sender that records every attempt: `(dc, attempt)` in call order.
+    /// A sender that records every attempt, and can refuse by DC or by NODE —
+    /// the rotation case needs the node granularity.
     #[derive(Default)]
     struct RecordingSender {
-        attempts: Mutex<Vec<(String, String)>>,
-        /// How many leading attempts a DC refuses before it acknowledges.
+        attempts: Mutex<Vec<(String, Uuid)>>,
         refuse_first: Mutex<HashMap<String, u32>>,
+        refuse_first_host: Mutex<HashMap<Uuid, u32>>,
     }
 
     impl RecordingSender {
         fn with_refusals(dc: &str, refusals: u32) -> Self {
-            let s = Self::default();
-            s.refuse_first
+            let sender = Self::default();
+            sender
+                .refuse_first
                 .lock()
                 .unwrap()
                 .insert(dc.to_string(), refusals);
-            s
+            sender
+        }
+
+        fn with_refusals_for_host(host_id: Uuid, refusals: u32) -> Self {
+            let sender = Self::default();
+            sender
+                .refuse_first_host
+                .lock()
+                .unwrap()
+                .insert(host_id, refusals);
+            sender
         }
 
         fn sends_for(&self, dc: &str) -> usize {
@@ -315,8 +354,21 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(d, _)| d == dc)
+                .filter(|(attempted_dc, _)| attempted_dc == dc)
                 .count()
+        }
+
+        fn sends_to_host(&self, host_id: Uuid) -> usize {
+            self.attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, attempted_host)| *attempted_host == host_id)
+                .count()
+        }
+
+        fn total_attempts(&self) -> usize {
+            self.attempts.lock().unwrap().len()
         }
     }
 
@@ -326,7 +378,7 @@ mod tests {
             self.attempts
                 .lock()
                 .unwrap()
-                .push((contact.dc.clone(), op.to_string()));
+                .push((contact.dc.clone(), contact.host_id));
             let mut refusals = self.refuse_first.lock().unwrap();
             if let Some(remaining) = refusals.get_mut(&contact.dc) {
                 if *remaining > 0 {
@@ -334,93 +386,129 @@ mod tests {
                     return Err("not acknowledged".to_string());
                 }
             }
+            drop(refusals);
+            let mut host_refusals = self.refuse_first_host.lock().unwrap();
+            if let Some(remaining) = host_refusals.get_mut(&contact.host_id) {
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    return Err("this node did not acknowledge".to_string());
+                }
+            }
+            let _ = op;
             Ok(())
         }
     }
 
-    /// The link count is per DC, not per node: 2 DCs → 1 contact, 3 → 2,
-    /// 4 → 3; adding nodes to a DC never adds a contact.
+    // ── I1 / I5: the registry ─────────────────────────────────────────────────
+
+    /// I1 + I5: the registry holds EVERY known node of a remote DC as a
+    /// candidate, in deterministic order, and never invents a DC for a peer that
+    /// announced none.
     #[test]
-    fn dc_contacts_hold_exactly_one_contact_per_remote_dc() {
+    fn registry_holds_every_peer_of_a_remote_dc_as_a_candidate() {
         let peers = [
-            peer(1, 7001), // dc1 (local) — never a target
-            peer(2, 7002), // dc2
-            peer(3, 7003), // dc2
-            peer(4, 7004), // dc2
-            peer(5, 7005), // dc3
-            peer(6, 7006), // dc3
+            peer(3, 7003),
+            peer(1, 7001),
+            peer(4, 7004),
+            peer(2, 7002),
+            peer(9, 7009),
         ];
         let dcs = with_dcs(&[
             (Uuid::from_u128(1), "dc1"),
             (Uuid::from_u128(2), "dc2"),
             (Uuid::from_u128(3), "dc2"),
-            (Uuid::from_u128(4), "dc2"),
-            (Uuid::from_u128(5), "dc3"),
-            (Uuid::from_u128(6), "dc3"),
+            (Uuid::from_u128(4), "dc3"),
         ]);
 
-        let contacts = dc_contacts(&peers, &dcs, "dc1");
+        let registry = dc_registry(&peers, &dcs, "dc1");
 
         assert_eq!(
-            contacts.keys().cloned().collect::<Vec<_>>(),
+            registry.keys().cloned().collect::<Vec<_>>(),
             vec!["dc2".to_string(), "dc3".to_string()],
-            "a 3-DC cluster holds exactly two cross-DC contacts: one per other DC"
+            "one link per remote DC — never one per remote node"
         );
         assert_eq!(
-            contacts["dc2"].host_id,
-            Uuid::from_u128(2),
-            "the contact is deterministic — the lowest host id in that DC"
+            registry["dc2"]
+                .candidates
+                .iter()
+                .map(|candidate| candidate.host_id)
+                .collect::<Vec<_>>(),
+            vec![Uuid::from_u128(2), Uuid::from_u128(3)],
+            "every known node of dc2 is a candidate, lowest host id first"
         );
-        assert_eq!(contacts["dc2"].addr, addr(7002));
-        assert_eq!(contacts["dc3"].host_id, Uuid::from_u128(5));
-
-        // 2 DCs → 1 contact; 4 DCs → 3 contacts.
-        let two_dc = dc_contacts(
-            &[peer(1, 7001), peer(2, 7002)],
-            &with_dcs(&[(Uuid::from_u128(1), "dc1"), (Uuid::from_u128(2), "dc2")]),
-            "dc1",
-        );
-        assert_eq!(two_dc.len(), 1, "2 DCs: each DC has one link to the other");
-
-        let peers4 = [peer(1, 7001), peer(2, 7002), peer(3, 7003), peer(4, 7004)];
-        let dcs4 = with_dcs(&[
-            (Uuid::from_u128(1), "dc1"),
-            (Uuid::from_u128(2), "dc2"),
-            (Uuid::from_u128(3), "dc3"),
-            (Uuid::from_u128(4), "dc4"),
-        ]);
-        let four_dc = dc_contacts(&peers4, &dcs4, "dc1");
         assert_eq!(
-            four_dc.len(),
-            3,
-            "4 DCs: each DC gets one copy from each of the other three"
+            registry["dc3"].candidates.len(),
+            1,
+            "a one-node DC has one candidate"
         );
         assert!(
-            !four_dc.contains_key("dc1"),
-            "a DC never dispatches to itself"
+            !registry.contains_key("dc1"),
+            "a DC is never its own relay target"
         );
     }
 
-    /// A peer whose DC was never announced must not become a cross-DC target:
-    /// unplaceable peers are treated as local everywhere else.
+    /// I5: a peer that announced no DC is not a relay target — an unplaceable
+    /// peer is treated as local everywhere else, so addressing it here would
+    /// deliver a cross-DC copy to a node that is probably in this DC.
     #[test]
-    fn dc_contacts_skip_peers_with_no_announced_dc() {
+    fn registry_skips_peers_with_no_announced_dc() {
         let peers = [peer(1, 7001), peer(2, 7002), peer(9, 7009)];
         let dcs = with_dcs(&[(Uuid::from_u128(1), "dc1"), (Uuid::from_u128(2), "dc2")]);
 
-        let contacts = dc_contacts(&peers, &dcs, "dc1");
+        let registry = dc_registry(&peers, &dcs, "dc1");
 
-        assert_eq!(
-            contacts.len(),
-            1,
-            "only the announced remote DC is a target"
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry["dc2"].candidates.len(), 1);
+        assert!(
+            registry["dc2"]
+                .candidates
+                .iter()
+                .all(|candidate| candidate.host_id != Uuid::from_u128(9)),
+            "the peer that announced nothing must not be addressed"
         );
-        assert!(contacts.contains_key("dc2"));
     }
 
-    /// One copy per remote DC per attempt — never one per remote node.
+    /// N DCs ⇒ N−1 links, whatever each DC's node count. Three DCs: each sends
+    /// one copy to each of the other two.
+    #[test]
+    fn registry_scales_with_dcs_not_nodes() {
+        let peers = [
+            peer(1, 7001),
+            peer(2, 7002),
+            peer(3, 7003),
+            peer(4, 7004),
+            peer(5, 7005),
+        ];
+        let dcs = with_dcs(&[
+            (Uuid::from_u128(1), "dc1"),
+            (Uuid::from_u128(2), "dc2"),
+            (Uuid::from_u128(3), "dc2"),
+            (Uuid::from_u128(4), "dc3"),
+            (Uuid::from_u128(5), "dc3"),
+        ]);
+
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        assert_eq!(registry.len(), 2, "3 DCs: two links from dc1");
+
+        let four = dc_registry(
+            &[peer(1, 7001), peer(2, 7002), peer(3, 7003), peer(4, 7004)],
+            &with_dcs(&[
+                (Uuid::from_u128(1), "dc1"),
+                (Uuid::from_u128(2), "dc2"),
+                (Uuid::from_u128(3), "dc3"),
+                (Uuid::from_u128(4), "dc4"),
+            ]),
+            "dc1",
+        );
+        assert_eq!(four.len(), 3, "4 DCs: one copy to each of the other three");
+    }
+
+    // ── I1 / I7: one copy per DC, one attempt when all ack ────────────────────
+
+    /// I1 + I7: four remote NODES in two DCs receive exactly two copies, one
+    /// attempt each — the WAN carries one op per DC, not one per node.
     #[tokio::test]
-    async fn fan_out_sends_exactly_one_copy_per_remote_dc() {
+    async fn fan_out_makes_one_attempt_per_dc_when_all_ack() {
         let peers = [peer(2, 7002), peer(3, 7003), peer(4, 7004), peer(5, 7005)];
         let dcs = with_dcs(&[
             (Uuid::from_u128(2), "dc2"),
@@ -428,36 +516,38 @@ mod tests {
             (Uuid::from_u128(4), "dc2"),
             (Uuid::from_u128(5), "dc3"),
         ]);
-        let contacts = dc_contacts(&peers, &dcs, "dc1");
+        let registry = dc_registry(&peers, &dcs, "dc1");
         let sender = RecordingSender::default();
 
         let report = CrossDcDispatch::default()
-            .fan_out(&sender, &7u64, &contacts)
+            .fan_out_registry(&sender, &7u64, &registry)
             .await;
 
         assert_eq!(
-            sender.attempts.lock().unwrap().len(),
+            sender.total_attempts(),
             2,
-            "four remote NODES in two DCs must receive exactly two copies"
+            "three remote nodes in dc2 plus one in dc3 must receive exactly two copies"
         );
         assert_eq!(sender.sends_for("dc2"), 1);
         assert_eq!(sender.sends_for("dc3"), 1);
         assert_eq!(report.delivered, vec!["dc2".to_string(), "dc3".to_string()]);
         assert_eq!(report.retries, 0);
-        assert!(report.is_complete(&contacts));
+        assert!(report.failed.is_empty());
     }
 
-    /// A DC that refuses an attempt is retried, and the DC that already
-    /// acknowledged is not sent a second copy.
+    // ── I2: a delivered DC is never re-sent ──────────────────────────────────
+
+    /// I2: a DC that refused one attempt is retried, and the DC that already
+    /// acknowledged is never sent a second copy.
     #[tokio::test]
-    async fn fan_out_retries_a_refusing_dc_without_resending_to_a_delivered_dc() {
+    async fn fan_out_retries_without_resending_to_a_delivered_dc() {
         let peers = [peer(2, 7002), peer(5, 7005)];
         let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
-        let contacts = dc_contacts(&peers, &dcs, "dc1");
+        let registry = dc_registry(&peers, &dcs, "dc1");
         let sender = RecordingSender::with_refusals("dc3", 1);
 
         let report = CrossDcDispatch::default()
-            .fan_out(&sender, &9u64, &contacts)
+            .fan_out_registry(&sender, &9u64, &registry)
             .await;
 
         assert_eq!(sender.sends_for("dc3"), 2, "the refusing DC got one retry");
@@ -467,46 +557,92 @@ mod tests {
             "a delivered DC is never sent a second copy"
         );
         assert_eq!(report.retries, 1);
-        assert_eq!(report.failed, Vec::<String>::new());
-        assert!(report.is_complete(&contacts));
+        assert!(report.failed.is_empty());
     }
 
-    /// A DC that never acknowledges is reported, not silently dropped, and the
-    /// other DCs are still delivered.
+    // ── I3: rotation to another live node, then a reported failure ────────────
+
+    /// I3: a refusal rotates to the NEXT live node of the same DC — still one
+    /// copy for that DC, just reached through another node.
+    #[tokio::test]
+    async fn fan_out_rotates_to_the_next_live_candidate_in_the_dc() {
+        let peers = [peer(2, 7002), peer(3, 7003), peer(5, 7005)];
+        let dcs = with_dcs(&[
+            (Uuid::from_u128(2), "dc2"),
+            (Uuid::from_u128(3), "dc2"),
+            (Uuid::from_u128(5), "dc3"),
+        ]);
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        let sender = RecordingSender::with_refusals_for_host(Uuid::from_u128(2), u32::MAX);
+
+        let report = CrossDcDispatch::default()
+            .fan_out_registry(&sender, &9u64, &registry)
+            .await;
+
+        assert_eq!(
+            report.delivered_by.get("dc2").copied(),
+            Some(Uuid::from_u128(3)),
+            "dc2 must be reached through its other live node"
+        );
+        assert_eq!(
+            sender.sends_to_host(Uuid::from_u128(2)),
+            1,
+            "the refusing node is tried once and then left alone"
+        );
+        assert_eq!(
+            sender.sends_for("dc2"),
+            2,
+            "one refusal, then the next node"
+        );
+        assert!(report.failed.is_empty());
+        assert_eq!(report.retries, 1);
+    }
+
+    /// I3: a DC whose nodes all refuse is reported and counted after a bounded
+    /// number of attempts — never dropped silently, and never retried forever.
     #[tokio::test]
     async fn fan_out_reports_a_dc_that_never_acknowledges() {
-        let peers = [peer(2, 7002), peer(5, 7005)];
-        let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
-        let contacts = dc_contacts(&peers, &dcs, "dc1");
-        let sender = RecordingSender::with_refusals("dc3", u32::MAX);
+        let peers = [peer(2, 7002), peer(3, 7003), peer(5, 7005)];
+        let dcs = with_dcs(&[
+            (Uuid::from_u128(2), "dc2"),
+            (Uuid::from_u128(3), "dc2"),
+            (Uuid::from_u128(5), "dc3"),
+        ]);
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        let sender = RecordingSender::with_refusals("dc2", u32::MAX);
         let dispatch = CrossDcDispatch::with_policy(CrossDcRetryPolicy {
             max_attempts: 3,
             backoff: Duration::from_millis(1),
         });
 
-        let report = dispatch.fan_out(&sender, &1u64, &contacts).await;
+        let report = dispatch.fan_out_registry(&sender, &1u64, &registry).await;
 
-        assert_eq!(sender.sends_for("dc3"), 3, "bounded attempts, then give up");
-        assert_eq!(report.failed, vec!["dc3".to_string()]);
-        assert_eq!(report.delivered, vec!["dc2".to_string()]);
-        assert!(!report.is_complete(&contacts));
+        assert_eq!(sender.sends_for("dc2"), 3, "bounded attempts, then give up");
+        assert_eq!(
+            sender.sends_for("dc3"),
+            1,
+            "the healthy DC is delivered exactly once regardless"
+        );
+        assert_eq!(report.failed, vec!["dc2".to_string()]);
+        assert_eq!(report.delivered, vec!["dc3".to_string()]);
+        assert!(!report.delivered_by.contains_key("dc2"));
     }
 
-    /// No remote DCs → nothing to do, and nothing counted.
+    /// No remote DCs → nothing sent, nothing counted.
     #[tokio::test]
     async fn fan_out_with_only_local_dc_sends_nothing() {
         let peers = [peer(1, 7001), peer(9, 7009)];
         let dcs = with_dcs(&[(Uuid::from_u128(1), "dc1")]);
-        let contacts = dc_contacts(&peers, &dcs, "dc1");
-        assert!(contacts.is_empty());
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        assert!(registry.is_empty());
 
         let sender = RecordingSender::default();
         let report = CrossDcDispatch::default()
-            .fan_out(&sender, &1u64, &contacts)
+            .fan_out_registry(&sender, &1u64, &registry)
             .await;
 
         assert!(report.delivered.is_empty());
         assert!(report.failed.is_empty());
-        assert_eq!(sender.attempts.lock().unwrap().len(), 0);
+        assert_eq!(sender.total_attempts(), 0);
     }
 }
