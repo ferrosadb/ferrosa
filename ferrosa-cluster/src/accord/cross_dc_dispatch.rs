@@ -221,6 +221,16 @@ impl CrossDcDispatch {
                 match sender.send_to_contact(contact, op).await {
                     Ok(()) => {
                         CROSS_DC_SENDS_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        // One line per delivered DC. "One copy per remote DC" is
+                        // only checkable against evidence, and this is it: the DC,
+                        // the node that took the copy, and the attempt it took.
+                        tracing::info!(
+                            dc = %link.dc,
+                            host = %contact.host_id,
+                            attempt,
+                            candidates = link.candidates.len(),
+                            "cross-DC copy delivered"
+                        );
                         report.delivered.push(link.dc.clone());
                         report.delivered_by.insert(link.dc.clone(), contact.host_id);
                         break;
