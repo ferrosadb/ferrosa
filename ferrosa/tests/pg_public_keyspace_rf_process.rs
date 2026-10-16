@@ -268,8 +268,26 @@ fn readiness_timeout_message(
 /// Wait until the node reports `{"ready":true}` on `/readyz` (leader elected and
 /// every listener up). Panics — naming the condition it was waiting on — if it
 /// never does.
+/// How long a node may produce NO new log output before it counts as STALLED rather
+/// than slow: a node that is still starting keeps writing, a hung one goes quiet.
+const READY_STALL_BACKSTOP: Duration = Duration::from_secs(30);
+
+/// Ceiling on the progress extension below, so a node that chatters forever still
+/// fails instead of hanging the run.
+const READY_HARD_CAP: Duration = Duration::from_secs(300);
+
 fn wait_ready(node: &Node, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let hard_cap = started + READY_HARD_CAP;
+    let mut deadline = started + timeout;
+    // The budget is spent on SILENCE, not on a wall clock: any new output resets it.
+    // That is the rule the engine's own barrier already uses ("The barrier must
+    // decide on that PROGRESS, not on a wall clock", quorum_availability.rs), and it
+    // is what separates a node starved by the full parallel suite from one that is
+    // genuinely hung -- the latter stops writing and still fails at the nominal
+    // budget, so this does not lengthen any assertion.
+    let mut seen_len = 0u64;
+    let mut progressed_at = started;
     let mut last_body: Option<String> = None;
     loop {
         if let Some(body) = http_get(node.ports.web, "/readyz", None) {
@@ -278,7 +296,18 @@ fn wait_ready(node: &Node, timeout: Duration) {
             }
             last_body = Some(body);
         }
-        if Instant::now() >= deadline {
+        let len = std::fs::metadata(node.log_path())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        if len > seen_len {
+            seen_len = len;
+            progressed_at = Instant::now();
+            if deadline < hard_cap {
+                deadline = Instant::now() + timeout;
+            }
+        }
+        let stalled = progressed_at.elapsed() >= READY_STALL_BACKSTOP;
+        if (Instant::now() >= deadline && stalled) || Instant::now() >= hard_cap {
             // One last probe: the freshest body is the one that names the condition.
             let body = http_get(node.ports.web, "/readyz", None).or(last_body);
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
