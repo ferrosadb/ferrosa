@@ -1269,6 +1269,37 @@ impl WritePath {
         }
     }
 
+    /// Whether THIS node's engine has FINISHED building `index_name` on
+    /// `table_id`.
+    ///
+    /// [`declares_index_locally`](Self::declares_index_locally) answers a
+    /// question about the schema; this one answers a question about the data. A
+    /// declared index whose backfill is still pending — or has failed — refuses
+    /// reads ([`StorageEngine::read_by_index_each_after`]), because it holds a
+    /// fraction of the table and a fraction reported as the whole answer is
+    /// worse than a slow one.
+    ///
+    /// A caller that can fall back to a scan therefore asks BOTH: the index is
+    /// usable only while it is declared and current. Asking only the first
+    /// turns the window between a declaration and its completed build into a
+    /// failed read, where the scan below would have returned the right rows.
+    ///
+    /// Resolved from the same handle [`declares_index_locally`] and
+    /// [`index_read_stream`](Self::index_read_stream) use, so the three cannot
+    /// disagree about which engine's index this is.
+    pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
+        match self {
+            Self::Direct(engine) => engine.index_is_current(table_id, index_name),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
+                .local_storage()
+                .index_is_current(table_id, index_name),
+            Self::Cluster(coordinator) => {
+                coordinator.storage.index_is_current(table_id, index_name)
+            }
+            Self::Unavailable => false,
+        }
+    }
+
     /// Stream a global secondary-index lookup in row order — `(partition
     /// key, clustering)` — strictly after `after` when given, without
     /// materializing the matching partitions. Every layer holds O(sources):

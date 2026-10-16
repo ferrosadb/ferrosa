@@ -31,6 +31,7 @@ use ferrosa_sparql::executor::{self, ExecutionLimits};
 use ferrosa_sparql::planner;
 use ferrosa_sparql::results::Binding;
 use ferrosa_sparql::triple_store::triples_table_id;
+use ferrosa_storage::index::IndexBackendConfig;
 use ferrosa_storage::{
     CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
 };
@@ -88,20 +89,39 @@ struct Fixture {
     storage: Arc<StorageEngine>,
     write_path: Arc<WritePath>,
     engine: SparqlEngine,
+    config: SparqlConfig,
     _dir: TempDir,
 }
 
 /// `keyspace == default_graph`: rows land in the graph component the served
 /// scope isolates on, so an index that ignored the graph would be visible here.
 fn fixture(config: SparqlConfig) -> Fixture {
+    fixture_with_index_backend(config, IndexBackendConfig::Local)
+}
+
+/// `fixture`, with the index build backend chosen by the caller.
+///
+/// `IndexBackendConfig::Off` builds no scheduler, so a declaration made over
+/// SSTables that already exist marks every one of them pending and nothing
+/// ever builds them. That is the backfill window a real node passes through —
+/// the index is registered, incomplete, and known-incomplete by the tracker —
+/// held still instead of racing a live builder.
+fn fixture_with_index_backend(config: SparqlConfig, index_backend: IndexBackendConfig) -> Fixture {
     let dir = TempDir::new().unwrap();
-    let storage = Arc::new(StorageEngine::new(storage_config(&dir), None).unwrap());
+    let mut storage_config = storage_config(&dir);
+    storage_config.index_backend = index_backend;
+    let storage = Arc::new(StorageEngine::new(storage_config, None).unwrap());
     let write_path = Arc::new(WritePath::direct(Arc::clone(&storage)));
-    let engine = SparqlEngine::new(Arc::clone(&storage), Arc::clone(&write_path), config);
+    let engine = SparqlEngine::new(
+        Arc::clone(&storage),
+        Arc::clone(&write_path),
+        config.clone(),
+    );
     Fixture {
         storage,
         write_path,
         engine,
+        config,
         _dir: dir,
     }
 }
@@ -141,6 +161,56 @@ impl Fixture {
         let out = executor::execute(&plan, &self.write_path, &ExecutionLimits { max_rows }).await?;
         Ok(rows_of(&out.results.bindings))
     }
+
+    /// Leave the object index DECLARED but NOT current, over the SSTables the
+    /// seeded rows were flushed into, and hand back the engine a fresh
+    /// registration boots.
+    ///
+    /// The shape is a node that comes up with data already on disk while the
+    /// index it now declares is still backfilling:
+    ///
+    /// 1. the seeded rows are flushed into an SSTable;
+    /// 2. the declaration is dropped, so the index is as absent as it was
+    ///    before `SparqlEngine::new` declared it — the rows stay on disk;
+    /// 3. `SparqlEngine::new` is run again over the SAME storage. That is the
+    ///    real registration entry point: it declares the object index, finds
+    ///    SSTables that predate the declaration, and marks them pending.
+    ///
+    /// The backend is `Off`, so nothing drains that pending set and the window
+    /// does not close under the test. The tracker state the executor reads is
+    /// the same either way — this only decides whether it is still there when
+    /// the assertions run.
+    fn leave_object_index_declared_but_not_current(&self) -> SparqlEngine {
+        let table_id = triples_table_id(KS);
+        self.storage
+            .flush_all()
+            .expect("the seeded rows must reach an SSTable, or there is no backfill to be pending");
+        assert!(
+            self.storage
+                .drop_index(&table_id, OBJECT_INDEX)
+                .expect("drop the declared index"),
+            "the fixture's registration must have declared '{OBJECT_INDEX}' for this window to exist"
+        );
+        assert!(
+            !self.storage.declares_index(&table_id, OBJECT_INDEX),
+            "step 2 must leave the index undeclared, or step 3 declares nothing"
+        );
+
+        let engine = SparqlEngine::new(
+            Arc::clone(&self.storage),
+            Arc::clone(&self.write_path),
+            self.config.clone(),
+        );
+        assert!(
+            self.storage.declares_index(&table_id, OBJECT_INDEX),
+            "the fresh registration must declare '{OBJECT_INDEX}' over the existing SSTables"
+        );
+        assert!(
+            !self.storage.index_is_current(&table_id, OBJECT_INDEX),
+            "the fixture is only meaningful while the declared index is known-incomplete"
+        );
+        engine
+    }
 }
 
 /// `(subject, predicate)` of every solution, sorted. Every query in this file
@@ -179,6 +249,32 @@ fn pair(subject: &str, predicate: &str) -> (String, String) {
         format!("http://ex/{subject}"),
         format!("http://ex/{predicate}"),
     )
+}
+
+/// [`served_object_rows`], with the failure left to the caller.
+///
+/// The backfill-window test has to LOOK at the failure: the defect it pins is
+/// a read that refuses, and an `expect` would print the refusal without ever
+/// comparing it to the rows the scan below would have returned.
+async fn served_object_rows_or_error(
+    engine: &SparqlEngine,
+    object: &str,
+) -> Result<HashSet<(String, String)>, String> {
+    let query = format!("SELECT ?s ?p WHERE {{ ?s ?p \"{object}\" }}");
+    match engine
+        .execute(&query, KS)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        SparqlResult::Select(r) => Ok(r
+            .results
+            .bindings
+            .iter()
+            .map(|row| (row["s"].value.clone(), row["p"].value.clone()))
+            .collect()),
+        SparqlResult::Ask(_) => Err("expected SELECT result, got ASK".into()),
+        SparqlResult::Graph(_) => Err("expected SELECT result, got Graph".into()),
+    }
 }
 
 // ── Log capture ─────────────────────────────────────────────────────────
@@ -342,6 +438,19 @@ async fn an_object_bound_query_is_answered_without_reading_the_whole_table() {
     });
     f.seed().await;
 
+    // The control this test stands for: the index it reads through is DECLARED
+    // and CURRENT. Without that pin, a change that sent every object-bound read
+    // back to the scan would still look answered here — the row is found either
+    // way — and only the bound below would notice.
+    assert!(
+        f.storage
+            .declares_index(&triples_table_id(KS), OBJECT_INDEX)
+            && f.storage
+                .index_is_current(&triples_table_id(KS), OBJECT_INDEX),
+        "this test is about the index read; it means nothing unless the fixture's \
+         '{OBJECT_INDEX}' is both declared and current"
+    );
+
     let indexed = f
         .run_bounded("SELECT ?s ?p ?o WHERE { ?s ?p \"object-019\" }", BOUND)
         .await
@@ -458,5 +567,82 @@ async fn an_undeclared_object_index_still_scans_and_still_warns() {
     assert!(
         captured.contains(OBJECT_INDEX),
         "the warning must name the index that is missing; captured: {captured}"
+    );
+}
+
+// =======================================================================
+// 4 — the backfill window: declared, but not yet current.
+// =======================================================================
+
+/// An object-bound query must fall back to the full scan while the index it
+/// declares is still backfilling — the right rows, slow, and loud about it.
+///
+/// `read_by_index_each_after` REFUSES a read through an index whose backfill
+/// has not finished: the index holds a fraction of the table, and a fraction
+/// reported as the whole answer is worse than a slow answer. So the access
+/// path has to be chosen on `declared AND current`, not on `declared` — in the
+/// window between the declaration and the completed build, the index path
+/// answers with an error where the scan underneath it answers correctly.
+///
+/// RED as written (under the declaration-alone predicate): the served query
+/// returns `Err("secondary index 'rdf_triples_object_idx' on rdf_triples in
+/// keyspace 'default' is not current; refusing to return incomplete results
+/// while index backfill is pending or failed")` in place of the row that is on
+/// disk and that the fallback scan finds.
+#[tokio::test]
+async fn an_object_bound_query_scans_while_the_declared_index_is_not_yet_current() {
+    let f = fixture_with_index_backend(
+        SparqlConfig {
+            default_graph: KS.to_string(),
+            ..Default::default()
+        },
+        IndexBackendConfig::Off,
+    );
+    f.seed().await;
+    let engine = f.leave_object_index_declared_but_not_current();
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // The contract: the rows come back. The declared index is incomplete, the
+    // table is not, and the scan is the access path that reads the table.
+    let expected: HashSet<(String, String)> = [pair("s19", "p")].into_iter().collect();
+    let rows = served_object_rows_or_error(&engine, "object-019").await;
+    assert_eq!(
+        rows,
+        Ok(expected),
+        "an index whose backfill is still pending must not be consulted: falling back to the \
+         scan returns the one triple whose object is 'object-019', and the index path does not"
+    );
+
+    // ...and it really scanned, rather than finding the row through the index
+    // it declares. The 8-row bound is answerable only out of index postings, so
+    // a read that dies on it streamed the table.
+    let tripped = f
+        .run_bounded("SELECT ?s ?p ?o WHERE { ?s ?p \"object-019\" }", BOUND)
+        .await
+        .expect_err(
+            "while the index is not current it cannot answer, so the read must stream the \
+             whole table and trip the 8-row bound",
+        );
+    assert!(
+        tripped
+            .to_string()
+            .contains("read more than 8 storage rows"),
+        "the fallback must die on the row bound, not on a refused index read: {tripped}"
+    );
+
+    // A fallback nobody can see is a fallback nobody can explain in an
+    // incident, and the window it is covering has to be named.
+    let captured = logs.contents();
+    assert!(
+        captured.contains("ObjectScan") && captured.contains(OBJECT_INDEX),
+        "the scan fallback must warn, and the warning must name the index it is standing in \
+         for; captured: {captured}"
     );
 }

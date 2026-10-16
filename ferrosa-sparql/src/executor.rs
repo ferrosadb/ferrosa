@@ -655,44 +655,58 @@ where
                 let _ = scan.feed(&partition)?;
             }
         }
-        TripleOp::ObjectScan { object, .. }
-            if !write_path.declares_index_locally(&table_id, OBJECT_INDEX_NAME) =>
-        {
-            // No object index on this node (nothing creates one today), so
-            // scan. This used to be reached by reading the missing index as
-            // "no hits"; an undeclared index is now refused, not answered
-            // empty (t_50c8bc7d), so the choice is made here, up front.
-            tracing::warn!(
-                object,
-                index = OBJECT_INDEX_NAME,
-                "ObjectScan: object index is not declared; streaming full scan \
-                 with filtering"
-            );
-            stream_scan(&table_id, write_path, &mut scan).await?;
-        }
         TripleOp::ObjectScan { object, .. } => {
-            // Keyed index read first. The stream keeps transport bounded and
-            // lets the scan stop as soon as its sink is satisfied.
-            let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
-            let mut indexed = write_path
-                .index_read_stream(&table_id, OBJECT_INDEX_NAME, &index_key, None)
-                .await?;
-            let mut found = false;
-            let mut stopped = false;
-            while let Some(partition) = indexed.next().await {
-                found = true;
-                if scan.feed(&partition?)?.is_break() {
-                    stopped = true;
-                    break;
-                }
-            }
-            if !found && !stopped {
+            // The index is an optimisation over a scan that is always correct,
+            // so the index path is taken only where it can actually answer:
+            // this node must DECLARE the index AND the index must be CURRENT.
+            //
+            // An undeclared index used to be read as "no hits"; it is refused
+            // now, not answered empty (t_50c8bc7d), so the fallback is chosen
+            // here, up front. A DECLARED index whose backfill is still pending
+            // is refused too, for a different reason — it holds a fraction of
+            // the table, and a fraction reported as the whole answer is worse
+            // than a slow one. During that window the scan is the only correct
+            // access path, exactly as it was before the index existed.
+            if !write_path.declares_index_locally(&table_id, OBJECT_INDEX_NAME) {
                 tracing::warn!(
                     object,
-                    "ObjectScan: no secondary index hit; falling back to a streaming \
-                     full scan with filtering"
+                    index = OBJECT_INDEX_NAME,
+                    "ObjectScan: object index is not declared; streaming full scan \
+                     with filtering"
                 );
                 stream_scan(&table_id, write_path, &mut scan).await?;
+            } else if !write_path.index_is_current(&table_id, OBJECT_INDEX_NAME) {
+                tracing::warn!(
+                    object,
+                    index = OBJECT_INDEX_NAME,
+                    "ObjectScan: object index is declared but not yet current — its backfill \
+                     is still pending or has failed; streaming full scan with filtering"
+                );
+                stream_scan(&table_id, write_path, &mut scan).await?;
+            } else {
+                // Keyed index read first. The stream keeps transport bounded and
+                // lets the scan stop as soon as its sink is satisfied.
+                let index_key = ferrosa_index::IndexKey(object.as_bytes().to_vec());
+                let mut indexed = write_path
+                    .index_read_stream(&table_id, OBJECT_INDEX_NAME, &index_key, None)
+                    .await?;
+                let mut found = false;
+                let mut stopped = false;
+                while let Some(partition) = indexed.next().await {
+                    found = true;
+                    if scan.feed(&partition?)?.is_break() {
+                        stopped = true;
+                        break;
+                    }
+                }
+                if !found && !stopped {
+                    tracing::warn!(
+                        object,
+                        "ObjectScan: no secondary index hit; falling back to a streaming \
+                         full scan with filtering"
+                    );
+                    stream_scan(&table_id, write_path, &mut scan).await?;
+                }
             }
         }
         TripleOp::PredicateScan { .. } | TripleOp::FullScan { .. } => {
