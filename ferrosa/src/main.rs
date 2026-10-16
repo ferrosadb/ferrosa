@@ -861,15 +861,43 @@ async fn ensure_postgres_default_keyspace(
     Ok(true)
 }
 
+/// Keep the topology this node ADVERTISES on the internode handshake equal to
+/// the topology its own ring commits.
+///
+/// Both `ClusterConfig` and `NetConfig` can read `FERROSA_DATA_CENTER` /
+/// `FERROSA_RACK` straight from the environment, which means the DC a node
+/// tells its peers about and the DC its membership commits are two independent
+/// reads of the same variable. Any divergence — a value edited in-process, a
+/// later config source, a future caller that builds one config and not the
+/// other — makes this node advertise a data center it does not belong to, and
+/// every peer then classifies it wrongly for `NetworkTopologyStrategy` and
+/// `LOCAL_*` quorum accounting. That failure is silent, cluster-wide, and looks
+/// exactly like "the configured DC was ignored", so make the committed value
+/// the single source of truth for the advertisement.
+///
+/// A DC/rack is fixed for the life of the process: the ring's topology is
+/// committed at formation, so an operator changing the variable requires a
+/// restart, which re-seeds both from the same value.
+fn seed_internode_topology(
+    net: &mut ferrosa_net::config::NetConfig,
+    cluster: &ferrosa_cluster::ClusterConfig,
+) {
+    net.data_center = cluster.data_center.clone();
+    net.rack = cluster.rack.clone();
+}
+
 /// Publish the committed topology in the node-local view the CQL layer serves.
 ///
-/// `ferrosa_schema::NodeConfig` is a second copy of this node's own topology:
-/// `system.local.data_center` / `.rack` are read straight out of it
+/// `ferrosa_schema::NodeConfig` is a THIRD copy of the node's own topology:
+/// `system.local.data_center`/`rack` are read straight out of it
 /// (`ferrosa-schema/src/system/local.rs`), and `ferrosa-cql` takes its local DC
 /// for `LOCAL_*` quorum routing from the same field. Both must be the DC the
 /// node's ring commits, so seed them from [`ferrosa_cluster::ClusterConfig`] —
 /// the one place `FERROSA_DATA_CENTER` is resolved — rather than leaving the
-/// `NodeConfig::default()` placeholder (`datacenter1`) in place.
+/// `NodeConfig::default()` placeholder in place.
+///
+/// Same rule as [`seed_internode_topology`], different consumer: one resolved
+/// value, every published copy.
 fn seed_local_topology(
     node: &mut ferrosa_schema::NodeConfig,
     cluster: &ferrosa_cluster::ClusterConfig,
@@ -2666,6 +2694,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         &node_tls,
         listener_tls::internode_require_is_explicit(&file_config),
     );
+    seed_internode_topology(&mut net_config_mut, &cluster_config);
     let net_config = Arc::new(net_config_mut);
 
     // SEC (FMEA epic: t_87a50318 auth, t_27bf4674 + t_d5d122ba TLS): refuse to
@@ -2745,8 +2774,9 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         )),
     );
 
-    // Kept alive for the node-local view published below: one resolved value
-    // (`FERROSA_DATA_CENTER`), every copy of it.
+    // `cluster_config` is kept alive for the published views below: the internode
+    // advertisement and the node-local `system.local` view are seeded from it, so
+    // all three report the one value `FERROSA_DATA_CENTER` resolved.
     let (mode_controller, handles) = ferrosa_cluster::ModeController::new(
         cluster_config.clone(),
         net_config.clone(),
@@ -3039,12 +3069,11 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         tokens,
         ..ferrosa_schema::NodeConfig::default()
     };
-    // `system.local.data_center`/`rack` and the coordinator's local DC for
-    // `LOCAL_*` routing both read THIS struct, so it must report the data center
-    // the node actually runs as — not the `NodeConfig::default()` placeholder.
-    // Left unseeded, a node started with `FERROSA_DATA_CENTER=us-west-2` answers
-    // `datacenter1` in `system.local` and routes `LOCAL_QUORUM` from a data
-    // center it does not belong to.
+    // `system.local.data_center`/`rack` and the coordinator's `LOCAL_*` local DC
+    // both read THIS struct, so it must report the DC the node actually runs
+    // as — not the `NodeConfig::default()` placeholder. Left unseeded, a node
+    // started with FERROSA_DATA_CENTER=us-west-2 answers `datacenter1` in
+    // system.local and routes LOCAL_QUORUM from a DC it does not belong to.
     seed_local_topology(&mut node_config, &cluster_config);
     let node_config = Arc::new(node_config);
     let connection_tracker =
@@ -5068,10 +5097,38 @@ mod tests {
         );
     }
 
-    /// The node-local view (`system.local`, and the coordinator's local DC for
-    /// `LOCAL_*` routing) publishes the committed topology, not the
-    /// `NodeConfig::default()` placeholder. RED against the pre-fix wiring: a
-    /// node started with `FERROSA_DATA_CENTER=us-west-2` answers `datacenter1`.
+    /// The DC/rack a node ADVERTISES is the DC/rack its ring commits, even when
+    /// the internode config was built independently (its own
+    /// `FERROSA_DATA_CENTER` read) and disagrees. RED against the pre-fix
+    /// wiring: `seed_internode_topology` absent leaves the internode config
+    /// claiming `stale-dc`, so this node tells every peer it lives in a data
+    /// center it does not belong to.
+    #[test]
+    fn internode_advertisement_matches_the_committed_topology() {
+        let cluster = ferrosa_cluster::ClusterConfig {
+            data_center: "us-west-2".to_string(),
+            rack: "rack-usw2-b".to_string(),
+            ..ferrosa_cluster::ClusterConfig::default()
+        };
+        let mut net = ferrosa_net::config::NetConfig {
+            data_center: "stale-dc".to_string(),
+            rack: "stale-rack".to_string(),
+            ..ferrosa_net::config::NetConfig::default()
+        };
+
+        seed_internode_topology(&mut net, &cluster);
+
+        assert_eq!(
+            net.data_center, "us-west-2",
+            "the advertised DC must be the one the ring commits"
+        );
+        assert_eq!(net.rack, "rack-usw2-b");
+    }
+
+    /// The node-local view (`system.local`, and the coordinator's LOCAL_* local
+    /// DC) publishes the committed topology, not the `NodeConfig::default()`
+    /// placeholder. RED against the pre-fix wiring: a node started with
+    /// FERROSA_DATA_CENTER=us-west-2 answers `datacenter1` in `system.local`.
     #[test]
     fn local_node_view_publishes_the_committed_topology() {
         let cluster = ferrosa_cluster::ClusterConfig {
@@ -5082,7 +5139,7 @@ mod tests {
         let mut node = ferrosa_schema::NodeConfig::default();
         assert_eq!(
             node.data_center, "datacenter1",
-            "the placeholder is what the bug shipped"
+            "the placeholder is the bug"
         );
 
         seed_local_topology(&mut node, &cluster);
@@ -5093,6 +5150,10 @@ mod tests {
 
     /// An unset `FERROSA_DATA_CENTER` publishes the same named default the ring
     /// commits, so a single-DC cluster is unchanged by the seeding.
+    ///
+    /// Kept from the node-local half of this fix (landed separately): it pins the
+    /// DEFAULT case for the node-local copy, which the agreement test below does
+    /// not cover.
     #[test]
     fn local_node_view_follows_the_default_cluster_config() {
         let cluster = ferrosa_cluster::ClusterConfig::default();
@@ -5102,6 +5163,47 @@ mod tests {
 
         assert_eq!(node.data_center, cluster.data_center);
         assert_eq!(node.rack, cluster.rack);
+    }
+
+    /// Both published copies come from one resolved value: seeding the internode
+    /// advertisement and the node-local view from the same `ClusterConfig`
+    /// leaves them equal, so a peer's view of this node and this node's own
+    /// `system.local` cannot disagree about where it lives.
+    #[test]
+    fn published_topology_is_identical_across_consumers() {
+        let cluster = ferrosa_cluster::ClusterConfig {
+            data_center: "eu-west-1".to_string(),
+            rack: "rack-euw1-c".to_string(),
+            ..ferrosa_cluster::ClusterConfig::default()
+        };
+        let mut net = ferrosa_net::config::NetConfig::default();
+        let mut node = ferrosa_schema::NodeConfig::default();
+
+        seed_internode_topology(&mut net, &cluster);
+        seed_local_topology(&mut node, &cluster);
+
+        assert_eq!(net.data_center, node.data_center);
+        assert_eq!(net.rack, node.rack);
+        assert_eq!(net.data_center, "eu-west-1");
+    }
+
+    /// With no DC configured, both configs fall back to the same default, so a
+    /// single-DC cluster announces exactly the DC it commits and no peer is
+    /// reclassified by the DC advertisement landing.
+    #[test]
+    fn internode_advertisement_follows_the_default_cluster_config() {
+        let cluster = ferrosa_cluster::ClusterConfig::default();
+        let mut net = ferrosa_net::config::NetConfig::default();
+
+        seed_internode_topology(&mut net, &cluster);
+
+        assert_eq!(net.data_center, cluster.data_center);
+        assert_eq!(net.rack, cluster.rack);
+        assert!(
+            !net.data_center.is_empty(),
+            "an unset FERROSA_DATA_CENTER still commits a named DC, and the \
+             handshake must advertise the same name rather than nothing"
+        );
     }
 
     /// A malformed `[internode].broadcast` must also be fatal for the same
