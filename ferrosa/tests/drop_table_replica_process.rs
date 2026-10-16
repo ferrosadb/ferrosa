@@ -41,7 +41,7 @@ use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config, NoTls};
 
 mod common;
-use common::ports::PortAllocator;
+use common::ports::{log_shows_port_collision, PortAllocator};
 
 /// The dropped table. The PG front end's default schema is `public`.
 const TABLE: &str = "drop_proc_tbl";
@@ -247,6 +247,180 @@ fn spawn_node_with_env(
         host_id,
         child,
     }
+}
+
+// ── startup: re-drawing a band that a concurrent process took ────────────────
+
+/// How many times a band is re-drawn before the failure is believed.
+const STARTUP_ATTEMPTS: usize = 5;
+
+/// What one node's startup needs, as a struct rather than a positional list: a
+/// swapped `host_id`/`seed` at a call site is invisible in review.
+struct StartupSpec<'a> {
+    host_id: &'a str,
+    cluster_name: &'a str,
+    seed: Option<&'a str>,
+    extra_env: &'a [(&'a str, &'a str)],
+    /// The readiness budget for ONE attempt.
+    ready_timeout: Duration,
+}
+
+/// Bring ONE node up, re-drawing its whole port band and restarting it if a
+/// listener lost its port to a concurrent process.
+///
+/// [`alloc_ports`] hands out a port that is free at that instant. The band sits
+/// below the kernel's ephemeral floor, so the kernel cannot hand it to an
+/// outbound connection, but nothing stops ANOTHER test process binding inside
+/// the band: `common::ports` leases each process a disjoint slice by file lock,
+/// and a process that cannot take a lease falls back to a slice keyed on its own
+/// process id. A node that loses a port never reports ready, and reporting that
+/// as a red would be a false failure about the product — so it is re-drawn.
+///
+/// The `allocate` seam lets a test hand the first attempt a band that is already
+/// taken, so the retry is PROVEN rather than asserted (see
+/// `a_port_taken_by_a_concurrent_process_is_redrawn_and_retried`).
+fn spawn_node_redrawing(
+    alloc: &mut PortAllocator,
+    spec: StartupSpec<'_>,
+    mut allocate: impl FnMut(&mut PortAllocator) -> Ports,
+) -> Node {
+    let mut last_failure = String::new();
+    for attempt in 1..=STARTUP_ATTEMPTS {
+        let dir = tempfile::tempdir().expect("node data dir");
+        let mut node = spawn_node_with_env(
+            dir,
+            allocate(alloc),
+            spec.host_id.to_string(),
+            spec.cluster_name,
+            spec.seed,
+            spec.extra_env,
+        );
+        match wait_ready_watching(&mut node, spec.ready_timeout, true) {
+            Ok(()) => return node,
+            Err(message) => {
+                if !log_shows_port_collision(&message) {
+                    panic!(
+                        "node {} did not become ready (attempt {attempt}/{STARTUP_ATTEMPTS}):\n{message}",
+                        spec.host_id
+                    );
+                }
+                eprintln!(
+                    "node {} lost a listener port to a concurrent process; re-drawing its band \
+                     and restarting (attempt {attempt}/{STARTUP_ATTEMPTS})",
+                    spec.host_id
+                );
+                last_failure = message;
+            }
+        }
+    }
+    panic!(
+        "node {} never became ready: all {STARTUP_ATTEMPTS} attempts lost a listener port to a \
+         concurrent process. Last failure:\n{last_failure}",
+        spec.host_id
+    );
+}
+
+/// The seed list for node `i` of an already-running mesh: every OTHER node's
+/// internode address. Used when a node is RESTARTED mid-test, so it rejoins the
+/// full mesh rather than the star.
+fn mesh_seed(nodes: &[Node], i: usize) -> String {
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(j, _)| *j != i)
+        .map(|(_, node)| format!("127.0.0.1:{}", node.ports.internode))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Bring the whole `N_NODES` mesh up: every node's ports are allocated up front
+/// so each can be given the others as seeds, and the WHOLE set is re-drawn and
+/// restarted if any listener loses its port — a partial retry would change the
+/// mesh the seeds describe.
+fn start_mesh_cluster(alloc: &mut PortAllocator, cluster_name: &str) -> Vec<Node> {
+    let mut last_failure = String::new();
+    for attempt in 1..=STARTUP_ATTEMPTS {
+        // Allocate every node's ports up front, so each node can be given the
+        // others as seeds. Every node seeds off the other two (a full mesh): that
+        // makes the auto-created `public` keyspace RF=3 on every node — its
+        // replication factor is `seeds + 1` — so an Accord write has two remote
+        // replicas to reach a quorum from. With the docker-compose star (node 0
+        // has no seed) the keyspace is RF=1 and an Accord write that resolves to
+        // the coordinator's own host fails "unknown peer: <own host_id>" and
+        // never commits.
+        let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(alloc)).collect();
+        let internode: Vec<String> = all_ports
+            .iter()
+            .map(|p| format!("127.0.0.1:{}", p.internode))
+            .collect();
+        let seeds_for = |i: usize| -> String {
+            internode
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, a)| a.clone())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+
+        let mut spawned: Vec<Node> = Vec::new();
+        for (i, ports) in all_ports.iter().enumerate() {
+            let dir = tempfile::tempdir().expect("node data dir");
+            // A host id must be distinct in BOTH halves, because the node id is
+            // derived from it two different ways and the halves are disjoint:
+            //
+            //  * Raft's `uuid_to_node_id` reads `bytes[8..16]` (the LAST two groups,
+            //    little-endian) — three host ids that differ only in the FIRST groups
+            //    collapse to one Raft node id, the voters cannot form a group, and no
+            //    leader is ever elected ("never installed the replicated DDL path /
+            //    elected a leader").
+            //  * Accord derives its numeric node id from `bytes[0..8]` (the FIRST
+            //    groups, big-endian) — host ids differing only in the LAST group
+            //    collide onto one Accord node id and every write fails "unknown peer"
+            //    against a self-send (trap 2 below).
+            //
+            // `0x11, 0x22, 0x33` repeated across all sixteen bytes matches the host
+            // ids `tests/docker-compose.cluster.yml` ships and is distinct in both
+            // halves. A single distinguishing group — either end — is not enough.
+            let d = 0x11u8 * (i as u8 + 1);
+            let host_id = format!(
+                "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
+                 {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
+            );
+            spawned.push(spawn_node(
+                dir,
+                *ports,
+                host_id,
+                cluster_name,
+                Some(&seeds_for(i)),
+            ));
+        }
+
+        let mut collision: Option<String> = None;
+        for node in spawned.iter_mut() {
+            if let Err(message) = wait_ready_watching(node, Duration::from_secs(90), true) {
+                if log_shows_port_collision(&message) {
+                    collision = Some(message);
+                    break;
+                }
+                panic!("node {} did not become ready:\n{message}", node.host_id);
+            }
+        }
+        match collision {
+            None => return spawned,
+            Some(message) => {
+                eprintln!(
+                    "a node lost a listener port to a concurrent process; re-drawing the whole \
+                     band and restarting the cluster (attempt {attempt}/{STARTUP_ATTEMPTS})"
+                );
+                last_failure = message;
+            }
+        }
+    }
+    panic!(
+        "the cluster never came up: all {STARTUP_ATTEMPTS} attempts lost a listener port to a \
+         concurrent process. Last failure:\n{last_failure}"
+    );
 }
 
 // ── readiness ─────────────────────────────────────────────────────────────────
@@ -505,12 +679,65 @@ fn node_gone_message(node: &mut Node, started: Instant) -> Option<String> {
 /// can delay the check by at most one probe — never by a whole poll tick, which
 /// is what the former 3 s read cost (5.6-8.7 s to notice a dead child).
 fn wait_ready(node: &mut Node, timeout: Duration) {
+    if let Err(message) = wait_ready_outcome(node, timeout) {
+        panic!("{message}");
+    }
+}
+
+/// Wait for readiness, RETURNING the failure text instead of panicking, so a
+/// caller can tell the two ways this fails apart:
+///
+/// * a listener that could not take its port — a harness accident, re-drawn and
+///   retried by [`spawn_node_redrawing`] and [`start_mesh_cluster`];
+/// * a node that is alive but never ready — a product failure, reported.
+fn wait_ready_outcome(node: &mut Node, timeout: Duration) -> Result<(), String> {
+    wait_ready_watching(node, timeout, false)
+}
+
+/// Readiness wait with a LOG WATCH: a node whose log already shows that a listener
+/// could not take its port is reported AT ONCE, instead of at the deadline.
+///
+/// The retry paths ( [`spawn_node_redrawing`], [`start_mesh_cluster`] ) want this:
+/// a lost port is re-drawn in about a second rather than after the whole budget,
+/// which is what makes a collision cheap to survive on a loaded runner — where a
+/// node can take seconds just to REACH its listeners. Note the CI failure that
+/// prompted this: with the check only at the deadline, a node that took ~5 s to
+/// bind had not yet logged anything about the taken port when a short budget
+/// expired, so the collision looked like a product failure.
+///
+/// The strict tests do NOT want it: a node that is alive but never ready has to be
+/// seen to spend its whole budget, so `wait_ready` keeps the un-watched semantics
+/// and that guard stays honest.
+fn wait_ready_watching(
+    node: &mut Node,
+    timeout: Duration,
+    watch_for_lost_port: bool,
+) -> Result<(), String> {
     let started = Instant::now();
     let deadline = started + timeout;
     let mut last_probe: Option<Probe> = None;
+    let mut polls: u32 = 0;
     loop {
         if let Some(message) = node_gone_message(node, started) {
-            panic!("{message}");
+            return Err(message);
+        }
+        // Every 5 polls (~500 ms): has the node already said a listener could not
+        // take its port? A failed bind is terminal for that listener, so this is
+        // not a race with recovery.
+        if watch_for_lost_port {
+            polls += 1;
+            if polls.is_multiple_of(5) {
+                let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+                if log_shows_port_collision(&log) {
+                    return Err(format!(
+                        "node {} lost a listener port: a port in its band was taken by a \
+                         concurrent process after allocation, so it can never become ready. \
+                         log tail:\n{}",
+                        node.host_id,
+                        tail(&log, 20)
+                    ));
+                }
+            }
         }
         let raw = http_get(node.ports.web, "/readyz", None, PROBE_READ_TIMEOUT);
         // An exit DURING the probe must not wait for the next tick. The probe
@@ -518,11 +745,11 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
         // accepted and then stalled is cut off by the read timeout), so this
         // keeps the check within about one probe of the exit.
         if let Some(message) = node_gone_message(node, started) {
-            panic!("{message}");
+            return Err(message);
         }
         if let Ok(raw) = raw {
             if raw.contains("\"ready\":true") {
-                return;
+                return Ok(());
             }
             if let Some(probe) = parse_probe(&raw) {
                 last_probe = Some(probe);
@@ -530,16 +757,13 @@ fn wait_ready(node: &mut Node, timeout: Duration) {
         }
         if Instant::now() >= deadline {
             let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
-            panic!(
-                "{}",
-                readiness_timeout_message(
-                    &node.host_id,
-                    node.ports.web,
-                    timeout,
-                    last_probe.as_ref(),
-                    &log
-                )
-            );
+            return Err(readiness_timeout_message(
+                &node.host_id,
+                node.ports.web,
+                timeout,
+                last_probe.as_ref(),
+                &log,
+            ));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -827,58 +1051,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
     let cluster_name = format!("drop-proc-{}", std::process::id());
     let mut alloc = PortAllocator::new();
 
-    // Allocate every node's ports up front, so each node can be given the others
-    // as seeds. Every node seeds off the other two (a full mesh): that makes the
-    // auto-created `public` keyspace RF=3 on every node — its replication factor
-    // is `seeds + 1` — so an Accord write has two remote replicas to reach a
-    // quorum from. With the docker-compose star (node 0 has no seed) the keyspace
-    // is RF=1 and an Accord write that resolves to the coordinator's own host
-    // fails "unknown peer: <own host_id>" and never commits.
-    let all_ports: Vec<Ports> = (0..N_NODES).map(|_| alloc_ports(&mut alloc)).collect();
-    let internode: Vec<String> = all_ports
-        .iter()
-        .map(|p| format!("127.0.0.1:{}", p.internode))
-        .collect();
-    let seeds_for = |i: usize| -> String {
-        internode
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != i)
-            .map(|(_, a)| a.clone())
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-
-    let mut nodes: Vec<Node> = Vec::new();
-    for (i, ports) in all_ports.iter().enumerate() {
-        let dir = tempfile::tempdir().expect("node data dir");
-        // A host id must be distinct in BOTH halves, because the node id is
-        // derived from it two different ways and the halves are disjoint:
-        //
-        //  * Raft's `uuid_to_node_id` reads `bytes[8..16]` (the LAST two groups,
-        //    little-endian) — three host ids that differ only in the FIRST groups
-        //    collapse to one Raft node id, the voters cannot form a group, and no
-        //    leader is ever elected ("never installed the replicated DDL path /
-        //    elected a leader").
-        //  * Accord derives its numeric node id from `bytes[0..8]` (the FIRST
-        //    groups, big-endian) — host ids differing only in the LAST group
-        //    collide onto one Accord node id and every write fails "unknown peer"
-        //    against a self-send (trap 2 below).
-        //
-        // `0x11, 0x22, 0x33` repeated across all sixteen bytes matches the host
-        // ids `tests/docker-compose.cluster.yml` ships and is distinct in both
-        // halves. A single distinguishing group — either end — is not enough.
-        let d = 0x11u8 * (i as u8 + 1);
-        let host_id = format!(
-            "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
-             {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
-        );
-        let node = spawn_node(dir, *ports, host_id, &cluster_name, Some(&seeds_for(i)));
-        nodes.push(node);
-    }
-    for node in nodes.iter_mut() {
-        wait_ready(node, Duration::from_secs(90));
-    }
+    let mut nodes = start_mesh_cluster(&mut alloc, &cluster_name);
 
     // Every node must be fully up; a half-bound cluster invalidates everything.
     for node in &nodes {
@@ -1008,7 +1181,7 @@ async fn a_refused_drop_on_a_real_node_process_fails_loud_and_never_resurrects()
     drop(guards);
 
     // (3) Restart the node that APPLIED the drop; the rows must not come back.
-    let seed = seeds_for(leader);
+    let seed = mesh_seed(&nodes, leader);
     let restarted = &mut nodes[leader];
     restarted.restart(&cluster_name, Some(&seed));
     wait_ready(restarted, Duration::from_secs(90));
@@ -1260,7 +1433,18 @@ fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
         host_id,
         "drop-dead-startup",
         None,
-        &[("FERROSA_TEST_FAULT_INJECT", "panic-thread")],
+        // RUST_BACKTRACE=0 for THIS child on purpose. The workflow sets
+        // RUST_BACKTRACE=1 globally, and symbolising a backtrace out of a debug
+        // binary is expensive: measured on one host, exec -> injected panic ->
+        // exit is ~32 ms without a backtrace and ~170 ms with one (5.3x), which
+        // on a loaded CI runner becomes seconds. Nothing here asserts on the std
+        // backtrace — the assertions quote the synchronous `FATAL:` line
+        // `lifecycle` writes — so this removes an unrelated cost from a
+        // measurement of DETECTION, not of symbolisation.
+        &[
+            ("FERROSA_TEST_FAULT_INJECT", "panic-thread"),
+            ("RUST_BACKTRACE", "0"),
+        ],
     );
 
     let started = Instant::now();
@@ -1272,8 +1456,19 @@ fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
     let message = panic_text(failure);
     eprintln!("readiness wait failed after {elapsed:?}:\n{message}");
 
+    // The property is DETECTION, and the budget is 90 s: this bound only has to
+    // be far below it, because the regression it guards is a wait that polls a
+    // corpse until the budget runs out (the merge-queue failure of PR #551 spent
+    // 74 s). It must NOT be tightened to the observed number: `elapsed` also
+    // contains the CHILD's own exec-and-die cost, which is milliseconds on a warm
+    // host and SECONDS on a loaded CI runner. A 5 s bound here failed a run at
+    // 5.325 s where the child itself took 4.119 s to die and was detected 0.6 s
+    // later — i.e. the detection was fine and the bound was measuring the runner.
+    // 30 s keeps the guard (a missing child check burns the whole 90 s, and the
+    // message assertions below prove the failure came from the child-gone path,
+    // not from the deadline) while absorbing runner variance.
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < Duration::from_secs(30),
         "the wait must fail as soon as the process is gone, not spend its budget \
          (it took {elapsed:?}):\n{message}"
     );
@@ -1292,5 +1487,67 @@ fn a_node_that_dies_at_startup_fails_the_readiness_wait_at_once() {
     assert!(
         !message.contains("did not become ready within"),
         "a node that exited did not merely time out:\n{message}"
+    );
+}
+
+/// The re-draw is PROVEN, not asserted: hand the first attempt a band whose
+/// PostgreSQL port a concurrent process is holding, and the node must still come
+/// up — on a different band.
+///
+/// A held listener is exactly what another test process binding inside the band
+/// looks like from here, and the node's own log says so: the failed bind is
+/// recorded, the node reports a not-ready condition rather than ready, and the
+/// harness must re-draw instead of reporting a product failure.
+#[test]
+fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
+    let mut alloc = PortAllocator::new();
+    let taken = alloc_ports(&mut alloc);
+    // Held for the whole test: the FIRST attempt's node can never bind it.
+    let _held = std::net::TcpListener::bind(("127.0.0.1", taken.pg))
+        .expect("occupy a port in the first attempt's band");
+
+    let started = Instant::now();
+    let mut allocations = 0usize;
+    let node = spawn_node_redrawing(
+        &mut alloc,
+        StartupSpec {
+            host_id: "77777777-7777-7777-7777-777777777777",
+            cluster_name: &format!("redraw-{}", std::process::id()),
+            seed: None,
+            extra_env: &[],
+            // The standard budget: with the log watch, a lost port is detected in
+            // about a second, so this covers a slow-but-healthy boot on a loaded
+            // runner rather than being burned on the node that cannot bind.
+            ready_timeout: Duration::from_secs(90),
+        },
+        |alloc| {
+            allocations += 1;
+            if allocations == 1 {
+                taken
+            } else {
+                alloc_ports(alloc)
+            }
+        },
+    );
+
+    let elapsed = started.elapsed();
+    assert!(
+        allocations > 1,
+        "the first attempt must have been handed the taken band, or this test proves nothing"
+    );
+    assert!(
+        elapsed < Duration::from_secs(60),
+        "the lost port must be detected as soon as the node logs it, not by burning the \
+         budget: the first attempt took {elapsed:?}"
+    );
+    assert_ne!(
+        node.ports.pg, taken.pg,
+        "the retry must be on a DIFFERENT band, not the port it already lost"
+    );
+    let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+    assert!(
+        !log.contains(common::ports::PORT_IN_USE),
+        "the node that came up must not itself have lost a port:\n{}",
+        tail(&log, 30)
     );
 }

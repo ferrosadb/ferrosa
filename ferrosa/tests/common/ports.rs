@@ -193,6 +193,20 @@ pub fn port_is_free(port: u16) -> bool {
     }
 }
 
+/// The kernel's refusal when a listener cannot take its port.
+///
+/// A port that is free when [`PortAllocator::get`] proves it can still be taken
+/// before the node binds it — by another test process binding inside the band.
+/// That is a harness accident, never a product failure, and a harness that sees
+/// it must re-draw rather than report it.
+pub const PORT_IN_USE: &str = "Address already in use";
+
+/// Whether a node's log — or a harness failure message quoting one — shows a
+/// listener that could not take its port.
+pub fn log_shows_port_collision(text: &str) -> bool {
+    text.contains(PORT_IN_USE)
+}
+
 /// Whether some other allocation in THIS process already owns `port`.
 pub fn reserved_in_process(port: u16) -> bool {
     process_reserved().lock().unwrap().contains(&port)
