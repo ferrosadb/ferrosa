@@ -3735,6 +3735,18 @@ fn expr_to_column_bytes(
     };
     let ty = column_type.to_ascii_lowercase();
     match (lit, ty.as_str()) {
+        // A `uuid` key column stores the 16 raw UUID bytes. This matches both the
+        // synthesized-key path (a vertex CREATEd without an id) and the MERGE
+        // path (`try_encode_expr_for_column_type`), so one logical vertex no
+        // longer gets two different storage keys depending on whether CREATE or
+        // MERGE wrote it — and a relationship whose uuid clustering column
+        // requires 16 raw bytes can address it.
+        (Literal::String(s), ty) if ty == "uuid" || ty.ends_with("uuidtype") => {
+            let uuid = uuid::Uuid::parse_str(s).map_err(|e| {
+                GraphError::Validation(format!("invalid UUID literal '{s}' for {column_type}: {e}"))
+            })?;
+            Ok(uuid.as_bytes().to_vec())
+        }
         (Literal::String(s), _) => Ok(s.as_bytes().to_vec()),
         (Literal::Integer(i), "int" | "integer") => Ok((*i as i32).to_be_bytes().to_vec()),
         (Literal::Integer(i), _) => Ok(i.to_be_bytes().to_vec()),
@@ -4067,6 +4079,59 @@ async fn execute_merge(
                 }
             }
         }
+
+        // An edge's storage key IS its endpoints' keys: the partition is the
+        // source vertex's key and the clustering is the destination vertex's key
+        // (see `execute_delete`, which reconstructs the edge key exactly this
+        // way, and the hop read path). A MATCH-selected endpoint is not a
+        // property expression — its own MergeOp above already resolved its real
+        // storage key by reading it — so thread those raw key BYTES here instead
+        // of hashing the endpoint's match properties. `content_addressed_key`
+        // yields a 32-byte blake3 digest, which a 16-byte uuid clustering column
+        // rejects with `expects 16 raw bytes but row provided 32`. Raw bytes also
+        // keep every other key type (text, bigint, composite) byte-faithful,
+        // where re-parsing a projected `_id` hex string would not.
+        //
+        // Only the schemaless fallback is rebound: when the schema-aware path
+        // already derived the key columns (a scalar edge shape, or a composite
+        // relationship table with more than one key component) it owns the
+        // shape, and the raw source/target key bytes here would truncate a
+        // composite key. The single-component check below is the exact shape the
+        // read/DELETE paths reconstruct: graph.source is the sole partition
+        // column and graph.target the sole clustering column.
+        if op.table.graph_type == "edge" && !shape.used_schema_layout {
+            let single_component_key = schema
+                .and_then(|schema_ref| {
+                    table_metadata_for(Some(schema_ref), &op.table.keyspace, &op.table.table)
+                })
+                .is_some_and(|meta| {
+                    let src_is_partition = meta.extensions.get("graph.source").is_some_and(|src| {
+                        meta.partition_key.len() == 1 && meta.partition_key[0] == *src
+                    });
+                    let dst_is_clustering =
+                        meta.extensions.get("graph.target").is_some_and(|dst| {
+                            meta.clustering_key.len() == 1 && meta.clustering_key[0].0 == *dst
+                        });
+                    src_is_partition && dst_is_clustering
+                });
+            if single_component_key {
+                let src_key = op
+                    .src_var
+                    .as_ref()
+                    .and_then(|var| var_keys.get(var))
+                    .map(|(_, key, _, _)| key.key.as_bytes().to_vec());
+                let dst_key = op
+                    .dst_var
+                    .as_ref()
+                    .and_then(|var| var_keys.get(var))
+                    .map(|(_, key, _, _)| key.key.as_bytes().to_vec());
+                if let (Some(src_bytes), Some(dst_bytes)) = (src_key, dst_key) {
+                    shape.key = DecoratedKey::new(PartitionKey::new(src_bytes));
+                    shape.clustering = dst_bytes;
+                }
+            }
+        }
+
         let key = shape.key.clone();
         let clustering = shape.clustering.clone();
 

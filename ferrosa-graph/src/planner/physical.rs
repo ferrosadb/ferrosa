@@ -63,10 +63,16 @@ pub struct CreateOp {
 ///
 /// For relationship MergeOps (`table.graph_type == "edge"`), `src_match_props`
 /// and `dst_match_props` hold the source and destination node match properties
-/// so that `execute_merge` can derive the correct partition and clustering keys:
+/// so that `execute_merge` can bind the edge to the rows the MATCH selected:
 ///
-/// - `partition key = content_addressed_key(src_match_props)`  — the source vertex key
-/// - `clustering    = content_addressed_key(dst_match_props)`  — the destination vertex key
+/// - `partition key = the source vertex's storage key`
+/// - `clustering    = the destination vertex's storage key`
+///
+/// The endpoints' own MergeOps resolve those keys by reading (see
+/// `infer_schema_aware_merge_shape`); `execute_merge` threads their raw bytes
+/// into the edge shape. `content_addressed_key(src_match_props)` /
+/// `content_addressed_key(dst_match_props)` is only the schemaless fallback the
+/// shared helpers start from, and is not the vertex key.
 ///
 /// The adjacency observer reads `mutation.key` as the source vertex ID and
 /// `row.clustering` as the target vertex ID.  Without these fields, hop queries
