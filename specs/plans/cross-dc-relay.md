@@ -118,6 +118,39 @@ working (if late) formation into a wait. The fix has to make **`I-B` converge fo
 an incomplete set**, reusing the existing rejoin promotion, and must fire **once** (no per-event
 `transition_to_cluster`), not replace the seed rule with a completeness gate.
 
+### Attempt 2 — the precise blocker, from the debug-level node logs
+
+Re-running the same test with `FERROSA_TEST_RUST_LOG="info,ferrosa_cluster::controller=debug"` (the
+join path's early returns log at DEBUG, which the harness pins to `info` by default) puts the actual
+decision in the dc2 nodes' logs:
+
+- `membership: peer join already pending, skipping duplicate trigger peer=5555…`
+- **`membership: peer already present in token ring with current metadata, skipping join trigger
+  peer=5555…`** — the same-DC peer IS in this node's **token ring** (placement membership) while it
+  is absent from its **openraft voter set**, and the guard that exists to stop duplicate-join churn
+  short-circuits exactly the reconciliation that is needed. dc2 ends with 0 membership changes while
+  dc1 gets one (`2222` was not yet in `3333`'s ring, so its trigger proceeded).
+- `WARN membership: JoinNode proposal failed peer=2222… e=has to forward request to: Some(6…)` — a
+  proposal attempted on a non-leader whose forward target did not resolve, i.e. proposing across the
+  per-DC groups is a second, independent failure.
+- Each dc2 node also ran the seed path (`seed: submitted JoinNode + AssignTokens … leader=…`), so a
+  dc2 node did initialise its own group — consistent with the three one-voter groups above.
+
+So the convergence fix is a **membership-reconciliation** fix, not a seed-rule fix:
+
+1. The trigger must key on the peer's absence from the **voter set**, not on the token ring — an
+   entry in the ring is not a vote, and today that inequality is what stops the promotion.
+2. A proposal must be able to reach a leader that can promote it (resolve the forward target across
+   the per-DC groups, or promote on the local leader), or the `has to forward request to` failure
+   needs a defined retry that does not depend on a node_map entry that may not exist yet.
+3. `I-A` still has a role — `max({self}) == self` is vacuously true, and three one-voter groups in
+   one DC cannot ever reach `expected` — but it must be applied **with** (1)+(2), never alone, and
+   must not turn a late-but-working formation into a wait.
+
+Evidence lives only in the retained node logs from that run
+(`FERROSA_TEST_KEEP_NODE_LOGS=<dir>`, ~1 MB, in the session scratch dir and pruned after 24 h), which
+is why both harness knobs (`KEEP_NODE_LOGS`, overridable `RUST_LOG`) are part of this change.
+
 
 ## Slices
 
