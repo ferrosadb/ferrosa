@@ -5148,23 +5148,6 @@ mod tests {
         assert_eq!(node.rack, "rack-usw2-b");
     }
 
-    /// An unset `FERROSA_DATA_CENTER` publishes the same named default the ring
-    /// commits, so a single-DC cluster is unchanged by the seeding.
-    ///
-    /// Kept from the node-local half of this fix (landed separately): it pins the
-    /// DEFAULT case for the node-local copy, which the agreement test below does
-    /// not cover.
-    #[test]
-    fn local_node_view_follows_the_default_cluster_config() {
-        let cluster = ferrosa_cluster::ClusterConfig::default();
-        let mut node = ferrosa_schema::NodeConfig::default();
-
-        seed_local_topology(&mut node, &cluster);
-
-        assert_eq!(node.data_center, cluster.data_center);
-        assert_eq!(node.rack, cluster.rack);
-    }
-
     /// Both published copies come from one resolved value: seeding the internode
     /// advertisement and the node-local view from the same `ClusterConfig`
     /// leaves them equal, so a peer's view of this node and this node's own

@@ -106,6 +106,23 @@ cluster-wide and severities run high. Several entries are *evidence* gaps
    `route_for_cl` selects `CrossDcAccord`, and stop the data path's per-NODE
    remote fan-out.
 
+7. **CL-18 (RPN 210)** — a DC's ring is built from its OWN Raft group's
+   membership, and cross-DC peers are deliberately excluded from that group
+   (`controller/cluster.rs` `partition_peers_by_dc`), so no node's
+   `system.peers` contains a peer from another DC. A dc2 node connects to a dc1
+   node and announces its DC (the dc1 node records it: `inbound peer connected
+   ... data_center=Some("eu-west-1")`), but a client in dc1 cannot see dc2 at
+   all, and `NetworkTopologyStrategy` cannot place a replica in a DC that is not
+   in its ring. Exposure: a multi-DC cluster is only multi-DC for the nodes that
+   exchange handshakes, never for placement, quorum accounting or client
+   discovery — `LOCAL_*` is correct but the cross-DC replica set is empty.
+   Evidence: `ferrosa/tests/data_center_process.rs::
+   a_peer_in_another_dc_reports_its_own_dc_in_system_peers` is the RED for the
+   goal state (ignored until the ring includes remote DCs). What IS proven on
+   real processes today: the configured DC is the DC in use
+   (`a_configured_data_center_is_used_and_stays_set`), and the DC travels the
+   handshake and is recorded by the receiving node.
+
 ## Detection assets
 - `ELECTION_STORM_TERM_JUMPS_TOTAL`, `INSTALLSNAPSHOT_PUSHES_TOTAL` (Raft health).
 - `LEADER_ELECTION_TIMEOUTS`, `FORMATION_REDUCED_DURABILITY_WRITES`,
