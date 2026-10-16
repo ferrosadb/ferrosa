@@ -152,6 +152,34 @@ Evidence lives only in the retained node logs from that run
 is why both harness knobs (`KEEP_NODE_LOGS`, overridable `RUST_LOG`) are part of this change.
 
 
+## Landing order and the rebase recipe (do this first, then the CL-76 fix)
+
+**Currency, measured:** `origin/main` is at `1c14bd9f` (v0.24.1) and contains **#581 merged** (`ea47f503`),
+so the DC/rack config fix is on main and this branch's copy of it is redundant. **#584**
+(`feat/sparql: declare the rdf_triples object index at registration`, head `09c54f5e`,
+`feat/graph-object-index`, 21 pass / 0 fail, **no file overlap with this branch**) is the PR this one is
+expected to land **on top of** — so rebase onto `09c54f5e`, not onto `main`, and #582's diff shrinks to
+its own commits the moment #584 merges.
+
+`git -c core.hooksPath=/dev/null rebase origin/feat/graph-object-index` conflicts in exactly three places,
+all in `ferrosa/src/main.rs`, and all the same shape: **both sides add complementary things at the same
+spot, separated by shared lines.** They are NOT duplicates, so neither side is dropped:
+
+| conflict | side A (main, from #581) | side B (this branch) |
+|---|---|---|
+| helper | `seed_local_topology(&mut NodeConfig, &ClusterConfig)` — the node-local view (`system.local`, `LOCAL_*` routing) | `seed_internode_topology(&mut NetConfig, &ClusterConfig)` — the topology ADVERTISED on the handshake |
+| tests 1-2 | `local_node_view_publishes_the_committed_topology`, `local_node_view_follows_the_default_cluster_config` | `internode_advertisement_matches_the_committed_topology`, `internode_advertisement_follows_the_default_cluster_config` |
+
+Both helpers are needed — they are the two published copies of one resolved setting, and seeding only one
+is the original bug. Resolution: keep BOTH helpers (the first needs its own closing `}` restored, because
+the shared `}` after the block closes the second), then both test pairs, **duplicating the shared
+`let cluster = ...` setup and the shared closing `}` for the second test of each pair**. A scripted
+line-index edit of that file produced duplicated markers and was aborted; do it as three explicit
+`patch` edits with `rg -c '<<<<<<<'` after each, never by slicing line ranges.
+
+Do NOT resolve these with `-X ours`/`-X theirs`: taking either side wholesale either drops #581's
+node-local view or this branch's advertisement.
+
 ## Slices
 
 1. **DC registry + live-candidate rotation** — done (`e5a3086b`).
