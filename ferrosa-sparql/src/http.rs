@@ -176,6 +176,15 @@ fn authorize_keyspace(
         })
 }
 
+/// POST /sparql — the SPARQL endpoint. Executes a query OR an update.
+///
+/// Per the SPARQL 1.1 Protocol an endpoint MAY accept both operations at one
+/// URL. A form-encoded body selects the operation by parameter — `query=…`
+/// runs a query (SELECT/ASK/CONSTRUCT/DESCRIBE) and `update=…` runs an update
+/// (INSERT/DELETE/…). Also accepts `application/sparql-query` /
+/// `application/sparql-update` raw bodies and a JSON body with a `query` or
+/// `update` field. This is the endpoint the bench driver posts to, for queries
+/// and updates alike.
 async fn handle_sparql_post(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -185,26 +194,24 @@ async fn handle_sparql_post(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let query_str = match extract_query_from_post(&headers, &body) {
-        Ok(q) => q,
+    let request = match extract_request_from_post(&headers, &body) {
+        Ok(r) => r,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
 
-    let keyspace = headers
-        .get("X-Keyspace")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("rdf");
-
-    if let Err(resp) = authorize_keyspace(&state.schema, &auth, keyspace, Permission::Select) {
-        return resp;
+    let keyspace = keyspace_from_headers(&headers);
+    match request {
+        SparqlRequest::Query(query) => {
+            if let Err(resp) =
+                authorize_keyspace(&state.schema, &auth, keyspace, Permission::Select)
+            {
+                return resp;
+            }
+            let accept = accept_from_headers(&headers);
+            execute_and_respond(&state, &query, keyspace, accept).await
+        }
+        SparqlRequest::Update(update) => run_update(&state, &auth, keyspace, &update).await,
     }
-
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    execute_and_respond(&state, &query_str, keyspace, accept).await
 }
 
 /// GET /sparql?query=... — execute a SPARQL query via URL parameter.
@@ -234,15 +241,15 @@ async fn handle_sparql_get(
         return resp;
     }
 
-    let accept = headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
+    let accept = accept_from_headers(&headers);
     execute_and_respond(&state, &params.query, &params.keyspace, accept).await
 }
 
-/// POST /sparql/update — execute a SPARQL UPDATE (INSERT DATA, DELETE DATA).
+/// POST /sparql/update — execute a SPARQL UPDATE.
+///
+/// The update text comes from the `update` form parameter (W3C SPARQL
+/// Protocol), a raw `application/sparql-update` body, or — for back-compat with
+/// the endpoint's original behaviour — the `query` parameter or a raw body.
 async fn handle_sparql_update(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -252,22 +259,45 @@ async fn handle_sparql_update(
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    let update_str = match extract_query_from_post(&headers, &body) {
-        Ok(q) => q,
+    let update_str = match extract_update_from_post(&headers, &body) {
+        Ok(u) => u,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
 
-    let keyspace = headers
+    let keyspace = keyspace_from_headers(&headers);
+    run_update(&state, &auth, keyspace, &update_str).await
+}
+
+/// The keyspace a request targets: the `X-Keyspace` header, else `"rdf"`.
+fn keyspace_from_headers(headers: &axum::http::HeaderMap) -> &str {
+    headers
         .get("X-Keyspace")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("rdf");
+        .unwrap_or("rdf")
+}
 
-    // SPARQL UPDATE is a write — require MODIFY on the keyspace.
-    if let Err(resp) = authorize_keyspace(&state.schema, &auth, keyspace, Permission::Modify) {
+/// The requested response format from the `Accept` header (empty → JSON).
+fn accept_from_headers(headers: &axum::http::HeaderMap) -> &str {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+}
+
+/// Authorize (MODIFY on the keyspace) and execute a SPARQL UPDATE, mapping the
+/// engine result to an HTTP response. A parse or plan error is the client's
+/// (400); anything else is the server's (500).
+async fn run_update(
+    state: &AppState,
+    auth: &AuthContext,
+    keyspace: &str,
+    update: &str,
+) -> Response {
+    if let Err(resp) = authorize_keyspace(&state.schema, auth, keyspace, Permission::Modify) {
         return resp;
     }
 
-    match state.engine.execute_update(&update_str, keyspace).await {
+    match state.engine.execute_update(update, keyspace).await {
         Ok(result) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -276,7 +306,9 @@ async fn handle_sparql_update(
             })),
         )
             .into_response(),
-        Err(crate::error::SparqlError::Parse(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
+        Err(crate::error::SparqlError::Parse(msg)) | Err(crate::error::SparqlError::Plan(msg)) => {
+            error_response(StatusCode::BAD_REQUEST, &msg)
+        }
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
 }
@@ -331,35 +363,83 @@ async fn execute_and_respond(
     }
 }
 
-fn extract_query_from_post(headers: &axum::http::HeaderMap, body: &[u8]) -> Result<String, String> {
+/// A SPARQL operation parsed from a POST body.
+enum SparqlRequest {
+    /// A query (SELECT/ASK/CONSTRUCT/DESCRIBE), from `query=` or a raw body.
+    Query(String),
+    /// An update (INSERT/DELETE/…), from `update=` or a raw body.
+    Update(String),
+}
+
+/// Extract the SPARQL operation from a POST body.
+///
+/// Selection by content type, per the SPARQL 1.1 Protocol:
+/// - `application/sparql-query`  → the raw body is a query;
+/// - `application/sparql-update` → the raw body is an update;
+/// - `application/x-www-form-urlencoded` → the `update` parameter wins, else
+///   `query`; a body naming neither is a 400;
+/// - `application/json` → the `update` field wins, else `query`;
+/// - anything else → the raw body is a query (the endpoint's original default).
+fn extract_request_from_post(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<SparqlRequest, String> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
     if content_type.contains("application/sparql-query") {
-        String::from_utf8(body.to_vec()).map_err(|e| format!("invalid UTF-8: {e}"))
-    } else if content_type.contains("application/x-www-form-urlencoded") {
-        // Parse query=... from form body.
+        return Ok(SparqlRequest::Query(raw_body_text(body)?));
+    }
+    if content_type.contains("application/sparql-update") {
+        return Ok(SparqlRequest::Update(raw_body_text(body)?));
+    }
+    if content_type.contains("application/x-www-form-urlencoded") {
         let params: Vec<(String, String)> =
             serde_urlencoded::from_bytes(body).map_err(|e| format!("form parse error: {e}"))?;
-        params
-            .into_iter()
-            .find(|(k, _)| k == "query")
-            .map(|(_, v)| v)
-            .ok_or_else(|| "missing 'query' parameter".into())
-    } else if content_type.contains("application/json") {
-        // Accept JSON body with {"query": "..."} for convenience.
+        if let Some((_, v)) = params.iter().find(|(k, _)| k == "update") {
+            return Ok(SparqlRequest::Update(v.clone()));
+        }
+        if let Some((_, v)) = params.iter().find(|(k, _)| k == "query") {
+            return Ok(SparqlRequest::Query(v.clone()));
+        }
+        return Err("SPARQL POST body must name an 'update' or 'query' parameter".into());
+    }
+    if content_type.contains("application/json") {
         let parsed: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| format!("JSON parse error: {e}"))?;
-        parsed["query"]
-            .as_str()
-            .map(|s| s.to_string())
-            .ok_or_else(|| "JSON body missing 'query' field".into())
-    } else {
-        // Default: treat body as raw SPARQL text.
-        String::from_utf8(body.to_vec()).map_err(|e| format!("invalid UTF-8: {e}"))
+        if let Some(u) = parsed["update"].as_str() {
+            return Ok(SparqlRequest::Update(u.to_string()));
+        }
+        if let Some(q) = parsed["query"].as_str() {
+            return Ok(SparqlRequest::Query(q.to_string()));
+        }
+        return Err("JSON body must have an 'update' or 'query' field".into());
     }
+    // No recognised content type: treat the body as raw SPARQL query text.
+    Ok(SparqlRequest::Query(raw_body_text(body)?))
+}
+
+/// Extract the UPDATE text from a POST body for the `/sparql/update` endpoint.
+///
+/// Prefers the `update` parameter (or a raw/`sparql-update` body). A body that
+/// carries only `query` (or no content type) is still treated as the update
+/// text, preserving this endpoint's original behaviour so existing clients do
+/// not break.
+fn extract_update_from_post(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<String, String> {
+    match extract_request_from_post(headers, body)? {
+        SparqlRequest::Update(u) => Ok(u),
+        SparqlRequest::Query(q) => Ok(q),
+    }
+}
+
+/// Decode a raw request body as UTF-8 SPARQL text.
+fn raw_body_text(body: &[u8]) -> Result<String, String> {
+    String::from_utf8(body.to_vec()).map_err(|e| format!("invalid UTF-8: {e}"))
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response {
@@ -531,5 +611,307 @@ mod auth_tests {
             .await
             .expect_err("require_tls with no certificate must not serve plaintext");
         assert!(err.to_string().contains("SPARQL"), "{err}");
+    }
+}
+
+/// End-to-end tests over the real HTTP surface the bench workload drives.
+///
+/// They bind the actual router on a loopback port (the crate's own surface, not
+/// a helper), send the exact form-encoded POST bodies the bench issues
+/// (`update=…` / `query=…`), and assert on the status and body. This is where
+/// the `update=`-vs-`query=` parameter split is pinned.
+#[cfg(test)]
+mod http_surface {
+    use super::*;
+    use ferrosa_cluster::write_path::WritePath;
+    use ferrosa_schema::{
+        AuthMethod, DeploymentMode, EnvSecretsProvider, PasswordHasher, PasswordPolicy,
+        RateLimitConfig, SchemaConfig, TestAuditSink,
+    };
+    use ferrosa_storage::{
+        CommitLogConfig, CompactionConfig, StorageEngine, StorageEngineConfig, SyncStrategyConfig,
+    };
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    const G: &str = "urn:ferrosa-bench:RUNID";
+
+    fn test_schema() -> Schema {
+        Schema::new(SchemaConfig {
+            hasher: PasswordHasher::default(),
+            password_policy: PasswordPolicy::permissive(),
+            auth_method: AuthMethod::Password,
+            rate_limit: RateLimitConfig::default(),
+            audit_sink: Box::new(TestAuditSink::new()),
+            secrets: Box::new(EnvSecretsProvider),
+            mode: DeploymentMode::Development,
+        })
+        .unwrap()
+    }
+
+    fn free_addr() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    async fn connect_retry(addr: SocketAddr) -> tokio::net::TcpStream {
+        for _ in 0..200 {
+            if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+                return stream;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("listener at {addr} never came up");
+    }
+
+    /// A running SPARQL HTTP endpoint backed by a real storage engine.
+    struct Harness {
+        addr: SocketAddr,
+        _dir: TempDir,
+    }
+
+    async fn spawn(auth_disabled: bool) -> Harness {
+        let dir = TempDir::new().unwrap();
+        let config = StorageEngineConfig {
+            commit_log: CommitLogConfig {
+                segment_size: 4096,
+                max_segment_age: std::time::Duration::from_secs(60),
+                sync_strategy: SyncStrategyConfig::Batch,
+                batch: Default::default(),
+                log_dir: dir.path().join("commitlog"),
+                checkpoint_dir: dir.path().join("commitlog"),
+                archive: None,
+            },
+            compaction: CompactionConfig::from_env(dir.path().join("compaction")),
+            object_store: None,
+            local_cache_max_bytes: 1024 * 1024,
+            local_disk_free_reserve_bytes: 0,
+            flush_threshold_bytes: 4096,
+            memtable_backpressure_bytes: u64::MAX,
+            flush_max_age_secs: 5,
+            data_dir: dir.path().to_path_buf(),
+            index_backend: ferrosa_storage::index::IndexBackendConfig::Local,
+            write_verify: true,
+            auth_enabled: false,
+            auth_warn: false,
+            max_pending_replay_mutations_without_schema: 1024,
+            memtable_num_shards: 64,
+            cache_hot_window_secs: 900,
+        };
+        let storage = Arc::new(StorageEngine::new(config, None).unwrap());
+        let write_path = Arc::new(WritePath::direct(Arc::clone(&storage)));
+        let engine = Arc::new(SparqlEngine::new(
+            storage,
+            write_path,
+            crate::engine::SparqlConfig::default(),
+        ));
+        let state = AppState {
+            engine,
+            schema: Arc::new(test_schema()),
+            auth_disabled,
+        };
+        let http_config = SparqlHttpConfig {
+            bind_addr: free_addr(),
+            ..SparqlHttpConfig::default()
+        };
+        let addr = http_config.bind_addr;
+        let app = build_router(state);
+        tokio::spawn(async move {
+            let _ = serve_app(&http_config, app).await;
+        });
+        Harness { addr, _dir: dir }
+    }
+
+    /// POST a form-encoded SPARQL request over the real socket.
+    async fn post_form(
+        addr: SocketAddr,
+        path: &str,
+        form_body: &str,
+        authorization: Option<&str>,
+    ) -> (u16, String) {
+        post(
+            addr,
+            path,
+            "application/x-www-form-urlencoded",
+            form_body,
+            authorization,
+        )
+        .await
+    }
+
+    /// POST a request with an explicit content type over the real socket.
+    async fn post(
+        addr: SocketAddr,
+        path: &str,
+        content_type: &str,
+        body: &str,
+        authorization: Option<&str>,
+    ) -> (u16, String) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = connect_retry(addr).await;
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: {content_type}\r\n\
+             Accept: application/sparql-results+json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        if let Some(a) = authorization {
+            req.push_str(&format!("Authorization: {a}\r\n"));
+        }
+        req.push_str("\r\n");
+        req.push_str(body);
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    /// The bench's three shapes, driven end to end over the HTTP surface.
+    ///
+    /// 1. `update=INSERT DATA { GRAPH <g> { … } }` on `/sparql` (the endpoint the
+    ///    driver posts updates to) succeeds;
+    /// 2. `query=SELECT ?o WHERE { GRAPH <g> { <s> <p> ?o } }` returns the
+    ///    inserted binding;
+    /// 3. `update=DELETE WHERE { GRAPH <g> { ?s ?p ?o } }` succeeds and the
+    ///    graph is empty afterwards.
+    #[tokio::test]
+    async fn bench_shapes_round_trip_over_the_http_surface() {
+        let h = spawn(true).await;
+
+        // Shape 1 — INSERT DATA into a named graph via `update=` on /sparql.
+        let insert = format!(
+            "update=INSERT DATA {{ GRAPH <{G}> {{ <urn:bench:{G}:s:1> <urn:bench:label> \"value-1\" }} }}"
+        );
+        let (status, body) = post_form(h.addr, "/sparql", &insert, None).await;
+        assert_eq!(
+            status, 200,
+            "INSERT DATA via update= must succeed; body={body}"
+        );
+        assert!(
+            body.contains("\"triples_inserted\":1"),
+            "the update response must report the insert: {body}"
+        );
+
+        // Shape 2 — bounded point lookup via `query=` on /sparql.
+        let select = format!(
+            "query=SELECT ?o WHERE {{ GRAPH <{G}> {{ <urn:bench:{G}:s:1> <urn:bench:label> ?o }} }}"
+        );
+        let (status, body) = post_form(h.addr, "/sparql", &select, None).await;
+        assert_eq!(status, 200, "the point lookup must succeed; body={body}");
+        assert!(
+            body.contains("\"value\":\"value-1\""),
+            "the lookup must return the inserted binding, got {body}"
+        );
+
+        // Shape 3 — DELETE WHERE over the named graph via `update=` on /sparql.
+        let delete = format!("update=DELETE WHERE {{ GRAPH <{G}> {{ ?s ?p ?o }} }}");
+        let (status, body) = post_form(h.addr, "/sparql", &delete, None).await;
+        assert_eq!(
+            status, 200,
+            "DELETE WHERE via update= must succeed; body={body}"
+        );
+        assert!(
+            body.contains("\"triples_deleted\":1"),
+            "the update response must report the delete: {body}"
+        );
+
+        // The graph is now empty.
+        let (status, body) = post_form(h.addr, "/sparql", &select, None).await;
+        assert_eq!(status, 200, "post-delete lookup must succeed; body={body}");
+        assert!(
+            body.contains("\"bindings\":[]"),
+            "the graph must be empty after DELETE WHERE, got {body}"
+        );
+    }
+
+    /// The `update=` parameter is also accepted on the dedicated update URL.
+    #[tokio::test]
+    async fn update_parameter_is_accepted_on_the_update_endpoint() {
+        let h = spawn(true).await;
+        let insert = format!(
+            "update=INSERT DATA {{ GRAPH <{G}> {{ <urn:bench:x> <urn:bench:label> \"v\" }} }}"
+        );
+        let (status, body) = post_form(h.addr, "/sparql/update", &insert, None).await;
+        assert_eq!(
+            status, 200,
+            "update= on /sparql/update must succeed; body={body}"
+        );
+        assert!(body.contains("\"triples_inserted\":1"), "{body}");
+    }
+
+    /// A form body naming neither parameter is a client error, not a silent
+    /// no-op — and the message names what it expected.
+    #[tokio::test]
+    async fn form_body_without_query_or_update_is_a_400() {
+        let h = spawn(true).await;
+        let (status, body) =
+            post_form(h.addr, "/sparql", "other=SELECT%20*%20WHERE%20%7B%7D", None).await;
+        assert_eq!(
+            status, 400,
+            "a body with no query/update must be rejected; body={body}"
+        );
+        assert!(
+            body.contains("update") && body.contains("query"),
+            "the error must name both expected parameters: {body}"
+        );
+    }
+
+    /// Raw `application/sparql-query` / `application/sparql-update` bodies still
+    /// work (the endpoint's original content-type handling is preserved).
+    #[tokio::test]
+    async fn raw_content_type_bodies_still_work() {
+        let h = spawn(true).await;
+        let insert =
+            format!("INSERT DATA {{ GRAPH <{G}> {{ <urn:bench:r> <urn:bench:label> \"raw\" }} }}");
+        let (status, _) = post(
+            h.addr,
+            "/sparql/update",
+            "application/sparql-update",
+            &insert,
+            None,
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "a raw application/sparql-update body must be honored"
+        );
+    }
+
+    /// With auth enabled, a request with no Authorization header is rejected;
+    /// with auth disabled, a request (header or not) is served. This is the
+    /// "optional HTTP basic auth" contract.
+    #[tokio::test]
+    async fn auth_is_enforced_only_when_enabled() {
+        let insert = format!(
+            "update=INSERT DATA {{ GRAPH <{G}> {{ <urn:bench:a> <urn:bench:label> \"a\" }} }}"
+        );
+
+        let on = spawn(false).await;
+        let (status, _) = post_form(on.addr, "/sparql", &insert, None).await;
+        assert_eq!(status, 401, "with auth on, no credentials must be rejected");
+
+        // A Basic header with unknown credentials is still rejected (proving the
+        // auth path parses and checks the header, not just its presence).
+        let (status, _) =
+            post_form(on.addr, "/sparql", &insert, Some("Basic dXNlcjpodW50ZXIy")).await;
+        assert_eq!(status, 401, "unknown credentials must be rejected");
+
+        // With auth disabled the same request is served, header or not.
+        let off = spawn(true).await;
+        let (status, body) =
+            post_form(off.addr, "/sparql", &insert, Some("Basic dXNlcjpwdw==")).await;
+        assert_eq!(
+            status, 200,
+            "with auth disabled a Basic header must be ignored, not rejected; body={body}"
+        );
     }
 }

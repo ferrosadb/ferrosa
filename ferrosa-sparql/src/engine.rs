@@ -314,7 +314,11 @@ impl SparqlEngine {
         // These were one value until this fix, and that conflation meant a
         // bound-subject point read looked under ("<keyspace>", subject) for a
         // row the writer had stored under ("default", subject).
-        let scope = planner::TripleScope::new(graph, &self.config.default_graph);
+        //
+        // The scope is ISOLATED: the served path reads only the default graph's
+        // partitions, so data inserted into a `GRAPH <iri>` block never leaks
+        // into an un-claused read.
+        let scope = planner::TripleScope::isolated(graph, &self.config.default_graph);
         let plan = planner::plan_query(&query, &scope)?;
 
         // 3. Execute plan against storage.

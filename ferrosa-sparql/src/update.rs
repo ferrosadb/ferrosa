@@ -58,7 +58,7 @@ pub async fn execute_update(
     // single-graph-per-keyspace engine. Without this, a desugared
     // `COPY/MOVE <g> TO DEFAULT` would run its leading `Drop(DEFAULT)` and wipe
     // the default graph before the later unaddressable named-graph read fails.
-    validate_update(&update, keyspace)?;
+    validate_update(&update)?;
 
     let mut total_inserted = 0usize;
     let mut total_deleted = 0usize;
@@ -128,21 +128,18 @@ pub async fn execute_update(
 ///
 /// This is the single chokepoint that makes the spargebra `COPY/MOVE/ADD`
 /// desugaring safe: those rewrite into a leading `Drop` plus a `DeleteInsert`
-/// that reads from / writes to a named graph this engine cannot address. By
-/// rejecting the whole request here — before the destructive `Drop` executes —
-/// we guarantee no partial side effects.
-fn validate_update(update: &spargebra::Update, keyspace: &str) -> Result<(), SparqlError> {
+/// that reads one graph and writes another. By rejecting the whole request here
+/// — before the destructive `Drop` executes — we guarantee no partial side
+/// effects.
+fn validate_update(update: &spargebra::Update) -> Result<(), SparqlError> {
     for op in &update.operations {
         match op {
-            spargebra::GraphUpdateOperation::InsertData { data } => {
-                for quad in data {
-                    check_graph_name(&quad.graph_name, keyspace, "INSERT DATA")?;
-                }
-            }
-            spargebra::GraphUpdateOperation::DeleteData { data } => {
-                for quad in data {
-                    check_graph_name(&quad.graph_name, keyspace, "DELETE DATA")?;
-                }
+            spargebra::GraphUpdateOperation::InsertData { .. }
+            | spargebra::GraphUpdateOperation::DeleteData { .. } => {
+                // `INSERT DATA` / `DELETE DATA` name their target graph on each
+                // quad and the writer keys rows by that graph component, so a
+                // named graph is addressable: nothing to reject. (The default
+                // graph's storage component is set by the writer.)
             }
             spargebra::GraphUpdateOperation::DeleteInsert {
                 delete,
@@ -150,19 +147,16 @@ fn validate_update(update: &spargebra::Update, keyspace: &str) -> Result<(), Spa
                 pattern,
                 ..
             } => {
-                for tmpl in delete {
-                    check_quad_graph_pattern(&tmpl.graph_name, keyspace, "DELETE")?;
-                }
-                for tmpl in insert {
-                    check_quad_graph_pattern(&tmpl.graph_name, keyspace, "INSERT")?;
-                }
-                // Reject a WHERE clause that reads from a named graph
-                // (`GraphPattern::Graph`), e.g. the COPY/MOVE/ADD source.
-                check_pattern_graph_reads(pattern, keyspace)?;
+                // Every DELETE/INSERT template and the WHERE read must denote
+                // ONE graph. A request that reads one graph and writes another
+                // is the COPY/MOVE/ADD desugaring, which this engine does not
+                // honor — reject it up front, before any (possibly destructive)
+                // op runs, so the request is atomic.
+                resolve_delete_insert_graph(insert, delete, pattern)?;
             }
             spargebra::GraphUpdateOperation::Clear { graph, silent }
             | spargebra::GraphUpdateOperation::Drop { graph, silent } => {
-                check_graph_target(graph, keyspace, *silent)?;
+                check_graph_target(graph, *silent)?;
             }
             spargebra::GraphUpdateOperation::Load { .. } => {
                 return Err(SparqlError::Plan(
@@ -180,83 +174,143 @@ fn validate_update(update: &spargebra::Update, keyspace: &str) -> Result<(), Spa
     Ok(())
 }
 
-/// Validate a concrete (`InsertData`/`DeleteData`) quad's graph name.
-fn check_graph_name(
-    graph: &spargebra::term::GraphName,
-    keyspace: &str,
-    op: &str,
-) -> Result<(), SparqlError> {
-    match graph {
-        spargebra::term::GraphName::DefaultGraph => Ok(()),
-        spargebra::term::GraphName::NamedNode(n) if n.as_str() == keyspace => Ok(()),
-        spargebra::term::GraphName::NamedNode(n) => {
-            Err(named_graph_unsupported(op, n.as_str(), keyspace))
+/// Validate a `CLEAR`/`DROP` target for the atomicity check.
+///
+/// Every `CLEAR`/`DROP` this validator sees is non-destructive to *other*
+/// data, so none can violate atomicity and this always passes. It exists so the
+/// up-front pass is exhaustive over operation kinds. (`exec_clear` still treats
+/// a named `CLEAR`/`DROP` target as an empty no-op; see its note.)
+fn check_graph_target(_target: &GraphTarget, _silent: bool) -> Result<(), SparqlError> {
+    Ok(())
+}
+
+/// The graph a `DELETE … INSERT … WHERE` request reads and writes.
+///
+/// A request is honored only when every DELETE template, every INSERT template,
+/// and the WHERE read denote the SAME graph. That is what separates a
+/// `DELETE WHERE { GRAPH <g> { … } }` (delete and read `<g>`) from the
+/// `COPY`/`MOVE`/`ADD` desugaring, which reads one graph and writes another.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GraphDenotation {
+    Default,
+    Named(String),
+}
+
+impl GraphDenotation {
+    /// The graph component the storage key uses for this graph.
+    fn storage_graph(&self) -> &str {
+        match self {
+            Self::Default => "default",
+            Self::Named(n) => n.as_str(),
         }
     }
 }
 
-/// Validate a `CLEAR`/`DROP` target for the atomicity check.
+/// Resolve the single graph a `DELETE … INSERT … WHERE` request operates on, or
+/// fail loud if it mixes graphs (the COPY/MOVE/ADD desugaring).
 ///
-/// All `CLEAR`/`DROP` targets are *safe* in this engine: `DefaultGraph`,
-/// `NamedGraphs`, and `AllGraphs` resolve to "every triple in this keyspace"
-/// (clearable), a `NamedNode` equal to the keyspace is that same graph, and any
-/// other `NamedNode` simply does not exist here, so `exec_clear` deletes nothing
-/// (a true no-op — it never fakes or mis-targets a deletion, per URS-QEC-X01 and
-/// the M1 `clear_non_matching_named_graph_deletes_nothing` contract).
-///
-/// Because every `CLEAR`/`DROP` is non-destructive-to-other-data, none of them
-/// can violate atomicity, so this validation always passes. It exists so the
-/// up-front pass is exhaustive over operation kinds (and as the place to tighten
-/// non-SILENT semantics later, if the single-graph model ever gains real named
-/// graphs).
-fn check_graph_target(
-    _target: &GraphTarget,
-    _keyspace: &str,
-    _silent: bool,
-) -> Result<(), SparqlError> {
-    Ok(())
+/// Returning the resolved graph is what lets the executor read, delete, and
+/// insert against the SAME graph, so a named-graph `DELETE WHERE` is exact.
+fn resolve_delete_insert_graph(
+    insert: &[QuadPattern],
+    delete: &[GroundQuadPattern],
+    pattern: &spargebra::algebra::GraphPattern,
+) -> Result<GraphDenotation, SparqlError> {
+    let mut target: Option<GraphDenotation> = None;
+    for tmpl in delete {
+        let d = graph_denotation_pattern(&tmpl.graph_name, "DELETE")?;
+        note_graph(&mut target, d)?;
+    }
+    for tmpl in insert {
+        let d = graph_denotation_pattern(&tmpl.graph_name, "INSERT")?;
+        note_graph(&mut target, d)?;
+    }
+    let mut where_graphs = Vec::new();
+    collect_where_graphs(pattern, &mut where_graphs)?;
+    if where_graphs.is_empty() {
+        // A WHERE clause with no `GRAPH` block reads the default graph.
+        where_graphs.push(GraphDenotation::Default);
+    }
+    for d in where_graphs {
+        note_graph(&mut target, d)?;
+    }
+    Ok(target.unwrap_or(GraphDenotation::Default))
 }
 
-/// Recursively reject any `GraphPattern::Graph` reading from a graph other than
-/// the keyspace default graph. Such a named-graph read (produced by the
-/// COPY/MOVE/ADD desugaring, or by an explicit `GRAPH <g> { … }` block in a
-/// WHERE clause) is not addressable here and must fail loud BEFORE any
-/// preceding destructive op runs.
-fn check_pattern_graph_reads(
+/// Fold `d` into the request's single target graph, or fail loud on a mix.
+fn note_graph(target: &mut Option<GraphDenotation>, d: GraphDenotation) -> Result<(), SparqlError> {
+    match target {
+        None => {
+            *target = Some(d);
+            Ok(())
+        }
+        Some(existing) if *existing == d => Ok(()),
+        Some(existing) => Err(SparqlError::Plan(format!(
+            "cross-graph SPARQL UPDATE is not supported: this endpoint reads and writes one \
+             graph per request, but this request mixes {} and {} (the ADD/MOVE/COPY \
+             desugaring). Split it into same-graph operations.",
+            describe_graph(existing),
+            describe_graph(&d),
+        ))),
+    }
+}
+
+fn describe_graph(g: &GraphDenotation) -> String {
+    match g {
+        GraphDenotation::Default => "the default graph".to_string(),
+        GraphDenotation::Named(n) => format!("named graph <{n}>"),
+    }
+}
+
+/// The graph a DELETE/INSERT template targets.
+fn graph_denotation_pattern(
+    graph: &spargebra::term::GraphNamePattern,
+    op: &str,
+) -> Result<GraphDenotation, SparqlError> {
+    match graph {
+        spargebra::term::GraphNamePattern::DefaultGraph => Ok(GraphDenotation::Default),
+        spargebra::term::GraphNamePattern::NamedNode(n) => {
+            Ok(GraphDenotation::Named(n.as_str().to_string()))
+        }
+        spargebra::term::GraphNamePattern::Variable(v) => Err(SparqlError::Plan(format!(
+            "{op} into a variable-bound graph (?{}) is not supported: name the graph with an IRI",
+            v.as_str()
+        ))),
+    }
+}
+
+/// Collect the graphs a WHERE clause reads. A `GRAPH <iri>` block contributes
+/// its IRI; a variable graph fails loud. An empty result means the WHERE reads
+/// the default graph.
+fn collect_where_graphs(
     pattern: &spargebra::algebra::GraphPattern,
-    keyspace: &str,
+    out: &mut Vec<GraphDenotation>,
 ) -> Result<(), SparqlError> {
     use spargebra::algebra::GraphPattern as G;
     match pattern {
         G::Graph { name, inner } => {
             match name {
-                NamedNodePattern::NamedNode(n) if n.as_str() == keyspace => {}
                 NamedNodePattern::NamedNode(n) => {
-                    return Err(SparqlError::Plan(format!(
-                        "reading from named graph <{}> is not supported: this endpoint \
-                         exposes a single graph per keyspace ('{keyspace}') — so \
-                         ADD/MOVE/COPY from a named graph cannot be honored",
-                        n.as_str()
-                    )));
+                    out.push(GraphDenotation::Named(n.as_str().to_string()));
                 }
                 NamedNodePattern::Variable(v) => {
                     return Err(SparqlError::Plan(format!(
-                        "GRAPH ?{} (variable-bound graph read) is not supported: this \
-                         endpoint exposes a single graph per keyspace ('{keyspace}')",
+                        "GRAPH ?{} (variable-bound graph read) is not supported: name the \
+                         graph with an IRI",
                         v.as_str()
                     )));
                 }
             }
-            check_pattern_graph_reads(inner, keyspace)
+            collect_where_graphs(inner, out)
         }
         G::Bgp { .. } | G::Path { .. } | G::Values { .. } => Ok(()),
         G::Join { left, right } | G::Union { left, right } | G::Minus { left, right } => {
-            check_pattern_graph_reads(left, keyspace)?;
-            check_pattern_graph_reads(right, keyspace)
+            collect_where_graphs(left, out)?;
+            collect_where_graphs(right, out)
         }
         G::LeftJoin { left, right, .. } => {
-            check_pattern_graph_reads(left, keyspace)?;
-            check_pattern_graph_reads(right, keyspace)
+            collect_where_graphs(left, out)?;
+            collect_where_graphs(right, out)
         }
         G::Filter { inner, .. }
         | G::Extend { inner, .. }
@@ -266,7 +320,7 @@ fn check_pattern_graph_reads(
         | G::Reduced { inner }
         | G::Slice { inner, .. }
         | G::Group { inner, .. }
-        | G::Service { inner, .. } => check_pattern_graph_reads(inner, keyspace),
+        | G::Service { inner, .. } => collect_where_graphs(inner, out),
     }
 }
 
@@ -287,28 +341,18 @@ async fn exec_delete_insert(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<(usize, usize), SparqlError> {
-    // URS-QEC-X01: a delete or insert template whose target graph is a named
-    // graph distinct from this keyspace's default graph is NOT addressable in
-    // the single-graph-per-keyspace model (the read/write path keys the table
-    // by keyspace and does not filter by the graph partition-key component).
-    // Honoring it by writing into the default graph would be a silent wrong
-    // result, so we fail loud BEFORE evaluating the WHERE or applying any
-    // mutation. This is what makes the spargebra ADD/MOVE/COPY desugaring
-    // (which targets named graphs) fail loud instead of silently operating on
-    // the wrong graph. (A named-graph *read* — `GraphPattern::Graph` in the
-    // WHERE clause, produced when COPY/MOVE/ADD source is a named graph — is
-    // separately rejected by the planner.)
-    for tmpl in delete {
-        check_quad_graph_pattern(&tmpl.graph_name, keyspace, "DELETE")?;
-    }
-    for tmpl in insert {
-        check_quad_graph_pattern(&tmpl.graph_name, keyspace, "INSERT")?;
-    }
+    // Resolve the single graph this request reads and writes (already validated,
+    // re-derived here so the executor keys its read, its deletes, and its
+    // inserts against the SAME graph).
+    let target = resolve_delete_insert_graph(insert, delete, pattern)?;
+    let target_graph = target.storage_graph();
 
-    // Same split as the read path: the keyspace names the table, the SPARQL
-    // default graph names the partition. Passing the keyspace as both is what
-    // made a bound-subject read miss rows this very function had written.
-    let scope = crate::planner::TripleScope::new(keyspace, "default");
+    // Same split as the read path: the keyspace names the table, the graph names
+    // the partition. The scope is ISOLATED so the WHERE scan reads only the
+    // target graph's partitions — `DELETE WHERE { GRAPH <g> { ?s ?p ?o } }` must
+    // tombstone `<g>`'s triples and no other graph's, and an un-claused
+    // `DELETE WHERE { ?s ?p ?o }` must clear the default graph only.
+    let scope = crate::planner::TripleScope::isolated(keyspace, target_graph);
     let plan = crate::planner::plan_where(pattern, &scope)?;
     let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
@@ -318,7 +362,7 @@ async fn exec_delete_insert(
     for sol in &solutions {
         for tmpl in delete {
             if let Some(triple) = instantiate_ground_delete(tmpl, sol) {
-                delete_ground_triple(keyspace, &triple, storage)?;
+                delete_ground_triple(keyspace, target_graph, &triple, storage)?;
                 deleted += 1;
             }
         }
@@ -328,7 +372,7 @@ async fn exec_delete_insert(
             if let Some(triple) = instantiate_insert(tmpl, sol) {
                 write_triple(
                     keyspace,
-                    keyspace,
+                    target_graph,
                     &triple.subject,
                     &triple.predicate,
                     &triple.object,
@@ -384,7 +428,7 @@ async fn exec_clear(
                 predicate: p.value.clone(),
                 object: o.value.clone(),
             };
-            delete_ground_triple(keyspace, &triple, storage)?;
+            delete_ground_triple(keyspace, keyspace, &triple, storage)?;
             deleted += 1;
         }
     }
@@ -392,7 +436,8 @@ async fn exec_clear(
     Ok(deleted)
 }
 
-/// A ground triple to tombstone (graph is implied by the keyspace).
+/// A ground triple to tombstone. The graph it lives in is supplied by the
+/// caller (the request's resolved target graph).
 struct GroundTriple {
     subject: String,
     predicate: String,
@@ -407,42 +452,6 @@ struct InsertTriple {
     obj_type: String,
     datatype: Option<String>,
     language: Option<String>,
-}
-
-/// Validate that a quad template's target graph (a [`GraphNamePattern`], as
-/// carried by both INSERT and DELETE templates in a `DeleteInsert`) is
-/// addressable in this single-graph-per-keyspace engine.
-///
-/// `DefaultGraph` maps to the keyspace's default graph (always OK). A
-/// `NamedNode` equal to the keyspace is the same graph (OK). Any other named
-/// graph — or a variable-bound graph — is not addressable: return a fail-loud
-/// error instead of silently operating on the default graph (URS-QEC-X01).
-fn check_quad_graph_pattern(
-    graph: &spargebra::term::GraphNamePattern,
-    keyspace: &str,
-    op: &str,
-) -> Result<(), SparqlError> {
-    match graph {
-        spargebra::term::GraphNamePattern::DefaultGraph => Ok(()),
-        spargebra::term::GraphNamePattern::NamedNode(n) if n.as_str() == keyspace => Ok(()),
-        spargebra::term::GraphNamePattern::NamedNode(n) => {
-            Err(named_graph_unsupported(op, n.as_str(), keyspace))
-        }
-        spargebra::term::GraphNamePattern::Variable(v) => Err(SparqlError::Plan(format!(
-            "{op} into a variable-bound graph (?{}) is not supported: this endpoint \
-             exposes a single graph per keyspace ('{keyspace}')",
-            v.as_str()
-        ))),
-    }
-}
-
-/// Build the standard fail-loud error for an unaddressable named graph.
-fn named_graph_unsupported(op: &str, graph: &str, keyspace: &str) -> SparqlError {
-    SparqlError::Plan(format!(
-        "{op} into named graph <{graph}> is not supported: this endpoint exposes a \
-         single graph per keyspace ('{keyspace}'); named graphs distinct from it \
-         are not addressable (so ADD/MOVE/COPY across graphs cannot be honored)"
-    ))
 }
 
 /// Resolve a `TermPattern` (subject/object position) against a solution into a
@@ -529,16 +538,18 @@ fn object_metadata(
     }
 }
 
-/// Tombstone a ground triple in `keyspace`'s graph via the shared low-level
-/// `StorageEngine` write path (same path `DELETE DATA` uses).
+/// Tombstone a ground triple in `graph` (a `rdf_triples` partition component of
+/// `keyspace`) via the shared low-level `StorageEngine` write path (same path
+/// `DELETE DATA` uses).
 fn delete_ground_triple(
     keyspace: &str,
+    graph: &str,
     triple: &GroundTriple,
     storage: &Arc<StorageEngine>,
 ) -> Result<(), SparqlError> {
     tombstone_triple(
         keyspace,
-        keyspace,
+        graph,
         &triple.subject,
         &triple.predicate,
         &triple.object,
