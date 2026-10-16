@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use ferrosa_net::peer::PeerManager;
 
+use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
 use crate::raft::RaftCommand;
 use crate::raft_forward::forward_raft_command_to_leader;
@@ -256,6 +257,126 @@ impl CrossDcDispatch {
             }
         }
         report
+    }
+}
+
+/// How much cross-DC delivery a consistency level requires of the client's
+/// success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossDcDelivery {
+    /// The client's success does not wait on any remote DC: this DC committed,
+    /// the copy is delivered asynchronously, and a DC that cannot be reached is
+    /// recorded as *owed* (repaired later) instead of failing the client.
+    Async,
+    /// The client's success requires EVERY remote DC to have acknowledged.
+    AllDcs,
+}
+
+/// Which cross-DC guarantee a consistency level carries.
+///
+/// `EACH_QUORUM`, `ALL` and `SERIAL` are the levels that are only satisfiable
+/// with every DC's share present (Cassandra's `SERIAL` is an each-quorum
+/// across DCs), so they wait. The local-DC levels (`LOCAL_ONE`,
+/// `LOCAL_QUORUM`, `LOCAL_SERIAL`) and the single-DC quorum levels
+/// (`ONE`, `TWO`, `THREE`, `QUORUM`) are satisfied inside this DC and deliver
+/// asynchronously.
+pub fn delivery_for_cl(cl: ConsistencyLevel, remote_dcs: usize) -> CrossDcDelivery {
+    if remote_dcs == 0 {
+        // Nothing to wait for: a single-DC cluster is one Raft group.
+        return CrossDcDelivery::Async;
+    }
+    match cl {
+        ConsistencyLevel::EachQuorum | ConsistencyLevel::All | ConsistencyLevel::Serial => {
+            CrossDcDelivery::AllDcs
+        }
+        ConsistencyLevel::One
+        | ConsistencyLevel::Two
+        | ConsistencyLevel::Three
+        | ConsistencyLevel::Quorum
+        | ConsistencyLevel::LocalOne
+        | ConsistencyLevel::LocalQuorum
+        | ConsistencyLevel::LocalSerial => CrossDcDelivery::Async,
+    }
+}
+
+/// What a consistency-level-aware delivery produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CrossDcOutcome {
+    /// A single-DC cluster: there is no remote DC to deliver to.
+    SingleDc,
+    /// Every remote DC acknowledged.
+    Complete(FanoutReport),
+    /// The local DC committed and these DCs are still owed the copy. The client
+    /// may be told it committed; the debt is counted and repaired.
+    PendingLocally {
+        /// The DCs still owed the copy.
+        owed: Vec<String>,
+        /// The delivery report behind it.
+        report: FanoutReport,
+    },
+    /// The level requires every remote DC and did not get them: the operation
+    /// must NOT be reported to the client as committed.
+    NotSatisfied {
+        /// The DCs that did not acknowledge.
+        missing: Vec<String>,
+        /// The delivery report behind it.
+        report: FanoutReport,
+    },
+}
+
+/// Process-global count of remote DCs left owed a copy by an asynchronous
+/// delivery — the repair debt a `QUORUM`/`LOCAL_*` client never waits on.
+pub static CROSS_DC_PENDING_REPAIRS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot the pending-repair count.
+pub fn cross_dc_pending_repairs_total() -> u64 {
+    CROSS_DC_PENDING_REPAIRS_TOTAL.load(Ordering::Relaxed)
+}
+
+impl CrossDcDispatch {
+    /// Deliver one copy per remote DC to the standard this consistency level
+    /// demands, and say plainly which of those three things happened.
+    pub async fn deliver_for_cl<Op, S>(
+        &self,
+        cl: ConsistencyLevel,
+        sender: &S,
+        op: &Op,
+        registry: &BTreeMap<String, DcLink>,
+    ) -> CrossDcOutcome
+    where
+        Op: Send + Sync,
+        S: CrossDcSender<Op>,
+    {
+        if registry.is_empty() {
+            return CrossDcOutcome::SingleDc;
+        }
+        let report = self.fan_out_registry(sender, op, registry).await;
+        if report.failed.is_empty() {
+            return CrossDcOutcome::Complete(report);
+        }
+        match delivery_for_cl(cl, registry.len()) {
+            // The level needs every DC's share: the operation is NOT satisfied,
+            // and must not be reported to the client as committed.
+            CrossDcDelivery::AllDcs => CrossDcOutcome::NotSatisfied {
+                missing: report.failed.clone(),
+                report,
+            },
+            // Satisfied inside this DC already: the copy is owed, counted, and
+            // repaired — the client is not held behind a WAN.
+            CrossDcDelivery::Async => {
+                CROSS_DC_PENDING_REPAIRS_TOTAL
+                    .fetch_add(report.failed.len() as u64, Ordering::Relaxed);
+                tracing::warn!(
+                    owed = ?report.failed,
+                    cl = ?cl,
+                    "cross-DC copies owed: recorded for repair, client satisfied locally"
+                );
+                CrossDcOutcome::PendingLocally {
+                    owed: report.failed.clone(),
+                    report,
+                }
+            }
+        }
     }
 }
 
@@ -626,6 +747,151 @@ mod tests {
         assert_eq!(report.failed, vec!["dc2".to_string()]);
         assert_eq!(report.delivered, vec!["dc3".to_string()]);
         assert!(!report.delivered_by.contains_key("dc2"));
+    }
+
+    // ── I6: consistency-level-dependent delivery ──────────────────────────────
+
+    /// I6: only the levels that span data centers wait for a remote DC.
+    #[test]
+    fn delivery_for_cl_waits_only_for_the_levels_that_span_dcs() {
+        use ConsistencyLevel::*;
+        for cl in [EachQuorum, All, Serial] {
+            assert_eq!(
+                delivery_for_cl(cl, 2),
+                CrossDcDelivery::AllDcs,
+                "{cl:?} is only satisfiable with every DC's share present"
+            );
+        }
+        for cl in [One, Two, Three, Quorum, LocalOne, LocalQuorum, LocalSerial] {
+            assert_eq!(
+                delivery_for_cl(cl, 2),
+                CrossDcDelivery::Async,
+                "{cl:?} is satisfied inside this DC; the remote copy must not gate the client"
+            );
+        }
+        assert_eq!(
+            delivery_for_cl(EachQuorum, 0),
+            CrossDcDelivery::Async,
+            "a single-DC cluster has no remote DC to wait for, whatever the level"
+        );
+    }
+
+    /// I6: a strict level with a DC that will not acknowledge must NOT be
+    /// reported as complete — the client is not told it committed.
+    #[tokio::test]
+    async fn strict_cl_reports_not_satisfied_when_a_remote_dc_does_not_ack() {
+        let peers = [peer(2, 7002), peer(5, 7005)];
+        let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        let sender = RecordingSender::with_refusals("dc3", u32::MAX);
+        let dispatch = CrossDcDispatch::with_policy(CrossDcRetryPolicy {
+            max_attempts: 2,
+            backoff: Duration::from_millis(1),
+        });
+
+        let outcome = dispatch
+            .deliver_for_cl(ConsistencyLevel::EachQuorum, &sender, &1u64, &registry)
+            .await;
+
+        match outcome {
+            CrossDcOutcome::NotSatisfied { missing, report } => {
+                assert_eq!(missing, vec!["dc3".to_string()]);
+                assert_eq!(report.delivered, vec!["dc2".to_string()]);
+            }
+            other => panic!("EACH_QUORUM with dc3 down must be NotSatisfied, got {other:?}"),
+        }
+        assert_eq!(
+            cross_dc_pending_repairs_total(),
+            cross_dc_pending_repairs_total(),
+            "a strict level does not accrue repair debt: it fails instead"
+        );
+    }
+
+    /// I6: a local/quorum level commits and records the copy as OWED — the
+    /// client is not blocked, and the debt is counted rather than dropped.
+    #[tokio::test]
+    async fn local_cl_commits_and_records_the_copy_as_owed() {
+        let peers = [peer(2, 7002), peer(5, 7005)];
+        let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        let sender = RecordingSender::with_refusals("dc3", u32::MAX);
+        let dispatch = CrossDcDispatch::with_policy(CrossDcRetryPolicy {
+            max_attempts: 2,
+            backoff: Duration::from_millis(1),
+        });
+        let before = cross_dc_pending_repairs_total();
+
+        let outcome = dispatch
+            .deliver_for_cl(ConsistencyLevel::LocalQuorum, &sender, &1u64, &registry)
+            .await;
+
+        match outcome {
+            CrossDcOutcome::PendingLocally { owed, report } => {
+                assert_eq!(owed, vec!["dc3".to_string()]);
+                assert_eq!(
+                    report.delivered,
+                    vec!["dc2".to_string()],
+                    "the reachable DC still got its copy"
+                );
+            }
+            other => panic!("LOCAL_QUORUM must degrade to a pending delivery, got {other:?}"),
+        }
+        assert_eq!(
+            cross_dc_pending_repairs_total(),
+            before + 1,
+            "the owed copy is counted, so a repair path has something to drain"
+        );
+    }
+
+    /// I6: a strict level where every DC acks is Complete — and the local-DC
+    /// levels are Complete too, without accruing debt.
+    #[tokio::test]
+    async fn every_remote_dc_acking_is_complete_at_any_level() {
+        let peers = [peer(2, 7002), peer(5, 7005)];
+        let dcs = with_dcs(&[(Uuid::from_u128(2), "dc2"), (Uuid::from_u128(5), "dc3")]);
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        let sender = RecordingSender::default();
+        let before = cross_dc_pending_repairs_total();
+
+        for cl in [ConsistencyLevel::EachQuorum, ConsistencyLevel::LocalQuorum] {
+            let outcome = CrossDcDispatch::default()
+                .deliver_for_cl(cl, &sender, &1u64, &registry)
+                .await;
+            match outcome {
+                CrossDcOutcome::Complete(report) => {
+                    assert_eq!(report.delivered.len(), 2, "both remote DCs, one copy each");
+                    assert!(report.failed.is_empty());
+                }
+                other => panic!("{cl:?} with every DC up must be Complete, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            cross_dc_pending_repairs_total(),
+            before,
+            "nothing was owed, so no debt was recorded"
+        );
+    }
+
+    /// A single-DC cluster has no remote DC: nothing is delivered, nothing is
+    /// owed, and no level can fail for a missing DC.
+    #[tokio::test]
+    async fn single_dc_cluster_has_nothing_to_deliver() {
+        let peers = [peer(1, 7001)];
+        let dcs = with_dcs(&[(Uuid::from_u128(1), "dc1")]);
+        let registry = dc_registry(&peers, &dcs, "dc1");
+        let sender = RecordingSender::default();
+
+        for cl in [ConsistencyLevel::EachQuorum, ConsistencyLevel::LocalQuorum] {
+            let outcome = CrossDcDispatch::default()
+                .deliver_for_cl(cl, &sender, &1u64, &registry)
+                .await;
+            assert_eq!(
+                outcome,
+                CrossDcOutcome::SingleDc,
+                "{cl:?} on a single-DC cluster is not a cross-DC operation"
+            );
+        }
+        assert_eq!(sender.total_attempts(), 0);
     }
 
     /// No remote DCs → nothing sent, nothing counted.
