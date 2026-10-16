@@ -531,6 +531,32 @@ async fn served_ids(client: &Client, table: &str) -> Result<BTreeSet<i32>, Strin
 
 /// Read this node's own replicas, retrying on a transient error, and report the
 /// id set it serves.
+/// How long a node is given to become READABLE -- to stop refusing snapshot reads
+/// because its local engine view has not applied the barrier's dependencies yet.
+/// Not a propagation budget: this only buys the right to ask the question.
+const READABILITY_BUDGET: Duration = Duration::from_secs(10);
+
+/// Read `table` through `node`, waiting out the transient in which the node's local
+/// engine view has not applied the snapshot barrier's dependencies yet. The engine
+/// refuses such a read on purpose ("PostgreSQL snapshot barrier dependencies were
+/// not applied locally") rather than expose an older view, and that window is
+/// exactly where a replica that was killed and is being repaired sits. The FIRST
+/// successful read is returned as-is, so a node that was genuinely behind still
+/// does not count as holding the row; a node that never becomes readable is an
+/// error, never a silent empty result.
+async fn read_ids_when_readable(node: &Node, table: &str) -> Result<BTreeSet<i32>, String> {
+    let deadline = Instant::now() + READABILITY_BUDGET;
+    loop {
+        match served_ids_through(node, table).await {
+            Ok(ids) => return Ok(ids),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 async fn served_ids_through(node: &Node, table: &str) -> Result<BTreeSet<i32>, String> {
     let client = pg_connect(node.ports.pg).await;
     served_ids(&client, table).await
@@ -726,9 +752,12 @@ async fn a_committed_row_survives_a_sigkill_and_is_repaired_onto_the_restarted_r
         // exactly the failure the guarantee forbids.
         let mut hold: Vec<usize> = Vec::new();
         for (i, node) in nodes.iter().enumerate() {
-            let ids = served_ids_through(node, &table)
+            // Readable is not the same as holding the row: see read_ids_when_readable.
+            // A restarted replica that cannot snapshot YET is waited out; one that is
+            // genuinely behind still fails the quorum assertion below.
+            let ids = read_ids_when_readable(node, &table)
                 .await
-                .unwrap_or_else(|e| panic!("node {i} could not be read at all: {e}"));
+                .unwrap_or_else(|e| panic!("node {i} never became readable: {e}"));
             if ids.contains(&id) {
                 hold.push(i);
             }

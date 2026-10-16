@@ -1,0 +1,83 @@
+# Runtime images for the ferrosa engine on glibc (Debian), alongside the
+# musl/Alpine image in Dockerfile.release.
+#
+# COPY-only, exactly like Dockerfile.release: the binaries are built ONCE in
+# release.yml (build-linux-gnu) and downloaded into dist/<arch>/<variant>/
+# before this build. Nothing compiles here, so the multi-arch build needs no
+# QEMU for a cross-arch compiler and the two images below share one build.
+#
+# Two targets are published from this file:
+#
+#   --target production   stripped binary, minimal runtime   -> :<tag>-glibc
+#   --target profiling    full DWARF, deliberately unstripped -> :<tag>-glibc-profiling
+#
+# The profiling target is the one that makes stack traces and flame graphs
+# resolvable: release.yml builds it with `--profile profiling` (debug = full,
+# see [profile.profiling]) and asserts .debug_info is present. It also carries
+# the two tools needed to turn a profile into a graph -- linux-perf for CPU
+# flame graphs and jeprof for jemalloc heap profiles -- because an image with
+# symbols but no way to sample or render them still cannot produce a flame graph.
+#
+# EXPOSE/ENTRYPOINT/UID are identical to Dockerfile.release so either image can
+# be swapped in without touching a deployment. The base is pinned by digest for
+# the same reason the other images are, and its glibc is the ceiling the
+# build-linux-gnu jobs assert against (GLIBC_RUNTIME_MAX).
+
+# ── production ──────────────────────────────────────────────────────────────
+FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS production
+
+# ca-certificates: required for TLS to S3. tzdata: correct timestamps/logs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 ferrosa \
+    && useradd --system --uid 10001 --gid ferrosa --no-create-home --shell /usr/sbin/nologin ferrosa \
+    && mkdir -p /etc/ferrosa /var/lib/ferrosa \
+    && chown -R ferrosa:ferrosa /var/lib/ferrosa
+
+# buildx sets TARGETARCH automatically per --platform entry (amd64 | arm64).
+ARG TARGETARCH
+COPY dist/${TARGETARCH}/production/ferrosa     /usr/local/bin/ferrosa
+COPY dist/${TARGETARCH}/production/ferrosa-ctl /usr/local/bin/ferrosa-ctl
+# Reference only — NOT the active config. Operators inject via env or a mount.
+COPY config/ferrosa.example.toml               /etc/ferrosa/ferrosa.example.toml
+
+ENV FERROSA_CONFIG=/etc/ferrosa/ferrosa.toml \
+    FERROSA_DATA_DIR=/var/lib/ferrosa
+
+# CQL, internode RPC, web/Prometheus, graph HTTP, Bolt, Arrow Flight gRPC.
+EXPOSE 9042 17000 9090 7474 7687 8815
+VOLUME /var/lib/ferrosa
+USER ferrosa
+ENTRYPOINT ["ferrosa"]
+
+# ── profiling ───────────────────────────────────────────────────────────────
+FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS profiling
+
+# linux-perf: CPU sampling for flame graphs.
+# libjemalloc-dev: supplies /usr/bin/jeprof, which renders the heap profiles the
+#   `ferrosa/profiling` feature emits. It is a -dev package on purpose: the
+#   diagnostic image is where a profiler is expected to be present.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates tzdata linux-perf libjemalloc-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid 10001 ferrosa \
+    && useradd --system --uid 10001 --gid ferrosa --no-create-home --shell /usr/sbin/nologin ferrosa \
+    && mkdir -p /etc/ferrosa /var/lib/ferrosa /var/lib/ferrosa/perf \
+    && chown -R ferrosa:ferrosa /var/lib/ferrosa
+
+ARG TARGETARCH
+# Unstripped: the DWARF in these binaries is the product of this image.
+COPY dist/${TARGETARCH}/profiling/ferrosa      /usr/local/bin/ferrosa
+COPY dist/${TARGETARCH}/production/ferrosa-ctl /usr/local/bin/ferrosa-ctl
+COPY config/ferrosa.example.toml               /etc/ferrosa/ferrosa.example.toml
+
+ENV FERROSA_CONFIG=/etc/ferrosa/ferrosa.toml \
+    FERROSA_DATA_DIR=/var/lib/ferrosa \
+    RUST_BACKTRACE=full
+
+EXPOSE 9042 17000 9090 7474 7687 8815
+VOLUME /var/lib/ferrosa
+USER ferrosa
+ENTRYPOINT ["ferrosa"]
