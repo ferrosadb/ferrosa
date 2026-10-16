@@ -151,3 +151,31 @@ in `ferrosa-storage`.
 **Gates on the final head** (`62f0c476`): fmt 0, clippy 0 findings, docs 0 errors,
 `ferrosa-sparql` 173 passed / 0 failed, `ferrosa-storage` 2045 passed / 0 failed,
 `ferrosa-cluster` 1764 passed / 0 failed.
+
+## Independent verification (separate verifier, merged tree 3c39cc72)
+
+Verdict: **verified with caveats** — the declaration holds at both registration
+sites and the arm takes the index path only on declared AND current. Six reds were
+re-taken under mutation, each compiling and failing on behaviour. Notable results:
+
+- The cleanest red is the currency half reverted alone (`executor.rs` back to
+  `declares_index_locally` only): exactly one test fails, with the refusal text this
+  item documents. A FULL revert proves the declaration instead — four of its five
+  failures land on fixture preconditions and never reach the access-path choice.
+- `an_undeclared_object_index_still_scans_and_still_warns` catches a removed
+  undeclared-branch only through its WARN text: both branches stream-scan, so its
+  data assertions hold either way. Non-vacuous, but narrower than it reads.
+- Claims about the half-written sidecar and the failed-build retry are held down by
+  PRE-EXISTING storage unit tests, not by this change; the boot convergence had no
+  test here at all until the follow-up added one.
+
+### Limitation found and now documented in the code
+
+`WritePath::index_is_current` is a **local** pre-check. In `Cluster` mode the two
+predicates resolve this node's engine while `index_read_stream` fans out to every
+replica, so a cluster-wide object-bound read can pass the gate on a current
+coordinator index and still meet a replica's loud not-current refusal. The doc
+comment previously claimed the three handles could not disagree; that claim is true
+only for `Direct` and `Pair`. It is corrected in the same change rather than left
+standing. Closing the cluster-mode gap needs a clustered test with divergent
+per-node index currency and is tracked separately.
