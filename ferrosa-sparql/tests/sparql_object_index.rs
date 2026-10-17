@@ -570,6 +570,469 @@ async fn an_undeclared_object_index_still_scans_and_still_warns() {
     );
 }
 
+/// Every SSTable generation in `table_dir`, by the id the tracker and the build
+/// jobs name it by. `<gen>-Data.db` is how a generation is discovered on disk
+/// (see `StorageEngine::list_generations_in_dir`), and the test reads it here
+/// rather than asking the engine, so a generation the engine has stopped
+/// tracking cannot make an assertion about "the pre-existing data" vacuous.
+fn generations_in(table_dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(table_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix("-Data.db")
+                .map(std::string::ToString::to_string)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Wait (bounded) for the object index to reach `is_current`.
+///
+/// The bound is a hang guard, not a latency assertion: the backfill of one
+/// 20-row SSTable finishes in milliseconds, and what is under test is the
+/// STATE the backfill reaches, never how fast it got there.
+fn wait_for_object_index_current(storage: &StorageEngine) -> bool {
+    let table_id = triples_table_id(KS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !storage.index_is_current(&table_id, OBJECT_INDEX) && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    storage.index_is_current(&table_id, OBJECT_INDEX)
+}
+
+/// [`wait_for_object_index_current`] for the opposite outcome: the object
+/// index's build failed and the failure is recorded.
+fn wait_for_object_index_failure(storage: &StorageEngine) -> bool {
+    let failed = || {
+        storage
+            .stale_secondary_indexes()
+            .iter()
+            .any(|stale| stale.index == OBJECT_INDEX && stale.last_error.is_some())
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !failed() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    failed()
+}
+
+// =======================================================================
+// 5 — CONVERGENCE: a declared index is driven to current with no operator.
+// =======================================================================
+
+/// A node that comes up over triples ALREADY on disk declares the object index
+/// over them and the backfill it queued reaches `is_current` with no operator
+/// action — after which the object-bound query reads through the repaired index
+/// rather than scanning.
+///
+/// This is the third creation path (the other two are `new` and the lazy
+/// registration, pinned above): the rows reach an SSTable while the index is
+/// NOT declared, which is the shape of a node whose data predates the index.
+/// The declaration submits a build for every generation that predates it; the
+/// backend is the real one (`IndexBackendConfig::Local`), so the only thing the
+/// test supplies is the wait.
+///
+/// RED as written against the reverted declaration (588d1bc7^): nothing declares
+/// the index, so there is no backfill to converge and the tight-bound read below
+/// streams all 20 rows and refuses to truncate.
+#[tokio::test]
+async fn a_node_booting_over_existing_triples_drives_the_object_index_to_current() {
+    let f = fixture(SparqlConfig {
+        default_graph: KS.to_string(),
+        ..Default::default()
+    });
+    f.seed().await;
+
+    // The rows reach an SSTable while the index is not declared, so no sidecar
+    // is written for them: `flush_all` builds sidecars only for the indexes the
+    // table maintains.
+    assert!(
+        f.storage
+            .drop_index(&triples_table_id(KS), OBJECT_INDEX)
+            .expect("drop the declared index"),
+        "the fixture's registration must have declared '{OBJECT_INDEX}' to drop"
+    );
+    f.storage
+        .flush_all()
+        .expect("the seeded rows must reach an SSTable");
+    assert!(
+        !f.storage
+            .declares_index(&triples_table_id(KS), OBJECT_INDEX),
+        "the fixture is only meaningful while the index is genuinely absent"
+    );
+    let table_dir = f.storage.table_sstable_dir(&triples_table_id(KS));
+    assert_eq!(
+        generations_in(&table_dir).len(),
+        1,
+        "the seeded rows must be in exactly one pre-existing generation"
+    );
+
+    // Boot: registration over pre-existing SSTables.
+    let engine = SparqlEngine::new(
+        Arc::clone(&f.storage),
+        Arc::clone(&f.write_path),
+        f.config.clone(),
+    );
+    assert!(
+        f.storage
+            .declares_index(&triples_table_id(KS), OBJECT_INDEX),
+        "registration over pre-existing SSTables must declare '{OBJECT_INDEX}'"
+    );
+
+    // Convergence, with the real scheduler and no operator action.
+    assert!(
+        wait_for_object_index_current(&f.storage),
+        "a declared index must reach current on its own; still not current: {:?}",
+        f.storage.stale_secondary_indexes()
+    );
+    assert!(
+        f.storage.stale_secondary_indexes().is_empty(),
+        "nothing may be left reported as degraded once the backfill has caught up: {:?}",
+        f.storage.stale_secondary_indexes()
+    );
+
+    // The repair is REAL, not merely a status: over a 20-row table under an
+    // 8-row bound, only an index read can answer. The scan counts every storage
+    // row at the source and refuses to truncate.
+    let indexed = f
+        .run_bounded("SELECT ?s ?p ?o WHERE { ?s ?p \"object-019\" }", BOUND)
+        .await
+        .expect(
+            "the repaired index must answer a 20-row table under an 8-row bound; a scan \
+             reads every row and refuses to truncate",
+        );
+    assert_eq!(
+        indexed,
+        vec![pair("s19", "p")],
+        "the repairable index must return exactly the triple stored under 'object-019'"
+    );
+
+    // The row the query above did not ask for is still reachable, so the index
+    // the repair produced is complete rather than narrow.
+    let other = served_object_rows(&engine, "object-004").await;
+    assert_eq!(
+        other,
+        [pair("s4", "p")].into_iter().collect(),
+        "every pre-existing triple must be in the index the boot repaired"
+    );
+}
+
+/// An index build interrupted before it finished leaves a half-written sidecar
+/// on disk. With no builder available it must stay VISIBLY not current — the
+/// artifact must never be read as a completed build — and the read path must
+/// answer correctly by scanning meanwhile.
+///
+/// The artifact is real: the writer's own 17-byte header, with no body and no
+/// footer, which is exactly what a build killed mid-write leaves behind. The
+/// backend is `Off` so the window is held still rather than raced: nothing
+/// drains the pending set, and what the tracker says about the generation is
+/// the same either way.
+#[tokio::test]
+async fn an_interrupted_object_index_build_is_not_current_and_the_read_still_scans() {
+    let f = fixture_with_index_backend(
+        SparqlConfig {
+            default_graph: KS.to_string(),
+            ..Default::default()
+        },
+        IndexBackendConfig::Off,
+    );
+    f.seed().await;
+    f.storage
+        .flush_all()
+        .expect("the seeded rows must reach an SSTable");
+    let table_dir = f.storage.table_sstable_dir(&triples_table_id(KS));
+    let generations = generations_in(&table_dir);
+    assert_eq!(generations.len(), 1, "one flushed generation");
+
+    // The build that never finished: a header, no body, no footer.
+    let sidecar = table_dir.join(format!("{}-{OBJECT_INDEX}.sidecar", generations[0]));
+    let mut partial = b"FXSI".to_vec();
+    partial.push(2);
+    partial.extend_from_slice(&1u64.to_le_bytes());
+    partial.extend_from_slice(&[0u8; 4]);
+    partial.extend_from_slice(b"\x07\x00\x00\x00shared");
+    std::fs::write(&sidecar, &partial).expect("write the half-written sidecar");
+    assert!(
+        sidecar.exists(),
+        "the artifact must be on disk, or the test proves nothing about trusting it"
+    );
+
+    // The next boot declares the index and finds the generation unbuilt.
+    assert!(f
+        .storage
+        .drop_index(&triples_table_id(KS), OBJECT_INDEX)
+        .expect("drop the declared index"));
+    let engine = SparqlEngine::new(
+        Arc::clone(&f.storage),
+        Arc::clone(&f.write_path),
+        f.config.clone(),
+    );
+
+    assert!(
+        f.storage
+            .declares_index(&triples_table_id(KS), OBJECT_INDEX),
+        "the boot must declare '{OBJECT_INDEX}' over the generation it found"
+    );
+    assert!(
+        !f.storage
+            .index_is_current(&triples_table_id(KS), OBJECT_INDEX),
+        "a half-written sidecar must not be read as a completed build: {:?}",
+        f.storage.stale_secondary_indexes()
+    );
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // The rows come back — by scanning, since the index cannot be trusted to
+    // answer for this generation.
+    assert_eq!(
+        served_object_rows_or_error(&engine, "object-019").await,
+        Ok([pair("s19", "p")].into_iter().collect()),
+        "while the interrupted build is unfinished the scan must still answer with the stored row"
+    );
+    let tripped = f
+        .run_bounded("SELECT ?s ?p ?o WHERE { ?s ?p \"object-019\" }", BOUND)
+        .await
+        .expect_err(
+            "the read must stream the whole table rather than answer out of a sidecar whose \
+             build never finished",
+        );
+    assert!(
+        tripped
+            .to_string()
+            .contains("read more than 8 storage rows"),
+        "the fallback must die on the row bound, not on a refused index read: {tripped}"
+    );
+    let captured = logs.contents();
+    assert!(
+        captured.contains("not yet current") && captured.contains(OBJECT_INDEX),
+        "the scan fallback must warn, naming the index it is standing in for; \
+         captured: {captured}"
+    );
+}
+
+/// The same half-written sidecar over a node that DOES have a builder: the boot
+/// re-drives the build rather than trusting the artifact, the index reaches
+/// current, and the object-bound query then reads through it.
+///
+/// The pair matters. This test alone would pass if the artifact were trusted
+/// (the query would be answered either way); the case above alone would pass if
+/// the artifact were trusted and never repaired. Together they say the artifact
+/// is neither trusted NOR fatal.
+#[tokio::test]
+async fn an_interrupted_object_index_build_is_redone_and_the_index_reaches_current() {
+    let f = fixture(SparqlConfig {
+        default_graph: KS.to_string(),
+        ..Default::default()
+    });
+    f.seed().await;
+    assert!(
+        f.storage
+            .drop_index(&triples_table_id(KS), OBJECT_INDEX)
+            .expect("drop the declared index"),
+        "the fixture's registration must have declared '{OBJECT_INDEX}' to drop"
+    );
+    f.storage
+        .flush_all()
+        .expect("the seeded rows must reach an SSTable");
+
+    // A build that died mid-write: the sidecar's header landed, its body did
+    // not.
+    let table_dir = f.storage.table_sstable_dir(&triples_table_id(KS));
+    let generations = generations_in(&table_dir);
+    assert_eq!(generations.len(), 1, "one flushed generation");
+    let partial = table_dir.join(format!("{}-{OBJECT_INDEX}.sidecar", generations[0]));
+    let mut artifact = b"FXSI".to_vec();
+    artifact.push(2);
+    artifact.extend_from_slice(&1u64.to_le_bytes());
+    artifact.extend_from_slice(&[0u8; 4]);
+    artifact.extend_from_slice(b"\x07\x00\x00\x00shared");
+    std::fs::write(&partial, &artifact).expect("write the half-written sidecar");
+
+    let _engine = SparqlEngine::new(
+        Arc::clone(&f.storage),
+        Arc::clone(&f.write_path),
+        f.config.clone(),
+    );
+    assert!(
+        f.storage
+            .declares_index(&triples_table_id(KS), OBJECT_INDEX),
+        "the boot must declare '{OBJECT_INDEX}' over the generation it found"
+    );
+
+    assert!(
+        wait_for_object_index_current(&f.storage),
+        "the build the interruption cut short must be re-driven until it completes: {:?}",
+        f.storage.stale_secondary_indexes()
+    );
+    assert!(
+        f.storage.stale_secondary_indexes().is_empty(),
+        "nothing may be left reported as degraded once the build has completed: {:?}",
+        f.storage.stale_secondary_indexes()
+    );
+    let indexed = f
+        .run_bounded("SELECT ?s ?p ?o WHERE { ?s ?p \"object-019\" }", BOUND)
+        .await
+        .expect("the completed index must answer without reading the whole table");
+    assert_eq!(indexed, vec![pair("s19", "p")]);
+}
+
+// =======================================================================
+// 6 — NO SILENT DEGRADATION: a build that keeps failing is OBSERVABLE.
+// =======================================================================
+
+/// A build that fails must be reported where an operator looks — the index's
+/// status, its error, its gauge, and a log line naming the index AND the
+/// generation — and the read path must keep answering correctly by scanning
+/// for as long as the index is not current.
+///
+/// The failure is injected where the real one happens: the build reads the
+/// SSTable successfully and cannot publish its sidecar, because the path the
+/// sidecar goes to is occupied by a directory. So the DATA stays readable and
+/// the two halves of this contract can be asserted together — the failure being
+/// reported must not be confused with the data being unavailable.
+#[tokio::test]
+async fn a_failing_object_index_build_is_reported_by_name_and_the_read_keeps_scanning() {
+    let f = fixture(SparqlConfig {
+        default_graph: KS.to_string(),
+        ..Default::default()
+    });
+    f.seed().await;
+    assert!(
+        f.storage
+            .drop_index(&triples_table_id(KS), OBJECT_INDEX)
+            .expect("drop the declared index"),
+        "the fixture's registration must have declared '{OBJECT_INDEX}' to drop"
+    );
+    f.storage
+        .flush_all()
+        .expect("the seeded rows must reach an SSTable");
+
+    let table_dir = f.storage.table_sstable_dir(&triples_table_id(KS));
+    let generations = generations_in(&table_dir);
+    assert_eq!(generations.len(), 1, "one flushed generation");
+    let generation = generations[0].clone();
+    let blocked = table_dir.join(format!("{generation}-{OBJECT_INDEX}.sidecar"));
+    std::fs::create_dir(&blocked).expect("occupy the sidecar path with a directory");
+
+    // The build runs on a scheduler worker, not on this thread, so the log the
+    // failure is reported in has to be a GLOBAL subscriber to be captured at
+    // all. Nothing else in this binary installs one.
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("this binary installs the global tracing subscriber exactly once");
+
+    let f = Fixture {
+        engine: SparqlEngine::new(
+            Arc::clone(&f.storage),
+            Arc::clone(&f.write_path),
+            f.config.clone(),
+        ),
+        ..f
+    };
+    assert!(
+        f.storage
+            .declares_index(&triples_table_id(KS), OBJECT_INDEX),
+        "the boot must declare '{OBJECT_INDEX}' over the generation it found"
+    );
+    assert!(
+        wait_for_object_index_failure(&f.storage),
+        "a failed backfill build must be recorded, not swallowed: {:?}",
+        f.storage.stale_secondary_indexes()
+    );
+
+    // STATUS: the index, its table, the outstanding generation, and the reason.
+    let stale = f.storage.publish_index_backfill_status();
+    assert_eq!(stale.len(), 1, "{stale:?}");
+    assert_eq!(
+        (stale[0].table.clone(), stale[0].index.as_str()),
+        (triples_table_id(KS), OBJECT_INDEX),
+        "the reported index must be the graph's object index, named: {stale:?}"
+    );
+    assert_eq!(stale[0].pending_generations, 1, "{stale:?}");
+    let error = stale[0]
+        .last_error
+        .as_deref()
+        .expect("a failed backfill must report why it failed");
+    assert!(
+        error.contains(&generation),
+        "the error must name the generation whose build failed: {error}"
+    );
+    assert!(
+        !error.contains("not current"),
+        "the reported failure must be the build's error, not a refusal at the read: {error}"
+    );
+
+    // COUNTER: the gauges an operator scrapes, labelled with the index.
+    let table = triples_table_id(KS).to_string();
+    assert_eq!(
+        ferrosa_storage::metrics::index_not_current(&table, OBJECT_INDEX),
+        1,
+        "a not-current index must be counted"
+    );
+    assert!(
+        ferrosa_storage::metrics::index_backfill_failed(&table, OBJECT_INDEX),
+        "a failed backfill must be flagged"
+    );
+
+    // LOG: the line names both the index and the generation that failed.
+    let captured = logs.contents();
+    let failure_line = captured
+        .lines()
+        .find(|line| line.contains("index backfill FAILED"))
+        .unwrap_or_else(|| panic!("no failure was logged; captured: {captured}"));
+    assert!(
+        failure_line.contains(OBJECT_INDEX) && failure_line.contains(&generation),
+        "the failure must name the index and the sstable: {failure_line}"
+    );
+
+    // READ: still correct, still by scanning, and still saying so.
+    assert_eq!(
+        served_object_rows_or_error(&f.engine, "object-019").await,
+        Ok([pair("s19", "p")].into_iter().collect()),
+        "a failing index must not cost the caller a correct answer"
+    );
+    let tripped = f
+        .run_bounded("SELECT ?s ?p ?o WHERE { ?s ?p \"object-019\" }", BOUND)
+        .await
+        .expect_err(
+            "with the index not current the read must stream the whole table, so the \
+             8-row bound must trip — an answer at that bound would come from an \
+             incomplete index",
+        );
+    assert!(
+        tripped
+            .to_string()
+            .contains("read more than 8 storage rows"),
+        "the fallback must die on the row bound, not on a refused index read: {tripped}"
+    );
+    assert!(
+        logs.contents().contains(OBJECT_INDEX) && logs.contents().contains("not yet current"),
+        "the scan fallback must warn, naming the index it is standing in for; \
+         captured: {}",
+        logs.contents()
+    );
+
+    std::fs::remove_dir(&blocked).expect("clear the blocked sidecar path");
+}
+
 // =======================================================================
 // 4 — the backfill window: declared, but not yet current.
 // =======================================================================
