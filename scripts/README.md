@@ -1,5 +1,19 @@
 # Scripts
 
+## CI lane guards (`scripts/ci/`)
+
+* `scripts/ci/guard-all-features-lane-live-infra.py` runs in CI (job
+  `all-features-lane-live-infra`) and as the nightly fuzz job's first step. It
+  scans every crate's `tests/*.rs` for the `live-infra-tests` gate and requires
+  each `--all-features --workspace` lane (`.github/workflows/ci.yml`,
+  `.github/workflows/nightly-fuzz.yml`, `scripts/pre-push-mirror-ci.sh`) to
+  cover every such test — by `--skip` substring, `--exclude <crate>` or (nextest)
+  `-E 'not binary(<target>)'`. A lane file that stops matching its parser is
+  reported, not skipped. Tests: `tests/ci/test_guard_all_features_lane_live_infra.py`.
+  Why: those tests panic without their prerequisites by policy, and the three
+  hand-maintained skip lists drifted — nightly-fuzz was red for 18 days from one
+  missing `--skip`.
+
 ## Policy: scripts never touch production data
 
 Scripts here are **reference and test material**. They are never the supported

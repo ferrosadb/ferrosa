@@ -102,6 +102,24 @@ jobs:
       - name: Guard tests
         run: python3 -m unittest -q tests/ci/test_guard_no_python_data_writes.py
 
+  # Every `--all-features --workspace` lane must exclude the tests behind
+  # `live-infra-tests`: they are absent from the default target and panic by
+  # policy without FERROSA_TEST_CLUSTER_NODES / _CONTAINERS / _FIRECRACKER, so a
+  # lane that forgets one is red on a test that was never runnable there.
+  # Hand-syncing three copies of the skip list failed: 532529ac skipped
+  # `replicated_jsonb_index_builds_on_every_node` in ci.yml and not in
+  # nightly-fuzz.yml, and the nightly fuzz session was red for 18 days. The guard
+  # is the invariant; the test proves it fails on a drifted lane.
+  all-features-lane-live-infra:
+    name: every --all-features lane excludes the live-infra tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Live-infra tests are excluded from every all-features lane
+        run: python3 scripts/ci/guard-all-features-lane-live-infra.py
+      - name: Guard tests (a drifted lane must fail)
+        run: python3 -m unittest -q tests/ci/test_guard_all_features_lane_live_infra.py
+
   # jsonb guards (T-025): serde_json features are unified workspace-wide, so one
   # dependent enabling arbitrary_precision / preserve_order / unbounded_depth
   # changes number and object semantics everywhere (hazards M8, M12). The value
