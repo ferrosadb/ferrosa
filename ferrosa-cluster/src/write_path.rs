@@ -1284,10 +1284,19 @@ impl WritePath {
     /// turns the window between a declaration and its completed build into a
     /// failed read, where the scan below would have returned the right rows.
     ///
-    /// Resolved from the same handle
-    /// [`declares_index_locally`](Self::declares_index_locally) and
+    /// Resolved, in `Direct` and `Pair`/`DegradedPair` mode, from the same
+    /// handle [`declares_index_locally`](Self::declares_index_locally) and
     /// [`index_read_stream`](Self::index_read_stream) use, so the three cannot
     /// disagree about which engine's index this is.
+    ///
+    /// That identity does NOT hold in `Cluster` mode, and the difference is
+    /// real rather than cosmetic: both predicates resolve THIS node's engine
+    /// (`coordinator.storage`) while [`index_read_stream`](Self::index_read_stream)
+    /// fans the read out to every replica. A cluster-wide object-bound read can
+    /// therefore pass this gate on a current coordinator index and still meet
+    /// the loud not-current refusal from a replica whose backfill is unfinished.
+    /// The gate is a LOCAL pre-check, not a cluster-wide guarantee; a caller
+    /// that needs the latter has to ask the replicas.
     pub fn index_is_current(&self, table_id: &TableId, index_name: &str) -> bool {
         match self {
             Self::Direct(engine) => engine.index_is_current(table_id, index_name),

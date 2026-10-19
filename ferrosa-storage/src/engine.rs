@@ -27349,6 +27349,199 @@ mod tests {
         assert!(!crate::metrics::index_backfill_failed(&table, "val_idx"));
     }
 
+    /// The graph's `rdf_triples` object index is a CLUSTERING-column index, and
+    /// `ferrosa-ctl index rebuild` cannot repair one: `StorageEngine::rebuild_index`
+    /// resolves PARTITION-KEY indexes only and refuses everything else. So the
+    /// healer's retry is the ONLY repair this index has, and the convergence
+    /// `a_failed_backfill_is_reported_and_healed_by_a_retry` pins for a cell
+    /// index has to hold for this kind too — it takes a different branch of
+    /// `resubmit_backfill` (a key-sourced index carries its clustering source,
+    /// so the retry never resolves a cell ordinal).
+    ///
+    /// The failure is injected through the same seam: the generation's Data.db
+    /// is unreadable while the backfill runs.
+    #[test]
+    fn a_failed_clustering_index_backfill_converges_through_the_retry() {
+        use ferrosa_index::IndexKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(graph_triples_schema()).unwrap();
+        let tid = graph_triples_table_id();
+        // Two partitions, three triples, all sharing the object the index is
+        // built on — so the index answering for a partition that PREDATES it is
+        // visible in the row counts, not only in the index state.
+        engine
+            .write(
+                &tid,
+                &make_key("g1|s1"),
+                graph_triple_row("p", "shared"),
+                1000,
+            )
+            .unwrap();
+        engine
+            .write(
+                &tid,
+                &make_key("g1|s1"),
+                graph_triple_row("q", "shared"),
+                1001,
+            )
+            .unwrap();
+        engine
+            .write(
+                &tid,
+                &make_key("g1|s2"),
+                graph_triple_row("p", "shared"),
+                1002,
+            )
+            .unwrap();
+        engine.flush(&tid).unwrap();
+
+        let gen = engine
+            .table_state(&tid)
+            .unwrap()
+            .store
+            .sstable_generation_ids()[0]
+            .clone();
+        let data = StorageEngine::generation_component_path_for_test(
+            &engine.table_sstable_dir(&tid),
+            gen.parse().unwrap(),
+            "Data.db",
+        )
+        .expect("the flushed generation has a Data.db");
+        let hidden = data.with_extension("hidden");
+        std::fs::rename(&data, &hidden).unwrap();
+
+        // `object` is clustering component 1 of `(predicate, object)`.
+        engine
+            .add_clustering_index(
+                &tid,
+                "rdf_triples_object_idx",
+                1,
+                ferrosa_index::IndexType::BTree,
+            )
+            .unwrap();
+
+        let failed = |engine: &StorageEngine| {
+            engine
+                .stale_secondary_indexes()
+                .iter()
+                .any(|s| s.index == "rdf_triples_object_idx" && s.last_error.is_some())
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !failed(&engine) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(failed(&engine), "{:?}", engine.stale_secondary_indexes());
+        let stale = engine.publish_index_backfill_status();
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert_eq!(stale[0].index, "rdf_triples_object_idx");
+        assert_eq!(stale[0].pending_generations, 1, "{stale:?}");
+        assert!(
+            !engine.index_is_current(&tid, "rdf_triples_object_idx"),
+            "a failed build must leave the index not current, not silently current"
+        );
+
+        // The retry does not run before its retry time.
+        assert_eq!(engine.heal_secondary_index_backfills().resubmitted, 0);
+
+        // The file is back; once the retry time passes, the healer re-drives the
+        // build of the pending generation and the index becomes current.
+        std::fs::rename(&hidden, &data).unwrap();
+        let later = std::time::Instant::now() + crate::index::scheduler::BUILD_RETRY_DELAY;
+        let heal = engine.heal_secondary_index_backfills_at(later, INDEX_BACKFILL_STALL_AFTER);
+        assert_eq!(heal.resubmitted, 1, "{heal:?}");
+
+        assert!(
+            wait_for_index_current(&engine, &tid, "rdf_triples_object_idx"),
+            "{:?}",
+            engine.stale_secondary_indexes()
+        );
+        assert!(engine.publish_index_backfill_status().is_empty());
+        assert_eq!(
+            crate::metrics::index_not_current(&tid.to_string(), "rdf_triples_object_idx"),
+            0
+        );
+        assert!(!crate::metrics::index_backfill_failed(
+            &tid.to_string(),
+            "rdf_triples_object_idx"
+        ));
+
+        // ...and the repaired index answers for the rows that predate it.
+        let found = collect_index_results(
+            &engine,
+            &tid,
+            "rdf_triples_object_idx",
+            &IndexKey(b"shared".to_vec()),
+        )
+        .unwrap();
+        let mut partitions: Vec<Vec<u8>> = found
+            .iter()
+            .map(|partition| partition.key.key.as_bytes().to_vec())
+            .collect();
+        partitions.sort();
+        partitions.dedup();
+        assert_eq!(
+            partitions,
+            vec![b"g1|s1".to_vec(), b"g1|s2".to_vec()],
+            "both partitions that predate the index are reachable through it"
+        );
+        let rows: usize = found.iter().map(|partition| partition.rows.len()).sum();
+        assert_eq!(
+            rows, 3,
+            "every triple whose object is 'shared' is reachable"
+        );
+    }
+
+    /// An `rdf_triples`-shaped schema: `((graph, subject), predicate, object)`.
+    fn graph_triples_schema() -> TableSchema {
+        TableSchema {
+            keyspace: "graph_ks".to_string(),
+            table: "rdf_triples".to_string(),
+            key_type: "org.apache.cassandra.db.marshal.CompositeType(\
+                       org.apache.cassandra.db.marshal.UTF8Type,\
+                       org.apache.cassandra.db.marshal.UTF8Type)"
+                .to_string(),
+            clustering_columns: vec![
+                ColumnDefinition {
+                    name: "predicate".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+                ColumnDefinition {
+                    name: "object".to_string(),
+                    type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+                },
+            ],
+            static_columns: vec![],
+            regular_columns: vec![ColumnDefinition {
+                name: "object_type".to_string(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".to_string(),
+            }],
+            extensions: Default::default(),
+        }
+    }
+
+    fn graph_triples_table_id() -> TableId {
+        TableId::new("graph_ks", "rdf_triples")
+    }
+
+    /// A triple row: the `(predicate, object)` clustering key the SPARQL update
+    /// path writes, encoded the way CQL encodes a composite of two UTF8 columns.
+    fn graph_triple_row(predicate: &str, object: &str) -> Row {
+        let mut clustering = Vec::new();
+        clustering.extend_from_slice(&(predicate.len() as u16).to_be_bytes());
+        clustering.extend_from_slice(predicate.as_bytes());
+        clustering.extend_from_slice(&(object.len() as u16).to_be_bytes());
+        clustering.extend_from_slice(object.as_bytes());
+        Row {
+            clustering,
+            cells: vec![(0, CellValue::live(b"literal".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        }
+    }
+
     /// A rebuild of a partial (Filtered) index on a flush or compaction
     /// output, or a healer retry, must carry the index's predicate. It did
     /// not: the eager job said `filter_predicate: None`, so the scheduler
