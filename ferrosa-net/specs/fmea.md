@@ -47,6 +47,16 @@ not are flagged as open gaps.
 3. **NET-5 (RPN 120)** — the handler-registration race is documented but the fix
    lives in `ferrosa-cluster`; track to closure so the documented bug-asserting
    test can be flipped to assert success.
+4. **NET-6 (RPN 72)** — a peer that advertises an *empty* or whitespace-only
+   `data_center` is treated as having announced nothing and falls back to the
+   local DC. That is the intended rolling-upgrade behaviour, but it is
+   indistinguishable from a genuine misconfiguration where a peer's DC string did
+   not get through. Severity 6 (a mis-attributed DC can let `LOCAL_*` quorums
+   count remote replicas again), occurrence 3, detection 4 — the handshake
+   succeeds either way and nothing logs the fallback. Detection: the DC/rack
+   round-trip tests plus `peer_topology_treats_a_blank_announcement_as_absent`.
+   Residual: no operator-visible signal for the fallback; a config-validation or
+   startup log line would close it.
 
 ## Detection assets
 

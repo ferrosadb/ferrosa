@@ -100,6 +100,19 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.stop();
+        // A formation that fails destroys its own evidence: the node's log lives
+        // inside this node's tempdir, which Drop removes -- so a failed run leaves
+        // nothing but the 60-line excerpt the panic printed, and a diagnosis made
+        // from an excerpt is a guess. When the caller asks to keep logs, copy the
+        // log out first. (Drop also runs while unwinding, which is exactly the
+        // failing path.) Opt-in: with the variable unset this changes nothing.
+        if let Some(root) = std::env::var_os("FERROSA_TEST_KEEP_NODE_LOGS") {
+            let dest = std::path::Path::new(&root).join(format!("{}-node.log", self.host_id));
+            if let Some(parent) = dest.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(self.log_path(), dest);
+        }
     }
 }
 
@@ -135,7 +148,10 @@ fn spawn_node(spec: NodeSpec<'_>) -> Node {
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ferrosa"));
     cmd.env("RUST_MIN_STACK", "33554432") // debug-profile worker stack
-        .env("RUST_LOG", "info")
+        .env(
+            "RUST_LOG",
+            std::env::var("FERROSA_TEST_RUST_LOG").unwrap_or_else(|_| "info".into()),
+        )
         .env("FERROSA_AUTH_ENABLED", "false")
         .env("FERROSA_DATA_DIR", &data_dir)
         .env("FERROSA_CLUSTER_NAME", cluster_name)
@@ -289,9 +305,11 @@ async fn peer_topology(client: &mut CqlClient) -> Vec<(i32, String, String)> {
         .collect()
 }
 
-/// The operator rule, on two real processes in two data centers: the configured
-/// DC is the DC in use, and no peer the node does know is labelled with another
-/// node's topology.
+// ── the tests ─────────────────────────────────────────────────────────────────
+
+/// Everything the operator rule requires of a node's OWN view, on two real
+/// processes in two data centers: the configured DC is the DC in use, and no
+/// peer the node does know is labelled with anyone else's topology.
 ///
 /// This is the reported defect, reproduced and closed: before the fix,
 /// `system.local` on a node started with `FERROSA_DATA_CENTER=us-west-2`
@@ -392,4 +410,290 @@ async fn a_configured_data_center_is_used_and_stays_set() {
 
     west.stop();
     east.stop();
+}
+
+/// A peer in ANOTHER data center announces its own DC, and the receiving node
+/// records what was ANNOUNCED rather than stamping the peer with its own DC.
+///
+/// This is the wire half of the data-center work: that `system.local` reports the
+/// configured DC is pinned by `a_configured_data_center_is_used_and_stays_set`, and
+/// that the cross-DC *surface* is the relay registry (not `system.peers`) is pinned
+/// by `cross_dc_registry_holds_the_other_dcs_and_not_this_one` in `ferrosa-cluster`.
+/// What no unit test can show is that the announcement survives a real handshake
+/// between two processes — the failure that made every node report `datacenter1`
+/// was that the peer's own DC never arrived at all.
+///
+/// A DC's Raft group holds only its own nodes (ADR-015), so a node's `system.peers`
+/// lists its own DC; the other DC's nodes are reached through the registry. Tracked
+/// as CL-18.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_in_another_data_center_announces_its_own_dc_on_the_handshake() {
+    let cluster_name = format!("dc-cross-{}", std::process::id());
+    let mut alloc = PortAllocator::new();
+    let all_ports: Vec<Ports> = (0..2).map(|_| alloc_ports(&mut alloc)).collect();
+    let seed_hub = format!("127.0.0.1:{}", all_ports[0].internode);
+
+    let mut west = spawn_node(NodeSpec {
+        dir: tempfile::tempdir().unwrap(),
+        ports: all_ports[0],
+        host_id: "11111111-1111-1111-1111-111111111111".to_string(),
+        cluster_name: &cluster_name,
+        seed: None,
+        dc: DC_WEST,
+        rack: "rack-west-a",
+        expected_cluster_size: 1,
+    });
+    let mut east = spawn_node(NodeSpec {
+        dir: tempfile::tempdir().unwrap(),
+        ports: all_ports[1],
+        host_id: "22222222-2222-2222-2222-222222222222".to_string(),
+        cluster_name: &cluster_name,
+        seed: Some(&seed_hub),
+        dc: DC_EAST,
+        rack: "rack-east-a",
+        expected_cluster_size: 1,
+    });
+    wait_ready(&west, Duration::from_secs(90));
+    wait_ready(&east, Duration::from_secs(90));
+
+    // Whichever node received the connection logs the DC the OTHER announced. Poll:
+    // the announcement lands when the connection is established, not when the peer
+    // finishes booting. Either direction satisfies the invariant, so both logs count —
+    // which side dialled is an implementation detail (the leader usually dials out).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let west_logs_east = format!("data_center=Some(\"{DC_EAST}\")");
+    let east_logs_west = format!("data_center=Some(\"{DC_WEST}\")");
+    loop {
+        let west_log = std::fs::read_to_string(west.log_path()).unwrap_or_default();
+        let east_log = std::fs::read_to_string(east.log_path()).unwrap_or_default();
+        if west_log.contains(&west_logs_east) || east_log.contains(&east_logs_west) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the peer's own DC never reached either node's record: a node in {DC_EAST} \
+             must announce {DC_EAST} and a node in {DC_WEST} must announce {DC_WEST}, \
+             never the receiver's own DC — that is the defect that made every node \
+             report `datacenter1`\n=== west log tail ===\n{}\n=== east log tail ===\n{}",
+            west.log_tail(25),
+            east.log_tail(25)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    west.stop();
+    east.stop();
+}
+
+// ── the cross-DC relay, on two real processes ─────────────────────────────────
+
+/// Poll `node`'s log until it records a peer that announced `dc`.
+///
+/// This is the precondition the relay depends on: a DC is only a relay target
+/// once this node has actually met a node of it, and the announcement is what
+/// the DC registry is built from.
+fn wait_for_announced_peer(node: &Node, dc: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut seen = String::new();
+    while Instant::now() < deadline {
+        seen = node.log_tail(600);
+        if seen.contains(&format!("data_center=Some(\"{dc}\")")) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    panic!(
+        "node {} never recorded a peer announcing {dc} — the DC registry stays empty, so no \
+         cross-DC copy can be addressed\n=== log tail ===\n{seen}",
+        node.host_id
+    );
+}
+
+/// Connect, showing the node's own log if CQL refuses the handshake — otherwise
+/// a refused STARTUP is a bare error string with no way to see why.
+async fn connect_or_dump(node: &Node) -> CqlClient {
+    match CqlClient::connect(format!("127.0.0.1:{}", node.ports.cql).parse().unwrap()).await {
+        Ok(client) => client,
+        Err(e) => panic!(
+            "CQL handshake with node {} (dc {}, port {}) failed: {e}\n=== log tail ===\n{}",
+            node.host_id,
+            node.dc,
+            node.ports.cql,
+            node.log_tail(60)
+        ),
+    }
+}
+
+/// Does `node` have `keyspace` in its own schema right now?
+async fn has_keyspace(node: &Node, keyspace: &str) -> bool {
+    let mut client = connect_or_dump(node).await;
+    let result = client
+        .query("SELECT keyspace_name FROM system_schema.keyspaces")
+        .await
+        .expect("system_schema.keyspaces");
+    result
+        .rows
+        .iter()
+        .any(|row| text(row, &result.column_names, "keyspace_name").as_deref() == Some(keyspace))
+}
+
+/// The acceptance proof for the cross-DC relay: a keyspace created through CQL on
+/// a node in `us-west-2` must appear on the nodes of `eu-west-1`.
+///
+/// PINNED RED — the topology it needs is not expressible with two processes, and
+/// the reason is a property of the deployment declaration rather than of the
+/// relay:
+///
+/// - A node accepts native-protocol connections only when its *local* Raft
+///   group's voter count reaches `FERROSA_EXPECTED_CLUSTER_SIZE`
+///   (`ModeController::accepts_cql_connections` → `declared_topology_is_ready`).
+///   Raft groups are per-DC, so EVERY DC must carry `expected_cluster_size`
+///   voters: the smallest two-DC cluster in which both DCs answer CQL is
+///   `2 x expected` nodes — six, at the default of three (CL-76).
+/// - Two nodes are the pair path by design (`declared_topology_is_ready` maps
+///   `expected == 2` to Pair + Primary), which is a different replication model,
+///   and a node declared `expected == 1` leaves Standalone the moment it meets a
+///   peer. Verified against two live processes: the west node logged
+///   `mode transition: -> pair` (west, `expected=1`) and `reverse connection
+///   established`.
+///
+/// So the test is written for six real processes — three voters in each DC — and
+/// is `#[ignore]`d until that is run (locally, or on the two-region fly deployment
+/// where it belongs). It has NOT been executed; the relay beneath it HAS: one copy
+/// per remote DC on real three-voter groups (ferrosa-cluster/tests/
+/// cross_dc_ddl_relay.rs), plus the runtime registry and the DDL-path seam in unit
+/// tests. What remains unproven is the end-to-end path across two live processes'
+/// handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ddl_created_in_one_dc_reaches_the_other() {
+    const VOTERS_PER_DC: usize = 3;
+    let cluster_name = format!("dc-relay-{}", std::process::id());
+    let mut alloc = PortAllocator::new();
+    let ports: Vec<Ports> = (0..VOTERS_PER_DC * 2)
+        .map(|_| alloc_ports(&mut alloc))
+        .collect();
+    let seed_hub = format!("127.0.0.1:{}", ports[0].internode);
+
+    // Distinct host ids in both halves: Raft's `uuid_to_node_id` reads bytes[8..16]
+    // and Accord reads bytes[0..8].
+    let host_id = |n: u8| {
+        // A small multiplier on purpose: `0x11 * n` stays inside a `u8` for the
+        // six nodes this test runs. A larger base (0x33) overflows at n = 6 —
+        // which is how this test failed the first time it was ever RUN, having
+        // been pinned `#[ignore]`d while the topology it needed was unavailable.
+        let d = 0x11u8 * n;
+        format!(
+            "{d:02x}{d:02x}{d:02x}{d:02x}-{d:02x}{d:02x}-{d:02x}{d:02x}-\
+             {d:02x}{d:02x}-{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}{d:02x}"
+        )
+    };
+
+    let mut nodes = Vec::new();
+    for (index, ports) in ports.into_iter().enumerate() {
+        let (dc, rack) = if index < VOTERS_PER_DC {
+            (DC_WEST, "rack-west-a")
+        } else {
+            (DC_EAST, "rack-east-a")
+        };
+        nodes.push(spawn_node(NodeSpec {
+            dir: tempfile::tempdir().unwrap(),
+            ports,
+            host_id: host_id(index as u8 + 1),
+            cluster_name: &cluster_name,
+            seed: if index == 0 { None } else { Some(&seed_hub) },
+            dc,
+            rack,
+            expected_cluster_size: VOTERS_PER_DC,
+        }));
+    }
+    let (west_nodes, east_nodes) = nodes.split_at(VOTERS_PER_DC);
+
+    for node in &nodes {
+        wait_ready(node, Duration::from_secs(120));
+        assert!(
+            !node.log_tail(400).contains("Address already in use"),
+            "node {} hit a port collision:\n{}",
+            node.host_id,
+            node.log_tail(30)
+        );
+    }
+
+    // The relay targets a DC this node has met.
+    wait_for_announced_peer(&west_nodes[0], DC_EAST, Duration::from_secs(60));
+
+    let keyspace = format!("relay_probe_{}", std::process::id());
+    let mut west_client = connect_or_dump(&west_nodes[0]).await;
+    west_client
+        .query(&format!(
+            "CREATE KEYSPACE {keyspace} WITH replication = \
+             {{'class': 'SimpleStrategy', 'replication_factor': 1}}"
+        ))
+        .await
+        .unwrap_or_else(|e| {
+            panic!(
+                "the local DDL must commit in its own DC: {e}\n=== west log ===\n{}",
+                west_nodes[0].log_tail(40)
+            )
+        });
+
+    // It must be in every node of the DC that committed it. The client's CREATE
+    // returning means the local group committed it; a FOLLOWER applies the schema
+    // from the replicated log asynchronously, so this is a bounded convergence check
+    // rather than an instantaneous one. The bound is what makes it a test: a lag that
+    // keeps growing is a real defect, so how long it took is reported.
+    let local_deadline = Instant::now() + Duration::from_secs(20);
+    let local_start = Instant::now();
+    let mut last_missing: Option<String> = None;
+    loop {
+        let mut missing = None;
+        for node in west_nodes {
+            if !has_keyspace(node, &keyspace).await {
+                missing = Some(node);
+                break;
+            }
+        }
+        match missing {
+            None => break,
+            Some(node) => {
+                if Instant::now() >= local_deadline {
+                    panic!(
+                        "the DDL never reached node {} in the DC that committed it after {:?}\n=== log ===\n{}",
+                        node.host_id,
+                        local_start.elapsed(),
+                        node.log_tail(40)
+                    );
+                }
+                last_missing = Some(node.host_id.to_string());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    let local_lag = local_start.elapsed();
+    assert!(
+        local_lag < Duration::from_secs(5),
+        "the DDL took {local_lag:?} to become visible in its own DC (last missing: {last_missing:?}) \
+         — convergence that slow is a regression, not scheduling noise"
+    );
+
+    // And it must arrive in the other DC, delivered by that DC's own group.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let mut missing = Vec::new();
+        for node in east_nodes {
+            if !has_keyspace(node, &keyspace).await {
+                missing.push(node.host_id.clone());
+            }
+        }
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the keyspace never reached {DC_EAST} (missing on {missing:?}): the cross-DC copy did \
+             not arrive\n=== west log (sender) ===\n{}\n=== east log (receiver) ===\n{}",
+            west_nodes[0].log_tail(45),
+            east_nodes[0].log_tail(45)
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 }

@@ -228,6 +228,10 @@ impl ModeController {
                     internode_broadcast,
                 } => {
                     tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
+                    // CL-76: this peer's arrival may be what COMPLETES this DC's declared
+                    // membership, at which point its seed initialises the group (it could
+                    // not claim the role earlier without forming a one-voter group).
+                    self.initialise_local_group_if_complete(all_peers_after_track);
                     if self.trigger_cluster_join(host_id, addr, cql_broadcast, internode_broadcast)
                     {
                         join_enqueued_invite = Some(host_id);
@@ -452,10 +456,63 @@ impl PeerEventListener for ModeController {
         }
         tracing::info!(peer = %host_id, %addr, "peer connected");
 
+        // Bridge the peer's announced data center into the controller's own
+        // map. For an OUTBOUND connection `PeerManager::install_pool` has
+        // already stored the handshake's advertised topology (its
+        // `store_broadcasts` runs before this callback), so this is a
+        // non-blocking read of a value that is already there — but nothing
+        // copied it into `peer_dcs`, and the leader dials its peers outbound
+        // after ClusterInvite. Without this bridge the peers the leader itself
+        // dialled stayed unclassified and `partition_peers_by_dc` treated them
+        // as local (the bug): LOCAL_* quorum counting counted remote-DC
+        // replicas, and ring build re-authored them under OUR dc.
+        //
+        // Deliberate choice: a SYNC peer-manager read. This callback cannot
+        // await, and `peer_dcs` is a `std::sync::Mutex` map, so the pair
+        // `get_peer_data_center_sync` (try_read) → `record_peer_dc` is the
+        // only option that neither blocks nor spawns. It allocates one String
+        // per connection establishment — the same discipline `on_inbound_peer`
+        // already uses — not per message, so the handshake hot path is
+        // untouched. `get_peer_data_center_sync` returns None on lock
+        // contention; that only leaves the peer classified as local, the same
+        // safe single-DC fallback the rolling-upgrade path takes, and the
+        // inbound callback remains the authority for a peer learned that way.
+        //
+        // Recorded BEFORE the transition guard below, so an outbound
+        // connection that triggers `transition_to_cluster` cannot race a
+        // snapshot of an empty map.
+        let announced_dc = match &**self.peer_manager.load() {
+            Some(pm) => pm.get_peer_data_center_sync(host_id),
+            None => None,
+        };
+        if let Some(dc) = announced_dc {
+            if !dc.trim().is_empty() {
+                self.record_peer_dc(host_id, dc);
+            }
+        }
+        // The rack half of the same bridge, off the same already-stored
+        // handshake value: recording only the DC would let `peer_topology`
+        // pair this peer's remote DC with OUR rack.
+        let announced_rack = match &**self.peer_manager.load() {
+            Some(pm) => pm.get_peer_rack_sync(host_id),
+            None => None,
+        };
+        if let Some(rack) = announced_rack {
+            if !rack.trim().is_empty() {
+                self.record_peer_rack(host_id, rack);
+            }
+        }
+
         // Track this peer
         {
-            let mut peers = self.connected_peers.lock();
-            track_connected_peer(&mut peers, host_id, addr, super::MAX_CONNECTED_PEERS);
+            // R-C-U: the tracked set is republished whole, so a reader (a mode
+            // transition, a peer plan, the DC registry) never takes a lock and
+            // never sees a half-updated list.
+            self.connected_peers.rcu(|current| {
+                let mut next = (**current).clone();
+                track_connected_peer(&mut next, host_id, addr, super::MAX_CONNECTED_PEERS);
+                next
+            });
         }
 
         // Register this peer's host_id in the raft network factory's node_map so
@@ -472,7 +529,7 @@ impl PeerEventListener for ModeController {
         let guard_start = std::time::Instant::now();
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        let all_peers = self.connected_peers.lock().clone();
+        let all_peers = self.connected_peers.load_full();
         let (cql_broadcast, internode_broadcast) =
             if matches!(current_mode, DeploymentMode::Cluster) {
                 let pm = self.peer_manager.load();
@@ -489,7 +546,7 @@ impl PeerEventListener for ModeController {
             host_id,
             addr,
             inbound: false,
-            connected_peers_after_track: all_peers.clone(),
+            connected_peers_after_track: (*all_peers).clone(),
             committed_cluster_size: self
                 .committed_cluster_size
                 .load(std::sync::atomic::Ordering::Relaxed),
@@ -514,8 +571,11 @@ impl PeerEventListener for ModeController {
 
         // Remove from tracked peers
         {
-            let mut peers = self.connected_peers.lock();
-            peers.retain(|(id, _)| *id != host_id);
+            self.connected_peers.rcu(|current| {
+                let mut next = (**current).clone();
+                next.retain(|(id, _)| *id != host_id);
+                next
+            });
         }
 
         // Hold the transition guard to prevent a disconnect handler from racing
@@ -530,7 +590,7 @@ impl PeerEventListener for ModeController {
                 // Check if remaining connected peers can form a quorum.
                 // Use committed cluster size (not dynamic connected count)
                 // to prevent premature quorum claims after partitions.
-                let connected = self.connected_peers.lock().len();
+                let connected = self.connected_peers.load().len();
                 let committed = self
                     .committed_cluster_size
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -591,6 +651,8 @@ impl InboundPeerCallback for ModeController {
         cql_broadcast: Option<String>,
         internode_broadcast: Option<String>,
         capabilities: u32,
+        data_center: Option<String>,
+        rack: Option<String>,
     ) {
         let (host_id, addr) = peer_id;
         if host_id == self.local_host_id {
@@ -609,9 +671,50 @@ impl InboundPeerCallback for ModeController {
             self.net_config.bind_addr.port(),
             internode_broadcast.as_deref(),
         );
-        tracing::info!(peer = %host_id, %addr, ?cql_broadcast, ?internode_broadcast, "inbound peer connected");
+        tracing::info!(
+            peer = %host_id,
+            %addr,
+            ?cql_broadcast,
+            ?internode_broadcast,
+            ?data_center,
+            ?rack,
+            "inbound peer connected"
+        );
 
-        // Register the peer here too, not only in `on_peer_connected`.
+        // Record the peer's announced data center BEFORE anything can build
+        // topology from it. `transition_to_cluster` (cluster.rs) reads
+        // `peer_dcs_snapshot()` synchronously, and for an inbound connection
+        // this callback is the only place the announcement arrives — the
+        // outbound path learns it in `PeerManager::add_peer`. Without this,
+        // every peer stays unclassified and `partition_peers_by_dc` treats it
+        // as local (the bug): LOCAL_* quorum counting then includes remote-DC
+        // replicas and DC-aware placement stamps peers with OUR DC.
+        //
+        // Must happen before the `transition_guard` is taken below, so a
+        // concurrent cluster transition cannot snapshot an empty map.
+        if let Some(ref dc) = data_center {
+            self.record_peer_dc(host_id, dc.clone());
+            // Mirror into PeerManager so system.peers/peers_v2 report the
+            // peer's own DC. try_write: this callback cannot await (see
+            // `set_peer_data_center_sync`); the controller map above is the
+            // authority for placement either way.
+            if !dc.trim().is_empty() {
+                if let Some(pm) = &**self.peer_manager.load() {
+                    pm.set_peer_data_center_sync(host_id, dc.clone());
+                }
+            }
+        }
+        // Same recording for the rack half of the announced topology, in the
+        // same place and under the same non-empty guard: every producer authors
+        // a peer's `NodeInfo` from `peer_topology(.., peer_dcs, peer_racks, ..)`,
+        // so recording only the DC would pair a remote DC with OUR rack.
+        if let Some(ref rack_name) = rack {
+            if !rack_name.trim().is_empty() {
+                self.record_peer_rack(host_id, rack_name.clone());
+            }
+        }
+
+        // Register this peer here too, not only in `on_peer_connected`.
         //
         // Which handler runs is decided by who dialled whom, and that has
         // nothing to do with whether the leader needs to route Raft RPCs to
@@ -693,18 +796,16 @@ impl InboundPeerCallback for ModeController {
 
         // Track this peer
         {
-            let mut peers = self.connected_peers.lock();
-            track_connected_peer(
-                &mut peers,
-                host_id,
-                reverse_addr,
-                super::MAX_CONNECTED_PEERS,
-            );
+            self.connected_peers.rcu(|current| {
+                let mut next = (**current).clone();
+                track_connected_peer(&mut next, host_id, reverse_addr, super::MAX_CONNECTED_PEERS);
+                next
+            });
         }
 
         let _guard = self.transition_guard.lock();
         let current_mode = **self.mode.load();
-        let all_peers = self.connected_peers.lock().clone();
+        let all_peers = self.connected_peers.load_full();
         let plan = peer_plan::plan_peer_connected(PeerConnectPlanInput {
             mode: current_mode,
             host_id,
@@ -715,7 +816,7 @@ impl InboundPeerCallback for ModeController {
             // distinct ports (t_7c01df7e).
             addr: reverse_addr,
             inbound: true,
-            connected_peers_after_track: all_peers.clone(),
+            connected_peers_after_track: (*all_peers).clone(),
             committed_cluster_size: self
                 .committed_cluster_size
                 .load(std::sync::atomic::Ordering::Relaxed),

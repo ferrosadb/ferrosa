@@ -364,6 +364,28 @@ pub(super) fn plan_invite_initiator_addr(
 
 use super::{ClusterStateHolder, ModeController};
 
+/// May this node claim the seed role — the right to call `raft.initialize()` — for
+/// its own data center?
+///
+/// CL-76: `is_highest_uuid` alone is NOT sufficient. The comparison is "self +
+/// peers", so a node that knows no peer of its OWN DC finds itself the highest UUID
+/// in a set of one and initialises a ONE-VOTER group. A DC whose nodes each do that
+/// ends up with one group per node, none of which can ever reach
+/// `expected_cluster_size`, and the DC never accepts clients.
+///
+/// The role is claimable only from a COMPLETE membership for that DC (self + the
+/// same-DC peers this node knows) — except when no size was declared, where a lone
+/// node is a single-node cluster and must still initialise itself.
+pub(super) fn should_claim_seed_role(
+    expected_cluster_size: usize,
+    local_peer_count: usize,
+    is_highest_uuid: bool,
+) -> bool {
+    let topology_is_complete =
+        expected_cluster_size == 0 || local_peer_count + 1 >= expected_cluster_size;
+    topology_is_complete && is_highest_uuid
+}
+
 pub(super) fn should_initialize_seed_membership(
     was_seed: bool,
     has_recovered_membership: bool,
@@ -695,6 +717,86 @@ pub fn raft_log_dir_for_dc(base: &std::path::Path, dc_name: &str) -> std::path::
     base.join(dc_name)
 }
 
+/// Resolve the DC to commit for a peer in this node's topology.
+///
+/// The announced DC is the authority: a peer that told us it lives in `dc2`
+/// must never be recorded under OUR DC. Peers that announced nothing (an
+/// older peer mid-rolling-upgrade, or none configured) fall back to the local
+/// DC — the behaviour before DC advertisement existed, so classifying them
+/// cannot change an existing single-DC cluster.
+///
+/// This is deliberately the same rule [`partition_peers_by_dc`] applies, so a
+/// peer's ring entry and its voter classification cannot disagree.
+pub fn dc_for_peer(
+    host_id: uuid::Uuid,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+) -> String {
+    match peer_dcs.get(&host_id) {
+        Some(dc) if !dc.trim().is_empty() => dc.clone(),
+        _ => local_dc.to_string(),
+    }
+}
+
+/// Resolved (data_center, rack) for a peer, as committed into topology.
+pub type PeerTopology = (String, String);
+
+/// Resolve the `(dc, rack)` to commit for a peer.
+///
+/// The peer's announced values win and absent ones fall back to the local
+/// node's — the single rule every producer (initial ring, recovered-topology
+/// refresh, seed join, membership admission) shares, so no two sites can
+/// disagree and no peer is ever recorded under another node's topology.
+pub fn peer_topology(
+    host_id: uuid::Uuid,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
+    local_dc: &str,
+    local_rack: &str,
+) -> PeerTopology {
+    let dc = dc_for_peer(host_id, peer_dcs, local_dc);
+    let rack = match peer_racks.get(&host_id) {
+        Some(rack) if !rack.trim().is_empty() => rack.clone(),
+        _ => local_rack.to_string(),
+    };
+    (dc, rack)
+}
+
+/// The `NodeInfo` the seed commits for one peer it is admitting
+/// (`transition_to_cluster`'s seed-join loop, after leader election).
+///
+/// Split out of that loop for the same reason
+/// [`build_recovered_topology_refresh_plan`] is a free function: the loop only
+/// runs after a real `raft.initialize()` + leader election across a live
+/// multi-node cluster, so the rule it applies — a peer is committed under THE
+/// PEER's announced dc/rack — is not otherwise reachable from a test.
+///
+/// It resolves both halves through [`peer_topology`], the single rule the ring
+/// build and the recovered-topology refresh also use, so a peer's committed
+/// membership and its ring entry cannot disagree.
+pub(super) fn seed_join_node_info(
+    peer_uuid: uuid::Uuid,
+    addr: SocketAddr,
+    peer_internode_broadcast: Option<&str>,
+    peer_cql_broadcast: Option<String>,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
+    // The local node's own (data_center, rack) - the fallback for a peer that
+    // announced neither. Grouped as a tuple so the parameter list stays cohesive.
+    local_topology: (&str, &str),
+) -> crate::raft::NodeInfo {
+    let (local_dc, local_rack) = local_topology;
+    let (data_center, rack) = peer_topology(peer_uuid, peer_dcs, peer_racks, local_dc, local_rack);
+    crate::raft::NodeInfo {
+        host_id: peer_uuid,
+        addr: super::membership::node_info_addr(addr, peer_internode_broadcast),
+        data_center,
+        rack,
+        state: crate::raft::NodeState::Normal,
+        cql_broadcast: peer_cql_broadcast,
+    }
+}
+
 /// W6.3: partition a `(host_id, addr)` peer list by DC, given a lookup
 /// table from `host_id` to DC name. Peers not present in `dcs` default
 /// to `local_dc` — this preserves single-DC behavior when no per-peer
@@ -719,14 +821,11 @@ pub fn partition_peers_by_dc(
     let mut others: std::collections::BTreeMap<String, Vec<(uuid::Uuid, SocketAddr)>> =
         std::collections::BTreeMap::new();
     for (uuid, addr) in peers {
-        let dc = dcs.get(uuid).map(String::as_str).unwrap_or(local_dc);
+        let dc = dc_for_peer(*uuid, dcs, local_dc);
         if dc == local_dc {
             local.push((*uuid, *addr));
         } else {
-            others
-                .entry(dc.to_string())
-                .or_default()
-                .push((*uuid, *addr));
+            others.entry(dc).or_default().push((*uuid, *addr));
         }
     }
     (local, others)
@@ -742,6 +841,8 @@ pub(super) fn build_recovered_topology_refresh_plan(
     peers: &[(uuid::Uuid, SocketAddr)],
     peer_cql_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
     peer_internode_broadcasts: &std::collections::HashMap<uuid::Uuid, Option<String>>,
+    peer_dcs: &std::collections::HashMap<uuid::Uuid, String>,
+    peer_racks: &std::collections::HashMap<uuid::Uuid, String>,
 ) -> Vec<crate::raft::NodeInfo> {
     let mut plan = Vec::with_capacity(peers.len() + 1);
     plan.push(crate::raft::NodeInfo {
@@ -758,11 +859,16 @@ pub(super) fn build_recovered_topology_refresh_plan(
         let peer_internode_broadcast = peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
         let node_addr =
             super::membership::node_info_addr(*addr, peer_internode_broadcast.as_deref());
+        // The refresh commits THE PEER's DC/rack. Re-authoring it under our own
+        // would silently undo every correct ring entry on the first leader
+        // restart with recovered topology, re-enabling the LOCAL_QUORUM bug.
+        let (peer_dc, peer_rack) =
+            peer_topology(*peer_uuid, peer_dcs, peer_racks, data_center, rack);
         plan.push(crate::raft::NodeInfo {
             host_id: *peer_uuid,
             addr: node_addr,
-            data_center: data_center.to_string(),
-            rack: rack.to_string(),
+            data_center: peer_dc,
+            rack: peer_rack,
             state: crate::raft::NodeState::Normal,
             cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
         });
@@ -858,7 +964,7 @@ impl ModeController {
             return;
         };
         let local_host_id = self.local_host_id;
-        let connected_peers = self.connected_peers.lock().clone();
+        let connected_peers = self.connected_peers.load_full();
         let Some(plan) =
             super::invite::plan_reconnect_invite(super::invite::ReconnectInvitePlanInput {
                 local_host_id,
@@ -996,6 +1102,118 @@ impl ModeController {
         self.transition_to_cluster(peers);
     }
 
+    /// Initialise this DC's Raft group once its declared membership is complete and
+    /// this node is that DC's seed.
+    ///
+    /// CL-76: the peer that COMPLETES a DC's membership usually arrives after this node
+    /// entered cluster mode — and at the earlier point the node knew no same-DC peer, so
+    /// it correctly did not claim the seed role (see `should_claim_seed_role`) and no
+    /// group was initialised. Without this, nobody in such a DC ever calls
+    /// `raft.initialize`, and the DC waits for a leader that will never be elected.
+    ///
+    /// Deliberately does NOT re-enter [`Self::transition_to_cluster`]: that path gates the
+    /// initialise on `should_initialize_seed_membership`, whose `has_recovered_topology_state`
+    /// term is already true for a node that has transitioned once, so a second transition
+    /// can never initialise (measured on the six-process test: 15 transitions, zero
+    /// `raft.initialize` calls). It initialises the group that ALREADY EXISTS instead, and
+    /// claims the attempt once by CAS so a burst of peer events cannot churn formation.
+    ///
+    /// Idempotent: a group with any voter is left alone, and the ordinary path owns it
+    /// from then on.
+    pub(super) fn initialise_local_group_if_complete(
+        &self,
+        peers: &[(Uuid, std::net::SocketAddr)],
+    ) {
+        let mode_ok = matches!(self.mode(), DeploymentMode::Cluster);
+        let raft = self.raft();
+        let voters = raft.as_ref().map(|r| {
+            r.metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count()
+        });
+        tracing::debug!(
+            mode = ?self.mode(),
+            mode_ok,
+            has_raft = raft.is_some(),
+            voters = ?voters,
+            "CL-76: late-initialise entry"
+        );
+        if !mode_ok {
+            return;
+        }
+        let Some(raft) = raft else {
+            return;
+        };
+        if voters.unwrap_or(0) > 0 {
+            return;
+        }
+        let local_dc = self.config.data_center.clone();
+        let peer_dcs = self.peer_dcs_snapshot();
+        let (local_peers, _) = partition_peers_by_dc(peers, &peer_dcs, &local_dc);
+        let is_highest = local_peers
+            .iter()
+            .map(|(id, _)| *id)
+            .chain(std::iter::once(self.local_host_id))
+            .max()
+            == Some(self.local_host_id);
+        let claimable = should_claim_seed_role(
+            self.config.expected_cluster_size,
+            local_peers.len(),
+            is_highest,
+        );
+        tracing::debug!(
+            local_dc = %local_dc,
+            connected = peers.len(),
+            local_peers = local_peers.len(),
+            is_highest,
+            expected = self.config.expected_cluster_size,
+            claimable,
+            "CL-76: late-initialise check"
+        );
+        if !claimable {
+            return;
+        }
+        // Lock-free single-claim: at most one initialise in flight, no mutex on the
+        // peer-event path.
+        if self
+            .seed_initialisation_claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let members = build_initial_raft_members(
+            self.local_host_id,
+            self.net_config.broadcast_addr,
+            &local_peers,
+        );
+        tracing::info!(
+            local_dc = %local_dc,
+            members = members.len(),
+            "CL-76: this DC's declared membership is complete and this node is its seed \
+             — initialising the group now"
+        );
+        let claim = self.seed_initialisation_claimed.clone();
+        self.spawn_tracked(async move {
+            if let Err(e) = raft.initialize(members).await {
+                tracing::warn!(
+                    %e,
+                    "CL-76: late raft.initialize failed — releasing the claim so a later \
+                     peer event can retry (an 'already initialised' error is benign)"
+                );
+                claim.store(false, std::sync::atomic::Ordering::Release);
+            }
+        });
+    }
+
     /// 4. TokenRing with deterministic initial token assignment
     /// 5. ClusterCoordinator for replica-aware writes
     /// 6. Swaps write path, DDL path, and cluster state atomically
@@ -1118,6 +1336,7 @@ impl ModeController {
                 )
             })
             .collect();
+        let peer_racks = self.peer_racks_snapshot();
 
         // Determine whether this node is the seed (responsible for calling
         // raft.initialize()). The seed is the node with the highest UUID among
@@ -1128,7 +1347,23 @@ impl ModeController {
         let mut all_member_uuids: Vec<uuid::Uuid> = peers.iter().map(|(id, _)| *id).collect();
         all_member_uuids.push(self.local_host_id);
         let max_uuid = all_member_uuids.iter().max().copied().unwrap_or_default();
-        let was_seed = self.local_host_id == max_uuid;
+        // CL-76: `max({self}) == self` is vacuously true, so the role is claimed only
+        // from a COMPLETE membership for this DC — see `should_claim_seed_role`.
+        let was_seed = should_claim_seed_role(
+            self.config.expected_cluster_size,
+            peers.len(),
+            self.local_host_id == max_uuid,
+        );
+        if !was_seed && self.local_host_id == max_uuid {
+            tracing::info!(
+                local_dc = %self.config.data_center,
+                local_peers = peers.len(),
+                expected = self.config.expected_cluster_size,
+                "CL-76: this node is the highest UUID but its DC's membership is not \
+                 complete here yet; not claiming the seed role (a later peer event \
+                 initialises the group once it is)"
+            );
+        }
 
         // Flush all memtables to SSTables before the write path switches to the
         // ClusterCoordinator. Data written in standalone/pair mode lives only in
@@ -1454,10 +1689,28 @@ impl ModeController {
             );
 
             // Add peers
+            // Each peer's ring entry carries THE PEER's announced DC/rack, not
+            // ours — a peer in dc2 recorded under our dc1 would make LOCAL_*
+            // quorum counting (and NTS placement) treat a remote replica as
+            // local. Peers that announced nothing fall back to the local DC
+            // via `dc_for_peer`, preserving single-DC behaviour for a peer
+            // that is still on the old version.
+            //
+            // Both halves come from the controller's own maps through the one
+            // shared rule, so this entry cannot mix our DC with the peer's rack
+            // (or vice versa) and cannot disagree with the recovered-topology
+            // refresh or the seed-authored `JoinNode` for the same peer.
             for (peer_uuid, addr) in &peers {
                 let peer_node_id = uuid_to_node_id(*peer_uuid);
                 let peer_internode_broadcast =
                     peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
+                let (peer_dc, peer_rack) = super::cluster::peer_topology(
+                    *peer_uuid,
+                    &peer_dc_map,
+                    &peer_racks,
+                    &local_dc,
+                    &self.config.rack,
+                );
                 ring.add_node(
                     peer_node_id,
                     NodeInfo {
@@ -1466,8 +1719,8 @@ impl ModeController {
                             *addr,
                             peer_internode_broadcast.as_deref(),
                         ),
-                        data_center: self.config.data_center.clone(),
-                        rack: self.config.rack.clone(),
+                        data_center: peer_dc,
+                        rack: peer_rack,
                         state: NodeState::Normal,
                         cql_broadcast: peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
                     },
@@ -1615,6 +1868,11 @@ impl ModeController {
         // must not block the PeerEventListener callback.
         let raft_groups_swap = self.raft_groups.clone();
         let local_raft_group_id = crate::raft::RaftGroupId::for_dc(&self.config.data_center);
+        // CL-76: handles the election loop needs to notice a completed DC membership
+        // without touching the controller (which this spawned task cannot borrow).
+        let connected_peers_for_init = self.connected_peers.clone();
+        let peer_dcs_for_init = self.peer_dcs.clone();
+        let seed_claim_for_init = self.seed_initialisation_claimed.clone();
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
         let registry = self.registry.clone();
@@ -2093,6 +2351,8 @@ impl ModeController {
 
         let bootstrap_complete_counter = bootstrap_complete_count;
         let consensus_health = self.consensus_health();
+        // Taken here, not inside the task: the task must not borrow `self`.
+        let ddl_relay = self.relay_handle();
         self.spawn_tracked(async move {
             // Deliver ClusterInvite to all peers BEFORE starting Raft.
             // This ensures peers transition to cluster mode and register
@@ -2483,6 +2743,64 @@ impl ModeController {
             let mut leader = None;
             let mut attempt: u32 = 0;
             loop {
+                // CL-76: this node entered cluster mode knowing fewer peers than its
+                // DC declares, so it correctly did not claim the seed role and NO group
+                // was initialised. The peer that completes the membership usually
+                // arrives while we are here — and the group handle exists only in this
+                // task (measured: on the seed of a late-forming DC, a peer-event
+                // callback sees `raft()` as `None` 84 times out of 84, because this
+                // task has not published the group yet). So the late initialise belongs
+                // in this loop: lock-free reads of the published peer state, then a CAS
+                // claim so it happens at most once.
+                if !seed_claim_for_init.load(std::sync::atomic::Ordering::Acquire) {
+                    let connected = connected_peers_for_init.load_full();
+                    let dcs = peer_dcs_for_init.load_full();
+                    let (local_peers, _) = partition_peers_by_dc(
+                        connected.as_slice(),
+                        &dcs,
+                        &config_for_promotion.data_center,
+                    );
+                    let is_highest = local_peers
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(std::iter::once(local_host_id_for_refresh))
+                        .max()
+                        == Some(local_host_id_for_refresh);
+                    if should_claim_seed_role(
+                        config_for_promotion.expected_cluster_size,
+                        local_peers.len(),
+                        is_highest,
+                    ) && seed_claim_for_init
+                        .compare_exchange(
+                            false,
+                            true,
+                            std::sync::atomic::Ordering::AcqRel,
+                            std::sync::atomic::Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        let members_now = build_initial_raft_members(
+                            local_host_id_for_refresh,
+                            local_raft_addr_for_init,
+                            &local_peers,
+                        );
+                        tracing::info!(
+                            local_dc = %config_for_promotion.data_center,
+                            members = members_now.len(),
+                            "CL-76: this DC's membership completed while waiting for a \
+                             leader — initialising the group now"
+                        );
+                        if let Err(e) = raft_arc.initialize(members_now).await {
+                            tracing::warn!(
+                                %e,
+                                "CL-76: late raft.initialize failed — releasing the claim \
+                                 so a later iteration can retry"
+                            );
+                            seed_claim_for_init
+                                .store(false, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                }
                 if let Some(lid) = raft_arc.current_leader().await {
                     leader = Some(lid);
                     break;
@@ -2512,6 +2830,8 @@ impl ModeController {
                             &peers,
                             &peer_cql_broadcasts,
                             &peer_internode_broadcasts,
+                            &peer_dc_map,
+                            &peer_racks,
                         );
                         let desired_raft_members = build_raft_members_from_node_info(&refresh_plan);
                         let raft_for_membership_repair = raft_arc.clone();
@@ -2576,6 +2896,8 @@ impl ModeController {
                             &peers,
                             &peer_cql_broadcasts,
                             &peer_internode_broadcasts,
+                            &peer_dc_map,
+                            &peer_racks,
                         );
                         let token_repair_plan = build_recovered_topology_token_repair_plan(
                             &refresh_plan,
@@ -2676,20 +2998,18 @@ impl ModeController {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
                             let peer_internode_broadcast =
                                 peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
-                            let node_info = crate::raft::NodeInfo {
-                                host_id: *peer_uuid,
-                                addr: super::membership::node_info_addr(
-                                    *addr,
-                                    peer_internode_broadcast.as_deref(),
+                            let node_info = seed_join_node_info(
+                                *peer_uuid,
+                                *addr,
+                                peer_internode_broadcast.as_deref(),
+                                peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
+                                &peer_dc_map,
+                                &peer_racks,
+                                (
+                                    &config_for_promotion.data_center,
+                                    &config_for_promotion.rack,
                                 ),
-                                data_center: config_for_promotion.data_center.clone(),
-                                rack: config_for_promotion.rack.clone(),
-                                state: crate::raft::NodeState::Normal,
-                                cql_broadcast: peer_cql_broadcasts
-                                    .get(peer_uuid)
-                                    .cloned()
-                                    .flatten(),
-                            };
+                            );
                             let join_cmd = crate::raft::RaftCommand {
                                 op: crate::raft::RaftOp::JoinNode(node_info),
                                 schema_version: Uuid::new_v4(),
@@ -2743,6 +3063,9 @@ impl ModeController {
                         raft: raft_arc.clone(),
                         peer_manager: peer_manager_for_ddl,
                         node_map: node_map_for_ddl,
+                        // A DDL committed into this DC is relayed to the other
+                        // DCs — one copy each — by the controller's relay.
+                        relay: ddl_relay.clone(),
                     }));
 
 
@@ -2752,7 +3075,7 @@ impl ModeController {
                         let raft_for_drain = raft_arc.clone();
                         let replayed = drain_ddl_queue(rx, |op| {
                             let raft = raft_for_drain.clone();
-                            async move { execute_via_raft(&raft, op).await.map(|_| ()) }
+                            async move { execute_via_raft(&raft, &op).await.map(|_| ()) }
                         })
                         .await;
                         if replayed > 0 {

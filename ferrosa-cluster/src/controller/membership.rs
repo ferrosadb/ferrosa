@@ -11,6 +11,7 @@ use crate::error::{ClusterError, Result};
 use crate::raft::{uuid_to_node_id, NodeInfo, NodeState, RaftCommand, RaftOp};
 use crate::ring::TokenRing;
 
+use super::cluster::peer_topology;
 use super::token::generate_deterministic_token;
 use super::ModeController;
 
@@ -136,11 +137,26 @@ impl ModeController {
             .collect();
 
         // 5. Propose JoinNode via Raft.
+        //
+        // The committed entry must carry THE PEER's announced dc/rack, never
+        // ours: this node authors the joiner's identity, so stamping it with
+        // the local topology would record a remote-DC node as a local-DC
+        // replica in every follower's `state.members` / ring, and LOCAL_*
+        // quorums would then count it as local. A peer that announced nothing
+        // (an older peer mid-rolling-upgrade) still falls back to the local
+        // topology, which is the behaviour before DC advertisement existed.
+        let (peer_dc, peer_rack) = peer_topology(
+            peer_host_id,
+            &self.peer_dcs_snapshot(),
+            &self.peer_racks_snapshot(),
+            &self.config.data_center,
+            &self.config.rack,
+        );
         let node_info = NodeInfo {
             host_id: peer_host_id,
             addr: String::new(), // will be filled by the connecting peer
-            data_center: self.config.data_center.clone(),
-            rack: self.config.rack.clone(),
+            data_center: peer_dc,
+            rack: peer_rack,
             state: NodeState::Normal,
             cql_broadcast: None,
         };
@@ -262,6 +278,27 @@ impl ModeController {
     /// `ClusterInvite` on every duplicate reconnect for an already-known live
     /// member; unbounded invite storms churn lanes and make LOCAL_QUORUM reads
     /// time out even while containers look healthy.
+    /// Is this node a VOTER in this node's own Raft group?
+    ///
+    /// The token ring records placement membership; only the Raft group's voter set
+    /// decides who participates in consensus. A peer can be in one and absent from the
+    /// other, and treating ring presence as proof of membership is what stopped the
+    /// promotion that reconciles them (CL-76).
+    /// `Some(true/false)` when this node owns a Raft group, `None` when it does not
+    /// (yet). `None` is NOT "not a voter": a node that has not published its group
+    /// cannot tell, and treating that as absence turned the duplicate-join guard into a
+    /// join loop for every ring member (two regression tests caught it).
+    fn local_group_voter_state(&self, peer_node_id: u64) -> Option<bool> {
+        self.raft().map(|raft| {
+            raft.metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|id| id == peer_node_id)
+        })
+    }
+
     pub(super) fn trigger_cluster_join(
         &self,
         host_id: Uuid,
@@ -285,8 +322,29 @@ impl ModeController {
             .and_then(|ring| ring.get_node(peer_node_id).cloned());
 
         if let Some(existing) = existing_member.as_ref() {
-            if !cluster_member_metadata_changed(existing, &desired_addr, cql_broadcast.as_deref())
-                && has_outbound_peer
+            // CL-76: an entry in the TOKEN RING is placement membership, not a vote.
+            // A same-DC peer that is in the ring but absent from our Raft group's voter
+            // set still has to be proposed: otherwise the leader never promotes it, the
+            // group can never reach `expected_cluster_size`, and a data center that
+            // formed from an incomplete peer set stays permanently unable to accept
+            // clients. This is the guard the debug logs name —
+            // "peer already present in token ring with current metadata, skipping join
+            // trigger" — firing on a peer that was in the ring and NOT a voter.
+            // Only an AUTHORITATIVE voter set may bypass the guard: a group that exists
+            // and does not contain the peer. No group, or the peer already a voter, keeps
+            // the ring guard exactly as it was.
+            if self.local_group_voter_state(peer_node_id) == Some(false) {
+                tracing::info!(
+                    peer = %host_id,
+                    node_id = peer_node_id,
+                    "peer is in the token ring but not a voter in this DC's Raft group: \
+                     proposing the join so the leader promotes it"
+                );
+            } else if !cluster_member_metadata_changed(
+                existing,
+                &desired_addr,
+                cql_broadcast.as_deref(),
+            ) && has_outbound_peer
             {
                 tracing::debug!(
                     peer = %host_id,

@@ -1,7 +1,7 @@
 use super::cluster::{
     build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
-    drain_ddl_queue, keyspace_needs_cluster_replay, should_initialize_seed_membership,
-    should_run_bootstrap_streaming,
+    drain_ddl_queue, keyspace_needs_cluster_replay, peer_topology, seed_join_node_info,
+    should_claim_seed_role, should_initialize_seed_membership, should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -230,7 +230,7 @@ async fn promote_from_degraded_pair_restores_writes() {
 
     // Enter pair mode via inbound connection. Lower host-id wins primary.
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0, None, None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(controller.role(), Some(PairRole::Primary));
 
@@ -279,7 +279,7 @@ async fn degraded_pair_serves_stale_reads() {
 
     // Enter pair mode
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0);
+    controller.on_inbound_peer((peer_id, peer_addr), None, None, 0, None, None);
     assert_eq!(controller.mode(), DeploymentMode::Pair);
 
     // Peer disconnects → DegradedPair
@@ -391,6 +391,8 @@ async fn pair_mode_reaches_an_inbound_peer_at_its_advertised_internode_address()
         None,
         Some("127.0.0.1:29000".into()),
         0,
+        None,
+        None,
     );
 
     assert_eq!(controller.mode(), DeploymentMode::Pair);
@@ -527,6 +529,8 @@ fn pair_formation_dials_the_advertised_address_on_any_co_located_layout() {
                 None,
                 Some(advertised.to_string()),
                 0,
+                None,
+                None,
             );
             assert_eq!(controller.mode(), DeploymentMode::Pair);
             assert_eq!(controller.dial_target(peer), Some(advertised));
@@ -658,10 +662,10 @@ fn connected_peers_tracked_and_cleared() {
     let peer_addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
     controller.on_peer_connected((peer_id, peer_addr));
 
-    assert_eq!(controller.connected_peers.lock().len(), 1);
+    assert_eq!(controller.connected_peers.load().len(), 1);
 
     controller.on_peer_disconnected((peer_id, peer_addr));
-    assert_eq!(controller.connected_peers.lock().len(), 0);
+    assert_eq!(controller.connected_peers.load().len(), 0);
 }
 
 /// Helper: create a ModeController in cluster mode with raft init spawned.
@@ -1471,6 +1475,10 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
     // refresh plan must commit that hostname, not the observed IP.
     let peer_internode_broadcasts =
         std::collections::HashMap::from([(peer_host_id, Some("peer-node:7000".to_string()))]);
+    // The peer announced its OWN dc/rack; the recovered plan must commit those,
+    // never the local node's.
+    let peer_dcs = std::collections::HashMap::from([(peer_host_id, "dc2".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer_host_id, "rack2".to_string())]);
 
     let plan = build_recovered_topology_refresh_plan(
         local_host_id,
@@ -1481,6 +1489,8 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
         &peers,
         &peer_cql_broadcasts,
         &peer_internode_broadcasts,
+        &peer_dcs,
+        &peer_racks,
     );
 
     assert_eq!(plan.len(), 2);
@@ -1494,6 +1504,15 @@ fn recovered_topology_refresh_plan_uses_current_live_addresses() {
         "recovered topology must commit the advertised internode hostname, not the observed IP"
     );
     assert_eq!(plan[1].cql_broadcast.as_deref(), Some("127.0.0.1:38043"));
+    assert_eq!(
+        plan[1].data_center, "dc2",
+        "the recovered plan must commit the PEER's announced DC, never the local node's"
+    );
+    assert_eq!(plan[1].rack, "rack2");
+    assert_eq!(
+        plan[0].data_center, "dc1",
+        "the local node keeps its own DC"
+    );
 }
 
 #[test]
@@ -1503,6 +1522,9 @@ fn recovered_topology_refresh_plan_repairs_tokens_for_every_voter() {
     let peers = vec![(peer_host_id, "10.89.5.18:7000".parse().unwrap())];
     let peer_cql_broadcasts = std::collections::HashMap::new();
     let peer_internode_broadcasts = std::collections::HashMap::new();
+    // No announcement: the peer must fall back to the local dc/rack (invariant 3).
+    let peer_dcs = std::collections::HashMap::new();
+    let peer_racks = std::collections::HashMap::new();
     let num_tokens = 4;
 
     let refresh_plan = build_recovered_topology_refresh_plan(
@@ -1514,6 +1536,8 @@ fn recovered_topology_refresh_plan_repairs_tokens_for_every_voter() {
         &peers,
         &peer_cql_broadcasts,
         &peer_internode_broadcasts,
+        &peer_dcs,
+        &peer_racks,
     );
     let token_plan = build_recovered_topology_token_repair_plan(&refresh_plan, num_tokens);
 
@@ -2323,6 +2347,8 @@ async fn existing_inbound_cluster_member_with_ephemeral_source_port_does_not_que
         None,
         None,
         0,
+        None,
+        None,
     );
 
     let pending = controller.pending_joins.lock();
@@ -2444,7 +2470,7 @@ fn self_connection_does_not_advance_cluster_formation() {
         "a self-connection must not be counted as a peer or trigger pair mode"
     );
     assert!(
-        controller.connected_peers.lock().is_empty(),
+        controller.connected_peers.load().is_empty(),
         "self must not enter the connected-peer formation set"
     );
 
@@ -2454,9 +2480,11 @@ fn self_connection_does_not_advance_cluster_formation() {
         None,
         None,
         0,
+        None,
+        None,
     );
     assert_eq!(controller.mode(), DeploymentMode::Standalone);
-    assert!(controller.connected_peers.lock().is_empty());
+    assert!(controller.connected_peers.load().is_empty());
 
     let real_peer = Uuid::from_u128(2);
     controller.on_peer_connected((real_peer, "127.0.0.2:7000".parse().unwrap()));
@@ -2466,7 +2494,7 @@ fn self_connection_does_not_advance_cluster_formation() {
         DeploymentMode::Pair,
         "one real peer plus self must remain pair, never advance to trio formation"
     );
-    let peers = controller.connected_peers.lock();
+    let peers = controller.connected_peers.load();
     assert_eq!(peers.len(), 1);
     assert_eq!(peers[0].0, real_peer);
 }
@@ -2685,7 +2713,14 @@ async fn reverse_inbound_race_does_not_promote_joiner_to_primary() {
 
     // Live 38xxx shape: the seed's reverse inbound arrives on an ephemeral
     // port before the joiner's canonical outbound `:7000` peer-connected event.
-    controller.on_inbound_peer((peer_id, "10.0.0.1:40370".parse().unwrap()), None, None, 0);
+    controller.on_inbound_peer(
+        (peer_id, "10.0.0.1:40370".parse().unwrap()),
+        None,
+        None,
+        0,
+        None,
+        None,
+    );
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(
         controller.role(),
@@ -3078,7 +3113,14 @@ async fn standalone_inbound_peer_transitions_to_pair() {
 
     // Inbound connection — should also transition, not reject.
     use ferrosa_net::rpc::InboundPeerCallback;
-    controller.on_inbound_peer((peer_id, "10.0.0.2:7000".parse().unwrap()), None, None, 0);
+    controller.on_inbound_peer(
+        (peer_id, "10.0.0.2:7000".parse().unwrap()),
+        None,
+        None,
+        0,
+        None,
+        None,
+    );
 
     assert_eq!(
         controller.mode(),
@@ -3519,7 +3561,7 @@ fn concurrent_mode_transitions_serialize() {
 
     // The connected_peers list should contain both peers (both calls
     // appended through the mutex, no lost updates).
-    let peers = controller.connected_peers.lock();
+    let peers = controller.connected_peers.load();
     assert_eq!(
         peers.len(),
         2,
@@ -4409,7 +4451,7 @@ async fn an_inbound_peer_is_registered_in_the_raft_node_map() {
         ))));
 
     let addr: SocketAddr = "127.0.0.1:7001".parse().unwrap();
-    controller.on_inbound_peer((inbound_peer, addr), None, None, 0);
+    controller.on_inbound_peer((inbound_peer, addr), None, None, 0, None, None);
 
     let map = controller
         .raft_node_map_snapshot()
@@ -4719,7 +4761,13 @@ fn install_downgrade_ring(controller: &ModeController, peer: Uuid, others: &[Uui
 
 fn connect(controller: &ModeController, peer: Uuid) {
     let addr: SocketAddr = "127.0.0.1:7000".parse().unwrap();
-    controller.connected_peers.lock().push((peer, addr));
+    // Same publication as production: the test helper republishes the list
+    // rather than mutating a shared one in place.
+    controller.connected_peers.rcu(|current| {
+        let mut next = (**current).clone();
+        next.push((peer, addr));
+        next
+    });
 }
 
 // Ben's rule (t_ad872ac7): "to become a pair an operator needs to bring one
@@ -5087,7 +5135,14 @@ async fn primary_paired_with(
         controller.as_peer_listener(),
     ));
     controller.set_peer_manager(pm.clone());
-    controller.on_inbound_peer((peer_id, peer.addr), None, Some(peer.addr.to_string()), 0);
+    controller.on_inbound_peer(
+        (peer_id, peer.addr),
+        None,
+        Some(peer.addr.to_string()),
+        0,
+        None,
+        None,
+    );
     assert_eq!(controller.role(), Some(PairRole::Primary));
     for _ in 0..100 {
         if pm.has_peer(peer_id) {
@@ -5798,4 +5853,609 @@ async fn a_seeded_controller_carrying_jsonb_initializes_and_leaves_standalone() 
         "a seeded node carrying jsonb must be able to leave standalone"
     );
     assert_eq!(controller.mode(), DeploymentMode::Pair);
+}
+
+// Multi-DC LOCAL_QUORUM: the acceptance criterion for the internode DC work.
+//
+// The defect: `record_peer_dc` had zero callers, so `peer_dcs` stayed empty and
+// every peer was classified as being in the LOCAL datacenter. With NTS that
+// makes LOCAL_QUORUM count remote-DC replicas as if they were local, and it
+// re-authors every peer's ring entry under our own DC.
+//
+// A single-DC test passes with the bug present (all peers ARE local), so these
+// build a genuine 2-DC topology. They also cover BOTH directions a peer can be
+// learned from, because which handler runs is decided by who dialled whom and
+// the leader usually dials its peers outbound after ClusterInvite.
+// ---------------------------------------------------------------------------
+
+/// The peers a multi-DC formation test drives. Local node is `dc1`; two peers
+/// announce `dc2`. The local DC's RF is 1 and dc2's is 2, so a correct
+/// classification yields one local replica plus two remote ones.
+fn multidc_peers() -> (Uuid, Uuid, Uuid) {
+    (
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0002),
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0003),
+        Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0004),
+    )
+}
+
+fn multidc_config(dir: &std::path::Path) -> Arc<ClusterConfig> {
+    Arc::new(ClusterConfig {
+        data_center: "dc1".to_string(),
+        rack: "rack1".to_string(),
+        raft_data_dir: Some(dir.join("raft")),
+        ..ClusterConfig::default()
+    })
+}
+
+/// The assertion set shared by both directions.
+///
+/// It drives the two production rules the defect broke, in the order the code
+/// applies them: `dc_for_peer` (how a peer's DC is resolved for its ring
+/// entry) and `partition_peers_by_dc` (how the local Raft group is chosen).
+/// Both read the controller's recorded `peer_dcs`, which is the thing that was
+/// never populated — so with the bug present every peer resolves to the local
+/// DC and LOCAL_QUORUM counts remote-DC replicas as local.
+fn assert_local_quorum_excludes_remote_dc(
+    controller: &Arc<ModeController>,
+    dc2_peer_a: Uuid,
+    dc2_peer_b: Uuid,
+) {
+    use crate::controller::cluster::{dc_for_peer, partition_peers_by_dc};
+
+    let local_id = controller.local_host_id;
+    let local_nid = crate::raft::uuid_to_node_id(local_id);
+    let a_nid = crate::raft::uuid_to_node_id(dc2_peer_a);
+    let b_nid = crate::raft::uuid_to_node_id(dc2_peer_b);
+
+    // 1. The controller must have RECORDED the peers' announced DC. Empty here
+    //    is the original bug: `record_peer_dc` had zero callers, so `peer_dcs`
+    //    was never populated.
+    let peer_dcs = controller.peer_dcs_snapshot();
+    for peer in [dc2_peer_a, dc2_peer_b] {
+        assert_eq!(
+            controller.peer_dc(peer).as_deref(),
+            Some("dc2"),
+            "the controller must record the peer's OWN announced DC, not leave \
+             peer_dcs empty (peer_dcs == {peer_dcs:?})"
+        );
+    }
+
+    // 2. The local Raft group / replica set must exclude the dc2 peers. This is
+    //    `partition_peers_by_dc` — the function whose behaviour the fix
+    //    changes — fed the controller's recorded map, exactly as
+    //    `transition_to_cluster` feeds it.
+    let addr = |port: u16| -> SocketAddr { format!("127.0.0.1:{port}").parse().unwrap() };
+    let all_peers = vec![
+        (local_id, addr(7000)),
+        (dc2_peer_a, addr(7001)),
+        (dc2_peer_b, addr(7002)),
+    ];
+    let (local_voters, others) = partition_peers_by_dc(&all_peers, &peer_dcs, "dc1");
+    assert!(
+        !local_voters.iter().any(|(id, _)| *id == dc2_peer_a)
+            && !local_voters.iter().any(|(id, _)| *id == dc2_peer_b),
+        "dc2 peers must not be local-DC voters: LOCAL_QUORUM would count their \
+         remote replicas as local. local_voters={local_voters:?} others={others:?}"
+    );
+    assert_eq!(
+        others.get("dc2").map(Vec::len),
+        Some(2),
+        "both dc2 peers must be grouped as cross-DC (peer_dcs == {peer_dcs:?})"
+    );
+
+    // 3. Resolve each peer's DC the way the ring build does and assert the
+    //    LOCAL_QUORUM local-DC filter — the rule `coordinate_read_nts_filtered`
+    //    and `coordinate_write_nts` apply — keeps only our own replicas.
+    let strategy_dc_rf =
+        std::collections::HashMap::from([("dc1".to_string(), 1usize), ("dc2".to_string(), 2usize)]);
+    let mut ring = crate::ring::TokenRing::new();
+    let mut node_dcs = vec![(local_nid, local_id)];
+    node_dcs.push((a_nid, dc2_peer_a));
+    node_dcs.push((b_nid, dc2_peer_b));
+    for (nid, uuid) in node_dcs {
+        ring.add_node(
+            nid,
+            NodeInfo {
+                host_id: uuid,
+                addr: "127.0.0.1:7000".into(),
+                data_center: dc_for_peer(uuid, &peer_dcs, "dc1"),
+                rack: "rack1".into(),
+                state: NodeState::Normal,
+                cql_broadcast: None,
+            },
+        );
+    }
+    assert_eq!(
+        ring.get_node(local_nid).map(|n| n.data_center.as_str()),
+        Some("dc1"),
+        "the local node keeps its own DC"
+    );
+    ring.assign_tokens(local_nid, &[40i64]);
+    ring.assign_tokens(a_nid, &[10i64]);
+    ring.assign_tokens(b_nid, &[20i64]);
+
+    let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
+        dc_rf: strategy_dc_rf.clone(),
+    };
+    let replicas = ring.replicas_for_strategy(0i64, &strategy);
+    let is_dc2 = |id: u64| id == a_nid || id == b_nid;
+    assert!(
+        replicas.iter().copied().any(is_dc2),
+        "the fixture must produce a token whose replica set includes a dc2 \
+         node, otherwise the exclusion assertion below is vacuous: {replicas:?}"
+    );
+
+    // The LOCAL_* filter production applies.
+    let local_replicas: Vec<u64> = replicas
+        .iter()
+        .copied()
+        .filter(|&id| {
+            ring.get_node(id)
+                .map(|n| n.data_center == "dc1")
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        !local_replicas.iter().copied().any(is_dc2),
+        "LOCAL_QUORUM must count ONLY local-DC replicas; a dc2 replica was \
+         counted as local: local={local_replicas:?} from {replicas:?}"
+    );
+    assert!(
+        replicas.len() > local_replicas.len(),
+        "the local-DC filter must actually drop the remote replica; otherwise \
+         the exclusion assertion proves nothing: {replicas:?}"
+    );
+
+    let local_rf = strategy_dc_rf.get("dc1").copied().unwrap_or(1);
+    let required = crate::consistency::ConsistencyLevel::LocalQuorum.block_for_dc(local_rf);
+    assert_eq!(
+        required, 1,
+        "LOCAL_QUORUM with dc1_rf=1 requires one local ack"
+    );
+    assert!(
+        local_replicas.len() >= required,
+        "LOCAL_QUORUM must be satisfiable from the local DC alone: \
+         local={local_replicas:?} required={required}"
+    );
+}
+
+/// Leader dials its peers OUTBOUND: the DC arrives in the handshake, is stored
+/// in `PeerManager`, and must be bridged into the controller's `peer_dcs` by
+/// `on_peer_connected` — otherwise the peers the leader itself dialled stay
+/// unclassified and LOCAL_QUORUM counts their remote replicas as local.
+#[tokio::test]
+async fn local_quorum_excludes_remote_dc_replicas_for_outbound_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+    let (dc2_peer_a, dc2_peer_b, _) = multidc_peers();
+
+    let (controller, _handles) = ModeController::new(
+        multidc_config(dir.path()),
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm.clone());
+
+    // What `PeerManager::install_pool` does before it fires the callback: it
+    // stores the advertised topology from the handshake, then calls
+    // `on_peer_connected`.
+    for (peer, port) in [(dc2_peer_a, 7001u16), (dc2_peer_b, 7002)] {
+        pm.set_peer_data_center(peer, "dc2".to_string()).await;
+        pm.set_peer_rack(peer, "rack2".to_string()).await;
+        controller.on_peer_connected((peer, format!("127.0.0.1:{port}").parse().unwrap()));
+    }
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    assert_local_quorum_excludes_remote_dc(&controller, dc2_peer_a, dc2_peer_b);
+}
+
+/// Peers dial the leader INBOUND (a seed is dialled BY its peers): the DC
+/// arrives on the handshake callback and must be recorded before
+/// `transition_to_cluster` snapshots `peer_dcs`.
+#[tokio::test]
+async fn local_quorum_excludes_remote_dc_replicas_for_inbound_peers() {
+    let dir = tempfile::tempdir().unwrap();
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::from_u128(1);
+    let (dc2_peer_a, dc2_peer_b, _) = multidc_peers();
+
+    let (controller, _handles) = ModeController::new(
+        multidc_config(dir.path()),
+        net_config.clone(),
+        local_id,
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::new(
+        net_config.clone(),
+        local_id,
+        controller.clone(),
+    ));
+    controller.set_peer_manager(pm);
+
+    let addr = |port: u16| -> SocketAddr { format!("127.0.0.1:{port}").parse().unwrap() };
+    controller.on_inbound_peer(
+        (dc2_peer_a, addr(7001)),
+        None,
+        None,
+        0,
+        Some("dc2".into()),
+        Some("rack2".into()),
+    );
+    controller.on_inbound_peer(
+        (dc2_peer_b, addr(7002)),
+        None,
+        None,
+        0,
+        Some("dc2".into()),
+        Some("rack2".into()),
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+
+    assert_local_quorum_excludes_remote_dc(&controller, dc2_peer_a, dc2_peer_b);
+}
+
+// ---------------------------------------------------------------------------
+// Internode DC/rack: the single resolution rule, and the seed-join rule.
+//
+// These exercise the production helpers directly rather than standing up a live
+// multi-node Raft cluster, following the existing
+// `recovered_topology_refresh_plan_*` tests: a peer that is committed into the
+// cluster or into the ring must carry THE PEER's announced dc/rack, never the
+// local node's. That stamping bug is what let LOCAL_* quorums count remote-DC
+// replicas.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn peer_topology_prefers_the_peers_announced_dc_and_rack() {
+    let peer = uuid::Uuid::new_v4();
+    let peer_dcs = std::collections::HashMap::from([(peer, "dc2".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer, "rack2".to_string())]);
+    assert_eq!(
+        peer_topology(peer, &peer_dcs, &peer_racks, "dc1", "rack1"),
+        ("dc2".to_string(), "rack2".to_string()),
+        "an announced DC must win over the local node's"
+    );
+}
+
+#[test]
+fn peer_topology_falls_back_to_local_for_a_silent_peer() {
+    let peer = uuid::Uuid::new_v4();
+    assert_eq!(
+        peer_topology(
+            peer,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            "dc1",
+            "rack1"
+        ),
+        ("dc1".to_string(), "rack1".to_string()),
+        "a peer that announced no DC is treated as local, preserving rolling upgrade"
+    );
+}
+
+#[test]
+fn peer_topology_treats_a_blank_announcement_as_absent() {
+    let peer = uuid::Uuid::new_v4();
+    let peer_dcs = std::collections::HashMap::from([(peer, "   ".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer, String::new())]);
+    assert_eq!(
+        peer_topology(peer, &peer_dcs, &peer_racks, "dc1", "rack1"),
+        ("dc1".to_string(), "rack1".to_string()),
+    );
+}
+
+#[test]
+fn seed_join_node_info_commits_the_peers_own_topology() {
+    let peer = uuid::Uuid::new_v4();
+    let peer_dcs = std::collections::HashMap::from([(peer, "dc2".to_string())]);
+    let peer_racks = std::collections::HashMap::from([(peer, "rack2".to_string())]);
+    let info = seed_join_node_info(
+        peer,
+        "127.0.0.1:7000".parse().unwrap(),
+        Some("127.0.0.1:7000"),
+        Some("127.0.0.1:9042".to_string()),
+        &peer_dcs,
+        &peer_racks,
+        ("dc1", "rack1"),
+    );
+    assert_eq!(info.host_id, peer);
+    assert_eq!(
+        info.data_center, "dc2",
+        "the seed must commit the PEER's DC, not its own"
+    );
+    assert_eq!(info.rack, "rack2");
+    assert_eq!(info.cql_broadcast.as_deref(), Some("127.0.0.1:9042"));
+    assert_eq!(info.state, crate::raft::NodeState::Normal);
+}
+
+#[test]
+fn seed_join_node_info_falls_back_to_local_for_a_silent_peer() {
+    let peer = uuid::Uuid::new_v4();
+    let info = seed_join_node_info(
+        peer,
+        "127.0.0.1:7000".parse().unwrap(),
+        None,
+        None,
+        &std::collections::HashMap::new(),
+        &std::collections::HashMap::new(),
+        ("dc1", "rack1"),
+    );
+    assert_eq!(info.data_center, "dc1");
+    assert_eq!(info.rack, "rack1");
+}
+
+// ---------------------------------------------------------------------------
+// The peer-topology maps are PUBLISHED, not locked.
+//
+// The peers surface reads `peer_dcs`/`peer_racks` once per ROW (it authors
+// `system.peers` and `system.local`), so a mutex there serialises every CQL
+// reader against every handshake, and a snapshot taken under it deep-copies the
+// map for every row. These pin the properties that make the published map safe
+// to rely on instead: readers see a whole immutable map, reading does not copy
+// it, and two peers announcing at once cannot lose each other.
+// ---------------------------------------------------------------------------
+
+/// A snapshot is an immutable view. If a recording could change a map an
+/// already-taken snapshot points at, a reader rendering one row could pair a
+/// peer's old DC with its new rack — the two maps are read separately.
+#[test]
+fn a_peer_topology_snapshot_does_not_change_under_a_later_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let peer = Uuid::new_v4();
+
+    controller.record_peer_dc(peer, "us-west-2");
+    let before = controller.peer_dcs_snapshot();
+
+    controller.record_peer_dc(peer, "eu-west-1");
+
+    assert_eq!(
+        before.get(&peer).map(String::as_str),
+        Some("us-west-2"),
+        "the snapshot taken before the recording must still read the old DC; a \
+         snapshot that mutates under the reader is not a snapshot"
+    );
+    assert_eq!(
+        controller
+            .peer_dcs_snapshot()
+            .get(&peer)
+            .map(String::as_str),
+        Some("eu-west-1"),
+        "and a snapshot taken after it must see the recording"
+    );
+}
+
+/// Reading must not copy. The peers surface snapshots these maps per row, so a
+/// deep copy per read is an allocation per row on the CQL path.
+#[test]
+fn reading_the_peer_topology_maps_does_not_copy_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let (peer, other) = (Uuid::new_v4(), Uuid::new_v4());
+    controller.record_peer_dc(peer, "eu-west-1");
+    controller.record_peer_rack(peer, "rack-east-a");
+
+    let (first, second) = (
+        controller.peer_dcs_snapshot(),
+        controller.peer_dcs_snapshot(),
+    );
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "two reads with no recording between them must observe the same map — \
+         a deep copy per read allocates once per peers row"
+    );
+    let (rack_first, rack_second) = (
+        controller.peer_racks_snapshot(),
+        controller.peer_racks_snapshot(),
+    );
+    assert!(
+        Arc::ptr_eq(&rack_first, &rack_second),
+        "racks mirror the DCs"
+    );
+
+    controller.record_peer_dc(other, "eu-west-1");
+
+    let third = controller.peer_dcs_snapshot();
+    assert!(
+        !Arc::ptr_eq(&first, &third),
+        "a recording must publish a NEW map, or the change is invisible"
+    );
+    assert_eq!(
+        third.get(&other).map(String::as_str),
+        Some("eu-west-1"),
+        "…and the published map must carry the recording"
+    );
+}
+
+/// Concurrent announcements must all land. A load-then-store write loses one of
+/// them silently; the write is read-copy-update for exactly this reason.
+#[test]
+fn concurrent_peer_topology_recordings_do_not_lose_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let (controller, _handles) = ModeController::new(
+        config,
+        Arc::new(NetConfig::default()),
+        Uuid::new_v4(),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let peers: Vec<Uuid> = (0..8).map(|_| Uuid::new_v4()).collect();
+
+    std::thread::scope(|scope| {
+        for (index, peer) in peers.iter().enumerate() {
+            let controller = Arc::clone(&controller);
+            scope.spawn(move || {
+                controller.record_peer_dc(*peer, format!("dc-{index}"));
+                controller.record_peer_rack(*peer, format!("rack-{index}"));
+            });
+        }
+    });
+
+    let dcs = controller.peer_dcs_snapshot();
+    let racks = controller.peer_racks_snapshot();
+    for (index, peer) in peers.iter().enumerate() {
+        let expected_dc = format!("dc-{index}");
+        let expected_rack = format!("rack-{index}");
+        assert_eq!(
+            dcs.get(peer).map(String::as_str),
+            Some(expected_dc.as_str()),
+            "every concurrent recording must be present (all {})",
+            peers.len()
+        );
+        assert_eq!(
+            racks.get(peer).map(String::as_str),
+            Some(expected_rack.as_str()),
+            "…in the rack map too"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CL-76: the seed role is claimed from a COMPLETE data-center membership.
+//
+// The seed is the node that may call `raft.initialize()` for its DC. The rule used
+// to be "the highest UUID among self + peers", which is VACUOUSLY true for a node
+// that knows no peer of its own DC (`max({self}) == self`) — so every node in such a
+// DC initialised a one-voter group, and a DC of three nodes ended up with three
+// groups of one, none able to reach `expected_cluster_size`.
+// ---------------------------------------------------------------------------
+
+/// A node that knows no peer of its own DC must not claim the seed role, and neither
+/// must one that knows fewer than the declared size: both would form a group that can
+/// never reach `expected_cluster_size`.
+#[test]
+fn a_node_without_its_dcs_full_membership_does_not_claim_the_seed_role() {
+    assert!(
+        !should_claim_seed_role(3, 0, true),
+        "an empty same-DC peer set makes `max({{self}}) == self` true, which is the bug: \
+         claiming it here initialises a ONE-voter group"
+    );
+    assert!(
+        !should_claim_seed_role(3, 1, true),
+        "two of three known is still incomplete; initialising now fixes the voter set \
+         at two forever"
+    );
+}
+
+/// The role is claimable once the membership is complete — and only by the highest
+/// UUID, so exactly one node in a DC initialises its group.
+#[test]
+fn the_seed_role_is_claimable_only_from_a_complete_membership_and_by_the_highest_uuid() {
+    assert!(
+        should_claim_seed_role(3, 2, true),
+        "3 of 3 known, highest UUID"
+    );
+    assert!(
+        !should_claim_seed_role(3, 2, false),
+        "the same complete set from a non-highest node must stay passive"
+    );
+    assert!(
+        should_claim_seed_role(1, 0, true),
+        "a one-node DC is complete as soon as it exists"
+    );
+}
+
+/// An undeclared cluster size keeps today's behaviour exactly: a lone node is a
+/// single-node cluster and must still initialise itself.
+#[test]
+fn an_undeclared_cluster_size_keeps_the_single_node_seed_behaviour() {
+    assert!(should_claim_seed_role(0, 0, true));
+    assert!(
+        should_claim_seed_role(0, 5, true),
+        "no declared size, nothing to wait for"
+    );
+    assert!(!should_claim_seed_role(0, 0, false));
+}
+
+/// The registry is how one DC reaches another: it holds the *other* DC's known
+/// nodes, keeps out of its own, and never invents a DC for a peer that announced
+/// none. Built from what the node learned at runtime, not from configuration.
+#[test]
+fn cross_dc_registry_holds_the_other_dcs_and_not_this_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let config = Arc::new(ClusterConfig {
+        data_center: "us-west-2".to_string(),
+        ..ClusterConfig::default()
+    });
+    let net_config = Arc::new(NetConfig::default());
+    let local_id = Uuid::new_v4();
+    let registry = Arc::new(HandlerRegistry::new());
+    let (controller, _handles) =
+        ModeController::new(config, net_config, local_id, storage, schema, registry);
+
+    let west = Uuid::new_v4();
+    let east_a = Uuid::new_v4();
+    let east_b = Uuid::new_v4();
+    let unplaced = Uuid::new_v4();
+    controller.set_connected_peers_for_test(vec![
+        (west, "127.0.0.1:7001".parse().unwrap()),
+        (east_a, "127.0.0.1:7002".parse().unwrap()),
+        (east_b, "127.0.0.1:7003".parse().unwrap()),
+        (unplaced, "127.0.0.1:7004".parse().unwrap()),
+    ]);
+    controller.record_peer_dc(west, "us-west-2");
+    controller.record_peer_dc(east_a, "eu-west-1");
+    controller.record_peer_dc(east_b, "eu-west-1");
+
+    let links = controller.cross_dc_registry();
+
+    assert_eq!(
+        links.keys().cloned().collect::<Vec<_>>(),
+        vec!["eu-west-1".to_string()],
+        "one link, to the other DC: a same-DC peer is not a relay target"
+    );
+    assert_eq!(
+        links["eu-west-1"].candidates.len(),
+        2,
+        "every node the other DC announced is a candidate"
+    );
+    assert!(
+        links["eu-west-1"]
+            .candidates
+            .iter()
+            .all(|candidate| candidate.host_id != unplaced),
+        "a peer that announced no DC is never addressed as a remote DC — it is \
+         treated as local everywhere else"
+    );
 }

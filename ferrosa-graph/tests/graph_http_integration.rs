@@ -574,6 +574,8 @@ impl InboundPeerCallback for NoopPeerListener {
         _cql_broadcast: Option<String>,
         _internode_broadcast: Option<String>,
         _capabilities: u32,
+        _data_center: Option<String>,
+        _rack: Option<String>,
     ) {
     }
 }

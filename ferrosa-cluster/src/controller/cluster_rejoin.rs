@@ -204,7 +204,7 @@ pub async fn attempt_rejoin(
 
             // Membership op (JoinNode), not a client DDL — no same-node
             // read-your-writes wait (and a rejoining node has no usable raft yet).
-            match forward_ddl_to_leader(None, &peer_manager, *peer_uuid, op).await {
+            match forward_ddl_to_leader(None, &peer_manager, *peer_uuid, &op).await {
                 Ok(_committed) => {
                     tracing::info!(
                         attempt,

@@ -68,6 +68,7 @@ use parking_lot::Mutex;
 use arc_swap::ArcSwap;
 use uuid::Uuid;
 
+mod cross_dc;
 use ferrosa_net::config::NetConfig;
 use ferrosa_net::rpc::HandlerRegistry;
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
@@ -223,8 +224,18 @@ pub struct ModeController {
     /// a partition, the node with the higher promote_epoch wins primary role.
     /// Prevents split-brain when both nodes force_promote independently.
     pub(super) promote_epoch: std::sync::atomic::AtomicU64,
+    /// Handle to this controller for components it OWNS and that must call back
+    /// into it — the DDL path's cross-DC relay. A weak handle because the
+    /// controller owns those components: a strong reference would be a cycle.
+    /// Set once at construction, from the `Arc<Self>` the constructor makes.
+    pub(super) self_weak: std::sync::OnceLock<std::sync::Weak<ModeController>>,
     /// All connected peers, tracked across mode transitions.
-    pub(super) connected_peers: Mutex<Vec<(Uuid, SocketAddr)>>,
+    /// Published whole on every change (`arc-swap`), like [`Self::ring`] and
+    /// [`Self::mode`]: every reader wants the entire list (a mode transition, a
+    /// peer plan, the DC registry), and each of those was cloning it out from
+    /// under a mutex — a lock plus an allocation on paths that run per relayed
+    /// operation. Readers take an atomic load; writers republish via R-C-U.
+    pub(super) connected_peers: Arc<ArcSwap<Vec<(Uuid, SocketAddr)>>>,
     /// Whether this node's cluster was dissolved into a pair (t_47bbeb66).
     /// Loaded from the durable marker at construction and set by the
     /// downgrade; while not `None`, Raft never starts and only the pair
@@ -247,7 +258,32 @@ pub struct ModeController {
     ///
     /// Peers absent from this map default to the local DC — this
     /// preserves single-DC behavior unchanged.
-    pub(super) peer_dcs: Mutex<HashMap<Uuid, String>>,
+    /// Published as one immutable map per change (`arc-swap`), like
+    /// [`Self::ring`] and [`Self::raft_groups`] above: the peers surface reads
+    /// this PER ROW when it authors `system.peers`/`system.local`, so a lock
+    /// here serialises every CQL reader against every handshake, and a snapshot
+    /// taken under the lock deep-copies the whole map. Readers take an atomic
+    /// load instead; a recording (rare, once per handshake) publishes a new map
+    /// by R-C-U so concurrent announcements cannot lose each other.
+    pub(super) peer_dcs: Arc<ArcSwap<HashMap<Uuid, String>>>,
+    /// Known rack for each connected peer. Exact mirror of [`Self::peer_dcs`]:
+    /// populated by [`Self::record_peer_rack`] from the same handshake that
+    /// announces the peer's DC, and read by every producer that authors a
+    /// peer's `NodeInfo` (`transition_to_cluster`'s ring build + seed join,
+    /// `handle_join_request`).
+    ///
+    /// It exists on the controller (not only in `PeerManager`) for the same
+    /// reason `peer_dcs` does: the producers run synchronously / inside an
+    /// owned `async move` block and must not reach through the
+    /// `ArcSwap<Option<PeerManager>>` guard, and a single in-scope map is what
+    /// keeps the ring entry and the voter classification from disagreeing.
+    ///
+    /// Peers absent from this map default to the local rack — this preserves
+    /// single-DC, single-rack behavior unchanged, including for a peer still on
+    /// a version that announces no topology.
+    /// Same publication model as [`Self::peer_dcs`] and for the same reason:
+    /// read per row by the peers surface, written once per handshake.
+    pub(super) peer_racks: Arc<ArcSwap<HashMap<Uuid, String>>>,
     /// Persistent hint store — holds mutations destined for temporarily
     /// unreachable replicas.  Shared with `ClusterCoordinator`.
     pub(super) hint_store: Arc<HintStore>,
@@ -275,6 +311,12 @@ pub struct ModeController {
     /// window to prevent concurrent `on_peer_connected` calls from both
     /// triggering `transition_to_pair` when two peers arrive simultaneously.
     pub(super) transition_guard: Mutex<()>,
+    /// Set, once, before this node attempts to initialise its DC's Raft group late
+    /// (CL-76). An `AtomicBool` claimed by CAS, not a mutex: the attempt is made from
+    /// a peer event, and a lock there would serialise connection handling for a flag
+    /// written a handful of times per process. `Arc` so the spawned initialise can
+    /// release the claim if it fails.
+    pub(super) seed_initialisation_claimed: Arc<std::sync::atomic::AtomicBool>,
     /// Formation epoch — incremented each time we enter Forming state.
     /// Used to reject stale ClusterInvite messages from previous formation attempts.
     pub(super) formation_epoch: std::sync::atomic::AtomicU64,
@@ -491,6 +533,7 @@ impl ModeController {
         // lag a transition the controller has made.
         schema.set_deployment_mode(initial_mode);
         let controller = Arc::new(Self {
+            self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: schema.deployment_mode_handle(),
@@ -507,11 +550,12 @@ impl ModeController {
             pair_context: Mutex::new(None),
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
-            connected_peers: Mutex::new(Vec::new()),
+            connected_peers: Arc::new(ArcSwap::from_pointee(Vec::new())),
             dissolution: ArcSwap::from_pointee(dissolution_state),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            peer_dcs: Mutex::new(HashMap::new()),
+            peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
             hint_config,
             hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -519,6 +563,7 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
+            seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
@@ -543,6 +588,10 @@ impl ModeController {
             cluster_state,
             ddl_path,
         };
+
+        // Published at construction, before anything can ask for it, so a
+        // component built later (the DDL path's cross-DC relay) always finds it.
+        let _ = controller.self_weak.set(Arc::downgrade(&controller));
 
         (controller, handles)
     }
@@ -607,7 +656,7 @@ impl ModeController {
     ) {
         // Seed from the live connected set: the map must cover every peer this
         // node is connected to, not only the snapshot formation was handed.
-        for (host_id, _addr) in self.connected_peers.lock().iter() {
+        for (host_id, _addr) in self.connected_peers.load().iter() {
             Self::insert_raft_node(&map, *host_id);
         }
         let pending: Vec<uuid::Uuid> = self
@@ -654,6 +703,7 @@ impl ModeController {
         let hint_store = Arc::new(HintStore::new(hint_config.clone()).expect("test hint store"));
 
         Arc::new(Self {
+            self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: {
@@ -673,11 +723,12 @@ impl ModeController {
             pair_context: Mutex::new(None),
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
-            connected_peers: Mutex::new(Vec::new()),
+            connected_peers: Arc::new(ArcSwap::from_pointee(Vec::new())),
             dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            peer_dcs: Mutex::new(HashMap::new()),
+            peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
             hint_config,
             hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -685,6 +736,7 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
+            seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
@@ -729,6 +781,7 @@ impl ModeController {
         };
 
         Arc::new(Self {
+            self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
             mode: {
@@ -748,11 +801,12 @@ impl ModeController {
             pair_context: Mutex::new(Some(pair_ctx)),
             force_promoted: AtomicBool::new(false),
             promote_epoch: std::sync::atomic::AtomicU64::new(0),
-            connected_peers: Mutex::new(Vec::new()),
+            connected_peers: Arc::new(ArcSwap::from_pointee(Vec::new())),
             dissolution: ArcSwap::from_pointee(dissolution::DissolutionState::None),
             pair_dissolve_transport: ArcSwap::from_pointee(None),
             raft_groups: Arc::new(ArcSwap::from_pointee(HashMap::new())),
-            peer_dcs: Mutex::new(HashMap::new()),
+            peer_dcs: Arc::new(ArcSwap::from_pointee(HashMap::new())),
+            peer_racks: Arc::new(ArcSwap::from_pointee(HashMap::new())),
             hint_store,
             hint_config,
             hint_deliveries_in_flight: Arc::new(Mutex::new(std::collections::HashSet::new())),
@@ -760,6 +814,7 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
+            seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
@@ -789,6 +844,16 @@ impl ModeController {
     /// Returns `None` until `set_peer_manager` has been called — typically
     /// during early bootstrap before networking comes up. Used by the
     /// `/admin/membership-snapshot` endpoint (Sprint 2 W2.3).
+    /// The relay a component this controller owns uses to reach the other DCs.
+    ///
+    /// `None` while the controller is not (yet) behind an `Arc` — every literal
+    /// constructor publishes it immediately, so this is only None on paths that
+    /// never relay (single-node and pair modes, where there is no other DC).
+    pub fn relay_handle(&self) -> Option<Arc<dyn crate::ddl_path::DdlRelay>> {
+        let controller = self.self_weak.get()?.upgrade()?;
+        Some(controller as Arc<dyn crate::ddl_path::DdlRelay>)
+    }
+
     pub fn peer_manager_arc(&self) -> Option<Arc<ferrosa_net::peer::PeerManager>> {
         self.peer_manager.load().as_ref().clone()
     }
@@ -1081,20 +1146,65 @@ impl ModeController {
     /// peer's `data_center` as configured at the peer (matches the
     /// `FERROSA_DATA_CENTER` env var on that node).
     pub fn record_peer_dc(&self, host_id: Uuid, dc_name: impl Into<String>) {
-        self.peer_dcs.lock().insert(host_id, dc_name.into());
+        let dc = dc_name.into();
+        // R-C-U rather than load-then-store: two peers announcing at once must
+        // both land, and a plain store would drop the other's entry.
+        self.peer_dcs.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(host_id, dc.clone());
+            next
+        });
     }
 
     /// Look up a peer's DC, if known. Returns `None` for peers that
     /// have not announced a DC; callers should treat that as "same DC
     /// as local" for backward compat.
     pub fn peer_dc(&self, host_id: Uuid) -> Option<String> {
-        self.peer_dcs.lock().get(&host_id).cloned()
+        self.peer_dcs.load().get(&host_id).cloned()
     }
 
     /// Snapshot of the peer-DC map. Used by `transition_to_cluster` and
     /// by tests.
-    pub(crate) fn peer_dcs_snapshot(&self) -> HashMap<Uuid, String> {
-        self.peer_dcs.lock().clone()
+    /// One refcount bump, no copy: callers deref to `&HashMap` exactly as
+    /// before, so no call site changes shape.
+    pub(crate) fn peer_dcs_snapshot(&self) -> Arc<HashMap<Uuid, String>> {
+        self.peer_dcs.load_full()
+    }
+
+    /// Record a connected peer's rack. Mirror of [`Self::record_peer_dc`] for
+    /// the other half of the announced topology, called from the same two
+    /// handshake paths (`on_inbound_peer`, `on_peer_connected`) that record the
+    /// DC.
+    ///
+    /// A rack is only useful paired with a DC: [`peer_topology`] takes both
+    /// from these maps, so recording one without the other would let a peer's
+    /// ring entry mix a remote DC with our rack.
+    ///
+    /// Idempotent: re-recording overwrites the prior entry. Pass the peer's
+    /// `rack` as configured at the peer (matches `FERROSA_RACK` on that node).
+    ///
+    /// [`peer_topology`]: cluster::peer_topology
+    pub fn record_peer_rack(&self, host_id: Uuid, rack_name: impl Into<String>) {
+        let rack = rack_name.into();
+        self.peer_racks.rcu(|current| {
+            let mut next = (**current).clone();
+            next.insert(host_id, rack.clone());
+            next
+        });
+    }
+
+    /// Look up a peer's rack, if known. Returns `None` for peers that have not
+    /// announced one; callers should treat that as "same rack as local".
+    pub fn peer_rack(&self, host_id: Uuid) -> Option<String> {
+        self.peer_racks.load().get(&host_id).cloned()
+    }
+
+    /// Snapshot of the peer-rack map — the counterpart of
+    /// [`Self::peer_dcs_snapshot`], so every producer that authors a peer's
+    /// `NodeInfo` can resolve both halves of its topology from one place with
+    /// no `PeerManager`/`ArcSwap` access.
+    pub(crate) fn peer_racks_snapshot(&self) -> Arc<HashMap<Uuid, String>> {
+        self.peer_racks.load_full()
     }
 
     /// Return a snapshot of the current token ring.
@@ -1128,7 +1238,7 @@ impl ModeController {
     /// tests state which members are up for checks that read it (the operator
     /// downgrade). Production code must never call this.
     pub fn set_connected_peers_for_test(&self, peers: Vec<(Uuid, SocketAddr)>) {
-        *self.connected_peers.lock() = peers;
+        self.connected_peers.store(Arc::new(peers));
     }
 
     /// Replace how the operator downgrade reaches its named peer.
@@ -1242,8 +1352,8 @@ impl ModeController {
     }
 
     /// The peers this node currently tracks as connected. **Test helper.**
-    pub fn connected_peers_for_test(&self) -> Vec<(Uuid, SocketAddr)> {
-        self.connected_peers.lock().clone()
+    pub fn connected_peers_for_test(&self) -> Arc<Vec<(Uuid, SocketAddr)>> {
+        self.connected_peers.load_full()
     }
 
     /// What this node knows about a dissolution of its cluster into a pair.

@@ -658,6 +658,37 @@ with `Overloaded`) and its frame-body buffer (tunable, loud `FrameTooLarge`).
   internode endpoint when creating reverse pools and tracking invite targets;
   the observed IP plus local port is only a compatibility fallback. This keeps
   same-host clusters with per-node ports from routing every host ID to the seed.
+- Internode DC/rack propagation — peers advertise their `data_center`/`rack` in
+  the handshake; the controller records them (`peer_dcs` / `peer_racks`) from
+  both the inbound handshake and outbound connects, and every site that commits
+  a peer (ring build, recovered-topology refresh, `handle_join_request`, the
+  seed-join loop) resolves that peer's topology through one rule
+  (`peer_topology`): the peer's announced value wins, and a peer that announced
+  none falls back to local. `NetworkTopologyStrategy` then places replicas
+  across real DCs and `LOCAL_*` quorums count only local-DC replicas. Resolution
+  happens once per connection establishment, not per message.
+- Cross-DC delivery (`accord/cross_dc_dispatch.rs`) — one copy per remote DC,
+  retried. A cluster of N DCs holds N-1 cross-DC links per DC (3 DCs: two each;
+  4: three each) no matter how many nodes a DC runs, because the local DC
+  commits through its own Raft group — whose openraft loop replicates the entry
+  to every voter in that DC — and each other DC receives exactly ONE copy that
+  its contact node (the lowest host id in that DC, so the choice is
+  deterministic) feeds into its own group, where that DC's mesh reaches its own
+  quorum. A peer whose DC was never announced is not a target: unplaceable peers
+  are local everywhere else, so inventing a remote DC for one would ship a copy
+  to a node that is probably in this DC. A DC that refuses an attempt is retried
+  with backoff (`CROSS_DC_RETRIES_TOTAL`) and a DC that never acknowledges is
+  reported and counted (`CROSS_DC_SEND_FAILURES_TOTAL`) rather than dropped
+  silently; `CROSS_DC_SENDS_TOTAL` counts one delivery per DC. Retrying is safe
+  because the receiving side deduplicates (Accord by `txn_id` in
+  `multi_dc_apply::AppliedTxnLedger`, schema commands by the `schema_version`
+  they carry), so a retried copy that already committed is a no-op.
+  **Not yet wired into the coordinator**: `coordinate_write_nts` still fans the
+  data path out one copy per replica NODE (including remote-DC replicas), and
+  `cl_routing::route_for_cl` — the decision that selects cross-DC Accord — has
+  no production caller, so this module's channel is exercised by
+  `tests/cross_dc_dispatch.rs` against real Raft groups until that call site
+  lands.
 - `ring/` — `TokenRing` (BTreeMap), SimpleStrategy + NetworkTopologyStrategy
   replica selection with rack diversity, learner `owns_tokens` handling.
 - `controller/membership.rs` — `MembershipChanger` mutates the four membership

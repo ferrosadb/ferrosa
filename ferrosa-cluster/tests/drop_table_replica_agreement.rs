@@ -208,7 +208,7 @@ async fn a_refused_drop_on_the_applying_node_surfaces_and_never_resurrects() {
         // on this node, so it must NOT be reported as success.
         let drop = execute_via_raft(
             &leader_raft,
-            DdlOperation::DropTable {
+            &DdlOperation::DropTable {
                 keyspace: KS.to_string(),
                 table: TBL.to_string(),
             },
