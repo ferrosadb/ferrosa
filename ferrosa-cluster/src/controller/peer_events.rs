@@ -228,6 +228,10 @@ impl ModeController {
                     internode_broadcast,
                 } => {
                     tracing::info!(peer = %host_id, "new peer connected in cluster mode, triggering join");
+                    // CL-76: this peer's arrival may be what COMPLETES this DC's declared
+                    // membership, at which point its seed initialises the group (it could
+                    // not claim the role earlier without forming a one-voter group).
+                    self.initialise_local_group_if_complete(all_peers_after_track);
                     if self.trigger_cluster_join(host_id, addr, cql_broadcast, internode_broadcast)
                     {
                         join_enqueued_invite = Some(host_id);

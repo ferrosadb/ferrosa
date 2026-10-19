@@ -1,7 +1,7 @@
 use super::cluster::{
     build_recovered_topology_refresh_plan, build_recovered_topology_token_repair_plan,
     drain_ddl_queue, keyspace_needs_cluster_replay, peer_topology, seed_join_node_info,
-    should_initialize_seed_membership, should_run_bootstrap_streaming,
+    should_claim_seed_role, should_initialize_seed_membership, should_run_bootstrap_streaming,
 };
 use super::*;
 use crate::raft::{NodeInfo, NodeState};
@@ -6347,6 +6347,57 @@ fn concurrent_peer_topology_recordings_do_not_lose_each_other() {
             "…in the rack map too"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// CL-76: the seed role is claimed from a COMPLETE data-center membership.
+//
+// The seed is the node that may call `raft.initialize()` for its DC. The rule used
+// to be "the highest UUID among self + peers", which is VACUOUSLY true for a node
+// that knows no peer of its own DC (`max({self}) == self`) — so every node in such a
+// DC initialised a one-voter group, and a DC of three nodes ended up with three
+// groups of one, none able to reach `expected_cluster_size`.
+// ---------------------------------------------------------------------------
+
+/// A node that knows no peer of its own DC must not claim the seed role, and neither
+/// must one that knows fewer than the declared size: both would form a group that can
+/// never reach `expected_cluster_size`.
+#[test]
+fn a_node_without_its_dcs_full_membership_does_not_claim_the_seed_role() {
+    assert!(
+        !should_claim_seed_role(3, 0, true),
+        "an empty same-DC peer set makes `max({{self}}) == self` true, which is the bug: \
+         claiming it here initialises a ONE-voter group"
+    );
+    assert!(
+        !should_claim_seed_role(3, 1, true),
+        "two of three known is still incomplete; initialising now fixes the voter set \
+         at two forever"
+    );
+}
+
+/// The role is claimable once the membership is complete — and only by the highest
+/// UUID, so exactly one node in a DC initialises its group.
+#[test]
+fn the_seed_role_is_claimable_only_from_a_complete_membership_and_by_the_highest_uuid() {
+    assert!(should_claim_seed_role(3, 2, true), "3 of 3 known, highest UUID");
+    assert!(
+        !should_claim_seed_role(3, 2, false),
+        "the same complete set from a non-highest node must stay passive"
+    );
+    assert!(
+        should_claim_seed_role(1, 0, true),
+        "a one-node DC is complete as soon as it exists"
+    );
+}
+
+/// An undeclared cluster size keeps today's behaviour exactly: a lone node is a
+/// single-node cluster and must still initialise itself.
+#[test]
+fn an_undeclared_cluster_size_keeps_the_single_node_seed_behaviour() {
+    assert!(should_claim_seed_role(0, 0, true));
+    assert!(should_claim_seed_role(0, 5, true), "no declared size, nothing to wait for");
+    assert!(!should_claim_seed_role(0, 0, false));
 }
 
 /// The registry is how one DC reaches another: it holds the *other* DC's known

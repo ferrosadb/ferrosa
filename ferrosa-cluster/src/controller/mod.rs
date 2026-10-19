@@ -311,6 +311,12 @@ pub struct ModeController {
     /// window to prevent concurrent `on_peer_connected` calls from both
     /// triggering `transition_to_pair` when two peers arrive simultaneously.
     pub(super) transition_guard: Mutex<()>,
+    /// Set, once, before this node attempts to initialise its DC's Raft group late
+    /// (CL-76). An `AtomicBool` claimed by CAS, not a mutex: the attempt is made from
+    /// a peer event, and a lock there would serialise connection handling for a flag
+    /// written a handful of times per process. `Arc` so the spawned initialise can
+    /// release the claim if it fails.
+    pub(super) seed_initialisation_claimed: Arc<std::sync::atomic::AtomicBool>,
     /// Formation epoch — incremented each time we enter Forming state.
     /// Used to reject stale ClusterInvite messages from previous formation attempts.
     pub(super) formation_epoch: std::sync::atomic::AtomicU64,
@@ -557,6 +563,7 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
+            seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
@@ -729,6 +736,7 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
+            seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
@@ -806,6 +814,7 @@ impl ModeController {
             ring: Arc::new(ArcSwap::from_pointee(None)),
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             transition_guard: Mutex::new(()),
+            seed_initialisation_claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             formation_epoch: std::sync::atomic::AtomicU64::new(0),
             seen_invite_initiators: Mutex::new(BTreeSet::new()),
             recent_reconnect_invites: Arc::new(Mutex::new(BTreeMap::new())),
