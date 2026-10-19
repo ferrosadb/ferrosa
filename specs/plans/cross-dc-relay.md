@@ -151,6 +151,30 @@ Evidence lives only in the retained node logs from that run
 (`FERROSA_TEST_KEEP_NODE_LOGS=<dir>`, ~1 MB, in the session scratch dir and pruned after 24 h), which
 is why both harness knobs (`KEEP_NODE_LOGS`, overridable `RUST_LOG`) are part of this change.
 
+### Resolved: both defects fixed, proven on six processes
+
+`a_ddl_created_in_one_dc_reaches_the_other` failed at 120-168 s before this change and passes in
+**6.2 s** after it. The two fixes, and the third thing that had to be true:
+
+1. **The seed role needs a complete DC membership** — `should_claim_seed_role(expected, local_peers,
+   is_highest)`, a pure predicate with three tests. `max({self}) == self` on an empty same-DC peer set
+   is the vacuum that produced one-voter groups. An undeclared size (`expected == 0`) keeps the old
+   single-node behaviour, asserted separately.
+2. **The late initialise must run where the group handle exists.** Re-entering
+   `transition_to_cluster` cannot initialise (the `should_initialize_seed_membership` gate; measured
+   15 transitions / 0 `raft.initialize`). A peer-event callback cannot either: instrumenting the
+   entry guard showed `has_raft = false` on **84 of 84** calls for the seed of a late-forming DC,
+   because the group is published by the transition task, not before it. So the attempt lives in that
+   task's election loop, which already holds `raft_arc`, and the membership it checks is read from the
+   published `ArcSwap` peer state.
+3. **Once, not once per event.** An `AtomicBool` claimed by `compare_exchange`, released only if
+   `initialize` fails. Both DCs now log exactly one late initialise and one `RaftMsg::Initialize` with
+   three members; the other four nodes initialise nothing.
+
+The lesson generalises: when a decision depends on state a background task owns, put the decision in
+that task. A callback observing the same condition from outside can be structurally unable to act on
+it, and no amount of re-checking fixes that.
+
 
 ## Landing order and the rebase recipe (do this first, then the CL-76 fix)
 

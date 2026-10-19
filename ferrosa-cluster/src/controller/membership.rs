@@ -284,17 +284,19 @@ impl ModeController {
     /// decides who participates in consensus. A peer can be in one and absent from the
     /// other, and treating ring presence as proof of membership is what stopped the
     /// promotion that reconciles them (CL-76).
-    fn is_local_group_voter(&self, peer_node_id: u64) -> bool {
-        self.raft()
-            .map(|raft| {
-                raft.metrics()
-                    .borrow()
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .any(|id| id == peer_node_id)
-            })
-            .unwrap_or(false)
+    /// `Some(true/false)` when this node owns a Raft group, `None` when it does not
+    /// (yet). `None` is NOT "not a voter": a node that has not published its group
+    /// cannot tell, and treating that as absence turned the duplicate-join guard into a
+    /// join loop for every ring member (two regression tests caught it).
+    fn local_group_voter_state(&self, peer_node_id: u64) -> Option<bool> {
+        self.raft().map(|raft| {
+            raft.metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .any(|id| id == peer_node_id)
+        })
     }
 
     pub(super) fn trigger_cluster_join(
@@ -328,30 +330,28 @@ impl ModeController {
             // clients. This is the guard the debug logs name —
             // "peer already present in token ring with current metadata, skipping join
             // trigger" — firing on a peer that was in the ring and NOT a voter.
-            let is_voter = self.is_local_group_voter(peer_node_id);
-            if is_voter
-                && !cluster_member_metadata_changed(
-                    existing,
-                    &desired_addr,
-                    cql_broadcast.as_deref(),
-                )
-                && has_outbound_peer
-            {
-                tracing::debug!(
-                    peer = %host_id,
-                    node_id = peer_node_id,
-                    "peer already present in token ring as a voter with current metadata, \
-                     skipping join trigger"
-                );
-                return false;
-            }
-            if !is_voter {
+            // Only an AUTHORITATIVE voter set may bypass the guard: a group that exists
+            // and does not contain the peer. No group, or the peer already a voter, keeps
+            // the ring guard exactly as it was.
+            if self.local_group_voter_state(peer_node_id) == Some(false) {
                 tracing::info!(
                     peer = %host_id,
                     node_id = peer_node_id,
                     "peer is in the token ring but not a voter in this DC's Raft group: \
                      proposing the join so the leader promotes it"
                 );
+            } else if !cluster_member_metadata_changed(
+                existing,
+                &desired_addr,
+                cql_broadcast.as_deref(),
+            ) && has_outbound_peer
+            {
+                tracing::debug!(
+                    peer = %host_id,
+                    node_id = peer_node_id,
+                    "peer already present in token ring with current metadata, skipping join trigger"
+                );
+                return false;
             }
         }
 
