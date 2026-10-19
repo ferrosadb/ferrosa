@@ -636,14 +636,44 @@ async fn a_ddl_created_in_one_dc_reaches_the_other() {
             )
         });
 
-    // It is in the creating DC immediately — that is the client's write.
-    for node in west_nodes {
-        assert!(
-            has_keyspace(node, &keyspace).await,
-            "the DDL must be in every node of the DC that committed it\n=== log ===\n{}",
-            node.log_tail(40)
-        );
+    // It must be in every node of the DC that committed it. The client's CREATE
+    // returning means the local group committed it; a FOLLOWER applies the schema
+    // from the replicated log asynchronously, so this is a bounded convergence check
+    // rather than an instantaneous one. The bound is what makes it a test: a lag that
+    // keeps growing is a real defect, so how long it took is reported.
+    let local_deadline = Instant::now() + Duration::from_secs(20);
+    let local_start = Instant::now();
+    let mut last_missing: Option<String> = None;
+    loop {
+        let mut missing = None;
+        for node in west_nodes {
+            if !has_keyspace(node, &keyspace).await {
+                missing = Some(node);
+                break;
+            }
+        }
+        match missing {
+            None => break,
+            Some(node) => {
+                if Instant::now() >= local_deadline {
+                    panic!(
+                        "the DDL never reached node {} in the DC that committed it after {:?}\n=== log ===\n{}",
+                        node.host_id,
+                        local_start.elapsed(),
+                        node.log_tail(40)
+                    );
+                }
+                last_missing = Some(node.host_id.to_string());
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     }
+    let local_lag = local_start.elapsed();
+    assert!(
+        local_lag < Duration::from_secs(5),
+        "the DDL took {local_lag:?} to become visible in its own DC (last missing: {last_missing:?}) \
+         — convergence that slow is a regression, not scheduling noise"
+    );
 
     // And it must arrive in the other DC, delivered by that DC's own group.
     let deadline = Instant::now() + Duration::from_secs(60);

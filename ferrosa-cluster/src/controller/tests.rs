@@ -6380,7 +6380,10 @@ fn a_node_without_its_dcs_full_membership_does_not_claim_the_seed_role() {
 /// UUID, so exactly one node in a DC initialises its group.
 #[test]
 fn the_seed_role_is_claimable_only_from_a_complete_membership_and_by_the_highest_uuid() {
-    assert!(should_claim_seed_role(3, 2, true), "3 of 3 known, highest UUID");
+    assert!(
+        should_claim_seed_role(3, 2, true),
+        "3 of 3 known, highest UUID"
+    );
     assert!(
         !should_claim_seed_role(3, 2, false),
         "the same complete set from a non-highest node must stay passive"
@@ -6396,7 +6399,10 @@ fn the_seed_role_is_claimable_only_from_a_complete_membership_and_by_the_highest
 #[test]
 fn an_undeclared_cluster_size_keeps_the_single_node_seed_behaviour() {
     assert!(should_claim_seed_role(0, 0, true));
-    assert!(should_claim_seed_role(0, 5, true), "no declared size, nothing to wait for");
+    assert!(
+        should_claim_seed_role(0, 5, true),
+        "no declared size, nothing to wait for"
+    );
     assert!(!should_claim_seed_role(0, 0, false));
 }
 

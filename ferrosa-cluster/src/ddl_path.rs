@@ -779,7 +779,7 @@ fn ddl_op_to_raft_command(op: &DdlOperation) -> RaftCommand {
         } => RaftOp::Revoke {
             role: role.clone(),
             resource: resource.clone(),
-            permission: permission.clone(),
+            permission: *permission,
         },
         DdlOperation::GrantRole {
             member,
@@ -995,7 +995,7 @@ pub async fn execute_via_raft(raft: &FerrosRaft, op: &DdlOperation) -> Result<u6
     // Name the statement for the failure path before the op is consumed: a DDL
     // that cannot be committed has to say which statement was left unconfirmed.
     let operation = ddl_op_target(op);
-    let cmd = ddl_op_to_raft_command(&op);
+    let cmd = ddl_op_to_raft_command(op);
 
     // The proposal is **bounded**. openraft's `client_write` has no deadline of
     // its own, and it does not notify a pending proposal when the leader stops

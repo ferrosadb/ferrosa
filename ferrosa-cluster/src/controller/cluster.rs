@@ -1102,9 +1102,6 @@ impl ModeController {
         self.transition_to_cluster(peers);
     }
 
-    /// 4. TokenRing with deterministic initial token assignment
-    /// 5. ClusterCoordinator for replica-aware writes
-    /// 6. Swaps write path, DDL path, and cluster state atomically
     /// Initialise this DC's Raft group once its declared membership is complete and
     /// this node is that DC's seed.
     ///
@@ -1217,6 +1214,9 @@ impl ModeController {
         });
     }
 
+    /// 4. TokenRing with deterministic initial token assignment
+    /// 5. ClusterCoordinator for replica-aware writes
+    /// 6. Swaps write path, DDL path, and cluster state atomically
     pub(super) fn transition_to_cluster(&self, peers: Vec<(Uuid, SocketAddr)>) {
         // A node whose cluster was dissolved into a pair never runs Raft again
         // (t_47bbeb66): rebuilding it from the persisted log would rejoin the
