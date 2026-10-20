@@ -71,12 +71,6 @@ static PEAK: AtomicI64 = AtomicI64::new(0);
 /// Bytes freed during the window that were allocated outside it. Reported so a
 /// reader can see how much the untagged tracker would have mis-subtracted.
 static FOREIGN_FREED: AtomicI64 = AtomicI64::new(0);
-/// DIAGNOSTIC: window memory freed by a thread other than the measuring one.
-static OFF_THREAD_FREED: AtomicI64 = AtomicI64::new(0);
-static OFF_THREAD_ALLOCATED: AtomicI64 = AtomicI64::new(0);
-thread_local! {
-    static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
 
 /// Header in front of every block: room for the window tag, padded to the
 /// block's alignment so the pointer handed out keeps that alignment.
@@ -103,9 +97,6 @@ unsafe impl GlobalAlloc for TrackingAlloc {
         unsafe { ptr.cast::<u64>().sub(1).write_unaligned(window) };
         if window != 0 {
             let size = layout.size() as i64;
-            if !MEASURING.with(|m| m.get()) {
-                OFF_THREAD_ALLOCATED.fetch_add(size, Ordering::Relaxed);
-            }
             let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
             PEAK.fetch_max(live, Ordering::Relaxed);
         }
@@ -117,9 +108,6 @@ unsafe impl GlobalAlloc for TrackingAlloc {
         if window != 0 {
             let size = layout.size() as i64;
             if made_in == window {
-                if !MEASURING.with(|m| m.get()) {
-                    OFF_THREAD_FREED.fetch_add(size, Ordering::Relaxed);
-                }
                 LIVE.fetch_sub(size, Ordering::Relaxed);
             } else {
                 FOREIGN_FREED.fetch_add(size, Ordering::Relaxed);
@@ -144,18 +132,9 @@ fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
     LIVE.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
     FOREIGN_FREED.store(0, Ordering::SeqCst);
-    OFF_THREAD_FREED.store(0, Ordering::SeqCst);
-    OFF_THREAD_ALLOCATED.store(0, Ordering::SeqCst);
-    MEASURING.with(|m| m.set(true));
     WINDOW.store(NEXT_WINDOW.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
     let out = f();
     WINDOW.store(0, Ordering::SeqCst);
-    MEASURING.with(|m| m.set(false));
-    eprintln!(
-        "  DIAG off-thread: allocated={} B, freed-window-memory={} B",
-        OFF_THREAD_ALLOCATED.load(Ordering::SeqCst),
-        OFF_THREAD_FREED.load(Ordering::SeqCst)
-    );
     let peak = PEAK.load(Ordering::SeqCst);
     eprintln!(
         "  window: peak={peak} B, freed-but-allocated-outside-the-window={} B",
