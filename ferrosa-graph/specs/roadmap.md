@@ -65,7 +65,18 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   mutation sequence, the derived adjacency set equals the reconciler's recomputed
   set — an invariant regression net independent of the executor.
 
+- **The first heal still holds the hot path (FMEA G-14).** Refuse adjacency
+  queries retryably at once while a heal runs instead of holding them for its
+  whole duration; let a heal survive one replica restarting (CL ALL fails it
+  today); and record a completed heal cluster-wide so the other nodes skip the
+  rewrite the first one already sent to every replica.
+
 ## Implemented since the last revision
+
+- **G-14 — a completed deploy heal is not repeated (2026-10-19).** The heal
+  writes `<data_dir>/graph-adjacency-heals.json` once it completes with zero
+  errors, and later starts serve at once instead of rerunning a CL ALL rewrite
+  of the whole keyspace before the first traversal (t_504435aa).
 
 - **G-3 — reconciler writes at the keyspace replication strategy (2026-10-03).**
   `write_mutation` / `write_tombstone` write the index at CL ALL under the

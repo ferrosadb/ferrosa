@@ -25,6 +25,7 @@ use ferrosa_storage::StorageEngine;
 
 use tokio_util::sync::CancellationToken;
 
+use crate::adjacency::heal_record;
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::{
     reconcile_once_with, record_heal, spawn_reconciliation, ReconcileMode,
@@ -493,11 +494,17 @@ type HealGate =
 fn spawn_on_first_poll_heal(
     schema: Arc<Schema>,
     write_path: Arc<ArcSwap<WritePath>>,
+    data_dir: std::path::PathBuf,
     keyspace: String,
 ) -> HealGate {
     use futures::FutureExt;
     async move {
-        let heal = tokio::spawn(heal_adjacency(schema, write_path.load_full(), keyspace));
+        let heal = tokio::spawn(heal_adjacency_unless_recorded(
+            schema,
+            write_path.load_full(),
+            data_dir,
+            keyspace,
+        ));
         match heal.await {
             Ok(outcome) => outcome,
             Err(join_error) => {
@@ -513,6 +520,57 @@ fn spawn_on_first_poll_heal(
     }
     .boxed()
     .shared()
+}
+
+/// The heal of `keyspace`, unless this node already completed one
+/// ([`heal_record`]). A completed heal is recorded so the next start skips it.
+///
+/// Fallbacks, both logged at ERROR: a record that cannot be read means heal
+/// (slow but correct); a completed heal that cannot be recorded still serves,
+/// and the next start heals again.
+async fn heal_adjacency_unless_recorded(
+    schema: Arc<Schema>,
+    wp: Arc<WritePath>,
+    data_dir: std::path::PathBuf,
+    keyspace: String,
+) -> std::result::Result<(), String> {
+    let (dir, ks) = (data_dir.clone(), keyspace.clone());
+    match tokio::task::spawn_blocking(move || heal_record::healed(&dir, &ks)).await {
+        Ok(Ok(true)) => {
+            tracing::info!(
+                keyspace = %keyspace,
+                "graph engine: adjacency heal already completed on this node; serving traversals"
+            );
+            return Ok(());
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => tracing::error!(
+            keyspace = %keyspace,
+            error = %e,
+            "graph engine: cannot read the adjacency heal record; healing as if none completed"
+        ),
+        Err(join_error) => tracing::error!(
+            keyspace = %keyspace,
+            error = %join_error,
+            "graph engine: reading the adjacency heal record died; healing as if none completed"
+        ),
+    }
+    heal_adjacency(schema, wp, keyspace.clone()).await?;
+    let ks = keyspace.clone();
+    match tokio::task::spawn_blocking(move || heal_record::record_healed(&data_dir, &ks)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(
+            keyspace = %keyspace,
+            error = %e,
+            "graph engine: adjacency heal completed but was not recorded; the next start heals again"
+        ),
+        Err(join_error) => tracing::error!(
+            keyspace = %keyspace,
+            error = %join_error,
+            "graph engine: recording the adjacency heal died; the next start heals again"
+        ),
+    }
+    Ok(())
 }
 
 /// One complete reconcile of `keyspace` before it serves traversals, in
@@ -571,8 +629,8 @@ async fn heal_adjacency(
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
     schema: Arc<Schema>,
-    /// Retained to keep the `Arc<StorageEngine>` alive for observers and WritePath.
-    #[allow(dead_code)]
+    /// Adjacency registration and observers, and the data dir that holds the
+    /// heal record.
     storage: Arc<StorageEngine>,
     write_path: Arc<ArcSwap<WritePath>>,
     config: GraphEngineConfig,
@@ -837,8 +895,10 @@ impl GraphEngine {
     }
 
     /// Make `keyspace`'s adjacency index ready to answer traversals: register
-    /// it, then — once per process — reconcile it completely before any
-    /// traversal on it runs.
+    /// it, then — once per node, ever — reconcile it completely before any
+    /// traversal on it runs. A completed heal is recorded in the data dir
+    /// ([`heal_record`]), so a restart serves at once instead of every
+    /// adjacency query waiting for the whole-keyspace rewrite again.
     ///
     /// This is the deploy heal. Builds before 330a0c29 tombstoned every
     /// adjacency entry of an edge table not keyed exactly (source)/(target)
@@ -890,6 +950,7 @@ impl GraphEngine {
         let candidate = spawn_on_first_poll_heal(
             Arc::clone(&self.schema),
             Arc::clone(&self.write_path),
+            self.storage.data_dir().to_path_buf(),
             keyspace.to_string(),
         );
         let mut published = None;

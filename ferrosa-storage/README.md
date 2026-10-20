@@ -850,8 +850,10 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   rewrites identical cells, so a repeat adds no rows. Frames of a table that
   was DROPPED after they were written are never applied to a re-created table of
   the same name: `unregister_table` durably records each drop in
-  `<data_dir>/dropped-tables.json` (`table_drops.rs`; a drop that cannot be
-  recorded is refused), and a file created at or before a table's drop holds only
+  `<data_dir>/dropped-tables.json` (`table_drops.rs`, written by
+  `schema_snapshot::persist_bounded_json` — public, so ferrosa-graph's
+  adjacency heal record uses the same staged, fsynced, renamed write; a drop
+  that cannot be recorded is refused), and a file created at or before a table's drop holds only
   earlier-incarnation frames. Those are copied (fsynced) to
   `<data_dir>/commitlog-quarantine/<file>.stale`, logged at ERROR, counted in
   `replay_set_aside_stale_frames_total`, and only then leave the set-aside file.

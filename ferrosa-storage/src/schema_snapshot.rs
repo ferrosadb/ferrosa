@@ -312,9 +312,11 @@ impl SchemaSnapshotStore {
     }
 }
 
-/// Atomically persist a storage-private JSON document without constructing an
-/// intermediate byte buffer. The filename is crate-controlled, not user input.
-pub(crate) fn persist_bounded_json<T: Serialize>(
+/// Atomically persist a JSON document under the data dir without constructing
+/// an intermediate byte buffer. The filename is a caller constant, not user
+/// input. Public so a crate that keeps a per-node ledger in the data dir (the
+/// graph engine's adjacency heal record) writes it the same durable way.
+pub fn persist_bounded_json<T: Serialize>(
     data_dir: &Path,
     filename: &str,
     value: &T,

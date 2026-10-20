@@ -160,12 +160,15 @@ A query flows: **parse → bind params → validate + authorize → logical plan
 physical plan → execute**. Every query in a keyspace that touches edges first
 awaits `GraphEngine::ensure_adjacency_ready`: once per process and keyspace it
 lazily creates `system_graph_<ks>.adjacency`, registers the
-`AdjacencyIndexObserver`, (if configured) starts the background reconciliation
-loop, and runs one complete synchronous reconcile pass — the **heal** — before
-any traversal reads the index. Concurrent first queries wait on the same heal
-(a `tokio::sync::OnceCell` per keyspace). A heal with any failed read, scan or
-write is not marked done: the query fails with the retryable
-`GraphError::Unavailable` (HTTP 503) and the next query heals again.
+`AdjacencyIndexObserver` and (if configured) starts the background
+reconciliation loop. Once per **node** and keyspace it runs one complete
+reconcile pass — the **heal** — before any traversal reads the index.
+Concurrent first queries wait on the same heal (a shared future per keyspace,
+run in its own task). A completed heal is recorded in the storage data dir
+(`graph-adjacency-heals.json`, `adjacency::heal_record`), so later starts skip
+it and serve at once. A heal with any failed read, scan or write is not
+recorded: the query fails with the retryable `GraphError::Unavailable`
+(HTTP 503) and the next query heals again.
 
 The **adjacency-consistency invariant** is the heart of the crate: every edge
 write must produce the matching OUT and IN adjacency entries. This is enforced
@@ -212,7 +215,7 @@ What happens on the first start of this build:
 
 1. Nothing at boot. The heal runs on the first graph query that needs the
    adjacency index in `agent_memory` (ferrosa-memory's first `TYPED_EDGE`
-   lookup), on each node independently, once per process.
+   lookup), on each node independently, until it completes once on that node.
 2. That query, and every adjacency query arriving while it runs, waits for
    one complete reconcile of every `agent_memory` edge table. Queries that
    need no adjacency (plain `RETURN`, vertex lookups) are not held.
@@ -253,9 +256,19 @@ cargo test --release -p ferrosa-graph --features slow-tests \
   --test adjacency_deploy_heal -- slow:: --nocapture
 ```
 
-The heal runs on every process start, not only the first after the deploy.
-Restarts therefore pay the same cost, and a node never serves traversals
-from an index it has not reconciled in this process.
+**A completed heal is not repeated.** Before 2026-10-19 the heal was held in
+memory only, so every restart reran it, and every edge MATCH/MERGE on the
+memory cluster waited about five minutes for a CL ALL rewrite of an index that
+was already whole. The damage comes only from pre-330a0c29 builds, so one
+complete heal per node is enough. The node now writes
+`<data_dir>/graph-adjacency-heals.json` (keyspace → heal version) after a heal
+with zero errors, and a start that finds the current version logs
+`adjacency heal already completed on this node` and serves at once. A record
+that does not parse is not trusted: the node heals, and logs
+`cannot read the adjacency heal record` at ERROR; it does not overwrite the
+file, so every start heals until an operator removes it. To force a heal on one node,
+stop it and delete that file; a build that needs every node to heal again
+raises `heal_record::HEAL_VERSION`.
 
 **Verify on one node** before rolling the others:
 
