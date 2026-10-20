@@ -1367,10 +1367,50 @@ impl AccordStateMachine {
         for (id, _) in &outcome.applied {
             self.applying.remove(id);
         }
+        let parked = !outcome.applied.iter().any(|(id, _)| *id == txn_id);
         // `storage_ok` was required above, so the engine's own commit-log fsync has
         // already returned for every id here: their rows are durable.
         self.bookkeep_applied_dedup(outcome.applied, true);
+        if parked {
+            self.release_parked_from_deps_ordered_after(txn_id);
+        }
         SmResponse::None
+    }
+
+    /// Re-check, under the state lock, the dependencies a lock-free apply parked
+    /// `waiter` on, and waive every one that has since committed AFTER it.
+    ///
+    /// [`Self::begin_apply_owned`] filters the dependency set under the state
+    /// lock, but the park happens later, without it. A dependency that commits
+    /// with a later `t` in between runs [`Self::release_waiters_ordered_before`]
+    /// while `waiter` is not parked yet, so nothing releases it, and `waiter`
+    /// then parks on a transaction ordered after it. That transaction never
+    /// applies first when its own read (a PostgreSQL snapshot barrier) waits for
+    /// `waiter` — the two wait on each other until the barrier abstains. A
+    /// dependency committing after this check finds `waiter` parked and releases
+    /// it itself, so together the two checks leave no window.
+    fn release_parked_from_deps_ordered_after(&mut self, waiter: TxnId) {
+        let Some(t) = self
+            .txn_states
+            .get(&waiter)
+            .filter(|state| state.phase == TxnPhase::Committed)
+            .map(|state| state.t)
+        else {
+            return;
+        };
+        let mut released: Vec<(TxnId, Vec<u8>)> = Vec::new();
+        {
+            // The engine's park/cascade is single-writer under the apply gate.
+            let _gate = self.apply_gate.lock();
+            for dep in self.apply_engine.parked_deps_of(&waiter) {
+                if self.executes_after(&dep, &t) {
+                    released.extend(self.apply_engine.waive_dependency(waiter, dep));
+                }
+            }
+        }
+        // Each released write-set was applied by `waive_dependency`, so its rows
+        // are durable.
+        self.bookkeep_applied_dedup(released, true);
     }
 
     /// Whether `dep` is committed with an execution timestamp later than `t`, so
@@ -1390,13 +1430,20 @@ impl AccordStateMachine {
     /// dependency would otherwise wait on each other until a timeout failed both.
     fn release_waiters_ordered_before(&mut self, dep: TxnId, dep_t: Timestamp) {
         let mut released: Vec<(TxnId, Vec<u8>)> = Vec::new();
-        for waiter in self.apply_engine.waiters_on(&dep) {
-            let executes_before = self
-                .txn_states
-                .get(&waiter)
-                .is_some_and(|state| state.phase == TxnPhase::Committed && state.t < dep_t);
-            if executes_before {
-                released.extend(self.apply_engine.waive_dependency(waiter, dep));
+        {
+            // Hold the apply gate: a lock-free apply parks under it, not under the
+            // state lock. Without it this could waive a waiter whose waits are
+            // registered but whose write-set is not stored yet, marking it applied
+            // with nothing persisted.
+            let _gate = self.apply_gate.lock();
+            for waiter in self.apply_engine.waiters_on(&dep) {
+                let executes_before = self
+                    .txn_states
+                    .get(&waiter)
+                    .is_some_and(|state| state.phase == TxnPhase::Committed && state.t < dep_t);
+                if executes_before {
+                    released.extend(self.apply_engine.waive_dependency(waiter, dep));
+                }
             }
         }
         // Each released waiter's parked write-set was applied by `waive_dependency`
@@ -2749,6 +2796,49 @@ mod tests {
             sm.get_state(&waiting).unwrap().phase,
             TxnPhase::Applied,
             "the dependency committed after this transaction, so the wait is waived"
+        );
+        assert_eq!(
+            capturing.captured(),
+            [(waiting, b"write".to_vec(), ts(1002))]
+        );
+    }
+
+    /// The LOCK-FREE inbound apply (`begin_apply_owned` → durable step →
+    /// `finish_apply`) filters the dependency set under the state lock, then
+    /// parks WITHOUT it. A dependency that commits with a later `t` inside that
+    /// window found no parked waiter to release, and the waiter then parked on
+    /// it anyway, waiting for a transaction ordered AFTER it to apply first.
+    /// When that later transaction is a PostgreSQL snapshot barrier, its own
+    /// read waits for this apply, so the two waited on each other until the
+    /// barrier abstained with "snapshot barrier dependencies were not applied
+    /// locally" (nightly fuzz 39222070801, `quorum_availability`).
+    #[test]
+    fn a_dependency_committing_later_during_a_lock_free_apply_does_not_park_it() {
+        let capturing = Arc::new(CapturingApplier::new());
+        let mut sm =
+            AccordStateMachine::with_applier(1, Arc::new(MockSyncWriter::new()), capturing.clone());
+        let (waiting, later) = crossed_pair();
+        sm.handle_preaccept(later, ts(1000), b"key", BallotNumber(0), 0);
+        sm.handle_preaccept(waiting, ts(1001), b"key", BallotNumber(0), 0);
+        sm.handle_commit(waiting, ts(1001), ts(1002), vec![later]);
+
+        // Phase 1 under the state lock: `later`'s final t is not known yet, so
+        // it stays in the dependency set the durable step will park on.
+        let work = match sm.begin_apply_owned(waiting, vec![b"write".to_vec()]) {
+            ApplyStep::Durable(work) => work,
+            ApplyStep::Done(response) => panic!("setup: expected durable work, got {response:?}"),
+        };
+        // The state lock is free while the durable step runs: `later` commits
+        // AFTER `waiting` in that window.
+        sm.handle_commit(later, ts(1000), ts(2000), vec![]);
+        let outcome = execute_apply_durability(*work);
+        sm.finish_apply(waiting, outcome);
+
+        assert_eq!(
+            sm.get_state(&waiting).unwrap().phase,
+            TxnPhase::Applied,
+            "a dependency that committed after this transaction while its apply was \
+             outside the state lock must not hold it parked"
         );
         assert_eq!(
             capturing.captured(),
