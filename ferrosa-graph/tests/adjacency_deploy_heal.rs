@@ -1104,6 +1104,46 @@ async fn deleting_one_edge_type_keeps_its_sibling_traversable() {
     );
 }
 
+/// A fully keyed but absent start vertex must terminate before reading any
+/// adjacency partition, even when the table already contains unrelated edges.
+#[tokio::test]
+async fn absent_keyed_start_does_not_scan_adjacency_partitions() {
+    let node = Node::new();
+    let engine = node.start_engine();
+    let tenant = tenant_id(0);
+    let session = session_id(0, 0);
+
+    for i in 0..24 {
+        let edge = Edge {
+            tenant,
+            session,
+            src: entity(0, 0, i * 2),
+            edge_type: "related_to",
+            dst: entity(0, 0, i * 2 + 1),
+        };
+        run_ok(&engine, &merge_query(&edge)).await;
+    }
+
+    let absent = Uuid::nil();
+    let query = format!(
+        "MATCH (a:Entity {{tenant_id: {}, session_id: {}, entity_id: {}}})\
+         -[r:TYPED_EDGE]->(b:Entity) RETURN r",
+        q(tenant),
+        q(session),
+        q(absent),
+    );
+    let result = engine
+        .execute(&query, KEYSPACE, &superuser())
+        .await
+        .expect("absent keyed anchor query");
+
+    assert!(result.rows.is_empty());
+    assert_eq!(
+        result.stats.edges_read, 0,
+        "no adjacency partition should be read"
+    );
+}
+
 /// Cluster mode, replication factor 2: the heal on one node repairs EVERY
 /// replica, not only the token's primary.
 ///

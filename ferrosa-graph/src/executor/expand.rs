@@ -5,6 +5,12 @@
 //!    `VirtualTable::read()` if the source is a virtual table)
 //! 2. For each hop, reading the adjacency index to find neighbors
 //! 3. Building a `GraphResult` with columns from the return clause
+//!
+//! Correctness: keyed anchors read only their adjacency partition, and hop
+//! frontiers stop at the configured fan-out bound without a duplicate neighbor
+//! vector.
+//! Last revised: 2026-10-06
+//! Last changed: Streamed adjacency neighbors and enforce frontier bounds per state.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -1703,6 +1709,7 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
             anchor,
             hops,
             optional_hops,
+            config.max_fan_out_per_hop,
             schema,
             &mut stats,
         )
@@ -1873,18 +1880,14 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                     .as_ref()
                     .and_then(|vt| table_metadata_for(schema, &vt.keyspace, &vt.table));
 
-                let pairs: Vec<(&Row, Vec<u8>)> = partition
-                    .rows
-                    .iter()
-                    .filter_map(|row| {
-                        traversable_neighbor_id(
-                            row,
-                            hop.edge_label.as_deref(),
-                            expected_adjacency_direction(hop.direction),
-                        )
-                        .map(|nid| (row, nid))
-                    })
-                    .collect();
+                let mut pairs_iter = partition.rows.iter().filter_map(|row| {
+                    traversable_neighbor_id(
+                        row,
+                        hop.edge_label.as_deref(),
+                        expected_adjacency_direction(hop.direction),
+                    )
+                    .map(|nid| (row, nid))
+                });
 
                 // Hydrate this vertex's neighbors with BOUNDED CONCURRENCY
                 // (t_4ce82a3e increment 3).
@@ -1912,7 +1915,6 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                 // would change which rows a LIMIT returns); only uncapped hops —
                 // where the full fan-out is consumed and order is re-established
                 // downstream — hydrate concurrently.
-                let mut pairs_iter = pairs.into_iter();
                 if cap_this_hop.is_some() {
                     for (row, nid) in pairs_iter {
                         if let Some(st) = hydrate_hop_neighbor(
@@ -1928,7 +1930,11 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                         )
                         .await?
                         {
-                            next_states.push(st);
+                            push_state_with_fan_out_limit(
+                                &mut next_states,
+                                st,
+                                config.max_fan_out_per_hop,
+                            )?;
                             if cap_this_hop.is_some_and(|cap| next_states.len() >= cap) {
                                 break 'states;
                             }
@@ -1958,18 +1964,13 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                             break;
                         };
                         if let Some(st) = hydrated? {
-                            next_states.push(st);
+                            push_state_with_fan_out_limit(
+                                &mut next_states,
+                                st,
+                                config.max_fan_out_per_hop,
+                            )?;
                         }
                     }
-                }
-
-                // T4: fan-out limit per hop.
-                if next_states.len() > config.max_fan_out_per_hop {
-                    return Err(GraphError::ResourceLimit(format!(
-                        "fan-out limit exceeded: {} neighbors (limit: {})",
-                        next_states.len(),
-                        config.max_fan_out_per_hop
-                    )));
                 }
             }
         }
@@ -2587,10 +2588,14 @@ async fn execute_optional_hops(
                         );
                         bindings.insert(rel_var.clone(), edge_json);
                     }
-                    next_states.push(ExpandState {
-                        current_key: neighbor_key,
-                        bindings,
-                    });
+                    push_state_with_fan_out_limit(
+                        &mut next_states,
+                        ExpandState {
+                            current_key: neighbor_key,
+                            bindings,
+                        },
+                        config.max_fan_out_per_hop,
+                    )?;
                 }
             }
             if next_states.len() == before_len {
@@ -2600,17 +2605,14 @@ async fn execute_optional_hops(
                         .entry(var.clone())
                         .or_insert(serde_json::Value::Null);
                 }
-                next_states.push(ExpandState {
-                    current_key: state.current_key.clone(),
-                    bindings,
-                });
-            }
-            if next_states.len() > config.max_fan_out_per_hop {
-                return Err(GraphError::ResourceLimit(format!(
-                    "fan-out limit exceeded: {} neighbors (limit: {})",
-                    next_states.len(),
-                    config.max_fan_out_per_hop
-                )));
+                push_state_with_fan_out_limit(
+                    &mut next_states,
+                    ExpandState {
+                        current_key: state.current_key.clone(),
+                        bindings,
+                    },
+                    config.max_fan_out_per_hop,
+                )?;
             }
         }
         stats.vertices_read += next_states.len();
@@ -2619,12 +2621,31 @@ async fn execute_optional_hops(
     Ok(current_states)
 }
 
+/// Add one result state while enforcing the fan-out limit before growing the
+/// frontier beyond its configured memory bound.
+fn push_state_with_fan_out_limit(
+    states: &mut Vec<ExpandState>,
+    state: ExpandState,
+    limit: usize,
+) -> Result<()> {
+    if states.len() >= limit {
+        return Err(GraphError::ResourceLimit(format!(
+            "fan-out limit exceeded: {} neighbors (limit: {})",
+            states.len() + 1,
+            limit
+        )));
+    }
+    states.push(state);
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn try_edge_anchored_initial_states(
     write_path: &WritePath,
     anchor: &Anchor,
     hops: &[Hop],
     optional_hops: &[Hop],
+    max_fan_out_per_hop: usize,
     schema: Option<&Schema>,
     stats: &mut QueryStats,
 ) -> Result<Option<Vec<ExpandState>>> {
@@ -2805,10 +2826,14 @@ async fn try_edge_anchored_initial_states(
                 );
             }
 
-            states.push(ExpandState {
-                current_key: DecoratedKey::new(PartitionKey::new(target_id)),
-                bindings,
-            });
+            push_state_with_fan_out_limit(
+                &mut states,
+                ExpandState {
+                    current_key: DecoratedKey::new(PartitionKey::new(target_id)),
+                    bindings,
+                },
+                max_fan_out_per_hop,
+            )?;
         }
     }
 
@@ -6849,6 +6874,35 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn adjacency_hop_does_not_collect_a_partition_sized_neighbor_vector() {
+        let src = include_str!("expand.rs");
+        let body = src
+            .split("async fn expand_to_states")
+            .nth(1)
+            .expect("expand_to_states must exist");
+        let body = &body[..body
+            .find("// Apply WHERE predicates")
+            .expect("the hop body must end before post-filters")];
+
+        assert!(
+            body.contains("write_path.read(&adj_table_id, vertex_key)"),
+            "an anchored vertex must read its adjacency partition by key"
+        );
+        assert!(
+            !body.contains("range_read_stream_all(&adj_table_id"),
+            "a bound start vertex must not enumerate the adjacency table"
+        );
+        assert!(
+            !body.contains("let pairs: Vec<(&Row, Vec<u8>)>"),
+            "neighbor IDs should be pulled from the partition rows, not copied into a second partition-sized vector"
+        );
+        assert!(
+            body.contains("push_state_with_fan_out_limit"),
+            "the frontier limit must stop state allocation as soon as it is reached"
+        );
+    }
 
     /// Aggregation must fold its input, not hold it.
     ///
