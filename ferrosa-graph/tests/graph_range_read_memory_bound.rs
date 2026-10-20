@@ -549,6 +549,31 @@ fn assert_bounded(name: &str, small: &Peaks, large: &Peaks, growth_factor: i64) 
     );
 }
 
+/// Run the unmeasured warm-up `query`, waiting out the keyspace's first-use
+/// adjacency heal as a retrying client does: a query during a heal that
+/// outlasts the engine's wait budget is refused retryably, and the heal goes
+/// on in its own task. Waiting here also keeps the heal out of the measured
+/// run, whose peak it would otherwise inflate.
+fn warm_up(rt: &tokio::runtime::Runtime, engine: &GraphEngine, query: &str) {
+    let auth = superuser();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match rt.block_on(engine.execute(query, KEYSPACE, &auth)) {
+            Ok(_) => return,
+            Err(ferrosa_graph::error::GraphError::Unavailable(reason)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "warm-up: the heal did not complete within 120 s: {reason}"
+                );
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                });
+            }
+            Err(other) => panic!("warm-up query: {other:?}"),
+        }
+    }
+}
+
 // --- 1. anchor scan (executor/expand.rs read_anchor_partitions) -----------
 
 fn anchor_scan_peaks(n: usize) -> Peaks {
@@ -562,8 +587,7 @@ fn anchor_scan_peaks(n: usize) -> Peaks {
     // One unmeasured run so lazily-built, query-independent state (schema
     // snapshots, adjacency-keyspace registration, the storage read path) is not
     // charged to the measured run.
-    rt.block_on(engine.execute(&query, KEYSPACE, &auth))
-        .expect("warm-up query");
+    warm_up(&rt, &engine, &query);
     let (result, operation) = measure_peak(|| {
         rt.block_on(engine.execute(
             &format!("MATCH (p:Person {{name: '{NEEDLE}'}}) RETURN p.name"),
@@ -609,8 +633,7 @@ fn edge_anchored_peaks(n: usize) -> Peaks {
     let engine = Arc::clone(&fx.engine);
     let auth = superuser();
     let query = format!("MATCH (a:Person)-[r:KNOWS {{tag: '{NEEDLE}'}}]->(b:Person) RETURN r.tag");
-    rt.block_on(engine.execute(&query, KEYSPACE, &auth))
-        .expect("warm-up query");
+    warm_up(&rt, &engine, &query);
     let (result, operation) = measure_peak(|| {
         rt.block_on(engine.execute(
             &format!("MATCH (a:Person)-[r:KNOWS {{tag: '{NEEDLE}'}}]->(b:Person) RETURN r.tag"),
@@ -666,8 +689,7 @@ fn varpath_peaks(n: usize) -> Peaks {
     let engine = Arc::clone(&fx.engine);
     let auth = superuser();
     let query = format!("MATCH (a:Person {{name: '{NEEDLE}'}})-[:KNOWS*1..2]->(b) RETURN b");
-    rt.block_on(engine.execute(&query, KEYSPACE, &auth))
-        .expect("warm-up query");
+    warm_up(&rt, &engine, &query);
     let (result, operation) = measure_peak(|| {
         rt.block_on(engine.execute(
             &format!("MATCH (a:Person {{name: '{NEEDLE}'}})-[:KNOWS*1..2]->(b) RETURN b"),

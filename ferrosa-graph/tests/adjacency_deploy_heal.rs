@@ -262,6 +262,14 @@ impl Node {
             std::time::Duration::from_secs(300),
         )
     }
+
+    /// [`Node::start_engine`], once it serves adjacency queries (see
+    /// [`healed`]). For engines that are not themselves under test.
+    async fn healed_engine(&self) -> GraphEngine {
+        let engine = self.start_engine();
+        healed(&engine).await;
+        engine
+    }
 }
 
 // ── The graph, and the reference it is checked against ──────────────────
@@ -461,10 +469,52 @@ impl Reference {
     }
 }
 
+/// Wait, as a retrying client does, until `engine` serves adjacency queries:
+/// a query during a heal that outlasts the wait budget is refused retryably
+/// (`GraphError::Unavailable`), and the heal goes on in its own task. A
+/// bounded poll on the engine's own readiness, never a sleep: on a loaded
+/// host even a small heal outlasts the budget, which is the contract.
+async fn healed(engine: &GraphEngine) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match engine.ensure_adjacency_ready_for_test(KEYSPACE).await {
+            Ok(()) => return,
+            Err(ferrosa_graph::error::GraphError::Unavailable(reason)) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the heal did not complete within 120 s: {reason}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(other) => {
+                panic!("adjacency readiness failed for a reason other than a heal: {other}")
+            }
+        }
+    }
+}
+
 /// Every traversal ferrosa-memory issues, for every vertex, all issued at once
 /// against `engine` — as the first requests after a restart arrive together.
-/// Returns the mismatches, so one failure shows the whole damage.
+/// Returns the mismatches, so one failure shows the whole damage. A refusal is
+/// a mismatch: call [`healed`] first when every query must be answered.
 async fn check_all(engine: &GraphEngine, reference: &Reference) -> Vec<String> {
+    check_all_with(engine, reference, Refusal::Mismatch).await
+}
+
+/// Whether a retryable refusal (a heal still running) counts as a mismatch.
+#[derive(Clone, Copy, PartialEq)]
+enum Refusal {
+    Mismatch,
+    /// Issued while a heal may be running: a refusal is allowed, a wrong or
+    /// partial answer never is.
+    Allowed,
+}
+
+async fn check_all_with(
+    engine: &GraphEngine,
+    reference: &Reference,
+    refusal: Refusal,
+) -> Vec<String> {
     let queries: Vec<(String, (Uuid, Uuid, Uuid), bool)> = reference
         .vertices
         .iter()
@@ -482,6 +532,11 @@ async fn check_all(engine: &GraphEngine, reference: &Reference) -> Vec<String> {
     for ((query, key, is_out), answer) in queries.iter().zip(answers) {
         let rows = match answer {
             Ok(rows) => rows,
+            Err(ferrosa_graph::error::GraphError::Unavailable(_))
+                if refusal == Refusal::Allowed =>
+            {
+                continue;
+            }
             Err(e) => {
                 mismatches.push(format!("{key:?} failed: {e}\n  {query}"));
                 continue;
@@ -908,7 +963,7 @@ async fn damage(
     let (before, after): (Vec<_>, Vec<_>) = all.iter().enumerate().partition(|(i, _)| i % 10 != 9);
     let mut live: BTreeSet<Edge> = BTreeSet::new();
 
-    let old = node.start_engine();
+    let old = node.healed_engine().await;
     for (_, e) in &before {
         run_ok(&old, &merge_query(e)).await;
         live.insert(**e);
@@ -955,20 +1010,23 @@ async fn damage(
 
 /// The first traversals after the deploy — issued together, as a restarted
 /// node receives them — see every live edge in its direction and no deleted
-/// edge, and `count(r)` matches the reference.
+/// edge, or are refused retryably while the heal runs; never a partial
+/// answer. Once the heal is done every query is answered, and `count(r)`
+/// matches the reference.
 #[tokio::test]
-async fn first_traversals_after_deploy_see_every_live_edge_and_no_deleted_one() {
+async fn first_traversals_after_deploy_answer_from_a_healed_index_or_refuse() {
     // ~500 adjacency entries: past RECONCILE_YIELD_EVERY_CHECKED_ENTRIES
     // (256), so the heal yields mid-pass and the queries issued with it run
-    // while it is half done — unless they wait for it.
+    // while it is half done — unless they wait for it or are refused.
     let (node, all, live) = damaged_node(2, 1, 40).await;
     let reference = Reference::new(&all, &live);
 
     let fresh = node.start_engine();
     assert_clean(
         "first traversals after the deploy",
-        &check_all(&fresh, &reference).await,
+        &check_all_with(&fresh, &reference, Refusal::Allowed).await,
     );
+    healed(&fresh).await;
     assert_clean(
         "counts after the deploy",
         &check_counts(&fresh, &reference).await,
@@ -1007,6 +1065,7 @@ async fn incomplete_heal_fails_retryably_and_the_next_query_heals() {
     );
 
     write_path.store(Arc::new(node.write_path()));
+    healed(&fresh).await;
     assert_clean(
         "traversals after the retried heal",
         &check_all(&fresh, &reference).await,
@@ -1055,7 +1114,130 @@ async fn a_restart_after_a_completed_heal_does_not_heal_again() {
     );
     assert_clean(
         "traversals after a restart that skipped the heal",
-        &check_all(&node.start_engine(), &reference).await,
+        &check_all(&node.healed_engine().await, &reference).await,
+    );
+}
+
+/// Write `e` and its two endpoint entities as CQL `INSERT`s do: straight to
+/// storage. No adjacency entry is derived unless an engine has already
+/// registered its observer for the keyspace. The endpoints are written
+/// because a traversal binds both `Entity` vertices; without them the MATCH
+/// is empty whatever the index holds.
+fn insert_edge_as_cql(storage: &StorageEngine, e: &Edge) {
+    let ts = now_micros();
+    let (key, clustering) = typed_edge_key(e);
+    for id in [e.src, e.dst] {
+        storage
+            .write(
+                &TableId::new(KEYSPACE, "entity_store"),
+                &key,
+                Row {
+                    clustering: id.as_bytes().to_vec(),
+                    cells: vec![(0, CellValue::live(format!("entity-{id}").into_bytes(), ts))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                },
+                ts,
+            )
+            .unwrap();
+    }
+    storage
+        .write(
+            &TableId::new(KEYSPACE, "typed_edges"),
+            &key,
+            Row {
+                clustering,
+                cells: vec![],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            },
+            ts,
+        )
+        .unwrap();
+}
+
+/// Edges inserted through CQL before the keyspace's first graph query are
+/// traversable once it runs.
+///
+/// Driver Smoke on PR #590 (2026-10-20): `test_bolt_compat.py` creates the
+/// edge tables, INSERTs its edges over CQL, then runs Bolt MATCHes. The
+/// adjacency observer is registered lazily by the first graph query, so those
+/// INSERTs derived no entries; the first-use heal built them from the edge
+/// table. Skipping the heal for an index this node had just created left
+/// every relationship MATCH empty.
+#[tokio::test]
+async fn edges_inserted_before_the_first_graph_query_are_traversable() {
+    let node = Node::new();
+    let (t, s) = (tenant_id(0), session_id(0, 0));
+    let e = Edge {
+        tenant: t,
+        session: s,
+        src: entity(0, 0, 0),
+        edge_type: "related_to",
+        dst: entity(0, 0, 1),
+    };
+    insert_edge_as_cql(&node.storage, &e);
+
+    let engine = node.healed_engine().await;
+    let rows = run_ok(&engine, &related_query(t, s, e.src)).await;
+    let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
+    assert_eq!(
+        got,
+        BTreeSet::from([e.dst.to_string()]),
+        "an edge INSERTed before the first graph query must be traversable"
+    );
+}
+
+/// After a restart, edges inserted through CQL before the keyspace's first
+/// graph query are traversable, even though this node already recorded a
+/// completed heal.
+///
+/// The observer is registered by the first graph query of each PROCESS, so a
+/// restarted node's CQL edge writes derive no entries until then. Before
+/// #589 the first query's heal built them; the heal record (#589) skips that
+/// heal on restart, and nothing else backfills them.
+#[tokio::test]
+async fn edges_inserted_after_a_restart_before_the_first_graph_query_are_traversable() {
+    let node = Node::new();
+    drop(node.healed_engine().await);
+    node.storage
+        .shutdown()
+        .expect("the first process shuts down cleanly");
+
+    // The second process: a new storage engine over the same data dir.
+    let storage = Arc::new(StorageEngine::new(storage_config(&node._dir), None).unwrap());
+    register_storage_tables(&storage);
+    storage
+        .register_table(
+            ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE).to_storage_schema(),
+        )
+        .unwrap();
+    let (t, s) = (tenant_id(0), session_id(0, 0));
+    let e = Edge {
+        tenant: t,
+        session: s,
+        src: entity(0, 0, 0),
+        edge_type: "related_to",
+        dst: entity(0, 0, 1),
+    };
+    insert_edge_as_cql(&storage, &e);
+
+    let engine = GraphEngine::new(
+        Arc::clone(&node.schema),
+        Arc::clone(&storage),
+        Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::direct(
+            Arc::clone(&storage),
+        ))),
+        GraphEngineConfig::default(),
+        std::time::Duration::from_secs(300),
+    );
+    healed(&engine).await;
+    let rows = run_ok(&engine, &related_query(t, s, e.src)).await;
+    let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
+    assert_eq!(
+        got,
+        BTreeSet::from([e.dst.to_string()]),
+        "an edge INSERTed after a restart, before the first graph query, must be traversable"
     );
 }
 
@@ -1080,7 +1262,7 @@ async fn an_incomplete_heal_is_not_recorded_and_the_next_start_heals() {
     );
     assert_clean(
         "traversals once a start can heal",
-        &check_all(&node.start_engine(), &reference).await,
+        &check_all(&node.healed_engine().await, &reference).await,
     );
 }
 
@@ -1109,7 +1291,7 @@ async fn an_unreadable_heal_record_heals_rather_than_skips() {
     );
     assert_clean(
         "traversals after healing past an unreadable record",
-        &check_all(&node.start_engine(), &reference).await,
+        &check_all(&node.healed_engine().await, &reference).await,
     );
 }
 
@@ -1176,7 +1358,19 @@ async fn first_query_through_foreach_still_heals_before_traversals() {
         dst = q(some.dst),
         ty = some.edge_type,
     );
-    run_ok(&fresh, &foreach).await;
+    // Retried as a client retries a refusal during the heal. Once it is
+    // answered, the heal it gated is done, so every traversal is answered.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match run(&fresh, &foreach).await {
+            Ok(_) => break,
+            Err(ferrosa_graph::error::GraphError::Unavailable(reason)) => {
+                assert!(std::time::Instant::now() < deadline, "{reason}");
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(other) => panic!("the FOREACH failed: {other}"),
+        }
+    }
     assert_clean(
         "traversals after a FOREACH first query",
         &check_all(&fresh, &reference).await,
@@ -1188,7 +1382,7 @@ async fn first_query_through_foreach_still_heals_before_traversals() {
 #[tokio::test]
 async fn deleting_one_edge_type_keeps_its_sibling_traversable() {
     let node = Node::new();
-    let engine = node.start_engine();
+    let engine = node.healed_engine().await;
     let (t, s) = (tenant_id(0), session_id(0, 0));
     let (a, b) = (entity(0, 0, 0), entity(0, 0, 1));
     let related = Edge {
@@ -1502,7 +1696,7 @@ mod cluster {
         // one, read directly.
         assert_clean(
             "traversals answered from the local replica",
-            &check_all(&node.start_engine(), &reference).await,
+            &check_all(&node.healed_engine().await, &reference).await,
         );
         let want = 2 * live.len();
         assert_eq!(
@@ -1598,13 +1792,103 @@ mod cluster {
             .expect("three dropped writes are retried, not a failed heal");
         assert_clean(
             "traversals after a heal that retried its failed writes",
-            &check_all(&node.start_engine(), &reference).await,
+            &check_all(&node.healed_engine().await, &reference).await,
         );
         assert_eq!(
             live_entries_in(&remote, &live),
             2 * live.len(),
             "the retried repairs reached the remote replica"
         );
+        server.shutdown(std::time::Duration::from_millis(50)).await;
+    }
+
+    /// A query does not wait out a long heal: it is refused retryably at once
+    /// and the heal goes on in its own task.
+    ///
+    /// Live on the memory cluster (2026-10-19): the heal takes about five
+    /// minutes of CL ALL round trips, and every adjacency MATCH/MERGE waited
+    /// for all of it. ferrosa-memory's graph client gives up after 10 s and
+    /// reports the engine unreachable, so a slow-but-healthy heal read as an
+    /// outage, and every waiting query held its connection the whole time.
+    /// Here each replica request takes 400 ms, so the heal outlasts the wait
+    /// budget many times over; the refusal is asserted against the heal's own
+    /// state, not a wall clock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_query_is_refused_retryably_instead_of_waiting_out_a_long_heal() {
+        let delay = std::time::Duration::from_millis(400);
+        let (node, all, live) = damage(Node::with_replication_factor(2), 1, 1, 24).await;
+        let reference = Reference::new(&all, &live);
+        let remote_dir = TempDir::new().unwrap();
+        let remote = Arc::new(StorageEngine::new(storage_config(&remote_dir), None).unwrap());
+        register_storage_tables(&remote);
+        remote
+            .register_table(
+                ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE).to_storage_schema(),
+            )
+            .unwrap();
+        tombstone_entries(&remote, &live, now_micros());
+        let (server, remote_addr, remote_host, _) =
+            start_replica_with_latency(Arc::clone(&remote), delay).await;
+        let local_host = Uuid::new_v4();
+        let mut ring = TokenRing::new();
+        ring.add_node(1, node_info("127.0.0.1:7000", local_host));
+        ring.add_node(2, node_info(&remote_addr, remote_host));
+        ring.assign_tokens(1, &[0]);
+        ring.assign_tokens(2, &[i64::MIN / 2]);
+        let coordinator = Arc::new(ClusterCoordinator::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(ring)),
+            Arc::new(PeerManager::new(
+                Arc::new(NetConfig::default()),
+                local_host,
+                Arc::new(NoopPeers),
+            )),
+            1,
+            Arc::clone(&node.storage),
+            2,
+            ConsistencyLevel::One,
+        ));
+        let fresh = GraphEngine::new(
+            Arc::clone(&node.schema),
+            Arc::clone(&node.storage),
+            Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::cluster(
+                coordinator,
+            ))),
+            GraphEngineConfig::default(),
+            std::time::Duration::from_secs(300),
+        );
+
+        let first = fresh.ensure_adjacency_ready_for_test(KEYSPACE).await;
+        assert!(
+            !fresh.adjacency_heal_completed_for_test(KEYSPACE),
+            "the heal must still be running when the first query is answered, \
+             or this test proves nothing; it answered {first:?}"
+        );
+        match first {
+            Err(ferrosa_graph::error::GraphError::Unavailable(reason)) => assert!(
+                reason.contains("retry"),
+                "the refusal must tell the client to retry: {reason}"
+            ),
+            other => panic!("a query during a long heal must be refused retryably, got {other:?}"),
+        }
+
+        // Nothing drives the heal now; it must finish on its own.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while !fresh.adjacency_heal_completed_for_test(KEYSPACE) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the heal did not complete in its own task after the query was refused"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        fresh
+            .ensure_adjacency_ready_for_test(KEYSPACE)
+            .await
+            .expect("once the heal is done, queries are served");
+        assert_clean(
+            "traversals after a heal that ran past its first query",
+            &check_all(&node.healed_engine().await, &reference).await,
+        );
+        assert_eq!(live_entries_in(&remote, &live), 2 * live.len());
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
@@ -1681,7 +1965,7 @@ mod cluster {
         // And it is still a complete heal.
         assert_clean(
             "traversals after a concurrent heal",
-            &check_all(&node.start_engine(), &reference).await,
+            &check_all(&node.healed_engine().await, &reference).await,
         );
         assert_eq!(live_entries_in(&remote, &live), 2 * live.len());
         server.shutdown(std::time::Duration::from_millis(50)).await;
@@ -1694,7 +1978,7 @@ mod cluster {
 #[tokio::test]
 async fn edge_count_skips_a_deleted_edge_in_a_live_partition() {
     let node = Node::new();
-    let engine = node.start_engine();
+    let engine = node.healed_engine().await;
     let (t, s) = (tenant_id(0), session_id(0, 0));
     let first = Edge {
         tenant: t,
@@ -1809,7 +2093,7 @@ mod slow {
         }
 
         // Register the observer the way the old build's first query did.
-        let old = node.start_engine();
+        let old = node.healed_engine().await;
         let all = production_shaped_edges();
         run_ok(
             &old,
@@ -1842,10 +2126,12 @@ mod slow {
         drop(old);
         as_left_by_prefix_build(&node);
 
-        // First start of the fixed build: the first query carries the heal.
+        // First start of the fixed build: the first queries start the heal,
+        // and are refused retryably if it outlasts the wait budget.
         let fresh = node.start_engine();
         let some = *live.iter().next().unwrap();
         let started = std::time::Instant::now();
+        healed(&fresh).await;
         let first = run_ok(&fresh, &related_query(some.tenant, some.session, some.src)).await;
         let first_query_ms = started.elapsed().as_millis();
         assert!(

@@ -163,12 +163,36 @@ lazily creates `system_graph_<ks>.adjacency`, registers the
 `AdjacencyIndexObserver` and (if configured) starts the background
 reconciliation loop. Once per **node** and keyspace it runs one complete
 reconcile pass — the **heal** — before any traversal reads the index.
-Concurrent first queries wait on the same heal (a shared future per keyspace,
-run in its own task). A completed heal is recorded in the storage data dir
-(`graph-adjacency-heals.json`, `adjacency::heal_record`), so later starts skip
-it and serve at once. A heal with any failed read, scan or write is not
-recorded: the query fails with the retryable `GraphError::Unavailable`
-(HTTP 503) and the next query heals again.
+Concurrent first queries share one heal (a shared future per keyspace, run in
+its own task). **A query waits on a running heal for at most
+`HEAL_WAIT_BUDGET` (1 s)**. After that it is refused with the retryable
+`GraphError::Unavailable` (HTTP 503, Bolt `DatabaseUnavailable`), and the heal
+goes on without it, so a minutes-long cluster heal never holds the hot path.
+A completed heal is recorded in the storage data dir
+(`graph-adjacency-heals.json`, `adjacency::heal_record`). A heal with any
+failed read, scan or write is not recorded: the query fails retryably and the
+next query heals again.
+
+**The heal is also the backfill, so a recorded start still runs a local
+catch-up.** The observer is registered by the keyspace's first graph query in
+each process. An edge that lands before that, such as a CQL `INSERT` or a
+replica write forwarded from another node, derives no adjacency entry. The
+first pass of the process is what indexes it. A start that finds the record
+therefore skips only the cluster-wide damage repair (`Rewrite`, CL ALL) and
+runs one `Repair` pass over this node's own storage (`catch_up_adjacency`).
+That pass is local, with no network round trips; the memory cluster's whole
+index took 337–466 ms on one node. Any entries it writes are logged at WARN
+(`adjacency catch-up indexed edges written before this process registered its
+observer`). Skipping the heal outright on restart, as #589 did, left such
+edges out of every traversal. Driver Smoke caught the same shape on a new
+keyspace, where `test_bolt_compat.py` INSERTs its edges before its first Bolt
+MATCH.
+
+The heal is streamed and bounded, not materializing. Both scans pull one
+partition at a time, at most `RECONCILE_ENTRIES_IN_FLIGHT` (32) entry repairs
+run at once, and the retry list is capped. Its cost is one read and one CL ALL
+write per entry, so a cluster heal is long because of round trips, not memory.
+Holding queries for it was the hot-path problem; the wait budget is the fix.
 
 The **adjacency-consistency invariant** is the heart of the crate: every edge
 write must produce the matching OUT and IN adjacency entries. This is enforced
@@ -216,9 +240,12 @@ What happens on the first start of this build:
 1. Nothing at boot. The heal runs on the first graph query that needs the
    adjacency index in `agent_memory` (ferrosa-memory's first `TYPED_EDGE`
    lookup), on each node independently, until it completes once on that node.
-2. That query, and every adjacency query arriving while it runs, waits for
-   one complete reconcile of every `agent_memory` edge table. Queries that
-   need no adjacency (plain `RETURN`, vertex lookups) are not held.
+2. The node logs `adjacency heal started` at WARN. That query, and every
+   adjacency query arriving while the heal runs, waits at most 1 s; past that
+   it gets HTTP 503 / Bolt `DatabaseUnavailable` ("being repaired (the heal is
+   still running); retry"), and `ferrosa_graph_adjacency_queries_refused_during_heal_total`
+   counts it. Clients should retry. Queries that need no adjacency (plain
+   `RETURN`, vertex lookups) are not held.
 3. The pass rewrites every entry to every replica (below), and logs one WARN
    line: `graph engine: adjacency heal repaired the index before serving
    traversals` with `entries_repaired` (tombstoned or missing here),

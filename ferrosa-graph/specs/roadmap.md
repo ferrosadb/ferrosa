@@ -65,11 +65,13 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   mutation sequence, the derived adjacency set equals the reconciler's recomputed
   set — an invariant regression net independent of the executor.
 
-- **The first heal still holds the hot path (FMEA G-14).** Refuse adjacency
-  queries retryably at once while a heal runs instead of holding them for its
-  whole duration; let a heal survive one replica restarting (CL ALL fails it
-  today); and record a completed heal cluster-wide so the other nodes skip the
-  rewrite the first one already sent to every replica.
+- **The rest of FMEA G-14.**
+  - Let a heal survive one replica restarting: CL ALL fails it today.
+  - Record a completed heal cluster-wide, so the other nodes skip the rewrite
+    that the first one already sent to every replica.
+  - Pace the heal's CL ALL writes against client traffic.
+  - On a legacy node, serve hops from the edge table while the heal runs,
+    instead of refusing them.
 
 ## Implemented since the last revision
 
@@ -77,6 +79,16 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   writes `<data_dir>/graph-adjacency-heals.json` once it completes with zero
   errors, and later starts serve at once instead of rerunning a CL ALL rewrite
   of the whole keyspace before the first traversal (t_504435aa).
+- **G-14: the heal no longer holds the hot path (2026-10-20).**
+  - A query waits on a running heal for at most 1 s, then is refused
+    retryably while the heal continues.
+  - A start that finds the heal record skips only the cluster-wide rewrite,
+    and still runs a local catch-up pass. That pass indexes the edges
+    written before the process registered its observer (t_d0dacb7a).
+- **Register the adjacency observer before writes are accepted.** It is
+  registered lazily, by the first graph query in each process. Writes that
+  land before then rely on the catch-up pass, and a node that never gets a
+  graph query never indexes forwarded edge writes at all (t_17765000).
 
 - **G-3 — reconciler writes at the keyspace replication strategy (2026-10-03).**
   `write_mutation` / `write_tombstone` write the index at CL ALL under the

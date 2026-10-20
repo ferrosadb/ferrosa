@@ -28,7 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::adjacency::heal_record;
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::{
-    reconcile_once_with, record_heal, spawn_reconciliation, ReconcileMode,
+    reconcile_once_with, record_heal, record_query_refused_during_heal, spawn_reconciliation,
+    ReconcileMode,
 };
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
@@ -490,11 +491,19 @@ impl crate::executor::spill::SpillReserver for StorageEngineSpill {
 type HealGate =
     futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<(), String>>>;
 
+/// The longest an adjacency query waits on a running heal before it is
+/// refused retryably. The heal is not tied to the query and goes on in its own
+/// task. Long enough that a single-node heal is invisible (the memory
+/// cluster's whole index, healed on one node, took 337-466 ms; README "Deploy
+/// notes"); short enough that a cluster heal (CL ALL round trips, minutes)
+/// never holds a query near a client's deadline (ferrosa-memory: 10 s).
+const HEAL_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A heal for `keyspace` that runs in its own task once first polled.
 fn spawn_on_first_poll_heal(
     schema: Arc<Schema>,
     write_path: Arc<ArcSwap<WritePath>>,
-    data_dir: std::path::PathBuf,
+    storage: Arc<StorageEngine>,
     keyspace: String,
 ) -> HealGate {
     use futures::FutureExt;
@@ -502,7 +511,7 @@ fn spawn_on_first_poll_heal(
         let heal = tokio::spawn(heal_adjacency_unless_recorded(
             schema,
             write_path.load_full(),
-            data_dir,
+            storage,
             keyspace,
         ));
         match heal.await {
@@ -523,7 +532,14 @@ fn spawn_on_first_poll_heal(
 }
 
 /// The heal of `keyspace`, unless this node already completed one
-/// ([`heal_record`]). A completed heal is recorded so the next start skips it.
+/// ([`heal_record`]); then only the local catch-up pass. A completed heal is
+/// recorded so the next start skips it.
+///
+/// The record skips only the cluster-wide damage repair. Every process still
+/// backfills locally: the adjacency observer is registered by the keyspace's
+/// first graph query in this process, so an edge written before it (a CQL
+/// INSERT, or a replica write forwarded from another node) derived no entry,
+/// and nothing else builds one. See [`catch_up_adjacency`].
 ///
 /// Fallbacks, both logged at ERROR: a record that cannot be read means heal
 /// (slow but correct); a completed heal that cannot be recorded still serves,
@@ -531,18 +547,13 @@ fn spawn_on_first_poll_heal(
 async fn heal_adjacency_unless_recorded(
     schema: Arc<Schema>,
     wp: Arc<WritePath>,
-    data_dir: std::path::PathBuf,
+    storage: Arc<StorageEngine>,
     keyspace: String,
 ) -> std::result::Result<(), String> {
+    let data_dir = storage.data_dir().to_path_buf();
     let (dir, ks) = (data_dir.clone(), keyspace.clone());
     match tokio::task::spawn_blocking(move || heal_record::healed(&dir, &ks)).await {
-        Ok(Ok(true)) => {
-            tracing::info!(
-                keyspace = %keyspace,
-                "graph engine: adjacency heal already completed on this node; serving traversals"
-            );
-            return Ok(());
-        }
+        Ok(Ok(true)) => return catch_up_adjacency(schema, storage, keyspace).await,
         Ok(Ok(false)) => {}
         Ok(Err(e)) => tracing::error!(
             keyspace = %keyspace,
@@ -555,6 +566,12 @@ async fn heal_adjacency_unless_recorded(
             "graph engine: reading the adjacency heal record died; healing as if none completed"
         ),
     }
+    tracing::warn!(
+        keyspace = %keyspace,
+        wait_budget_ms = HEAL_WAIT_BUDGET.as_millis() as u64,
+        "graph engine: adjacency heal started; adjacency queries that outlast the wait \
+         budget are refused retryably until it completes"
+    );
     heal_adjacency(schema, wp, keyspace.clone()).await?;
     let ks = keyspace.clone();
     match tokio::task::spawn_blocking(move || heal_record::record_healed(&data_dir, &ks)).await {
@@ -569,6 +586,58 @@ async fn heal_adjacency_unless_recorded(
             error = %join_error,
             "graph engine: recording the adjacency heal died; the next start heals again"
         ),
+    }
+    Ok(())
+}
+
+/// The local catch-up on a node that already completed the heal: one
+/// [`ReconcileMode::Repair`] pass over this node's own storage, which writes
+/// the entries of edges that landed before this process registered its
+/// adjacency observer (and tombstones the entries of edges deleted then). It
+/// reads and writes locally with no network round trips: the memory cluster's
+/// whole index took 337-466 ms on one node. Anything it repaired is the
+/// observer gap made visible, so it is logged at WARN.
+async fn catch_up_adjacency(
+    schema: Arc<Schema>,
+    storage: Arc<StorageEngine>,
+    keyspace: String,
+) -> std::result::Result<(), String> {
+    let local = WritePath::direct(storage);
+    let started = std::time::Instant::now();
+    let metrics = reconcile_once_with(&schema, &local, &keyspace, ReconcileMode::Repair).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    if !metrics.is_complete() {
+        tracing::warn!(
+            keyspace = %keyspace,
+            errors = metrics.errors,
+            elapsed_ms,
+            "graph engine: adjacency catch-up incomplete; traversals on this keyspace fail \
+             retryably until one completes"
+        );
+        return Err(format!(
+            "graph adjacency index for keyspace {keyspace} is being brought up to date \
+             ({} reconcile errors); retry",
+            metrics.errors
+        ));
+    }
+    if metrics.entries_repaired > 0 || metrics.orphans_removed > 0 {
+        tracing::warn!(
+            keyspace = %keyspace,
+            entries_repaired = metrics.entries_repaired,
+            entries_removed = metrics.orphans_removed,
+            entries_checked = metrics.entries_checked,
+            elapsed_ms,
+            "graph engine: adjacency catch-up indexed edges written before this process \
+             registered its observer"
+        );
+    } else {
+        tracing::info!(
+            keyspace = %keyspace,
+            entries_checked = metrics.entries_checked,
+            elapsed_ms,
+            "graph engine: adjacency heal already completed on this node; local catch-up \
+             found nothing to index; serving traversals"
+        );
     }
     Ok(())
 }
@@ -931,11 +1000,18 @@ impl GraphEngine {
         if let Some(Ok(())) = gate.peek() {
             return Ok(());
         }
-        match gate.clone().await {
-            Ok(()) => Ok(()),
-            Err(reason) => {
+        match tokio::time::timeout(HEAL_WAIT_BUDGET, gate.clone()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => {
                 self.forget_failed_heal(keyspace, &gate);
                 Err(GraphError::Unavailable(reason))
+            }
+            Err(_still_healing) => {
+                record_query_refused_during_heal();
+                Err(GraphError::Unavailable(format!(
+                    "graph adjacency index for keyspace {keyspace} is being repaired \
+                     (the heal is still running); retry"
+                )))
             }
         }
     }
@@ -950,7 +1026,7 @@ impl GraphEngine {
         let candidate = spawn_on_first_poll_heal(
             Arc::clone(&self.schema),
             Arc::clone(&self.write_path),
-            self.storage.data_dir().to_path_buf(),
+            Arc::clone(&self.storage),
             keyspace.to_string(),
         );
         let mut published = None;

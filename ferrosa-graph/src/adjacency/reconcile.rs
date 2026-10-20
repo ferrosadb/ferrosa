@@ -76,6 +76,14 @@ static ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static PASSES_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HEALS_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
 static HEALS_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static QUERIES_REFUSED_DURING_HEAL_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Record an adjacency query refused because its keyspace's heal was still
+/// running past the wait budget. Counted, not logged per query: the heal's
+/// own start, progress and end lines describe the episode.
+pub fn record_query_refused_during_heal() {
+    QUERIES_REFUSED_DURING_HEAL_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
 
 fn record_pass(metrics: &ReconcileMetrics) {
     PASSES_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -134,6 +142,11 @@ pub fn render_prometheus(out: &mut String) {
             "ferrosa_graph_adjacency_heals_failed_total",
             "First-use adjacency heals that were incomplete; their queries failed retryably.",
             &HEALS_FAILED_TOTAL,
+        ),
+        (
+            "ferrosa_graph_adjacency_queries_refused_during_heal_total",
+            "Adjacency queries refused retryably because their keyspace's heal was still running.",
+            &QUERIES_REFUSED_DURING_HEAL_TOTAL,
         ),
     ] {
         // Writing to a String cannot fail.
