@@ -1,5 +1,6 @@
 //! Adjacency index: per-keyspace system table for fast graph traversals.
 
+pub mod heal_record;
 pub mod observer;
 pub mod reconcile;
 pub mod schema;

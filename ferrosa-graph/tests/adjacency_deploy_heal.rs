@@ -866,6 +866,22 @@ fn live_entries_in(storage: &StorageEngine, edges: &BTreeSet<Edge>) -> usize {
     live
 }
 
+/// Remove the heal record the fixture's engine wrote. The fixture drives the
+/// pre-fix state with the current engine, whose first query heals the still
+/// undamaged index and records it; the pre-fix build kept no record, so the
+/// node it leaves behind has none.
+fn as_left_by_prefix_build(node: &Node) {
+    let record = node
+        .storage
+        .data_dir()
+        .join(ferrosa_graph::adjacency::heal_record::HEAL_RECORD_FILE);
+    match std::fs::remove_file(&record) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => panic!("cannot remove {}: {e}", record.display()),
+    }
+}
+
 /// Build the state a memory-cluster node is in when the fixed build first
 /// starts on it, and return the live edge set it must answer from.
 ///
@@ -931,6 +947,7 @@ async fn damage(
         }
     }
     drop(old);
+    as_left_by_prefix_build(&node);
     (node, all, live)
 }
 
@@ -993,6 +1010,106 @@ async fn incomplete_heal_fails_retryably_and_the_next_query_heals() {
     assert_clean(
         "traversals after the retried heal",
         &check_all(&fresh, &reference).await,
+    );
+}
+
+/// A graph engine over `node` whose write path cannot read or write, so a heal
+/// it starts fails. Registration and the heal gate need no write path; only a
+/// heal does, so its readiness answer shows whether it tried to heal.
+fn engine_that_cannot_heal(node: &Node) -> GraphEngine {
+    GraphEngine::new(
+        Arc::clone(&node.schema),
+        Arc::clone(&node.storage),
+        Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::Unavailable)),
+        GraphEngineConfig::default(),
+        std::time::Duration::from_secs(300),
+    )
+}
+
+/// A node that completed the heal does not heal again when it restarts.
+///
+/// Live on 2026-10-19 (the memory cluster): the heal is kept in memory only, so
+/// every restart reran it, and every edge MATCH/MERGE waited about five minutes
+/// for a CL=ALL rewrite of an index that was already whole. The damage it
+/// repairs was made by builds before 330a0c29 and nothing since makes it, so
+/// one complete heal on a node is enough.
+#[tokio::test]
+async fn a_restart_after_a_completed_heal_does_not_heal_again() {
+    let (node, all, live) = damaged_node(1, 1, 12).await;
+    let reference = Reference::new(&all, &live);
+    let first = node.start_engine();
+    first
+        .ensure_adjacency_ready_for_test(KEYSPACE)
+        .await
+        .expect("the first start heals");
+    drop(first);
+
+    let restarted = engine_that_cannot_heal(&node);
+    restarted
+        .ensure_adjacency_ready_for_test(KEYSPACE)
+        .await
+        .expect("a restart after a completed heal serves without healing again");
+    assert!(
+        restarted.adjacency_heal_completed_for_test(KEYSPACE),
+        "the recorded heal counts as this process's"
+    );
+    assert_clean(
+        "traversals after a restart that skipped the heal",
+        &check_all(&node.start_engine(), &reference).await,
+    );
+}
+
+/// A heal that did not complete records nothing: the next start heals.
+#[tokio::test]
+async fn an_incomplete_heal_is_not_recorded_and_the_next_start_heals() {
+    let (node, all, live) = damaged_node(1, 1, 12).await;
+    let reference = Reference::new(&all, &live);
+    engine_that_cannot_heal(&node)
+        .ensure_adjacency_ready_for_test(KEYSPACE)
+        .await
+        .expect_err("a heal with failed reads does not complete");
+
+    let restarted = engine_that_cannot_heal(&node);
+    let refused = restarted.ensure_adjacency_ready_for_test(KEYSPACE).await;
+    assert!(
+        matches!(
+            refused,
+            Err(ferrosa_graph::error::GraphError::Unavailable(_))
+        ),
+        "a start after an incomplete heal must heal again, got {refused:?}"
+    );
+    assert_clean(
+        "traversals once a start can heal",
+        &check_all(&node.start_engine(), &reference).await,
+    );
+}
+
+/// A heal record that cannot be read is not trusted: the start heals.
+#[tokio::test]
+async fn an_unreadable_heal_record_heals_rather_than_skips() {
+    let (node, all, live) = damaged_node(1, 1, 12).await;
+    let reference = Reference::new(&all, &live);
+    std::fs::write(
+        node.storage
+            .data_dir()
+            .join(ferrosa_graph::adjacency::heal_record::HEAL_RECORD_FILE),
+        b"{not json",
+    )
+    .unwrap();
+
+    let refused = engine_that_cannot_heal(&node)
+        .ensure_adjacency_ready_for_test(KEYSPACE)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(ferrosa_graph::error::GraphError::Unavailable(_))
+        ),
+        "an unreadable record must not skip the heal, got {refused:?}"
+    );
+    assert_clean(
+        "traversals after healing past an unreadable record",
+        &check_all(&node.start_engine(), &reference).await,
     );
 }
 
@@ -1683,6 +1800,7 @@ mod slow {
             }
         }
         drop(old);
+        as_left_by_prefix_build(&node);
 
         // First start of the fixed build: the first query carries the heal.
         let fresh = node.start_engine();
