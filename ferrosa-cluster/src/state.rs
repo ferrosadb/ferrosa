@@ -1,4 +1,4 @@
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -6,6 +6,7 @@ use tokio::sync::RwLock;
 
 use ferrosa_schema::system::peers::{ClusterState, PeerInfo};
 
+use crate::addr_cache::NonBlockingAddrCache;
 use crate::config::ClusterConfig;
 use crate::pair::PairState;
 use crate::ring::TokenRing;
@@ -31,6 +32,8 @@ pub struct PairClusterState {
     /// Cached peers result — returned on `RwLock` contention instead of
     /// an empty vec. Updated each time `peers()` successfully reads state.
     cached_peers: ArcSwap<Vec<PeerInfo>>,
+    /// Resolves the peer's CQL broadcast without blocking the CQL runtime on DNS.
+    addr_cache: NonBlockingAddrCache,
 }
 
 impl PairClusterState {
@@ -40,6 +43,7 @@ impl PairClusterState {
             state,
             broadcast_resolver: None,
             cached_peers: ArcSwap::from_pointee(Vec::new()),
+            addr_cache: NonBlockingAddrCache::default(),
         }
     }
 
@@ -53,6 +57,7 @@ impl PairClusterState {
             state,
             broadcast_resolver: Some(peer_manager as Arc<dyn BroadcastResolver>),
             cached_peers: ArcSwap::from_pointee(Vec::new()),
+            addr_cache: NonBlockingAddrCache::default(),
         }
     }
 }
@@ -72,11 +77,9 @@ impl ClusterState for PairClusterState {
             .broadcast_resolver
             .as_ref()
             .and_then(|resolver| resolver.resolve_broadcast(state.peer_host_id));
-        let (native_addr, native_port) = if let Some(ref broadcast) = peer_broadcast {
-            parse_addr(broadcast).unwrap_or((ip, 9042))
-        } else {
-            (ip, 9042)
-        };
+        let (native_addr, native_port) = peer_broadcast
+            .and_then(|broadcast| self.addr_cache.get(&broadcast))
+            .map_or((ip, 9042), |a| (a.ip(), a.port()));
         let peer_node_id = crate::raft::uuid_to_node_id(state.peer_host_id);
         let tokens: Vec<String> = crate::controller::deterministic_tokens_for_node(
             peer_node_id,
@@ -118,12 +121,23 @@ pub trait BroadcastResolver: Send + Sync {
     /// Look up the CQL broadcast address for a peer by host_id.
     /// Non-blocking — returns None if the address is unavailable.
     fn resolve_broadcast(&self, host_id: uuid::Uuid) -> Option<String>;
+
+    /// The internode socket address this node last dialled `host_id` at --
+    /// kept after the peer goes down. Non-blocking; `None` if unknown or the
+    /// lock is contended.
+    fn known_internode_addr(&self, _host_id: uuid::Uuid) -> Option<SocketAddr> {
+        None
+    }
 }
 
 /// PeerManager implements BroadcastResolver via its broadcast map.
 impl BroadcastResolver for ferrosa_net::peer::PeerManager {
     fn resolve_broadcast(&self, host_id: uuid::Uuid) -> Option<String> {
         self.get_peer_cql_broadcast_sync(host_id)
+    }
+
+    fn known_internode_addr(&self, host_id: uuid::Uuid) -> Option<SocketAddr> {
+        self.peer_socket_addr_sync(host_id)
     }
 }
 
@@ -136,6 +150,9 @@ pub struct RaftClusterState {
     ring: Arc<ArcSwap<TokenRing>>,
     local_node_id: u64,
     broadcast_resolver: Option<Arc<dyn BroadcastResolver>>,
+    /// Resolves ring hostnames (`node3:7000`) without blocking the CQL
+    /// runtime on DNS; see [`crate::addr_cache`].
+    addr_cache: NonBlockingAddrCache,
 }
 
 impl RaftClusterState {
@@ -144,6 +161,7 @@ impl RaftClusterState {
             ring,
             local_node_id,
             broadcast_resolver: None,
+            addr_cache: NonBlockingAddrCache::default(),
         }
     }
 
@@ -157,7 +175,32 @@ impl RaftClusterState {
             ring,
             local_node_id,
             broadcast_resolver: Some(peer_manager as Arc<dyn BroadcastResolver>),
+            addr_cache: NonBlockingAddrCache::default(),
         }
+    }
+
+    /// Replace the hostname resolver (tests inject a controlled lookup).
+    pub fn with_addr_cache(mut self, addr_cache: NonBlockingAddrCache) -> Self {
+        self.addr_cache = addr_cache;
+        self
+    }
+
+    /// The peer's internode `(ip, port)`: its ring address when that resolves
+    /// (from cache, never blocking), else the address this node last dialled
+    /// it at. A down peer whose hostname no longer resolves keeps its row.
+    fn internode_endpoint(&self, info: &crate::raft::NodeInfo) -> Option<(IpAddr, u16)> {
+        if let Some(addr) = self.addr_cache.get(&info.addr) {
+            return Some((addr.ip(), addr.port()));
+        }
+        let known = self
+            .broadcast_resolver
+            .as_ref()?
+            .known_internode_addr(info.host_id)?;
+        let ring_port = info
+            .addr
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok());
+        Some((known.ip(), ring_port.unwrap_or(known.port())))
     }
 }
 
@@ -169,8 +212,15 @@ impl ClusterState for RaftClusterState {
             .filter(|&&id| id != self.local_node_id)
             .filter_map(|&id| {
                 let info = ring.get_node(id)?;
-                // Parse addr string "host:port" into IP + port.
-                let (ip, port) = parse_addr(&info.addr)?;
+                let Some((ip, port)) = self.internode_endpoint(info) else {
+                    tracing::warn!(
+                        node_id = id,
+                        host_id = %info.host_id,
+                        addr = %info.addr,
+                        "ring member omitted from system.peers: its address has not resolved and no dialled address is known"
+                    );
+                    return None;
+                };
                 // Use cql_broadcast for native_address (host-reachable address
                 // for port-mapped container clusters). Check three sources:
                 // 1. NodeInfo.cql_broadcast (set during ring construction for local node)
@@ -180,11 +230,9 @@ impl ClusterState for RaftClusterState {
                     let resolver = self.broadcast_resolver.as_ref()?;
                     resolver.resolve_broadcast(info.host_id)
                 });
-                let (native_addr, native_port) = if let Some(ref broadcast) = peer_broadcast {
-                    parse_addr(broadcast).unwrap_or((ip, 9042))
-                } else {
-                    (ip, 9042)
-                };
+                let (native_addr, native_port) = peer_broadcast
+                    .and_then(|broadcast| self.addr_cache.get(&broadcast))
+                    .map_or((ip, 9042), |a| (a.ip(), a.port()));
                 // Populate `tokens` from the ring. cdrs-tokio's
                 // `is_peer_row_valid` filters out any peer row whose
                 // `tokens` column is empty — and on an empty pool the
@@ -217,19 +265,6 @@ impl ClusterState for RaftClusterState {
             })
             .collect()
     }
-}
-
-/// Parse "ip:port" or "host:port" into (IpAddr, u16).
-/// Returns None if parsing fails.
-fn parse_addr(addr: &str) -> Option<(IpAddr, u16)> {
-    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
-        return Some((socket_addr.ip(), socket_addr.port()));
-    }
-
-    let mut addrs = addr.to_socket_addrs().ok()?;
-    addrs
-        .next()
-        .map(|socket_addr| (socket_addr.ip(), socket_addr.port()))
 }
 
 #[cfg(test)]
@@ -675,5 +710,111 @@ mod tests {
             peers[0].release_version, "5.1.0-ferrosa",
             "peer release_version should be Cassandra-compatible, not CARGO_PKG_VERSION"
         );
+    }
+
+    fn noop_peer_manager() -> Arc<ferrosa_net::peer::PeerManager> {
+        struct NoopListener;
+        impl ferrosa_net::peer::PeerEventListener for NoopListener {
+            fn on_peer_connected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_disconnected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_suspected(&self, _: ferrosa_net::rpc::handler::PeerId) {}
+            fn on_peer_recovered(&self, _: uuid::Uuid) {}
+            fn on_peer_failed(&self, _: uuid::Uuid) {}
+        }
+        Arc::new(ferrosa_net::peer::PeerManager::new(
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ))
+    }
+
+    /// A two-node ring: the local node at an IP, the peer at `peer_addr`
+    /// (a hostname, as `FERROSA_INTERNODE_BROADCAST` advertises it).
+    fn ring_with_hostname_peer(peer_addr: &str) -> (Arc<ArcSwap<TokenRing>>, u64, Uuid) {
+        use crate::raft::{NodeInfo, NodeState};
+        let (local_id, peer_id, peer_host_id) = (1_u64, 2_u64, Uuid::new_v4());
+        let node = |host_id: Uuid, addr: &str| NodeInfo {
+            host_id,
+            addr: addr.to_string(),
+            data_center: "dc1".to_string(),
+            rack: "rack1".to_string(),
+            state: NodeState::Normal,
+            cql_broadcast: None,
+        };
+        let mut ring = TokenRing::new();
+        ring.add_node(local_id, node(Uuid::new_v4(), "172.18.0.3:7000"));
+        ring.add_node(peer_id, node(peer_host_id, peer_addr));
+        ring.assign_tokens(peer_id, &[0]);
+        (
+            Arc::new(ArcSwap::from_pointee(ring)),
+            local_id,
+            peer_host_id,
+        )
+    }
+
+    /// Nightly docker smoke, Phase 8: once node3's container is stopped its
+    /// name stops resolving, and `system.peers` dropped node3 -- the ring still
+    /// holds it and this node still knows the address it dialled it at. A down
+    /// peer is still a ring member; Cassandra lists it with its last address.
+    #[tokio::test]
+    async fn raft_peers_lists_down_peer_whose_hostname_no_longer_resolves() {
+        let (ring, local_id, peer_host_id) =
+            ring_with_hostname_peer("ferrosa-stopped-peer.invalid:7000");
+        let pm = noop_peer_manager();
+        pm.add_peer_entry((peer_host_id, "172.18.0.5:7000".parse().unwrap()))
+            .await;
+
+        let peers = RaftClusterState::with_peer_manager(ring, local_id, pm).peers();
+
+        assert_eq!(
+            peers.len(),
+            1,
+            "a down ring member must stay in system.peers"
+        );
+        assert_eq!(peers[0].host_id, peer_host_id);
+        assert_eq!(peers[0].peer, "172.18.0.5".parse::<IpAddr>().unwrap());
+        assert_eq!(peers[0].peer_port, 7000);
+    }
+
+    /// The CQL runtime stall itself: on the CI runner `getaddrinfo("node3")`
+    /// for the stopped container takes 5 s (node logs: FERROSA_SEED node3:7000
+    /// "not usable yet" exactly 5.00 s after startup), and `system.peers` ran it
+    /// on the CQL runtime for every connecting driver. `peers()` must answer
+    /// within a bounded wait however long the resolver hangs.
+    #[tokio::test]
+    async fn raft_peers_does_not_wait_out_a_hanging_resolver() {
+        use crate::addr_cache::{DEFAULT_FIRST_RESOLVE_WAIT, DEFAULT_REFRESH_AFTER};
+        use std::time::{Duration, Instant};
+
+        let (ring, local_id, peer_host_id) = ring_with_hostname_peer("node3:7000");
+        let pm = noop_peer_manager();
+        pm.add_peer_entry((peer_host_id, "172.18.0.5:7000".parse().unwrap()))
+            .await;
+        let hanging_dns = crate::addr_cache::NonBlockingAddrCache::with_lookup(
+            Arc::new(|_: &str| {
+                std::thread::sleep(Duration::from_secs(5));
+                Err(std::io::Error::other(
+                    "Temporary failure in name resolution",
+                ))
+            }),
+            DEFAULT_REFRESH_AFTER,
+            DEFAULT_FIRST_RESOLVE_WAIT,
+        );
+        let state =
+            RaftClusterState::with_peer_manager(ring, local_id, pm).with_addr_cache(hanging_dns);
+
+        let started = Instant::now();
+        let first = state.peers();
+        let second = state.peers();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "system.peers blocked {elapsed:?} on a hanging resolver"
+        );
+        for peers in [first, second] {
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].peer, "172.18.0.5".parse::<IpAddr>().unwrap());
+        }
     }
 }
