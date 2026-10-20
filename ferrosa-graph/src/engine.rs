@@ -28,7 +28,8 @@ use tokio_util::sync::CancellationToken;
 use crate::adjacency::heal_record;
 use crate::adjacency::observer::AdjacencyIndexObserver;
 use crate::adjacency::reconcile::{
-    reconcile_once_with, record_heal, spawn_reconciliation, ReconcileMode,
+    reconcile_once_with, record_heal, record_query_refused_during_heal, spawn_reconciliation,
+    ReconcileMode,
 };
 use crate::adjacency::{adjacency_keyspace_name, adjacency_table_metadata};
 use crate::error::{GraphError, Result};
@@ -490,6 +491,14 @@ impl crate::executor::spill::SpillReserver for StorageEngineSpill {
 type HealGate =
     futures::future::Shared<futures::future::BoxFuture<'static, std::result::Result<(), String>>>;
 
+/// The longest an adjacency query waits on a running heal before it is
+/// refused retryably. The heal is not tied to the query and goes on in its own
+/// task. Long enough that a single-node heal is invisible (the memory
+/// cluster's whole index, healed on one node, took 337-466 ms; README "Deploy
+/// notes"); short enough that a cluster heal (CL ALL round trips, minutes)
+/// never holds a query near a client's deadline (ferrosa-memory: 10 s).
+const HEAL_WAIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// A heal for `keyspace` that runs in its own task once first polled.
 fn spawn_on_first_poll_heal(
     schema: Arc<Schema>,
@@ -555,6 +564,12 @@ async fn heal_adjacency_unless_recorded(
             "graph engine: reading the adjacency heal record died; healing as if none completed"
         ),
     }
+    tracing::warn!(
+        keyspace = %keyspace,
+        wait_budget_ms = HEAL_WAIT_BUDGET.as_millis() as u64,
+        "graph engine: adjacency heal started; adjacency queries that outlast the wait \
+         budget are refused retryably until it completes"
+    );
     heal_adjacency(schema, wp, keyspace.clone()).await?;
     let ks = keyspace.clone();
     match tokio::task::spawn_blocking(move || heal_record::record_healed(&data_dir, &ks)).await {
@@ -849,6 +864,7 @@ impl GraphEngine {
                         "failed to register graph adjacency table {adj_ks}.adjacency: {e}"
                     ))
                 })?;
+            self.record_new_index_needs_no_heal(keyspace).await;
         }
 
         let adj_schema = adjacency_table_metadata(keyspace).to_storage_schema();
@@ -894,6 +910,33 @@ impl GraphEngine {
         Ok(should_register_observer)
     }
 
+    /// Record `keyspace` as healed because this node just created its
+    /// adjacency table: it was absent from the schema, so no build before
+    /// 330a0c29 ever wrote to it and there is no damage to repair. Without
+    /// this, every new install and every new graph keyspace paid the deploy
+    /// heal on its first edge query. If the record cannot be written, the heal
+    /// runs (slow but correct) and the failure is logged at ERROR.
+    async fn record_new_index_needs_no_heal(&self, keyspace: &str) {
+        let (dir, ks) = (self.storage.data_dir().to_path_buf(), keyspace.to_string());
+        match tokio::task::spawn_blocking(move || heal_record::record_healed(&dir, &ks)).await {
+            Ok(Ok(())) => tracing::info!(
+                keyspace,
+                "graph engine: created the adjacency index; it holds nothing to heal"
+            ),
+            Ok(Err(e)) => tracing::error!(
+                keyspace,
+                error = %e,
+                "graph engine: created the adjacency index but could not record that it needs \
+                 no heal; it will be healed"
+            ),
+            Err(join_error) => tracing::error!(
+                keyspace,
+                error = %join_error,
+                "graph engine: recording a new adjacency index died; it will be healed"
+            ),
+        }
+    }
+
     /// Make `keyspace`'s adjacency index ready to answer traversals: register
     /// it, then — once per node, ever — reconcile it completely before any
     /// traversal on it runs. A completed heal is recorded in the data dir
@@ -931,11 +974,18 @@ impl GraphEngine {
         if let Some(Ok(())) = gate.peek() {
             return Ok(());
         }
-        match gate.clone().await {
-            Ok(()) => Ok(()),
-            Err(reason) => {
+        match tokio::time::timeout(HEAL_WAIT_BUDGET, gate.clone()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => {
                 self.forget_failed_heal(keyspace, &gate);
                 Err(GraphError::Unavailable(reason))
+            }
+            Err(_still_healing) => {
+                record_query_refused_during_heal();
+                Err(GraphError::Unavailable(format!(
+                    "graph adjacency index for keyspace {keyspace} is being repaired \
+                     (the heal is still running); retry"
+                )))
             }
         }
     }
