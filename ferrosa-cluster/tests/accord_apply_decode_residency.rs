@@ -38,7 +38,7 @@
 //! residency rather than a constant.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use ferrosa_cluster::accord::apply::{
@@ -54,32 +54,78 @@ use ferrosa_storage::{Mutation, StorageEngine, StorageEngineConfig};
 // --- peak-allocation tracker (scoped to this integration-test binary only) ---
 // Every test in this file measures inside `measure_peak`, which arms the tracker
 // for the duration of its closure only, so the tests cannot perturb each other.
+//
+// Each allocation carries a header naming the measurement WINDOW it was made in
+// (0 = outside any window). A free counts against the window only if the block
+// was allocated in that same window. Without the tag, a free of memory allocated
+// BEFORE the window -- the previous measurement's engine tearing down on its own
+// threads, a commit-log segment retired in the background -- was subtracted from
+// a total it was never added to, so the window under-reported its peak by
+// however much foreign memory happened to be freed during it. That amount
+// depends on thread scheduling, which is why the input guard's separation fell
+// to 0.65x the input on a loaded runner and the guard declared itself blind.
 struct TrackingAlloc;
-static ARMED: AtomicBool = AtomicBool::new(false);
+static WINDOW: AtomicU64 = AtomicU64::new(0);
 static LIVE: AtomicI64 = AtomicI64::new(0);
 static PEAK: AtomicI64 = AtomicI64::new(0);
+/// Bytes freed during the window that were allocated outside it. Reported so a
+/// reader can see how much the untagged tracker would have mis-subtracted.
+static FOREIGN_FREED: AtomicI64 = AtomicI64::new(0);
+/// DIAGNOSTIC: window memory freed by a thread other than the measuring one.
+static OFF_THREAD_FREED: AtomicI64 = AtomicI64::new(0);
+static OFF_THREAD_ALLOCATED: AtomicI64 = AtomicI64::new(0);
+thread_local! {
+    static MEASURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Header in front of every block: room for the window tag, padded to the
+/// block's alignment so the pointer handed out keeps that alignment.
+fn header_len(layout: Layout) -> usize {
+    layout.align().max(std::mem::size_of::<u64>())
+}
+
+fn padded(layout: Layout) -> Layout {
+    let size = layout
+        .size()
+        .checked_add(header_len(layout))
+        .expect("allocation size overflows with the tracker header");
+    Layout::from_size_align(size, layout.align()).expect("tracker header layout")
+}
 
 unsafe impl GlobalAlloc for TrackingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() && ARMED.load(Ordering::Relaxed) {
-            let live =
-                LIVE.fetch_add(layout.size() as i64, Ordering::Relaxed) + layout.size() as i64;
+        let base = unsafe { System.alloc(padded(layout)) };
+        if base.is_null() {
+            return base;
+        }
+        let window = WINDOW.load(Ordering::Relaxed);
+        let ptr = unsafe { base.add(header_len(layout)) };
+        unsafe { ptr.cast::<u64>().sub(1).write_unaligned(window) };
+        if window != 0 {
+            let size = layout.size() as i64;
+            if !MEASURING.with(|m| m.get()) {
+                OFF_THREAD_ALLOCATED.fetch_add(size, Ordering::Relaxed);
+            }
+            let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
             PEAK.fetch_max(live, Ordering::Relaxed);
         }
         ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        if ARMED.load(Ordering::Relaxed) {
-            // Clamp at zero: `measure_peak` zeroes LIVE at arm time, so a free of
-            // memory allocated BEFORE the window would drive the counter negative
-            // and, because PEAK is a running maximum of LIVE, suppress every later
-            // allocation.
-            let _ = LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-                Some((live - layout.size() as i64).max(0))
-            });
+        let made_in = unsafe { ptr.cast::<u64>().sub(1).read_unaligned() };
+        let window = WINDOW.load(Ordering::Relaxed);
+        if window != 0 {
+            let size = layout.size() as i64;
+            if made_in == window {
+                if !MEASURING.with(|m| m.get()) {
+                    OFF_THREAD_FREED.fetch_add(size, Ordering::Relaxed);
+                }
+                LIVE.fetch_sub(size, Ordering::Relaxed);
+            } else {
+                FOREIGN_FREED.fetch_add(size, Ordering::Relaxed);
+            }
         }
-        unsafe { System.dealloc(ptr, layout) }
+        unsafe { System.dealloc(ptr.sub(header_len(layout)), padded(layout)) }
     }
 }
 
@@ -92,14 +138,30 @@ static ALLOC: TrackingAlloc = TrackingAlloc;
 /// because the tracker is a process-global allocator: a concurrently-running
 /// test's allocations would otherwise pollute the window.
 static MEASURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static NEXT_WINDOW: AtomicU64 = AtomicU64::new(1);
 
 fn measure_peak<R>(f: impl FnOnce() -> R) -> (R, i64) {
     LIVE.store(0, Ordering::SeqCst);
     PEAK.store(0, Ordering::SeqCst);
-    ARMED.store(true, Ordering::SeqCst);
+    FOREIGN_FREED.store(0, Ordering::SeqCst);
+    OFF_THREAD_FREED.store(0, Ordering::SeqCst);
+    OFF_THREAD_ALLOCATED.store(0, Ordering::SeqCst);
+    MEASURING.with(|m| m.set(true));
+    WINDOW.store(NEXT_WINDOW.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
     let out = f();
-    ARMED.store(false, Ordering::SeqCst);
-    (out, PEAK.load(Ordering::SeqCst))
+    WINDOW.store(0, Ordering::SeqCst);
+    MEASURING.with(|m| m.set(false));
+    eprintln!(
+        "  DIAG off-thread: allocated={} B, freed-window-memory={} B",
+        OFF_THREAD_ALLOCATED.load(Ordering::SeqCst),
+        OFF_THREAD_FREED.load(Ordering::SeqCst)
+    );
+    let peak = PEAK.load(Ordering::SeqCst);
+    eprintln!(
+        "  window: peak={peak} B, freed-but-allocated-outside-the-window={} B",
+        FOREIGN_FREED.load(Ordering::SeqCst)
+    );
+    (out, peak)
 }
 
 const KS: &str = "apply_residency_ks";
