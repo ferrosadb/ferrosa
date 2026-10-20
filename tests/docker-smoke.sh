@@ -327,13 +327,13 @@ cql_ok() {
 # Helper: run one CQL statement against a list of contact points, and fail only
 # once none of them acknowledges it. cqlsh speaks to a single host:port and has
 # no client-side failover, so a node that accepts the socket and then does not
-# answer is indistinguishable from a dead cluster. That happens here for real:
-# a node's CQL request runtime freezes for seconds around the moment one of its
-# peers is stopped (ferrosa_sched_runtime_stall_*; 5s on node1 in nightly
-# 38533936817 while node3 was being reaped), and the surviving sibling — up,
-# healthy and idle — was never tried. Phases whose assertion is about *cluster*
-# availability walk the survivors; every contact point's error is reported when
-# all of them refuse, so an unreachable cluster still fails the run.
+# answer is indistinguishable from a dead cluster. Phases whose assertion is
+# about *cluster* availability walk the survivors; every contact point's error
+# is reported when all of them refuse, so an unreachable cluster still fails
+# the run. (The 5s CQL-runtime stalls once seen right after a peer was stopped
+# were system.peers resolving the stopped container's name with a blocking
+# getaddrinfo, which the runner's DNS answers only after 5s; fixed in
+# ferrosa-cluster/src/addr_cache.rs. A survivor that stalls now is a new bug.)
 cql_ok_any() {
     local stmt=$1 description=$2; shift 2
     local port out err=""
@@ -685,8 +685,7 @@ sleep 5
 # Writes should succeed (2 of 3 alive, QUORUM = 2). The consistency level is
 # set explicitly: cqlsh defaults to ONE, under which this phase and Phase 9
 # assert nothing about quorum at all. Both survivors are offered as contact
-# points: either is a legal coordinator, and the node that just lost a peer can
-# spend seconds with its CQL runtime frozen (ferrosa_sched_runtime_stall_*).
+# points: either is a legal coordinator.
 info "Writing with 1 node down (QUORUM should succeed)..."
 cql_ok_any "CONSISTENCY QUORUM; INSERT INTO cluster_test.data (k, v, source) VALUES ('after_kill3', 'quorum_ok', 'node1')" \
     "QUORUM write with 1 of 3 nodes down" 9042 9043

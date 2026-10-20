@@ -1793,6 +1793,15 @@ impl DepWaitApplier {
         self.graph.lock().waiters_of(dep)
     }
 
+    /// The dependencies `waiter` is still parked on (empty when it is not parked).
+    pub fn parked_deps_of(&self, waiter: &TxnId) -> Vec<TxnId> {
+        self.graph
+            .lock()
+            .deps_of(waiter)
+            .map(|deps| deps.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     /// Release `waiter` from its wait on `dep`, which executes after it and so
     /// must not hold it up (an Accord transaction waits only for dependencies
     /// that execute BEFORE it). If that was its last wait, its parked write-set is

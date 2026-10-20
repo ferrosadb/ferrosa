@@ -4,6 +4,7 @@
 //! Last changed: Exported bounded consensus health supervision.
 
 pub mod accord;
+pub mod addr_cache;
 pub mod config;
 pub mod consensus_health;
 pub mod consistency;

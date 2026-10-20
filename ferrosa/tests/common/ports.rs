@@ -61,9 +61,24 @@ pub const SLICE_LEN: u16 = 200;
 /// every other test in the workspace.
 pub const SLICES: u16 = (BAND_LEN / SLICE_LEN as u32) as u16;
 
-/// Directory holding one lock file per slice, under the platform's temp dir —
-/// shared by every test process of the run, and unique to this machine.
+/// Directory holding one lock file per slice.
 const SLICE_LOCK_DIR: &str = "ferrosa-test-port-band";
+
+/// Where the slice locks live: ONE directory per machine, whatever `TMPDIR` says.
+///
+/// The ports are a machine-wide resource, so the leases must be too. Keying them
+/// on `TMPDIR` split them: a self-hosted Actions runner sets `TMPDIR` to its own
+/// `_work/_temp`, so a CI job and a local run on the same host -- or two runners
+/// on it -- each leased slice 0 from their own directory and both scanned from
+/// port 20000.
+fn slice_lock_root() -> std::path::PathBuf {
+    let shared = std::path::Path::new("/tmp");
+    if cfg!(unix) && shared.is_dir() {
+        shared.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    }
+}
 
 /// The slice this process leased from the OS, if a lease could be taken at all.
 /// Diagnostics: the allocator needs only the start port, but a guard that spans
@@ -124,7 +139,7 @@ fn process_slice_start() -> u16 {
 /// Claims a slice by taking an exclusive lock on its file, and holds the lock —
 /// and the file descriptor under it — for the life of the process.
 fn claim_slice_lease() -> Option<u16> {
-    let dir = std::env::temp_dir().join(SLICE_LOCK_DIR);
+    let dir = slice_lock_root().join(SLICE_LOCK_DIR);
     std::fs::create_dir_all(&dir).ok()?;
     for index in 0..SLICES {
         let path = dir.join(format!("slice-{index:02}.lock"));
@@ -180,8 +195,9 @@ pub fn kernel_ephemeral_floor() -> u16 {
 /// live (it only permits one over a `TIME_WAIT`), so a bind that succeeds means
 /// nothing is serving that address — including a wildcard listener, which the
 /// kernel reports as a conflict for the loopback address too. The bind is
-/// dropped immediately; [`PortAllocator`] then records the port as spoken for
-/// by this process, so it is not re-issued to another test thread.
+/// dropped immediately. [`PortAllocator`] reserves the port for this process
+/// BEFORE calling this, so the probe never lands on a port another test thread
+/// has been handed.
 pub fn port_is_free(port: u16) -> bool {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     match std::net::TcpListener::bind(addr) {
@@ -210,6 +226,20 @@ pub fn log_shows_port_collision(text: &str) -> bool {
 /// Whether some other allocation in THIS process already owns `port`.
 pub fn reserved_in_process(port: u16) -> bool {
     process_reserved().lock().unwrap().contains(&port)
+}
+
+/// Claim `port` for this process; `false` if some allocation here already owns
+/// it. A probe of a port is a real bind, so claim the port first and probe it
+/// second -- the other order lets the probe take a port another test thread was
+/// handed, for an instant, out from under its owner.
+pub fn reserve_in_process(port: u16) -> bool {
+    process_reserved().lock().unwrap().insert(port)
+}
+
+/// Give back a claim that turned out not to be usable (something else holds the
+/// port) or that a test only needed while it set up.
+pub fn release_in_process(port: u16) {
+    process_reserved().lock().unwrap().remove(&port);
 }
 
 /// Every port this process has handed out, across all its test threads.
@@ -274,10 +304,15 @@ impl PortAllocator {
             if self.taken.contains(&port) {
                 continue;
             }
-            if !port_is_free(port) {
+            // Reserve BEFORE probing. The probe is a real bind, so probing a port
+            // another allocation in this process already owns takes it from that
+            // owner for an instant -- long enough for the owner's own bind (or its
+            // node's) to fail with `Address already in use`.
+            if !reserve_in_process(port) {
                 continue;
             }
-            if !process_reserved().lock().unwrap().insert(port) {
+            if !port_is_free(port) {
+                release_in_process(port);
                 continue;
             }
             self.taken.insert(port);

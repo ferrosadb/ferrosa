@@ -13,8 +13,8 @@ mod common;
 use std::collections::HashSet;
 
 use common::ports::{
-    kernel_ephemeral_floor, port_is_free, process_lease_state, reserved_in_process, PortAllocator,
-    BAND_END, BAND_START, SLICES, SLICE_LEN,
+    kernel_ephemeral_floor, port_is_free, process_lease_state, release_in_process,
+    reserve_in_process, PortAllocator, BAND_END, BAND_START, SLICES, SLICE_LEN,
 };
 
 /// Invariant 5 — capacity, and the reason it needs its own guard: both halves of
@@ -103,10 +103,24 @@ fn a_port_a_listener_already_holds_is_never_handed_to_a_node() {
     // Order-independent: pick a band port that this process has not already
     // been given and that nothing is listening on, so the squatter below — not
     // an earlier test's reservation — is what the allocator must skip.
+    // Claim before probing, as the allocator does, so this search never binds a
+    // port a concurrently running test has been handed.
     let port = (BAND_START..=BAND_END)
-        .find(|p| !reserved_in_process(*p) && port_is_free(*p))
+        .find(|p| {
+            if !reserve_in_process(*p) {
+                return false;
+            }
+            if port_is_free(*p) {
+                return true;
+            }
+            release_in_process(*p);
+            false
+        })
         .expect("a free, unreserved port in the band");
     let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).expect("squat a band port");
+    // Release the claim only once the squatter holds the port: from here on the
+    // allocator must skip it because it is LISTENED on, not because it is ours.
+    release_in_process(port);
 
     let mut alloc = PortAllocator::beginning_at(port);
     let handed: Vec<u16> = (0..8).map(|_| alloc.get()).collect();
@@ -135,6 +149,7 @@ fn a_port_a_listener_already_holds_is_never_handed_to_a_node() {
 /// The children are this same binary re-run with a filter, so the guard measures
 /// the allocator instead of a stand-in for it.
 #[test]
+#[serial_test::serial(port_band_forks)]
 fn concurrent_test_processes_are_never_handed_the_same_port() {
     const MARKER: &str = "FERROSA_PORT_BAND_PROBE";
     let exe = std::env::current_exe().expect("the test binary's own path");
@@ -146,13 +161,22 @@ fn concurrent_test_processes_are_never_handed_the_same_port() {
     // legitimately. That protocol mistake made this guard fail in CI with
     // `[20600, 20600, 20600, 20800]` — four LEASED slices, three of them released
     // and re-let — while every harness in the same job passed.
+    //
+    // Each child also gets its OWN temp dir. Two test runs on one machine do not
+    // share `TMPDIR`: a self-hosted Actions job sets it to its runner's
+    // `_work/_temp`, so a lease kept under `TMPDIR` let a CI job on the same host
+    // as a local run lease slice 0 alongside it, and both scanned from port 20000.
+    let tmpdirs: Vec<tempfile::TempDir> = (0..4)
+        .map(|_| tempfile::tempdir().expect("a per-child temp dir"))
+        .collect();
     let mut children: Vec<std::process::Child> = Vec::new();
     let mut handed = Vec::new();
     let mut states = Vec::new();
-    for _ in 0..4 {
+    for tmpdir in &tmpdirs {
         let mut child = std::process::Command::new(&exe)
             .args(["--exact", "port_band_process_probe", "--nocapture"])
             .env(MARKER, "1")
+            .env("TMPDIR", tmpdir.path())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -237,5 +261,72 @@ fn two_tests_in_one_process_are_never_handed_the_same_port() {
         all.len(),
         "two allocations in one process were handed the same port, so their nodes \
          would fight over it: {all:?}"
+    );
+}
+
+/// A port this process has handed out is never touched by another allocation's
+/// scan, so its owner can always bind it.
+///
+/// RED as written, against the allocator that probed a candidate (a real bind)
+/// BEFORE asking whether this process already owned it: a sibling test's scan
+/// walked over every port its neighbours had been handed and bound each one for
+/// an instant. An owner binding inside that instant got `Address already in
+/// use` — the nightly fuzz lane's `a_taken_cql_port_is_named_in_the_log` failed
+/// in 0.03 s with exactly that, on the port its own allocator had just handed it,
+/// while the web and postgres cases scanned the same slice beside it.
+///
+/// Serialized with the guard that spawns probe processes: a child forked while
+/// the owner holds its listener inherits that socket until it `exec`s, so the
+/// owner's next bind fails with no other `bind` anywhere. That is fork's fd
+/// inheritance, not a probe, and the two must not overlap for this to measure.
+#[test]
+#[serial_test::serial(port_band_forks)]
+fn a_port_handed_out_is_never_probed_by_a_sibling_allocation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Allocations per scanner. Each one reserves a port for the life of the
+    /// process, and all of them together must fit in this process's own slice:
+    /// a scan that runs past the slice probes ports another test PROCESS leased,
+    /// which is a collision this guard would then misreport as its own.
+    const SCANNERS: usize = 4;
+    const GETS_PER_SCANNER: usize = 30;
+    const _: () = assert!(
+        SCANNERS * GETS_PER_SCANNER <= SLICE_LEN as usize * 3 / 4,
+        "the scanners would allocate past this process's slice"
+    );
+    let owned = PortAllocator::new().get();
+    let done = Arc::new(AtomicUsize::new(0));
+    let scanners: Vec<_> = (0..SCANNERS)
+        .map(|_| {
+            let done = Arc::clone(&done);
+            std::thread::spawn(move || {
+                // Each fresh allocator starts its scan at `owned`, so every
+                // `get` passes over the owner's port first.
+                for _ in 0..GETS_PER_SCANNER {
+                    PortAllocator::beginning_at(owned).get();
+                }
+                done.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .collect();
+
+    let mut collisions = 0usize;
+    let mut binds = 0usize;
+    while done.load(Ordering::SeqCst) < scanners.len() {
+        match std::net::TcpListener::bind(("127.0.0.1", owned)) {
+            Ok(listener) => drop(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => collisions += 1,
+            Err(e) => panic!("binding the owned port {owned} failed unexpectedly: {e}"),
+        }
+        binds += 1;
+    }
+    for scanner in scanners {
+        scanner.join().expect("scanner thread");
+    }
+    assert_eq!(
+        collisions, 0,
+        "the owner of port {owned} could not bind it {collisions} times in {binds} tries: \
+         another allocation's scan was probing a port this process had already handed out"
     );
 }

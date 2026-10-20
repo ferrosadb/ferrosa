@@ -44,6 +44,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
 
+      - name: Check this lane still excludes every live-infra test
+        # Seconds instead of an hour: a live-infra test this lane's `--skip` list
+        # forgot fails the fuzz session on a test that is not runnable here.
+        run: python3 scripts/ci/guard-all-features-lane-live-infra.py
+
       - name: Install Cap'n Proto compiler
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends capnproto libunwind-dev
 
@@ -90,7 +95,11 @@ jobs:
           # as ci.yml does; they ran here and failed at 56.7 ms on 2026-09-30.
           # The `perf-regression` job below enforces them unchanged.
           # Crate excludes + skip list mirror ci.yml's proven --all-features run
-          # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name);
+          # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name).
+          # A live-infra test this lane forgets is a red nightly: the parity is
+          # checked by scripts/ci/guard-all-features-lane-live-infra.py, so add
+          # the test name here (and in ci.yml + scripts/pre-push-mirror-ci.sh)
+          # when a new live-only test lands;
           # the file-IO repair fuzz is skipped here and run in the step below.
           # Bound the fuzz to a wall-clock budget so the run COMPLETES (exit 0)
           # instead of being cancelled by the GH step/job timeout. `timeout`
@@ -114,6 +123,7 @@ jobs:
                  --skip peak_resident_readers_within_cap --skip streaming_equals_single_pass \
                  --skip bounded_fetch_reassembles_to_single_pass \
                  --skip read_merge_is_lww_no_data_loss --skip digest_walk_is_deterministic \
+                 --skip replicated_jsonb_index_builds_on_every_node \
                  --skip differential_oracle_dml_agrees \
                  --skip differential_oracle_corpus_agrees \
                  --skip differential_oracle_jsonb \

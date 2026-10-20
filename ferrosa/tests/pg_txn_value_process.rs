@@ -611,7 +611,19 @@ fn a_port_taken_by_a_concurrent_process_is_redrawn_and_retried() {
     // exists for now that allocation is out of the kernel's ephemeral range, and it
     // must be re-drawn rather than reused.
     let stolen_port = (common::ports::BAND_START..=common::ports::BAND_END)
-        .find(|p| !common::ports::reserved_in_process(*p) && common::ports::port_is_free(*p))
+        .find(|p| {
+            // Claim before probing, so the probe never binds a port another test
+            // thread in this process was handed. The claim is kept: the port is
+            // held for the whole test and no allocation may hand it out.
+            if !common::ports::reserve_in_process(*p) {
+                return false;
+            }
+            if common::ports::port_is_free(*p) {
+                return true;
+            }
+            common::ports::release_in_process(*p);
+            false
+        })
         .expect("a free port in the harness band");
     // Bound for the whole test — dropping it would release the port the retry
     // must be seen to step over.

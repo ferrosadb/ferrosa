@@ -658,6 +658,13 @@ impl PeerManager {
         peers.get(&host_id).map(|state| state.peer_id.1.to_string())
     }
 
+    /// Non-blocking [`Self::peer_addr`] for synchronous readers (`system.peers`).
+    /// `None` if the peer is unknown or the lock is contended.
+    pub fn peer_socket_addr_sync(&self, host_id: uuid::Uuid) -> Option<std::net::SocketAddr> {
+        let peers = self.peers.try_read().ok()?;
+        peers.get(&host_id).map(|state| state.peer_id.1)
+    }
+
     /// Ensure there is an outbound connection pool for `host_id`.
     ///
     /// Uses the provided address string (IP:port or resolvable hostname:port)
