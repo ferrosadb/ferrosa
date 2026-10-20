@@ -1118,24 +1118,127 @@ async fn a_restart_after_a_completed_heal_does_not_heal_again() {
     );
 }
 
-/// A keyspace whose adjacency index this node creates is not healed: no build
-/// before 330a0c29 ever wrote to it, so there is nothing to repair, and its
-/// first edge query is served at once rather than waiting on (or being refused
-/// during) a heal. This is every new install and every new graph keyspace.
-#[tokio::test]
-async fn a_new_keyspace_is_served_without_a_heal() {
-    let node = Node::new();
-    let fresh = engine_that_cannot_heal(&node);
-    fresh
-        .ensure_adjacency_ready_for_test(KEYSPACE)
-        .await
-        .expect("a newly created adjacency index needs no heal");
+/// Write `e` and its two endpoint entities as CQL `INSERT`s do: straight to
+/// storage. No adjacency entry is derived unless an engine has already
+/// registered its observer for the keyspace. The endpoints are written
+/// because a traversal binds both `Entity` vertices; without them the MATCH
+/// is empty whatever the index holds.
+fn insert_edge_as_cql(storage: &StorageEngine, e: &Edge) {
+    let ts = now_micros();
+    let (key, clustering) = typed_edge_key(e);
+    for id in [e.src, e.dst] {
+        storage
+            .write(
+                &TableId::new(KEYSPACE, "entity_store"),
+                &key,
+                Row {
+                    clustering: id.as_bytes().to_vec(),
+                    cells: vec![(0, CellValue::live(format!("entity-{id}").into_bytes(), ts))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(ts),
+                },
+                ts,
+            )
+            .unwrap();
+    }
+    storage
+        .write(
+            &TableId::new(KEYSPACE, "typed_edges"),
+            &key,
+            Row {
+                clustering,
+                cells: vec![],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            },
+            ts,
+        )
+        .unwrap();
+}
 
-    // And a restart of it does not heal either.
-    engine_that_cannot_heal(&node)
-        .ensure_adjacency_ready_for_test(KEYSPACE)
-        .await
-        .expect("a restart over an index this node created needs no heal");
+/// Edges inserted through CQL before the keyspace's first graph query are
+/// traversable once it runs.
+///
+/// Driver Smoke on PR #590 (2026-10-20): `test_bolt_compat.py` creates the
+/// edge tables, INSERTs its edges over CQL, then runs Bolt MATCHes. The
+/// adjacency observer is registered lazily by the first graph query, so those
+/// INSERTs derived no entries; the first-use heal built them from the edge
+/// table. Skipping the heal for an index this node had just created left
+/// every relationship MATCH empty.
+#[tokio::test]
+async fn edges_inserted_before_the_first_graph_query_are_traversable() {
+    let node = Node::new();
+    let (t, s) = (tenant_id(0), session_id(0, 0));
+    let e = Edge {
+        tenant: t,
+        session: s,
+        src: entity(0, 0, 0),
+        edge_type: "related_to",
+        dst: entity(0, 0, 1),
+    };
+    insert_edge_as_cql(&node.storage, &e);
+
+    let engine = node.healed_engine().await;
+    let rows = run_ok(&engine, &related_query(t, s, e.src)).await;
+    let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
+    assert_eq!(
+        got,
+        BTreeSet::from([e.dst.to_string()]),
+        "an edge INSERTed before the first graph query must be traversable"
+    );
+}
+
+/// After a restart, edges inserted through CQL before the keyspace's first
+/// graph query are traversable, even though this node already recorded a
+/// completed heal.
+///
+/// The observer is registered by the first graph query of each PROCESS, so a
+/// restarted node's CQL edge writes derive no entries until then. Before
+/// #589 the first query's heal built them; the heal record (#589) skips that
+/// heal on restart, and nothing else backfills them.
+#[tokio::test]
+async fn edges_inserted_after_a_restart_before_the_first_graph_query_are_traversable() {
+    let node = Node::new();
+    drop(node.healed_engine().await);
+    node.storage
+        .shutdown()
+        .expect("the first process shuts down cleanly");
+
+    // The second process: a new storage engine over the same data dir.
+    let storage = Arc::new(StorageEngine::new(storage_config(&node._dir), None).unwrap());
+    register_storage_tables(&storage);
+    storage
+        .register_table(
+            ferrosa_graph::adjacency::adjacency_table_metadata(KEYSPACE).to_storage_schema(),
+        )
+        .unwrap();
+    let (t, s) = (tenant_id(0), session_id(0, 0));
+    let e = Edge {
+        tenant: t,
+        session: s,
+        src: entity(0, 0, 0),
+        edge_type: "related_to",
+        dst: entity(0, 0, 1),
+    };
+    insert_edge_as_cql(&storage, &e);
+
+    let engine = GraphEngine::new(
+        Arc::clone(&node.schema),
+        Arc::clone(&storage),
+        Arc::new(arc_swap::ArcSwap::from_pointee(WritePath::direct(
+            Arc::clone(&storage),
+        ))),
+        GraphEngineConfig::default(),
+        std::time::Duration::from_secs(300),
+    );
+    healed(&engine).await;
+    let rows = run_ok(&engine, &related_query(t, s, e.src)).await;
+    let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
+    assert_eq!(
+        got,
+        BTreeSet::from([e.dst.to_string()]),
+        "an edge INSERTed after a restart, before the first graph query, must be traversable"
+    );
 }
 
 /// A heal that did not complete records nothing: the next start heals.

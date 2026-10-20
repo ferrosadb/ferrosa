@@ -82,7 +82,13 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 - **G-14: the heal no longer holds the hot path (2026-10-20).**
   - A query waits on a running heal for at most 1 s, then is refused
     retryably while the heal continues.
-  - An adjacency table this node creates is never healed (t_d0dacb7a).
+  - A start that finds the heal record skips only the cluster-wide rewrite,
+    and still runs a local catch-up pass. That pass indexes the edges
+    written before the process registered its observer (t_d0dacb7a).
+- **Register the adjacency observer before writes are accepted.** It is
+  registered lazily, by the first graph query in each process. Writes that
+  land before then rely on the catch-up pass, and a node that never gets a
+  graph query never indexes forwarded edge writes at all (t_17765000).
 
 - **G-3 — reconciler writes at the keyspace replication strategy (2026-10-03).**
   `write_mutation` / `write_tombstone` write the index at CL ALL under the

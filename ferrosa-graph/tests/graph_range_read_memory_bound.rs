@@ -565,7 +565,9 @@ fn warm_up(rt: &tokio::runtime::Runtime, engine: &GraphEngine, query: &str) {
                     std::time::Instant::now() < deadline,
                     "warm-up: the heal did not complete within 120 s: {reason}"
                 );
-                rt.block_on(tokio::time::sleep(std::time::Duration::from_millis(20)));
+                rt.block_on(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                });
             }
             Err(other) => panic!("warm-up query: {other:?}"),
         }
