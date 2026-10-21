@@ -493,6 +493,28 @@ async fn healed(engine: &GraphEngine) {
     }
 }
 
+/// Wait until `engine`'s first heal completes, tolerating only the refusal
+/// for a heal still running. Unlike [`healed`], a failed heal panics rather
+/// than being retried, so a test that the first heal succeeds stays one.
+async fn first_heal_completes(engine: &GraphEngine) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match engine.ensure_adjacency_ready_for_test(KEYSPACE).await {
+            Ok(()) => return,
+            Err(ferrosa_graph::error::GraphError::Unavailable(reason))
+                if reason.contains("the heal is still running") =>
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the heal did not complete within 120 s: {reason}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            Err(other) => panic!("the first heal did not complete: {other}"),
+        }
+    }
+}
+
 /// Every traversal ferrosa-memory issues, for every vertex, all issued at once
 /// against `engine` — as the first requests after a restart arrive together.
 /// Returns the mismatches, so one failure shows the whole damage. A refusal is
@@ -1097,10 +1119,7 @@ async fn a_restart_after_a_completed_heal_does_not_heal_again() {
     let (node, all, live) = damaged_node(1, 1, 12).await;
     let reference = Reference::new(&all, &live);
     let first = node.start_engine();
-    first
-        .ensure_adjacency_ready_for_test(KEYSPACE)
-        .await
-        .expect("the first start heals");
+    first_heal_completes(&first).await;
     drop(first);
 
     let restarted = engine_that_cannot_heal(&node);
@@ -1688,10 +1707,9 @@ mod cluster {
             0,
             "the remote replica starts damaged"
         );
-        fresh
-            .ensure_adjacency_ready_for_test(KEYSPACE)
-            .await
-            .expect("the heal completes against both replicas");
+        // On a loaded runner the heal outlasts a query's wait budget and the
+        // query is refused while it runs; wait that out.
+        first_heal_completes(&fresh).await;
         // Each node answers CL ONE traversals from its own replica: the local
         // one, read directly.
         assert_clean(
@@ -1786,10 +1804,7 @@ mod cluster {
             std::time::Duration::from_secs(300),
         );
 
-        fresh
-            .ensure_adjacency_ready_for_test(KEYSPACE)
-            .await
-            .expect("three dropped writes are retried, not a failed heal");
+        first_heal_completes(&fresh).await;
         assert_clean(
             "traversals after a heal that retried its failed writes",
             &check_all(&node.healed_engine().await, &reference).await,
@@ -1952,10 +1967,7 @@ mod cluster {
         // runner (1.10 s against 1.08 s), with the repairs plainly in flight
         // together.
         let entries = 2 * all.len();
-        fresh
-            .ensure_adjacency_ready_for_test(KEYSPACE)
-            .await
-            .expect("the heal completes against both replicas");
+        first_heal_completes(&fresh).await;
         assert!(
             concurrency.peak() >= 8,
             "the heal of {entries} entries never had more than {} requests at the replica \
