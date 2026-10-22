@@ -51,7 +51,9 @@ pub mod validator;
 pub(crate) use executor::{compaction_planning_deferred, compaction_pressure};
 pub use executor::{CompactionExecutor, CompactionResult};
 pub use metadata::{CompactionTask, SSTableMetadata};
-pub use strategy::{CompactionConfig, CompactionStrategy, NoCompactionStrategy, SizeTieredStrategy};
+pub use strategy::{
+    CompactionConfig, CompactionStrategy, NoCompactionStrategy, SizeTieredStrategy,
+};
 pub use strategy_ucs::{UcsConfig, UnifiedCompactionStrategy};
 
 /// Fires a [`cancel_harness::CancelPoint`] hook at a named step in the

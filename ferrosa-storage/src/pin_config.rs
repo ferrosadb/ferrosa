@@ -31,9 +31,13 @@ impl PinConfig {
             Some("nvme") => PinMode::NvMe,
             _ => PinMode::None,
         };
+        // `storage.pin_max_bytes` accepts the same size literals as
+        // `rrd.block_bytes` (`"10GiB"`, `"512KiB"`, bare bytes); an unparseable
+        // value is still ignored here, as it always has been, because pinning is
+        // an optimisation and not a retention guarantee.
         let max_bytes = ext
             .get("storage.pin_max_bytes")
-            .and_then(|v| v.parse().ok());
+            .and_then(|v| crate::size_units::parse_size(v).ok());
         Self { mode, max_bytes }
     }
 
@@ -73,6 +77,15 @@ mod tests {
         );
         let config = PinConfig::from_extensions(&ext);
         assert_eq!(config.max_bytes, Some(10737418240));
+    }
+
+    #[test]
+    fn pin_config_parses_size_literals() {
+        let mut ext = HashMap::new();
+        ext.insert("storage.pin".to_string(), "nvme".to_string());
+        ext.insert("storage.pin_max_bytes".to_string(), "10GiB".to_string());
+        let config = PinConfig::from_extensions(&ext);
+        assert_eq!(config.max_bytes, Some(10 * 1024 * 1024 * 1024));
     }
 
     #[test]

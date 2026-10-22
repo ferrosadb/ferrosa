@@ -55,6 +55,7 @@ pub mod rrd;
 pub(crate) mod runtime_tuning;
 pub mod schema_snapshot;
 pub mod self_heal;
+pub mod size_units;
 pub mod snapshot;
 pub mod spill_budget;
 pub mod spilling_dedup;
