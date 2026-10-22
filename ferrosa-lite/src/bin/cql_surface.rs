@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          (tenant_id, server_fingerprint, next_cursor, updated_at, reservation_token) \
          VALUES ({TENANT}, 'srv-1', 101, '2026-10-22 12:00:00.000+0000', {TOKEN}) IF NOT EXISTS"
     );
-    report_cl(&mut client, "insert cursor_state if not exists", &insert_cursor, 6).await;
+    report_cl(&mut client, "insert cursor_state if not exists", &insert_cursor, 4).await;
 
     // 6. UPDATE ... IF <non-key column> = ? — compare-and-set on next_cursor.
     //    This is the shape that decides whether the control store can reserve a
@@ -128,9 +128,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          SET next_cursor = 201, updated_at = '2026-10-22 12:00:01.000+0000', reservation_token = {TOKEN} \
          WHERE tenant_id = {TENANT} AND server_fingerprint = 'srv-1' IF next_cursor = 101"
     );
-    report_cl(&mut client, "update cursor_state if next_cursor = 101 (CAS)", &cas, 6).await;
+    report_cl(&mut client, "update cursor_state if next_cursor = 101 (CAS)", &cas, 4).await;
     // A stale CAS must report not-applied, not error.
-    report_cl(&mut client, "update cursor_state if next_cursor = 101 (stale CAS)", &cas, 6).await;
+    report_cl(&mut client, "update cursor_state if next_cursor = 101 (stale CAS)", &cas, 4).await;
 
     // 7. INSERT ... IF NOT EXISTS — event (control_store.rs append path).
     let insert_event = format!(
@@ -140,8 +140,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          VALUES ({TENANT}, 'srv-1', 0, 202, {EVENT}, {COMMAND}, 'command', '{{}}', \
                  '2026-10-22 12:00:02.000+0000') IF NOT EXISTS"
     );
-    report_cl(&mut client, "insert event if not exists", &insert_event, 6).await;
-    report_cl(&mut client, "insert event if not exists (repeat)", &insert_event, 6).await;
+    report_cl(&mut client, "insert event if not exists", &insert_event, 4).await;
+    report_cl(&mut client, "insert event if not exists (repeat)", &insert_event, 4).await;
 
     // 8. INSERT ... IF NOT EXISTS — command row.
     let insert_command = format!(
@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          VALUES ({TENANT}, 'srv-1', {COMMAND}, 'ping', '{{}}', 'pending', null, null, \
                  '2026-10-22 12:00:03.000+0000', '2026-10-22 12:00:03.000+0000') IF NOT EXISTS"
     );
-    report_cl(&mut client, "insert command if not exists", &insert_command, 6).await;
+    report_cl(&mut client, "insert command if not exists", &insert_command, 4).await;
 
     // 9. UPDATE ... IF EXISTS — command state transition (control_store.rs:1014).
     let update_command = format!(
@@ -160,7 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          WHERE tenant_id = {TENANT} AND server_fingerprint = 'srv-1' AND command_id = {COMMAND} \
          IF EXISTS"
     );
-    report_cl(&mut client, "update command if exists", &update_command, 6).await;
+    report_cl(&mut client, "update command if exists", &update_command, 4).await;
 
     // 10. Schema probes at CL ONE (control_store.rs:591-604).
     for (name, q) in [
@@ -198,7 +198,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
          WHERE tenant_id = {TENANT} AND server_fingerprint = 'srv-1' AND cursor_bucket = 0 \
          AND cursor > 0 AND cursor <= 202 LIMIT 100"
     );
-    report_cl(&mut client, "select clustering range with limit", &range, 6).await;
+    report_cl(&mut client, "select clustering range with limit", &range, 4).await;
 
     // 12. PREPARE — the scylla driver prepares by default.
     match client.prepare(&range).await {
@@ -226,8 +226,11 @@ async fn report(client: &mut CqlClient, name: &str, cql: &str) {
     }
 }
 
+/// `cl` is 1 (CL ONE) or 4 (CL QUORUM) — the two the in-tree client can send.
+/// The control store's own session default is LOCAL_QUORUM (6), which has no
+/// helper here; CL 6 resolution is therefore not exercised by this probe.
 async fn report_cl(client: &mut CqlClient, name: &str, cql: &str, cl: u16) {
-    let outcome = if cl == 6 {
+    let outcome = if cl == 4 {
         client.query_quorum(cql).await
     } else {
         client.query(cql).await
