@@ -50,6 +50,17 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   live `ferrosa-schema` role store via [`SchemaVerifierStore`]. Fail loud: an
   unknown role / bad proof never authenticates, and a `NOLOGIN` role is refused
   even with a valid proof.
+- **Unowned-node posture** (ADR-024) — a node with `auth_enabled=false` seeds and
+  replays no roles, so no login can authenticate. The listener stays bound and
+  refuses every login by name — `FATAL` `28000` "no roles are configured on this
+  node, so no login can authenticate: enable CQL auth
+  (`FERROSA_AUTH_ENABLED=true`) to seed the login roles, then set
+  `FERROSA_SEED_ADMIN_PASSWORD` to choose the administrator password" — instead of the
+  internal `Handshake(UnknownRole)` name. The node says the same thing once at
+  startup. `NoRolesConfigured` is distinct from `UnknownRole` (which stays the
+  answer on a node that *has* login roles, and still counts as a failed login)
+  and is not charged to the failed-login limiter. The posture is read from the
+  role registry, not from the config flag.
 - **Failed-login limiter** (t_e1c819ad) — every login is admitted through the
   schema's shared per-user limiter (`Schema::check_login_rate_limit`, the one
   `Schema::authenticate` uses for CQL); unknown roles and bad proofs count as

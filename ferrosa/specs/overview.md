@@ -90,7 +90,10 @@ replication uniform.
 4. **Auth is driven from one switch.** `FERROSA_AUTH_ENABLED` (or
    `[cql].auth_enabled`) is the source of truth; `resolve_auth_disabled` derives
    the CQL/web/graph/Bolt `auth_disabled` flag. `FERROSA_AUTH_DISABLED` is a
-   deprecated override that logs a warning.
+   deprecated override that logs a warning. The PostgreSQL front-end does not
+   consult the flag: it authenticates from the role registry, so with auth off
+   (no seeded or replayed roles) it stays bound and refuses every login by name
+   with the keys that fix it, and says the same once at startup (ADR-024).
 5. **Graceful shutdown flushes before exit.** `SIGTERM` (container stop) and
    `SIGINT` both trigger a 30 s drain that flushes memtables and persists schema
    — skipping it is 100 % data loss on restart.

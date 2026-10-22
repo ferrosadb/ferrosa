@@ -54,7 +54,7 @@ pub use messages::{
 pub use mvcc::{MvccManager, PgWrite};
 pub use portal_limits::{PortalLimits, SuspendedPortals};
 pub use scram::{ScramError, ScramServerFirst, ScramVerifier};
-pub use server::{PgTls, QueryContext};
+pub use server::{PgTls, QueryContext, NO_ROLES_REFUSAL};
 pub use txn_write_set::TxnWriteSet;
 
 pub use accord_access::AccordAccess;

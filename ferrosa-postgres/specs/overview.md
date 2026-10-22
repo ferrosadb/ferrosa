@@ -77,6 +77,11 @@ TCP accept (server::serve)
        SSLRequest        → 'S' + rustls handshake (PgTls configured) | 'N' (no cert)
        Startup           → FATAL 28000 if require_tls and no TLS
                          → limiter admit (FATAL 28000 "login throttled") → AuthenticationSASL
+                         → no verifier AND no login role on the node: FATAL 28000
+                           "no roles are configured on this node, …" (ADR-024),
+                           NOT charged to the limiter
+                         → no verifier on a node that HAS login roles: FATAL 28P01,
+                           record_failure
        SASLInitial/Final → bad proof: record_failure, FATAL 28P01
                          → complete_login (NOLOGIN refused) → AuthenticationOk + … + ReadyForQuery
      Phase 2: query_loop (as the authenticated AuthContext) frames Q / Parse / Bind /

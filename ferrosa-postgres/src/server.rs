@@ -76,11 +76,23 @@ fn random_server_nonce() -> String {
     STANDARD_NO_PAD.encode(bytes)
 }
 
+/// Operator-facing text for the unowned-node posture: a node with no role that
+/// can authenticate over the PostgreSQL wire refuses every login with this
+/// message (ADR-024). Exported so the node's startup log and the wire `FATAL`
+/// cannot drift apart.
+pub const NO_ROLES_REFUSAL: &str =
+    "no roles are configured on this node, so no login can authenticate: \
+     enable CQL auth (FERROSA_AUTH_ENABLED=true) to seed the login roles, then set \
+     FERROSA_SEED_ADMIN_PASSWORD to choose the administrator password";
+
 /// SQLSTATE to report for a fatal connection error (fail loud to the client).
 fn sqlstate(err: &ConnError) -> &'static str {
     match err {
         ConnError::Handshake(HandshakeError::Scram(_))
         | ConnError::Handshake(HandshakeError::UnknownRole) => "28P01", // invalid_password
+        // Includes `NoRolesConfigured`: the node refuses every login because it
+        // has no role at all. That is an authorization-configuration failure
+        // (28000), not a wrong password (28P01).
         ConnError::Handshake(_) | ConnError::TlsRequired => "28000", // invalid_authorization
         ConnError::Codec(_) | ConnError::Unexpected(_) => "08P01",   // protocol_violation
     }
@@ -90,6 +102,7 @@ fn sqlstate(err: &ConnError) -> &'static str {
 /// reason so a client log says why the connection was closed.
 fn fatal_message(err: &ConnError) -> String {
     match err {
+        ConnError::Handshake(HandshakeError::NoRolesConfigured) => NO_ROLES_REFUSAL.to_string(),
         ConnError::Handshake(HandshakeError::Throttled(reason)) => {
             format!("login throttled for this role (failed-login limiter): {reason}")
         }
