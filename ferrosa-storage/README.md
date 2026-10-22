@@ -580,6 +580,16 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   block. Recommended per-tier starting points live in the `rrd::config` module
   docs. Window arithmetic is in microseconds (the cell-timestamp unit) and a
   timestamp exactly on an edge belongs to the window that starts there.
+- **The segment writer** (`store::flush_segmented`) — a flush of a segmented
+  table buckets the sealed snapshot by window and writes one generation per
+  non-empty window, before the token-range shard decision (a shard split would
+  cut a window across files). Rows are bucketed by the first clustering
+  component via `time_series_row_timestamp`; a partition's statics and partition
+  deletion ride in its earliest-window generation, which reads merge. Registration
+  refuses two shapes rather than producing files that can never be expired: a
+  clustering key that is not an 8-byte timestamp, and a table with a secondary,
+  vector or full-text index, whose memtable postings are not windowed. Retention
+  (unlink) and the generation → window index are not implemented yet.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
   backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest. The local

@@ -6480,7 +6480,7 @@ impl<F: FlushTarget> TableStore<F> {
         self.update_view("flush:clear_segmented_memtable", |live| {
             let next = StoreView {
                 active: Arc::clone(&live.active),
-                flushing: without_sealed(&live.flushing, &old_active),
+                flushing: without_sealed(&live.flushing, old_active),
                 sstables: Arc::clone(&live.sstables),
                 sstable_ids: Arc::clone(&live.sstable_ids),
                 indexes: Arc::clone(&live.indexes),

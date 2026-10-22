@@ -381,11 +381,28 @@ order and there is nothing for a compaction strategy to merge.
   exactly on an edge (`k * window`) belongs to the window that starts there.
   Segment identity is derived from the window start alone, so two rows in one
   window cannot split across segments.
-- **Not yet implemented in this slice:** rolling the segment when a flush spans
-  a window boundary, retention by unlinking the oldest expired segment through
-  the existing retire path, and read-path reporting of an unlinked window as
-  absent. `rrd.block_bytes` is parsed and clamped by `effective_block_bytes`
-  but has no consumer until the segment writer lands.
+- **The segment writer** (`store::flush_segmented`). A flush of a segmented table
+  buckets the sealed snapshot by window and writes **one generation per non-empty
+  window**, so a window is always exactly the set of generations whose rows fall
+  in it — which is what makes retention an unlink later. It runs *before* the
+  token-range shard decision, because a shard split would cut one window across
+  several files. Rows are bucketed by the first clustering component, decoded
+  with `time_series_row_timestamp`. Empty windows produce no file, and an empty
+  memtable produces no generation. A partition's statics and partition deletion
+  ride in its earliest-window generation only; reads merge every source of a
+  partition, so this stays invisible to them. The late-writer drain compares
+  against the union of a partition's window generations rather than one file.
+  Two tables are refused at registration rather than producing un-expirable
+  files: a clustering key that is not an 8-byte timestamp, and a table declaring
+  a secondary, vector or full-text index, whose memtable postings are not
+  windowed and would point at rows another generation holds.
+- **Not yet implemented in this slice:** retention by unlinking the oldest
+  expired segment through the existing retire path, read-path reporting of an
+  unlinked window as absent, and a generation → window index (retention needs one:
+  `SstableDescriptor::min_timestamp`/`max_timestamp` are *write* timestamps, not
+  the data timestamps a window is defined by). `rrd.block_bytes` is parsed and
+  clamped by `effective_block_bytes` but still has no consumer — the writer
+  landed without needing it.
 
 ## jsonb (T-150)
 
