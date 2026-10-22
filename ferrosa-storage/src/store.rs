@@ -2941,6 +2941,9 @@ pub(crate) mod flush_fault_test_hook {
     pub(crate) enum FlushFault {
         /// After the active memtable moved to `flushing`, before encoding.
         AfterSwap,
+        /// After the n-th generation of an RRD-segmented flush was written and
+        /// published (1-based), before the next one starts.
+        AfterSegmentGeneration(u64),
     }
 
     thread_local! {
@@ -5692,6 +5695,47 @@ impl<F: FlushTarget> TableStore<F> {
             return Ok(FlushOutcome::NothingToFlush);
         }
 
+        // Step 4b: an RRD-segmented table writes ONE immutable generation per
+        // time window its sealed memtable touched (see `flush_segmented`).
+        // This runs before the shard decision: a token-range shard split would
+        // cut a window's rows across files, which is the opposite of what
+        // retention needs.
+        match crate::rrd::RrdConfig::from_extensions(&flush_schema.extensions) {
+            None => {}
+            Some(Err(reason)) => {
+                // Registration rejects an unusable `rrd.*` set, so this is a
+                // hand-edited schema. Writing the memtable as one unsegmented
+                // file would leave retention a file it can never unlink.
+                return Err(ferrosa_common::Error::InvalidData(format!(
+                    "{}.{}: {reason}",
+                    flush_schema.keyspace, flush_schema.table
+                )));
+            }
+            Some(Ok(config)) => {
+                if flush_catalog.declares_any() || target_catalog.declares_any() {
+                    return Err(ferrosa_common::Error::InvalidData(format!(
+                        "{}.{} sets {} so a flush writes one generation per window, but the \
+                         table declares a secondary, vector or full-text index: a memtable's \
+                         index postings are not windowed, so a per-window sidecar would point at \
+                         rows another generation holds. Drop the index, or store the tier \
+                         without {}",
+                        flush_schema.keyspace,
+                        flush_schema.table,
+                        crate::rrd::config::SEGMENT_WINDOW_KEY,
+                        crate::rrd::config::SEGMENT_WINDOW_KEY
+                    )));
+                }
+                return self.flush_segmented(
+                    partitions,
+                    &flush_schema,
+                    &config,
+                    &old_active,
+                    snapshot_epoch,
+                    total_start,
+                );
+            }
+        }
+
         // Parallel sharded flush (slice #3): when the table has NO secondary
         // indexes, split the token-sorted partitions into shards and encode each
         // into its own SSTable in parallel. Encode is ~98% of flush time and is
@@ -6229,6 +6273,231 @@ impl<F: FlushTarget> TableStore<F> {
         })?;
 
         Ok(FlushOutcome::Published)
+    }
+
+    /// Write one RRD window's rows as one immutable generation, then publish it.
+    ///
+    /// The generation's components are fsynced by the flush target before this
+    /// returns (see [`FlushTarget::flush_deferred_files`]), so a caller that
+    /// publishes each window in turn leaves every completed window durable
+    /// before it starts the next.
+    fn write_segment_generation(
+        &self,
+        schema: &TableSchema,
+        partitions: &mut [Partition],
+    ) -> Result<SstableDescriptor> {
+        let header = flush::header_for_flush(schema, partitions);
+        let staged_output = self.flush_target.file_output_staging_dir()?;
+        let table_label = format!("{}.{}", schema.keyspace, schema.table);
+        let mut writer = if let Some(staging_dir) = staged_output.as_ref() {
+            SSTableWriter::new_file_backed(
+                self.options.clone(),
+                header.clone(),
+                staging_dir.join("Data.db"),
+            )?
+        } else {
+            SSTableWriter::new(self.options.clone(), header.clone())
+        };
+        let phase_start = Instant::now();
+        for p in partitions.iter_mut() {
+            crate::memtable::expand_collection_blobs_in_place(p, &header, &table_label)?;
+            writer.add_partition(p)?;
+        }
+        let (reader, output_bytes) = if let Some(staging_dir) = staged_output {
+            let output = writer.finish_to_directory_deferred_sync(staging_dir)?;
+            let output_bytes = output.total_size_bytes();
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::EncodeSstable,
+                phase_start.elapsed(),
+            );
+            let phase_start = Instant::now();
+            let reader = self.flush_target.flush_deferred_files(output)?;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::LocalWriteSstable,
+                phase_start.elapsed(),
+            );
+            (reader, output_bytes)
+        } else {
+            let output = writer.finish()?;
+            let output_bytes = (output.data.len()
+                + output.partitions.len()
+                + output.rows.len()
+                + output.filter.len()
+                + output.statistics.len()
+                + output.toc.len()
+                + output.compression_info.as_ref().map_or(0, |ci| ci.len()))
+                as u64;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::EncodeSstable,
+                phase_start.elapsed(),
+            );
+            let phase_start = Instant::now();
+            let reader = self.flush_target.flush(output)?;
+            crate::metrics::observe_flush_phase(
+                crate::metrics::FlushPhase::LocalWriteSstable,
+                phase_start.elapsed(),
+            );
+            (reader, output_bytes)
+        };
+
+        let gen = self.flush_target.last_generation();
+        self.next_gen
+            .fetch_max(gen + 1, std::sync::atomic::Ordering::SeqCst);
+        let desc = SstableDescriptor::from_reader(
+            format!("{gen}"),
+            self.flush_target.base_dir().to_path_buf(),
+            &reader,
+        );
+        crate::metrics::observe_flush_output(
+            output_bytes,
+            partitions.iter().map(|p| p.rows.len()).sum::<usize>() as u64,
+            partitions.len() as u64,
+        );
+        let reader = Arc::new(reader);
+        self.seed_reader(&desc, Arc::clone(&reader));
+
+        // Publish this generation before the next one is written, so a crash
+        // between two leaves the completed ones in the view AND on disk, and a
+        // reader never has to wait for the whole flush to see the window that
+        // already exists.
+        self.update_view("flush:install_segment_generation", |current| {
+            let mut sstables = vec![desc.clone()];
+            sstables.extend(current.sstables.iter().cloned());
+            let mut ids = vec![(desc.gen.clone(), desc.dir.clone())];
+            ids.extend(current.sstable_ids.iter().cloned());
+            // A segmented table declares no index (see the refusal in
+            // `flush_sealed`), so its generations carry no sidecars.
+            let mut sidecars: Vec<Arc<HashMap<String, SidecarReader>>> =
+                vec![Arc::new(HashMap::new())];
+            sidecars.extend(current.sidecar_indexes.iter().cloned());
+            let next = StoreView {
+                active: Arc::clone(&current.active),
+                flushing: Arc::clone(&current.flushing),
+                sstables: Arc::new(sstables),
+                sstable_ids: Arc::new(ids),
+                indexes: Arc::clone(&current.indexes),
+                sidecar_indexes: Arc::new(sidecars),
+                vector_indexes: Arc::clone(&current.vector_indexes),
+            };
+            (Some(next), ())
+        })?;
+        Ok(desc)
+    }
+
+    /// Flush a sealed memtable of an RRD-segmented table as ONE generation per
+    /// time window it touched.
+    ///
+    /// This is the reason the extension exists: retention deletes a window by
+    /// unlinking its file, so a file may hold exactly one window. A memtable
+    /// holds whatever was written since the last flush — every partition, every
+    /// window — so it is split here by [`segment_partitions_by_window`], and
+    /// each non-empty window is written as its own immutable generation, oldest
+    /// first.
+    ///
+    /// Each generation is durable (components fsynced) and installed in the
+    /// view before the next is written. A crash between two of them therefore
+    /// leaves every completed generation readable after restart, and a
+    /// generation whose components were only partly written is skipped by the
+    /// restart loader — the same guarantee every flush already has.
+    ///
+    /// The sealed memtable stays in `flushing` until the last window is
+    /// published, so reads see it (and its index postings) throughout.
+    fn flush_segmented(
+        &self,
+        partitions: Vec<Partition>,
+        schema: &Arc<TableSchema>,
+        config: &crate::rrd::RrdConfig,
+        old_active: &Arc<dyn Memtable>,
+        snapshot_epoch: u64,
+        total_start: Instant,
+    ) -> Result<FlushOutcome> {
+        let mut buckets = segment_partitions_by_window(schema, config, partitions)?;
+        let mut published = 0usize;
+        // Test-only: which generation of this flush we are on, so the crash
+        // hook can fire between two of them.
+        #[cfg(test)]
+        let mut generation_ordinal = 0u64;
+        for (window_start, bucket) in buckets.iter_mut() {
+            let rows_here: usize = bucket.iter().map(|p| p.rows.len()).sum();
+            let desc = self.write_segment_generation(schema, bucket)?;
+            published += 1;
+            tracing::debug!(
+                gen = %desc.gen,
+                window_start,
+                rows = rows_here,
+                partitions = bucket.len(),
+                "flush: segment generation published"
+            );
+            #[cfg(test)]
+            {
+                generation_ordinal += 1;
+                flush_fault_test_hook::fire(
+                    flush_fault_test_hook::FlushFault::AfterSegmentGeneration(generation_ordinal),
+                );
+            }
+        }
+
+        // Late-writer drain: identical semantics to the unsegmented path, but
+        // compared against the UNION of the partition's window generations —
+        // the flush split each partition, so no single generation holds the
+        // image to compare against. Impossible behind the sealed gate; keep the
+        // rows and say so loudly if it ever happens.
+        if late_writer_drain_needed(old_active.as_ref(), snapshot_epoch) {
+            let by_key: std::collections::BTreeMap<&DecoratedKey, Vec<&Partition>> = {
+                let mut map: std::collections::BTreeMap<&DecoratedKey, Vec<&Partition>> =
+                    std::collections::BTreeMap::new();
+                for image in buckets.iter().flat_map(|(_, bucket)| bucket.iter()) {
+                    map.entry(&image.key).or_default().push(image);
+                }
+                map
+            };
+            let mut replay_ctx = None;
+            old_active.for_each_partition(None, None, &mut |p| {
+                let images = by_key.get(&p.key).map(Vec::as_slice).unwrap_or(&[]);
+                if !segmented_partition_needs_replay(images, p) {
+                    return true;
+                }
+                let (current_view, schema_now) =
+                    replay_ctx.get_or_insert_with(|| (self.view.load(), self.schema.load()));
+                self.late_writes_after_seal
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::error!(
+                    partition = ?p.key,
+                    "flush: a row reached a sealed segmented memtable after its snapshot; \
+                     replaying it without its index postings"
+                );
+                for row in &p.rows {
+                    if let Err(e) = current_view.active.put(&p.key, row.clone(), schema_now) {
+                        tracing::error!(%e, "flush(segmented): late-writer replay put failed");
+                    }
+                }
+                true
+            });
+        }
+
+        // The sealed memtable leaves `flushing` only now: every one of its
+        // windows is on disk, so no row is left in memory-only.
+        self.update_view("flush:clear_segmented_memtable", |live| {
+            let next = StoreView {
+                active: Arc::clone(&live.active),
+                flushing: without_sealed(&live.flushing, &old_active),
+                sstables: Arc::clone(&live.sstables),
+                sstable_ids: Arc::clone(&live.sstable_ids),
+                indexes: Arc::clone(&live.indexes),
+                sidecar_indexes: Arc::clone(&live.sidecar_indexes),
+                vector_indexes: Arc::clone(&live.vector_indexes),
+            };
+            (Some(next), ())
+        })?;
+        crate::metrics::observe_flush_phase(
+            crate::metrics::FlushPhase::Total,
+            total_start.elapsed(),
+        );
+        Ok(if published == 0 {
+            FlushOutcome::NothingToFlush
+        } else {
+            FlushOutcome::Published
+        })
     }
 
     /// Parallel sharded flush (slice #3). Split the token-sorted `partitions`
@@ -11254,6 +11523,121 @@ fn time_series_row_timestamp(
     Some(timestamp_unit.raw_to_micros(i64::from_be_bytes(bytes)))
 }
 
+/// Split a sealed memtable's partitions into one bucket per time window.
+///
+/// Returns the buckets in ascending window order, each holding exactly the rows
+/// whose data timestamp falls in that window — the unit one generation (one
+/// immutable file) is written from. A window no row fell in produces no bucket,
+/// so it produces no file, and an empty memtable produces no buckets at all.
+///
+/// Assignment is by the row's timestamp component, not by column position: the
+/// tier's first clustering column is the component its rows are ordered by, and
+/// [`time_series_row_timestamp`] is the crate's one decoder for it (8
+/// big-endian bytes, whose unit the column's storage class declares). A table
+/// whose clustering key is not that component cannot be windowed and fails loud
+/// rather than writing a file that spans windows — retention could never unlink
+/// such a file.
+///
+/// A partition's non-row state is carried once, in the generation for the
+/// earliest window that partition touches: its static row and its
+/// partition-level deletion carry write timestamps, not data timestamps, and a
+/// read merges every source of a partition, so the state still applies to the
+/// rows in later windows. Retention therefore never duplicates it and never
+/// loses it while any of that partition's rows are retained.
+fn segment_partitions_by_window(
+    schema: &TableSchema,
+    config: &crate::rrd::RrdConfig,
+    partitions: Vec<Partition>,
+) -> Result<Vec<(i64, Vec<Partition>)>> {
+    if schema.clustering_columns.len() != 1 {
+        return Err(ferrosa_common::Error::InvalidData(format!(
+            "{}.{} sets {} but has {} clustering columns: a segmented tier needs exactly one \
+             clustering component to place a row in a window, and it must be an 8-byte timestamp",
+            schema.keyspace,
+            schema.table,
+            crate::rrd::config::SEGMENT_WINDOW_KEY,
+            schema.clustering_columns.len()
+        )));
+    }
+    let timestamp_unit = crate::timeseries::TimeSeriesTimestampUnit::from_storage_type(
+        &schema.clustering_columns[0].type_name,
+    );
+
+    let mut buckets: std::collections::BTreeMap<i64, Vec<Partition>> =
+        std::collections::BTreeMap::new();
+    for partition in partitions {
+        let Partition {
+            key,
+            deletion,
+            static_row,
+            rows,
+        } = partition;
+        let mut by_window: std::collections::BTreeMap<i64, Vec<Row>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let Some(ts) = time_series_row_timestamp(&row, timestamp_unit) else {
+                return Err(ferrosa_common::Error::InvalidData(format!(
+                    "{}.{} sets {} but a row's clustering key is {} bytes: the window is \
+                     computed from the 8-byte timestamp that component must hold",
+                    schema.keyspace,
+                    schema.table,
+                    crate::rrd::config::SEGMENT_WINDOW_KEY,
+                    row.clustering.len()
+                )));
+            };
+            by_window
+                .entry(config.window_start_micros(ts))
+                .or_default()
+                .push(row);
+        }
+        if by_window.is_empty() {
+            let carrier =
+                segment_carrier_timestamp(&deletion, static_row.as_ref()).ok_or_else(|| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "{}.{} partition {:?} has no rows and no timestamp to place it in a window",
+                        schema.keyspace, schema.table, key
+                    ))
+                })?;
+            by_window.insert(config.window_start_micros(carrier), Vec::new());
+        }
+        // `by_window` is ascending, so the first bucket is the earliest window
+        // this partition touches and is the only one that carries its statics.
+        let mut static_row = static_row;
+        for (window_start, rows) in by_window {
+            buckets.entry(window_start).or_default().push(Partition {
+                key: key.clone(),
+                deletion,
+                static_row: static_row.take(),
+                rows,
+            });
+        }
+    }
+    Ok(buckets.into_iter().collect())
+}
+
+/// The timestamp that places a partition with no rows in a window.
+///
+/// Only reachable for a partition kept by a static row or a partition-level
+/// deletion — both carry write timestamps (the wall clock at write), which is
+/// the closest thing to a data timestamp such a partition has, and either keeps
+/// the state in a file instead of dropping it.
+fn segment_carrier_timestamp(
+    deletion: &ferrosa_sstable::types::DeletionTime,
+    static_row: Option<&Row>,
+) -> Option<i64> {
+    let newest_static =
+        static_row.and_then(|row| row.cells.iter().map(|(_, cell)| cell.timestamp).max());
+    if deletion.is_live() {
+        newest_static
+    } else {
+        Some(
+            newest_static
+                .unwrap_or(deletion.marked_for_delete_at)
+                .max(deletion.marked_for_delete_at),
+        )
+    }
+}
+
 /// Whether the flush's late-writer drain must walk the sealed memtable at all.
 ///
 /// The drain exists to catch writes that landed after the snapshot but before
@@ -11292,23 +11676,72 @@ fn late_partition_needs_replay(
 /// Expanding a whole-value collection keeps each row's clustering, deletion,
 /// liveness and newest cell timestamp (the sentinel it adds is one older).
 fn same_rows_and_timestamps(a: &Partition, b: &Partition) -> bool {
-    fn newest(row: &Row) -> Option<i64> {
-        row.cells.iter().map(|(_, cell)| cell.timestamp).max()
-    }
-    fn same_row(a: &Row, b: &Row) -> bool {
-        a.clustering == b.clustering
-            && a.deletion == b.deletion
-            && a.primary_key_liveness == b.primary_key_liveness
-            && newest(a) == newest(b)
-    }
     a.deletion == b.deletion
         && a.rows.len() == b.rows.len()
-        && a.rows.iter().zip(&b.rows).all(|(x, y)| same_row(x, y))
+        && a.rows
+            .iter()
+            .zip(&b.rows)
+            .all(|(x, y)| same_row_image(x, y))
         && match (&a.static_row, &b.static_row) {
-            (Some(x), Some(y)) => same_row(x, y),
+            (Some(x), Some(y)) => same_row_image(x, y),
             (None, None) => true,
             _ => false,
         }
+}
+
+/// The newest cell timestamp of a row, which is what a collection expansion
+/// preserves (it adds an older sentinel cell).
+fn newest_cell_timestamp(row: &Row) -> Option<i64> {
+    row.cells.iter().map(|(_, cell)| cell.timestamp).max()
+}
+
+/// Whether two images of one row agree, whatever their collection cells'
+/// layout — the row-level half of [`same_rows_and_timestamps`].
+fn same_row_image(a: &Row, b: &Row) -> bool {
+    a.clustering == b.clustering
+        && a.deletion == b.deletion
+        && a.primary_key_liveness == b.primary_key_liveness
+        && newest_cell_timestamp(a) == newest_cell_timestamp(b)
+}
+
+/// Whether a sealed segmented memtable's partition gained a row after the
+/// snapshot the flush wrote from (see `flush_segmented`).
+///
+/// A segmented flush split the partition across its windows, so no single
+/// generation holds the image to compare against; the union of the partition's
+/// generations is that image. Order is not compared — the union is assembled
+/// from several files, so it is compared in clustering order.
+fn segmented_partition_needs_replay(images: &[&Partition], late: &Partition) -> bool {
+    if images.is_empty() {
+        return true;
+    }
+    let union = Partition {
+        key: late.key.clone(),
+        deletion: images[0].deletion,
+        static_row: images.iter().find_map(|image| image.static_row.clone()),
+        rows: images
+            .iter()
+            .flat_map(|image| image.rows.iter().cloned())
+            .collect(),
+    };
+    if union.deletion != late.deletion
+        || union.rows.len() != late.rows.len()
+        || match (&union.static_row, &late.static_row) {
+            (Some(x), Some(y)) => !same_row_image(x, y),
+            (None, None) => false,
+            _ => true,
+        }
+    {
+        return true;
+    }
+    let mut flushed_rows: Vec<&Row> = union.rows.iter().collect();
+    let mut late_rows: Vec<&Row> = late.rows.iter().collect();
+    flushed_rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
+    late_rows.sort_by(|x, y| x.clustering.cmp(&y.clustering));
+    flushed_rows
+        .iter()
+        .zip(&late_rows)
+        .any(|(x, y)| !same_row_image(x, y))
 }
 
 #[cfg(test)]
