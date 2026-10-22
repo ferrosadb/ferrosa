@@ -82,8 +82,8 @@ fn random_server_nonce() -> String {
 /// cannot drift apart.
 pub const NO_ROLES_REFUSAL: &str =
     "no roles are configured on this node, so no login can authenticate: \
-     enable CQL auth (FERROSA_AUTH_ENABLED=true) and set an administrator password \
-     (FERROSA_SEED_ADMIN_PASSWORD) to create a login role";
+     enable CQL auth (FERROSA_AUTH_ENABLED=true) to seed the login roles, then set \
+     FERROSA_SEED_ADMIN_PASSWORD to choose the administrator password";
 
 /// SQLSTATE to report for a fatal connection error (fail loud to the client).
 fn sqlstate(err: &ConnError) -> &'static str {

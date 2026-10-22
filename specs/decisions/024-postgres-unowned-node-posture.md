@@ -55,7 +55,7 @@ One line, SQLSTATE `28000`
 
 <!-- markdownlint-disable-next-line MD013 -->
 ```text
-FATAL:  no roles are configured on this node, so no login can authenticate: enable CQL auth (FERROSA_AUTH_ENABLED=true) and set an administrator password (FERROSA_SEED_ADMIN_PASSWORD) to create a login role
+FATAL:  no roles are configured on this node, so no login can authenticate: enable CQL auth (FERROSA_AUTH_ENABLED=true) to seed the login roles, then set FERROSA_SEED_ADMIN_PASSWORD to choose the administrator password
 ```
 
 `28000` (`invalid_authorization_specification`) is deliberate: `28P01`
@@ -63,7 +63,7 @@ FATAL:  no roles are configured on this node, so no login can authenticate: enab
 verifier, and there is no verifier to try. A `psql` client renders it verbatim:
 
 ```text
-psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  no roles are configured on this node, so no login can authenticate: enable CQL auth (FERROSA_AUTH_ENABLED=true) and set an administrator password (FERROSA_SEED_ADMIN_PASSWORD) to create a login role
+psql: error: connection to server at "127.0.0.1", port 5432 failed: FATAL:  no roles are configured on this node, so no login can authenticate: enable CQL auth (FERROSA_AUTH_ENABLED=true) to seed the login roles, then set FERROSA_SEED_ADMIN_PASSWORD to choose the administrator password
 ```
 
 A driver sees the same text in its error object and `28000` in its SQLSTATE
@@ -153,12 +153,12 @@ authentication.
 ## Verification (measured, 2026-10-22)
 
 A debug node built from this branch, booted with `FERROSA_AUTH_ENABLED=false`
-(`FERROSA_POSTGRES_BIND=127.0.0.1:18432`, fresh data directory):
+(`FERROSA_POSTGRES_BIND=127.0.0.1:18442`, fresh data directory):
 
 ```text
-$ psql "host=127.0.0.1 port=18432 user=ferrosa_admin dbname=ferrosa" -c 'select 1'
+$ psql "host=127.0.0.1 port=18442 user=ferrosa_admin dbname=ferrosa" -c 'select 1'
 psql (PostgreSQL) 18.6
-psql: error: connection to server at "127.0.0.1", port 18432 failed: FATAL:  no roles are configured on this node, so no login can authenticate: enable CQL auth (FERROSA_AUTH_ENABLED=true) and set an administrator password (FERROSA_SEED_ADMIN_PASSWORD) to create a login role
+psql: error: connection to server at "127.0.0.1", port 18442 failed: FATAL:  no roles are configured on this node, so no login can authenticate: enable CQL auth (FERROSA_AUTH_ENABLED=true) to seed the login roles, then set FERROSA_SEED_ADMIN_PASSWORD to choose the administrator password
 ```
 
 with `user=nobody` the same message: the refusal is about the node, not about
@@ -167,8 +167,9 @@ who asked. In the node's own log it appears once, with the bind address:
 ```text
 WARN ferrosa: PostgreSQL listener is bound and cannot authenticate anyone: no roles are
 configured on this node, so no login can authenticate: enable CQL auth
-(FERROSA_AUTH_ENABLED=true) and set an administrator password
-(FERROSA_SEED_ADMIN_PASSWORD) to create a login role bind=127.0.0.1:18432
+(FERROSA_AUTH_ENABLED=true) to seed the login roles, then set
+FERROSA_SEED_ADMIN_PASSWORD to choose the administrator password
+bind=127.0.0.1:18442
 ```
 
 A second node booted from the same build with `FERROSA_AUTH_ENABLED=true` and
@@ -176,14 +177,22 @@ A second node booted from the same build with `FERROSA_AUTH_ENABLED=true` and
 same `psql` command serves the row the appliance needs:
 
 ```text
-$ PGPASSWORD=… psql "host=127.0.0.1 port=18433 user=ferrosa_admin dbname=ferrosa" -c 'SELECT 1 AS one'
+$ PGPASSWORD=… psql "host=127.0.0.1 port=18443 user=ferrosa_admin dbname=ferrosa" -c 'SELECT 1 AS one'
  one
 -----
    1
 (1 row)
 ```
 
-On that provisioned node the pre-existing refusals are unchanged: an unknown
-role is still `Handshake(UnknownRole)` (and still counted as a failed login,
-`AuthFailed` in the audit log), a bad password still
-`Handshake(Scram(ProofMismatch))`.
+On that provisioned node the pre-existing refusals are unchanged — measured on
+the same build, `psql` against `user=ghost` and a wrong password for
+`ferrosa_admin`:
+
+```text
+FATAL:  Handshake(UnknownRole)
+FATAL:  Handshake(Scram(ProofMismatch))
+```
+
+An unknown role is still charged as a failed login (`AuthFailed` in the audit
+log); only the unowned-node refusal is exempt, because there is no role to lock
+out and charging the limiter there would pollute a real role's backoff state.

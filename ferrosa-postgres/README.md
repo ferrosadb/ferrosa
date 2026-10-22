@@ -54,8 +54,8 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   replays no roles, so no login can authenticate. The listener stays bound and
   refuses every login by name — `FATAL` `28000` "no roles are configured on this
   node, so no login can authenticate: enable CQL auth
-  (`FERROSA_AUTH_ENABLED=true`) and set an administrator password
-  (`FERROSA_SEED_ADMIN_PASSWORD`) to create a login role" — instead of the
+  (`FERROSA_AUTH_ENABLED=true`) to seed the login roles, then set
+  `FERROSA_SEED_ADMIN_PASSWORD` to choose the administrator password" — instead of the
   internal `Handshake(UnknownRole)` name. The node says the same thing once at
   startup. `NoRolesConfigured` is distinct from `UnknownRole` (which stays the
   answer on a node that *has* login roles, and still counts as a failed login)
