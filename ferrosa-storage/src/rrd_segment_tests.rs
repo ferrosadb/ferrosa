@@ -462,6 +462,125 @@ fn rrd_flush_of_an_empty_memtable_writes_no_generation() {
     assert_eq!(engine.sstable_count(&table_id), 0);
 }
 
+/// INVARIANT 3: a partition whose rows span two windows is readable across
+/// both, with no row lost and the clustering order preserved.
+#[test]
+fn rrd_partition_spanning_two_windows_reads_across_both_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+    let table_id = rrd_table_id("rrd_span");
+    engine
+        .register_table(segmented_schema("rrd_span"))
+        .expect("register");
+    let key = make_key("s1");
+
+    // Interleaved write order (window 1 first) so the read has to order them,
+    // not inherit insertion order from one file.
+    let rows: [(i64, &[u8]); 4] = [
+        (SEGMENT_WINDOW_MICROS + 2, b"c"),
+        (1, b"a"),
+        (SEGMENT_WINDOW_MICROS + 1, b"b"),
+        (2, b"d"),
+    ];
+    write_and_flush_once(&engine, &table_id, &key, &rows);
+
+    assert_eq!(
+        generations(&engine, &table_id).len(),
+        2,
+        "the fixture must actually split this partition across two generations"
+    );
+
+    let partition = engine
+        .read(&table_id, &key)
+        .expect("read")
+        .expect("the partition must be readable");
+    let timestamps: Vec<i64> = partition.rows.iter().map(clustered_ts).collect();
+    let mut sorted = timestamps.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        timestamps, sorted,
+        "a partition read across two generations must come back in clustering order, got \
+         {timestamps:?}"
+    );
+    assert_eq!(
+        timestamps,
+        vec![1, 2, SEGMENT_WINDOW_MICROS + 1, SEGMENT_WINDOW_MICROS + 2],
+        "every row of both windows must be present, got {timestamps:?}"
+    );
+    let values: Vec<Vec<u8>> = partition
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .first()
+                .and_then(|(_, cell)| cell.value.clone())
+                .expect("value")
+        })
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            b"a".to_vec(),
+            b"d".to_vec(),
+            b"b".to_vec(),
+            b"c".to_vec()
+        ]
+    );
+}
+
+/// INVARIANT 4: a table without `rrd.segment_window` is untouched — one
+/// generation per flush, however the rows' timestamps spread.
+#[test]
+fn rrd_plain_table_still_writes_one_generation_per_flush() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+    let table_id = rrd_table_id("plain_ts");
+    // The same time-shaped schema as a segmented table, and NOT segmented:
+    // the only difference is the extension.
+    engine
+        .register_table(rrd_schema("plain_ts", &[]))
+        .expect("register");
+    let key = make_key("s1");
+
+    // Rows in four different 17m windows, flushed as one memtable.
+    write_and_flush_once(
+        &engine,
+        &table_id,
+        &key,
+        &[
+            (1, b"a".as_slice()),
+            (SEGMENT_WINDOW_MICROS + 1, b"b".as_slice()),
+            (2 * SEGMENT_WINDOW_MICROS + 1, b"c".as_slice()),
+            (3 * SEGMENT_WINDOW_MICROS + 1, b"d".as_slice()),
+        ],
+    );
+    assert_eq!(
+        generations(&engine, &table_id).len(),
+        1,
+        "a plain table must still write exactly one generation per flush"
+    );
+    let gens = generations(&engine, &table_id);
+    let partition = generation_rows(&engine, &table_id, &gens[0], &key).expect("partition");
+    assert_eq!(
+        partition.rows.len(),
+        4,
+        "the one generation holds every row of the memtable"
+    );
+
+    // A second flush adds exactly one more generation.
+    write_and_flush_once(
+        &engine,
+        &table_id,
+        &key,
+        &[(4 * SEGMENT_WINDOW_MICROS + 1, b"e".as_slice())],
+    );
+    assert_eq!(
+        generations(&engine, &table_id).len(),
+        2,
+        "two flushes of a plain table are two generations"
+    );
+}
+
 /// A segmented flush cannot window a table with no 8-byte timestamp component,
 /// so it fails loudly instead of writing a file that spans windows (which
 /// retention would then be unable to expire).
