@@ -1,0 +1,52 @@
+[package]
+name = "ferrosa-lite"
+version.workspace = true
+edition = "2021"
+description = "Ferrosa lite node: storage + CQL (+ optional SQL engine) and nothing else"
+
+# Dependency closure is the point of this crate. It is deliberately NOT a
+# feature flag on `ferrosa`, whose node crate depends unconditionally on
+# graph/sparql/udf/postgres/sched/session/cdc/cluster/flight.
+#
+# What it actually pulls in is decided by these crates' own manifests:
+#   ferrosa-cql     -> cdc, cluster, net, index, row-bridge, schema, session,
+#                      sched, sstable, storage, udf   (all unconditional)
+#   ferrosa-storage -> sched, cdc, index, row-bridge, schema, sstable, common
+# The `test-util` feature is what supplies `standalone_for_test()`, the only
+# in-tree constructor of a working single-node `SharedState` outside the
+# `ferrosa` binary. It is off in library builds; enabling it here compiles a
+# fixture (~80 lines), not test code.
+[dependencies]
+arc-swap = "1.7"
+ferrosa-cluster = { path = "../ferrosa-cluster" }
+ferrosa-common = { path = "../ferrosa-common" }
+ferrosa-cql = { path = "../ferrosa-cql" }
+ferrosa-net = { path = "../ferrosa-net" }
+ferrosa-schema = { path = "../ferrosa-schema" }
+ferrosa-session = { path = "../ferrosa-session" }
+ferrosa-sql = { path = "../ferrosa-sql", optional = true }
+ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-udf = { path = "../ferrosa-udf" }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+# Link the in-process relational engine (ferrosa-sql: parser/plan/catalog/
+# exec/provider/spill) and run one real parse -> plan -> exec at startup, so
+# the engine's code is reachable and therefore in the measured binary.
+sql = ["dep:ferrosa-sql"]
+
+[[bin]]
+name = "ferrosa-lite"
+path = "src/main.rs"
+
+# Not part of the shipped artifact: a CQL client that drives the same
+# conditional-write shape the appliance control store uses, for the 10k-write
+# RSS row.
+[[bin]]
+name = "ferrosa-lite-loadgen"
+path = "src/bin/loadgen.rs"

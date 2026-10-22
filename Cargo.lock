@@ -2592,6 +2592,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrosa-lite"
+version = "0.22.3"
+dependencies = [
+ "arc-swap",
+ "ferrosa-cluster",
+ "ferrosa-common",
+ "ferrosa-cql",
+ "ferrosa-net",
+ "ferrosa-schema",
+ "ferrosa-session",
+ "ferrosa-sql",
+ "ferrosa-storage",
+ "ferrosa-udf",
+ "parking_lot 0.12.5",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "ferrosa-loadgen"
 version = "0.22.3"
 dependencies = [
