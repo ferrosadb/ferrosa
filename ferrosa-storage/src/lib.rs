@@ -51,6 +51,7 @@ pub mod range_merger;
 pub mod reader_pool;
 pub mod replay_set_aside;
 pub mod restore;
+pub mod rrd;
 pub(crate) mod runtime_tuning;
 pub mod schema_snapshot;
 pub mod self_heal;
