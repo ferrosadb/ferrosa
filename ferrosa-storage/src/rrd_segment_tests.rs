@@ -82,9 +82,17 @@ fn rrd_table_produces_no_compaction_task_at_any_size() {
     );
 }
 
-/// The control for the test above: the same cadence, the same engine
-/// configuration, no `rrd.*` extension — the planner schedules work. Without
-/// this, a planner that never schedules anything would pass the rrd assertion.
+/// The control for the test above: no `rrd.*` extension, the same overlapping
+/// segments — the planner selects work. Without this, a planner that never
+/// scheduled anything would pass the rrd assertion vacuously.
+///
+/// Asserted at the strategy, not at the executor. An earlier version of this
+/// control asserted that six flushes left a task in flight, which is a race
+/// against the background executor: on a fast runner the merge completes before
+/// the assertion looks, the counts return to zero, and the control fails while
+/// the code is correct. `select` is the deterministic observable — it is the
+/// same call the rrd test makes, on the same fixture, with the only difference
+/// being the table's extensions.
 #[test]
 fn plain_table_with_the_same_cadence_produces_a_compaction_task() {
     let dir = tempfile::tempdir().unwrap();
@@ -98,18 +106,50 @@ fn plain_table_with_the_same_cadence_produces_a_compaction_task() {
         .register_table(rrd_schema("plain_table", &[]))
         .expect("plain table registers");
 
-    write_partitions_and_flush(&engine, &plain, 6);
-
     let state = engine.table_state(&plain).expect("plain table registered");
+    let metadata = overlapping_metadata();
+    let selected = engine
+        .strategy_for_table(&state)
+        .select(&metadata, &state.schema(), &plain);
+
     assert!(
-        engine.compaction_executor.compaction_in_flight() + engine.compaction_executor.pending_result_count() >= 1,
-        "six flushes of a plain table must schedule compaction — otherwise the \
-         rrd fixture proves nothing"
+        !selected.is_empty(),
+        "a table without rrd.* must select compaction work over {} overlapping \
+         segments; got none, which would make the rrd assertion vacuous",
+        metadata.len()
     );
-    assert!(
-        engine.maybe_compact(&plain, &state) || state.store.sstable_count() < 6,
-        "the plain table's segments are eligible for compaction"
-    );
+}
+
+/// Overlapping segments spanning six orders of magnitude: the shape a compacted
+/// table has, which is what both the control above and the rrd test below feed
+/// to the same planner.
+fn overlapping_metadata() -> Vec<crate::compaction::metadata::SSTableMetadata> {
+    let sizes = [
+        3 * 1024u64,
+        64 * 1024,
+        1024 * 1024,
+        100 * 1024 * 1024,
+        1024 * 1024 * 1024,
+        4 * 1024 * 1024 * 1024,
+    ];
+    let mut metadata = Vec::new();
+    for (i, size) in sizes.iter().enumerate() {
+        for span in [1i64, 1_000_000, i64::MAX / 4, i64::MAX - 1] {
+            let base = (i as i64 * 7).saturating_add(span);
+            metadata.push(crate::compaction::metadata::SSTableMetadata {
+                id: format!("gen-{i}-{span}"),
+                path: std::path::PathBuf::from(format!("/tmp/gen-{i}-{span}")),
+                size_bytes: *size,
+                min_token: base,
+                max_token: base.saturating_add(span),
+                min_timestamp: 1,
+                max_timestamp: 2,
+                partition_count: 1,
+                legacy_format: false,
+            });
+        }
+    }
+    metadata
 }
 
 /// INVARIANT 3, the "at any size" half.
