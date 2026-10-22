@@ -3730,6 +3730,18 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         };
         let pg_store =
             std::sync::Arc::new(ferrosa_postgres::SchemaVerifierStore::new(schema.clone()));
+        // The unowned-node posture (ADR-024): `auth_enabled=false` skips both
+        // seed-role bootstrap and `system_auth` replay, so this listener would
+        // accept TCP and refuse every login with an internal enum name. The
+        // per-connection refusal now names the cause; say it ONCE here, with the
+        // keys that fix it, rather than leaving it to a client log.
+        if !pg_store.login_roles_configured() {
+            tracing::warn!(
+                bind = %pg_bind,
+                "PostgreSQL listener is bound and cannot authenticate anyone: {}",
+                ferrosa_postgres::NO_ROLES_REFUSAL
+            );
+        }
         // Resolve the committer PER STATEMENT, not once here. This listener is
         // bound at step 11b; seed connection (and therefore formation) begins at
         // step 12, so at this moment a node that is about to become a Raft

@@ -24,6 +24,27 @@ impl SchemaVerifierStore {
     pub fn new(schema: Arc<Schema>) -> Self {
         Self { schema }
     }
+
+    /// Whether any role on this node can authenticate over the PostgreSQL wire:
+    /// it may log in and carries a stored SCRAM verifier.
+    ///
+    /// This is the node's PostgreSQL posture in one question. `auth_enabled=false`
+    /// skips BOTH role seeding and `system_auth` replay at boot, so an unowned
+    /// node answers `false` and every login would otherwise be reported as an
+    /// unknown role. The handshake uses this to refuse by name
+    /// ([`crate::HandshakeError::NoRolesConfigured`], ADR-024) instead.
+    ///
+    /// The registry is the source of truth, not the config flag: a node whose
+    /// registry really does hold a login role (in-process tests, a node whose
+    /// roles were applied some other way) can authenticate, and saying
+    /// otherwise would be a lie the client can disprove.
+    pub fn login_roles_configured(&self) -> bool {
+        self.schema
+            .snapshot()
+            .roles
+            .values()
+            .any(|role| role.can_login && role.scram.is_some())
+    }
 }
 
 /// Logins go through the schema's shared per-user rate limiter (the one
@@ -32,6 +53,10 @@ impl SchemaVerifierStore {
 impl VerifierStore for SchemaVerifierStore {
     fn verifier(&self, user: &str) -> Option<ScramVerifier> {
         self.schema.scram_credential(user).map(|c| (&c).into())
+    }
+
+    fn login_roles_configured(&self) -> bool {
+        SchemaVerifierStore::login_roles_configured(self)
     }
 
     fn admit(&self, user: &str) -> Result<(), String> {
@@ -124,6 +149,35 @@ mod tests {
     fn unknown_role_resolves_to_none() {
         let s = store_with_role("alice", "s3cretPwd!42");
         assert!(s.verifier("bob").is_none());
+    }
+
+    #[test]
+    fn a_role_with_a_verifier_is_a_configured_login_role() {
+        let s = store_with_role("alice", "s3cretPwd!42");
+        assert!(
+            s.login_roles_configured(),
+            "a role with a SCRAM verifier can authenticate over Postgres"
+        );
+        assert!(VerifierStore::login_roles_configured(&s));
+    }
+
+    #[test]
+    fn fresh_schema_has_no_login_role() {
+        // Exactly the node state with `auth_enabled=false`: nothing seeded and
+        // nothing replayed, so no role carries a verifier. This is the fact the
+        // handshake reports as `NoRolesConfigured` instead of `UnknownRole`.
+        let schema = Schema::new(test_config()).expect("schema bootstraps");
+        assert!(
+            schema
+                .snapshot()
+                .roles
+                .values()
+                .all(|role| role.scram.is_none()),
+            "precondition: a fresh registry holds no SCRAM verifier"
+        );
+        let s = SchemaVerifierStore::new(Arc::new(schema));
+        assert!(!s.login_roles_configured());
+        assert!(!VerifierStore::login_roles_configured(&s));
     }
 
     #[test]

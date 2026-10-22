@@ -28,6 +28,22 @@ pub trait VerifierStore {
     /// exist or has no verifier.
     fn verifier(&self, user: &str) -> Option<ScramVerifier>;
 
+    /// Whether ANY role on this node can authenticate over the PostgreSQL wire
+    /// — a role that may log in and carries a stored SCRAM verifier.
+    ///
+    /// [`Self::verifier`] returning `None` is ambiguous: the named role may not
+    /// exist, or the node may have no roles at all (an unowned node: CQL auth
+    /// disabled means neither seeding nor replay ever populated the registry).
+    /// The handshake asks this to refuse the second case by name, so the
+    /// operator is told to create a role instead of being blamed for a role
+    /// they never had.
+    ///
+    /// The default is `true` ("cannot tell"): a store that does not track the
+    /// node's role population keeps the historical `UnknownRole` refusal.
+    fn login_roles_configured(&self) -> bool {
+        true
+    }
+
     /// Admission gate, consulted before any verifier work. `Err` carries the
     /// operator-facing reason the login is refused (backoff / lockout).
     fn admit(&self, user: &str) -> Result<(), String>;
@@ -48,6 +64,12 @@ pub enum HandshakeError {
     MissingUser,
     /// The named role has no SCRAM verifier (cannot authenticate over Postgres).
     UnknownRole,
+    /// The node has no role at all that can authenticate over Postgres: no
+    /// role carries a SCRAM verifier. This is an unowned node's posture (CQL
+    /// auth disabled, so nothing was ever seeded or replayed), not a client
+    /// mistake — the refusal says so instead of reporting [`Self::UnknownRole`]
+    /// for every login.
+    NoRolesConfigured,
     /// The failed-login limiter refused the attempt (backoff or lockout).
     Throttled(String),
     /// The proof verified but the role store refused the login.
@@ -123,6 +145,15 @@ impl<'a, S: VerifierStore> Handshake<'a, S> {
         // hardened version runs the exchange against a dummy verifier. Tracked
         // as a follow-up (threat-model).
         let Some(verifier) = self.store.verifier(user) else {
+            // A node with NO role that can log in cannot authenticate anyone.
+            // That is a different fact from "this role does not exist", and it
+            // is the one the operator has to act on: the refusal names it
+            // (ADR-024), and it is NOT recorded as a failed login — there is no
+            // role to lock out, and charging the limiter would let an unowned
+            // node's refusals pollute a real role's backoff state.
+            if !self.store.login_roles_configured() {
+                return Err(HandshakeError::NoRolesConfigured);
+            }
             // An unknown role counts as a failed login, as it does over CQL.
             self.store.record_failure(user);
             return Err(HandshakeError::UnknownRole);
@@ -240,10 +271,16 @@ mod tests {
         failures: std::cell::Cell<u32>,
         successes: std::cell::Cell<u32>,
         locked: bool,
+        /// Whether the node has any role that can log in (see
+        /// [`VerifierStore::login_roles_configured`]).
+        login_roles: bool,
     }
     impl VerifierStore for MockStore {
         fn verifier(&self, user: &str) -> Option<ScramVerifier> {
             (user == self.user).then(|| self.verifier.clone())
+        }
+        fn login_roles_configured(&self) -> bool {
+            self.login_roles
         }
         fn admit(&self, _user: &str) -> Result<(), String> {
             if self.locked {
@@ -273,6 +310,7 @@ mod tests {
             failures: std::cell::Cell::new(0),
             successes: std::cell::Cell::new(0),
             locked: false,
+            login_roles: true,
         }
     }
 
@@ -341,6 +379,41 @@ mod tests {
             Err(HandshakeError::UnknownRole)
         );
         assert_eq!(s.failures.get(), 1, "an unknown role counts as a failure");
+    }
+
+    #[test]
+    fn node_without_login_roles_is_refused_by_name() {
+        // The unowned-node posture: no role on the node can authenticate, so
+        // the refusal must say that rather than blame the named user, and it
+        // must not charge the failed-login limiter for a role that cannot exist.
+        let mut s = store("pencil");
+        s.login_roles = false;
+        let mut hs = Handshake::new(&s, SERVER_NONCE);
+        assert_eq!(
+            hs.on_startup(&startup("ferrosa_admin")),
+            Err(HandshakeError::NoRolesConfigured)
+        );
+        assert_eq!(
+            s.failures.get(),
+            0,
+            "a node with no roles cannot record a failed login"
+        );
+        assert!(!hs.is_authenticated());
+    }
+
+    #[test]
+    fn node_with_roles_still_reports_an_unknown_role() {
+        // The same `None` verifier on a node that DOES have login roles stays
+        // `UnknownRole` (and counts as a failure): the new refusal must not
+        // swallow user-enumeration accounting on a provisioned node.
+        let s = store("pencil");
+        assert!(s.login_roles_configured());
+        let mut hs = Handshake::new(&s, SERVER_NONCE);
+        assert_eq!(
+            hs.on_startup(&startup("nobody")),
+            Err(HandshakeError::UnknownRole)
+        );
+        assert_eq!(s.failures.get(), 1);
     }
 
     #[test]
