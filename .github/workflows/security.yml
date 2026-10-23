@@ -1,0 +1,280 @@
+name: Security
+
+# Supply-chain and secret gates. Ferrosa is a database that holds other
+# people's data and ships as a binary, a .deb and a container image, so a bad
+# dependency reaches every install.
+#
+# Where these jobs run: this repository is PUBLIC and its jobs run on
+# GitHub-hosted runners, like the rest of its CI. Pull requests from forks
+# trigger this workflow, and fork code must never reach Ferrosa's own
+# (self-hosted) machines, so no job here may move to a self-hosted runner.
+# Nothing here needs a secret: every job reads public data with the
+# workflow's read-only token.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  schedule:
+    # Advisories land after a PR merges, so a periodic run is the only way a
+    # newly disclosed vulnerability in an unchanged dependency is ever seen.
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# A superseded PR run is cancelled; main, the merge queue and the weekly cron
+# are not.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  advisories:
+    name: Dependency Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            crates.io:443
+            static.crates.io:443
+            index.crates.io:443
+            static.rust-lang.org:443
+            sh.rustup.rs:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.62.35
+        with:
+          tool: cargo-deny@0.20.2
+      # advisories: known CVEs. bans: duplicate/banned crates.
+      # licenses: nothing copyleft sneaking into a shipped binary.
+      # sources: crates only from registries we name.
+      - name: Root workspace
+        run: cargo deny --all-features check advisories bans licenses sources
+      # Workspaces with their own Cargo.lock are separate dependency graphs; a
+      # vulnerable crate in one of them is invisible to the root check. Each
+      # is checked against the same root deny.toml (cargo-deny reads
+      # <cwd>/deny.toml). A new nested Cargo.lock must be added here.
+      - name: Separately locked workspaces
+        run: |
+          set -euo pipefail
+          for manifest in \
+            ferrosa-jsonb-conformance/Cargo.toml \
+            ferrosa-sstable/fuzz/Cargo.toml \
+            examples/timeseries-rrd/wasm-rust/rms/Cargo.toml \
+            examples/timeseries-rrd/wasm-rust/stddev/Cargo.toml
+          do
+            echo "::group::$manifest"
+            cargo deny --manifest-path "$manifest" --all-features check advisories bans licenses sources
+            echo "::endgroup::"
+          done
+      - name: Every Cargo.lock is covered
+        # Fails when a Cargo.lock exists that neither step above checks, so a
+        # new nested workspace cannot go unaudited.
+        run: |
+          set -euo pipefail
+          expected="Cargo.lock
+          examples/timeseries-rrd/wasm-rust/rms/Cargo.lock
+          examples/timeseries-rrd/wasm-rust/stddev/Cargo.lock
+          ferrosa-jsonb-conformance/Cargo.lock
+          ferrosa-sstable/fuzz/Cargo.lock"
+          actual="$(git ls-files -- '*Cargo.lock' | sort)"
+          if [ "$actual" != "$(printf '%s\n' "$expected" | sed 's/^ *//' | sort)" ]; then
+            echo "::error::tracked Cargo.lock files differ from the list this job checks:"
+            printf '%s\n' "$actual"
+            exit 1
+          fi
+
+  python-advisories:
+    name: Python Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            pypi.org:443
+            files.pythonhosted.org:443
+            api.osv.dev:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install pip-audit
+        env:
+          VERSION: 2.10.1
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/pip-audit"
+          "$RUNNER_TEMP/pip-audit/bin/pip" install --quiet "pip-audit==${VERSION}"
+          echo "$RUNNER_TEMP/pip-audit/bin" >> "$GITHUB_PATH"
+      # The driver test harnesses' requirements. drivers/pyproject.toml has
+      # one dependency (cassandra-driver), which these resolve as well.
+      - name: Audit requirements
+        run: |
+          set -euo pipefail
+          for req in \
+            ferrosa-jepsen/drivers/python/requirements.txt \
+            tests/drivers/python/requirements.txt
+          do
+            echo "::group::$req"
+            pip-audit --progress-spinner off -r "$req"
+            echo "::endgroup::"
+          done
+
+  node-advisories:
+    name: Node Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            registry.npmjs.org:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      # The AssemblyScript UDF proof of concept; its lockfile is the only one.
+      - name: npm audit (asc-poc)
+        working-directory: ferrosa-udf/examples/asc-poc
+        run: npm audit --audit-level=high --omit=dev
+
+  go-advisories:
+    name: Go Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+            api.osv.dev:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install osv-scanner
+        env:
+          VERSION: 2.6.0
+        run: |
+          set -euo pipefail
+          # Into the job's temp directory rather than the checkout, so the
+          # binary is not part of the tree being scanned.
+          dir="$RUNNER_TEMP/osv-scanner"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${VERSION}/osv-scanner_linux_amd64"
+          chmod +x "$dir/osv-scanner"
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/osv-scanner" --version
+      # The Go driver test harnesses.
+      - name: Scan go modules
+        run: |
+          osv-scanner scan source \
+            --lockfile ferrosa-jepsen/drivers/go/go.mod \
+            --lockfile tests/drivers/go/go.mod
+
+  secrets:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            github.com:443
+            api.github.com:443
+            objects.githubusercontent.com:443
+            release-assets.githubusercontent.com:443
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # gitleaks needs history to scan commits, not just the tree.
+          fetch-depth: 0
+      # The gitleaks ACTION requires a paid licence for organisation repos.
+      # The binary is MIT and has no such restriction, so it is used directly.
+      - name: Install gitleaks
+        env:
+          VERSION: 8.30.1
+        run: |
+          set -euo pipefail
+          # Into the job's temp directory rather than the checkout, so the
+          # tarball does not sit inside the tree being scanned.
+          dir="$RUNNER_TEMP/gitleaks"
+          mkdir -p "$dir"
+          curl -fsSL -o "$dir/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          tar -xzf "$dir/gitleaks.tar.gz" -C "$dir" gitleaks
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/gitleaks" version
+
+      # --log-opts=HEAD: the history of the ref under test, not every ref in
+      # the clone. `gitleaks git` otherwise runs `git log --all`, and
+      # fetch-depth 0 fetches every branch, so a PR's check could fail on a
+      # commit that exists only on another branch. For a pull request HEAD is
+      # the merge commit, so main's full history and the PR's own commits are
+      # both still scanned.
+      #
+      # Reviewed false positives in history are silenced one finding at a time
+      # by fingerprint in .gitleaksignore; no path or rule is allow-listed.
+      - name: Scan history for secrets
+        run: gitleaks git . --log-opts=HEAD --redact --verbose --exit-code 1
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Code scanning needs GitHub Code Security turned on for the repository;
+    # until it is, analyze runs the queries and then fails to upload.
+    #
+    # Gated on a repository variable rather than left out, so turning it on
+    # is a one-line change (set CODE_SECURITY_ENABLED=true in Settings >
+    # Secrets and variables > Actions > Variables). SKIPPED is visibly not
+    # PASSED: the job never reports green while it is not actually running.
+    if: vars.CODE_SECURITY_ENABLED == 'true'
+    permissions:
+      contents: read
+      actions: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: rust
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: github/codeql-action/init@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+      - if: matrix.build-mode == 'autobuild'
+        uses: github/codeql-action/autobuild@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+      - uses: github/codeql-action/analyze@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          category: /language:${{ matrix.language }}

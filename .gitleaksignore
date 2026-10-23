@@ -1,0 +1,39 @@
+# gitleaks fingerprints (commit:file:rule:line) for reviewed false positives.
+#
+# Each line silences ONE finding in ONE historical commit. Nothing here
+# allow-lists a path, a rule or a value shape, so every file is still scanned
+# by every rule, and a new secret anywhere (even in these files) still fails
+# Secret Scan. Reviewed 2026-10-23; no finding was a real credential.
+
+# generic-api-key: ferrosa/src/main.rs config_val tests. The "key" is the NAME of
+# a throwaway env var (FERROSA_TEST_CFG_*), not a secret value.
+4dc4e925f8d64c1cf73588c4907068ad8dab4a7b:ferrosa/src/main.rs:generic-api-key:1282
+4dc4e925f8d64c1cf73588c4907068ad8dab4a7b:ferrosa/src/main.rs:generic-api-key:1290
+4dc4e925f8d64c1cf73588c4907068ad8dab4a7b:ferrosa/src/main.rs:generic-api-key:1299
+ac04dcfe003f5f840a4a753e08962adb6f425f0c:ferrosa/src/main.rs:generic-api-key:1094
+ac04dcfe003f5f840a4a753e08962adb6f425f0c:ferrosa/src/main.rs:generic-api-key:1114
+ac04dcfe003f5f840a4a753e08962adb6f425f0c:ferrosa/src/main.rs:generic-api-key:1135
+ac04dcfe003f5f840a4a753e08962adb6f425f0c:ferrosa/src/main.rs:generic-api-key:1198
+edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:424
+edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:439
+edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:461
+edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:471
+edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:481
+
+# generic-api-key: SSTable format comments ("key bounds: u16-length-prefixed ...").
+8ff35fe05db0e55c565b0185967f12e629f84c32:ferrosa-sstable/src/writer.rs:generic-api-key:308
+6cea2704bf3be06e2f78a755ab302a7759450c5f:ferrosa-sstable/src/partition_index.rs:generic-api-key:12
+
+# curl-auth-user: docs and bug notes showing the seeded LOCAL-DEV default login
+# (ferrosa_user, also in config/ferrosa.example.toml and the auth test fixtures),
+# plus one PLAN doc where the rule matched a JSON array after `curl`. None is a
+# deployed credential.
+fe0501e6ae5eca4e49f713ee3d6a68401432a005:specs/in-process/bug-bulk-lane-send-timeouts-on-coordinated-reads.md:curl-auth-user:53
+fe0501e6ae5eca4e49f713ee3d6a68401432a005:specs/in-process/bug-bulk-lane-send-timeouts-on-coordinated-reads.md:curl-auth-user:168
+866f9f3263a799ecf2d33152f286a2a91bda3b44:docs/ferrosa-memory/getting-started.html:curl-auth-user:136
+866f9f3263a799ecf2d33152f286a2a91bda3b44:docs/ferrosa-memory/getting-started.md:curl-auth-user:188
+866f9f3263a799ecf2d33152f286a2a91bda3b44:docs/ferrosa-memory/getting-started.md:curl-auth-user:202
+1369f6023ecd86ecce51d37eabc47b9b98696320:specs/implemented/bug-seeded-ferrosa-user-cannot-authenticate-to-graph-http.md:curl-auth-user:35
+b05afdf6e6f4d1ef30b07d13e831d00b5d2ee1ea:PLAN-observability-wiring.md:curl-auth-user:120
+c66b9a1710a3ff6a934d733b25d903323e1c40c7:docs/cypher.html:curl-auth-user:589
+c66b9a1710a3ff6a934d733b25d903323e1c40c7:docs/cypher.html:curl-auth-user:622

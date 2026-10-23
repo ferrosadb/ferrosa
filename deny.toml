@@ -1,0 +1,91 @@
+# cargo-deny configuration for ferrosa.
+#
+# Ferrosa is a database server that holds other people's data and ships as a
+# prebuilt binary, a .deb and a container image. A bad dependency reaches
+# every install, so the gates are set to deny rather than warn.
+#
+# The Security workflow runs this against every Cargo.lock in the repo: the
+# root workspace and the separately-locked workspaces (ferrosa-jsonb-conformance,
+# ferrosa-sstable/fuzz, the timeseries-rrd wasm examples).
+
+[advisories]
+# Any known vulnerability fails the build. If one is genuinely not exploitable
+# here, add it to `ignore` WITH a comment saying why and the board task that
+# tracks removing it — never silence the whole check.
+yanked = "deny"
+ignore = [
+    # quick-xml 0.37 via object_store 0.11 (the S3 client). The fixed quick-xml
+    # (>= 0.41) needs object_store 0.14, a trait redesign of ThrottledStore and
+    # StatsStore; reachable only through XML from the configured S3 endpoint.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 pinned by object_store 0.11; migration is t_573d5dfe" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 pinned by object_store 0.11; migration is t_573d5dfe" },
+    # Marvin timing attack in rsa: no patched release exists. Only the
+    # ferrosa-jepsen test harness reaches it, through russh's ssh client.
+    { id = "RUSTSEC-2023-0071", reason = "rsa via russh in the jepsen harness only, no fix upstream; t_53aee440" },
+    # Unmaintained, no successor that is a drop-in: each replacement changes an
+    # encoded format or a storage engine and is tracked on the board.
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.3 in ferrosa-cluster wire/raft encoding; replacement is t_db4de357" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash via sled 0.34; moving off sled is t_522a1937" },
+    { id = "RUSTSEC-2024-0384", reason = "instant via sled 0.34 (parking_lot 0.11); moving off sled is t_522a1937" },
+    { id = "RUSTSEC-2024-0436", reason = "paste (build-time proc-macro) via arrow-flight 53; arrow upgrade is t_748a4011" },
+]
+
+[bans]
+multiple-versions = "warn"   # noisy in a large workspace; not a security gate
+# First-party crates depend on each other by `path = ...` with no version,
+# which reads as a wildcard. A path dependency inside this repo is not a
+# supply-chain surface; a wildcard on a REGISTRY crate still fails below.
+allow-wildcard-paths = true
+wildcards = "deny"           # "*" lets a future release in without review
+deny = [
+    # Unmaintained 0.1 time crate with a known soundness issue (RUSTSEC-2020-0071).
+    { crate = "time:<0.2", reason = "segfault in localtime_r; use time 0.3 or chrono" },
+]
+skip = []
+
+[licenses]
+# Copyleft licences are excluded deliberately: ferrosa ships as a binary and
+# container image, and is embedded by private Ferrosa products; a GPL
+# dependency would change the terms of everything that links it.
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    # Certificate root data from the rustls HTTPS stack (webpki-roots):
+    # CDLA-Permissive-2.0, not CDLA-Sharing. ferrosa-memory, ferrosa-dbaas,
+    # ferrosa-coordinator and forge already allow it.
+    "CDLA-Permissive-2.0",
+    # University of Illinois/NCSA, a permissive BSD-style licence. Only
+    # libfuzzer-sys (LLVM's libFuzzer) uses it, in the ferrosa-sstable/fuzz
+    # workspace, which is never shipped.
+    "NCSA",
+]
+exceptions = []
+
+# First-party crates that are never published carry no meaningful license
+# decision for this check. Third-party licences are still enforced.
+private = { ignore = true }
+
+[sources]
+# Crates may come only from the public registry, plus the one git fork the
+# workspace patches in by explicit commit. An unexpected git or alternate
+# registry source is how a dependency gets swapped for something else.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = [
+    # [patch.crates-io] openraft, pinned by rev in Cargo.toml (ADR-012:
+    # PreVote, CheckQuorum, leadership transfer on top of upstream 0.9.24).
+    "https://github.com/ferrosadb/openraft.git",
+]
