@@ -108,7 +108,7 @@ fn round_trips_a_compressed_message() {
     // This one is a REGRESSION GUARD, not the red that produced the fix: before
     // the fix a narrow writer and narrow reader were self-consistent, so it
     // passed. The driver fixtures above are what fail without the fix.
-    let body: Vec<u8> = std::iter::repeat(b'B').take(500).collect();
+    let body: Vec<u8> = vec![b'B'; 500];
     let header = FrameHeader {
         version: 0x05,
         flags: 0,
