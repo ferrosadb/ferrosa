@@ -13,8 +13,8 @@ mod common;
 use std::collections::HashSet;
 
 use common::ports::{
-    kernel_ephemeral_floor, port_is_free, process_lease_state, release_in_process,
-    reserve_in_process, PortAllocator, BAND_END, BAND_START, SLICES, SLICE_LEN,
+    kernel_ephemeral_floor, port_is_free, process_lease_state, release_in_process, PortAllocator,
+    BAND_END, BAND_START, SLICES, SLICE_LEN,
 };
 
 /// Invariant 5 — capacity, and the reason it needs its own guard: both halves of
@@ -101,26 +101,9 @@ fn every_port_handed_to_a_node_is_below_the_kernel_ephemeral_floor() {
 #[test]
 #[serial_test::serial(port_band_forks)]
 fn a_port_a_listener_already_holds_is_never_handed_to_a_node() {
-    // Order-independent: pick a band port that this process has not already
-    // been given and that nothing is listening on, so the squatter below — not
-    // an earlier test's reservation — is what the allocator must skip.
-    // Claim before probing, as the allocator does, so this search never binds a
-    // port a concurrently running test has been handed.
-    let port = (BAND_START..=BAND_END)
-        .find(|p| {
-            if !reserve_in_process(*p) {
-                return false;
-            }
-            if port_is_free(*p) {
-                return true;
-            }
-            release_in_process(*p);
-            false
-        })
-        .expect("a free, unreserved port in the band");
-    // Keep this probe/drop/rebind setup out of sibling process launches: a fork
-    // can briefly retain the just-dropped probe in its child until exec.
-    let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).expect("squat a band port");
+    let mut own_slice = PortAllocator::new();
+    let squatter = common::ports::hold_collision_port(&mut own_slice);
+    let port = squatter.local_addr().unwrap().port();
     // Release the claim only once the squatter holds the port: from here on the
     // allocator must skip it because it is LISTENED on, not because it is ours.
     release_in_process(port);
@@ -413,5 +396,44 @@ fn a_port_handed_out_is_never_probed_by_a_sibling_allocation() {
         collisions, 0,
         "the owner of port {owned} could not bind it {collisions} times in {binds} tries: \
          another allocation's scan was probing a port this process had already handed out"
+    );
+}
+
+/// A collision fixture must honour the allocator it was given, including its
+/// slice. The old global scan ignored it and stole an unbound restart port from
+/// another process in CI (run 39842236334).
+#[test]
+#[serial_test::serial(port_band_forks)]
+fn intentional_collision_uses_the_supplied_allocator() {
+    const MARKER: &str = "FERROSA_COLLISION_SLICE_PROBE";
+    if std::env::var_os(MARKER).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "intentional_collision_uses_the_supplied_allocator",
+                "--nocapture",
+            ])
+            .env(MARKER, "1")
+            .output()
+            .unwrap();
+        assert!(child.status.success(), "{child:?}");
+        return;
+    }
+    // A fresh process has no retained reservations from sibling guard tests.
+    let own_start =
+        BAND_START + common::ports::process_lease().expect("own process lease") * SLICE_LEN;
+    let start = own_start + SLICE_LEN - 8;
+    let mut alloc = PortAllocator::beginning_at(start);
+    let listener = common::ports::hold_collision_port(&mut alloc);
+    let port = listener.local_addr().unwrap().port();
+    assert!(
+        (start..own_start + SLICE_LEN).contains(&port),
+        "collision fixture escaped its allocator's slice: held {port}"
+    );
+    assert!(common::ports::reserved_in_process(port));
+    assert_ne!(
+        alloc.get(),
+        port,
+        "the intentionally held port must stay reserved"
     );
 }

@@ -220,5 +220,78 @@ class QuorumWriteContactPointTest(unittest.TestCase):
             )
 
 
+class RecoveryReadinessTest(unittest.TestCase):
+    """Run Phase 10 verbatim: mode/CQL can precede usable replication lanes.
+
+    Run 39922605666's node1.log records both MutationForward calls rejected
+    with "lane is reconnecting; retry later" at 17:36:59.500, after all three
+    mode checks passed. Keep the write one-shot; establish quorum by reading.
+    """
+
+    def run_recovery(self, permanent=False):
+        smoke = DOCKER_SMOKE.read_text()
+        block = smoke.split("# Verify cluster re-forms", 1)[1].split(
+            "# Cross-node reads should work", 1
+        )[0]
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            calls = tmp / "calls"
+            reads = tmp / "reads"
+            shim = tmp / "cqlsh"
+            shim.write_text(r'''#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+query = sys.argv[sys.argv.index("-e") + 1]
+with open(os.environ["RECOVERY_CALLS"], "a") as out:
+    out.write(query + "\n")
+p = Path(os.environ["RECOVERY_READS"])
+n = int(p.read_text()) if p.exists() else 0
+if "SELECT" in query and "CONSISTENCY QUORUM;" in query:
+    p.write_text(str(n + 1))
+    if os.environ["RECOVERY_PERMANENT"] == "1" or n == 0:
+        # The expected value in a failed response must not satisfy readiness.
+        print("lane is reconnecting; retry later: value_a", file=sys.stderr)
+        sys.exit(1)
+    print("value_a")
+    sys.exit(0)
+if "INSERT" in query and n < 2:
+    print('write timeout: CL=QUORUM, received=1, required=2', file=sys.stderr)
+    sys.exit(1)
+sys.exit(0)
+''')
+            shim.chmod(0o755)
+            script = "\n".join([
+                "set -uo pipefail",
+                'fail() { echo "FAIL: $1"; exit 1; }',
+                'pass() { echo "PASS: $1"; }',
+                'info() { echo "INFO: $1"; }',
+                'wait_for_cluster_mode() { :; }',
+                # Advance the shell's real deadline clock without a long test.
+                'sleep() { SECONDS=$((SECONDS + 10)); }',
+                _bash_function(smoke, "wait_for_cql_value"),
+                _bash_function(smoke, "cql_ok"),
+                block,
+            ])
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                text=True, timeout=10, env={**os.environ,
+                    "PATH": f"{tmp}{os.pathsep}{os.environ['PATH']}",
+                    "RECOVERY_CALLS": str(calls), "RECOVERY_READS": str(reads),
+                    "RECOVERY_PERMANENT": str(int(permanent))})
+            return proc, calls.read_text().splitlines()
+
+    def test_recovery_waits_for_quorum_before_the_one_shot_write(self):
+        proc, calls = self.run_recovery()
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        writes = [q for q in calls if "INSERT" in q]
+        self.assertEqual(1, len(writes), calls)
+        self.assertGreaterEqual(sum("SELECT" in q for q in calls[:calls.index(writes[0])]), 2)
+
+    def test_recovery_fails_without_writing_if_replication_never_recovers(self):
+        proc, calls = self.run_recovery(permanent=True)
+        self.assertNotEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertFalse(any("INSERT" in q for q in calls), calls)
+        self.assertIn("QUORUM", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

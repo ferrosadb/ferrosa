@@ -240,6 +240,12 @@ to the real `sysctl`, checks the returned floor and distinct ports, and requires
 one query across the initial probe and repeated allocations. Port-exclusion
 assertions and the below-ephemeral-range checks remain unchanged.
 
+Intentional collision fixtures also allocate their occupied listener through
+`hold_collision_port` and their own `PortAllocator`. A global band scan bypasses
+other processes' leases and can steal a temporarily unbound replica restart port.
+The shared helper is exercised by both the collision/retry fixture and a
+port-band regression that checks the supplied allocator is honoured.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — composition-root model

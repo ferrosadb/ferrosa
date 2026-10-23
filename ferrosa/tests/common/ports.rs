@@ -345,3 +345,10 @@ impl Default for PortAllocator {
         Self::new()
     }
 }
+
+/// Hold an intentionally occupied port for a listener-collision fixture.
+/// The allocator owns the process slice and every intentional collision must use it.
+pub fn hold_collision_port(alloc: &mut PortAllocator) -> std::net::TcpListener {
+    let port = alloc.get();
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("hold an allocated collision port")
+}

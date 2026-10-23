@@ -91,3 +91,28 @@ initialization fails the observer's initialization assertion. No exclusion
 assertions, retries, or timeout budgets were relaxed. This repair is test support
 only; application startup and listener behavior are unchanged. See Forge
 `t_f961615a`; the broader pre-taken-slice fixture issue remains on `t_97fb1f1c`.
+
+### Resolved collision fixture escaping its process lease (2026-10-23)
+
+The PostgreSQL transaction collision fixture scanned the entire shared band with
+process-local reservations, ignoring other processes' slice leases. CI run
+39842236334 overlapped it with a committed-row replica restart; that replica
+failed to rebind CQL port 20016. Logs do not identify the socket owner, but an
+exact-source two-process control reproduced the mechanism: the global selector
+held the owner's unbound port 20000 and prevented its rebind. Allocating through
+the collision fixture's own allocator preserved the owner rebind. The fixture
+and the occupied-listener guard now share `hold_collision_port`; the deliberate
+first SPARQL collision and retry/readiness assertions remain exercised. The new
+allocator-boundary guard fails with the global selector and passes with this
+fix. This is independent of the macOS descriptor-inheritance repair above.
+
+### Docker recovery smoke readiness (2026-10-23)
+
+Nightly run 39922605666's cluster-mode checks succeeded before the survivor's
+peer RPC lanes finished reconnecting; both recovery MutationForward calls
+failed and the one-shot QUORUM write received only its local response. Phase 10
+now establishes replication readiness with a bounded QUORUM read of an existing
+row before asserting the one-shot write and cross-replica data recovery. A failed
+read cannot satisfy the value predicate even if its diagnostic contains that
+value. Script-level controls cover transient and permanent unavailability;
+the actual container run remains a separate integration check.
