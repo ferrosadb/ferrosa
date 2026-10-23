@@ -2,6 +2,7 @@
 name = "ferrosa-schema"
 description = "Schema management for Ferrosa: metadata, auth, audit, system keyspaces"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

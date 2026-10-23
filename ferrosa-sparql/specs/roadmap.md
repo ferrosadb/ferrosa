@@ -55,6 +55,9 @@ stubs), the FMEA ([fmea.md](fmea.md)), and the dependency/usage review.
 - **Full Turtle / RDF-XML serialization (FMEA SP-8).** Route CONSTRUCT/DESCRIBE
   output through `oxrdf`/`sparesults` for prefixed, grouped Turtle and correct
   RDF/XML instead of the current N-Triples-subset and ad-hoc XML.
+  `sparesults` was declared but never used, and was removed: 0.3.x pins
+  `quick-xml` 0.37 (RUSTSEC-2026-0194/0195). Re-add it only at a release on
+  `quick-xml` >= 0.41.
 - **RDF\* annotation evaluation (FMEA SP-7).** Requires a storage encoding for
   quoted-triple terms in key position, insert support for quoted-triple
   subjects, and a join planner that binds the inner pattern before the outer

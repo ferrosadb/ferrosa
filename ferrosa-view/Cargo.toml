@@ -2,6 +2,7 @@
 name = "ferrosa-view"
 description = "Materialized view core: metadata, DDL validation, and pure view-delta computation (protocol-agnostic, no I/O)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

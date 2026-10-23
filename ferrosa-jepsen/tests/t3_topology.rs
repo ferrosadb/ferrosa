@@ -21,11 +21,29 @@ use std::process::Command;
 #[cfg(feature = "live-infra-tests")]
 use std::time::Duration;
 
+use yaml_rust2::{Yaml, YamlLoader};
+
 const COMPOSE_RELATIVE: &str = "tests/docker/jepsen-cluster-t3.yml";
 
 fn compose_path() -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     manifest_dir.join(COMPOSE_RELATIVE)
+}
+
+/// The compose file's single YAML document.
+fn parse_compose(raw: &str) -> Yaml {
+    let mut docs = YamlLoader::load_from_str(raw).expect("parse compose yaml");
+    assert_eq!(
+        docs.len(),
+        1,
+        "compose file must hold exactly one YAML document"
+    );
+    docs.remove(0)
+}
+
+/// A mapping key, for looking up a service or an environment variable.
+fn key(name: &str) -> Yaml {
+    Yaml::String(name.into())
 }
 
 #[test]
@@ -37,13 +55,10 @@ fn t3_compose_yaml_exists_and_parses() {
         path.display()
     );
     let raw = std::fs::read_to_string(&path).expect("read compose yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
+    let parsed = parse_compose(&raw);
 
     // services: dc1-node1..3 + dc2-node1..3 + rustfs + rustfs-init + volume-permissions.
-    let services = parsed
-        .get("services")
-        .and_then(|v| v.as_mapping())
-        .expect("services mapping");
+    let services = parsed["services"].as_hash().expect("services mapping");
     for required in [
         "rustfs",
         "rustfs-init",
@@ -55,19 +70,16 @@ fn t3_compose_yaml_exists_and_parses() {
         "dc2-node3",
     ] {
         assert!(
-            services.contains_key(serde_yaml::Value::String(required.into())),
+            services.contains_key(&key(required)),
             "compose must declare service `{required}`"
         );
     }
 
     // networks: dc1-net, dc2-net, wan-net.
-    let networks = parsed
-        .get("networks")
-        .and_then(|v| v.as_mapping())
-        .expect("networks mapping");
+    let networks = parsed["networks"].as_hash().expect("networks mapping");
     for required in ["dc1-net", "dc2-net", "wan-net"] {
         assert!(
-            networks.contains_key(serde_yaml::Value::String(required.into())),
+            networks.contains_key(&key(required)),
             "compose must declare network `{required}` (W6.9)"
         );
     }
@@ -76,16 +88,16 @@ fn t3_compose_yaml_exists_and_parses() {
 #[test]
 fn t3_compose_pins_each_dc_node_to_its_dc_via_env() {
     let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
-    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+    let parsed = parse_compose(&raw);
+    let services = parsed["services"].as_hash().unwrap();
 
     // Helper: read FERROSA_DATA_CENTER from a service definition.
     let dc_of = |name: &str| -> String {
         let svc = services
-            .get(serde_yaml::Value::String(name.into()))
+            .get(&key(name))
             .unwrap_or_else(|| panic!("service {name} missing"));
-        let env = svc.get("environment").and_then(|v| v.as_mapping()).unwrap();
-        env.get(serde_yaml::Value::String("FERROSA_DATA_CENTER".into()))
+        let env = svc["environment"].as_hash().unwrap();
+        env.get(&key("FERROSA_DATA_CENTER"))
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| panic!("{name} missing FERROSA_DATA_CENTER"))
@@ -105,14 +117,14 @@ fn t3_compose_seeds_within_each_dc() {
     // Cross-DC peering is added via wan-net at runtime, not via
     // FERROSA_SEED.
     let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
-    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+    let parsed = parse_compose(&raw);
+    let services = parsed["services"].as_hash().unwrap();
 
     for n in ["dc1-node1", "dc1-node2", "dc1-node3"] {
-        let svc = services.get(serde_yaml::Value::String(n.into())).unwrap();
-        let env = svc.get("environment").and_then(|v| v.as_mapping()).unwrap();
+        let svc = services.get(&key(n)).unwrap();
+        let env = svc["environment"].as_hash().unwrap();
         let seed = env
-            .get(serde_yaml::Value::String("FERROSA_SEED".into()))
+            .get(&key("FERROSA_SEED"))
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| panic!("{n} missing FERROSA_SEED"));
         assert!(
@@ -125,10 +137,10 @@ fn t3_compose_seeds_within_each_dc() {
         );
     }
     for n in ["dc2-node1", "dc2-node2", "dc2-node3"] {
-        let svc = services.get(serde_yaml::Value::String(n.into())).unwrap();
-        let env = svc.get("environment").and_then(|v| v.as_mapping()).unwrap();
+        let svc = services.get(&key(n)).unwrap();
+        let env = svc["environment"].as_hash().unwrap();
         let seed = env
-            .get(serde_yaml::Value::String("FERROSA_SEED".into()))
+            .get(&key("FERROSA_SEED"))
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| panic!("{n} missing FERROSA_SEED"));
         assert!(
@@ -145,8 +157,8 @@ fn t3_compose_seeds_within_each_dc() {
 #[test]
 fn t3_compose_advertises_host_reachable_cql_ports() {
     let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
-    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+    let parsed = parse_compose(&raw);
+    let services = parsed["services"].as_hash().unwrap();
 
     for (node, port) in [
         ("dc1-node1", 29042),
@@ -157,14 +169,13 @@ fn t3_compose_advertises_host_reachable_cql_ports() {
         ("dc2-node3", 29144),
     ] {
         let service = services
-            .get(serde_yaml::Value::String(node.into()))
+            .get(&key(node))
             .unwrap_or_else(|| panic!("service {node} missing"));
-        let env = service
-            .get("environment")
-            .and_then(|v| v.as_mapping())
+        let env = service["environment"]
+            .as_hash()
             .unwrap_or_else(|| panic!("{node} missing environment"));
         let actual = env
-            .get(serde_yaml::Value::String("FERROSA_CQL_BROADCAST".into()))
+            .get(&key("FERROSA_CQL_BROADCAST"))
             .and_then(|v| v.as_str());
 
         assert_eq!(
@@ -178,8 +189,8 @@ fn t3_compose_advertises_host_reachable_cql_ports() {
 #[test]
 fn t3_compose_grants_nodes_network_admin_for_wan_nemeses() {
     let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
-    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+    let parsed = parse_compose(&raw);
+    let services = parsed["services"].as_hash().unwrap();
 
     for node in [
         "dc1-node1",
@@ -190,11 +201,10 @@ fn t3_compose_grants_nodes_network_admin_for_wan_nemeses() {
         "dc2-node3",
     ] {
         let service = services
-            .get(serde_yaml::Value::String(node.into()))
+            .get(&key(node))
             .unwrap_or_else(|| panic!("service {node} missing"));
-        let capabilities = service
-            .get("cap_add")
-            .and_then(|value| value.as_sequence())
+        let capabilities = service["cap_add"]
+            .as_vec()
             .unwrap_or_else(|| panic!("{node} must declare cap_add for WAN nemeses"));
 
         assert!(
@@ -209,15 +219,13 @@ fn t3_compose_grants_nodes_network_admin_for_wan_nemeses() {
 #[test]
 fn t3_compose_attaches_each_dc_to_its_network_and_wan() {
     let raw = std::fs::read_to_string(compose_path()).expect("read compose yaml");
-    let parsed: serde_yaml::Value = serde_yaml::from_str(&raw).expect("parse compose yaml");
-    let services = parsed.get("services").and_then(|v| v.as_mapping()).unwrap();
+    let parsed = parse_compose(&raw);
+    let services = parsed["services"].as_hash().unwrap();
 
     let networks_of = |name: &str| -> Vec<String> {
-        let svc = services
-            .get(serde_yaml::Value::String(name.into()))
-            .unwrap();
-        match svc.get("networks") {
-            Some(serde_yaml::Value::Sequence(seq)) => seq
+        let svc = services.get(&key(name)).unwrap();
+        match &svc["networks"] {
+            Yaml::Array(seq) => seq
                 .iter()
                 .filter_map(|v| v.as_str().map(String::from))
                 .collect(),

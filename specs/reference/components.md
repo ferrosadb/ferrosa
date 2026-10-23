@@ -364,7 +364,7 @@ graph BT
 
 - **Purpose**: SPARQL 1.1 Query and Update endpoint with RDF*/SPARQL-star support
 - **Location**: `ferrosa-sparql/`
-- **Dependencies**: `ferrosa-common`, `ferrosa-storage`, `ferrosa-schema`, `ferrosa-index`, `ferrosa-sstable`, `spargebra` (with `sparql-12`), `sparesults`, `oxrdf`, `axum`, `tower-http`, `tokio`, `tracing`, `serde_json`
+- **Dependencies**: `ferrosa-common`, `ferrosa-storage`, `ferrosa-schema`, `ferrosa-index`, `ferrosa-sstable`, `spargebra` (with `sparql-12`), `oxrdf`, `axum`, `tower-http`, `tokio`, `tracing`, `serde_json`
 - **Status**: Sprint 1 complete — parser, planner, executor, HTTP endpoint, FILTER evaluation, property path BFS, content negotiation, SPARQL UPDATE
 - **Modules**:
   - `engine.rs` — `SparqlEngine`: parse → plan → execute, auto-registers `rdf_triples` table
@@ -445,7 +445,7 @@ graph BT
 
 - **Purpose**: Custom internode protocol — transport, RPC, failure detection
 - **Location**: `ferrosa-net/`
-- **Dependencies**: `ferrosa-common`, `arc-swap`, `async-trait`, `bytes`, `capnp` (build-time `capnpc`), `dashmap`, `futures`, `hmac`, `lz4_flex`, `parking_lot`, `rand`, `rustls`, `rustls-pemfile`, `sha2`, `snap`, `tokio`, `tokio-rustls`, `tokio-util`, `tracing`, `uuid`, `zstd`
+- **Dependencies**: `ferrosa-common`, `arc-swap`, `async-trait`, `bytes`, `capnp` (build-time `capnpc`), `dashmap`, `futures`, `hmac`, `lz4_flex`, `parking_lot`, `rand`, `rustls`, `sha2`, `snap`, `tokio`, `tokio-rustls`, `tokio-util`, `tracing`, `uuid`, `zstd`
 - **Status**: Phase 1 complete — 87 message types, PSK auth, priority-lane RPC, CQL broadcast propagation
 - Its only internal dependency is `ferrosa-common` (shared types); it deliberately stays below the schema/storage layers
 - **Modules**:

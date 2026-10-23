@@ -1,7 +1,9 @@
 [package]
 name = "ferrosa-graph"
 version.workspace = true
+publish.workspace = true
 edition = "2021"
+license.workspace = true
 description = "Graph query engine for ferrosa — Cypher/GQL endpoint"
 
 [dependencies]

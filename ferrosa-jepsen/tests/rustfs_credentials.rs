@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use yaml_rust2::{Yaml, YamlLoader};
+
 fn compose_path(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(relative)
 }
@@ -19,33 +21,26 @@ fn jepsen_compose_files_allow_rustfs_default_credentials() {
 fn assert_rustfs_default_credentials_are_explicitly_allowed(path: &Path) {
     let raw =
         std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let parsed: serde_yaml::Value =
-        serde_yaml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
-    let services = parsed
-        .get("services")
-        .and_then(|v| v.as_mapping())
+    let docs =
+        YamlLoader::load_from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+    let services = docs
+        .first()
+        .and_then(|doc| doc["services"].as_hash())
         .unwrap_or_else(|| panic!("{} missing services mapping", path.display()));
     let rustfs = services
-        .get(serde_yaml::Value::String("rustfs".into()))
+        .get(&Yaml::String("rustfs".into()))
         .unwrap_or_else(|| panic!("{} missing rustfs service", path.display()));
-    let env = rustfs
-        .get("environment")
-        .and_then(|v| v.as_mapping())
+    let env = rustfs["environment"]
+        .as_hash()
         .unwrap_or_else(|| panic!("{} rustfs service missing environment", path.display()));
+    let env_str = |key: &str| env.get(&Yaml::String(key.into())).and_then(Yaml::as_str);
 
-    let access_key = env
-        .get(serde_yaml::Value::String("RUSTFS_ACCESS_KEY".into()))
-        .and_then(|v| v.as_str());
-    let secret_key = env
-        .get(serde_yaml::Value::String("RUSTFS_SECRET_KEY".into()))
-        .and_then(|v| v.as_str());
+    let access_key = env_str("RUSTFS_ACCESS_KEY");
+    let secret_key = env_str("RUSTFS_SECRET_KEY");
 
     if access_key == Some("rustfsadmin") && secret_key == Some("rustfsadmin") {
         assert_eq!(
-            env.get(serde_yaml::Value::String(
-                "RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS".into()
-            ))
-            .and_then(|v| v.as_str()),
+            env_str("RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS"),
             Some("true"),
             "{} uses RustFS default credentials and must set \
              RUSTFS_ALLOW_INSECURE_DEFAULT_CREDENTIALS=true",
