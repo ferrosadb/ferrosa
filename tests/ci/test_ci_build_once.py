@@ -44,7 +44,8 @@ MUSL_BUILD = (
     f"cargo build --release --target {MUSL_TARGET} "
     "-p ferrosa -p ferrosa-ctl --features ferrosa/full"
 )
-BUILD_JOB = "build-node-image"
+GLIBC_JOB = "glibc"  # compiles, in the Ubuntu 22.04 container
+BUILD_JOB = "build-node-image"  # packages that build into the test node image
 MUSL_JOB = "musl"
 # Jobs that run the server binary. None of them may compile it.
 CONSUMERS = ("examples", "secure-compose", "integration", "postgres-jepsen-fault")
@@ -61,8 +62,8 @@ class CiBuildsEachShippedBinaryOnce(unittest.TestCase):
 
     def test_exactly_two_jobs_compile_a_release_binary_once_each(self):
         builders = {name for name, job in self.jobs.items() if release_builds(job)}
-        self.assertEqual(builders, {BUILD_JOB, MUSL_JOB})
-        self.assertEqual(release_builds(self.jobs[BUILD_JOB]), [GLIBC_BUILD])
+        self.assertEqual(builders, {GLIBC_JOB, MUSL_JOB})
+        self.assertEqual(release_builds(self.jobs[GLIBC_JOB]), [GLIBC_BUILD])
         self.assertEqual(release_builds(self.jobs[MUSL_JOB]), [MUSL_BUILD])
 
     def test_each_build_is_the_command_release_yml_ships(self):
@@ -70,6 +71,17 @@ class CiBuildsEachShippedBinaryOnce(unittest.TestCase):
         gnu = [c.replace("${{ matrix.target }}", GLIBC_TARGET) for c in release_builds(release["build-linux-gnu"])]
         self.assertIn(GLIBC_BUILD, gnu)
         self.assertIn(MUSL_BUILD, release_builds(release["build-linux-x86_64"]))
+
+    def test_the_glibc_build_runs_where_release_builds_it(self):
+        # release.yml builds glibc in Ubuntu 22.04 (glibc 2.35) so every glibc
+        # artifact runs on 22.04 and newer. CI builds in the same container, or
+        # it tests a binary with a different glibc requirement than ships.
+        from tests.ci.test_release_glibc import UBUNTU_2204
+
+        image = f"image: {UBUNTU_2204}"
+        self.assertIn(image, self.jobs[GLIBC_JOB])
+        self.assertIn(image, jobs(RELEASE)["build-linux-gnu"])
+        self.assertIn('GLIBC_FLOOR: "2.35"', self.jobs[GLIBC_JOB])
 
     def test_the_musl_job_reports_the_required_check(self):
         # The main ruleset requires "Static Build (musl)" (gh api
@@ -80,11 +92,15 @@ class CiBuildsEachShippedBinaryOnce(unittest.TestCase):
     def test_the_duplicate_build_jobs_are_gone(self):
         self.assertNotIn("build-flight-binary", self.jobs)
 
-    def test_the_node_image_packages_the_glibc_binary_with_flight_off(self):
+    def test_the_node_image_packages_the_glibc_build_with_flight_off(self):
+        # A container job has no docker daemon, so the image is packaged on
+        # the host from the glibc job's artifact, without compiling.
         job = self.jobs[BUILD_JOB]
-        self.assertIn(f"cp target/{GLIBC_TARGET}/release/ferrosa ", job)
-        self.assertIn("ENV FERROSA_FLIGHT_ENABLED=false", job)
+        self.assertRegex(job, rf"(?m)^    needs: {GLIBC_JOB}$")
         self.assertIn("name: ferrosa-glibc", job)
+        self.assertIn("name: ferrosa-glibc", self.jobs[GLIBC_JOB])
+        self.assertIn("ENV FERROSA_FLIGHT_ENABLED=false", job)
+        self.assertEqual(cargo_commands(job), [])
 
     def test_every_consumer_runs_the_built_image_and_compiles_no_server(self):
         for name in CONSUMERS:
@@ -101,7 +117,7 @@ class CiBuildsEachShippedBinaryOnce(unittest.TestCase):
         # default-features build: a Linux release compile of a build no user
         # gets. It now stages each shipped tarball from its one build.
         job = self.jobs["install-smoke"]
-        self.assertRegex(job, r"(?m)^    needs: \[build-node-image, musl\]$")
+        self.assertRegex(job, r"(?m)^    needs: \[glibc, musl\]$")
         for artifact, target in (("ferrosa-glibc", GLIBC_TARGET), ("ferrosa-musl-static", MUSL_TARGET)):
             self.assertIn(artifact, job)
             self.assertIn(target, job)

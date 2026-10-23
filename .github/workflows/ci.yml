@@ -49,6 +49,8 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_release_workflow.py
       - name: Check releases ship glibc alongside musl
         run: python3 -m unittest -q tests/ci/test_release_glibc.py
+      - name: Check the .deb declares the glibc its binary needs
+        run: python3 -m unittest -q tests/ci/test_build_deb.py
       # Nightly and stable releases take main's Cargo version (main leads) and
       # refuse to release below the latest stable tag.
       - name: Check release version comes from main
@@ -526,34 +528,48 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           retention-days: 14
 
-  build-node-image:
-    name: Build node image
-    # release.yml's build-linux-gnu runner, so the binary's glibc requirement
-    # is the one the release asserts against its runtime base.
+  glibc:
+    name: Build glibc (Ubuntu 22.04)
+    # release.yml's build-linux-gnu container: Ubuntu 22.04 (glibc 2.35), so
+    # CI tests the binary with the glibc requirement that ships. Pinned by
+    # digest; not yet mirrored to downloads.ferrosa.ai (forge t_df6a29de).
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
+    container:
+      image: docker.io/library/ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
+    env:
+      # The oldest glibc every glibc artifact must run on (Ubuntu 22.04).
+      GLIBC_FLOOR: "2.35"
     steps:
+      - name: Install glibc build dependencies
+        # Same packages as release.yml's build-linux-gnu, before checkout: the
+        # bare image has no git, and the toolchain action needs curl.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential pkg-config perl file \
+            capnproto libunwind-dev
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: node-image
+          key: glibc-ubuntu2204
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
-      - name: Install glibc build dependencies
-        # Same packages as release.yml's build-linux-gnu.
-        run: sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
       - name: Build the glibc release binary (once)
         # Curated `ferrosa/full`, NOT --all-features: this is the release
         # binary's feature set.
         run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p ferrosa -p ferrosa-ctl --features ferrosa/full
-      - name: Strip and report
+      - name: Strip, and check the glibc floor
         run: |
+          set -euo pipefail
           strip target/x86_64-unknown-linux-gnu/release/ferrosa
           strip target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
           file target/x86_64-unknown-linux-gnu/release/ferrosa
-          echo "glibc required: $(objdump -T target/x86_64-unknown-linux-gnu/release/ferrosa | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -n1)"
+          required="$(objdump -T target/x86_64-unknown-linux-gnu/release/ferrosa | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -n1 | sed 's/^GLIBC_//')"
+          echo "glibc required: ${required} (floor ${GLIBC_FLOOR})"
+          if [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$required" | sort -V | tail -n1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::binary needs glibc ${required}, newer than ${GLIBC_FLOOR} (Ubuntu 22.04)"
+            exit 1
+          fi
       - name: Upload glibc binaries
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -562,10 +578,27 @@ jobs:
             target/x86_64-unknown-linux-gnu/release/ferrosa
             target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
           retention-days: 14
+
+  build-node-image:
+    name: Build node image
+    # Packages the glibc job's binaries; a container job has no docker daemon,
+    # so the image is built here, on the host, without compiling anything.
+    needs: glibc
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Download the glibc binaries
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ferrosa-glibc
+          path: node-bin
       - name: Package into a thin runtime image
         run: |
           mkdir -p node-bin
-          cp target/x86_64-unknown-linux-gnu/release/ferrosa target/x86_64-unknown-linux-gnu/release/ferrosa-ctl node-bin/
+          # upload-artifact does not keep file modes.
+          chmod +x node-bin/ferrosa node-bin/ferrosa-ctl
           cat > node-bin/Dockerfile <<'DEOF'
           FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
           RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -1111,7 +1144,7 @@ jobs:
   # and as the release gate; it no longer compiles three binaries per PR.
   install-smoke:
     name: Install smoke (${{ matrix.libc }} tarball)
-    needs: [build-node-image, musl]
+    needs: [glibc, musl]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:

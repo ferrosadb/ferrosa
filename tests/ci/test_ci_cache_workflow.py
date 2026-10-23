@@ -43,7 +43,7 @@ RELEASE_WORKFLOWS = {
 # one. --all-features would put test-only / live-infra features into it.
 RELEASE_SHAPED_JOBS = {
     ("ci.yml", "musl"): "the shipped static musl binary, built once",
-    ("ci.yml", "build-node-image"): "the shipped glibc binary, built once; its image is what every CI job and paired repo runs",
+    ("ci.yml", "glibc"): "the shipped glibc binary, built once in Ubuntu 22.04; build-node-image packages it",
     ("ci.yml", "aarch64-musl"): "checks release.yml's aarch64 packages and features",
     ("install-smoke.yml", "build"): "stages the real release tarball layout",
     ("nightly-fuzz.yml", "smoke-test"): "musl fallback for the nightly .deb image",

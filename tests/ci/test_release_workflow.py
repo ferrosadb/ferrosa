@@ -35,7 +35,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual("0.13.2", tagged_version)
 
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        debian_job = workflow.split("      - name: Build Debian package\n", 1)[1].split("\n      - name:", 1)[0]
+        debian_job = workflow.split("      - name: Build Debian package (glibc)\n", 1)[1].split("\n      - name:", 1)[0]
         self.assertIn(
             'VERSION="$(bash .github/scripts/release-version.sh '
             '"$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"',
