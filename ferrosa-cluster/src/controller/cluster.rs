@@ -1910,7 +1910,10 @@ impl ModeController {
         use crate::raft::handlers::LazyRaft;
         let (raft_tx, lazy_raft) = LazyRaft::channel();
 
-        let append_handler = Arc::new(RaftAppendHandler::new(lazy_raft.clone()));
+        let append_handler = Arc::new(RaftAppendHandler::new(
+            lazy_raft.clone(),
+            self.leader_contact.clone(),
+        ));
         self.registry
             .register(MsgType::RaftAppendEntries, append_handler);
 
