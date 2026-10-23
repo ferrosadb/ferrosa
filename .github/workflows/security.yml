@@ -10,6 +10,18 @@ name: Security
 # (self-hosted) machines, so no job here may move to a self-hosted runner.
 # Nothing here needs a secret: every job reads public data with the
 # workflow's read-only token.
+#
+# Egress is AUDITED, not blocked. On GitHub-hosted runners harden-runner's
+# block mode works only if its agent takes over DNS, and that is not reliable:
+# in run 40017365622, systemd-resolved still queried Azure DNS (168.63.129.16)
+# directly after the agent restarted it. The agent therefore never learned
+# github.com's address. It dropped git's fetch AND the runner's own connections
+# to GitHub (Runner.Worker, resolved before the agent started), so checkout
+# failed and the job hung until its timeout. The runner's traffic goes to
+# whatever GitHub address it cached, and allowed-endpoints takes host names,
+# not address ranges, so no allow-list can prevent this. These jobs hold no
+# secret and only a read-only token, so audit loses little. Every connection
+# is still recorded on the run's StepSecurity insights page.
 
 on:
   push:
@@ -42,17 +54,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            api.github.com:443
-            objects.githubusercontent.com:443
-            release-assets.githubusercontent.com:443
-            crates.io:443
-            static.crates.io:443
-            index.crates.io:443
-            static.rust-lang.org:443
-            sh.rustup.rs:443
+          egress-policy: audit
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
       - name: Install cargo-deny
@@ -106,12 +108,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            pypi.org:443
-            files.pythonhosted.org:443
-            api.osv.dev:443
+          egress-policy: audit
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install pip-audit
         env:
@@ -143,10 +140,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            registry.npmjs.org:443
+          egress-policy: audit
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       # The AssemblyScript UDF proof of concept; its lockfile is the only one.
       - name: npm audit (asc-poc)
@@ -161,13 +155,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            api.github.com:443
-            objects.githubusercontent.com:443
-            release-assets.githubusercontent.com:443
-            api.osv.dev:443
+          egress-policy: audit
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install osv-scanner
         env:
@@ -198,12 +186,7 @@ jobs:
       - name: Harden the runner
         uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
         with:
-          egress-policy: block
-          allowed-endpoints: >
-            github.com:443
-            api.github.com:443
-            objects.githubusercontent.com:443
-            release-assets.githubusercontent.com:443
+          egress-policy: audit
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           # gitleaks needs history to scan commits, not just the tree.
