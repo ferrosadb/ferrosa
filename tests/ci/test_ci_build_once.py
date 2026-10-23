@@ -61,6 +61,12 @@ class CiBuildsTheShippedBinaryOnce(unittest.TestCase):
         release_x86 = jobs(RELEASE)["build-linux-x86_64"]
         self.assertIn(SHIPPED_BUILD, [c.strip() for c in release_builds(release_x86)])
 
+    def test_the_build_job_reports_the_required_musl_check(self):
+        # The main ruleset requires "Static Build (musl)" (gh api
+        # repos/ferrosadb/ferrosa/rules/branches/main). Losing the name blocks
+        # every merge until the ruleset is edited.
+        self.assertRegex(self.jobs[BUILD_JOB], r"(?m)^    name: Static Build \(musl\)$")
+
     def test_the_duplicate_build_jobs_are_gone(self):
         self.assertNotIn("musl", self.jobs)
         self.assertNotIn("build-flight-binary", self.jobs)

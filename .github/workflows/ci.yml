@@ -484,7 +484,9 @@ jobs:
   # ships FERROSA_FLIGHT_ENABLED=false so a paired repository sees no new
   # listener, and a job that needs Flight sets it to true.
   build-node-image:
-    name: Build node image
+    # The `main` ruleset requires a check named "Static Build (musl)"; this
+    # job is that build now, so it carries the name.
+    name: Static Build (musl)
     runs-on: ubuntu-latest
     permissions:
       contents: read
