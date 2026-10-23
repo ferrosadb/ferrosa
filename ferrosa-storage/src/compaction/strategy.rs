@@ -184,6 +184,26 @@ fn positive_u32_from_value(name: &str, value: &str, default: u32, min: u32, max:
     normalized
 }
 
+/// A strategy for a table whose storage is already ordered.
+///
+/// RRD-segmented tables (`rrd.segment_window`) keep one immutable segment per
+/// time window, and the segments never overlap in time, so row order across
+/// segments is already the read order. There is nothing to merge; selecting a
+/// task anyway would rewrite whole segments and destroy the property the
+/// extension exists for (retention by unlink, write amplification 1.0).
+pub struct NoCompactionStrategy;
+
+impl CompactionStrategy for NoCompactionStrategy {
+    fn select(
+        &self,
+        _sstables: &[SSTableMetadata],
+        _schema: &TableSchema,
+        _table_id: &TableId,
+    ) -> Vec<CompactionTask> {
+        Vec::new()
+    }
+}
+
 /// Size-Tiered Compaction Strategy.
 ///
 /// Groups SSTables into buckets by similar size. A bucket is formed when

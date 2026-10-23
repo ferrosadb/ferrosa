@@ -354,6 +354,39 @@ operator can call
 `StorageEngine::resume_table_compactions_after_digest_failures(table_id)` to
 resume and reset the streak.
 
+## RRD segmented tables
+
+A table carrying `rrd.segment_window` is stored as immutable, time-bounded
+segments: one file per window, whose rows all fall inside that window. The
+segments never overlap in time, so row order across them is already the read
+order and there is nothing for a compaction strategy to merge.
+
+- **Selection.** `StorageEngine::strategy_for_table` returns
+  `compaction::NoCompactionStrategy` (always `Vec::new()`), and `maybe_compact`
+  returns `false` before its bounded-backlog branch. The second guard is not
+  redundant: the backlog branch builds a task from the smallest SSTables without
+  consulting any strategy, so a table with more segments than `max_inputs`
+  would still be rewritten there on every flush. Both are keyed on
+  `RrdConfig::is_segmented`, which is the *presence* of `rrd.segment_window` —
+  a hand-edited schema whose window no longer parses must not fall back to UCS.
+- **Configuration** (`rrd::config`). `rrd.segment_window` and `rrd.retain` are
+  required (no shared defaults: both are properties of the series' write rate),
+  `rrd.block_bytes` defaults to `DEFAULT_BLOCK_BYTES` (1 MiB). A malformed
+  duration or size, a missing companion key, a zero window or block, or a
+  retention shorter than one window fails table registration, the same contract
+  `consolidation.*` already has. Durations reuse
+  `timeseries::config::parse_duration`; sizes use `size_units::parse_size`, the
+  crate's only size parser.
+- **Window arithmetic.** Microseconds, the cell-timestamp unit. A timestamp
+  exactly on an edge (`k * window`) belongs to the window that starts there.
+  Segment identity is derived from the window start alone, so two rows in one
+  window cannot split across segments.
+- **Not yet implemented in this slice:** rolling the segment when a flush spans
+  a window boundary, retention by unlinking the oldest expired segment through
+  the existing retire path, and read-path reporting of an unlinked window as
+  absent. `rrd.block_bytes` is parsed and clamped by `effective_block_bytes`
+  but has no consumer until the segment writer lands.
+
 ## jsonb (T-150)
 
 `external_sort` payload accounting counts the canonical jsonb bytes (T-150); a document-sized value never accounts as 0.

@@ -5309,6 +5309,9 @@ impl StorageEngine {
         indexed_columns: Vec<(String, usize)>,
     ) -> ferrosa_common::Result<()> {
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        // A table either stores segments or it does not: an unusable `rrd.*`
+        // value is a schema error, never a silent fall back to compaction.
+        Self::validate_rrd_extensions(&table_id, &schema)?;
         // A same-name re-create after a DROP whose removal failed must never
         // reach the previous incarnation's still-registered store. When a
         // pending-sweep intent names this table, retire whatever is registered
@@ -8983,6 +8986,22 @@ impl StorageEngine {
                 }
             }
         })
+    }
+
+    /// Reject an unusable `rrd.*` extension set, the way
+    /// [`Self::build_time_series_consolidator`] rejects an unusable
+    /// `consolidation.*` one: a malformed window or a missing retention horizon
+    /// is a DDL error, not a table that silently starts compacting.
+    fn validate_rrd_extensions(
+        table_id: &TableId,
+        schema: &TableSchema,
+    ) -> ferrosa_common::Result<()> {
+        match crate::rrd::RrdConfig::from_extensions(&schema.extensions) {
+            None | Some(Ok(_)) => Ok(()),
+            Some(Err(reason)) => Err(ferrosa_common::Error::InvalidFormat(format!(
+                "invalid rrd extensions for {table_id}: {reason}"
+            ))),
+        }
     }
 
     fn build_time_series_consolidator(
@@ -13628,6 +13647,14 @@ impl StorageEngine {
     }
 
     fn maybe_compact(&self, table_id: &TableId, state: &TableState) -> bool {
+        // An RRD-segmented table is never compacted. This guard is not redundant
+        // with `strategy_for_table`: the bounded-backlog branch below builds a
+        // task from the smallest SSTables without consulting any strategy, so a
+        // table with more than `max_inputs` segments would still be rewritten on
+        // every flush there.
+        if crate::rrd::RrdConfig::is_segmented(&state.schema().extensions) {
+            return false;
+        }
         // Defer before planning anything when the compaction pipeline is already
         // saturated. The task and result queues are one and two deep per worker,
         // so a full planning round here would compute `select` plus one metadata
@@ -13793,10 +13820,17 @@ impl StorageEngine {
 
     /// Select the compaction strategy for a table based on its extensions.
     ///
+    /// An RRD-segmented table (`rrd.segment_window`) gets
+    /// [`NoCompactionStrategy`]: its segments are immutable, one per time
+    /// window, and never overlap in time, so there is nothing to merge.
+    ///
     /// Tables with `compaction.class` containing "Unified" or "UCS" use the
     /// Unified Compaction Strategy. All others default to STCS.
     fn strategy_for_table(&self, state: &TableState) -> Box<dyn CompactionStrategy> {
         let extensions = &state.schema().extensions;
+        if crate::rrd::RrdConfig::is_segmented(extensions) {
+            return Box::new(crate::compaction::NoCompactionStrategy);
+        }
         let class = extensions.get("compaction.class").map(|s| s.as_str());
         match class {
             Some(c) if c.contains("Unified") || c.contains("UCS") => {
@@ -16871,6 +16905,7 @@ mod tests {
     include!("engine_evicted_ranged_tests.rs");
     include!("engine_outage_tests.rs");
     include!("engine_finalize_offload_tests.rs");
+    include!("rrd_segment_tests.rs");
 
     use super::*;
 

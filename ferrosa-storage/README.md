@@ -557,6 +557,29 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   stays exercised: dev and test clusters use 1 GiB.
 - **NVMe pinning** (`pin_config.rs`) — `PinMode::NvMe` keeps a table local and
   skips S3 upload; pin/unpin transitions reconcile the S3 lifecycle.
+  `storage.pin_max_bytes` takes the same size literals as `rrd.block_bytes`
+  (`size_units::parse_size`: bare bytes, `KiB`/`MiB`/`GiB`/`TiB`; decimal `MB` is
+  rejected, not guessed).
+- **RRD segmented tables** (`rrd/`) — a table that sets `rrd.segment_window`
+  stores one immutable segment per time window instead of letting UCS merge
+  everything. UCS is the wrong mechanism for a tiny, continuously written table:
+  its 100 MiB `min_sstable_size` floor puts a 2.64 MiB telemetry table in one
+  density bucket, so every flush rewrites the union of the table (96x–576x write
+  amplification, growing with the square of the flush count), and row TTL makes
+  it worse because expiry is a tombstone a later compaction must rewrite.
+  Segments never overlap in time, so row order across them is already the read
+  order: `strategy_for_table` returns `NoCompactionStrategy` and `maybe_compact`
+  refuses the table before its bounded-backlog branch (which builds a task
+  without consulting a strategy). Configuration, parsed once in
+  `rrd::config::RrdConfig` and validated at table creation:
+  `rrd.segment_window` (required, no shared default), `rrd.retain` (required),
+  and `rrd.block_bytes` (optional, `DEFAULT_BLOCK_BYTES` = 1 MiB).
+  `block_bytes` is a ceiling, not a fixed unit: `effective_block_bytes` clamps it
+  to the bytes the table holds inside its retention, so a tier whose whole
+  retention is under one block is one object per segment rather than a padded
+  block. Recommended per-tier starting points live in the `rrd::config` module
+  docs. Window arithmetic is in microseconds (the cell-timestamp unit) and a
+  timestamp exactly on an edge belongs to the window that starts there.
 - **Secondary-index pipeline** (`index/`, `memtable/eager_index.rs`) —
   per-index state tracker, channel-based build scheduler, local/remote/off
   backends, FTI + vector (HNSW/IVFFlat) sidecars, artifact manifest. The local
