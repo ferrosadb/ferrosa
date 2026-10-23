@@ -465,15 +465,17 @@ class TestTTL:
 
     def test_insert_with_ttl(self, session):
         session.execute(
-            "INSERT INTO users (id, name) VALUES (950, 'Ephemeral') USING TTL 1"
+            "INSERT INTO users (id, name) VALUES (950, 'Ephemeral') USING TTL 2"
         )
-        # Verify it exists right away.
+        # Verify it exists right away. TTL expiry is whole-second, as in
+        # Cassandra: a TTL n row lives (n-1, n] seconds, so a TTL 1 row written
+        # late in a second can be gone a few ms later. TTL 2 guarantees > 1 s.
         rows = list(session.execute("SELECT name FROM users WHERE id = 950"))
         assert len(rows) == 1
         assert rows[0].name == "Ephemeral"
 
-        # Wait for TTL to expire.
-        time.sleep(2)
+        # Wait for TTL to expire (lifetime is at most 2 s).
+        time.sleep(3)
 
         rows = list(session.execute("SELECT name FROM users WHERE id = 950"))
         assert len(rows) == 0

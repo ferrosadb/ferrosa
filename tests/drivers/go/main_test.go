@@ -535,13 +535,15 @@ func TestInsertWithTTL(t *testing.T) {
 	defer session.Close()
 
 	if err := session.Query(
-		"INSERT INTO users (id, name) VALUES (?, ?) USING TTL 1",
+		"INSERT INTO users (id, name) VALUES (?, ?) USING TTL 2",
 		950, "Ephemeral",
 	).Exec(); err != nil {
 		t.Fatalf("insert with TTL: %v", err)
 	}
 
-	// Verify row exists immediately.
+	// Verify row exists immediately. TTL expiry is whole-second, as in
+	// Cassandra: a TTL n row lives (n-1, n] seconds, so a TTL 1 row written
+	// late in a second can be gone a few ms later. TTL 2 guarantees > 1 s.
 	var name string
 	if err := session.Query("SELECT name FROM users WHERE id = ?", 950).
 		Scan(&name); err != nil {
@@ -551,8 +553,8 @@ func TestInsertWithTTL(t *testing.T) {
 		t.Errorf("name = %q, want Ephemeral", name)
 	}
 
-	// Wait for TTL to expire.
-	time.Sleep(2 * time.Second)
+	// Wait for TTL to expire (lifetime is at most 2 s).
+	time.Sleep(3 * time.Second)
 
 	if err := session.Query("SELECT name FROM users WHERE id = ?", 950).
 		Scan(&name); err != gocql.ErrNotFound {

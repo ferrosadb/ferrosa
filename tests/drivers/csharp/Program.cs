@@ -504,17 +504,19 @@ class CqlSmokeTest
         Test("insert_with_ttl", () =>
         {
             session.Execute(
-                "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (300, 'TTLUser') USING TTL 1");
+                "INSERT INTO " + KEYSPACE + ".users (id, name) VALUES (300, 'TTLUser') USING TTL 2");
 
-            // Verify the row exists immediately
+            // Verify the row exists immediately. TTL expiry is whole-second, as in
+            // Cassandra: a TTL n row lives (n-1, n] seconds, so a TTL 1 row written
+            // late in a second can be gone a few ms later. TTL 2 guarantees > 1 s.
             var rs = session.Execute(
                 "SELECT name FROM " + KEYSPACE + ".users WHERE id = 300");
             var row = rs.FirstOrDefault();
             AssertTrue(row != null, "TTL row should exist immediately after insert");
             AssertEqual(row.GetValue<string>("name"), "TTLUser", "TTL row name");
 
-            // Wait for TTL to expire
-            Thread.Sleep(2000);
+            // Wait for TTL to expire (lifetime is at most 2 s)
+            Thread.Sleep(3000);
 
             // Verify the row is gone
             rs = session.Execute(

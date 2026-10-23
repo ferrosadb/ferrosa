@@ -507,5 +507,104 @@ async fn bt004_standalone_concurrent_sessions() {
     }
 }
 
+/// Whole seconds since the epoch: the clock TTL expiry is computed against.
+fn epoch_secs_and_millis() -> (u64, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before the epoch");
+    (now.as_secs(), now.subsec_millis())
+}
+
+/// Wait until the wall clock is at least `from_ms` into a second, so the next
+/// statement lands just before a second boundary. Bounded: at most ~1 s.
+async fn wait_until_late_in_a_second(from_ms: u32) -> u64 {
+    for _ in 0..1_100 {
+        let (secs, ms) = epoch_secs_and_millis();
+        if ms >= from_ms {
+            return secs;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    panic!("wall clock never reached {from_ms} ms into a second within 1.1 s");
+}
+
+/// Wait until the wall clock has moved past second `secs`.
+async fn wait_until_after_second(secs: u64) {
+    for _ in 0..1_100 {
+        if epoch_secs_and_millis().0 > secs {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    panic!("wall clock never left second {secs} within 1.1 s");
+}
+
+/// Reproduces the driver smoke failure "select right after insert: not found"
+/// (Go `TestInsertWithTTL`, CI run 40017365125) deterministically.
+///
+/// TTL expiry is whole-second, as in Cassandra: a write in second `W` with
+/// `USING TTL n` expires at `W + n`, and is dead once the clock's whole second
+/// reaches it (`now_secs >= local_deletion_time`; Cassandra's
+/// `ExpiringLivenessInfo.isLive` is `nowInSec < localExpirationTime`). So a
+/// `TTL 1` row lives anywhere in `(0, 1]` s, and one written late in a second
+/// is gone milliseconds later. That is the contract, not data loss: a driver
+/// test that reads a `TTL 1` row back "immediately" fails whenever its insert
+/// and read straddle a second boundary.
+#[tokio::test]
+async fn a_ttl_1_row_written_late_in_a_second_expires_at_the_next_boundary() {
+    let (mut client, _state, _dir) = boot_with_table().await;
+
+    let write_second = wait_until_late_in_a_second(900).await;
+    client
+        .query("INSERT INTO test_ks.users (id, name) VALUES ('ttl1', 'Ephemeral') USING TTL 1")
+        .await
+        .expect("INSERT USING TTL 1");
+    assert_eq!(
+        epoch_secs_and_millis().0,
+        write_second,
+        "the INSERT must complete inside the second it started in, or this \
+         test is not measuring the boundary"
+    );
+
+    wait_until_after_second(write_second).await;
+    let result = client
+        .query("SELECT name FROM test_ks.users WHERE id = 'ttl1'")
+        .await
+        .expect("SELECT");
+    assert!(
+        result.rows.is_empty(),
+        "a TTL 1 row written in second {write_second} must be expired once the \
+         clock reaches {}: got {} row(s)",
+        write_second + 1,
+        result.rows.len()
+    );
+}
+
+/// Positive control for the test above, and the guarantee the fixed driver
+/// tests rely on: a `TTL 2` row lives more than one second, so it is still
+/// readable after crossing a second boundary however late it was written.
+#[tokio::test]
+async fn a_ttl_2_row_written_late_in_a_second_survives_the_next_boundary() {
+    let (mut client, _state, _dir) = boot_with_table().await;
+
+    let write_second = wait_until_late_in_a_second(900).await;
+    client
+        .query("INSERT INTO test_ks.users (id, name) VALUES ('ttl2', 'Durable') USING TTL 2")
+        .await
+        .expect("INSERT USING TTL 2");
+
+    wait_until_after_second(write_second).await;
+    let result = client
+        .query("SELECT name FROM test_ks.users WHERE id = 'ttl2'")
+        .await
+        .expect("SELECT");
+    assert_eq!(result.rows.len(), 1, "the TTL 2 row must still be live");
+    let name_idx = column_index(&result, "name").expect("'name' column not found");
+    assert_eq!(
+        cell_as_str(&result.rows[0], name_idx).as_deref(),
+        Some("Durable")
+    );
+}
+
 #[path = "smoke/wiring.rs"]
 mod wiring;
