@@ -6459,3 +6459,153 @@ fn cross_dc_registry_holds_the_other_dcs_and_not_this_one() {
          treated as local everywhere else"
     );
 }
+
+/// 2026-10-23 nightly control-cluster roll: a node restarted with a persisted
+/// committed vote must not claim a live leader until that leader contacts it.
+mod raft_leader_liveness_after_restart {
+    use super::*;
+    use crate::raft::handlers::{LazyRaft, RaftAppendHandler};
+    use crate::raft::leader_contact::LeaderLiveness;
+    use crate::raft::log_store::SledLogStore;
+    use crate::raft::network::FerrosRaftNetworkFactory;
+    use crate::raft::state_machine::FerrosStateMachine;
+    use crate::raft::{FerrosRaft, FerrosRaftConfig};
+    use ferrosa_net::peer::{PeerEventListener, PeerManager};
+    use openraft::raft::AppendEntriesRequest;
+    use openraft::Vote;
+
+    struct NoopListener;
+    impl PeerEventListener for NoopListener {
+        fn on_peer_connected(&self, _peer: PeerId) {}
+        fn on_peer_disconnected(&self, _peer: PeerId) {}
+        fn on_peer_suspected(&self, _peer: PeerId) {}
+        fn on_peer_recovered(&self, _peer_id: Uuid) {}
+        fn on_peer_failed(&self, _peer_id: Uuid) {}
+    }
+
+    const LEADER: u64 = 99;
+    const TERM: u64 = 5;
+
+    /// A single Raft node over `raft_dir` with no reachable peers.
+    async fn raft_over(raft_dir: &std::path::Path) -> Arc<FerrosRaft> {
+        let config = Arc::new(
+            openraft::Config {
+                cluster_name: "liveness-after-restart".into(),
+                // This node must never start an election of its own: the test
+                // pins the vote it persisted, and a timer firing would replace it.
+                enable_elect: false,
+                ..Default::default()
+            }
+            .validate()
+            .expect("valid raft config"),
+        );
+        let peers = Arc::new(PeerManager::new(
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        let network = FerrosRaftNetworkFactory::new(
+            peers,
+            Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
+        );
+        let log_store = SledLogStore::new(raft_dir).expect("sled log store");
+        let raft = FerrosRaft::new(1, config, network, log_store, FerrosStateMachine::new())
+            .await
+            .expect("FerrosRaft::new");
+        Arc::new(raft)
+    }
+
+    fn heartbeat() -> AppendEntriesRequest<FerrosRaftConfig> {
+        AppendEntriesRequest {
+            vote: Vote::new_committed(TERM, LEADER),
+            prev_log_id: None,
+            entries: vec![],
+            leader_commit: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restarted_node_names_its_persisted_leader_but_is_not_live_until_contacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let raft_dir = dir.path().join("raft");
+
+        // Given a node that followed leader 99 at term 5, then stopped. openraft
+        // names only a voter as leader, so 99 must be in the membership.
+        let before = raft_over(&raft_dir).await;
+        let members: std::collections::BTreeMap<u64, openraft::BasicNode> = [1, LEADER]
+            .into_iter()
+            .map(|id| (id, openraft::BasicNode::default()))
+            .collect();
+        before
+            .initialize(members)
+            .await
+            .expect("initialize membership {1, 99}");
+        before
+            .append_entries(heartbeat())
+            .await
+            .expect("accepts the leader");
+        before.shutdown().await.expect("clean shutdown");
+        drop(before);
+
+        // When it restarts from the same disk,
+        let raft = raft_over(&raft_dir).await;
+        let controller = ModeController::standalone_for_test(
+            test_schema(),
+            test_storage(&dir.path().join("data")),
+        );
+
+        // then openraft names the persisted leader (what /readyz used to trust)
+        assert_eq!(
+            raft.current_leader().await,
+            Some(LEADER),
+            "persisted committed vote"
+        );
+        // but this process has no evidence that leader is alive.
+        assert_eq!(
+            controller.raft_leader_liveness(&raft),
+            LeaderLiveness::NoContactSinceStart
+        );
+
+        // Once the leader's AppendEntries arrives through the real handler,
+        let (tx, lazy) = LazyRaft::channel();
+        tx.send(Some(Arc::clone(&raft))).expect("publish raft");
+        let handler = RaftAppendHandler::new(lazy, controller.leader_contact());
+        let body = bytes::Bytes::from(bincode::serialize(&heartbeat()).unwrap());
+        let reply = handler
+            .handle(
+                (Uuid::new_v4(), "127.0.0.1:1".parse().unwrap()),
+                Message::RaftAppendEntries(body),
+            )
+            .await;
+        assert!(
+            matches!(reply, Some(Message::RaftAppendResponse(_))),
+            "{reply:?}"
+        );
+
+        // the leader is live.
+        assert_eq!(controller.raft_leader_liveness(&raft), LeaderLiveness::Live);
+        raft.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn single_voter_leader_is_live() {
+        // A one-voter group has no peer to ack it; its own ack must count, or a
+        // single-node Raft cluster would never answer ready.
+        let dir = tempfile::tempdir().unwrap();
+        let raft = raft_over(&dir.path().join("raft")).await;
+        let members: std::collections::BTreeMap<u64, openraft::BasicNode> =
+            [(1, openraft::BasicNode::default())].into_iter().collect();
+        raft.initialize(members).await.expect("initialize {1}");
+        raft.trigger().elect().await.expect("trigger election");
+        raft.wait(Some(std::time::Duration::from_secs(10)))
+            .current_leader(1, "single voter elects itself")
+            .await
+            .expect("node 1 becomes leader");
+        let controller = ModeController::standalone_for_test(
+            test_schema(),
+            test_storage(&dir.path().join("data")),
+        );
+        assert_eq!(controller.raft_leader_liveness(&raft), LeaderLiveness::Live);
+        raft.shutdown().await.expect("clean shutdown");
+    }
+}
