@@ -395,8 +395,9 @@ wait_for_cluster_mode() {
     local deadline=$((SECONDS + timeout)) last=""
     while (( SECONDS < deadline )); do
         last=$(cluster_status "$port" 2>/dev/null || true)
-        if grep -q '"mode":"cluster"' <<<"$last"; then
-            pass "$name in cluster mode"
+        if grep -q '"mode":"cluster"' <<<"$last" &&
+            grep -q '"ddl_path":"cluster"' <<<"$last"; then
+            pass "$name in cluster mode with Raft-backed DDL"
             return 0
         fi
         sleep 1

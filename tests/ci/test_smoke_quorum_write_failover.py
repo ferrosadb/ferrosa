@@ -293,5 +293,46 @@ sys.exit(0)
         self.assertIn("QUORUM", proc.stdout)
 
 
+class ClusterDdlReadinessTest(unittest.TestCase):
+    def _run(self, publish):
+        with tempfile.TemporaryDirectory() as directory:
+            counter = Path(directory) / "calls"
+            counter.write_text("0")
+            script = "\n".join([
+                "set -uo pipefail",
+                'fail() { echo "FAIL: $1"; exit 1; }',
+                'pass() { echo "PASS: $1"; }',
+                'sleep() { :; }',
+                r'''cluster_status() {
+    local count=$(< "$SMOKE_CLUSTER_STATE")
+    count=$((count + 1))
+    printf '%s' "$count" > "$SMOKE_CLUSTER_STATE"
+    local path=forming
+    if [ "$count" -eq 1 ]; then path=direct; fi
+    if [ "$SMOKE_CLUSTER_PUBLISH" = 1 ] && [ "$count" -ge 3 ]; then path=cluster; fi
+    printf '{"mode":"cluster","ddl_path":"%s"}' "$path"
+}''',
+                _bash_function(DOCKER_SMOKE.read_text(), "wait_for_cluster_mode"),
+                'wait_for_cluster_mode 9090 Node1 1',
+            ])
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=5,
+                env={**os.environ, "SMOKE_CLUSTER_STATE": str(counter),
+                     "SMOKE_CLUSTER_PUBLISH": "1" if publish else "0"},
+            )
+            return result, int(counter.read_text())
+
+    def test_mode_alone_does_not_finish_cluster_formation(self):
+        result, calls = self._run(publish=True)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(3, calls, "must observe Direct, Forming, then Cluster DDL")
+
+    def test_missing_cluster_ddl_fails_the_existing_bounded_wait(self):
+        result, calls = self._run(publish=False)
+        self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertGreater(calls, 0)
+        self.assertIn("FAIL", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

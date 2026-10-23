@@ -124,3 +124,19 @@ fixture to the shared helper left it unused on Linux and failed strict Clippy.
 The exact-source Linux lint guard reproduces the failure with the unconditional
 import. The full all-features test mirror requires Linux because its real-file
 `STATX_DIOALIGN` probe deliberately rejects other platforms.
+
+## DDL publication readiness race (`t_9a8b88de`)
+
+A node may know its live Raft leader before the asynchronous transition
+publishes Cluster DDL. Reporting ready in that interval allowed a successful
+local CREATE that never reached the other DC. `/readyz` now requires the
+published Cluster DDL path as well as live leadership, retaining existing
+`raft_leader` diagnostics when Raft itself is not live. A real elected Raft
+fixture checks Direct and Forming return 503 and the same node returns 200 only
+after Cluster publication. Cluster transition/admission is repaired in
+`ferrosa-cluster`; this does not repair previously divergent schema.
+
+The smoke harness also requires `ddl_path == "cluster"` inside its existing
+cluster-formation wait, so its one-shot CREATE cannot race publication.
+Behavioral shell regressions cover delayed and permanently missing publication
+without extending the wait or retrying writes.

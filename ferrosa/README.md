@@ -246,8 +246,20 @@ other processes' leases and can steal a temporarily unbound replica restart port
 The shared helper is exercised by both the collision/retry fixture and a
 port-band regression that checks the supplied allocator is honoured.
 
-The all-features CI mirror runs on Linux. It enables the real-file
-`STATX_DIOALIGN` probe, which deliberately fails on other host platforms.
+The all-features CI mirror runs on Linux as an unprivileged user. It enables
+the real-file `STATX_DIOALIGN` probe, which deliberately fails on other host
+platforms. Permission-failure fixtures require an unprivileged user because
+root can bypass their filesystem permission controls.
+
+Readiness also waits for the Raft-backed DDL path after leader election. A
+live leader alone cannot make `/readyz` succeed while DDL remains Direct or
+Forming; the response names `ddl_path` as the missing condition. Declared
+cluster admission refuses clients until that path is published. The smoke
+harness waits for the same published path before its single-attempt cluster DDL.
+
+The graph scale/heal fixture reserves all nextest runner slots while it runs,
+keeping other tests out of its two-second production commit-log admission
+budget. Its workload, assertions and deadlines are unchanged.
 
 ## Specs
 
