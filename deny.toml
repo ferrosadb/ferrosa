@@ -14,9 +14,10 @@
 # tracks removing it — never silence the whole check.
 yanked = "deny"
 ignore = [
-    # quick-xml 0.37 via object_store 0.11 (the S3 client). The fixed quick-xml
-    # (>= 0.41) needs object_store 0.14, a trait redesign of ThrottledStore and
-    # StatsStore; reachable only through XML from the configured S3 endpoint.
+    # quick-xml 0.37 via object_store 0.11 (the S3 client). Reachable only
+    # through object_store's XML parsing of responses from the operator-configured
+    # S3/R2 endpoint. The fix needs object_store >= 0.14, a trait redesign of
+    # ThrottledStore and StatsStore, tracked as t_573d5dfe for the next release.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.37 pinned by object_store 0.11; migration is t_573d5dfe" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.37 pinned by object_store 0.11; migration is t_573d5dfe" },
     # Marvin timing attack in rsa: no patched release exists. Only the
@@ -71,7 +72,12 @@ allow = [
     # workspace, which is never shipped.
     "NCSA",
 ]
-exceptions = []
+exceptions = [
+    # inferno (CDDL-1.0, weak copyleft) renders the debug flamegraph endpoint
+    # (ferrosa/src/web/debug.rs). It is used unmodified, as a library; CDDL is
+    # allowed for this one crate only, never globally.
+    { crate = "inferno", allow = ["CDDL-1.0"] },
+]
 
 # First-party crates that are never published carry no meaningful license
 # decision for this check. Third-party licences are still enforced.
