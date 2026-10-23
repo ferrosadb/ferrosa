@@ -72,3 +72,22 @@ cannot fall through to node-wide cancellation. The route is POST-only and remain
 behind the shared admin/operator authentication middleware. Tests exercise real
 queued compactions on two tables and verify selected cancellation preserves inputs.
 | FE-OUT-F3 (outage 2026-10-10) | **A node exited with no final log line.** The log writer is `tracing_appender::non_blocking`; `process::exit` (16 sites) and the supervisor's `abort()` skip the guard that drains it, a panic went to stderr only, and SIGTERM was not named. | Operators could not tell a crash from a kill; node2 died at 16:55 with nothing in its log. | 7 | 5 | 9 | 315 → 35 | **Fixed:** `lifecycle.rs` (see README). Tests: `tests/last_line.rs` runs the binary: `panic_on_any_thread_writes_a_final_log_line`, `fatal_exit_flushes_and_logs_reason` (all 20,000 queued lines must survive the exit with the writer slowed to 100 us/line; `WorkerGuard::drop` alone kept 5,166 in isolation and ~209 under full-workspace load, so the exit counts both ends of the writer and waits up to 30 s, logging any shortfall), `sigterm_logs_the_signal_name` (`received SIGTERM`, last line `ferrosa exiting code=0 reason=shutdown after SIGTERM`); each red on origin/main and red again with its guard removed. Residual: SIGKILL and OOM kills still leave no line (nothing can), and a panic hook cannot help a process killed while the hook runs. |
+
+### Resolved test-harness bind failures from descriptor inheritance (2026-10-23)
+
+`kernel_ephemeral_floor` launched macOS `sysctl` for every allocation. A helper
+process could temporarily retain a sibling thread's listener across its close,
+so `a_port_handed_out_is_never_probed_by_a_sibling_allocation` reported a bind
+collision even with its allocator scan removed. Five unchanged runs and five
+query-only diagnosis controls failed. The helper now caches the host range and
+initializes it before `port_is_free` creates a transient listener. The listener
+squatter fixture also joins the existing fork-serialization group: its
+probe/drop/rebind setup cannot overlap the process-spawning guards.
+
+The new fresh-process query observer uses the real platform `sysctl` and checks
+both floor/port values and query counts. Restoring the uncached reader fails the
+original bind guard and query guard in five of five controls; removing pre-probe
+initialization fails the observer's initialization assertion. No exclusion
+assertions, retries, or timeout budgets were relaxed. This repair is test support
+only; application startup and listener behavior are unchanged. See Forge
+`t_f961615a`; the broader pre-taken-slice fixture issue remains on `t_97fb1f1c`.

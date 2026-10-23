@@ -99,6 +99,7 @@ fn every_port_handed_to_a_node_is_below_the_kernel_ephemeral_floor() {
 }
 
 #[test]
+#[serial_test::serial(port_band_forks)]
 fn a_port_a_listener_already_holds_is_never_handed_to_a_node() {
     // Order-independent: pick a band port that this process has not already
     // been given and that nothing is listening on, so the squatter below — not
@@ -117,6 +118,8 @@ fn a_port_a_listener_already_holds_is_never_handed_to_a_node() {
             false
         })
         .expect("a free, unreserved port in the band");
+    // Keep this probe/drop/rebind setup out of sibling process launches: a fork
+    // can briefly retain the just-dropped probe in its child until exec.
     let squatter = std::net::TcpListener::bind(("127.0.0.1", port)).expect("squat a band port");
     // Release the claim only once the squatter holds the port: from here on the
     // allocator must skip it because it is LISTENED on, not because it is ours.
@@ -246,6 +249,85 @@ fn port_band_process_probe() {
     let _ = std::io::stdin().read_line(&mut release);
 }
 
+/// RED with the uncached reader restored: at least 18 sysctl launches instead of one
+/// across an initial probe, an explicit floor read and eight allocations. Removing
+/// initialization from `port_is_free` instead fails the child's pre-probe check.
+/// Each launch can briefly inherit a sibling listener; reservation alone cannot
+/// prevent that bind failure.
+#[cfg(target_os = "macos")]
+#[test]
+#[serial_test::serial(port_band_forks)]
+fn port_probes_and_allocations_query_kernel_configuration_once() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let actual = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", "net.inet.ip.portrange.first"])
+        .output()
+        .expect("query the real macOS floor");
+    assert!(actual.status.success());
+    let expected_floor: u16 = String::from_utf8(actual.stdout)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let queries = dir.path().join("queries");
+    let observer = dir.path().join("sysctl");
+    // Preserve sysctl's actual arguments/output; observe launches, not a guessed
+    // replacement value. Only the child gets this PATH, so other tests cannot
+    // see the observer or race an environment mutation.
+    std::fs::write(
+        &observer,
+        "#!/bin/sh\nprintf 'query\\n' >> \"$FERROSA_PORT_BAND_QUERY_LOG\"\nexec /usr/sbin/sysctl \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&observer, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![dir.path().to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "port_band_kernel_query_probe", "--nocapture"])
+        .env("FERROSA_PORT_BAND_QUERY_PROBE", "1")
+        .env("FERROSA_PORT_BAND_QUERY_LOG", &queries)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "{child:?}");
+    let stdout = String::from_utf8(child.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!("PROBE_FLOOR={expected_floor}")),
+        "{stdout}"
+    );
+    let queries = std::fs::read_to_string(queries).expect("the observer must have run");
+    assert_eq!(
+        queries.lines().count(),
+        1,
+        "allocating more ports spawned additional sysctl helpers after the floor was known"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn port_band_kernel_query_probe() {
+    if std::env::var_os("FERROSA_PORT_BAND_QUERY_PROBE").is_none() {
+        return;
+    }
+    assert!(port_is_free(0));
+    let queries =
+        std::path::PathBuf::from(std::env::var_os("FERROSA_PORT_BAND_QUERY_LOG").unwrap());
+    assert!(
+        queries.exists(),
+        "a temporary port probe returned before kernel configuration was initialized"
+    );
+    let floor = kernel_ephemeral_floor();
+    let mut allocator = PortAllocator::new();
+    let ports: HashSet<_> = (0..8).map(|_| allocator.get()).collect();
+    assert_eq!(ports.len(), 8);
+    assert!(ports.iter().all(|&port| port < floor));
+    println!("PROBE_FLOOR={floor}");
+}
+
 #[test]
 fn two_tests_in_one_process_are_never_handed_the_same_port() {
     let mut first = PortAllocator::new();
@@ -279,6 +361,9 @@ fn two_tests_in_one_process_are_never_handed_the_same_port() {
 /// the owner holds its listener inherits that socket until it `exec`s, so the
 /// owner's next bind fails with no other `bind` anywhere. That is fork's fd
 /// inheritance, not a probe, and the two must not overlap for this to measure.
+/// The kernel-range helper must also initialize before any transient probe and
+/// reuse its result: repeated macOS sysctl launches reproduced this failure even
+/// with the scanner's allocator call removed (five of five diagnosis controls).
 #[test]
 #[serial_test::serial(port_band_forks)]
 fn a_port_handed_out_is_never_probed_by_a_sibling_allocation() {

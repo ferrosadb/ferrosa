@@ -230,6 +230,16 @@ seconds later, never reports ready, and the harness reads the readiness timeout 
 a product failure. Keep harness ports, and every published host port (a `docker
 compose` mapping, a Jepsen topology), below that floor.
 
+The helper reads kernel range configuration once per test process, before any
+transient port probe. This matters on macOS: repeated `sysctl` helpers can
+briefly inherit a listener another thread has just closed and make its next
+bind fail. The port-band tests keep probe/drop/rebind fixtures in the existing
+`port_band_forks` group with process-spawning tests; the scanner threads inside
+the bind-exclusion guard remain concurrent. A fresh-process observer delegates
+to the real `sysctl`, checks the returned floor and distinct ports, and requires
+one query across the initial probe and repeated allocations. Port-exclusion
+assertions and the below-ephemeral-range checks remain unchanged.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — composition-root model

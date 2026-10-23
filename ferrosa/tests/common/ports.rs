@@ -169,7 +169,17 @@ fn claim_slice_lease() -> Option<u16> {
 ///
 /// A listening port must be BELOW this to be safe on both platforms, so we read
 /// the platform's own value rather than assuming one.
+///
+/// The range is host configuration for the lifetime of a test process. Read it
+/// once, before handing out the first port. Re-running `sysctl` during a sibling
+/// listener's bind/drop loop can briefly inherit its descriptor into the helper
+/// process, keeping the port occupied even though no allocator probes it.
 pub fn kernel_ephemeral_floor() -> u16 {
+    static FLOOR: OnceLock<u16> = OnceLock::new();
+    *FLOOR.get_or_init(read_kernel_ephemeral_floor)
+}
+
+fn read_kernel_ephemeral_floor() -> u16 {
     if let Ok(text) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
         if let Some(first) = text.split_whitespace().next() {
             if let Ok(floor) = first.parse::<u16>() {
@@ -199,6 +209,9 @@ pub fn kernel_ephemeral_floor() -> u16 {
 /// BEFORE calling this, so the probe never lands on a port another test thread
 /// has been handed.
 pub fn port_is_free(port: u16) -> bool {
+    // Complete the one-time host query before creating a transient listener.
+    // A concurrent initializer may launch sysctl and inherit open descriptors.
+    let _ = kernel_ephemeral_floor();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     match std::net::TcpListener::bind(addr) {
         Ok(listener) => {
