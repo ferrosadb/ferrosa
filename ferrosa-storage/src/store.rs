@@ -1047,7 +1047,7 @@ fn upgrade_fti_sidecar(path: &std::path::Path, gen: &str, index_name: &str) -> R
     let written = std::fs::copy(path, &tmp).and_then(|_| {
         let mut file = std::fs::OpenOptions::new().append(true).open(&tmp)?;
         file.write_all(&tail)?;
-        file.sync_all()
+        ferrosa_common::durable_sync::sync_all(&file)
     });
     if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
         if let Err(cleanup) = std::fs::remove_file(&tmp) {

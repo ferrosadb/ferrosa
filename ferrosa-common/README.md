@@ -88,6 +88,16 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   `PRIMARY KEY`, where a time-ordered globally-unique row key is required. The
   layout is bytes-only and takes no clock of its own, so callers own uniqueness.
   See [Reserved `_sys_` columns](#reserved-_sys_-columns).
+- **Durable sync** — `durable_sync`: the one place the workspace makes a file
+  durable (`sync_all`, `sync_data`, `sync_dir`, `sync_with`). On macOS the
+  process-wide `SyncMode` (`[storage] fsync_mode` / `FERROSA_FSYNC_MODE`,
+  installed once at startup by the `ferrosa` binary) picks `fsync(2)`
+  (default), `F_BARRIERFSYNC` or `F_FULLFSYNC`; on Linux every mode issues the
+  `fsync`/`fdatasync` std always did. The two weaker modes survive a process
+  or OS crash but not a sudden power loss on macOS; the module docs carry the
+  table. Every call is counted (`ferrosa_durable_syncs_total{call}`), and
+  `clippy.toml` refuses a direct `File::sync_all`/`sync_data` anywhere in the
+  workspace, because on Apple targets those are always `F_FULLFSYNC`.
 - **Test generators** — behind the `test-generators` feature: proptest
   strategies (`arb_cell_value`, `arb_cell`, `arb_partition_key`,
   `arb_decorated_key`) shared across crates, plus shrink-friendly generated
@@ -97,7 +107,7 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 ## How it works
 
 One module per concern; all are pure data + small methods with no I/O except the
-HLC reading the system clock:
+HLC reading the system clock and `durable_sync` issuing the sync system call:
 
 - **`cancel`** — `CancelToken`/`CancelReason`/`Cancelled`, the shared
   cancellation primitive (a single shared `Arc<Inner>`; `cancel()` is
@@ -157,6 +167,7 @@ back:
 | TimeUUID keys | `timeuuid::v1_timeuuid`, `timeuuid::SYNTHETIC_KEY_COLUMN`, `timeuuid::is_reserved_column_name`, `timeuuid::UUID_EPOCH_OFFSET` |
 | Spawning | `TaskPool` |
 | Cancellation | `CancelToken`, `CancelReason`, `Cancelled` |
+| Durability | `durable_sync::{sync_all, sync_data, sync_dir, sync_with, SyncMode, install_process_mode, process_mode}` |
 
 ## Dependencies
 
@@ -167,7 +178,8 @@ back:
   shared types (`CqlType`/`CqlValue`, `TableSchema`) can be reused without
   pulling in `ferrosa-cql`. External deps only: `num-bigint`, `serde`, `uuid`,
   `tokio` (rt), `crossbeam-channel` (T-021, `CancelToken`'s `closed()` channel),
-  and `proptest` (optional, `test-generators`).
+  `libc` (Apple targets only, `durable_sync`'s `fcntl` calls), and `proptest`
+  (optional, `test-generators`).
 
 **Called by** (crates that depend on this — essentially every crate):
 

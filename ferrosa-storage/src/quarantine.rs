@@ -191,7 +191,7 @@ impl QuarantineWriter {
             .map_err(|e| Error::InvalidData(format!("quarantine: write: {e}")))?;
         file.write_all(b"\n")
             .map_err(|e| Error::InvalidData(format!("quarantine: write: {e}")))?;
-        file.sync_data()
+        ferrosa_common::durable_sync::sync_data(&file)
             .map_err(|e| Error::InvalidData(format!("quarantine: sync: {e}")))?;
 
         FLUSH_QUARANTINED_ROWS_TOTAL.fetch_add(1, Ordering::Relaxed);

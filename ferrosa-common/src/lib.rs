@@ -23,6 +23,7 @@ pub mod complex_cell;
 pub mod cql_type;
 pub mod data_type;
 pub mod deployment_mode;
+pub mod durable_sync;
 pub mod error;
 pub mod geometry;
 pub mod key;

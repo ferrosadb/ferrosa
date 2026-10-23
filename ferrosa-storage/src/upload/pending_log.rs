@@ -72,7 +72,7 @@ impl PendingUploadsLog {
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         file.write_all(encoded.as_bytes())?;
         file.flush()?;
-        file.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&file)?;
         crate::metrics::observe_upload_phase(
             crate::metrics::UploadPhase::PendingLogAdd,
             start.elapsed(),
@@ -102,7 +102,7 @@ impl PendingUploadsLog {
         let mut file = OpenOptions::new().append(true).open(&self.path)?;
         file.write_all(encoded.as_bytes())?;
         file.flush()?;
-        file.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&file)?;
         crate::metrics::observe_upload_phase(
             crate::metrics::UploadPhase::PendingLogCompactionAdd,
             start.elapsed(),
@@ -131,7 +131,7 @@ impl PendingUploadsLog {
             }
         }
         file.flush()?;
-        file.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&file)?;
         crate::metrics::observe_upload_phase(
             crate::metrics::UploadPhase::PendingLogRemove,
             start.elapsed(),

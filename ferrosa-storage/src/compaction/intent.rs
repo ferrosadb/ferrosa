@@ -122,7 +122,7 @@ impl CompactionIntentRecord {
             let mut file = std::fs::File::create(&tmp)?;
             file.write_all(&json)?;
             file.flush()?;
-            file.sync_all()?;
+            ferrosa_common::durable_sync::sync_all(&file)?;
         }
         let path = Self::path(table_dir, &self.task_id);
         std::fs::rename(&tmp, &path)?;

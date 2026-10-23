@@ -179,6 +179,30 @@ fn config_val_opt(env_key: &str, config: &toml::Value, section: &str, key: &str)
         .or_else(|| std::env::var(env_key).ok())
 }
 
+/// Resolve the process-wide durability sync mode: `[storage] fsync_mode`
+/// (TOML) overrides `FERROSA_FSYNC_MODE` (`env`), which overrides the default,
+/// plain `fsync(2)`. Same TOML-wins precedence as [`config_val`]. A value that
+/// does not parse stops startup, naming where it came from: a durability
+/// setting that was asked for and silently not applied is worse than none.
+/// See `ferrosa_common::durable_sync` for what each mode costs.
+fn resolve_fsync_mode(
+    config: &toml::Value,
+    env: Option<&str>,
+) -> Result<ferrosa_common::durable_sync::SyncMode, String> {
+    use ferrosa_common::durable_sync::{SyncMode, ENV};
+    let from_toml = config.get("storage").and_then(|s| s.get("fsync_mode"));
+    match (from_toml, env) {
+        (Some(value), _) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| format!("[storage] fsync_mode must be a string, got {value}"))?;
+            SyncMode::parse(raw).map_err(|e| format!("[storage] fsync_mode: {e}"))
+        }
+        (None, Some(raw)) => SyncMode::parse(raw).map_err(|e| format!("{ENV}: {e}")),
+        (None, None) => Ok(SyncMode::default()),
+    }
+}
+
 /// Resolve a positive-`usize` CQL server limit. `[cql] <key>` (TOML) overrides
 /// `env_key`, which overrides `default` -- same TOML-wins precedence as
 /// [`config_val`].
@@ -2101,6 +2125,27 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     let file_config = load_config(&config_path)?;
     if std::path::Path::new(&config_path).exists() {
         tracing::info!(path = %config_path, "loaded config file");
+    }
+
+    // 1c. Durability sync mode, installed before anything opens a data file:
+    // every sync in the process reads it (`ferrosa_common::durable_sync`).
+    let fsync_env = std::env::var(ferrosa_common::durable_sync::ENV).ok();
+    let fsync_mode = resolve_fsync_mode(&file_config, fsync_env.as_deref())
+        .and_then(|mode| ferrosa_common::durable_sync::install_process_mode(mode).map(|()| mode))
+        .map_err(|e| format!("fsync mode: {e}"))?;
+    if fsync_mode.survives_power_loss() {
+        tracing::info!(
+            fsync_mode = fsync_mode.name(),
+            durability = fsync_mode.durability(),
+            "durable sync mode"
+        );
+    } else {
+        tracing::warn!(
+            fsync_mode = fsync_mode.name(),
+            durability = fsync_mode.durability(),
+            "durable sync mode is NOT power-loss durable on this platform; set \
+             [storage] fsync_mode = \"full\" (or FERROSA_FSYNC_MODE=full) where that matters"
+        );
     }
 
     // 2. Load/generate host_id
@@ -4801,6 +4846,44 @@ mod tests {
         assert_eq!(result, "/data/ferrosa");
 
         std::env::remove_var(key);
+    }
+
+    fn fsync_config(mode: &str) -> toml::Value {
+        toml::from_str(&format!("[storage]\nfsync_mode = \"{mode}\"\n")).unwrap()
+    }
+
+    #[test]
+    fn fsync_mode_defaults_to_plain_fsync_when_neither_source_sets_it() {
+        use ferrosa_common::durable_sync::SyncMode;
+        assert_eq!(
+            resolve_fsync_mode(&empty_config(), None),
+            Ok(SyncMode::Fsync)
+        );
+    }
+
+    #[test]
+    fn fsync_mode_reads_toml_then_env_and_toml_wins() {
+        use ferrosa_common::durable_sync::SyncMode;
+        assert_eq!(
+            resolve_fsync_mode(&fsync_config("full"), None),
+            Ok(SyncMode::Full)
+        );
+        assert_eq!(
+            resolve_fsync_mode(&empty_config(), Some("barrier")),
+            Ok(SyncMode::Barrier)
+        );
+        assert_eq!(
+            resolve_fsync_mode(&fsync_config("full"), Some("fsync")),
+            Ok(SyncMode::Full)
+        );
+    }
+
+    #[test]
+    fn an_unknown_fsync_mode_is_a_startup_error_naming_its_source() {
+        let err = resolve_fsync_mode(&fsync_config("fast"), None).unwrap_err();
+        assert!(err.contains("[storage] fsync_mode"), "{err}");
+        let err = resolve_fsync_mode(&empty_config(), Some("fast")).unwrap_err();
+        assert!(err.contains("FERROSA_FSYNC_MODE"), "{err}");
     }
 
     #[test]

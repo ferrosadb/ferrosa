@@ -20,6 +20,7 @@ pub mod cache;
 pub mod commitlog;
 pub mod compaction;
 pub mod data_store;
+pub(crate) mod durable;
 pub mod engine;
 pub(crate) mod evicted_read;
 pub mod eviction_audit;

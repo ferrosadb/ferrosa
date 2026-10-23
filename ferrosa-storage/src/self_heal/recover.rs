@@ -113,7 +113,7 @@ fn stamp() -> u128 {
 }
 
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    std::fs::File::open(dir)?.sync_all()
+    ferrosa_common::durable_sync::sync_all(&std::fs::File::open(dir)?)
 }
 
 impl StorageEngine {

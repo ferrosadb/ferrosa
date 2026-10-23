@@ -339,7 +339,7 @@ impl EvictionAudit {
         file.set_len(inner.last_line_start)?;
         file.seek(SeekFrom::Start(inner.last_line_start))?;
         file.write_all(line)?;
-        file.sync_data()?;
+        ferrosa_common::durable_sync::sync_data(&file)?;
         inner.current_len = inner.last_line_start + line.len() as u64;
         inner.last = Some(merged);
         Ok(())
@@ -360,7 +360,7 @@ impl EvictionAudit {
             .append(true)
             .open(self.config.dir.join(CURRENT))?;
         file.write_all(&line)?;
-        file.sync_data()?;
+        ferrosa_common::durable_sync::sync_data(&file)?;
         inner.last_line_start = inner.current_len;
         inner.current_len += line.len() as u64;
         inner.last = Some(record);

@@ -171,7 +171,7 @@ impl SchemaSnapshotStore {
             serde_json::to_writer_pretty(&mut writer, &SnapshotDocumentRef::new(snapshot))
                 .map_err(json_error("serialize staged schema snapshot"))?;
             writer.flush()?;
-            writer.get_ref().inner.sync_all()?;
+            ferrosa_common::durable_sync::sync_all(&writer.get_ref().inner)?;
         }
         crash_at(crash, CrashPoint::StageSynced)?;
 
@@ -299,7 +299,7 @@ impl SchemaSnapshotStore {
     }
 
     fn sync_directory(&self) -> Result<()> {
-        File::open(&self.data_dir)?.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&File::open(&self.data_dir)?)?;
         Ok(())
     }
 
@@ -354,12 +354,12 @@ pub fn persist_bounded_json<T: Serialize>(
         serde_json::to_writer_pretty(&mut writer, value)
             .map_err(json_error("serialize storage schema"))?;
         writer.flush()?;
-        writer.get_ref().inner.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&writer.get_ref().inner)?;
     }
 
     let _: IgnoredAny = deserialize_bounded(&stage, DEFAULT_MAX_BYTES)?;
     std::fs::rename(&stage, data_dir.join(filename))?;
-    File::open(data_dir)?.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&File::open(data_dir)?)?;
     FileExt::unlock(&lock)?;
     Ok(())
 }

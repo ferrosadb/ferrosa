@@ -2349,6 +2349,7 @@ version = "0.27.0"
 dependencies = [
  "crossbeam-channel",
  "ferrosa-jsonb",
+ "libc",
  "num-bigint",
  "proptest",
  "serde",

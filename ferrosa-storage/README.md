@@ -84,18 +84,23 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   idle wait, so a `stop()` that lands between the loop's own check and the
   wait is never lost (FMEA ST-90; it used to leave `stop()` in `join()` for
   the whole idle interval).
-  **The sync call is a runtime setting** (FMEA ST-87):
-  `FERROSA_COMMITLOG_SYNC_MODE` = `full` (default, `F_FULLFSYNC`, power-loss
-  durable) | `barrier` (`F_BARRIERFSYNC`) | `fsync` (`fsync(2)`). The weaker
-  two survive a process crash and a kernel panic but not a power loss on
-  macOS; on Linux every mode is `fdatasync`. An unknown value stops startup;
-  the mode is logged when the commit log opens (a weaker one at WARN) and
-  `ferrosa_commitlog_syncs_by_mode_total{mode}` counts the calls actually
-  issued. The old `macos-standard-sync` cargo feature is gone: it used
-  `File::sync_data`, which Rust implements as `F_FULLFSYNC` on Apple targets,
-  so it never changed anything. For the same reason every other
-  `sync_all`/`sync_data` in this crate (flush, checkpoint, compaction intent,
-  eviction marker) is already `F_FULLFSYNC` on macOS.
+  **The sync call is a runtime setting** (FMEA ST-87, ST-92): the
+  process-wide `[storage] fsync_mode` / `FERROSA_FSYNC_MODE` = `fsync`
+  (default, `fsync(2)`) | `barrier` (`F_BARRIERFSYNC`) | `full`
+  (`F_FULLFSYNC`, power-loss durable), with `FERROSA_COMMITLOG_SYNC_MODE`
+  overriding it for the commit log alone. The two weaker modes survive a
+  process crash and an OS crash but not a power loss on macOS; on Linux
+  every mode issues exactly the `fsync`/`fdatasync` it always did. An unknown
+  value stops startup; the mode is logged at startup and when the commit log
+  opens (a weaker one at WARN), and `ferrosa_durable_syncs_total{call}` /
+  `ferrosa_commitlog_syncs_by_mode_total{mode}` count the calls actually
+  issued. **Every** durability sync in this crate (flush, checkpoint,
+  compaction intent, eviction marker, schema snapshot, upload log, restore)
+  goes through `ferrosa_common::durable_sync`; `clippy.toml` refuses a direct
+  `File::sync_all`/`sync_data`, which Rust implements as `F_FULLFSYNC` on
+  Apple targets whatever was configured. Async call sites use
+  `durable::sync_tokio_file`, which syncs a duplicate descriptor on the
+  blocking pool as tokio itself does.
 - **Flush** (`flush.rs`, `store.rs`) — `TableStore` composes active/flushing
   memtables + SSTable descriptors behind a single `ArcSwap<StoreView>`, and
   every view change is a compare-and-swap derived from the current view.

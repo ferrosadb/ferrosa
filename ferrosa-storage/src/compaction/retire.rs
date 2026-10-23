@@ -47,7 +47,7 @@ fn clear_eviction_marker(root: &Path, generation: &str) -> io::Result<()> {
 }
 
 fn sync_directory(path: &Path) -> io::Result<()> {
-    std::fs::File::open(path)?.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&std::fs::File::open(path)?)?;
     #[cfg(test)]
     crate::flush::fsync_probe::note_dir(path);
     Ok(())

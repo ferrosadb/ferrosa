@@ -187,14 +187,16 @@ pub(super) fn publish_atomically(
     {
         let mut file = fs::File::create(tmp_path)?;
         file.write_all(bytes)?;
-        file.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&file)?;
     }
     fs::rename(tmp_path, final_path)?;
     if let Some(parent) = final_path.parent() {
         // Best effort, and said out loud: the data is already published and
         // readable; only its survival of a power cut is at stake, and failing
         // the save here would make a durability hint look like a lost write.
-        if let Err(e) = fs::File::open(parent).and_then(|d| d.sync_all()) {
+        if let Err(e) =
+            fs::File::open(parent).and_then(|d| ferrosa_common::durable_sync::sync_all(&d))
+        {
             tracing::warn!(
                 directory = %parent.display(),
                 error = %e,

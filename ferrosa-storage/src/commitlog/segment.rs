@@ -178,47 +178,11 @@ pub(crate) fn syncs_issued(mode: CommitLogSyncMode) -> u64 {
     SYNCS_BY_MODE[mode_index(mode)].load(Ordering::Relaxed)
 }
 
-/// An interrupted sync is reissued, as `std` does for `sync_all`. The bound
-/// only stops a signal storm from spinning forever; it then fails loudly.
-#[cfg(target_vendor = "apple")]
-const MAX_EINTR_RETRIES: usize = 64;
-
-#[cfg(target_vendor = "apple")]
-fn apple_sync(file: &fs::File, mode: CommitLogSyncMode) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let fd = file.as_raw_fd();
-    for _ in 0..MAX_EINTR_RETRIES {
-        // SAFETY: `fd` is owned by `file`, which outlives the call; none of
-        // these calls reads or writes memory through a pointer.
-        let rc = unsafe {
-            match mode {
-                CommitLogSyncMode::Full => libc::fcntl(fd, libc::F_FULLFSYNC),
-                CommitLogSyncMode::Barrier => libc::fcntl(fd, libc::F_BARRIERFSYNC),
-                // `File::sync_data` would be F_FULLFSYNC on Apple targets.
-                CommitLogSyncMode::Fsync => libc::fsync(fd),
-            }
-        };
-        if rc != -1 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.kind() != std::io::ErrorKind::Interrupted {
-            return Err(err);
-        }
-    }
-    Err(std::io::Error::other(format!(
-        "commit-log {} sync interrupted {MAX_EINTR_RETRIES} times in a row",
-        mode.name()
-    )))
-}
-
-/// Makes `file` durable in `mode`. On non-Apple targets every mode is
+/// Makes `file` durable in `mode` through the workspace's one sync helper
+/// (`ferrosa_common::durable_sync`). On non-Apple targets every mode is
 /// `fdatasync`, which already flushes the device cache there.
 fn sync_file(file: &fs::File, mode: CommitLogSyncMode) -> ferrosa_common::Result<()> {
-    #[cfg(target_vendor = "apple")]
-    apple_sync(file, mode)?;
-    #[cfg(not(target_vendor = "apple"))]
-    file.sync_data()?;
+    ferrosa_common::durable_sync::sync_with(file, mode, ferrosa_common::durable_sync::Scope::Data)?;
     SYNCS_BY_MODE[mode_index(mode)].fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
@@ -251,7 +215,8 @@ fn repair_marker_in_place(
 /// A failure is returned, never retried another way. This used to fall back
 /// from `F_FULLFSYNC` to `sync_all` on error, but `sync_all` is itself
 /// `F_FULLFSYNC` on Apple targets: the fallback reissued the same call and
-/// discarded the first error without a trace.
+/// discarded the first error without a trace. On Linux this is now
+/// `fdatasync` on the directory, as it was before the shared helper.
 fn sync_parent_dir(path: &Path, mode: CommitLogSyncMode) -> ferrosa_common::Result<()> {
     if let Some(parent) = path.parent() {
         let dir = fs::File::open(parent)?;
@@ -397,9 +362,9 @@ impl Segment {
     ///
     /// The buffer is pre-allocated and zeroed. The 17-byte header is written
     /// immediately, followed by an 8-byte sync marker (all zeros = EOF marker).
-    /// Syncs use the default, power-loss durable [`CommitLogSyncMode::Full`].
+    /// Syncs use the process-wide mode (`ferrosa_common::durable_sync`).
     pub fn new(id: u64, size: usize, dir: &Path) -> Self {
-        Self::with_sync_mode(id, size, dir, CommitLogSyncMode::default())
+        Self::with_sync_mode(id, size, dir, ferrosa_common::durable_sync::process_mode())
     }
 
     /// Like [`new`](Self::new), syncing in `sync_mode`.
@@ -1253,11 +1218,11 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_made_without_a_mode_uses_the_durable_default() {
+    fn a_segment_made_without_a_mode_uses_the_process_wide_mode() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
             Segment::new(1, 4096, dir.path()).sync_mode(),
-            CommitLogSyncMode::Full
+            ferrosa_common::durable_sync::process_mode()
         );
     }
 

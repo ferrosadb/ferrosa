@@ -260,7 +260,7 @@ fn sync_parent_dir(path: &Path) -> IndexResult<()> {
     let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) else {
         return Ok(());
     };
-    std::fs::File::open(dir)?.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&std::fs::File::open(dir)?)?;
     Ok(())
 }
 
@@ -373,7 +373,7 @@ impl V2Sink {
         let mut file = body.into_inner().map_err(|error| error.into_error())?;
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header_bytes(SIDECAR_VERSION, count))?;
-        file.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&file)?;
         Ok(count)
     }
 }

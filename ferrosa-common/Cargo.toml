@@ -21,6 +21,11 @@ serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["rt"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# `durable_sync` issues F_FULLFSYNC / F_BARRIERFSYNC / fsync(2) itself on Apple
+# targets, because `File::sync_all` and `sync_data` are both F_FULLFSYNC there.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 [features]
 test-generators = ["proptest"]
 # Installs a counting global allocator in the `ferrosa` binary and feeds

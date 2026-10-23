@@ -568,12 +568,12 @@ pub(crate) fn fadvise_dontneed(file: &File) {
 }
 
 /// Durable data sync (metadata sync of length is covered by the extra sync after
-/// `set_len`). Kept simple — the platform `F_FULLFSYNC` nuance already lives in
-/// the commit-log path; SSTable output is fsynced then published, and a lost
+/// `set_len`). The platform call follows `[storage] fsync_mode`
+/// (`ferrosa_common::durable_sync`); SSTable output is fsynced then published, and a lost
 /// just-written SSTable is re-derivable from the memtable/commit log.
 /// `pub(crate)` so `pump::FileSink` (T-032) can call it from its own `sync_data`.
 pub(crate) fn sync_data(file: &File) -> Result<()> {
-    file.sync_data()?;
+    ferrosa_common::durable_sync::sync_data(file)?;
     Ok(())
 }
 

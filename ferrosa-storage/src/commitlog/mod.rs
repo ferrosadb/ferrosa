@@ -514,8 +514,8 @@ impl CommitLog {
             tracing::warn!(
                 sync_mode = mode.name(),
                 durability = mode.durability(),
-                env = config::CommitLogSyncMode::ENV,
-                "commit log: sync mode is NOT power-loss durable on macOS; chosen explicitly"
+                env = config::COMMITLOG_SYNC_MODE_ENV,
+                "commit log: sync mode is NOT power-loss durable on macOS; set [storage] fsync_mode = \"full\" where that matters"
             );
         }
 
@@ -2700,7 +2700,7 @@ mod tests {
         {
             let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             f.write_all_at(&[sentinel], SENTINEL_OFFSET as u64).unwrap();
-            f.sync_all().unwrap();
+            ferrosa_common::durable_sync::sync_all(&f).unwrap();
         }
 
         for _ in 0..4 {

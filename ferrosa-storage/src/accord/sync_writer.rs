@@ -12,7 +12,7 @@
 //!
 //! # Production vs Testing
 //!
-//! - [`FileSyncWriter`] — production implementation using `File::sync_all()`
+//! - [`FileSyncWriter`] — production implementation using `ferrosa_common::durable_sync::sync_all`
 //! - [`MockSyncWriter`] — test implementation that records call ordering
 
 use std::fs::OpenOptions;
@@ -61,7 +61,7 @@ pub trait SyncWriter: Send + Sync {
 // FileSyncWriter — production implementation
 // ---------------------------------------------------------------------------
 
-/// Production implementation using `File::sync_all()`.
+/// Production implementation using `ferrosa_common::durable_sync::sync_all`.
 ///
 /// Appends data to a file and calls `sync_all()` to guarantee the data
 /// is durable on disk before returning. Each call opens, writes, syncs,
@@ -138,7 +138,7 @@ impl SyncWriter for FileSyncWriter {
             return SyncWriteResult::FsyncFailed(e);
         }
 
-        match file.sync_all() {
+        match ferrosa_common::durable_sync::sync_all(&file) {
             Ok(()) => SyncWriteResult::Ok,
             Err(e) => SyncWriteResult::FsyncFailed(e),
         }

@@ -1,0 +1,9 @@
+# Every durability sync goes through `ferrosa_common::durable_sync`, so the
+# operator's `[storage] fsync_mode` reaches it. On Apple targets the std and
+# tokio sync methods are always F_FULLFSYNC, whatever was configured.
+disallowed-methods = [
+    { path = "std::fs::File::sync_all", reason = "use ferrosa_common::durable_sync::sync_all (honours [storage] fsync_mode)" },
+    { path = "std::fs::File::sync_data", reason = "use ferrosa_common::durable_sync::sync_data (honours [storage] fsync_mode)" },
+    { path = "tokio::fs::File::sync_all", reason = "use ferrosa_common::durable_sync::sync_all on the std file, off the async runtime" },
+    { path = "tokio::fs::File::sync_data", reason = "use ferrosa_common::durable_sync::sync_data on the std file, off the async runtime" },
+]

@@ -189,7 +189,7 @@ impl SegmentWriter {
     /// Flush and fsync.
     pub fn sync(&mut self) -> io::Result<()> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()
+        ferrosa_common::durable_sync::sync_all(self.writer.get_ref())
     }
 }
 
@@ -354,7 +354,7 @@ mod tests {
             let mut f = OpenOptions::new().append(true).open(path).unwrap();
             f.write_all(b"\xde\xad\xbe\xef\x00\x01\x02\x03garbage")
                 .unwrap();
-            f.sync_all().unwrap();
+            ferrosa_common::durable_sync::sync_all(&f).unwrap();
         }
 
         // Opening the reader must recover exactly 3 records.
@@ -397,7 +397,7 @@ mod tests {
             byte[0] ^= 0xFF;
             f.seek(SeekFrom::Start(len - 1)).unwrap();
             f.write_all(&byte).unwrap();
-            f.sync_all().unwrap();
+            ferrosa_common::durable_sync::sync_all(&f).unwrap();
         }
 
         let reader = SegmentReader::open(path).unwrap();

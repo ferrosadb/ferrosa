@@ -87,107 +87,30 @@ impl Default for SyncStrategyConfig {
     }
 }
 
-/// Which system call makes a commit-log segment durable.
+/// Which system call makes a commit-log segment durable: the workspace-wide
+/// [`SyncMode`](ferrosa_common::durable_sync::SyncMode). The table of what each
+/// mode survives on macOS, and why the default is plain `fsync(2)`, lives on
+/// `ferrosa_common::durable_sync`.
 ///
-/// This only matters on macOS. There, `fsync(2)` hands data to the drive but
-/// does not flush the drive's volatile cache, so it survives a process crash
-/// and a kernel panic (the controller keeps power and drains its cache) but
-/// not a power loss. On Linux `fdatasync(2)` already flushes the device cache,
-/// so every mode runs `fdatasync` there: a mode never makes Linux weaker.
-///
-/// | Mode | macOS call | Process crash | Kernel panic | Power loss |
-/// |------|------------|---------------|--------------|------------|
-/// | `Full` (default) | `fcntl(F_FULLFSYNC)` | survives | survives | survives |
-/// | `Barrier` | `fcntl(F_BARRIERFSYNC)` | survives | survives | may lose the tail since the last full flush; never reorders it |
-/// | `Fsync` | `fsync(2)` | survives | survives | may lose or reorder recent writes |
-///
-/// Note that Rust's `File::sync_all` and `File::sync_data` are both
-/// `F_FULLFSYNC` on Apple targets, so `Fsync` has to call `libc::fsync`
-/// itself. Selected at startup by `FERROSA_COMMITLOG_SYNC_MODE`, logged then,
-/// and exported as `ferrosa_commitlog_sync_mode`; never a build-time choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum CommitLogSyncMode {
-    /// Flush the drive cache on every sync. Power-loss durable.
-    #[default]
-    Full,
-    /// fsync plus a drive write barrier: ordered, not power-loss durable.
-    Barrier,
-    /// Plain fsync: neither ordered nor durable across power loss.
-    Fsync,
-}
+/// The commit log follows the process-wide mode (`[storage] fsync_mode` /
+/// `FERROSA_FSYNC_MODE`) unless `FERROSA_COMMITLOG_SYNC_MODE` overrides it for
+/// the commit log alone. Logged at startup and exported as
+/// `ferrosa_commitlog_syncs_by_mode_total`; never a build-time choice.
+pub type CommitLogSyncMode = ferrosa_common::durable_sync::SyncMode;
 
-impl CommitLogSyncMode {
-    /// The environment variable that selects the mode.
-    pub const ENV: &'static str = "FERROSA_COMMITLOG_SYNC_MODE";
+/// Overrides the process-wide fsync mode for the commit log only.
+pub const COMMITLOG_SYNC_MODE_ENV: &str = "FERROSA_COMMITLOG_SYNC_MODE";
 
-    const ALL: [Self; 3] = [Self::Full, Self::Barrier, Self::Fsync];
-
-    /// The name accepted by [`parse`](Self::parse).
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Barrier => "barrier",
-            Self::Fsync => "fsync",
+/// Reads `FERROSA_COMMITLOG_SYNC_MODE`. Unset means the process-wide mode. A set
+/// but unknown value is an error, not the default: a durability setting that
+/// was asked for and silently not applied is the failure this prevents.
+pub fn commitlog_sync_mode_from_env() -> Result<CommitLogSyncMode, String> {
+    match std::env::var(COMMITLOG_SYNC_MODE_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(ferrosa_common::durable_sync::process_mode()),
+        Err(e) => Err(format!("{COMMITLOG_SYNC_MODE_ENV}: {e}")),
+        Ok(raw) => {
+            CommitLogSyncMode::parse(&raw).map_err(|e| format!("{COMMITLOG_SYNC_MODE_ENV}: {e}"))
         }
-    }
-
-    /// Parses a mode name, ignoring case and surrounding whitespace.
-    pub fn parse(raw: &str) -> Result<Self, String> {
-        let wanted = raw.trim();
-        Self::ALL
-            .into_iter()
-            .find(|mode| mode.name().eq_ignore_ascii_case(wanted))
-            .ok_or_else(|| {
-                format!(
-                    "unknown commit-log sync mode {raw:?}; expected one of full, barrier, fsync"
-                )
-            })
-    }
-
-    /// Reads [`ENV`](Self::ENV). Unset means `Full`. A set but unknown value
-    /// is an error, not the default: a durability setting that was asked for
-    /// and silently not applied is the failure this type exists to prevent.
-    pub fn from_env() -> Result<Self, String> {
-        match std::env::var(Self::ENV) {
-            Err(std::env::VarError::NotPresent) => Ok(Self::default()),
-            Err(e) => Err(format!("{}: {e}", Self::ENV)),
-            Ok(raw) => Self::parse(&raw).map_err(|e| format!("{}: {e}", Self::ENV)),
-        }
-    }
-
-    /// Whether an acknowledged, synced write survives sudden power loss. Off
-    /// Apple targets every mode is `fdatasync(2)`, which flushes the device cache.
-    pub fn survives_power_loss(self) -> bool {
-        !cfg!(target_vendor = "apple") || matches!(self, Self::Full)
-    }
-
-    /// One line, for the startup log, saying what this mode guarantees on
-    /// this platform. It never says "panic": the install smoke fails any
-    /// startup log that does (see `no_durability_line_mentions_a_panic`).
-    #[cfg(target_vendor = "apple")]
-    pub fn durability(self) -> &'static str {
-        match self {
-            Self::Full => {
-                "F_FULLFSYNC: synced writes survive process crash, OS crash and power loss"
-            }
-            Self::Barrier => {
-                "F_BARRIERFSYNC: synced writes survive process crash and OS crash; on power loss \
-                 the tail since the drive last flushed its cache can be lost, in order"
-            }
-            Self::Fsync => {
-                "fsync(2): synced writes survive process crash and OS crash; on power loss \
-                 recent writes can be lost or reordered"
-            }
-        }
-    }
-
-    /// One line, for the startup log, saying what this mode guarantees on
-    /// this platform. It never says "panic": the install smoke fails any
-    /// startup log that does (see `no_durability_line_mentions_a_panic`).
-    #[cfg(not(target_vendor = "apple"))]
-    pub fn durability(self) -> &'static str {
-        "fdatasync(2): synced writes survive process crash, OS crash and power loss \
-         (the mode chooses the sync call only on Apple targets)"
     }
 }
 
@@ -223,7 +146,7 @@ impl CommitLogBatchConfig {
             target_bytes: Self::DEFAULT_TARGET_BYTES,
             max_delay,
             sync_stall_deadline: Self::DEFAULT_SYNC_STALL_DEADLINE,
-            sync_mode: CommitLogSyncMode::default(),
+            sync_mode: ferrosa_common::durable_sync::process_mode(),
         }
     }
 
@@ -243,7 +166,7 @@ impl CommitLogBatchConfig {
             .map(Duration::from_millis)
             .unwrap_or(default.sync_stall_deadline);
         // `sync_mode` is not read here: an unusable mode must stop startup
-        // rather than fall back, so it comes from `CommitLogSyncMode::from_env`.
+        // rather than fall back, so it comes from `commitlog_sync_mode_from_env`.
         Self {
             target_bytes,
             max_delay,
@@ -504,12 +427,14 @@ mod tests {
         }
     }
 
+    /// The commit log follows the process-wide `[storage] fsync_mode`, whose
+    /// default is plain fsync(2); `FERROSA_COMMITLOG_SYNC_MODE` overrides it.
     #[test]
-    fn the_default_sync_mode_is_the_power_loss_durable_one() {
-        assert_eq!(CommitLogSyncMode::default(), CommitLogSyncMode::Full);
+    fn the_default_sync_mode_is_the_process_wide_one() {
+        assert_eq!(CommitLogSyncMode::default(), CommitLogSyncMode::Fsync);
         assert_eq!(
             CommitLogBatchConfig::default().sync_mode,
-            CommitLogSyncMode::Full
+            ferrosa_common::durable_sync::process_mode()
         );
         assert!(CommitLogSyncMode::Full.survives_power_loss());
     }
@@ -537,7 +462,7 @@ mod tests {
     fn off_apple_every_mode_is_fdatasync_and_survives_power_loss() {
         for mode in CommitLogSyncMode::ALL {
             assert!(mode.survives_power_loss(), "{mode:?}");
-            assert!(mode.durability().starts_with("fdatasync(2)"), "{mode:?}");
+            assert!(mode.durability().contains("fdatasync(2)"), "{mode:?}");
         }
     }
 
@@ -558,13 +483,16 @@ mod tests {
     #[serial_test::serial(env)]
     fn sync_mode_from_env_defaults_when_unset_and_refuses_garbage() {
         unsafe { std::env::remove_var("FERROSA_COMMITLOG_SYNC_MODE") };
-        assert_eq!(CommitLogSyncMode::from_env(), Ok(CommitLogSyncMode::Full));
+        assert_eq!(
+            commitlog_sync_mode_from_env(),
+            Ok(ferrosa_common::durable_sync::process_mode())
+        );
 
-        unsafe { std::env::set_var("FERROSA_COMMITLOG_SYNC_MODE", "fsync") };
-        assert_eq!(CommitLogSyncMode::from_env(), Ok(CommitLogSyncMode::Fsync));
+        unsafe { std::env::set_var("FERROSA_COMMITLOG_SYNC_MODE", "full") };
+        assert_eq!(commitlog_sync_mode_from_env(), Ok(CommitLogSyncMode::Full));
 
         unsafe { std::env::set_var("FERROSA_COMMITLOG_SYNC_MODE", "fast") };
-        let err = CommitLogSyncMode::from_env().unwrap_err();
+        let err = commitlog_sync_mode_from_env().unwrap_err();
         assert!(err.contains("FERROSA_COMMITLOG_SYNC_MODE"), "{err}");
 
         unsafe { std::env::remove_var("FERROSA_COMMITLOG_SYNC_MODE") };

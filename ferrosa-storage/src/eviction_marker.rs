@@ -167,10 +167,10 @@ pub fn write_marker(table_dir: &Path, gen: &str, record: &EvictionRecord) -> std
     let tmp = table_dir.join(format!(".{gen}.evicted.tmp"));
     let mut file = std::fs::File::create(&tmp)?;
     file.write_all(&bytes)?;
-    file.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&file)?;
     drop(file);
     std::fs::rename(&tmp, marker_path(table_dir, gen))?;
-    std::fs::File::open(table_dir)?.sync_all()
+    ferrosa_common::durable_sync::sync_all(&std::fs::File::open(table_dir)?)
 }
 
 /// Path of the marker for `gen`.

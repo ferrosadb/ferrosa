@@ -867,7 +867,7 @@ impl StorageEngineConfig {
         };
         commit_log.batch =
             crate::commitlog::config::CommitLogBatchConfig::from_env(commit_log.batch.clone());
-        commit_log.batch.sync_mode = crate::commitlog::config::CommitLogSyncMode::from_env()
+        commit_log.batch.sync_mode = crate::commitlog::config::commitlog_sync_mode_from_env()
             .map_err(ferrosa_common::Error::InvalidFormat)?;
 
         let compaction = CompactionConfig::from_env(data_dir.join("compaction"));
@@ -2953,7 +2953,12 @@ impl StorageEngine {
                                 );
                                 return Ok((false, 0, 0));
                             }
-                            file.sync_all().await.map_err(|e| {
+                            crate::durable::sync_tokio_file(
+                                &file,
+                                ferrosa_common::durable_sync::Scope::All,
+                            )
+                            .await
+                            .map_err(|e| {
                                 ferrosa_common::Error::InvalidFormat(format!(
                                     "failed to sync SSTable rehydration temp file {}: {e}",
                                     tmp_path.display()
@@ -15940,7 +15945,7 @@ impl StorageEngine {
 
     fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
         let file = std::fs::File::open(dir)?;
-        file.sync_all()
+        ferrosa_common::durable_sync::sync_all(&file)
     }
 
     fn quarantine_incomplete_generation(table_dir: &std::path::Path, sstable_id: &str) {

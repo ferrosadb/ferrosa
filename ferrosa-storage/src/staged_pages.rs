@@ -31,21 +31,14 @@ use std::fs::File;
 /// could not be cleaned must not be silently mapped, or the staging region would
 /// be exactly the unreclaimable dirty file-backed memory this exists to avoid.
 pub(crate) fn flush_staged_pages(file: &File) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        // On Apple targets `File::sync_data` is `F_FULLFSYNC` — a device-cache
-        // flush that a throwaway staging file does not need. Plain `fsync`
-        // already writes the dirty pages back, which is all "clean" requires, so
-        // use it and skip the F_FULLFSYNC cost on the commit path.
-        file.sync_all()
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        // `fdatasync`: writes the dirty DATA pages back (they become clean)
-        // without the metadata flush a staging file does not need. The same call
-        // the SSTable write pump makes (`ferrosa_sstable::direct::sync_data`).
-        file.sync_data()
-    }
+    // Writeback, not durability, so this is plain `fsync` on Apple targets
+    // whatever `[storage] fsync_mode` says: a throwaway staging file does not
+    // need a device-cache flush. (It used to call `File::sync_all` there,
+    // believing that was plain fsync; on Apple targets it is F_FULLFSYNC.)
+    // Elsewhere it is `fdatasync`: the dirty DATA pages are written back (they
+    // become clean) without the metadata flush a staging file does not need.
+    use ferrosa_common::durable_sync::{sync_with, Scope, SyncMode};
+    sync_with(file, SyncMode::Fsync, Scope::Data)
 }
 
 /// Kernel-reported page-state probes for the staging tests (Linux only: the

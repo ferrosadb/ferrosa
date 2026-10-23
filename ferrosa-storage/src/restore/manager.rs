@@ -391,18 +391,20 @@ impl RestoreManager {
                 ))
             })?;
         }
-        file.sync_data().await.map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to sync SSTable restore temp file {}: {e}",
-                local_path.display()
-            ))
-        })?;
+        crate::durable::sync_tokio_file(&file, ferrosa_common::durable_sync::Scope::Data)
+            .await
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to sync SSTable restore temp file {}: {e}",
+                    local_path.display()
+                ))
+            })?;
         Ok(Some(bytes))
     }
 
     fn sync_directory(dir: &Path) -> std::io::Result<()> {
         let file = std::fs::File::open(dir)?;
-        file.sync_all()
+        ferrosa_common::durable_sync::sync_all(&file)
     }
 
     fn quarantine_incomplete_generation(table_dir: &Path, sstable_id: &str) {

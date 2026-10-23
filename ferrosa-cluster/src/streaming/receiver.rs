@@ -233,7 +233,7 @@ impl StreamSession {
             file.flush().map_err(|e| {
                 ClusterError::Internal(format!("stream: failed to flush staged mutations: {e}"))
             })?;
-            file.sync_all().map_err(|e| {
+            ferrosa_common::durable_sync::sync_all(&file).map_err(|e| {
                 ClusterError::Internal(format!("stream: failed to sync staged mutations: {e}"))
             })?;
         }

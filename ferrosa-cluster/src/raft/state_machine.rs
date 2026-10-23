@@ -966,7 +966,7 @@ impl FerrosStateMachine {
                 std::io::Write::flush(&mut writer)
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
             }
-            file.sync_all()
+            ferrosa_common::durable_sync::sync_all(&file)
                 .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
         }
         std::fs::rename(&tmp, path)
@@ -977,7 +977,7 @@ impl FerrosStateMachine {
         // and the node with no snapshot at all.
         if let Some(parent) = path.parent() {
             if let Ok(dir) = std::fs::File::open(parent) {
-                dir.sync_all()
+                ferrosa_common::durable_sync::sync_all(&dir)
                     .map_err(|e| StorageIOError::write_state_machine(to_any_error(e)))?;
             }
         }

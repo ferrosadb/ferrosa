@@ -1406,7 +1406,7 @@ impl FileFlushTarget {
     /// the SSTable is durable.
     fn fsync_path(path: &Path) -> std::io::Result<()> {
         let f = std::fs::File::open(path)?;
-        f.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&f)?;
         #[cfg(test)]
         Self::record_fsync(path);
         Ok(())
@@ -1428,7 +1428,7 @@ impl FileFlushTarget {
     /// sequence crash-atomic.
     pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
         let f = std::fs::File::open(dir)?;
-        f.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&f)?;
         #[cfg(test)]
         Self::record_dir_fsync(dir);
         Ok(())
@@ -2606,7 +2606,7 @@ impl FlushTarget for FileFlushTarget {
         ));
         let written = std::fs::File::create(&tmp).and_then(|mut file| {
             file.write_all(fti_bytes)?;
-            file.sync_all()
+            ferrosa_common::durable_sync::sync_all(&file)
         });
         if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
             if let Err(cleanup) = std::fs::remove_file(&tmp) {

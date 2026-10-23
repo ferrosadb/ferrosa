@@ -137,11 +137,11 @@ pub fn write_dissolution(raft_dir: &Path, dissolution: &PairDissolution) -> Resu
         use std::io::Write;
         let mut file = std::fs::File::create(&staging).map_err(|e| io("create", e))?;
         file.write_all(&body).map_err(|e| io("write", e))?;
-        file.sync_all().map_err(|e| io("fsync", e))?;
+        ferrosa_common::durable_sync::sync_all(&file).map_err(|e| io("fsync", e))?;
     }
     std::fs::rename(&staging, marker_path(raft_dir)).map_err(|e| io("rename", e))?;
     std::fs::File::open(raft_dir)
-        .and_then(|dir| dir.sync_all())
+        .and_then(|dir| ferrosa_common::durable_sync::sync_all(&dir))
         .map_err(|e| io("fsync dir", e))?;
     Ok(())
 }

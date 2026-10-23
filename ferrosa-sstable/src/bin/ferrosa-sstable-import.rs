@@ -17,7 +17,7 @@ fn temp_import_directory(table_dir: &std::path::Path, gen: &str) -> PathBuf {
 
 fn sync_directory(dir: &std::path::Path) -> std::io::Result<()> {
     let file = std::fs::File::open(dir)?;
-    file.sync_all()
+    ferrosa_common::durable_sync::sync_all(&file)
 }
 
 fn main() {

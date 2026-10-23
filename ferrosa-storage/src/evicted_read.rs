@@ -893,11 +893,11 @@ fn write_synced(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let mut file = std::fs::File::create(path)?;
     file.write_all(bytes)?;
-    file.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&file)?;
     Ok(())
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {
-    std::fs::File::open(dir)?.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&std::fs::File::open(dir)?)?;
     Ok(())
 }

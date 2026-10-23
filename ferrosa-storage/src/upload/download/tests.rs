@@ -572,7 +572,9 @@ async fn legacy_download(
         bytes += chunk.len() as u64;
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
     }
-    file.sync_data().await.map_err(|e| e.to_string())?;
+    crate::durable::sync_tokio_file(&file, ferrosa_common::durable_sync::Scope::Data)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(bytes)
 }
 

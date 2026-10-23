@@ -184,8 +184,8 @@ impl ReplaySetAside {
                 "replay set-aside is dirty but has no file".into(),
             ));
         };
-        file.sync_all()?;
-        File::open(&self.dir)?.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(file)?;
+        ferrosa_common::durable_sync::sync_all(&File::open(&self.dir)?)?;
         self.dirty = false;
         Ok(())
     }
@@ -522,7 +522,7 @@ impl FileOutcome {
 const DURABLE_EVERY: u64 = 50_000;
 
 fn sync_dir(dir: &Path) -> Result<()> {
-    File::open(dir)?.sync_all()?;
+    ferrosa_common::durable_sync::sync_all(&File::open(dir)?)?;
     Ok(())
 }
 
@@ -618,7 +618,7 @@ impl ReingestRun {
     fn make_quarantine_durable(&mut self) -> Result<()> {
         if let Some((writer, target)) = self.stale_writer.take() {
             let file = writer.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
+            ferrosa_common::durable_sync::sync_all(&file)?;
             if let Some(dir) = target.parent() {
                 sync_dir(dir)?;
             }
@@ -652,7 +652,7 @@ fn finish_file(
         }
         Some(writer) => {
             let file = writer.into_inner().map_err(|e| e.into_error())?;
-            file.sync_all()?;
+            ferrosa_common::durable_sync::sync_all(&file)?;
             std::fs::rename(&run.partial, path)?;
             sync_dir(dir)?;
         }

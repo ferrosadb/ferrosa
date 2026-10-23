@@ -191,7 +191,7 @@ fn restore_cluster_member_marker_atomic(
         let mut file = std::fs::File::create(&staging)?;
         file.write_all(&saved.bytes[..saved.len])?;
         file.flush()?;
-        file.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&file)?;
         if file.metadata()?.len() != saved.len as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -199,7 +199,7 @@ fn restore_cluster_member_marker_atomic(
             ));
         }
         std::fs::rename(&staging, &live)?;
-        std::fs::File::open(raft_dir)?.sync_all()?;
+        ferrosa_common::durable_sync::sync_all(&std::fs::File::open(raft_dir)?)?;
         Ok(())
     })();
     if result.is_err() {

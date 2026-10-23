@@ -74,6 +74,16 @@ data_dir                 = "~/.ferrosa/data"
 flush_threshold_bytes    = 67108864   # 64 MiB — memtable size before flush
 flush_interval_secs      = 30         # background flush cadence
 commit_log_segment_size  = 33554432   # 32 MiB
+# The system call every durability sync issues on macOS (no effect on Linux,
+# where fsync/fdatasync already flush the drive cache). Env: FERROSA_FSYNC_MODE;
+# this key wins. FERROSA_COMMITLOG_SYNC_MODE overrides it for the commit log.
+#   fsync   (default) fsync(2): survives a process or OS crash; a sudden power
+#           loss can lose or reorder writes synced since the drive last
+#           flushed its cache.
+#   barrier F_BARRIERFSYNC: as fsync, but never reorders them.
+#   full    F_FULLFSYNC: also survives power loss; several times slower per
+#           sync (measured 20.8 ms vs 6.0 ms per CREATE TABLE on an M-series Mac).
+# fsync_mode = "fsync"
 
 # ---------------------------------------------------------------------------
 # S3 — DISABLED by default. Single-node installs use local disk only.

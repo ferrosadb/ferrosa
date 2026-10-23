@@ -344,9 +344,7 @@ async fn write_whole(
         .flush()
         .await
         .map_err(|e| local("flush SSTable download temp file", e))?;
-    writer
-        .get_mut()
-        .sync_data()
+    crate::durable::sync_tokio_file(writer.get_ref(), ferrosa_common::durable_sync::Scope::Data)
         .await
         .map_err(|e| local("sync SSTable download temp file", e))?;
     Ok(written)
@@ -457,7 +455,7 @@ async fn download_ranged(
     drop(inflight);
     verify_len(total, size, s3_path)?;
     let synced = Arc::clone(&file);
-    run_blocking(move || synced.sync_data())
+    run_blocking(move || ferrosa_common::durable_sync::sync_data(&synced))
         .await
         .map_err(|e| Fail::Fatal(format!("failed to sync {}: {e}", tmp.display())))?;
     Ok(Some(Downloaded {
