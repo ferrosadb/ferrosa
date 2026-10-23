@@ -1,7 +1,9 @@
 [package]
 name = "ferrosa-sim"
 version.workspace = true
+publish.workspace = true
 edition = "2021"
+license.workspace = true
 
 # Sprint 5 (ADR-017): deterministic simulation harness for the Raft layer.
 #

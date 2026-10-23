@@ -1,7 +1,9 @@
 [package]
 name = "ferrosa-udf"
 version.workspace = true
+publish.workspace = true
 edition = "2021"
+license.workspace = true
 description = "WASM-sandboxed User-Defined Function execution for Ferrosa"
 
 [dependencies]

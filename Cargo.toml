@@ -85,4 +85,8 @@ opt-level = 3
 version = "0.27.0"
 edition = "2021"
 license = "Apache-2.0"
+# No workspace crate is published to crates.io. Saying so lets cargo-deny
+# treat intra-workspace `path = ...` dependencies as what they are (not
+# registry wildcards) and keeps an accidental `cargo publish` from leaking one.
+publish = false
 repository = "https://github.com/ferrosadb/ferrosa"

@@ -2,6 +2,7 @@
 name = "ferrosa-storage"
 description = "Single-node storage engine for Ferrosa: memtable, flush, merge"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

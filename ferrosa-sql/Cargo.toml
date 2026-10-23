@@ -2,6 +2,7 @@
 name = "ferrosa-sql"
 description = "Bespoke relational query engine for Ferrosa (planner + operators)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

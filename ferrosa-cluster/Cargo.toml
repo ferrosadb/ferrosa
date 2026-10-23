@@ -1,7 +1,9 @@
 [package]
 name = "ferrosa-cluster"
 version.workspace = true
+publish.workspace = true
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 arc-swap = "1.7"
