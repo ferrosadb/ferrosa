@@ -42,7 +42,8 @@ RELEASE_WORKFLOWS = {
 # Jobs in CI workflows that build a binary or image standing in for a shipped
 # one. --all-features would put test-only / live-infra features into it.
 RELEASE_SHAPED_JOBS = {
-    ("ci.yml", "build-node-image"): "the one release build; its image is what every CI job and paired repo runs",
+    ("ci.yml", "musl"): "the shipped static musl binary, built once",
+    ("ci.yml", "build-node-image"): "the shipped glibc binary, built once; its image is what every CI job and paired repo runs",
     ("ci.yml", "aarch64-musl"): "checks release.yml's aarch64 packages and features",
     ("install-smoke.yml", "build"): "stages the real release tarball layout",
     ("nightly-fuzz.yml", "smoke-test"): "musl fallback for the nightly .deb image",

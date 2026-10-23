@@ -467,30 +467,28 @@ jobs:
         # aarch64 build, checked without the release profile or the link.
         run: cargo check --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
 
-  # ── Build the shipped binary ONCE (12-factor build/release/run) ─────
-  # The one release compile in this workflow (tests/ci/test_ci_build_once.py
-  # pins it): x86_64 musl with the curated `ferrosa/full` set, byte-for-byte
-  # the command release.yml ships and bakes into the published Docker image.
-  # Every job that runs a server runs THIS binary, packaged once into the
-  # immutable `ferrosa-test-node:latest` image: examples, secure-compose,
-  # integration, the PostgreSQL Jepsen cluster, driver smoke and the paired
-  # repositories that pull it from GHCR.
+  # ── Build each shipped binary ONCE (12-factor build/release/run) ─────
+  # Two binaries ship on Linux, and this workflow compiles each exactly once,
+  # with the command release.yml ships it with (tests/ci/test_ci_build_once.py
+  # pins both):
   #
-  # This replaced three release compiles per run (a musl job, a glibc
-  # default-features node image, a glibc `flight` binary). The glibc build's
-  # reason, "musl's allocator is slow", stopped holding when jemalloc became
-  # the global allocator on every non-MSVC target (ferrosa/src/main.rs).
-  # Whether Arrow Flight listens is runtime config, not a build: the image
-  # ships FERROSA_FLIGHT_ENABLED=false so a paired repository sees no new
-  # listener, and a job that needs Flight sets it to true.
-  build-node-image:
-    # The `main` ruleset requires a check named "Static Build (musl)"; this
-    # job is that build now, so it carries the name.
+  #   * `musl`: static x86_64 musl, `ferrosa/full`, for hosts without a usable
+  #     glibc. The main ruleset requires its check, "Static Build (musl)".
+  #   * `build-node-image`: x86_64 glibc, `ferrosa/full`. 15-20% faster than
+  #     musl, so it ships wherever the host's glibc allows, and it is what every
+  #     job here that runs a server runs, packaged once into the immutable
+  #     `ferrosa-test-node:latest` image: examples, secure-compose,
+  #     integration, the PostgreSQL Jepsen cluster, driver smoke and the paired
+  #     repositories that pull it from GHCR.
+  #
+  # This replaced five release compiles per run (musl, a glibc default-features
+  # node image, a glibc `flight` binary, and install-smoke's glibc and macOS
+  # tarballs). Whether Arrow Flight listens is runtime config, not a build:
+  # the image ships FERROSA_FLIGHT_ENABLED=false so a paired repository sees no
+  # new listener, and a job that needs Flight sets it to true.
+  musl:
     name: Static Build (musl)
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
@@ -502,7 +500,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
       - name: Install musl tools and capnproto
         run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
-      - name: Build the release binary (once)
+      - name: Build the musl release binary (once)
         # Curated `ferrosa/full`, NOT --all-features: this is the release
         # binary's feature set.
         run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
@@ -525,10 +523,47 @@ jobs:
             target/x86_64-unknown-linux-musl/release/ferrosa
             target/x86_64-unknown-linux-musl/release/ferrosa-ctl
           retention-days: 14
+
+  build-node-image:
+    name: Build node image
+    # release.yml's build-linux-gnu runner, so the binary's glibc requirement
+    # is the one the release asserts against its runtime base.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: node-image
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install glibc build dependencies
+        # Same packages as release.yml's build-linux-gnu.
+        run: sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
+      - name: Build the glibc release binary (once)
+        # Curated `ferrosa/full`, NOT --all-features: this is the release
+        # binary's feature set.
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p ferrosa -p ferrosa-ctl --features ferrosa/full
+      - name: Strip and report
+        run: |
+          strip target/x86_64-unknown-linux-gnu/release/ferrosa
+          strip target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
+          file target/x86_64-unknown-linux-gnu/release/ferrosa
+          echo "glibc required: $(objdump -T target/x86_64-unknown-linux-gnu/release/ferrosa | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -n1)"
+      - name: Upload glibc binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-glibc
+          path: |
+            target/x86_64-unknown-linux-gnu/release/ferrosa
+            target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
+          retention-days: 14
       - name: Package into a thin runtime image
         run: |
           mkdir -p node-bin
-          cp target/x86_64-unknown-linux-musl/release/ferrosa target/x86_64-unknown-linux-musl/release/ferrosa-ctl node-bin/
+          cp target/x86_64-unknown-linux-gnu/release/ferrosa target/x86_64-unknown-linux-gnu/release/ferrosa-ctl node-bin/
           cat > node-bin/Dockerfile <<'DEOF'
           FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
           RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -1066,31 +1101,41 @@ jobs:
         if: always()
         run: docker compose -f /tmp/docker-compose.ci.yml down -v 2>/dev/null || true
 
-  # ── Stage 2c': Install smoke on the tarball users get ──────────────
-  # install/install.sh installs the x86_64 musl tarball on Linux, so this
-  # stages exactly that tarball from the one release build above and runs the
-  # real installer against it. install-smoke.yml (glibc + macOS builds, and
-  # ferrosa-memory compiled from source) runs on main, nightly, and as the
-  # release gate; it no longer compiles three more binaries on every PR.
+  # ── Stage 2c': Install smoke on the tarballs users get ─────────────
+  # Both shipped Linux tarballs, staged from the two release builds above,
+  # each installed by the real installer: glibc (the faster build, shipped
+  # wherever the host's glibc allows) and static musl. install-smoke.yml
+  # (macOS, and ferrosa-memory compiled from source) runs on main, nightly,
+  # and as the release gate; it no longer compiles three binaries per PR.
   install-smoke:
-    name: Install smoke (shipped musl tarball)
-    needs: build-node-image
+    name: Install smoke (${{ matrix.libc }} tarball)
+    needs: [build-node-image, musl]
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            artifact: ferrosa-glibc
+            target: x86_64-unknown-linux-gnu
+          - libc: musl
+            artifact: ferrosa-musl-static
+            target: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Download the musl binaries built earlier in CI
+      - name: Download the binaries built earlier in CI
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          name: ferrosa-musl-static
-          path: /tmp/ferrosa-musl
+          name: ${{ matrix.artifact }}
+          path: /tmp/ferrosa-bin
       - name: Stage the release tarball from those binaries
         # upload-artifact does not keep file modes.
         run: |
-          chmod +x /tmp/ferrosa-musl/ferrosa /tmp/ferrosa-musl/ferrosa-ctl
-          GITHUB_REF_NAME=v0.0.0-smoke bash .github/scripts/stage-release-tarball.sh x86_64-unknown-linux-musl /tmp/ferrosa-musl
+          chmod +x /tmp/ferrosa-bin/ferrosa /tmp/ferrosa-bin/ferrosa-ctl
+          GITHUB_REF_NAME=v0.0.0-smoke bash .github/scripts/stage-release-tarball.sh ${{ matrix.target }} /tmp/ferrosa-bin
       - name: Run the user-grade install smoke against it
-        run: bash tests/install_smoke.sh --ferrosa-tarball dist/ferrosa-v0.0.0-smoke-x86_64-unknown-linux-musl.tar.gz
+        run: bash tests/install_smoke.sh --ferrosa-tarball dist/ferrosa-v0.0.0-smoke-${{ matrix.target }}.tar.gz
 
   # ── Stage 2d: Cluster integration tests (--ignored, Docker) ────────
   integration:
