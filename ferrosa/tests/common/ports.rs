@@ -169,7 +169,20 @@ fn claim_slice_lease() -> Option<u16> {
 ///
 /// A listening port must be BELOW this to be safe on both platforms, so we read
 /// the platform's own value rather than assuming one.
+///
+/// Read ONCE per process. On macOS the value comes from spawning `sysctl`, and
+/// [`PortAllocator::get`] asks on every allocation: a child spawned while another
+/// thread is between `socket()` and setting `FD_CLOEXEC` on its listener (macOS
+/// has no atomic `SOCK_CLOEXEC`) inherits that listener and keeps the port bound
+/// for as long as `sysctl` runs. The owner's next bind then fails with `Address
+/// already in use` -- 11,497 of 13,828 binds in
+/// `a_port_handed_out_is_never_probed_by_a_sibling_allocation` (t_470b78c6).
 pub fn kernel_ephemeral_floor() -> u16 {
+    static FLOOR: OnceLock<u16> = OnceLock::new();
+    *FLOOR.get_or_init(read_kernel_ephemeral_floor)
+}
+
+fn read_kernel_ephemeral_floor() -> u16 {
     if let Ok(text) = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range") {
         if let Some(first) = text.split_whitespace().next() {
             if let Ok(floor) = first.parse::<u16>() {
