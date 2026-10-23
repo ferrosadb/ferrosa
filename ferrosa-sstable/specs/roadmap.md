@@ -116,3 +116,22 @@ This is **not** an old-writer versus new-writer benchmark. It demonstrates this
 local pump's bounded stall and recovery; it does not establish a historical
 speedup or production throughput SLA. Keep identical fixtures, codec, build
 profile, segment/depth settings and filesystem for a historical comparison.
+
+### Completed: reusable sequential compaction buffers (2026-10-23)
+
+Added caller-owned row decode, bounded `decompress_into`, task-local scan
+buffers and incremental staged partition writing. Cache-backed point reads and
+the owned writer API retain their contracts. The uniform scan guard permits
+only constant warm-up/growth overhead across 896 additional rows for None, LZ4
+and Zstd, simple and complex columns.
+
+Deferred clustered compaction values use checked logical `ValueSpan` offsets.
+The pending cursor checks bounds first; winner and tie reads validate their own
+chunks. Before advancing a source or emitting its merged row, compaction validates
+every unread raw span, including schema-dropped columns. This avoids a separate
+validation pass over fetched values while preserving checks on discarded bytes.
+Ordinary losing values do not allocate payload buffers. Schema ordinal remapping
+moves spans and their original validation indices with cell identities. The public
+metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
+and corrupt losing/dropped-value tests cover this path alongside fully decoding
+output verification.

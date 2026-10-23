@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Decode clustering bytes directly into owned row storage.
+//! Correctness: Decoder allocation and corrupt-length regressions.
+//!
 //! Data.db reader for Cassandra BTI SSTables.
 //!
 //! The Data.db file contains serialized partitions in token order. Each
@@ -28,7 +32,7 @@ use crate::varint;
 /// is corrupt; it must be rejected *before* it drives an allocation, otherwise
 /// a bogus varint (a corrupt SSTable once encoded a multi-terabyte length here)
 /// would attempt a pathological `Vec` allocation and OOM the process.
-const MAX_VALUE_LEN: usize = 256 * 1024 * 1024;
+pub(crate) const MAX_VALUE_LEN: usize = 256 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Row flags (bit positions in the flags byte preceding each unfiltered row)
@@ -170,6 +174,16 @@ const DELETION_IS_LIVE: u8 = 0x80;
 // DataReader
 // ---------------------------------------------------------------------------
 
+/// Location of an opaque cell value in the logical, uncompressed Data.db.
+/// Length and every traversed checksum chunk are validated before this is exposed.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ValueSpan {
+    /// Logical uncompressed Data.db byte offset.
+    pub offset: u64,
+    /// Validated number of opaque value bytes.
+    pub len: usize,
+}
+
 /// Reads partitions sequentially from a Data.db file.
 ///
 /// The reader tracks its current byte position and advances through the file
@@ -182,6 +196,7 @@ pub struct DataReader<'a, R: ReadAt> {
     header: &'a SerializationHeader,
     pos: u64,
     legacy_fixed_value_lengths: bool,
+    validate_spans: bool,
     /// Legacy nanosecond timestamps this reader normalised (t_cf637b6e),
     /// added to `legacy_ns_timestamps_normalised_total{source="sstable"}` once,
     /// on drop, so the per-cell cost is a local increment.
@@ -212,6 +227,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             header,
             pos: start_pos,
             legacy_fixed_value_lengths: false,
+            validate_spans: true,
             legacy_ns_normalised: 0,
         }
     }
@@ -405,6 +421,107 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
             let row = self.read_row(flags, false)?;
             return Ok(Some(row));
+        }
+    }
+
+    /// Pull a complete row into reusable caller-owned buffers. Empty means the
+    /// partition ended; errors retain the same decode/length validation as owned reads.
+    pub fn read_next_clustered_row_into(&mut self, row: &mut Row) -> Result<bool> {
+        loop {
+            // The caller opened a partition and has not consumed its end
+            // marker yet. EOF here is truncation, not successful completion.
+            let file_len = self.reader.len()?;
+            if self.pos >= file_len {
+                return Err(Self::missing_partition_end_error());
+            }
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+            if flags & END_OF_PARTITION != 0 {
+                return Ok(false);
+            }
+            if flags & IS_MARKER != 0 {
+                return Ok(false);
+            }
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            if is_static {
+                // Skip stray static rows defensively (Cassandra
+                // writes them first; `read_partition_header_only`
+                // already consumed any in this partition).
+                self.skip_row_body(flags, true)?;
+                continue;
+            }
+            self.read_row_into(flags, false, row, None)?;
+            return Ok(true);
+        }
+    }
+
+    /// Produce pending value spans after checking their extents. The caller must
+    /// fetch or checksum-validate EVERY span before advancing/publishing a row.
+    /// This lets compaction validate each selected or discarded payload once.
+    pub fn read_next_clustered_row_pending_into(
+        &mut self,
+        row: &mut Row,
+        spans: &mut Vec<ValueSpan>,
+    ) -> Result<bool> {
+        let previous = self.validate_spans;
+        self.validate_spans = false;
+        let result = self.read_next_clustered_row_metadata_into(row, spans);
+        self.validate_spans = previous;
+        result
+    }
+
+    /// Read all cell identities/liveness while deferring opaque values to spans.
+    /// Skipped ranges are still checked for bounds, decompression and chunk CRC.
+    pub fn read_next_clustered_row_metadata_into(
+        &mut self,
+        row: &mut Row,
+        spans: &mut Vec<ValueSpan>,
+    ) -> Result<bool> {
+        loop {
+            // The caller opened a partition and has not consumed its end
+            // marker yet. EOF here is truncation, not successful completion.
+            let file_len = self.reader.len()?;
+            if self.pos >= file_len {
+                return Err(Self::missing_partition_end_error());
+            }
+            let mut flags_buf = [0u8; 1];
+            self.reader.read_exact_at(&mut flags_buf, self.pos)?;
+            self.pos += 1;
+            let flags = flags_buf[0];
+            if flags & END_OF_PARTITION != 0 {
+                return Ok(false);
+            }
+            if flags & IS_MARKER != 0 {
+                return Ok(false);
+            }
+            let extended_flags = if flags & EXTENSION_FLAG != 0 {
+                let mut ext_buf = [0u8; 1];
+                self.reader.read_exact_at(&mut ext_buf, self.pos)?;
+                self.pos += 1;
+                ext_buf[0]
+            } else {
+                0
+            };
+            let is_static = extended_flags & EXT_IS_STATIC != 0;
+            if is_static {
+                // Skip stray static rows defensively (Cassandra
+                // writes them first; `read_partition_header_only`
+                // already consumed any in this partition).
+                self.skip_row_body(flags, true)?;
+                continue;
+            }
+            self.read_row_into(flags, false, row, Some(spans))?;
+            return Ok(true);
         }
     }
 
@@ -1274,6 +1391,23 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
 
     /// Read a single row given its already-consumed flags byte.
     fn read_row(&mut self, flags: u8, is_static: bool) -> Result<Row> {
+        let mut row = Row {
+            clustering: Vec::new(),
+            cells: Vec::new(),
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+        self.read_row_into(flags, is_static, &mut row, None)?;
+        Ok(row)
+    }
+
+    fn read_row_into(
+        &mut self,
+        flags: u8,
+        is_static: bool,
+        out: &mut Row,
+        mut spans: Option<&mut Vec<ValueSpan>>,
+    ) -> Result<()> {
         self.legacy_fixed_value_lengths = false;
         // Clustering key (not present for static rows)
         //
@@ -1289,7 +1423,8 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         } else {
             let num_clustering = self.header.clustering_types.len();
 
-            let mut ck_bytes = Vec::new();
+            let mut ck_bytes = std::mem::take(&mut out.clustering);
+            ck_bytes.clear();
             if num_clustering > 0 {
                 let (header_bits, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
@@ -1380,33 +1515,64 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // even needed — `marshal::collection_value_type` returns a `&str` derived
         // from the column type, and `columns` borrows through `Self::header`
         // (an `&'a` field), so nothing forces the metadata to be owned.
-        let mut cells = Vec::with_capacity(present_columns.len(num_columns));
+        let mut cells = std::mem::take(&mut out.cells);
+        let mut used = 0;
         for col_idx in present_columns.iter(num_columns) {
             let (is_complex, value_type) =
                 complex_col_meta(&columns[col_idx].1, self.header.complex_collections);
             if is_complex {
                 let dt = self.read_complex_deletion(has_complex_deletion)?;
                 if let Some(sentinel) = complex_deletion_sentinel(dt) {
-                    cells.push((col_idx as u16, sentinel));
+                    if used == cells.len() {
+                        cells.push((col_idx as u16, sentinel));
+                    } else {
+                        cells[used] = (col_idx as u16, sentinel);
+                    }
+                    used += 1;
                 }
                 let (count, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
                 self.pos += n as u64;
                 for _ in 0..count {
-                    let cell = self.read_cell(&liveness, value_type, true)?;
-                    cells.push((col_idx as u16, cell));
+                    if used == cells.len() {
+                        cells.push((0, CellValue::tombstone(0, 0)));
+                    }
+                    cells[used].0 = col_idx as u16;
+                    let span = spans.as_mut().map(|spans| {
+                        if used >= spans.len() {
+                            spans.resize(used + 1, ValueSpan::default());
+                        }
+                        &mut spans[used]
+                    });
+                    self.read_cell_into(&liveness, value_type, true, &mut cells[used].1, span)?;
+                    used += 1;
                 }
             } else {
-                let cell = self.read_cell(&liveness, value_type, false)?;
-                cells.push((col_idx as u16, cell));
+                if used == cells.len() {
+                    cells.push((0, CellValue::tombstone(0, 0)));
+                }
+                cells[used].0 = col_idx as u16;
+                let span = spans.as_mut().map(|spans| {
+                    if used >= spans.len() {
+                        spans.resize(used + 1, ValueSpan::default());
+                    }
+                    &mut spans[used]
+                });
+                self.read_cell_into(&liveness, value_type, false, &mut cells[used].1, span)?;
+                used += 1;
             }
         }
 
-        Ok(Row {
+        cells.truncate(used);
+        if let Some(spans) = spans {
+            spans.resize(used, ValueSpan::default());
+        }
+        *out = Row {
             clustering,
             cells,
             deletion,
             primary_key_liveness: liveness,
-        })
+        };
+        Ok(())
     }
 
     /// When the row flag `HAS_COMPLEX_DELETION` is set, every complex column in
@@ -1888,31 +2054,63 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         Ok(())
     }
 
-    /// Allocate and fill a `len`-byte value buffer at the cursor, rejecting a
-    /// corrupt length *before* allocation. A length above [`MAX_VALUE_LEN`]
-    /// indicates a corrupt SSTable; surfacing a clean error lets the engine
-    /// exclude the file instead of OOMing on a pathological allocation.
-    /// Advances `self.pos` past the value on success.
-    fn read_value_bytes(&mut self, len: usize, what: &str) -> Result<Vec<u8>> {
+    fn read_value_or_span(
+        &mut self,
+        len: usize,
+        buffer: &mut Vec<u8>,
+        span: Option<&mut ValueSpan>,
+    ) -> Result<()> {
+        if let Some(span) = span {
+            if len > MAX_VALUE_LEN {
+                return Err(Error::InvalidData(format!(
+                    "cell value length {len} exceeds maximum ({MAX_VALUE_LEN})"
+                )));
+            }
+            let end = self
+                .pos
+                .checked_add(len as u64)
+                .ok_or_else(|| Error::InvalidData("payload extent overflow".into()))?;
+            if end > self.reader.len()? {
+                return Err(Error::InvalidData("payload extends beyond data".into()));
+            }
+            if self.validate_spans {
+                self.reader.validate_range(self.pos, len)?;
+            }
+            *span = ValueSpan {
+                offset: self.pos,
+                len,
+            };
+            self.pos += len as u64;
+            buffer.clear();
+            Ok(())
+        } else {
+            self.read_value_bytes_into(len, "cell value", buffer)
+        }
+    }
+
+    /// Check the corrupt-length bound before growing caller-owned storage.
+    fn read_value_bytes_into(
+        &mut self,
+        len: usize,
+        what: &str,
+        buffer: &mut Vec<u8>,
+    ) -> Result<()> {
         if len > MAX_VALUE_LEN {
-            return Err(Error::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "{what} length {len} exceeds maximum ({MAX_VALUE_LEN}), likely corrupt SSTable"
-                ),
+            return Err(Error::InvalidData(format!(
+                "{what} length {len} exceeds maximum ({MAX_VALUE_LEN})"
             )));
         }
-        let mut buf = vec![0u8; len];
-        self.reader.read_exact_at(&mut buf, self.pos)?;
+        buffer.resize(len, 0);
+        self.reader.read_exact_at(buffer, self.pos)?;
         self.pos += len as u64;
-        Ok(buf)
+        Ok(())
     }
 
     /// Read clustering component `i` (`self.header.clustering_types[i]`) at the
     /// cursor and append it to `ck_bytes`, length-prefixing each component when
     /// the clustering key has more than one so the CQL layer's
     /// `decode_clustering` can split them back. The on-disk length is bounded
-    /// via [`Self::read_value_bytes`].
+    /// via [`Self::read_value_bytes_into`].
     fn read_clustering_value_into(
         &mut self,
         i: usize,
@@ -1927,11 +2125,19 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 len as usize
             }
         };
-        let vbuf = self.read_value_bytes(vlen, "clustering value")?;
-        if num_clustering > 1 {
-            ck_bytes.extend_from_slice(&(vbuf.len() as u16).to_be_bytes());
+        if vlen > MAX_VALUE_LEN {
+            return Err(Error::InvalidData(format!(
+                "clustering value length {vlen} exceeds maximum ({MAX_VALUE_LEN})"
+            )));
         }
-        ck_bytes.extend_from_slice(&vbuf);
+        if num_clustering > 1 {
+            ck_bytes.extend_from_slice(&(vlen as u16).to_be_bytes());
+        }
+        let start = ck_bytes.len();
+        ck_bytes.resize(start + vlen, 0);
+        self.reader
+            .read_exact_at(&mut ck_bytes[start..], self.pos)?;
+        self.pos += vlen as u64;
         Ok(())
     }
 
@@ -1942,6 +2148,18 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         value_type: &str,
         is_complex: bool,
     ) -> Result<CellValue> {
+        let mut cell = CellValue::tombstone(0, 0);
+        self.read_cell_into(row_liveness, value_type, is_complex, &mut cell, None)?;
+        Ok(cell)
+    }
+    fn read_cell_into(
+        &mut self,
+        row_liveness: &LivenessInfo,
+        value_type: &str,
+        is_complex: bool,
+        out: &mut CellValue,
+        mut span: Option<&mut ValueSpan>,
+    ) -> Result<()> {
         let mut cell_flags_buf = [0u8; 1];
         self.reader.read_exact_at(&mut cell_flags_buf, self.pos)?;
         self.pos += 1;
@@ -1989,24 +2207,34 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // Cell path (complex/collection columns only): `uvint(len) + bytes`,
         // between the ttl and the value. Present for every element cell of a
         // complex column, gated purely by complex-ness (no cell-flag bit).
-        let path = if is_complex {
+        if is_complex {
             let (plen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            Some(self.read_value_bytes(plen as usize, "cell path")?)
+            self.read_value_bytes_into(
+                plen as usize,
+                "cell path",
+                out.path.get_or_insert_with(Vec::new),
+            )?;
         } else {
-            None
-        };
+            out.path = None;
+        }
 
         // Value (absent if HAS_EMPTY_VALUE is set). `value_type` is the
         // element/value type for a complex column, the column type for a simple one.
-        let value = if has_empty_value {
-            None
+        if has_empty_value {
+            out.value.get_or_insert_with(Vec::new).clear();
+            if let Some(span) = span.as_mut() {
+                **span = ValueSpan {
+                    offset: self.pos,
+                    len: 0,
+                };
+            }
         } else if is_complex {
             // A collection element value is always length-prefixed (uvint), even
             // when its element type is fixed-width — matching Cassandra.
             let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            Some(self.read_value_bytes(vlen as usize, "cell value")?)
+            self.read_value_or_span(vlen as usize, out.value.get_or_insert_with(Vec::new), span)?;
         } else {
             let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
                 if self.legacy_fixed_value_lengths {
@@ -2024,25 +2252,24 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 self.pos += n as u64;
                 vlen as usize
             };
-            Some(self.read_value_bytes(vlen, "cell value")?)
+            self.read_value_or_span(vlen, out.value.get_or_insert_with(Vec::new), span)?;
         };
 
-        let cell = if is_deleted {
-            CellValue::tombstone(timestamp, local_deletion_time)
-        } else if is_expiring {
-            CellValue::expiring(
-                value.unwrap_or_default(),
-                timestamp,
-                ttl,
-                local_deletion_time,
-            )
+        out.timestamp = timestamp;
+        out.ttl = if is_expiring && !is_deleted {
+            ttl
         } else {
-            CellValue::live(value.unwrap_or_default(), timestamp)
+            ferrosa_common::NO_TTL
         };
-        Ok(match path {
-            Some(p) => cell.with_path(p),
-            None => cell,
-        })
+        out.local_deletion_time = if is_deleted || is_expiring {
+            local_deletion_time
+        } else {
+            ferrosa_common::NO_DELETION_TIME
+        };
+        if is_deleted {
+            out.value = None;
+        }
+        Ok(())
     }
 }
 

@@ -239,9 +239,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   cap now derive from the node's CPU count and configured memory (cgroup v2/v1
   limit, else system RAM) — at most `cpus`, and at most `memory/2 ÷ 256 MB`
   concurrent merges (keeping peak compaction memory under half the limit),
-  clamped to 8. Since compaction streams a partition-group at a time (per-task
-  memory ≈ widest partition × inputs, not the whole SSTable), the old fixed cap
-  of 2 was over-conservative. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
+  clamped to 8. Compaction keeps one reusable row per input plus one output row,
+  worker-owned chunk buffers and the bounded writer pumps. Its payload working
+  set depends on maximum row width and fan-in, rather than partition length. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
   `FERROSA_COMPACTION_WORKERS` still override; the resolved values are logged at
   startup.
   **Direct-read + read-ahead input (on by default):** compaction
@@ -274,7 +274,8 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
  retained until the table itself is dropped, so a stale replica's pre-truncate
  copy can never be resurrected. If every
  partition purges away, one is written unpurged (an empty output cannot be swapped
- in) and counted. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
+ in) and counted. The candidate's rows spool to staging disk; only its header and
+ static row are retained. No full-partition defensive clone is made. Metrics: `ferrosa_storage_compaction_purged_markers_total`,
  `..._purge_held_back_total`, `..._purge_policy_errors_total`.
   **Flush fix:** a partition holding only a partition-level delete (no rows, no static
   row) is now flushed; it used to be dropped as empty, losing the delete.
@@ -293,12 +294,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   file unselected indefinitely), chunked by the same `max_threshold` /
   `max_compaction_bytes` bounds as STCS, one task per chunk; `maybe_compact`
   excludes files a strategy task already covers to avoid overlapping repairs.
-  **Compaction output is always monotonic:** because `merge::merge_partitions`
-  returns a single-source partition in its on-disk order, the executor runs
-  `merge::ensure_partition_rows_sorted` on every merged partition (a cheap O(n)
-  `is_sorted` check for the already-sorted common case), so even a 1-input legacy
-  rewrite re-sorts each partition — permanently fixing the on-disk order the
-  streaming read path assumes.
+  **Compaction output is always monotonic:** `compaction::stream` merges rows
+  by clustering key, checks modern input ordering and uses the bounded external
+  sorter for legacy inputs (4 MiB resident sort budget plus one row, bounded
+  disk merge fan-in). A stable input ordinal preserves tie order across runs.
+  `begin_partition` / `write_partition_row` / `end_partition` write staged BTI
+  output incrementally. Streamed clustered partitions index every row, including
+  small partitions, so emission needs no row-count lookahead.
   **Promote directory fsync before input eviction (T-001, FMEA ST-30):**
   `promote_compaction_output` renames the staged output into
   `sstables/<table>/<gen>` and then fsyncs `sstables/<table>/` itself, reusing
@@ -1560,3 +1562,32 @@ clear the pause and retry streak; the next failure starts at the initial delay.
 ## jsonb (T-150)
 
 `external_sort` payload accounting counts the canonical jsonb bytes (T-150); a document-sized value never accounts as 0.
+
+## Compaction allocation contract (2026-10-23)
+
+The merge and decode buffers belong to each worker. Sequential `scan_iter`
+bypasses shared compressed/CRC chunk-cache mutexes; output verification fully
+decodes rows into reusable storage and still rejects truncation and checksum
+failures. Existing admission, reader-pool, I/O and publication synchronization
+remain; this is not a claim that the entire storage engine is lock-free.
+
+Modern clustered input heads retain cell metadata and bounds-checked logical
+value offsets. Ordinary losing values are never owned; selected values fill
+reusable output storage.
+Equal-timestamp value ties use two reusable comparison buffers. Every skipped
+range still validates its chunks and length. This bounds payload memory by the
+output row and comparison buffers, plus per-input metadata/chunk/read-ahead
+buffers. It does not claim constant memory for arbitrarily wide individual rows
+or zero copying. Static rows remain owned while partition headers reconcile,
+so the worst-case bound also includes static-row width times fan-in.
+Legacy rewrites keep owned row heads and sort through bounded spill buffers
+(4 MiB plus one row), rather than collecting complete partitions. Output index,
+Bloom and validation metadata remain; whole-task heap can vary with workload.
+No runtime dependency was added.
+
+`tests/compaction_alloc.rs` guards retained reconciliation vectors and allocation-
+free collection protection. `examples/compaction_allocation_probe.rs` exercises
+the public executor with allocation counts, allocated bytes, peak live heap,
+exact row/cell assertions, BTI point lookups and optional measured budgets.
+The reproducible Fly runner and evidence contract are in
+`../deploy/fly-compaction-probe/README.md`.

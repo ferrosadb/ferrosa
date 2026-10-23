@@ -1,0 +1,30 @@
+{
+  "application": "ferrosa database executable",
+  "build_command": "cargo build --release -p ferrosa --bin ferrosa",
+  "release_profile": "optimized + line-tables-only debug; split-debuginfo off; strip none",
+  "target": "x86_64-unknown-linux-gnu",
+  "rustc": "1.98.0",
+  "baseline_commit": "e2bc833dd2249abacf397f25bb49011f78da4962",
+  "candidate_source": "source-manifest.json frozen V5 hashes",
+  "baseline_built_before_candidate": true,
+  "build_exit": 0,
+  "candidate_build_elapsed_seconds": 376,
+  "baseline": {
+    "release_bytes": 461070664,
+    "stripped_bytes": 82320304,
+    "release_sha256": "d835cf804a1ab52e0766b65f95222f36c95ef2957ff886411a20c6a9cbd84beb",
+    "stripped_sha256": "9524dbe83350349f61fd17b21ff0b9ce5650f18bd777d7a53f2f4c7f732222bd"
+  },
+  "candidate": {
+    "release_bytes": 462224656,
+    "stripped_bytes": 82558048,
+    "release_sha256": "75964538ae62c83794c33100bacb3ce8cb4358abbc67e632cf0b38a2432a6ad1",
+    "stripped_sha256": "65da102f4c513c9079b90945d5e15e655ae4333e311bd794120f1cf676a95493"
+  },
+  "strip_command": "strip <copy of ferrosa>",
+  "interpretation": "small executable growth; correctness and measured performance take priority; no size reduction claimed",
+  "release_bytes_delta": 1153992,
+  "release_bytes_delta_percent": 0.25028527948158796,
+  "stripped_bytes_delta": 237744,
+  "stripped_bytes_delta_percent": 0.2888035981985615
+}

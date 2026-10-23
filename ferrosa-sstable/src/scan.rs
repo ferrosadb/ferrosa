@@ -293,6 +293,25 @@ impl<R: ReadAt> ReadAt for ReadAheadReader<R> {
         Ok(copied)
     }
 
+    fn read_at_sparse(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if buf.is_empty() || offset >= self.len {
+            return Ok(0);
+        }
+        let target = buf.len().min((self.len - offset) as usize);
+        let state = self.state.lock().expect("read-ahead state poisoned");
+        if let Some(cached) = state.window.slice_from(offset) {
+            if cached.len() >= target {
+                buf[..target].copy_from_slice(&cached[..target]);
+                return Ok(target);
+            }
+        }
+        // Metadata can jump past an entire payload and then revisit it. Keep
+        // the sequential window and its outstanding prefetch for payload reads.
+        drop(state);
+        self.inner.read_exact_at(&mut buf[..target], offset)?;
+        Ok(target)
+    }
+
     fn len(&self) -> Result<u64> {
         Ok(self.len)
     }
@@ -519,6 +538,28 @@ mod tests {
         let r = ReadAheadReader::with_prefetch(src, 1_024).expect("new");
         let err = scan_all(&r, 128).expect_err("second window must fail loudly");
         assert!(err.to_string().contains("injected source failure"), "{err}");
+    }
+
+    #[test]
+    fn sparse_failure_preserves_the_sequential_prefetch() {
+        let (src, _) = probe(8_192, Some(4_096));
+        let oracle = src.data[..4_096].to_vec();
+        let r = ReadAheadReader::with_prefetch(src, 1_024).unwrap();
+        let mut byte = [0u8; 1];
+        r.read_exact_at(&mut byte, 0).unwrap();
+        let error = r.read_at_sparse(&mut byte, 4_096).unwrap_err();
+        assert!(error.to_string().contains("injected source failure"));
+        let mut block = [0u8; 1_024];
+        for (i, expected) in oracle.chunks(1_024).enumerate() {
+            r.read_exact_at(&mut block, (i * 1_024) as u64).unwrap();
+            assert_eq!(block.as_slice(), expected);
+        }
+        assert_eq!(r.prefetch_hits(), 3);
+        assert!(r
+            .read_at(&mut byte, 4_096)
+            .unwrap_err()
+            .to_string()
+            .contains("injected source failure"));
     }
 
     #[test]

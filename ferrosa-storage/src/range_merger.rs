@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Keep deferred value spans aligned during compaction ordinal remapping.
+//! Correctness: Cursor parity, corruption and ordinal-remap tests.
+//!
 //! Lazy k-way merge across memtable + flushing memtable + SSTable
 //! iterators (ADR-020). Yields one merged-and-deletion-suppressed
 //! partition at a time in token order — no `Vec<Partition>` ever held
@@ -194,6 +198,33 @@ impl ColumnOrdinalMapping {
                 is_identity(&mapping.static_columns) && mapping.regular_columns.is_empty();
         }
         mapping
+    }
+
+    /// Remap a deferred compaction row while retaining each value's source span.
+    /// Canonical cell ordering is supplied by the compaction winner selector;
+    /// sorting the cells here alone would detach offsets from their identities.
+    pub(crate) fn remap_regular_metadata(
+        &self,
+        row: &mut Row,
+        spans: &mut Vec<ferrosa_sstable::data::ValueSpan>,
+        span_indices: &mut Vec<usize>,
+    ) {
+        if self.identity {
+            return;
+        }
+        let mut used = 0;
+        for i in 0..row.cells.len() {
+            if let Some(Some(target)) = self.regular_columns.get(row.cells[i].0 as usize) {
+                row.cells[i].0 = *target;
+                row.cells.swap(used, i);
+                spans.swap(used, i);
+                span_indices.swap(used, i);
+                used += 1;
+            }
+        }
+        row.cells.truncate(used);
+        spans.truncate(used);
+        span_indices.truncate(used);
     }
 
     /// Mapping for REWRITING SSTables into an SSTable (compaction, spill

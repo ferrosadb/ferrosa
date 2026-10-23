@@ -1,0 +1,374 @@
+{
+  "baseline": {
+    "256,1,4,128,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 10118519,
+        "median": 10573429,
+        "max": 12061329
+      },
+      "alloc_events": {
+        "min": 8903,
+        "median": 8903,
+        "max": 8906
+      },
+      "allocated_bytes": {
+        "min": 20492141,
+        "median": 20492141,
+        "max": 20492336
+      },
+      "peak_live_delta_bytes": {
+        "min": 14123123,
+        "median": 14123123,
+        "max": 14123318
+      }
+    },
+    "2048,1,4,128,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 28177868,
+        "median": 31089228,
+        "max": 36712858
+      },
+      "alloc_events": {
+        "min": 64557,
+        "median": 64557,
+        "max": 64557
+      },
+      "allocated_bytes": {
+        "min": 37123130,
+        "median": 37123130,
+        "max": 37123130
+      },
+      "peak_live_delta_bytes": {
+        "min": 23924571,
+        "median": 23924571,
+        "max": 23924571
+      }
+    },
+    "16384,1,4,128,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 204837548,
+        "median": 358904218,
+        "max": 364974028
+      },
+      "alloc_events": {
+        "min": 509499,
+        "median": 509504,
+        "max": 509504
+      },
+      "allocated_bytes": {
+        "min": 143464087,
+        "median": 143464519,
+        "max": 143464519
+      },
+      "peak_live_delta_bytes": {
+        "min": 66444125,
+        "median": 66444557,
+        "max": 66444557
+      }
+    },
+    "64,128,4,64,False,True,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 79846245,
+        "median": 88174125,
+        "max": 113260413
+      },
+      "alloc_events": {
+        "min": 292480,
+        "median": 292480,
+        "max": 292480
+      },
+      "allocated_bytes": {
+        "min": 76174164,
+        "median": 76174164,
+        "max": 76174164
+      },
+      "peak_live_delta_bytes": {
+        "min": 25964918,
+        "median": 25964918,
+        "max": 25964918
+      }
+    },
+    "2048,1,4,128,True,True,True": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 54353647,
+        "median": 58557657,
+        "max": 62461856
+      },
+      "alloc_events": {
+        "min": 134496,
+        "median": 134496,
+        "max": 134496
+      },
+      "allocated_bytes": {
+        "min": 42889360,
+        "median": 42889360,
+        "max": 42889360
+      },
+      "peak_live_delta_bytes": {
+        "min": 23154489,
+        "median": 23154489,
+        "max": 23154489
+      }
+    },
+    "256,1,4,16384,False,False,True": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 77596685,
+        "median": 78224875,
+        "max": 82744805
+      },
+      "alloc_events": {
+        "min": 19838,
+        "median": 19838,
+        "max": 19838
+      },
+      "allocated_bytes": {
+        "min": 105943269,
+        "median": 105943269,
+        "max": 105943269
+      },
+      "peak_live_delta_bytes": {
+        "min": 54849170,
+        "median": 54849170,
+        "max": 54849170
+      }
+    },
+    "2048,1,16,64,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 80243055,
+        "median": 85305005,
+        "max": 103586624
+      },
+      "alloc_events": {
+        "min": 238344,
+        "median": 238344,
+        "max": 238348
+      },
+      "allocated_bytes": {
+        "min": 86612038,
+        "median": 86612038,
+        "max": 86612281
+      },
+      "peak_live_delta_bytes": {
+        "min": 53827623,
+        "median": 53827623,
+        "max": 53827866
+      }
+    },
+    "1,1,4,8388608,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 868455719,
+        "median": 884145147,
+        "max": 888304106
+      },
+      "alloc_events": {
+        "min": 13798,
+        "median": 13798,
+        "max": 13801
+      },
+      "allocated_bytes": {
+        "min": 161190753,
+        "median": 161190753,
+        "max": 161216913
+      },
+      "peak_live_delta_bytes": {
+        "min": 88275072,
+        "median": 88275072,
+        "max": 88288128
+      }
+    }
+  },
+  "candidate": {
+    "256,1,4,128,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 8719309,
+        "median": 9479609,
+        "max": 10767619
+      },
+      "alloc_events": {
+        "min": 1057,
+        "median": 1057,
+        "max": 1061
+      },
+      "allocated_bytes": {
+        "min": 18838353,
+        "median": 18838353,
+        "max": 18838596
+      },
+      "peak_live_delta_bytes": {
+        "min": 13340878,
+        "median": 13340878,
+        "max": 13341121
+      }
+    },
+    "2048,1,4,128,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 19127259,
+        "median": 20346828,
+        "max": 21841649
+      },
+      "alloc_events": {
+        "min": 1684,
+        "median": 1684,
+        "max": 1684
+      },
+      "allocated_bytes": {
+        "min": 23236600,
+        "median": 23236600,
+        "max": 23236600
+      },
+      "peak_live_delta_bytes": {
+        "min": 17199270,
+        "median": 17199270,
+        "max": 17199270
+      }
+    },
+    "16384,1,4,128,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 98425384,
+        "median": 301563292,
+        "max": 304609581
+      },
+      "alloc_events": {
+        "min": 6678,
+        "median": 6680,
+        "max": 6682
+      },
+      "allocated_bytes": {
+        "min": 31733561,
+        "median": 31733705,
+        "max": 31733897
+      },
+      "peak_live_delta_bytes": {
+        "min": 21227568,
+        "median": 21227712,
+        "max": 21227904
+      }
+    },
+    "64,128,4,64,False,True,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 52237186,
+        "median": 62037276,
+        "max": 89340665
+      },
+      "alloc_events": {
+        "min": 7371,
+        "median": 7371,
+        "max": 7371
+      },
+      "allocated_bytes": {
+        "min": 28121149,
+        "median": 28121149,
+        "max": 28121149
+      },
+      "peak_live_delta_bytes": {
+        "min": 21224254,
+        "median": 21224254,
+        "max": 21224254
+      }
+    },
+    "2048,1,4,128,True,True,True": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 33424558,
+        "median": 36045398,
+        "max": 39355448
+      },
+      "alloc_events": {
+        "min": 3238,
+        "median": 3238,
+        "max": 3238
+      },
+      "allocated_bytes": {
+        "min": 19606900,
+        "median": 19606900,
+        "max": 19606900
+      },
+      "peak_live_delta_bytes": {
+        "min": 13434398,
+        "median": 13434398,
+        "max": 13434398
+      }
+    },
+    "256,1,4,16384,False,False,True": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 77115205,
+        "median": 77908065,
+        "max": 81594085
+      },
+      "alloc_events": {
+        "min": 2084,
+        "median": 2084,
+        "max": 2088
+      },
+      "allocated_bytes": {
+        "min": 24214922,
+        "median": 24214922,
+        "max": 24215165
+      },
+      "peak_live_delta_bytes": {
+        "min": 13313048,
+        "median": 13313048,
+        "max": 13313291
+      }
+    },
+    "2048,1,16,64,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 43259098,
+        "median": 43602648,
+        "max": 47609597
+      },
+      "alloc_events": {
+        "min": 3052,
+        "median": 3052,
+        "max": 3056
+      },
+      "allocated_bytes": {
+        "min": 41001711,
+        "median": 41001711,
+        "max": 41001972
+      },
+      "peak_live_delta_bytes": {
+        "min": 35067298,
+        "median": 35067298,
+        "max": 35067346
+      }
+    },
+    "1,1,4,8388608,False,False,False": {
+      "n": 7,
+      "elapsed_ns": {
+        "min": 880974377,
+        "median": 884578598,
+        "max": 888242337
+      },
+      "alloc_events": {
+        "min": 982,
+        "median": 982,
+        "max": 986
+      },
+      "allocated_bytes": {
+        "min": 43467689,
+        "median": 43467689,
+        "max": 43467950
+      },
+      "peak_live_delta_bytes": {
+        "min": 29626284,
+        "median": 29626284,
+        "max": 29626332
+      }
+    }
+  }
+}

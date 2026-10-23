@@ -540,30 +540,12 @@ async fn has_keyspace(node: &Node, keyspace: &str) -> bool {
 /// The acceptance proof for the cross-DC relay: a keyspace created through CQL on
 /// a node in `us-west-2` must appear on the nodes of `eu-west-1`.
 ///
-/// PINNED RED — the topology it needs is not expressible with two processes, and
-/// the reason is a property of the deployment declaration rather than of the
-/// relay:
-///
-/// - A node accepts native-protocol connections only when its *local* Raft
-///   group's voter count reaches `FERROSA_EXPECTED_CLUSTER_SIZE`
-///   (`ModeController::accepts_cql_connections` → `declared_topology_is_ready`).
-///   Raft groups are per-DC, so EVERY DC must carry `expected_cluster_size`
-///   voters: the smallest two-DC cluster in which both DCs answer CQL is
-///   `2 x expected` nodes — six, at the default of three (CL-76).
-/// - Two nodes are the pair path by design (`declared_topology_is_ready` maps
-///   `expected == 2` to Pair + Primary), which is a different replication model,
-///   and a node declared `expected == 1` leaves Standalone the moment it meets a
-///   peer. Verified against two live processes: the west node logged
-///   `mode transition: -> pair` (west, `expected=1`) and `reverse connection
-///   established`.
-///
-/// So the test is written for six real processes — three voters in each DC — and
-/// is `#[ignore]`d until that is run (locally, or on the two-region fly deployment
-/// where it belongs). It has NOT been executed; the relay beneath it HAS: one copy
-/// per remote DC on real three-voter groups (ferrosa-cluster/tests/
-/// cross_dc_ddl_relay.rs), plus the runtime registry and the DDL-path seam in unit
-/// tests. What remains unproven is the end-to-end path across two live processes'
-/// handshake.
+/// Each DC needs its own three-voter Raft group. Two nodes declared with
+/// expected size two exercise pair replication, and expected size one only
+/// permits standalone readiness. This proof therefore runs six real processes,
+/// three voters per DC, through one CQL CREATE and bounded convergence checks.
+/// Readiness must include Cluster DDL publication: a live leader with Direct
+/// DDL can acknowledge a local CREATE before the cross-DC relay is installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ddl_created_in_one_dc_reaches_the_other() {
     const VOTERS_PER_DC: usize = 3;

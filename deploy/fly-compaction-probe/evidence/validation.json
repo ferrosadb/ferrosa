@@ -1,0 +1,132 @@
+{
+  "fly": {
+    "normal_scan": {
+      "passed": 16,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0
+    },
+    "cursor": {
+      "passed": 1,
+      "failed": 0,
+      "exit": 0
+    },
+    "physical_io_cursor": {
+      "passed": 1,
+      "failed": 0,
+      "exit": 0
+    },
+    "compaction": {
+      "passed": 272,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0
+    },
+    "compaction_allocation": {
+      "passed": 1,
+      "failed": 0,
+      "exit": 0
+    },
+    "two_shape_peak": {
+      "passed": 1,
+      "failed": 0,
+      "exit": 0
+    },
+    "full_sstable": {
+      "unit_integration_passed": 508,
+      "doctests_passed": 7,
+      "passed_total": 515,
+      "failed": 0,
+      "ignored": 0,
+      "exit": 0,
+      "raw_log_sha256": "2f46ea983ba6165260113d2d2aa3d215f13b0815f400f60d34a326d7f2a0ef7b"
+    },
+    "paired_exact_content_probes": {
+      "passed": 112,
+      "failed": 0
+    },
+    "bounded_io_control_probes": {
+      "passed": 24,
+      "failed": 0
+    },
+    "node_build": {
+      "exit": 0,
+      "elapsed_seconds": 376
+    }
+  },
+  "local_final_v5": {
+    "sstable_lib_tests": {
+      "passed": 510,
+      "failed": 0,
+      "skipped": 0,
+      "exit": 0
+    },
+    "storage_lib_tests": {
+      "passed": 2082,
+      "failed": 0,
+      "skipped": 0,
+      "exit": 0
+    },
+    "clippy": "all-targets/all-features -D warnings passed",
+    "docs": "workspace -D warnings passed",
+    "fmt": "passed",
+    "p0_oom_audit": "passed",
+    "precommit": "31 intended paths passed",
+    "miri_sparse_failure": "passed",
+    "stream_lcov": "543/608 = 89.31%; stream source unchanged after V4",
+    "fuzz": "V4 sstable_offsets/checksum_parsing each60s passed; predates V5 sparse read hints",
+    "build_all_targets": {
+      "exit": 0,
+      "elapsed_ms": 365436,
+      "warning": "existing Apple ld __eh_frame >16 MB compact-unwind warning; separate from zero Clippy warnings"
+    }
+  },
+  "known_limitations": {
+    "t_97fb1f1c": "unchanged isolated port-band assertion fails full workspace and CI mirror",
+    "t_71b33c44": "full cursor Miri existing crossbeam/Rayon Stacked Borrows retag failure",
+    "t_8ec7ed26": "unchanged lockfile audit32vulnerabilities17warnings",
+    "t_8badc9dc": "stream refactoring plus unused modern sorter path formatting follow-up"
+  },
+  "commands": {
+    "fly_full_sstable": "cargo test --release -p ferrosa-sstable -- --test-threads=1",
+    "fly_compaction": "cargo test --release -p ferrosa-storage --lib compaction -- --test-threads=1",
+    "fly_guards": "cargo test --release -p ferrosa-storage --test compaction_alloc --test compaction_streaming_peak -- --test-threads=1 --nocapture"
+  },
+  "cleanup": "task-owned Fly app and machine destroyed after final artifacts collected; cleanup.json",
+  "harness_sha256_both_arms": "010d54963a330b004d7264460d9d5d68b815b5f6faf53b6df5f66912d4c84f3c",
+  "raw_final_archive_sha256": "492f556d55f194c414ac78810c819681b9ad09aba4a051123fc0ce169b8e7c01",
+  "final_budget_measurements": {
+    "final-v5-64B-green.log": {
+      "correct": true,
+      "rows": 2048,
+      "partitions": 1,
+      "fanin": 4,
+      "value_bytes": 64,
+      "complex": false,
+      "purge": false,
+      "compressed": false,
+      "repetition": 0,
+      "alloc_events": 1621,
+      "allocated_bytes": 20859686,
+      "peak_live_delta_bytes": 15106462,
+      "elapsed_ns": 20133939,
+      "peak_budget_bytes": 16777216
+    },
+    "final-v5-large-green.log": {
+      "correct": true,
+      "rows": 1,
+      "partitions": 1,
+      "fanin": 4,
+      "value_bytes": 8388608,
+      "complex": false,
+      "purge": false,
+      "compressed": false,
+      "repetition": 0,
+      "alloc_events": 980,
+      "allocated_bytes": 43467687,
+      "peak_live_delta_bytes": 29626284,
+      "elapsed_ns": 885272007,
+      "peak_budget_bytes": 33554432
+    }
+  }
+}

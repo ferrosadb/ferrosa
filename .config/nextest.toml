@@ -118,6 +118,15 @@ filter = "binary(pump_loom)"
 test-group = "compile-bound"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
+# This fixture builds a large graph and checks production commit-log admission
+# against its unchanged two-second unsynced-write deadline. In the wide CI run
+# it failed at 2029 ms while unrelated process/storage tests competed for I/O;
+# the serial cargo mirror passed. Reserve every runner slot for this fixture,
+# preserving the workload, assertions and durability deadline.
+[[profile.default.overrides]]
+filter = "binary(adjacency_deploy_heal) and test(slow::deploy_heal_at_memory_cluster_scale)"
+threads-required = "num-test-threads"
+
 [profile.default]
 # A test that hangs must not hang CI. This is a backstop, not a budget: normal
 # tests finish in milliseconds, and the overrides above carry the real limits.

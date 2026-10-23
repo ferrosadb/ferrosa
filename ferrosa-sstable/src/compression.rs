@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Decode compressed chunks into bounded reusable storage.
+//! Correctness: Cursor parity, corruption and ordinal-remap tests.
+//!
 //! Compression and CompressionInfo for SSTable data chunks.
 //!
 //! SSTable data is stored in compressed chunks (default 16KB uncompressed).
@@ -35,6 +39,7 @@ pub enum Compression {
 }
 
 thread_local! {
+    static ZSTD_DCTX: RefCell<Option<zstd::bulk::Decompressor<'static>>> = const { RefCell::new(None) };
     /// A per-thread, lazily-created zstd compression context, reused across
     /// `compress_into` calls at the same level.
     ///
@@ -269,6 +274,49 @@ impl Compression {
             Compression::Lz4 => lz4_flex::decompress_size_prepended(data)
                 .map_err(|e| Error::InvalidData(format!("LZ4 decompression failed: {e}"))),
             Compression::Zstd { .. } => zstd::decode_all(data).map_err(Error::Io),
+        }
+    }
+
+    /// Decode into bounded caller-owned storage. Malformed or oversized frames
+    /// fail instead of expanding a buffer from a wire-declared size.
+    pub fn decompress_into(&self, data: &[u8], dst: &mut [u8]) -> Result<usize> {
+        match self {
+            Self::None => {
+                if data.len() > dst.len() {
+                    return Err(Error::InvalidData(
+                        "decompression destination too small".into(),
+                    ));
+                }
+                dst[..data.len()].copy_from_slice(data);
+                Ok(data.len())
+            }
+            Self::Lz4 => {
+                let prefix = data
+                    .get(..4)
+                    .ok_or_else(|| Error::InvalidData("truncated LZ4 prefix".into()))?;
+                let len = u32::from_le_bytes(prefix.try_into().expect("four bytes")) as usize;
+                if len > dst.len() {
+                    return Err(Error::InvalidData(
+                        "LZ4 declared length exceeds destination".into(),
+                    ));
+                }
+                let n = lz4_flex::block::decompress_into(&data[4..], &mut dst[..len])
+                    .map_err(|e| Error::InvalidData(format!("LZ4 decompression failed: {e}")))?;
+                if n != len {
+                    return Err(Error::InvalidData("LZ4 declared length mismatch".into()));
+                }
+                Ok(n)
+            }
+            Self::Zstd { .. } => ZSTD_DCTX.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(zstd::bulk::Decompressor::new()?);
+                }
+                slot.as_mut()
+                    .expect("initialized decoder")
+                    .decompress_to_buffer(data, dst)
+                    .map_err(Error::Io)
+            }),
         }
     }
 
