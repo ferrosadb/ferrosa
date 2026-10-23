@@ -12457,13 +12457,25 @@ async fn route_create_index(
         .name
         .unwrap_or_else(|| format!("{}_{}_idx", s.table, s.columns.join("_")));
 
-    if s.if_not_exists
-        && state.schema.snapshot().indexes.contains_key(&(
-            ks.to_string(),
-            s.table.clone(),
-            index_name.clone(),
-        ))
-    {
+    let existing = s
+        .if_not_exists
+        .then(|| {
+            state
+                .schema
+                .snapshot()
+                .indexes
+                .get(&(ks.to_string(), s.table.clone(), index_name.clone()))
+                .cloned()
+        })
+        .flatten();
+    if let Some(existing) = existing {
+        // The schema alone does not make the index exist for a client: the
+        // `system_schema.indexes` row is written separately and its failure is
+        // only logged. Answering OK over a missing row is how a migration
+        // retry stayed stuck forever (t_7512889f).
+        if !index_registration_persisted(&state.engine, &existing)? {
+            repair_index_registration(state, existing).await?;
+        }
         return Ok(result::encode_schema_change(
             "CREATED",
             "TABLE",
@@ -14910,13 +14922,7 @@ mod like_match_tests {
 /// schema-only deployment) is logged loudly but does not fail CREATE INDEX —
 /// the index is still live in the Registry and is repersisted at next boot.
 fn persist_index_row_direct(engine: &StorageEngine, index: &IndexMetadata) {
-    let row = ferrosa_schema::system::persistence::index_to_rows(index);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    let tid = TableId::new("system_schema", "indexes");
-    if let Err(e) = engine.write(&tid, &row.key, row.row, ts) {
+    if let Err(e) = write_index_row(engine, index) {
         tracing::warn!(
             %e,
             keyspace = %index.keyspace,
@@ -14925,6 +14931,86 @@ fn persist_index_row_direct(engine: &StorageEngine, index: &IndexMetadata) {
             "router: failed to persist system_schema.indexes row (Direct DDL)"
         );
     }
+}
+
+/// Write one index's `system_schema.indexes` row to this node's engine.
+fn write_index_row(engine: &StorageEngine, index: &IndexMetadata) -> ferrosa_common::Result<()> {
+    let row = ferrosa_schema::system::persistence::index_to_rows(index);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let tid = TableId::new("system_schema", "indexes");
+    engine.write(&tid, &row.key, row.row, ts)
+}
+
+/// Whether this node's persisted `system_schema.indexes` holds a row for
+/// `index` — the table `SELECT ... FROM system_schema.indexes` is served from.
+fn index_registration_persisted(
+    engine: &StorageEngine,
+    index: &IndexMetadata,
+) -> Result<bool, CqlError> {
+    let rows = engine
+        .read_persisted_indexes()
+        .map_err(|e| CqlError::ServerError(format!("read system_schema.indexes: {e}")))?;
+    Ok(rows.iter().any(|r| {
+        r.keyspace_name == index.keyspace
+            && r.table_name == index.table
+            && r.index_name == index.name
+    }))
+}
+
+/// Rewrite the registration row of an index the schema already holds but
+/// `system_schema.indexes` does not (t_7512889f).
+///
+/// Every DDL path records an index in the schema and writes its row as two
+/// steps, and a failed row write is logged rather than returned — so an
+/// interrupted or failed CREATE INDEX can leave the index live in the schema
+/// and invisible to every client that introspects it. `IF NOT EXISTS` is the
+/// retry a client issues to converge, so it re-applies the existing metadata
+/// through the current DDL path instead of answering OK over the gap. The
+/// Raft and pair applies are idempotent on the schema and the engine (log
+/// replay already re-applies them after every restart) and write the row
+/// unconditionally, on every node.
+async fn repair_index_registration(
+    state: &SharedState,
+    index: IndexMetadata,
+) -> Result<(), CqlError> {
+    tracing::warn!(
+        keyspace = %index.keyspace,
+        table = %index.table,
+        index = %index.name,
+        "CREATE INDEX IF NOT EXISTS: index is in the schema but its system_schema.indexes \
+         row is missing — rewriting the registration"
+    );
+    let ddl_guard = state.ddl_path.load();
+    let ddl = &**ddl_guard;
+    match ddl {
+        DdlPath::Direct { .. } => {
+            write_index_row(&state.engine, &index).map_err(|e| {
+                CqlError::ServerError(format!(
+                    "failed to rewrite system_schema.indexes row for {}.{}.{}: {e}",
+                    index.keyspace, index.table, index.name
+                ))
+            })?;
+        }
+        DdlPath::Pair(coordinator) => {
+            coordinator
+                .coordinate_ddl(DdlOperation::CreateIndex(index))
+                .await?;
+        }
+        DdlPath::Cluster { .. } => {
+            ddl.execute(DdlOperation::CreateIndex(index))
+                .await
+                .map_err(CqlError::from)?;
+        }
+        DdlPath::Unavailable | DdlPath::Forming { .. } => {
+            return Err(CqlError::ServerError(
+                "DDL unavailable: peer lost".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Tombstone a `system_schema.indexes` row for standalone (Direct) DROP INDEX.
@@ -19809,6 +19895,100 @@ mod tests {
             1,
             "WHERE index_name filter must match the persisted row"
         );
+    }
+
+    /// t_7512889f: `CREATE INDEX IF NOT EXISTS` must not answer OK while the
+    /// index's `system_schema.indexes` registration is missing.
+    ///
+    /// The fixture registers the index in the schema Registry WITHOUT its
+    /// persisted row — the state a CREATE INDEX leaves behind when its row write
+    /// fails or the node restarts between the two (both are logged, not
+    /// returned). ferrosa-memory's migration retry then reissues the statement
+    /// with `IF NOT EXISTS` and probes `system_schema.indexes`, which is served
+    /// from the persisted rows. Before the fix the retry short-circuits on the
+    /// Registry alone, returns OK, and the probe finds nothing, so the migration
+    /// fails its postcondition forever.
+    ///
+    /// RED as written: the retry returns OK and the VALUE assertion on the
+    /// persisted row fails; it fails on the short-circuit's behaviour, not on a
+    /// missing symbol.
+    #[tokio::test]
+    async fn create_index_if_not_exists_repairs_missing_registration_row() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE regidx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE regidx.users (id int PRIMARY KEY, email text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        // Drift: the Registry knows the index, the persisted table does not.
+        state
+            .schema
+            .create_index_internal(ferrosa_schema::IndexMetadata {
+                keyspace: "regidx".to_string(),
+                table: "users".to_string(),
+                name: "regidx_email".to_string(),
+                index_type: ferrosa_index::IndexType::BTree,
+                target_columns: vec!["email".to_string()],
+                filter_predicate: None,
+                options: std::collections::HashMap::new(),
+            })
+            .unwrap();
+        let persisted_before = state.engine.read_persisted_indexes().unwrap();
+        assert!(
+            !persisted_before
+                .iter()
+                .any(|r| r.keyspace_name == "regidx" && r.index_name == "regidx_email"),
+            "precondition: the registration row must be absent, got {persisted_before:?}"
+        );
+
+        let retry =
+            crate::parser::parse("CREATE INDEX IF NOT EXISTS regidx_email ON regidx.users (email)")
+                .unwrap();
+        route(&state, &ctx, retry).await.unwrap();
+
+        let persisted: Vec<(String, String, String)> = state
+            .engine
+            .read_persisted_indexes()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.keyspace_name == "regidx")
+            .map(|r| (r.keyspace_name, r.table_name, r.index_name))
+            .collect();
+        assert_eq!(
+            persisted,
+            vec![(
+                "regidx".to_string(),
+                "users".to_string(),
+                "regidx_email".to_string()
+            )],
+            "IF NOT EXISTS answered OK, so the registration row must exist afterwards"
+        );
+
+        // And the probe a migration runner uses must see it through CQL.
+        let stmt = crate::parser::parse(
+            "SELECT * FROM system_schema.indexes WHERE index_name = 'regidx_email'",
+        )
+        .unwrap();
+        let RouteResult::Result(body) = route(&state, &ctx, stmt).await.unwrap() else {
+            panic!("expected Rows result");
+        };
+        assert_eq!(extract_row_count(&body), 1);
     }
 
     /// Proves the `system_schema.indexes` read path is backed by *storage*, not

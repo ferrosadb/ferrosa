@@ -5709,6 +5709,87 @@ mod tests {
         assert_eq!(remaining[0].index_name, "survivor_idx");
     }
 
+    /// t_7512889f: re-applying a `CreateIndex` whose registration row was lost
+    /// must write the row and leave the index built.
+    ///
+    /// `CREATE INDEX IF NOT EXISTS` in the CQL router repairs a missing
+    /// `system_schema.indexes` row in cluster mode by proposing the existing
+    /// metadata again, so this apply has to be idempotent on the schema and the
+    /// engine and must not skip the row because the index is already known.
+    /// The fixture loses the row the way production does: the system table is
+    /// not registered yet, so the write fails and is only logged.
+    ///
+    /// Regression guard, not the red: it passes on the parent commit too. The
+    /// red for the repair is `create_index_if_not_exists_repairs_missing_registration_row`
+    /// in `ferrosa-cql`; this pins the premise its cluster arm relies on.
+    #[tokio::test]
+    async fn reapplied_create_index_rewrites_a_lost_registration_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = test_engine(dir.path());
+        let schema = Arc::new(test_schema_instance());
+        let mut sm =
+            FerrosStateMachine::with_side_effects(Arc::clone(&schema), Arc::clone(&engine));
+        let index = IndexMetadata {
+            keyspace: "regks".into(),
+            table: "tbl".into(),
+            name: "value_idx".into(),
+            index_type: ferrosa_index::IndexType::BTree,
+            target_columns: vec!["value".into()],
+            filter_predicate: None,
+            options: std::collections::HashMap::new(),
+        };
+
+        sm.apply(vec![
+            make_entry(1, 1, RaftOp::CreateKeyspace(simple_keyspace("regks"))),
+            make_entry(
+                1,
+                2,
+                RaftOp::CreateTable(Box::new(simple_table("regks", "tbl"))),
+            ),
+            make_entry(1, 3, RaftOp::CreateIndex(index.clone())),
+        ])
+        .await
+        .unwrap();
+        engine.register_system_tables().unwrap();
+        let table_id = TableId::new("regks", "tbl");
+        assert!(
+            engine.read_persisted_indexes().unwrap().is_empty(),
+            "precondition: the first apply's registration row must be lost"
+        );
+        assert!(
+            schema.snapshot().indexes.contains_key(&(
+                "regks".into(),
+                "tbl".into(),
+                "value_idx".into()
+            )),
+            "precondition: the schema must already hold the index"
+        );
+        assert!(
+            engine.declares_index(&table_id, "value_idx"),
+            "precondition: the first apply built the index"
+        );
+
+        sm.apply(vec![make_entry(1, 4, RaftOp::CreateIndex(index))])
+            .await
+            .unwrap();
+
+        let persisted: Vec<(String, String, String)> = engine
+            .read_persisted_indexes()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.keyspace_name, r.table_name, r.index_name))
+            .collect();
+        assert_eq!(
+            persisted,
+            vec![("regks".into(), "tbl".into(), "value_idx".into())],
+            "the re-applied CreateIndex must rewrite the lost registration row"
+        );
+        assert!(
+            engine.declares_index(&table_id, "value_idx"),
+            "re-applying must leave the index built"
+        );
+    }
+
     #[test]
     fn leave_node_cleans_node_from_index_state_map() {
         let mut sm = FerrosStateMachine::new();
