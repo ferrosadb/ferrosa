@@ -1652,6 +1652,11 @@ pub struct StorageEngine {
     /// `disk_free_bytes_cached()` at most ~once per second. Reading this on the
     /// per-write admission path keeps the blocking `statvfs` syscall off the
     /// async worker threads (raft apply, coordinator, CQL handlers).
+    /// Set by [`StorageEngine::shutdown`] before its first flush. From then on
+    /// write admission refuses every write: the memtables it would land in
+    /// are never flushed again and the commit log stops syncing, so an
+    /// acknowledged write would be lost on restart (t_1e8c4354).
+    shutting_down: AtomicBool,
     cached_disk_free_bytes: AtomicU64,
     /// Milliseconds since [`reference_instant`] of the last successful disk-free
     /// refresh. `u64::MAX` is the sentinel for "never checked".
@@ -3253,6 +3258,13 @@ impl StorageEngine {
     }
 
     pub fn check_write_admission(&self) -> ferrosa_common::Result<()> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "storage engine is shutting down: write refused (it would be acknowledged \
+                 but never persisted) path={}",
+                self.config.data_dir.display()
+            )));
+        }
         let reserve = self.config.local_disk_free_reserve_bytes;
         if reserve == 0 {
             return Ok(());
@@ -3603,6 +3615,7 @@ impl StorageEngine {
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
@@ -3865,6 +3878,7 @@ impl StorageEngine {
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
@@ -4158,6 +4172,7 @@ impl StorageEngine {
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
@@ -13427,9 +13442,17 @@ impl StorageEngine {
 
     /// Shuts down the storage engine gracefully.
     ///
-    /// Flushes all dirty memtables, stops the compaction executor,
-    /// shuts down the upload manager, and stops the commit log.
+    /// Closes write admission, then flushes all dirty memtables, stops the
+    /// compaction executor, shuts down the upload manager, and stops the
+    /// commit log.
+    ///
+    /// Admission closes FIRST: a write landing during or after the flush
+    /// would be acknowledged into a memtable that is never flushed again and a
+    /// commit-log buffer that is never synced again (t_1e8c4354).
     pub fn shutdown(&self) -> ferrosa_common::Result<()> {
+        self.shutting_down.store(true, Ordering::Release);
+        tracing::info!("storage-engine: shutdown started; refusing new writes");
+
         // Flush all tables.
         let table_ids: Vec<TableId> = self.tables.load().keys().cloned().collect();
         for table_id in &table_ids {
@@ -16639,6 +16662,7 @@ impl StorageEngine {
             manifest_drift_flagged: AtomicBool::new(false),
             eviction_audit,
             s3_sync_requested: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
             cached_disk_free_bytes: AtomicU64::new(0),
             disk_free_checked_at_ms: AtomicU64::new(u64::MAX),
             flush_requested: AtomicBool::new(false),
@@ -35114,6 +35138,67 @@ mod tests {
             read_result.unwrap().rows[0].cells[0].1.value.as_deref(),
             Some(b"restart_val".as_slice()),
             "row value must be unchanged after restart"
+        );
+    }
+
+    /// t_1e8c4354: once `shutdown()` has flushed the memtables and stopped the
+    /// commit log, a write must be REFUSED, not acknowledged into a buffer
+    /// nothing will ever persist.
+    ///
+    /// Found on an installer VM: a client `CREATE INDEX` that arrived while the
+    /// node drained on SIGTERM wrote its `system_schema.indexes` row after the
+    /// flush, got OK, and the row was gone after the restart, while the schema
+    /// snapshot written later in the same shutdown kept the index. The client
+    /// then retried forever against an index the schema listed and the engine
+    /// had no record of.
+    ///
+    /// The row written BEFORE shutdown is the positive control: it proves this
+    /// reopen reconstructs data, so the late row's absence is about the late
+    /// write and not about a restart that rebuilds nothing.
+    ///
+    /// RED as written: the late write returns `Ok` and is lost on reopen; it
+    /// fails on the engine's admission behaviour, not on a missing symbol.
+    #[test]
+    fn a_write_after_shutdown_is_refused_and_never_acknowledged() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = TableId::new("test_ks", "test_table");
+
+        let late_write = {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            engine
+                .write(
+                    &tid,
+                    &make_key("before"),
+                    make_row(b"before_val", 1000),
+                    1000,
+                )
+                .unwrap();
+            engine.shutdown().unwrap();
+            engine.write(&tid, &make_key("late"), make_row(b"late_val", 2000), 2000)
+        };
+
+        let reopened =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        let before = reopened
+            .read(&tid, &make_key("before"))
+            .unwrap()
+            .expect("positive control: a row written before shutdown must survive the reopen");
+        assert_eq!(
+            before.rows[0].cells[0].1.value.as_deref(),
+            Some(b"before_val".as_slice())
+        );
+
+        let late_after_reopen = reopened.read(&tid, &make_key("late")).unwrap();
+        assert!(
+            late_write.is_err(),
+            "a write after shutdown was acknowledged; after the reopen it reads back as \
+             {late_after_reopen:?}"
+        );
+        assert!(
+            late_after_reopen.is_none(),
+            "a refused write must not appear after the reopen"
         );
     }
 

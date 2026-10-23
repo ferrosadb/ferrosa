@@ -78,6 +78,10 @@ fn setup_state_with_log_segment(segment_size: usize) -> (Arc<SharedState>, TempD
         cache_hot_window_secs: 900,
     };
     let engine = Arc::new(StorageEngine::new(engine_config, None).unwrap());
+    // Mirror the production boot (`main.rs`): system tables are registered
+    // before the node serves CQL. Without it, DDL that persists a
+    // `system_schema.*` row (CREATE INDEX) is refused (t_1e8c4354).
+    engine.register_system_tables().unwrap();
     let schema = Arc::new(
         Schema::new(SchemaConfig {
             hasher: PasswordHasher::Bcrypt { cost: 4 },

@@ -12500,7 +12500,16 @@ async fn route_create_index(
             // Dogfood: persist the system_schema.indexes row so the storage-backed
             // SELECT path returns it. The cluster/pair DDL paths persist this via
             // SystemTableWriter on the leader; standalone Direct mode writes it here.
-            persist_index_row_direct(&state.engine, &index_meta);
+            // The row is written BEFORE the Registry learns the index, and a
+            // failed write fails the statement: otherwise the Registry (and the
+            // schema.json snapshot taken from it) holds an index no persisted row
+            // backs, and the client is told OK (t_1e8c4354).
+            write_index_row(&state.engine, &index_meta).map_err(|e| {
+                CqlError::ServerError(format!(
+                    "CREATE INDEX {}.{}.{}: failed to persist its system_schema.indexes row: {e}",
+                    index_meta.keyspace, index_meta.table, index_meta.name
+                ))
+            })?;
             state.schema.create_index(index_meta, ctx.auth)?;
         }
         DdlPath::Pair(coordinator) => {
@@ -14908,32 +14917,11 @@ mod like_match_tests {
     }
 }
 
-/// Apply column selection (with `toJson()` support) to system table query results.
-///
-/// System table handlers build the full set of columns, then this function
-/// projects down to the columns requested in the `SELECT` list. If the
-/// `SELECT` list contains `toJson(col)`, the column value is serialized to
-/// a JSON string using [`bridge::cql_value_to_json`].
-/// Persist a `system_schema.indexes` row for standalone (Direct) DDL.
-///
-/// The cluster/pair DDL paths dogfood this via `SystemTableWriter` on the Raft
-/// leader; standalone mode has no such path, so the CQL router writes the row
-/// directly. A failure here (e.g. the system table is not registered in a
-/// schema-only deployment) is logged loudly but does not fail CREATE INDEX —
-/// the index is still live in the Registry and is repersisted at next boot.
-fn persist_index_row_direct(engine: &StorageEngine, index: &IndexMetadata) {
-    if let Err(e) = write_index_row(engine, index) {
-        tracing::warn!(
-            %e,
-            keyspace = %index.keyspace,
-            table = %index.table,
-            index = %index.name,
-            "router: failed to persist system_schema.indexes row (Direct DDL)"
-        );
-    }
-}
-
 /// Write one index's `system_schema.indexes` row to this node's engine.
+///
+/// Standalone (Direct) DDL has no `SystemTableWriter`, so the router writes the
+/// row itself. Callers fail the statement on error: the row is what every
+/// client introspects, and the Registry must never hold an index it lacks.
 fn write_index_row(engine: &StorageEngine, index: &IndexMetadata) -> ferrosa_common::Result<()> {
     let row = ferrosa_schema::system::persistence::index_to_rows(index);
     let ts = std::time::SystemTime::now()
@@ -19989,6 +19977,63 @@ mod tests {
             panic!("expected Rows result");
         };
         assert_eq!(extract_row_count(&body), 1);
+    }
+
+    /// t_1e8c4354: a CREATE INDEX whose `system_schema.indexes` row cannot be
+    /// written must fail, and must leave the schema Registry without the index.
+    ///
+    /// This is the installer-VM sequence: SIGTERM starts the storage shutdown
+    /// while a client's CREATE INDEX is in flight. The engine refuses the row
+    /// write once shutdown has begun, but the Direct path only logged that and
+    /// registered the index anyway, so the shutdown's `schema.json` snapshot
+    /// kept an index that no persisted row backs, and the client was told OK.
+    ///
+    /// RED as written: the statement returns Ok and the Registry holds the index;
+    /// it fails on the Direct arm's behaviour, not on a missing symbol.
+    #[tokio::test]
+    async fn create_index_fails_and_registers_nothing_when_its_row_cannot_be_written() {
+        let (state, _dir) = setup();
+        state.engine.register_system_tables().unwrap();
+
+        let ctx = RequestContext {
+            auth: &dev_auth(),
+            current_keyspace: &None,
+            consistency: ConsistencyLevel::One,
+            serial_consistency: None,
+            paging: crate::paging::PagingParams::default(),
+            client_address: String::new(),
+            protocol_version: 4,
+        };
+
+        for cql in [
+            "CREATE KEYSPACE shutidx WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE shutidx.users (id int PRIMARY KEY, email text)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(cql).unwrap())
+                .await
+                .unwrap();
+        }
+
+        state.engine.shutdown().unwrap();
+
+        let create =
+            crate::parser::parse("CREATE INDEX shutidx_email ON shutidx.users (email)").unwrap();
+        let outcome = route(&state, &ctx, create).await;
+
+        let registered = state.schema.snapshot().indexes.contains_key(&(
+            "shutidx".to_string(),
+            "users".to_string(),
+            "shutidx_email".to_string(),
+        ));
+        assert!(
+            outcome.is_err(),
+            "CREATE INDEX must fail when its registration row cannot be persisted \
+             (Registry holds the index: {registered})"
+        );
+        assert!(
+            !registered,
+            "a failed CREATE INDEX must not leave the index in the schema Registry"
+        );
     }
 
     /// Proves the `system_schema.indexes` read path is backed by *storage*, not
