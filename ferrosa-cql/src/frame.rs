@@ -176,6 +176,17 @@ pub struct CqlFrame {
 
 /// CQL v5 frame header size (uncompressed): 3 bytes header + 3 bytes CRC24.
 pub const V5_FRAME_HEADER_SIZE: usize = 6;
+/// Uncompressed v5 segment header width: payload length (17) + flag (1).
+pub const V5_UNCOMPRESSED_HEADER_SIZE: usize = 3;
+/// Compressed v5 segment header width: payload length (17) + uncompressed
+/// length (17) + flag (1), which spills into a fifth byte.
+///
+/// This width is decided by the NEGOTIATION, not per frame: once compression is
+/// on, every frame carries the extra field even when its own payload was not
+/// worth compressing (those set the uncompressed length to 0).
+pub const V5_COMPRESSED_HEADER_SIZE: usize = 5;
+/// Width of the CRC24 that follows a segment header.
+const V5_CRC24_SIZE: usize = 3;
 /// CQL v5 CRC32 trailer size.
 pub const V5_CRC32_SIZE: usize = 4;
 /// Maximum payload in a single v5 frame: 2^17 - 1 = 131,071 bytes.
@@ -288,21 +299,47 @@ impl CqlCodec {
         &mut self,
         src: &mut BytesMut,
     ) -> std::result::Result<Option<CqlFrame>, CqlError> {
-        if src.len() < V5_FRAME_HEADER_SIZE {
+        // A compressed v5 connection uses a FIVE-byte header carrying the
+        // uncompressed length alongside the payload length; an uncompressed one
+        // uses THREE. The width is a property of the negotiation, not of the
+        // individual frame, so it must be read from the codec -- reading three
+        // bytes off a compressed stream lands the CRC24 check on the wrong
+        // bytes and every frame fails.
+        let compressed_framing = self.compression.is_some();
+        let header_len = if compressed_framing {
+            V5_COMPRESSED_HEADER_SIZE
+        } else {
+            V5_UNCOMPRESSED_HEADER_SIZE
+        };
+
+        if src.len() < header_len + V5_CRC24_SIZE {
             return Ok(None);
         }
 
-        // Parse 3-byte header (little-endian).
-        let h0 = src[0] as u32;
-        let h1 = src[1] as u32;
-        let h2 = src[2] as u32;
-        let header_bits = h0 | (h1 << 8) | (h2 << 16);
-        let payload_len = (header_bits & 0x1FFFF) as usize; // bits 0-16
-        let is_self_contained = (header_bits >> 17) & 1 == 1; // bit 17
+        // Header fields are little-endian across `header_len` bytes.
+        let mut header_bits: u64 = 0;
+        for (i, &byte) in src[..header_len].iter().enumerate() {
+            header_bits |= (byte as u64) << (8 * i);
+        }
 
-        // Verify CRC24 of the 3 header bytes.
-        let expected_crc24 = src[3] as u32 | ((src[4] as u32) << 8) | ((src[5] as u32) << 16);
-        let actual_crc24 = crc24(&src[..3]);
+        let payload_len = (header_bits & 0x1FFFF) as usize; // bits 0-16
+        let (uncompressed_len, is_self_contained) = if compressed_framing {
+            // bits 17-33: uncompressed length (0 = this frame is not compressed)
+            let uncompressed = ((header_bits >> 17) & 0x1FFFF) as usize;
+            (uncompressed, (header_bits >> 34) & 1 == 1) // bit 34: flag
+        } else {
+            (0, (header_bits >> 17) & 1 == 1) // bit 17: flag
+        };
+
+        // Verify CRC24 over the whole header, whose width depends on framing.
+        let crc24_end = header_len + V5_CRC24_SIZE;
+        let expected_crc24 = u32::from_le_bytes([
+            src[header_len],
+            src[header_len + 1],
+            src[header_len + 2],
+            0,
+        ]);
+        let actual_crc24 = crc24(&src[..header_len]);
         if expected_crc24 != actual_crc24 {
             return Err(CqlError::Protocol(format!(
                 "v5 frame header CRC24 mismatch: expected 0x{expected_crc24:06X}, \
@@ -310,14 +347,14 @@ impl CqlCodec {
             )));
         }
 
-        let total = V5_FRAME_HEADER_SIZE + payload_len + V5_CRC32_SIZE;
+        let total = crc24_end + payload_len + V5_CRC32_SIZE;
         if src.len() < total {
             src.reserve(total - src.len());
             return Ok(None);
         }
 
-        // Verify CRC32 of the payload.
-        let payload_start = V5_FRAME_HEADER_SIZE;
+        // Verify CRC32 of the encoded (possibly compressed) payload.
+        let payload_start = crc24_end;
         let payload_end = payload_start + payload_len;
         let crc32_start = payload_end;
         let expected_crc32 = u32::from_le_bytes([
@@ -334,10 +371,31 @@ impl CqlCodec {
             )));
         }
 
-        // Extract payload.
-        src.advance(V5_FRAME_HEADER_SIZE);
-        let payload = src.split_to(payload_len);
+        // Extract payload. In compressed framing the length prefix lives in the
+        // header, so the v4-style helpers need it prepended back.
+        src.advance(crc24_end);
+        let wire_payload = src.split_to(payload_len).freeze();
         src.advance(V5_CRC32_SIZE); // skip CRC32
+
+        let payload = if uncompressed_len > 0 {
+            let compression = self.compression.expect("uncompressed_len implies negotiation");
+            let mut prefixed = Vec::with_capacity(4 + wire_payload.len());
+            prefixed.extend_from_slice(&(uncompressed_len as u32).to_be_bytes());
+            prefixed.extend_from_slice(&wire_payload);
+            let plain = match compression {
+                Compression::Lz4 => decompress_lz4(&prefixed)?,
+                Compression::Snappy => decompress_snappy(&prefixed)?,
+            };
+            if plain.len() != uncompressed_len {
+                return Err(CqlError::Protocol(format!(
+                    "v5 frame decompressed to {} bytes, header declared {uncompressed_len}",
+                    plain.len()
+                )));
+            }
+            Bytes::from(plain)
+        } else {
+            wire_payload
+        };
 
         if !is_self_contained {
             // Slice of a large envelope. Per the v5 spec EVERY slice carries
@@ -372,7 +430,7 @@ impl CqlCodec {
         // from a peer that terminates with a self-contained slice; combining
         // preserves that behavior.
         let envelope_data = if self.v5_segment_buf.is_empty() {
-            payload.freeze()
+            payload
         } else {
             self.v5_segment_buf.extend_from_slice(&payload);
             self.v5_segment_buf.split().freeze()
@@ -503,6 +561,32 @@ impl Encoder<CqlFrame> for CqlCodec {
         } else {
             None
         };
+
+        // A v5 connection that negotiated compression uses the WIDE segment
+        // header on every frame, so this path has to cover ERROR frames too --
+        // they are sent uncompressed (uncompressed length 0) rather than in the
+        // narrow format, which the peer would misread.
+        if self.v5_framed && self.compression.is_some() {
+            header.length = item.body.len() as u32;
+            // ERROR frames stay uncompressed: drivers routinely decode them on
+            // connections that are already degraded, and a compression failure
+            // there would hide the real error.
+            let compress_this = header.opcode != Opcode::Error;
+            log_encoded_error_frame(
+                &header,
+                original_body_len,
+                original_body_len,
+                if compress_this { self.compression } else { None },
+                error_info.as_ref(),
+            );
+            encode_v5_message_compressed(
+                &header,
+                &item.body,
+                if compress_this { self.compression } else { None },
+                dst,
+            );
+            return Ok(());
+        }
 
         if header.opcode == Opcode::Error {
             // Keep ERROR frames uncompressed. Drivers often enter error decode
@@ -842,6 +926,81 @@ pub fn encode_v5_frame(envelope_header: &FrameHeader, body: &[u8], dst: &mut Byt
     for slice in envelope.chunks(V5_MAX_PAYLOAD) {
         put_v5_frame(slice, false, dst);
     }
+}
+
+/// Encode a v5 message on a connection where compression was negotiated.
+///
+/// Two things differ from the uncompressed form. The segment header is FIVE
+/// bytes wide (payload length, uncompressed length, flag), and the uncompressed
+/// length travels in that header instead of the 4-byte prefix the v4 helpers
+/// use. Every segment on such a connection carries the wide header, including
+/// segments this function chose not to compress (their uncompressed length is
+/// 0), because the receiver picks the header width from the negotiation.
+///
+/// Compression is applied per segment, matching the reference driver: it chunks
+/// the message first, then compresses each chunk. Compressing once and then
+/// splitting would leave the receiver unable to decompress any individual
+/// segment.
+pub fn encode_v5_message_compressed(
+    envelope_header: &FrameHeader,
+    body: &[u8],
+    compression: Option<Compression>,
+    dst: &mut BytesMut,
+) {
+    let mut envelope = BytesMut::with_capacity(HEADER_SIZE + body.len());
+    envelope_header.encode(&mut envelope);
+    envelope.put_slice(body);
+
+    let segment_count = envelope.len().div_ceil(V5_MAX_PAYLOAD).max(1);
+    // Only a message that fits in one segment is self-contained; a split message
+    // ends by the envelope's own length field, not by a terminator.
+    let self_contained = segment_count == 1;
+
+    for chunk in envelope.chunks(V5_MAX_PAYLOAD) {
+        let Some(compression) = compression else {
+            put_v5_frame_with_uncompressed_len(chunk, 0, self_contained, dst);
+            continue;
+        };
+        let compressed = match compression {
+            Compression::Lz4 => compress_lz4(chunk),
+            Compression::Snappy => compress_snappy(chunk),
+        };
+        // Strip the 4-byte big-endian length prefix the v4 helpers prepend; the
+        // v5 header carries that length instead.
+        let block = &compressed[4..];
+        if block.len() < chunk.len() {
+            put_v5_frame_with_uncompressed_len(block, chunk.len(), self_contained, dst);
+        } else {
+            // Not worth compressing: still a wide header, uncompressed length 0.
+            put_v5_frame_with_uncompressed_len(chunk, 0, self_contained, dst);
+        }
+    }
+}
+
+/// Append one v5 frame using the FIVE-byte (compressed-connection) header,
+/// where `uncompressed_len == 0` means this frame's payload is not compressed.
+fn put_v5_frame_with_uncompressed_len(
+    payload: &[u8],
+    uncompressed_len: usize,
+    self_contained: bool,
+    dst: &mut BytesMut,
+) {
+    debug_assert!(payload.len() <= V5_MAX_PAYLOAD);
+    debug_assert!(uncompressed_len <= V5_MAX_PAYLOAD);
+
+    let mut header_bits: u64 = payload.len() as u64;
+    header_bits |= (uncompressed_len as u64) << 17;
+    if self_contained {
+        header_bits |= 1 << 34;
+    }
+    let h_bytes = header_bits.to_le_bytes();
+    let crc24_bytes = crc24(&h_bytes[..V5_COMPRESSED_HEADER_SIZE]).to_le_bytes();
+
+    dst.reserve(V5_COMPRESSED_HEADER_SIZE + V5_CRC24_SIZE + payload.len() + V5_CRC32_SIZE);
+    dst.put_slice(&h_bytes[..V5_COMPRESSED_HEADER_SIZE]);
+    dst.put_slice(&crc24_bytes[..V5_CRC24_SIZE]);
+    dst.put_slice(payload);
+    dst.put_u32_le(crc32_ieee_v5(payload));
 }
 
 /// Fill the 3-byte length/flags header, its CRC24, and the trailing CRC32 of a
