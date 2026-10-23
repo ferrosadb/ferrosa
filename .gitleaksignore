@@ -20,9 +20,13 @@ edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:461
 edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:471
 edff95e2f5c5851891eef5a81a002f3dd173ba1e:ferrosa/src/main.rs:generic-api-key:481
 
-# generic-api-key: SSTable format comments ("key bounds: u16-length-prefixed ...").
+# generic-api-key: SSTable format comments describing the length-prefixed
+# smallest/largest partition keys of the file (writer.rs, partition_index.rs).
 8ff35fe05db0e55c565b0185967f12e629f84c32:ferrosa-sstable/src/writer.rs:generic-api-key:308
 6cea2704bf3be06e2f78a755ab302a7759450c5f:ferrosa-sstable/src/partition_index.rs:generic-api-key:12
+# The first version of this file's own comment for the line above (commit
+# 362398fd, reworded since) matched the same rule.
+362398fd04e588b94c458df9aba7dc37bd76dee9:.gitleaksignore:generic-api-key:23
 
 # curl-auth-user: docs and bug notes showing the seeded LOCAL-DEV default login
 # (ferrosa_user, also in config/ferrosa.example.toml and the auth test fixtures),
