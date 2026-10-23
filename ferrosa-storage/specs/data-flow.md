@@ -114,3 +114,24 @@ flowchart TD
 - **Quarantine.** A row that fails cell/clustering validation at flush or replay
   is written to a durable `quarantine/*.jsonl` sidecar and skipped; the flush
   continues and `FLUSH_QUARANTINED_ROWS_TOTAL` increments.
+
+## Compaction cursor flow (2026-10-23)
+
+Validated input reader → task-owned checksum/decompression scan buffers → one
+row head per source → column/path winner selection → deletion suppression →
+safe marker purge → incremental BTI staging writer → complete validating row
+readback and existing digest/publication protocol. Each output row is consumed
+before another is requested. Legacy rows pass through bounded external sort;
+an unpurged fallback uses a private disk spool until any output survives.
+Cancellation/error unwinds the staging guard and preserves input ownership.
+
+Deferred clustered compaction values use checked logical `ValueSpan` offsets.
+The pending cursor checks bounds first; winner and tie reads validate their own
+chunks. Before advancing a source or emitting its merged row, compaction validates
+every unread raw span, including schema-dropped columns. This avoids a separate
+validation pass over fetched values while preserving checks on discarded bytes.
+Ordinary losing values do not allocate payload buffers. Schema ordinal remapping
+moves spans and their original validation indices with cell identities. The public
+metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
+and corrupt losing/dropped-value tests cover this path alongside fully decoding
+output verification.

@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Add worker-owned sequential chunk buffers without cache locks.
+//! Correctness: Cached/scan parity, CRC, truncation and compaction tests.
+//!
 //! SSTableReader -- compose all components into a single read interface.
 //!
 //! Opens a BTI SSTable from component file handles and provides:
@@ -156,6 +160,27 @@ fn read_compressed_chunk<R: ReadAt>(
     compressed_file_len: u64,
     chunk_index: usize,
 ) -> Result<Vec<u8>> {
+    let mut input = Vec::new();
+    let mut output = Vec::new();
+    read_compressed_chunk_into(
+        data,
+        ci,
+        compressed_file_len,
+        chunk_index,
+        &mut input,
+        &mut output,
+    )?;
+    Ok(output)
+}
+
+fn read_compressed_chunk_into<R: ReadAt>(
+    data: &R,
+    ci: &CompressionInfo,
+    compressed_file_len: u64,
+    chunk_index: usize,
+    compressed: &mut Vec<u8>,
+    chunk: &mut Vec<u8>,
+) -> Result<()> {
     let Some(&chunk_offset) = ci.chunk_offsets.get(chunk_index) else {
         return Err(ferrosa_common::Error::InvalidData(format!(
             "compressed chunk index {chunk_index} out of bounds"
@@ -194,8 +219,8 @@ fn read_compressed_chunk<R: ReadAt>(
         ));
     }
 
-    let mut compressed = vec![0u8; chunk_size];
-    data.read_exact_at(&mut compressed, chunk_offset)?;
+    compressed.resize(chunk_size, 0);
+    data.read_exact_at(compressed, chunk_offset)?;
 
     let payload_len = chunk_size - std::mem::size_of::<u32>();
     let payload = &compressed[..payload_len];
@@ -227,7 +252,9 @@ fn read_compressed_chunk<R: ReadAt>(
         )));
     }
 
-    let chunk = ci.compression.decompress(payload, ci.chunk_length)?;
+    chunk.resize(ci.chunk_length, 0);
+    let written = ci.compression.decompress_into(payload, chunk)?;
+    chunk.truncate(written);
     let chunk_start = u64::try_from(chunk_index)
         .ok()
         .and_then(|index| index.checked_mul(ci.chunk_length as u64))
@@ -243,7 +270,7 @@ fn read_compressed_chunk<R: ReadAt>(
             chunk.len()
         )));
     }
-    Ok(chunk)
+    Ok(())
 }
 
 /// Test seam for the offset-fuzz target. This is absent from normal builds and
@@ -432,15 +459,139 @@ impl<R: ReadAt> ReadAt for ChunkedUncompressedData<'_, R> {
 /// `CRC.db` verification (uncompressed tables that carry the checksum
 /// components), or directly (uncompressed tables without them — logged once
 /// as "not checked", never an error). See [`SSTableReader::data_source`].
+/// A sequential cursor owns its two chunk buffers. RefCell expresses local
+/// mutation through ReadAt's shared-reference interface; no chunk-cache lock,
+/// Arc allocation, or sharing with point readers occurs on this path.
+struct ScanData<'a, R: ReadAt> {
+    data: &'a R,
+    compression: Option<&'a CompressionInfo>,
+    crc: Option<&'a ChunkCrcTable>,
+    file_len: u64,
+    len: u64,
+    buffers: std::cell::RefCell<ScanBuffers>,
+}
+#[derive(Default)]
+struct ScanBuffers {
+    index: Option<usize>,
+    input: Vec<u8>,
+    output: Vec<u8>,
+}
+
+struct ScanChunkRead<'a, R>(&'a R, bool);
+impl<R: ReadAt> ReadAt for ScanChunkRead<'_, R> {
+    fn len(&self) -> Result<u64> {
+        self.0.len()
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if self.1 {
+            self.0.read_at_sparse(buf, offset)
+        } else {
+            self.0.read_at(buf, offset)
+        }
+    }
+}
+impl<R: ReadAt> ReadAt for ScanData<'_, R> {
+    fn len(&self) -> Result<u64> {
+        Ok(self.len)
+    }
+    fn validate_range(&self, offset: u64, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| ferrosa_common::Error::InvalidData("payload extent overflow".into()))?;
+        if end > self.len {
+            return Err(ferrosa_common::Error::InvalidData(
+                "payload extends beyond data".into(),
+            ));
+        }
+        if self.compression.is_none() && self.crc.is_none() {
+            return self.data.validate_range(offset, len);
+        }
+        let chunk_size =
+            self.compression
+                .map(|c| c.chunk_length)
+                .unwrap_or_else(|| self.crc.expect("CRC").chunk_size as usize) as u64;
+        let mut pos = offset;
+        let mut byte = [0u8; 1];
+        while pos < end {
+            self.read_exact_at(&mut byte, pos)?;
+            pos = (pos / chunk_size + 1) * chunk_size;
+        }
+        Ok(())
+    }
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        if self.compression.is_none() && self.crc.is_none() {
+            return self.data.read_at(buf, offset);
+        }
+        let chunk_size = self
+            .compression
+            .map(|c| c.chunk_length)
+            .unwrap_or_else(|| self.crc.expect("CRC or compression").chunk_size as usize);
+        let mut copied = 0;
+        let available = self.len.saturating_sub(offset).min(buf.len() as u64) as usize;
+        let mut buffers = self.buffers.borrow_mut();
+        while copied < available {
+            let pos = offset + copied as u64;
+            let index = (pos / chunk_size as u64) as usize;
+            if buffers.index != Some(index) {
+                let sparse = buffers
+                    .index
+                    .is_some_and(|previous| previous.checked_add(1) != Some(index));
+                let source = ScanChunkRead(self.data, sparse);
+                buffers.index = None;
+                if let Some(ci) = self.compression {
+                    let ScanBuffers { input, output, .. } = &mut *buffers;
+                    read_compressed_chunk_into(&source, ci, self.file_len, index, input, output)?;
+                } else {
+                    let table = self.crc.expect("CRC table");
+                    let start = index as u64 * chunk_size as u64;
+                    let len = self.len.saturating_sub(start).min(chunk_size as u64) as usize;
+                    buffers.output.resize(len, 0);
+                    source.read_exact_at(&mut buffers.output, start)?;
+                    if table.crcs.get(index).copied() != Some(crc32fast::hash(&buffers.output)) {
+                        return Err(ferrosa_common::Error::InvalidData(format!(
+                            "CRC.db mismatch at Data.db chunk offset {start}"
+                        )));
+                    }
+                }
+                let expected = self
+                    .len
+                    .saturating_sub(index as u64 * chunk_size as u64)
+                    .min(chunk_size as u64) as usize;
+                if buffers.output.len() != expected {
+                    return Err(ferrosa_common::Error::InvalidData(
+                        "decompressed chunk length mismatch".into(),
+                    ));
+                }
+                buffers.index = Some(index);
+            }
+            let within = (pos % chunk_size as u64) as usize;
+            let n = (buffers.output.len() - within).min(available - copied);
+            buf[copied..copied + n].copy_from_slice(&buffers.output[within..within + n]);
+            copied += n;
+        }
+        Ok(copied)
+    }
+}
+
 enum ReadSource<'a, R: ReadAt> {
+    Scan(ScanData<'a, R>),
     Compressed(ChunkedCompressedData<'a, R>),
     Verified(ChunkedUncompressedData<'a, R>),
     Raw(&'a R),
 }
 
 impl<R: ReadAt> ReadAt for ReadSource<'_, R> {
+    fn validate_range(&self, offset: u64, len: usize) -> Result<()> {
+        match self {
+            Self::Scan(d) => d.validate_range(offset, len),
+            Self::Compressed(d) => d.validate_range(offset, len),
+            Self::Verified(d) => d.validate_range(offset, len),
+            Self::Raw(d) => d.validate_range(offset, len),
+        }
+    }
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         match self {
+            Self::Scan(d) => d.read_at(buf, offset),
             Self::Compressed(d) => d.read_at(buf, offset),
             Self::Verified(d) => d.read_at(buf, offset),
             Self::Raw(d) => d.read_at(buf, offset),
@@ -449,6 +600,7 @@ impl<R: ReadAt> ReadAt for ReadSource<'_, R> {
 
     fn len(&self) -> Result<u64> {
         match self {
+            Self::Scan(d) => d.len(),
             Self::Compressed(d) => d.len(),
             Self::Verified(d) => d.len(),
             Self::Raw(d) => d.len(),
@@ -1130,6 +1282,35 @@ impl<R: ReadAt> SSTableReader<R> {
         PartitionIter::new(self)
     }
 
+    /// Sequential, task-owned scan buffers bypass the shared chunk caches.
+    /// The cursor is deliberately not Sync; each worker owns its decode state.
+    pub fn scan_iter(&self) -> Result<PartitionIter<'_, R>> {
+        let file_len = self.data.len()?;
+        if let Some(crc) = &self.crc_table {
+            if crc.expected_chunk_count(file_len) != crc.crcs.len() as u64 {
+                return Err(ferrosa_common::Error::InvalidData(
+                    "CRC.db chunk count mismatch".into(),
+                ));
+            }
+        }
+        let len = self
+            .compression_info
+            .as_ref()
+            .map_or(file_len, |ci| ci.data_length);
+        Ok(PartitionIter {
+            sst: self,
+            pos: 0,
+            source: ReadSource::Scan(ScanData {
+                data: &self.data,
+                compression: self.compression_info.as_ref(),
+                crc: self.crc_table.as_ref(),
+                file_len,
+                len,
+                buffers: std::cell::RefCell::new(ScanBuffers::default()),
+            }),
+        })
+    }
+
     /// Scan partitions sequentially, stopping once `limit` partitions have
     /// been decoded. Production full-table callers should use
     /// [`Self::partitions_iter`] instead of passing an effectively unbounded
@@ -1358,6 +1539,62 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         })
     }
 
+    /// Read metadata and bounds-checked pending spans. Before advancing or
+    /// publishing, fetch selected spans and validate every unselected span.
+    pub fn next_clustered_row_pending_into(
+        &mut self,
+        row: &mut crate::types::Row,
+        spans: &mut Vec<crate::data::ValueSpan>,
+    ) -> Result<bool> {
+        let mut reader = DataReader::new(&self.source, &self.sst.stored, self.pos);
+        let present = reader.read_next_clustered_row_pending_into(row, spans)?;
+        self.pos = reader.position();
+        Ok(present)
+    }
+
+    /// Check an unselected pending value's complete extent and checksum chunks.
+    pub fn validate_value_span(&self, span: crate::data::ValueSpan) -> Result<()> {
+        if span.len > crate::data::MAX_VALUE_LEN {
+            return Err(ferrosa_common::Error::InvalidData(
+                "invalid pending value length".into(),
+            ));
+        }
+        self.source.validate_range(span.offset, span.len)
+    }
+
+    /// Read identities/liveness into reusable storage and defer cell payloads.
+    /// Values stay represented by logical offsets; skipped chunks remain verified.
+    pub fn next_clustered_row_metadata_into(
+        &mut self,
+        row: &mut crate::types::Row,
+        spans: &mut Vec<crate::data::ValueSpan>,
+    ) -> Result<bool> {
+        let mut reader = DataReader::new(&self.source, &self.sst.stored, self.pos);
+        let present = reader.read_next_clustered_row_metadata_into(row, spans)?;
+        self.pos = reader.position();
+        Ok(present)
+    }
+
+    /// Copy one previously validated opaque value into caller-owned storage.
+    /// Scan sources support bounded refills when an earlier span is revisited.
+    pub fn read_value_span(
+        &self,
+        span: crate::data::ValueSpan,
+        buffer: &mut Vec<u8>,
+    ) -> Result<()> {
+        let end = span
+            .offset
+            .checked_add(span.len as u64)
+            .ok_or_else(|| ferrosa_common::Error::InvalidData("payload extent overflow".into()))?;
+        if span.len > crate::data::MAX_VALUE_LEN || end > self.source.len()? {
+            return Err(ferrosa_common::Error::InvalidData(
+                "invalid deferred value extent".into(),
+            ));
+        }
+        buffer.resize(span.len, 0);
+        self.source.read_exact_at(buffer, span.offset)
+    }
+
     /// Yield the next partition in storage order. Returns `Ok(None)` when
     /// the iterator has reached EOF.
     /// Phase 1 of the row-streamed partition read: decode header
@@ -1403,6 +1640,14 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         let result = reader.read_next_clustered_row()?;
         self.pos = reader.position();
         Ok(result)
+    }
+
+    /// Decode into a worker's reusable row storage instead of allocating a new row.
+    pub fn next_clustered_row_into(&mut self, row: &mut crate::types::Row) -> Result<bool> {
+        let mut reader = DataReader::new(&self.source, &self.sst.stored, self.pos);
+        let present = reader.read_next_clustered_row_into(row)?;
+        self.pos = reader.position();
+        Ok(present)
     }
 
     /// Projection-aware companion to [`Self::next_clustered_row`].
