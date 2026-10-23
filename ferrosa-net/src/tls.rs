@@ -12,7 +12,10 @@
 use std::sync::Arc;
 
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::CertificateDer;
+// PEM parsing comes from rustls-pki-types, the maintained successor of
+// rustls-pemfile (RUSTSEC-2025-0134).
+use rustls::pki_types::pem::{self, PemObject};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::config::NetConfig;
@@ -152,7 +155,7 @@ pub fn build_tls_connector(config: &NetConfig) -> Result<Option<TlsConnector>> {
 fn load_certs(path: &str, what: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = std::fs::File::open(path)
         .map_err(|e| NetError::Protocol(format!("failed to open {what} {path}: {e}")))?;
-    rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+    CertificateDer::pem_reader_iter(std::io::BufReader::new(file))
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| NetError::Protocol(format!("failed to parse {what} {path}: {e}")))
 }
@@ -160,17 +163,16 @@ fn load_certs(path: &str, what: &str) -> Result<Vec<CertificateDer<'static>>> {
 fn load_cert_and_key(
     cert_path: &str,
     key_path: &str,
-) -> Result<(
-    Vec<CertificateDer<'static>>,
-    rustls::pki_types::PrivateKeyDer<'static>,
-)> {
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     let certs = load_certs(cert_path, "TLS cert")?;
     let key_file = std::fs::File::open(key_path)
         .map_err(|e| NetError::Protocol(format!("failed to open TLS key {key_path}: {e}")))?;
-    let key = rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
-        .map_err(|e| NetError::Protocol(format!("failed to parse TLS key {key_path}: {e}")))?
-        .ok_or_else(|| {
-            NetError::Protocol(format!("no private key found in TLS key file {key_path}"))
+    let key =
+        PrivateKeyDer::from_pem_reader(std::io::BufReader::new(key_file)).map_err(|e| match e {
+            pem::Error::NoItemsFound => {
+                NetError::Protocol(format!("no private key found in TLS key file {key_path}"))
+            }
+            e => NetError::Protocol(format!("failed to parse TLS key {key_path}: {e}")),
         })?;
 
     Ok((certs, key))
@@ -210,6 +212,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("/nonexistent/c.pem"), "{err}");
+    }
+
+    /// Writes `contents` to a fresh file under the temp dir and returns its path.
+    fn write_temp(name: &str, contents: &str) -> String {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrosa-net-tls-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join(name);
+        std::fs::write(&path, contents).expect("write temp file");
+        path.to_str().expect("utf-8 temp path").to_owned()
+    }
+
+    #[test]
+    fn pem_cert_and_key_round_trip() {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate self-signed cert");
+        let cert_path = write_temp("cert.pem", &generated.cert.pem());
+        let key_path = write_temp("key.pem", &generated.key_pair.serialize_pem());
+
+        let (certs, key) = load_cert_and_key(&cert_path, &key_path).expect("load PEM pair");
+
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].as_ref(), generated.cert.der().as_ref());
+        assert_eq!(
+            key.secret_der(),
+            generated.key_pair.serialize_der().as_slice()
+        );
+    }
+
+    #[test]
+    fn key_file_without_a_key_is_named_as_such() {
+        let generated = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate self-signed cert");
+        let cert_path = write_temp("cert.pem", &generated.cert.pem());
+        // A certificate where the key belongs: parses as PEM, holds no key.
+        let key_path = write_temp("key.pem", &generated.cert.pem());
+
+        let err = load_cert_and_key(&cert_path, &key_path).unwrap_err();
+
+        assert!(err.to_string().contains("no private key found"), "{err}");
+        assert!(err.to_string().contains(&key_path), "{err}");
+    }
+
+    #[test]
+    fn malformed_cert_pem_is_a_parse_error() {
+        let path = write_temp(
+            "cert.pem",
+            "-----BEGIN CERTIFICATE-----\nnot base64!\n-----END CERTIFICATE-----\n",
+        );
+
+        let err = load_certs(&path, "TLS cert").unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to parse TLS cert"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -129,7 +129,8 @@ ferrosa-storage = { path = "../ferrosa-storage", features = ["test-support"] }
 # Parses the committed docker-compose stacks in
 # tests/pair_primary_is_deterministic.rs so the pinned FERROSA_HOST_ID values
 # are checked against the ordering choose_pair_role elects on.
-serde_yaml = "0.9"
+# yaml-rust2 rather than the unmaintained serde_yaml (RUSTSEC-2024-0449).
+yaml-rust2 = "0.13"
 serial_test = "3"
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }

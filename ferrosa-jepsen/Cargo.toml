@@ -49,6 +49,8 @@ dirs-next = "2"
 scylla = "1.5.0"
 
 [dev-dependencies]
-serde_yaml = "0.9"
+# serde_yaml is unmaintained (RUSTSEC-2024-0449, via unsafe-libyaml);
+# yaml-rust2 is pure Rust and maintained.
+yaml-rust2 = "0.13"
 tempfile = "3"
 tokio-postgres = "0.7"

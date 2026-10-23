@@ -39,12 +39,12 @@ fn workspace_file(name: &str) -> PathBuf {
 fn pinned_host_ids(compose_path: &Path) -> BTreeMap<String, Uuid> {
     let raw = std::fs::read_to_string(compose_path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", compose_path.display()));
-    let doc: serde_yaml::Value = serde_yaml::from_str(&raw)
+    let docs = yaml_rust2::YamlLoader::load_from_str(&raw)
         .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", compose_path.display()));
 
-    let services = doc
-        .get("services")
-        .and_then(|s| s.as_mapping())
+    let services = docs
+        .first()
+        .and_then(|doc| doc["services"].as_hash())
         .unwrap_or_else(|| panic!("{} has no `services` mapping", compose_path.display()));
 
     let mut pins = BTreeMap::new();
@@ -55,11 +55,9 @@ fn pinned_host_ids(compose_path: &Path) -> BTreeMap<String, Uuid> {
         if !name.contains("node") {
             continue;
         }
-        let Some(raw_id) = service
-            .get("environment")
-            .and_then(|env| env.get("FERROSA_HOST_ID"))
-            .and_then(|id| id.as_str())
-        else {
+        // Indexing a missing key yields `Yaml::BadValue`, whose `as_str` is
+        // `None`, so an absent environment or pin lands in the `else` below.
+        let Some(raw_id) = service["environment"]["FERROSA_HOST_ID"].as_str() else {
             continue;
         };
         let id = Uuid::parse_str(raw_id).unwrap_or_else(|e| {

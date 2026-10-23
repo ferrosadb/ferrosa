@@ -77,24 +77,23 @@ fn postgres_jepsen_compose_advertises_host_reachable_cql_ports() {
     let path = postgres_jepsen_compose_path();
     let compose =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    let parsed: serde_yaml::Value =
-        serde_yaml::from_str(&compose).expect("parse PostgreSQL Jepsen compose YAML");
-    let services = parsed
-        .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
+    let docs = yaml_rust2::YamlLoader::load_from_str(&compose)
+        .expect("parse PostgreSQL Jepsen compose YAML");
+    let services = docs
+        .first()
+        .and_then(|doc| doc["services"].as_hash())
         .expect("services mapping");
 
     for (node, port) in [("node1", 29042), ("node2", 29043), ("node3", 29044)] {
         let service = services
-            .get(serde_yaml::Value::String(node.into()))
+            .get(&yaml_rust2::Yaml::String(node.into()))
             .unwrap_or_else(|| panic!("service {node} missing"));
-        let environment = service
-            .get("environment")
-            .and_then(serde_yaml::Value::as_mapping)
+        let environment = service["environment"]
+            .as_hash()
             .unwrap_or_else(|| panic!("{node} missing environment"));
         let actual = environment
-            .get(serde_yaml::Value::String("FERROSA_CQL_BROADCAST".into()))
-            .and_then(serde_yaml::Value::as_str);
+            .get(&yaml_rust2::Yaml::String("FERROSA_CQL_BROADCAST".into()))
+            .and_then(yaml_rust2::Yaml::as_str);
 
         assert_eq!(
             actual,

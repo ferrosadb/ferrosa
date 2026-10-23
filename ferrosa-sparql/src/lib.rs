@@ -2,7 +2,7 @@
 //!
 //! Parses SPARQL via the `spargebra` crate, translates algebra trees to
 //! storage reads against ferrosa's CQL-backed triple store, and serializes
-//! results via `sparesults`.
+//! results with its own writers (JSON, XML, CSV/TSV, N-Triples).
 
 pub mod engine;
 pub mod error;
