@@ -63,6 +63,10 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_ci_build_once.py
       - name: Check every ignored and slow test still runs somewhere
         run: python3 -m unittest -q tests/ci/test_ignored_test_partition.py
+      - name: Check every slow test is selectable by the slow-module filters
+        run: python3 -m unittest -q tests/ci/test_slow_tests_are_selectable.py
+      - name: Check test builds optimize the engines tests run inside
+        run: python3 -m unittest -q tests/ci/test_dev_profile_optimizes_test_engines.py
       - name: Check the no-new-waivers guard
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
       # Pins the smoke harness's client side: Phase 8's QUORUM write must walk
@@ -372,20 +376,20 @@ jobs:
         # indistinguishable from a hang from the outside, so no harness-side budget
         # rule can tell the two apart, and lengthening the budget would only mask it.
         # The step above excludes these binaries; this one gives them the machine.
-        # Named as explicit `--test` targets rather than a binary-name
-        # filterset: this step carries no `--skip` list, so anything it selects
-        # by accident RUNS, and the file-IO-heavy tests (differential_oracle,
+        # The SAME package selection as the step above (`--workspace`, the same
+        # excludes, `--lib --tests`), narrowed by a filterset. `-p ferrosa`
+        # resolved features differently and rebuilt the workspace: 2m55s of
+        # compile for 24s of tests. tests/ci/test_ci_build_once.py pins both.
+        # This step carries no `--skip` list, so anything it selects by
+        # accident RUNS, and the file-IO-heavy tests (differential_oracle,
         # cassandra_reads_compacted, compaction_end_to_end_pipeline, lazyfs
         # promote, the typed-edge count merger) fail in ~0.1s without their
-        # infrastructure. A target list cannot over-select.
+        # infrastructure. `binary()` matches a binary name exactly, so the
+        # filterset selects these six binaries and nothing else.
         run: |
-          cargo nextest run --all-features -p ferrosa \
-            --test commit_guarantee_replica_process \
-            --test drop_table_replica_process \
-            --test jsonb_first_class_cluster_process \
-            --test pg_public_keyspace_rf_process \
-            --test pg_select_cluster_read_process \
-            --test pg_txn_value_process
+          cargo nextest run --all-features --workspace --lib --tests \
+            --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+            -E 'package(ferrosa) and (binary(commit_guarantee_replica_process) or binary(drop_table_replica_process) or binary(jsonb_first_class_cluster_process) or binary(pg_public_keyspace_rf_process) or binary(pg_select_cluster_read_process) or binary(pg_txn_value_process))'
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no

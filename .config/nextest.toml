@@ -44,7 +44,11 @@ serial-range-scans = { max-threads = 1 }
 # runner that overshoot became a 240s timeout and failed the job.
 #
 # Serializing them restores their true cost. They are ~7s total in release and
-# ~125-240s in debug; a single slot is far cheaper than the timeout they caused.
+# were ~125-240s in debug; a single slot is far cheaper than the timeout they
+# caused. Since Cargo.toml optimizes the engines they run inside (QuickJS,
+# Cranelift/wasmtime, loom) in dev builds, the five ferrosa-udf asc tests take
+# ~8s together and pump_loom ~16s locally, so the serial chain no longer
+# outlasts the parallel run by ~8 minutes.
 compile-bound = { max-threads = 1 }
 
 
@@ -109,10 +113,11 @@ test-group = "compile-bound"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
 # ── compile-bound: loom model checker ──────────────────────────────────────
-# `pump_loom` explores thread interleavings; the depth-2 model alone is ~126s
-# in a debug build (and ~10s in release — the crate's docs say to run it
-# release). It is a correctness proof, so it must not be skipped; it just must
-# not share cores with 17 other test processes.
+# `pump_loom` explores thread interleavings; the depth-2 model alone was ~126s
+# in a debug build (214s in CI run 40017365568) and ~10s in release. The dev
+# profile now optimizes `loom` itself (Cargo.toml), which cut the local debug
+# run from 45.7s to 15.6s. It is a correctness proof, so it must not be
+# skipped; it just must not share cores with 17 other test processes.
 [[profile.default.overrides]]
 filter = "binary(pump_loom)"
 test-group = "compile-bound"

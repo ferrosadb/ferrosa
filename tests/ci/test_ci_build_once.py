@@ -91,6 +91,24 @@ class CiBuildsTheShippedBinaryOnce(unittest.TestCase):
         self.assertIn("tests/install_smoke.sh --ferrosa-tarball", job)
         self.assertEqual(cargo_commands(job), [])
 
+    def test_the_isolated_harness_run_reuses_the_main_test_build(self):
+        # `-p ferrosa` resolves features differently from the main run's
+        # `--workspace` selection, so cargo rebuilt the workspace: 2m55s of
+        # compile to run 24s of tests (CI run 40017365568). The same package
+        # selection, narrowed by a filterset, builds nothing new.
+        job = self.jobs["test"]
+        main = [c for c in cargo_commands(job) if "--skip ::slow::" in c]
+        harness = [c for c in cargo_commands(job) if "commit_guarantee_replica_process" in c and c not in main]
+        self.assertEqual(len(main), 1)
+        self.assertEqual(len(harness), 1)
+        selection = re.compile(r"--all-features|--workspace|--lib|--tests|--exclude \S+")
+        self.assertEqual(sorted(selection.findall(harness[0])), sorted(selection.findall(main[0])))
+        excluded = set(re.findall(r"not binary\((\w+_process)\)", main[0]))
+        selected = set(re.findall(r"binary\((\w+)\)", harness[0]))
+        self.assertEqual(len(excluded), 6)
+        self.assertEqual(selected, excluded)
+        self.assertIn("package(ferrosa) and (", harness[0])
+
     def test_the_from_source_install_smokes_do_not_run_per_pr(self):
         # install-smoke.yml compiles ferrosa on Linux and macOS and ferrosa-memory
         # from source. It gates releases (workflow_call) and runs on main and
