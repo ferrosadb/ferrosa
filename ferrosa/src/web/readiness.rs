@@ -5,10 +5,11 @@
 //! the missing condition otherwise.
 //! A failed consensus runtime overrides every deployment-mode shortcut and
 //! returns 503 without awaiting a Raft handle.
-//! Last revised: 2026-10-10
-//! Last changed: A ready answer reports `"status":"degraded"` and names, under
-//!   `stalled_replication`, any Raft follower whose lag has not shrunk across
-//!   `ReplicationHealth::STALL_SWEEPS` leader sweeps (outage 2026-10-10, D4).
+//! Last revised: 2026-10-23
+//! Last changed: Forming/Cluster readiness requires live evidence of the Raft
+//!   leader (`ModeController::raft_leader_liveness`), not just a leader named by
+//!   the persisted vote. A restarted node answered ready on a stale vote and
+//!   went 503 three seconds later, failing the 2026-10-23 control-cluster roll.
 //!
 //! ## Readiness criteria
 //!
@@ -21,9 +22,14 @@
 //! |------------|---------------------------------------------|
 //! | Standalone | Ready unless consensus supervision failed   |
 //! | Pair       | Ready unless consensus supervision failed   |
-//! | Forming    | Ready only once a Raft leader is elected    |
-//! | Cluster    | Ready only once a Raft leader is elected    |
+//! | Forming    | Ready only while the Raft leader is live    |
+//! | Cluster    | Ready only while the Raft leader is live    |
 //! | Degraded*  | Mode rules apply unless consensus failed    |
+//!
+//! "Live" means evidence from this process, within the election timeout: as
+//! leader, a quorum ack; as follower, an accepted AppendEntries from the leader
+//! it names, at the current term. A leader named only by the persisted vote is
+//! not live (`detail` says which case applies).
 //!
 //! Independent of mode, a supervised background task that is failing, stalled
 //! or restarting (`storage_flush`, `maintenance_loop`; see `crate::supervisor`)
@@ -177,8 +183,11 @@ fn ready_response(
 /// Returns `200` immediately — these modes serve requests without Raft.
 ///
 /// # Forming / Cluster modes
-/// Returns `200` only if a Raft leader is currently known to this node.
-/// Otherwise returns `503` with `{"ready":false,"waiting_for":"raft_leader"}`.
+/// Returns `200` only if this node has live evidence of its Raft leader: as
+/// leader, a quorum ack within the election timeout; as follower, an accepted
+/// AppendEntries from that leader at the current term within the election
+/// timeout. Otherwise returns `503` with
+/// `{"ready":false,"waiting_for":"raft_leader","detail":<why>}`.
 pub async fn readyz_handler(
     State(mc): State<Arc<ModeController>>,
     State(listeners): State<Arc<crate::listener_status::ListenerStatus>>,
@@ -331,21 +340,21 @@ pub async fn readyz_handler(
                         })),
                     )
                 }
-                Some(raft) => {
-                    let leader = raft.current_leader().await;
-                    if leader.is_some() {
-                        ready_response(&storage, &replication)
-                    } else {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            Json(json!({
-                                "ready": false,
-                                "waiting_for": "raft_leader",
-                                "detail": "no raft leader elected yet"
-                            })),
-                        )
-                    }
-                }
+                // A named leader is not enough: openraft names one from the
+                // persisted vote, so a restarted node named a leader it had not
+                // heard from and answered ready (the 2026-10-23 control roll).
+                // Require evidence from this process that the leader is live.
+                Some(raft) => match mc.raft_leader_liveness(&raft).reason() {
+                    None => ready_response(&storage, &replication),
+                    Some(detail) => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "ready": false,
+                            "waiting_for": "raft_leader",
+                            "detail": detail
+                        })),
+                    ),
+                },
             }
         }
     }

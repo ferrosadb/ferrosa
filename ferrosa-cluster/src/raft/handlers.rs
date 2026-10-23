@@ -932,13 +932,16 @@ impl LazyRaft {
 ///
 /// Deserializes the request with bincode, forwards it to the local Raft
 /// instance, and returns the serialized response as `RaftAppendResponse`.
+/// Every request this node accepts is recorded in `contact`, which readiness
+/// reads as evidence that the leader is live.
 pub struct RaftAppendHandler {
     raft: LazyRaft,
+    contact: Arc<super::leader_contact::LeaderContact>,
 }
 
 impl RaftAppendHandler {
-    pub fn new(raft: LazyRaft) -> Self {
-        Self { raft }
+    pub fn new(raft: LazyRaft, contact: Arc<super::leader_contact::LeaderContact>) -> Self {
+        Self { raft, contact }
     }
 }
 
@@ -953,14 +956,21 @@ impl RpcHandler for RaftAppendHandler {
             Message::RaftAppendEntries(b) => b,
             other => return unexpected_message("RaftAppendHandler", &other),
         };
+        let contact = self.contact.clone();
         raft_rpc(
             "RaftAppendHandler",
             &self.raft,
             &bytes,
             |raft, req: AppendEntriesRequest<FerrosRaftConfig>| async move {
-                raft.append_entries(req)
+                let vote = req.vote;
+                let resp = raft
+                    .append_entries(req)
                     .await
-                    .map_err(|e| format!("append_entries failed: {e}"))
+                    .map_err(|e| format!("append_entries failed: {e}"))?;
+                if let Some((leader, term)) = super::leader_contact::accepted_append(&vote, &resp) {
+                    contact.record(leader, term, std::time::Instant::now());
+                }
+                Ok::<_, String>(resp)
             },
             Message::RaftAppendResponse,
         )
