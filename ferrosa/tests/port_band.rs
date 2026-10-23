@@ -12,9 +12,12 @@ mod common;
 
 use std::collections::HashSet;
 
+#[cfg(target_os = "macos")]
+use common::ports::port_is_free;
+
 use common::ports::{
-    kernel_ephemeral_floor, port_is_free, process_lease_state, release_in_process, PortAllocator,
-    BAND_END, BAND_START, SLICES, SLICE_LEN,
+    kernel_ephemeral_floor, process_lease_state, release_in_process, PortAllocator, BAND_END,
+    BAND_START, SLICES, SLICE_LEN,
 };
 
 /// Invariant 5 — capacity, and the reason it needs its own guard: both halves of

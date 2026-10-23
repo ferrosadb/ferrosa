@@ -14,6 +14,9 @@
 # that's gated behind FERROSA_PRE_PUSH_INTEGRATION=1 in
 # .pre-commit-config.yaml.
 #
+# Run this all-features gate on Linux: live-infra-tests includes the real-file
+# STATX_DIOALIGN probe, which deliberately rejects other platforms.
+#
 # Speed: ~30-50% faster via cargo-nextest when installed (parallel
 # by binary AND by test). Falls back to `cargo test` otherwise.
 #

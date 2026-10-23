@@ -116,3 +116,10 @@ row before asserting the one-shot write and cross-replica data recovery. A faile
 read cannot satisfy the value predicate even if its diagnostic contains that
 value. Script-level controls cover transient and permanent unavailability;
 the actual container run remains a separate integration check.
+
+The kernel-query observer and its `port_is_free` import share the macOS target
+guard. Keeping that import unconditional after moving the occupied-listener
+fixture to the shared helper left it unused on Linux and failed strict Clippy.
+The exact-source Linux lint guard reproduces the failure with the unconditional
+import. The full all-features test mirror requires Linux because its real-file
+`STATX_DIOALIGN` probe deliberately rejects other platforms.

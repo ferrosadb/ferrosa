@@ -246,6 +246,9 @@ other processes' leases and can steal a temporarily unbound replica restart port
 The shared helper is exercised by both the collision/retry fixture and a
 port-band regression that checks the supplied allocator is honoured.
 
+The all-features CI mirror runs on Linux. It enables the real-file
+`STATX_DIOALIGN` probe, which deliberately fails on other host platforms.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — composition-root model
