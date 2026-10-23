@@ -133,7 +133,10 @@ fn never_ready_lazy_raft() -> LazyRaft {
 
 fn handler_for(msg_type: MsgType, lazy: LazyRaft) -> Arc<dyn RpcHandler> {
     match msg_type {
-        MsgType::RaftAppendEntries => Arc::new(RaftAppendHandler::new(lazy)),
+        MsgType::RaftAppendEntries => Arc::new(RaftAppendHandler::new(
+            lazy,
+            Arc::new(ferrosa_cluster::raft::leader_contact::LeaderContact::new()),
+        )),
         MsgType::RaftVote => Arc::new(RaftVoteHandler::new(lazy)),
         MsgType::RaftPreVote => Arc::new(RaftPreVoteHandler::new(lazy)),
         MsgType::RaftInstallSnapshot => Arc::new(RaftSnapshotHandler::new(lazy)),
@@ -320,4 +323,72 @@ async fn snapshot_handler_raft_not_ready_sends_error_reply() {
         "not ready",
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Leader contact (2026-10-23): readiness needs evidence of a LIVE leader
+// ---------------------------------------------------------------------------
+
+fn heartbeat(term: u64, leader: u64) -> Message {
+    let req: AppendEntriesRequest<FerrosRaftConfig> = AppendEntriesRequest {
+        vote: Vote::new_committed(term, leader),
+        prev_log_id: None,
+        entries: vec![],
+        leader_commit: None,
+    };
+    request(
+        MsgType::RaftAppendEntries,
+        Bytes::from(bincode::serialize(&req).expect("encode append entries")),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn append_handler_records_contact_only_for_accepted_requests() {
+    use ferrosa_cluster::raft::leader_contact::LeaderContact;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (lazy, _raft) = ready_lazy_raft(&dir).await;
+    let contact = Arc::new(LeaderContact::new());
+    let handler: Arc<dyn RpcHandler> = Arc::new(RaftAppendHandler::new(lazy, Arc::clone(&contact)));
+
+    // Given a node that has heard from nobody,
+    assert_eq!(contact.last(), None);
+
+    // when a leader at a newer term sends a heartbeat it accepts,
+    let (reply, _) = send_to_handler(
+        MsgType::RaftAppendEntries,
+        Arc::clone(&handler),
+        heartbeat(5, 99),
+    )
+    .await;
+    assert!(
+        matches!(reply, Ok(Message::RaftAppendResponse(_))),
+        "{reply:?}"
+    );
+
+    // then that leader and term are recorded as contact.
+    let seen = contact.last().expect("accepted heartbeat is contact");
+    assert_eq!((seen.leader, seen.term), (99, 5));
+
+    // A stale leader is refused with HigherVote and is NOT contact.
+    let (reply, _) = send_to_handler(
+        MsgType::RaftAppendEntries,
+        Arc::clone(&handler),
+        heartbeat(3, 42),
+    )
+    .await;
+    let Ok(Message::RaftAppendResponse(body)) = reply else {
+        panic!("expected an append response, got {reply:?}");
+    };
+    let resp: AppendEntriesResponse<u64> = bincode::deserialize(&body).expect("decode response");
+    assert!(
+        matches!(resp, AppendEntriesResponse::HigherVote(_)),
+        "{resp:?}"
+    );
+    let seen = contact.last().expect("still the earlier contact");
+    assert_eq!(
+        (seen.leader, seen.term),
+        (99, 5),
+        "a refused request must not overwrite contact"
+    );
 }

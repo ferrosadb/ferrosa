@@ -205,6 +205,9 @@ pub struct ModeController {
     /// Per-follower replication progress, fed by the leader's snapshot pusher
     /// and Raft network; read by readiness and the metrics endpoint.
     pub(super) replication_health: Arc<crate::raft::replication_health::ReplicationHealth>,
+    /// Accepted AppendEntries since process start, fed by the Raft append
+    /// handler; read by readiness as evidence that the named leader is live.
+    pub(super) leader_contact: Arc<crate::raft::leader_contact::LeaderContact>,
     pub(super) mode: Arc<ArcSwap<DeploymentMode>>,
     pub(super) write_path: Arc<ArcSwap<WritePath>>,
     pub(super) cluster_state: Arc<ArcSwap<ClusterStateHolder>>,
@@ -536,6 +539,7 @@ impl ModeController {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
+            leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: schema.deployment_mode_handle(),
             write_path: write_path.clone(),
             cluster_state: cluster_state.clone(),
@@ -706,6 +710,7 @@ impl ModeController {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
+            leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
                 schema.set_deployment_mode(DeploymentMode::Standalone);
                 schema.deployment_mode_handle()
@@ -784,6 +789,7 @@ impl ModeController {
             self_weak: std::sync::OnceLock::new(),
             consensus_health: Arc::new(ConsensusHealth::new()),
             replication_health: Arc::new(crate::raft::replication_health::ReplicationHealth::new()),
+            leader_contact: Arc::new(crate::raft::leader_contact::LeaderContact::new()),
             mode: {
                 schema.set_deployment_mode(DeploymentMode::Pair);
                 schema.deployment_mode_handle()
@@ -995,6 +1001,39 @@ impl ModeController {
     /// Per-follower replication progress (lag, stalls, snapshot-send failures).
     pub fn replication_health(&self) -> Arc<crate::raft::replication_health::ReplicationHealth> {
         self.replication_health.clone()
+    }
+
+    /// Accepted-AppendEntries evidence shared with the Raft append handler.
+    pub fn leader_contact(&self) -> Arc<crate::raft::leader_contact::LeaderContact> {
+        self.leader_contact.clone()
+    }
+
+    /// Whether `raft`'s leader is live by this process's own evidence, not by
+    /// the persisted vote alone. The window is the election timeout maximum:
+    /// past it, Raft itself treats the leader as gone.
+    pub fn raft_leader_liveness(
+        &self,
+        raft: &crate::raft::FerrosRaft,
+    ) -> crate::raft::leader_contact::LeaderLiveness {
+        use crate::raft::leader_contact::{leader_liveness, LeaderView};
+        let view = {
+            let m = raft.metrics();
+            let m = m.borrow();
+            LeaderView {
+                id: m.id,
+                state: m.state,
+                current_term: m.current_term,
+                current_leader: m.current_leader,
+                millis_since_quorum_ack: m.millis_since_quorum_ack,
+            }
+        };
+        let window = std::time::Duration::from_millis(self.config.raft_election_timeout_max_ms);
+        leader_liveness(
+            view,
+            self.leader_contact.last(),
+            std::time::Instant::now(),
+            window,
+        )
     }
 
     /// Synchronous fast path used by readiness and CQL dispatch.
