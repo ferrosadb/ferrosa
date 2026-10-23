@@ -116,14 +116,20 @@ fn round_trips_a_compressed_message() {
         opcode: Opcode::Result,
         length: body.len() as u32,
     };
-    let frame = CqlFrame { header, body: body.clone().into() };
+    let frame = CqlFrame {
+        header,
+        body: body.clone().into(),
+    };
 
     let mut writer = compressed_v5_codec();
     let mut wire = BytesMut::new();
     writer.encode(frame, &mut wire).expect("encode");
 
     // A wide header: the payload shrank, so total is less than 5+3+509+4.
-    assert!(wire.len() < 5 + 3 + 509 + 4, "compressible body must shrink");
+    assert!(
+        wire.len() < 5 + 3 + 509 + 4,
+        "compressible body must shrink"
+    );
 
     let mut reader = compressed_v5_codec();
     let decoded = reader
@@ -147,7 +153,10 @@ fn error_frames_on_a_compressed_connection_still_use_the_wide_header() {
         opcode: Opcode::Error,
         length: body.len() as u32,
     };
-    let frame = CqlFrame { header, body: body.clone().into() };
+    let frame = CqlFrame {
+        header,
+        body: body.clone().into(),
+    };
 
     let mut writer = compressed_v5_codec();
     let mut wire = BytesMut::new();

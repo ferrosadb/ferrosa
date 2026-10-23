@@ -333,12 +333,8 @@ impl CqlCodec {
 
         // Verify CRC24 over the whole header, whose width depends on framing.
         let crc24_end = header_len + V5_CRC24_SIZE;
-        let expected_crc24 = u32::from_le_bytes([
-            src[header_len],
-            src[header_len + 1],
-            src[header_len + 2],
-            0,
-        ]);
+        let expected_crc24 =
+            u32::from_le_bytes([src[header_len], src[header_len + 1], src[header_len + 2], 0]);
         let actual_crc24 = crc24(&src[..header_len]);
         if expected_crc24 != actual_crc24 {
             return Err(CqlError::Protocol(format!(
@@ -378,7 +374,9 @@ impl CqlCodec {
         src.advance(V5_CRC32_SIZE); // skip CRC32
 
         let payload = if uncompressed_len > 0 {
-            let compression = self.compression.expect("uncompressed_len implies negotiation");
+            let compression = self
+                .compression
+                .expect("uncompressed_len implies negotiation");
             let mut prefixed = Vec::with_capacity(4 + wire_payload.len());
             prefixed.extend_from_slice(&(uncompressed_len as u32).to_be_bytes());
             prefixed.extend_from_slice(&wire_payload);
@@ -576,13 +574,21 @@ impl Encoder<CqlFrame> for CqlCodec {
                 &header,
                 original_body_len,
                 original_body_len,
-                if compress_this { self.compression } else { None },
+                if compress_this {
+                    self.compression
+                } else {
+                    None
+                },
                 error_info.as_ref(),
             );
             encode_v5_message_compressed(
                 &header,
                 &item.body,
-                if compress_this { self.compression } else { None },
+                if compress_this {
+                    self.compression
+                } else {
+                    None
+                },
                 dst,
             );
             return Ok(());
