@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Stream rows through staged output and full validating readback.
+//! Correctness: Differential compaction, corruption, cancellation and memory guards.
+//!
 //! Correctness: A completed result is published once or its staging is reclaimed.
 //! Last revised: 2026-09-27
 //! Last changed: Publish retryable digest and readback failures through a bounded channel.
@@ -1296,14 +1300,11 @@ impl CompactionExecutor {
     where
         F: FnMut(usize),
     {
-        use crate::compaction::purge;
         use crate::flush::{FileFlushTarget, FlushTarget};
-        use crate::merge;
         use crate::range_merger::ColumnOrdinalMapping;
         use ferrosa_sstable::io::FileReadAt;
         use ferrosa_sstable::reader::{SSTableComponents, SSTableReader};
         use ferrosa_sstable::writer::SSTableWriter;
-        use std::collections::BinaryHeap;
 
         tracing::info!(
             table_id = %task.table_id,
@@ -1494,236 +1495,18 @@ impl CompactionExecutor {
         )
         .map_err(|e| format!("writer staging: {e}"))?;
 
-        // 3. K-way streaming merge across the input partition iterators.
-        //
-        // Min-heap (custom `Ord` flips the comparison) yields the
-        // smallest partition key.  For each minimum key we drain every
-        // reader currently exposing that key (replenishing as we go),
-        // run `merge::merge_partitions`, write the result, and free it.
-        let mut iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, FileReadAt>> =
-            Vec::with_capacity(readers.len());
-        for r in &readers {
-            let read_start = Instant::now();
-            let iter = r
-                .partitions_iter()
-                .map_err(|e| format!("partitions_iter: {e}"))?;
-            crate::metrics::observe_compaction_phase(
-                crate::metrics::CompactionPhase::MergeRead,
-                read_start.elapsed(),
-            );
-            iters.push(iter);
-        }
-
-        // Heap entry: the Partition is moved into the heap (no key
-        // clones), with a custom `Ord` that sorts by the partition's
-        // own DecoratedKey in token-comparable order.  This eliminates
-        // the O(N) key-allocation pressure the previous (key.clone(),
-        // idx) design caused.
-        struct HeapEntry {
-            partition: ferrosa_sstable::types::Partition,
-            reader_idx: usize,
-        }
-        impl PartialEq for HeapEntry {
-            fn eq(&self, other: &Self) -> bool {
-                self.partition.key == other.partition.key
-            }
-        }
-        impl Eq for HeapEntry {}
-        impl PartialOrd for HeapEntry {
-            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-        impl Ord for HeapEntry {
-            // BinaryHeap is a max-heap; we want a min-heap, so flip the
-            // comparison (smaller DecoratedKey "wins" the pop).
-            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-                other.partition.key.cmp(&self.partition.key)
-            }
-        }
-
-        let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(iters.len());
-        let mut last_input_keys: Vec<Option<ferrosa_common::DecoratedKey>> =
-            vec![None; iters.len()];
-        for (idx, it) in iters.iter_mut().enumerate() {
-            let read_start = Instant::now();
-            let next = it.next_partition().map_err(|e| format!("iter init: {e}"))?;
-            crate::metrics::observe_compaction_phase(
-                crate::metrics::CompactionPhase::MergeRead,
-                read_start.elapsed(),
-            );
-            if let Some(mut partition) = next {
-                validate_compaction_input_key_order(
-                    &task.inputs[idx].id,
-                    &last_input_keys[idx],
-                    &partition.key,
-                )?;
-                last_input_keys[idx] = Some(partition.key.clone());
-                mappings[idx].remap_partition(&mut partition);
-                heap.push(HeapEntry {
-                    partition,
-                    reader_idx: idx,
-                });
-            }
-        }
-
-        let mut total_input_rows: usize = 0;
-        // Counts and min/max token across all merged output partitions so the
-        // emitted SSTableMetadata can be filled without a second scan.
-        let mut tally = OutputTally::default();
-        let table_label = task.table_id.to_string();
-        // First partition that purged down to nothing, kept (unpurged) in case
-        // every partition does: an empty output cannot be swapped in.
-        let mut held_back: Option<ferrosa_sstable::types::Partition> = None;
-        let mut purged_markers: u64 = 0;
-        // Test-only: which merge-loop iteration this is, so the cancel harness
-        // can distinguish the first partition from every later one.
-        #[cfg(any(test, feature = "test-support"))]
-        let mut merge_loop_iteration: u64 = 0;
-
-        while let Some(top) = heap.pop() {
-            #[cfg(any(test, feature = "test-support"))]
-            {
-                cancel_point!(
-                    &pool_table_key,
-                    if merge_loop_iteration == 0 {
-                        CancelPoint::MergePartitionFirst
-                    } else {
-                        CancelPoint::MergePartitionMiddle
-                    }
-                );
-                merge_loop_iteration += 1;
-            }
-            if let Err(c) = cancel.check() {
-                return Err(c.to_string());
-            }
-            // Drain all heap entries that share this key (multiple inputs
-            // wrote the same partition).
-            let HeapEntry {
-                partition: first_partition,
-                reader_idx: first_idx,
-            } = top;
-            // We need to compare future heap tops against this key to
-            // collect duplicates. The partition itself moves into the
-            // group; cheap to compare via a reference into `group`
-            // afterward.
-            total_input_rows += first_partition.rows.len();
-            let mut group: Vec<ferrosa_sstable::types::Partition> = Vec::with_capacity(1);
-            group.push(first_partition);
-            // Advance reader first_idx.
-            let read_start = Instant::now();
-            let next = iters[first_idx]
-                .next_partition()
-                .map_err(|e| format!("iter advance: {e}"))?;
-            crate::metrics::observe_compaction_phase(
-                crate::metrics::CompactionPhase::MergeRead,
-                read_start.elapsed(),
-            );
-            if let Some(next) = next {
-                let mut next = next;
-                validate_compaction_input_key_order(
-                    &task.inputs[first_idx].id,
-                    &last_input_keys[first_idx],
-                    &next.key,
-                )?;
-                last_input_keys[first_idx] = Some(next.key.clone());
-                mappings[first_idx].remap_partition(&mut next);
-                heap.push(HeapEntry {
-                    partition: next,
-                    reader_idx: first_idx,
-                });
-            }
-            // Drain other readers sitting at the same key.
-            while heap.peek().map(|h| h.partition.key == group[0].key) == Some(true) {
-                let HeapEntry {
-                    partition,
-                    reader_idx,
-                } = heap.pop().expect("peek implies pop");
-                total_input_rows += partition.rows.len();
-                group.push(partition);
-                let read_start = Instant::now();
-                let next = iters[reader_idx]
-                    .next_partition()
-                    .map_err(|e| format!("iter advance: {e}"))?;
-                crate::metrics::observe_compaction_phase(
-                    crate::metrics::CompactionPhase::MergeRead,
-                    read_start.elapsed(),
-                );
-                if let Some(next) = next {
-                    let mut next = next;
-                    validate_compaction_input_key_order(
-                        &task.inputs[reader_idx].id,
-                        &last_input_keys[reader_idx],
-                        &next.key,
-                    )?;
-                    last_input_keys[reader_idx] = Some(next.key.clone());
-                    mappings[reader_idx].remap_partition(&mut next);
-                    heap.push(HeapEntry {
-                        partition: next,
-                        reader_idx,
-                    });
-                }
-            }
-
-            observe_group_width(group.len());
-
-            let merge_start = Instant::now();
-            let mut merged = merge::merge_partitions(group);
-            // Compaction output MUST be monotonic. merge_partitions leaves a
-            // single-source partition in its on-disk order, which for a legacy
-            // SSTable can be non-monotonic (t_a0f922a3) — this rewrites it in
-            // clustering order. Cheap O(n) sorted-check for the common already
-            // -sorted case (all multi-source merges, all modern files).
-            merge::ensure_partition_rows_sorted(&mut merged);
-            crate::metrics::observe_compaction_phase(
-                crate::metrics::CompactionPhase::MergePartition,
-                merge_start.elapsed(),
-            );
-            if let Some(policy) = task.purge.as_ref() {
-                // Physically reclaim rows a table tombstone (TRUNCATE) covers. The
-                // logical effect is already immediate on every read; this is what
-                // makes the space come back. The reserved table-tombstone partition
-                // is exempt from the purge below — it may only be dropped once every
-                // replica has purged the data it covers, which is not tracked yet, so
-                // it is retained until the table is dropped.
-                merge::reclaim_covers_table(&mut merged, policy.table_delete);
-                if purge::has_purgeable_marker(&merged, policy)
-                    && !crate::table_tombstone::is_table_tombstone_key(&merged.key)
-                {
-                    let original = held_back.is_none().then(|| merged.clone());
-                    purged_markers += purge::purge_partition(&mut merged, policy).markers();
-                    if purge::is_empty_partition(&merged) {
-                        if held_back.is_none() {
-                            held_back = original;
-                        }
-                        continue;
-                    }
-                }
-            }
-            emit_partition(
-                &mut writer,
-                &output_header,
-                &table_label,
-                merged,
-                &mut tally,
-            )?;
-        }
-
-        if tally.partitions == 0 {
-            // Every partition purged away. Write the first one back unpurged so the
-            // output is non-empty (the swap needs an output); it is dropped by the
-            // next compaction that has other data. Counted so it is visible.
-            let Some(kept) = held_back.take() else {
-                return Err("no partitions to compact".into());
-            };
-            crate::metrics::inc_compaction_purge_held_back();
-            tracing::warn!(
-                table_id = %task.table_id,
-                "compaction: every partition purged away; writing one unpurged partition \
-                 so the output is not empty"
-            );
-            emit_partition(&mut writer, &output_header, &table_label, kept, &mut tally)?;
-        }
+        let (tally, total_input_rows, purged_markers) = super::stream::compact(
+            super::stream::Inputs {
+                task,
+                readers: &readers,
+                mappings: &mappings,
+            },
+            &output_header,
+            &mut writer,
+            &staging_dir,
+            cancel,
+            &mut observe_group_width,
+        )?;
         if purged_markers > 0 {
             crate::metrics::add_compaction_purged_markers(purged_markers);
             tracing::info!(
@@ -1819,22 +1602,29 @@ impl CompactionExecutor {
             let verify_start = Instant::now();
             {
                 let mut iter = reader
-                    .partitions_iter()
+                    .scan_iter()
                     .map_err(|e| format!("CORRUPTION: output partitions_iter failed: {e}"))?;
-                while let Some(p) = iter
-                    .next_partition()
+                let mut row = ferrosa_sstable::types::Row {
+                    clustering: Vec::new(),
+                    cells: Vec::new(),
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::NONE,
+                };
+                while iter
+                    .next_partition_header_only()
                     .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
+                    .is_some()
                 {
                     cancel_point!(&pool_table_key, CancelPoint::VerifyPartition);
-                    if let Err(c) = cancel.check() {
-                        remove_staged_output_components(
-                            &task.output_dir,
-                            &flush_target.generation().to_string(),
-                        );
-                        return Err(c.to_string());
-                    }
+                    cancel.check().map_err(|e| e.to_string())?;
                     readback_partitions += 1;
-                    readback_rows += p.rows.len();
+                    while iter
+                        .next_clustered_row_into(&mut row)
+                        .map_err(|e| format!("CORRUPTION: output read failed: {e}"))?
+                    {
+                        cancel.check().map_err(|e| e.to_string())?;
+                        readback_rows += 1;
+                    }
                 }
             }
             crate::metrics::observe_compaction_phase(
@@ -2002,11 +1792,11 @@ fn combine_input_headers<R: ferrosa_sstable::io::ReadAt>(
 }
 
 /// Counts and token span of the partitions written to the compaction output.
-struct OutputTally {
-    partitions: u64,
-    rows: usize,
-    min_token: i64,
-    max_token: i64,
+pub(super) struct OutputTally {
+    pub(super) partitions: u64,
+    pub(super) rows: usize,
+    pub(super) min_token: i64,
+    pub(super) max_token: i64,
 }
 
 impl Default for OutputTally {
@@ -2020,37 +1810,7 @@ impl Default for OutputTally {
     }
 }
 
-/// Validate and write one merged partition, recording it in `tally`.
-fn emit_partition(
-    writer: &mut ferrosa_sstable::writer::SSTableWriter,
-    header: &ferrosa_sstable::statistics::SerializationHeader,
-    table: &str,
-    mut merged: ferrosa_sstable::types::Partition,
-    tally: &mut OutputTally,
-) -> std::result::Result<(), String> {
-    let write_start = Instant::now();
-    // A legacy simple-framed input may carry whole-value collection cells that
-    // a complex-framed output cannot hold as-is. The merged partition is
-    // owned here, so it is expanded in place, never copied.
-    crate::memtable::expand_collection_blobs_in_place(&mut merged, header, table)
-        .map_err(|e| format!("write partition: {e}"))?;
-    let merged = &merged;
-    validate_partition_writable(merged, header).map_err(|e| format!("write partition: {e}"))?;
-    writer
-        .add_partition(merged)
-        .map_err(|e| format!("write partition: {e}"))?;
-    let token = merged.key.token.0;
-    tally.rows += merged.rows.len();
-    tally.partitions += 1;
-    tally.min_token = tally.min_token.min(token);
-    tally.max_token = tally.max_token.max(token);
-    crate::metrics::observe_compaction_phase(
-        crate::metrics::CompactionPhase::WriterAddPartition,
-        write_start.elapsed(),
-    );
-    Ok(())
-}
-
+#[cfg(test)]
 fn validate_partition_writable(
     partition: &ferrosa_sstable::types::Partition,
     header: &ferrosa_sstable::statistics::SerializationHeader,
@@ -2064,27 +1824,7 @@ fn validate_partition_writable(
     Ok(())
 }
 
-fn validate_compaction_input_key_order(
-    gen: &str,
-    previous: &Option<ferrosa_common::DecoratedKey>,
-    next: &ferrosa_common::DecoratedKey,
-) -> std::result::Result<(), String> {
-    if let Some(previous) = previous {
-        if next <= previous {
-            return Err(format!(
-                "aborting compaction: SSTable {gen} corrupt: Data.db partitions out of token order: \
-                 key {:?} token {} <= previous key {:?} token {}",
-                next.key.as_bytes(),
-                next.token.0,
-                previous.key.as_bytes(),
-                previous.token.0
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_row_writable(
+pub(super) fn validate_row_writable(
     row: &ferrosa_sstable::types::Row,
     is_static: bool,
     partition: &ferrosa_sstable::types::Partition,
@@ -2386,6 +2126,178 @@ mod tests {
     /// without `ensure_partition_rows_sorted` in the executor the rewrite would
     /// keep the bad order while stamping byte-comparable bounds — permanently
     /// non-monotonic and never re-selected.
+    /// Regression guard for the deferred-value selector: equal timestamps must
+    /// compare real payloads across sources AND adjacent duplicates in one source.
+    #[test]
+    fn compaction_deferred_values_preserve_equal_timestamp_ties() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut schema = test_schema_with_columns();
+        schema
+            .regular_columns
+            .push(ferrosa_common::schema::ColumnDefinition {
+                name: "second".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            });
+        let row = |cell| Row {
+            clustering: 1i32.to_be_bytes().to_vec(),
+            cells: vec![(0, cell)],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        };
+        let key = DecoratedKey::new(PartitionKey::from(b"ties".as_slice()));
+        let mut parts = vec![
+            Partition {
+                key: key.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![
+                    row(CellValue::live(b"alpha".to_vec(), 1000)),
+                    row(CellValue::live(b"zeta".to_vec(), 1000)),
+                ],
+            },
+            Partition {
+                key: key.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![row(CellValue::live(b"bravo".to_vec(), 1000))],
+            },
+            Partition {
+                key: key.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![row(CellValue::tombstone(1000, 10))],
+            },
+        ];
+        // Equal higher timestamps must retain ORIGINAL source ordering even
+        // when a lower-index source exposes its winner in the next row batch.
+        parts[0].rows[1].primary_key_liveness = LivenessInfo::with_ttl(2000, 60, 200);
+        parts[1].rows[0].primary_key_liveness = LivenessInfo::with_ttl(2000, 90, 300);
+        parts[0].rows[1].deletion = DeletionTime::new(900, 20);
+        parts[1].rows[0].deletion = DeletionTime::new(900, 30);
+        // Cell reconciliation's comparator intentionally ignores TTL on exact
+        // timestamp/value/expiry ties, so original source priority also matters.
+        parts[0].rows[1]
+            .cells
+            .push((1, CellValue::expiring(b"same".to_vec(), 2000, 60, 200)));
+        parts[1].rows[0]
+            .cells
+            .push((1, CellValue::expiring(b"same".to_vec(), 2000, 90, 200)));
+        let expected = crate::merge::merge_partitions(parts.clone());
+        let inputs = parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let dir = tmp.path().join(format!("input-{i}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                write_sstable_to_dir(&dir, &[p], &schema)
+            })
+            .collect();
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs,
+            output_dir: output_dir.clone(),
+            schema,
+            table_id: test_table_id(),
+            purge: None,
+        };
+        let result = CompactionExecutor::execute_task(&task).unwrap();
+        let reader = open_sstable_reader(&output_dir, &result.metadata.id);
+        assert_eq!(collect_reader_partitions(&reader), vec![expected]);
+        assert_eq!(
+            reader
+                .get_clustering_row(&key, &1i32.to_be_bytes())
+                .unwrap()
+                .unwrap()
+                .rows[0]
+                .cells[0]
+                .1
+                .value
+                .as_deref(),
+            Some(b"zeta".as_slice())
+        );
+    }
+
+    /// Regression guard for deferred validation scheduling. Discarded versions
+    /// and dropped schema columns still require every input checksum to pass.
+    #[test]
+    fn compaction_checks_corrupt_losing_and_dropped_values() {
+        use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
+        use std::io::{Seek, SeekFrom, Write};
+        for drop_column in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let schema = test_schema_with_columns();
+            let mut old_schema = schema.clone();
+            if drop_column {
+                old_schema.regular_columns.insert(
+                    0,
+                    ferrosa_common::schema::ColumnDefinition {
+                        name: "gone".into(),
+                        type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                    },
+                );
+            }
+            let key = DecoratedKey::new(PartitionKey::from(b"crc-loser".as_slice()));
+            let mut cells = vec![(0, CellValue::live(vec![1; 128 * 1024], 1000))];
+            if drop_column {
+                cells.push((1, CellValue::live(b"old".to_vec(), 1000)));
+            }
+            let old = Partition {
+                key: key.clone(),
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: 1i32.to_be_bytes().to_vec(),
+                    cells,
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(1000),
+                }],
+            };
+            let new = Partition {
+                key,
+                deletion: DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![Row {
+                    clustering: 1i32.to_be_bytes().to_vec(),
+                    cells: vec![(0, CellValue::live(b"fresh".to_vec(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(2000),
+                }],
+            };
+            let old_dir = tmp.path().join("old");
+            let new_dir = tmp.path().join("new");
+            std::fs::create_dir_all(&old_dir).unwrap();
+            std::fs::create_dir_all(&new_dir).unwrap();
+            let old_meta = write_sstable_to_dir(&old_dir, &[old], &old_schema);
+            let new_meta = write_sstable_to_dir(&new_dir, &[new], &schema);
+            let data = old_dir.join(format!("{}-Data.db", old_meta.id));
+            let mut file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+            file.seek(SeekFrom::Start(65536)).unwrap();
+            file.write_all(&[2]).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+            let output_dir = tmp.path().join("output");
+            std::fs::create_dir_all(&output_dir).unwrap();
+            let task = CompactionTask {
+                inputs: vec![old_meta, new_meta],
+                output_dir,
+                schema,
+                table_id: test_table_id(),
+                purge: None,
+            };
+            let error = CompactionExecutor::execute_task(&task)
+                .expect_err("corrupt discarded bytes must abort compaction");
+            assert!(
+                error.contains("CRC.db mismatch"),
+                "dropped={drop_column}: {error}"
+            );
+            assert!(data.exists(), "failed compaction must preserve inputs");
+        }
+    }
+
     #[test]
     fn compaction_resorts_single_misordered_legacy_sstable() {
         use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};

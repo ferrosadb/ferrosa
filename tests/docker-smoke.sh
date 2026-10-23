@@ -273,9 +273,9 @@ wait_for_cql_value() {
     local last_result=""
 
     while (( SECONDS < deadline )); do
-        last_result=$(cqlsh --connect-timeout=2 --request-timeout=2 \
-            localhost "$port" -e "$query" 2>&1) || true
-        if grep -Fq -- "$expected" <<<"$last_result"; then
+        if last_result=$(cqlsh --connect-timeout=2 --request-timeout=2 \
+            localhost "$port" -e "$query" 2>&1) &&
+            grep -Fq -- "$expected" <<<"$last_result"; then
             return 0
         fi
         sleep 1
@@ -395,8 +395,9 @@ wait_for_cluster_mode() {
     local deadline=$((SECONDS + timeout)) last=""
     while (( SECONDS < deadline )); do
         last=$(cluster_status "$port" 2>/dev/null || true)
-        if grep -q '"mode":"cluster"' <<<"$last"; then
-            pass "$name in cluster mode"
+        if grep -q '"mode":"cluster"' <<<"$last" &&
+            grep -q '"ddl_path":"cluster"' <<<"$last"; then
+            pass "$name in cluster mode with Raft-backed DDL"
             return 0
         fi
         sleep 1
@@ -738,6 +739,13 @@ wait_cql 9044 "node3" "$PAIR_CQL_TIMEOUT"
 wait_for_cluster_mode 9090 "Node1" 90
 wait_for_cluster_mode 9091 "Node2" 90
 wait_for_cluster_mode 9092 "Node3" 90
+
+# Cluster mode is a topology label; local CQL/system queries also succeed while
+# the survivor's peer lanes are reconnecting (nightly run 39922605666). Establish
+# replication readiness with a bounded, non-mutating QUORUM read of existing data
+# before the one-shot recovery write. A cluster that never recovers still fails.
+wait_for_cql_value 9042 "CONSISTENCY QUORUM; SELECT v FROM cluster_test.data WHERE k = 'key_a';" \
+    "value_a" "QUORUM replication readiness after recovery"
 
 # Writes should work again
 info "Writing after recovery..."

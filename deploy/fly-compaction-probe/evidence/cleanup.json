@@ -1,0 +1,9 @@
+{
+  "app": "ferrosa-compaction-probe-1023",
+  "machine": "68342d1f206778",
+  "destroy_exit": 0,
+  "destroy_output": "Destroyed app ferrosa-compaction-probe-1023",
+  "task_app_absent": true,
+  "existing_builder_untouched_and_present": true,
+  "raw_final_archive_collected_before_destroy": true
+}

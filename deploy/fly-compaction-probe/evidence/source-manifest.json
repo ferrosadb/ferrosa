@@ -1,0 +1,67 @@
+{
+  "baseline_commit": "e2bc833dd2249abacf397f25bb49011f78da4962",
+  "candidate": "frozen final V5 sparse read hints; uncommitted feature perf/compaction-cursors",
+  "candidate_modified_source_and_tests_sha256": {
+    "ferrosa-sstable/src/compression.rs": "6a8da9ca4133d6a4a9039dcb9739b071be02453ea3fe048ce416346b55a6aad3",
+    "ferrosa-sstable/src/data.rs": "d9c81fdf8d23e3cd9c1921364ff6df3b383c257e40a165e1eed57a15bc3f1785",
+    "ferrosa-sstable/src/io.rs": "7828122c1cc6e04716af28d5f5f5d40a02e76a3cea38da4697aa709eda862103",
+    "ferrosa-sstable/src/reader.rs": "6f0e633a4525a9a521ad87e5e185a98b55f53c84cde3697c3935ff8e4956c700",
+    "ferrosa-sstable/src/scan.rs": "cbd2bf2539afebb8be70855cd2219b7ca9f032f52f5678b24c2d56fadc8c6796",
+    "ferrosa-sstable/src/writer.rs": "eab3c2e57129a5d5e751e72f04d2b5d45e7b5c9e661356399e620da632eefeb1",
+    "ferrosa-sstable/tests/scan_cursor.rs": "75600629065816b74abe2f5618b7961c504bba46ba45ab533a41cd1309b56060",
+    "ferrosa-sstable/tests/scan_cursor_io.rs": "5f8fb6bc636e923f025effe52dec70ea503e989f57cf04c090e4008659c0633b",
+    "ferrosa-sstable/tests/sstable_read_alloc.rs": "c1d1ccd287178bac158e2a8a1e316f5202333be1d39d9ca37fd30a743bc7bf10",
+    "ferrosa-storage/examples/compaction_allocation_probe.rs": "010d54963a330b004d7264460d9d5d68b815b5f6faf53b6df5f66912d4c84f3c",
+    "ferrosa-storage/src/compaction/executor.rs": "72bdec42404982992404a57c4f1556d0a0037478109f8edda65d85e5263b3692",
+    "ferrosa-storage/src/compaction/mod.rs": "567b350e47937860ce06bc635d845b13d4f2902c833ae86754b80fba23f94a04",
+    "ferrosa-storage/src/compaction/purge.rs": "a2a731d2f6f49cf5abba3ac0308e6f244e8222a1fc185270bc627450f3232173",
+    "ferrosa-storage/src/compaction/stream.rs": "080426e26ece3444a6be6ddd1dc7f723af7684bb7487adaf90ec18fb6c393165",
+    "ferrosa-storage/src/merge.rs": "a40c0c590df92772e093afbd5cb09a1259cf83ca4eccdad47543c8b6fb1d044a",
+    "ferrosa-storage/src/range_merger.rs": "0215fb1817101143ddb49dae3856757545fa8781ef05880066fca61bc74e6cbb",
+    "ferrosa-storage/tests/compaction_alloc.rs": "f029c59796da683dfc405279dcc9e41e2ddfc2f2b974f23d31a43214c333f1fc",
+    "ferrosa-storage/tests/compaction_streaming_peak.rs": "2ef3b61216e796945c8d83e078a0d7551da746423fe37709e810ea548f65873a"
+  },
+  "untouched_source": "baseline commit",
+  "harness_identical_on_both_arms": true,
+  "sha256": {
+    "Cargo.lock": "c9121059371fe283379562a40cdc3240fd1c327ca4aa8541c1de6d86c1a0588e",
+    "Cargo.toml": "ca502406263673ca05b112ee54c42d88cbcd3abb9587fc3669fd8360d04e8ff1",
+    "rust-toolchain.toml": "989e7ea1e202f064d793f67c08f4878d4c2449b92dc02e23f05384922bc811b6",
+    "deploy/fly-compaction-probe/paired.py": "db0db8021371efd2a21943b3e85997edb99ca8c577a62ad1bb8b411c7644790c",
+    "deploy/fly-compaction-probe/attribute.py": "02e8e440300b49b29b7348153314556541dc6860b181213d01a76909a3ffc843",
+    "deploy/fly-compaction-probe/run-final-v5.sh": "b3be1bd133cd78d9fbf0dc12ef031eb52183fc42db1de66fcdce95d6b5fe319b"
+  },
+  "machine": {
+    "provider": "Fly",
+    "app": "ferrosa-compaction-probe-1023",
+    "machine": "68342d1f206778",
+    "region": "sjc",
+    "cpu_kind": "performance",
+    "cpus": 4,
+    "memory_mib": 8192,
+    "rootfs_gb": 30
+  },
+  "toolchain": {
+    "rustc": "1.98.0 (88d9e12ae 2026-08-18)",
+    "llvm": "22.1.8",
+    "target": "x86_64-unknown-linux-gnu",
+    "profile": "release",
+    "debug": "line-tables-only",
+    "split-debuginfo": "off",
+    "strip": "none",
+    "RUSTFLAGS": "unset",
+    "CARGO_BUILD_JOBS": 4
+  },
+  "isolation": {
+    "baseline_target": "/work/baseline-target",
+    "candidate_target": "/work/candidate-target",
+    "dependency_seed": "external dependencies only; local crate artifacts/fingerprints removed",
+    "timings": "alternating seven fresh-process pairs per shape; direct reads enabled; sync before each arm; compiler/test/trace traffic absent"
+  },
+  "source_scope": "modern clustered path: source metadata plus owned winning output and reusable tie buffers; legacy: fully owned row heads, 4 MiB plus one-row sorter/spill buffers; static rows remain owned per input",
+  "raw_evidence_path": "/Users/bkearns/src/ferrosa-suite/compaction-probe-evidence-20261023",
+  "measurement_allocator": "counting System allocator; production node uses jemalloc; not a production-allocator throughput claim",
+  "synchronization": "task-owned merge/decode state bypasses shared chunk cache; existing I/O, scheduler and publication synchronization remains",
+  "executed_final_runner_sha256": "97b7a8007317ab00a80729370f91295d1faa911ee11ab1535455235b9e046ae3",
+  "rerun_wrapper_note": "Tracked final runner includes formerly separate targeted gates/build steps; executed final runner starts after those gates. Same paired.py, probe source and measured command semantics."
+}
