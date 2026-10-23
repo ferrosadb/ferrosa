@@ -70,6 +70,25 @@ class ReleaseShipsGlibcAlongsideMusl(unittest.TestCase):
         self.assertIn('GLIBC_FLOOR: "2.35"', gnu)
         self.assertIn('"$GLIBC_FLOOR"', code(gnu))
 
+    def test_every_container_job_runs_its_steps_in_bash(self):
+        # Inside a `container:` job GitHub's default shell is `sh -e`, and the
+        # Ubuntu image's sh is dash, which rejects `set -o pipefail` and exits 2.
+        # CI run 40039687871 failed exactly so ("set: Illegal option -o
+        # pipefail") after a successful 16-minute compile.
+        workflows = REPO_ROOT / ".github" / "workflows"
+        checked = 0
+        for path in sorted(workflows.glob("*.yml")):
+            for name, job in jobs(path.read_text(encoding="utf-8")).items():
+                if not re.search(r"(?m)^    container:", job):
+                    continue
+                checked += 1
+                self.assertRegex(
+                    job,
+                    r"(?m)^    defaults:\n      run:\n        shell: bash$",
+                    f"{path.name}:{name} runs in a container without shell: bash",
+                )
+        self.assertGreaterEqual(checked, 2)
+
     def test_the_deb_is_built_from_the_glibc_binaries(self):
         gnu = code(self.jobs["build-linux-gnu"])
         self.assertIn(

@@ -536,6 +536,11 @@ jobs:
     runs-on: ubuntu-24.04
     container:
       image: docker.io/library/ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
+    # Inside a container GitHub's default shell is `sh -e`, and this image's sh
+    # is dash, which rejects `set -o pipefail` (CI run 40039687871).
+    defaults:
+      run:
+        shell: bash
     env:
       # The oldest glibc every glibc artifact must run on (Ubuntu 22.04).
       GLIBC_FLOOR: "2.35"
