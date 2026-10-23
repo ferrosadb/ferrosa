@@ -21,9 +21,16 @@ updates:
       prefix: "chore(deps)"
       include: "scope"
 
-  # Cargo: keep Rust deps current to surface CVEs early.
+  # Cargo: keep Rust deps current to surface CVEs early. The root workspace
+  # plus every separately locked workspace (each has its own Cargo.lock;
+  # .github/workflows/security.yml audits the same list).
   - package-ecosystem: "cargo"
-    directory: "/"
+    directories:
+      - "/"
+      - "/ferrosa-jsonb-conformance"
+      - "/ferrosa-sstable/fuzz"
+      - "/examples/timeseries-rrd/wasm-rust/rms"
+      - "/examples/timeseries-rrd/wasm-rust/stddev"
     schedule:
       interval: "weekly"
       day: "monday"
@@ -35,6 +42,65 @@ updates:
           - "minor"
           - "patch"
     open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Python driver test harnesses and the drop-in driver package.
+  - package-ecosystem: "pip"
+    directories:
+      - "/drivers"
+      - "/ferrosa-jepsen/drivers/python"
+      - "/tests/drivers/python"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    groups:
+      pip-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # Go driver test harnesses.
+  - package-ecosystem: "gomod"
+    directories:
+      - "/ferrosa-jepsen/drivers/go"
+      - "/tests/drivers/go"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    groups:
+      gomod-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+
+  # The AssemblyScript UDF proof of concept.
+  - package-ecosystem: "npm"
+    directory: "/ferrosa-udf/examples/asc-poc"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Los_Angeles"
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    open-pull-requests-limit: 5
     commit-message:
       prefix: "chore(deps)"
       include: "scope"

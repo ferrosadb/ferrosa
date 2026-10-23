@@ -2,6 +2,7 @@
 name = "ferrosa-jsonb"
 description = "Exact, canonical, fail-loud jsonb value model for Ferrosa (leaf crate, no arrow-rs)"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

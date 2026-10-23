@@ -144,7 +144,7 @@ case the scan runs to completion under the bound instead. `ASK` is planned with
 - **`ferrosa-schema`** — `Schema` carried in `AppState`.
 - **`ferrosa-net`** — `tls::optional_server_config` builds the HTTPS config.
 
-External: `spargebra`, `sparesults`, `oxrdf` (all with `sparql-12`/`rdf-12`),
+External: `spargebra`, `oxrdf` (both with `sparql-12`/`rdf-12`),
 `axum`, `axum-server` (`tls-rustls-no-provider`), `tokio`, `futures` (`StreamExt` over the partition stream), `tower-http`,
 `serde`/`serde_json`, `serde_urlencoded`, `base64` (declared, currently unused),
 `uuid`, `tracing`.

@@ -368,7 +368,7 @@ pub async fn run(addr: SocketAddr, panel: Option<String>) -> io::Result<()> {
 }
 
 /// Main event loop.  Separated from `run()` so teardown always happens.
-fn event_loop<B: ratatui::backend::Backend>(
+fn event_loop<B: ratatui::backend::Backend<Error = io::Error>>(
     terminal: &mut Terminal<B>,
     state: &mut AppState,
     client: &mut CqlClient,

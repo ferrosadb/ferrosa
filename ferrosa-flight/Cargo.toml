@@ -2,6 +2,7 @@
 name = "ferrosa-flight"
 description = "Apache Arrow Flight (gRPC) query endpoint for Ferrosa"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

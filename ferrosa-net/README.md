@@ -219,7 +219,7 @@ value counts as unset.
   dependency.
 
 External: `tokio`, `tokio-util`, `bytes`, `capnp`/`capnpc`, `rustls` +
-`tokio-rustls` + `rustls-pemfile`, `hmac` + `sha2`, `dashmap`, `parking_lot`,
+`tokio-rustls` (PEM parsing via `rustls::pki_types`), `hmac` + `sha2`, `dashmap`, `parking_lot`,
 `arc-swap`, `futures`, `uuid`, `rand`, `lz4_flex`, `snap`, `tracing`.
 
 **Called by** (crates that depend on this):
