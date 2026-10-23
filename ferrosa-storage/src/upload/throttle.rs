@@ -1,14 +1,21 @@
 //! Client-side request throttling for the object store.
 //!
-//! Cloudflare R2 answers bursts with `429 Too Many Requests`, and
-//! `object_store` 0.11 retries only 5xx responses, so every 429 failed its
-//! request outright. Recovery (restoring evicted SSTables, read-through
-//! rehydration) issues exactly those bursts.
+//! Cloudflare R2 answers bursts with `429 Too Many Requests`. Recovery
+//! (restoring evicted SSTables, read-through rehydration) issues exactly
+//! those bursts.
 //!
 //! [`ThrottledStore`] wraps the one object store every path shares (uploads,
 //! compaction uploads, deletes, rehydration, restore): a [`RequestPacer`]
 //! spaces requests to a configured rate, and a request answered 429 is
 //! retried with bounded exponential backoff.
+//!
+//! The 429 retry lives here and nowhere else. `object_store` 0.11 never
+//! retried a 429; 0.13 and later retry it inside the HTTP client, unpaced,
+//! where this layer cannot count it. [`RateLimitSurfacing`] is installed as
+//! the S3 client's HTTP connector and turns every 429 response into a
+//! non-retryable error, so each one reaches [`ThrottledStore`]: it is paced,
+//! counted in [`rate_limit_events`] (which download concurrency backs off
+//! on), logged, and bounded by [`RateLimitRetry`] as before.
 //!
 //! It also caps requests in flight (`FERROSA_S3_MAX_CONCURRENT_REQUESTS`) with
 //! its own permits rather than `object_store::limit::LimitStore`, for two
@@ -21,7 +28,8 @@
 //!   yields nothing for `FERROSA_S3_BODY_IDLE_TIMEOUT_SECS` fails with a
 //!   retryable error and releases the permit, instead of holding it for the
 //!   900 s request timeout. `get_range` and `get_ranges` go through `get_opts`
-//!   (the trait defaults), so every body consumer gets the same bound.
+//!   (`ObjectStoreExt` and the trait default), so every body consumer gets
+//!   the same bound.
 
 use std::fmt;
 use std::future::Future;
@@ -33,10 +41,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
+use object_store::client::{
+    HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest, HttpResponse, HttpService,
+    ReqwestConnector,
+};
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UploadPart,
+    ClientOptions, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
+    MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions,
+    PutPayload, PutResult, Result, UploadPart,
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
@@ -120,12 +133,71 @@ impl Default for RateLimitRetry {
 
 /// Whether an object-store error is the server rate-limiting us.
 ///
-/// `object_store` 0.11 does not expose the HTTP status of a failed request
-/// as a type, only in its message ("HTTP status client error (429 Too Many
-/// Requests)"), so this matches on that text.
+/// `object_store` does not expose the HTTP status of a failed request as a
+/// public type (its `RetryError` is crate-private), only in its message, so
+/// this matches on that text. [`RateLimitSurfacing`] writes the same text.
 pub fn is_rate_limited(err: &object_store::Error) -> bool {
     let text = err.to_string();
     text.contains("429") && text.contains("Too Many Requests")
+}
+
+/// The message [`RateLimitSurfacing`] gives a 429 response. It carries the
+/// text [`is_rate_limited`] matches.
+const RATE_LIMITED_RESPONSE: &str = "HTTP status client error (429 Too Many Requests); \
+     surfaced to ferrosa's ThrottledStore, which paces and retries it";
+
+/// An [`HttpConnector`] whose clients return every `429 Too Many Requests`
+/// response as a non-retryable [`HttpError`] instead of a response.
+///
+/// `object_store` 0.13+ retries a 429 inside its HTTP client, below every
+/// [`ObjectStore`] wrapper: unpaced by [`RequestPacer`], invisible to
+/// [`rate_limit_events`] and the 429 log, and stacked under this layer's own
+/// [`RateLimitRetry`]. An [`HttpErrorKind::Unknown`] error is never retried
+/// by the client (`client/retry.rs`), so the 429 reaches [`ThrottledStore`]
+/// exactly as it did on 0.11, which never retried one. Every other status,
+/// 5xx retries included, passes through untouched.
+#[derive(Debug, Default)]
+pub struct RateLimitSurfacing {
+    inner: ReqwestConnector,
+}
+
+impl HttpConnector for RateLimitSurfacing {
+    fn connect(&self, options: &ClientOptions) -> Result<HttpClient> {
+        let client = self.inner.connect(options)?;
+        Ok(HttpClient::new(SurfaceRateLimits(client)))
+    }
+}
+
+/// The [`HttpService`] [`RateLimitSurfacing`] hands out.
+#[derive(Debug)]
+struct SurfaceRateLimits<S>(S);
+
+/// Something that can execute one HTTP request: an [`HttpClient`], or a
+/// scripted service in tests.
+#[async_trait]
+trait Execute: fmt::Debug + Send + Sync + 'static {
+    async fn execute(&self, req: HttpRequest) -> std::result::Result<HttpResponse, HttpError>;
+}
+
+#[async_trait]
+impl Execute for HttpClient {
+    async fn execute(&self, req: HttpRequest) -> std::result::Result<HttpResponse, HttpError> {
+        HttpClient::execute(self, req).await
+    }
+}
+
+#[async_trait]
+impl<S: Execute> HttpService for SurfaceRateLimits<S> {
+    async fn call(&self, req: HttpRequest) -> std::result::Result<HttpResponse, HttpError> {
+        let response = self.0.execute(req).await?;
+        if response.status().as_u16() == 429 {
+            return Err(HttpError::new(
+                HttpErrorKind::Unknown,
+                std::io::Error::other(RATE_LIMITED_RESPONSE),
+            ));
+        }
+        Ok(response)
+    }
 }
 
 /// Count of 429 responses seen by any [`ThrottledStore`] in this process.
@@ -142,7 +214,15 @@ pub fn rate_limit_events() -> u64 {
 
 /// An [`ObjectStore`] that caps requests in flight, paces them, retries
 /// rate-limited ones, and bounds how long a GET body may stay silent.
+///
+/// The state sits behind an [`Arc`] because `list` and `delete_stream` return
+/// `'static` streams: each one owns a handle to the limits it is paced by.
 pub struct ThrottledStore {
+    shared: Arc<Throttle>,
+}
+
+/// The limits and accounting every request of one [`ThrottledStore`] shares.
+struct Throttle {
     inner: Arc<dyn ObjectStore>,
     pacer: Option<RequestPacer>,
     retry: RateLimitRetry,
@@ -171,17 +251,21 @@ impl ThrottledStore {
             "the body idle timeout must be positive"
         );
         Self {
-            inner,
-            pacer: limits.requests_per_second.map(RequestPacer::new),
-            retry,
-            limits,
-            permits: Arc::new(Semaphore::new(limits.max_in_flight)),
-            throttled: AtomicBool::new(false),
-            waiting: AtomicBool::new(false),
-            slow_waits: AtomicU64::new(0),
+            shared: Arc::new(Throttle {
+                inner,
+                pacer: limits.requests_per_second.map(RequestPacer::new),
+                retry,
+                limits,
+                permits: Arc::new(Semaphore::new(limits.max_in_flight)),
+                throttled: AtomicBool::new(false),
+                waiting: AtomicBool::new(false),
+                slow_waits: AtomicU64::new(0),
+            }),
         }
     }
+}
 
+impl Throttle {
     /// Wait for the pacer, then for a permit, and report a long wait.
     async fn admit(&self, op: &'static str) -> OwnedSemaphorePermit {
         let started = Instant::now();
@@ -398,9 +482,9 @@ impl MultipartUpload for LimitedUpload {
 impl fmt::Debug for ThrottledStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ThrottledStore")
-            .field("pacer", &self.pacer)
-            .field("limits", &self.limits)
-            .field("retry", &self.retry)
+            .field("pacer", &self.shared.pacer)
+            .field("limits", &self.shared.limits)
+            .field("retry", &self.shared.retry)
             .finish_non_exhaustive()
     }
 }
@@ -410,12 +494,18 @@ impl fmt::Display for ThrottledStore {
         write!(
             f,
             "ThrottledStore(max_in_flight={}, {})",
-            self.limits.max_in_flight, self.inner
+            self.shared.limits.max_in_flight, self.shared.inner
         )
     }
 }
 
+/// Every method is implemented (`missing_trait_methods` is denied), so a
+/// method added to the trait cannot slip past the limits through a default.
+/// `get_ranges` and `rename_opts` restate the trait defaults on top of this
+/// store's own `get_opts`, `copy_opts` and `delete_stream`, so each request
+/// they issue is paced, permitted and idle-bounded.
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStore for ThrottledStore {
     async fn put_opts(
         &self,
@@ -423,8 +513,9 @@ impl ObjectStore for ThrottledStore {
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult> {
-        self.call("put", location, || {
-            self.inner.put_opts(location, payload.clone(), opts.clone())
+        let t = &self.shared;
+        t.call("put", location, || {
+            t.inner.put_opts(location, payload.clone(), opts.clone())
         })
         .await
     }
@@ -432,32 +523,42 @@ impl ObjectStore for ThrottledStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
-        let upload = self
+        let t = &self.shared;
+        let upload = t
             .call("put_multipart", location, || {
-                self.inner.put_multipart_opts(location, opts.clone())
+                t.inner.put_multipart_opts(location, opts.clone())
             })
             .await?;
         Ok(Box::new(LimitedUpload {
             upload,
-            permits: Arc::clone(&self.permits),
+            permits: Arc::clone(&t.permits),
         }))
     }
 
-    /// `get`, `get_range` and `get_ranges` are the trait defaults, which all
-    /// come here, so every body is idle-bounded and holds its permit.
+    /// `get`, `get_range` and `head` (`ObjectStoreExt`) and `get_ranges` (the
+    /// trait default) all come here. A body is idle-bounded and holds its
+    /// permit; a HEAD has no body, so its permit is released at once.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
-        let (result, permit) = self
+        let t = &self.shared;
+        if options.head {
+            return t
+                .call("head", location, || {
+                    t.inner.get_opts(location, options.clone())
+                })
+                .await;
+        }
+        let (result, permit) = t
             .request("get", location, || {
-                self.inner.get_opts(location, options.clone())
+                t.inner.get_opts(location, options.clone())
             })
             .await?;
         let payload = match result.payload {
             GetResultPayload::Stream(stream) => GetResultPayload::Stream(idle_bounded(
                 stream,
                 permit,
-                self.limits.body_idle_timeout,
+                t.limits.body_idle_timeout,
                 location.clone(),
             )),
             file @ GetResultPayload::File(..) => file,
@@ -465,57 +566,127 @@ impl ObjectStore for ThrottledStore {
         Ok(GetResult { payload, ..result })
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        self.call("head", location, || self.inner.head(location))
-            .await
+    async fn get_ranges(
+        &self,
+        location: &Path,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Result<Vec<Bytes>> {
+        object_store::coalesce_ranges(
+            ranges,
+            |range| self.get_range(location, range),
+            object_store::OBJECT_STORE_COALESCE_DEFAULT,
+        )
+        .await
     }
 
-    async fn delete(&self, location: &Path) -> Result<()> {
-        self.call("delete", location, || self.inner.delete(location))
-            .await
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
-        // A listing is a paged stream; it holds one permit while it runs and
-        // pacing covers only its first page.
-        let prefix = prefix.cloned();
-        self.admit("list")
-            .map(move |permit| {
-                self.inner
-                    .list(prefix.as_ref())
-                    .map(move |item| {
-                        let _held = &permit;
-                        item
-                    })
-                    .boxed()
+    /// Each location is deleted by its own request, paced, holding a permit
+    /// and retried on 429 like any other: `ObjectStoreExt::delete` comes here
+    /// with a stream of one. Results keep the input order.
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let t = Arc::clone(&self.shared);
+        let in_flight = t.limits.max_in_flight;
+        locations
+            .map(move |location| {
+                let t = Arc::clone(&t);
+                async move {
+                    let location = location?;
+                    t.call("delete", &location, || t.inner.delete(&location))
+                        .await?;
+                    Ok(location)
+                }
             })
-            .into_stream()
-            .flatten()
+            .buffered(in_flight)
             .boxed()
     }
 
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        // A listing is a paged stream; it holds one permit while it runs and
+        // pacing covers only its first page.
+        let t = Arc::clone(&self.shared);
+        let prefix = prefix.cloned();
+        async move {
+            let permit = t.admit("list").await;
+            t.inner
+                .list(prefix.as_ref())
+                .map(move |item| {
+                    let _held = &permit;
+                    item
+                })
+                .boxed()
+        }
+        .into_stream()
+        .flatten()
+        .boxed()
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        let t = Arc::clone(&self.shared);
+        let prefix = prefix.cloned();
+        let offset = offset.clone();
+        async move {
+            let permit = t.admit("list").await;
+            t.inner
+                .list_with_offset(prefix.as_ref(), &offset)
+                .map(move |item| {
+                    let _held = &permit;
+                    item
+                })
+                .boxed()
+        }
+        .into_stream()
+        .flatten()
+        .boxed()
+    }
+
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
+        let t = &self.shared;
         let location = prefix.cloned().unwrap_or_default();
-        self.call("list", &location, || self.inner.list_with_delimiter(prefix))
+        t.call("list", &location, || t.inner.list_with_delimiter(prefix))
             .await
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-        self.call("copy", from, || self.inner.copy(from, to)).await
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+        let t = &self.shared;
+        let op = match options.mode {
+            object_store::CopyMode::Overwrite => "copy",
+            object_store::CopyMode::Create => "copy_if_not_exists",
+        };
+        t.call(op, from, || t.inner.copy_opts(from, to, options.clone()))
+            .await
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        self.call("copy_if_not_exists", from, || {
-            self.inner.copy_if_not_exists(from, to)
-        })
-        .await
+    async fn rename_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: object_store::RenameOptions,
+    ) -> Result<()> {
+        // Copy then delete, as the trait default does, through this store so
+        // both requests take the limits.
+        let mode = match options.target_mode {
+            object_store::RenameTargetMode::Overwrite => object_store::CopyMode::Overwrite,
+            object_store::RenameTargetMode::Create => object_store::CopyMode::Create,
+        };
+        let copy = CopyOptions {
+            mode,
+            extensions: options.extensions,
+        };
+        self.copy_opts(from, to, copy).await?;
+        self.delete(from).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicUsize};
 
     /// A consumer that polls a finished stream once more must be told it is
     /// finished.
@@ -573,12 +744,36 @@ mod tests {
         );
     }
 
-    /// Answers the first `rate_limited` GETs the way R2 does under load,
-    /// then serves from memory.
+    /// Answers the first `rate_limited` GETs (and the first `deletes.limited`
+    /// deletes) the way R2 does under load, then serves from memory.
     #[derive(Debug)]
     struct RateLimitingStore {
-        inner: object_store::memory::InMemory,
+        inner: Arc<object_store::memory::InMemory>,
         rate_limited: AtomicU32,
+        deletes: Arc<DeleteScript>,
+    }
+
+    /// What the deletes reaching a [`RateLimitingStore`] see and do.
+    #[derive(Debug, Default)]
+    struct DeleteScript {
+        /// Deletes still to answer 429.
+        limited: AtomicU32,
+        /// Delete requests that reached the store, 429s included.
+        issued: AtomicUsize,
+        in_flight: AtomicUsize,
+        max_in_flight: AtomicUsize,
+        /// How long a delete that is not rate-limited takes.
+        delay: Duration,
+    }
+
+    impl RateLimitingStore {
+        fn new(deletes: DeleteScript) -> Self {
+            Self {
+                inner: Arc::new(object_store::memory::InMemory::new()),
+                rate_limited: AtomicU32::new(0),
+                deletes: Arc::new(deletes),
+            }
+        }
     }
 
     impl fmt::Display for RateLimitingStore {
@@ -607,7 +802,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &Path,
-            opts: PutMultipartOpts,
+            opts: PutMultipartOptions,
         ) -> Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -621,20 +816,44 @@ mod tests {
             }
             self.inner.get_opts(location, options).await
         }
-        async fn delete(&self, location: &Path) -> Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path>>,
+        ) -> BoxStream<'static, Result<Path>> {
+            let script = Arc::clone(&self.deletes);
+            let inner = Arc::clone(&self.inner);
+            locations
+                .then(move |location| {
+                    let script = Arc::clone(&script);
+                    let inner = Arc::clone(&inner);
+                    async move {
+                        let location = location?;
+                        script.issued.fetch_add(1, Ordering::SeqCst);
+                        let limited = script
+                            .limited
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                            .is_ok();
+                        if limited {
+                            return Err(too_many_requests());
+                        }
+                        let now = script.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                        script.max_in_flight.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(script.delay).await;
+                        let result = inner.delete(&location).await;
+                        script.in_flight.fetch_sub(1, Ordering::SeqCst);
+                        result.map(|()| location)
+                    }
+                })
+                .boxed()
         }
-        fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
+        fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+        async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -657,10 +876,7 @@ mod tests {
     }
 
     async fn store_rate_limiting(times: u32) -> (Arc<dyn ObjectStore>, Path) {
-        let inner = RateLimitingStore {
-            inner: object_store::memory::InMemory::new(),
-            rate_limited: AtomicU32::new(0),
-        };
+        let inner = RateLimitingStore::new(DeleteScript::default());
         let path = Path::from("prefix/sstables/1-Data.db");
         inner
             .put(&path, PutPayload::from_static(b"rows"))
@@ -776,5 +992,294 @@ mod tests {
         let err = store.get(&path).await.unwrap_err();
 
         assert!(is_rate_limited(&err), "the 429 is surfaced: {err}");
+    }
+
+    /// `object_store` 0.13 turned `delete` into `delete_stream`, which a
+    /// wrapper must implement itself. Each delete in the stream is its own
+    /// request: rate-limited ones are retried like any other, and the 429 is
+    /// counted for the download back-off.
+    #[tokio::test]
+    async fn a_rate_limited_delete_is_retried_until_it_succeeds() {
+        let inner = Arc::new(RateLimitingStore::new(DeleteScript {
+            limited: AtomicU32::new(2),
+            ..DeleteScript::default()
+        }));
+        let path = Path::from("prefix/sstables/1-Data.db");
+        inner
+            .put(&path, PutPayload::from_static(b"rows"))
+            .await
+            .unwrap();
+        let store = ThrottledStore::new(inner.clone(), limits(64), fast_retry(5));
+        let events_before = rate_limit_events();
+
+        store.delete(&path).await.unwrap();
+
+        assert_eq!(inner.deletes.issued.load(Ordering::SeqCst), 3);
+        assert!(
+            matches!(
+                inner.inner.head(&path).await,
+                Err(object_store::Error::NotFound { .. })
+            ),
+            "the delete took effect"
+        );
+        assert!(rate_limit_events() >= events_before + 2);
+    }
+
+    /// Every delete of a multi-location `delete_stream` takes one of the
+    /// store's shared permits, so deletes count against the same in-flight cap
+    /// as everything else: with one of two permits held by an unread GET body,
+    /// at most one delete runs at a time.
+    #[tokio::test]
+    async fn deletes_share_the_in_flight_cap_with_other_requests() {
+        let inner = Arc::new(RateLimitingStore::new(DeleteScript {
+            delay: Duration::from_millis(20),
+            ..DeleteScript::default()
+        }));
+        let held_path = Path::from("prefix/sstables/held-Data.db");
+        inner
+            .put(&held_path, PutPayload::from_static(b"rows"))
+            .await
+            .unwrap();
+        let paths: Vec<Path> = (0..6)
+            .map(|i| Path::from(format!("prefix/sstables/{i}-Data.db")))
+            .collect();
+        for path in &paths {
+            inner
+                .put(path, PutPayload::from_static(b"rows"))
+                .await
+                .unwrap();
+        }
+        let store = ThrottledStore::new(inner.clone(), limits(2), fast_retry(3));
+        let held = store.get(&held_path).await.unwrap();
+
+        let deleted: Vec<Path> = store
+            .delete_stream(futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed())
+            .map(|r| r.unwrap())
+            .collect()
+            .await;
+        drop(held);
+
+        assert_eq!(deleted, paths, "every location, in input order");
+        let max = inner.deletes.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(
+            max, 1,
+            "one permit of two is held by a GET body, so deletes run one at a time"
+        );
+    }
+
+    /// Deletes are paced like every other request: 11 deletes at 50/s take
+    /// at least 200 ms.
+    #[tokio::test]
+    async fn deletes_are_paced() {
+        let inner = Arc::new(RateLimitingStore::new(DeleteScript::default()));
+        let store = ThrottledStore::new(
+            inner.clone(),
+            ThrottleLimits {
+                requests_per_second: Some(50),
+                ..limits(64)
+            },
+            fast_retry(3),
+        );
+        let paths = (0..11).map(|i| Ok(Path::from(format!("p/{i}"))));
+        let start = Instant::now();
+
+        let results: Vec<Result<Path>> = store
+            .delete_stream(futures::stream::iter(paths).boxed())
+            .collect()
+            .await;
+
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert!(
+            start.elapsed() >= Duration::from_millis(200),
+            "11 deletes at 50/s must take at least 200ms, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// `list` returns a `'static` stream since 0.13, so the listing must own
+    /// its permit rather than borrow the store: it holds the permit while it
+    /// is alive, keeps working after the store handle is dropped, and releases
+    /// the permit when dropped.
+    #[tokio::test]
+    async fn a_listing_owns_its_permit_until_it_is_dropped() {
+        let inner = object_store::memory::InMemory::new();
+        for i in 0..3 {
+            inner
+                .put(&Path::from(format!("p/{i}")), PutPayload::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let store = ThrottledStore::new(Arc::new(inner), limits(1), fast_retry(3));
+        let probe = Path::from("p/0");
+
+        let mut listing = store.list(Some(&Path::from("p")));
+        let first = listing.next().await.expect("one item").unwrap();
+        assert!(first.location.as_ref().starts_with("p/"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), store.head(&probe))
+                .await
+                .is_err(),
+            "a live listing holds the only permit"
+        );
+
+        let other = ThrottledStore {
+            shared: Arc::clone(&store.shared),
+        };
+        drop(store);
+        let rest: Vec<_> = listing.by_ref().collect().await;
+        assert_eq!(rest.len(), 2, "the listing outlives the store handle");
+        drop(listing);
+
+        tokio::time::timeout(Duration::from_secs(5), other.head(&probe))
+            .await
+            .expect("a dropped listing releases its permit")
+            .unwrap();
+    }
+
+    /// `head` is `get_opts` with `head: true` since 0.13. It must not hold a
+    /// permit past the response (it has no body to read), and a 429 on it is
+    /// retried as a head.
+    #[tokio::test]
+    async fn a_head_releases_its_permit_and_is_retried_on_429() {
+        let (inner, path) = store_rate_limiting(1).await;
+        let store = ThrottledStore::new(inner, limits(1), fast_retry(3));
+
+        let meta = store.head(&path).await.unwrap();
+        assert_eq!(meta.size, 4);
+        tokio::time::timeout(Duration::from_secs(5), store.head(&path))
+            .await
+            .expect("the first head released the only permit")
+            .unwrap();
+    }
+
+    /// An HTTP server that answers the first `limited` requests with
+    /// `429 Too Many Requests` and every later one with a 4-byte object,
+    /// counting the requests it receives.
+    async fn rate_limiting_server(limited: usize) -> (String, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let n = counted.fetch_add(1, Ordering::SeqCst);
+                        let response: &[u8] = if n < limited {
+                            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\n\r\n"
+                        } else {
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nETag: \"e\"\r\n\
+                              Last-Modified: Wed, 21 Oct 2015 07:28:00 GMT\r\n\r\nrows"
+                        };
+                        if sock.write_all(response).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// The production S3 client, pointed at `endpoint`, under a fast-retry
+    /// throttle: the same builder `build_object_store` uses.
+    fn production_s3_against(endpoint: &str, retry: RateLimitRetry) -> ThrottledStore {
+        let cfg = super::super::config::ObjectStoreConfig {
+            endpoint: endpoint.to_owned(),
+            ..super::super::config::ObjectStoreConfig::test_config()
+        };
+        let s3 = cfg.s3_builder().unwrap().build().unwrap();
+        ThrottledStore::new(Arc::new(s3), limits(4), retry)
+    }
+
+    /// object_store 0.13+ retries a 429 inside its HTTP client, below this
+    /// layer: unpaced, uncounted, and stacked under this layer's own retry
+    /// (10 x 10 attempts). The production client must hand every 429 up, so
+    /// each one is exactly one request this layer paced and counted.
+    #[tokio::test]
+    async fn the_s3_client_hands_every_429_to_the_throttle() {
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        let _guard = tracing::subscriber::set_default(logs.subscriber());
+        let (endpoint, hits) = rate_limiting_server(2).await;
+        let store = production_s3_against(&endpoint, fast_retry(5));
+
+        let bytes = store
+            .get(&Path::from("k"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+
+        assert_eq!(bytes.as_ref(), b"rows");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "two 429s and the success");
+        // The server count is the same whichever layer retried; what differs
+        // is whether this layer saw the 429s. Without RateLimitSurfacing the
+        // client absorbs both, and this store neither logs nor counts them.
+        let text = logs.text();
+        assert!(
+            text.lines()
+                .any(|l| l.contains("WARN") && l.contains("rate-limiting requests (429)")),
+            "the 429 reached the throttle:\n{text}"
+        );
+    }
+
+    /// A bucket that never stops answering 429 fails after exactly this
+    /// layer's attempts, with the 429 recognisable to [`is_rate_limited`].
+    #[tokio::test]
+    async fn an_endless_429_from_the_s3_client_fails_after_the_throttle_attempts() {
+        let (endpoint, hits) = rate_limiting_server(usize::MAX).await;
+        let store = production_s3_against(&endpoint, fast_retry(3));
+
+        let err = store.head(&Path::from("k")).await.unwrap_err();
+
+        assert!(is_rate_limited(&err), "{err}");
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    /// Only a 429 is surfaced; any other response passes through unchanged,
+    /// so the client keeps retrying 5xx itself.
+    #[tokio::test]
+    async fn only_a_429_response_is_turned_into_an_error() {
+        #[derive(Debug)]
+        struct Answer(u16);
+        #[async_trait]
+        impl Execute for Answer {
+            async fn execute(
+                &self,
+                _req: HttpRequest,
+            ) -> std::result::Result<HttpResponse, HttpError> {
+                let mut response =
+                    HttpResponse::new(object_store::client::HttpResponseBody::from(Bytes::new()));
+                *response.status_mut() = self.0.try_into().unwrap();
+                Ok(response)
+            }
+        }
+        let request = || HttpRequest::new(object_store::client::HttpRequestBody::empty());
+
+        let err = SurfaceRateLimits(Answer(429))
+            .call(request())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.kind(),
+            HttpErrorKind::Unknown,
+            "never retried by the client"
+        );
+        assert!(err.to_string().contains("429 Too Many Requests"), "{err}");
+        for status in [200u16, 404, 500, 503] {
+            let response = SurfaceRateLimits(Answer(status))
+                .call(request())
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), status);
+        }
     }
 }

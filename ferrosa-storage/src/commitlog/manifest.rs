@@ -19,6 +19,7 @@
 
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 use serde::{Deserialize, Serialize};
 
 /// Path suffix within the prefix for the archive manifest.

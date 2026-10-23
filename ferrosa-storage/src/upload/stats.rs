@@ -28,8 +28,9 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::path::Path;
 use object_store::{
-    GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOpts, PutOptions, PutPayload, PutResult, Result, UploadPart,
+    CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    RenameOptions, Result, UploadPart,
 };
 
 /// Default for [`tracked_label_pairs`], used when `FERROSA_S3_STATS_MAX_KEYS` is
@@ -869,7 +870,10 @@ impl MultipartUpload for StatsUpload {
     }
 }
 
+/// Every method is implemented (`missing_trait_methods` is denied), so a
+/// request reaches the inner store only through a method that counts it.
 #[async_trait]
+#[deny(clippy::missing_trait_methods)]
 impl ObjectStore for StatsStore {
     async fn put_opts(
         &self,
@@ -893,7 +897,7 @@ impl ObjectStore for StatsStore {
     async fn put_multipart_opts(
         &self,
         location: &Path,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         let object = self.stats.counters_for(location);
         let started = Instant::now();
@@ -909,7 +913,16 @@ impl ObjectStore for StatsStore {
         }))
     }
 
+    /// `get`, `get_range` and `head` (`ObjectStoreExt`) all come here. A HEAD
+    /// is counted as one and carries no object traffic.
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        if options.head {
+            let started = Instant::now();
+            let result = self.inner.get_opts(location, options).await;
+            self.stats
+                .finish(Op::Head, started, 0, result.as_ref().err());
+            return result;
+        }
         let ranged = options.range.is_some();
         let op = if ranged { Op::GetRange } else { Op::Get };
         let object = self.stats.counters_for(location);
@@ -923,8 +936,8 @@ impl ObjectStore for StatsStore {
             &object.get_whole
         };
         kind.fetch_add(1, Ordering::Relaxed);
-        object.observe_size(result.meta.size as u64);
-        let delivered = result.range.end.saturating_sub(result.range.start) as u64;
+        object.observe_size(result.meta.size);
+        let delivered = result.range.end.saturating_sub(result.range.start);
         result.payload = match result.payload {
             GetResultPayload::Stream(stream) => {
                 let stats = Arc::clone(&self.stats);
@@ -952,27 +965,8 @@ impl ObjectStore for StatsStore {
         Ok(result)
     }
 
-    async fn get_range(&self, location: &Path, range: Range<usize>) -> Result<Bytes> {
-        let requested = range.end.saturating_sub(range.start) as u64;
-        let object = self.stats.counters_for(location);
-        let started = Instant::now();
-        let result = self.inner.get_range(location, range).await;
-        let got = result.as_ref().map_or(0, |b| b.len() as u64);
-        self.stats
-            .finish(Op::GetRange, started, got, result.as_ref().err());
-        object.get_ranged.fetch_add(1, Ordering::Relaxed);
-        object
-            .bytes_requested
-            .fetch_add(requested, Ordering::Relaxed);
-        object.bytes_fetched.fetch_add(got, Ordering::Relaxed);
-        result
-    }
-
-    async fn get_ranges(&self, location: &Path, ranges: &[Range<usize>]) -> Result<Vec<Bytes>> {
-        let requested: u64 = ranges
-            .iter()
-            .map(|r| r.end.saturating_sub(r.start) as u64)
-            .sum();
+    async fn get_ranges(&self, location: &Path, ranges: &[Range<u64>]) -> Result<Vec<Bytes>> {
+        let requested: u64 = ranges.iter().map(|r| r.end.saturating_sub(r.start)).sum();
         let object = self.stats.counters_for(location);
         let started = Instant::now();
         let result = self.inner.get_ranges(location, ranges).await;
@@ -991,36 +985,42 @@ impl ObjectStore for StatsStore {
         result
     }
 
-    async fn head(&self, location: &Path) -> Result<ObjectMeta> {
-        let started = Instant::now();
-        let result = self.inner.head(location).await;
-        self.stats
-            .finish(Op::Head, started, 0, result.as_ref().err());
-        result
-    }
-
-    async fn delete(&self, location: &Path) -> Result<()> {
-        let started = Instant::now();
-        let result = self.inner.delete(location).await;
-        self.stats
-            .finish(Op::Delete, started, 0, result.as_ref().err());
-        result
-    }
-
-    fn list(&self, prefix: Option<&Path>) -> BoxStream<'_, Result<ObjectMeta>> {
-        // A listing is a paged stream; the request is counted when it is
-        // issued, and an item error counts as an error.
-        let started = Instant::now();
+    /// Each location is one delete request, timed from when it is issued.
+    /// Results keep the input order.
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path>>,
+    ) -> BoxStream<'static, Result<Path>> {
+        let inner = Arc::clone(&self.inner);
         let stats = Arc::clone(&self.stats);
-        stats.finish(Op::List, started, 0, None);
-        self.inner
-            .list(prefix)
-            .inspect(move |item| {
-                if let Err(e) = item {
-                    stats.finish(Op::List, Instant::now(), 0, Some(e));
+        locations
+            .map(move |location| {
+                let inner = Arc::clone(&inner);
+                let stats = Arc::clone(&stats);
+                async move {
+                    let location = location?;
+                    let started = Instant::now();
+                    let result = inner.delete(&location).await;
+                    stats.finish(Op::Delete, started, 0, result.as_ref().err());
+                    result.map(|()| location)
                 }
             })
+            .buffered(DELETE_CONCURRENCY)
             .boxed()
+    }
+
+    fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
+        // A listing is a paged stream; the request is counted when it is
+        // issued, and an item error counts as an error.
+        counted_listing(&self.stats, self.inner.list(prefix))
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        counted_listing(&self.stats, self.inner.list_with_offset(prefix, offset))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
@@ -1031,21 +1031,48 @@ impl ObjectStore for StatsStore {
         result
     }
 
-    async fn copy(&self, from: &Path, to: &Path) -> Result<()> {
+    async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         let started = Instant::now();
-        let result = self.inner.copy(from, to).await;
+        let result = self.inner.copy_opts(from, to, options).await;
         self.stats
             .finish(Op::Other, started, 0, result.as_ref().err());
         result
     }
 
-    async fn copy_if_not_exists(&self, from: &Path, to: &Path) -> Result<()> {
-        let started = Instant::now();
-        let result = self.inner.copy_if_not_exists(from, to).await;
-        self.stats
-            .finish(Op::Other, started, 0, result.as_ref().err());
-        result
+    async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
+        // Copy then delete through this store, as the trait default does, so
+        // the two requests are counted as the two they are.
+        let mode = match options.target_mode {
+            object_store::RenameTargetMode::Overwrite => object_store::CopyMode::Overwrite,
+            object_store::RenameTargetMode::Create => object_store::CopyMode::Create,
+        };
+        let copy = CopyOptions {
+            mode,
+            extensions: options.extensions,
+        };
+        self.copy_opts(from, to, copy).await?;
+        self.delete(from).await
     }
+}
+
+/// Deletes one [`StatsStore::delete_stream`] keeps in flight, matching what
+/// `object_store`'s own S3 client uses when bulk delete is off.
+const DELETE_CONCURRENCY: usize = 20;
+
+/// `listing`, counted as one list request now and one error per item error.
+fn counted_listing(
+    stats: &Arc<ObjectStoreStats>,
+    listing: BoxStream<'static, Result<ObjectMeta>>,
+) -> BoxStream<'static, Result<ObjectMeta>> {
+    let stats = Arc::clone(stats);
+    stats.finish(Op::List, Instant::now(), 0, None);
+    listing
+        .inspect(move |item| {
+            if let Err(e) = item {
+                stats.finish(Op::List, Instant::now(), 0, Some(e));
+            }
+        })
+        .boxed()
 }
 
 #[cfg(test)]

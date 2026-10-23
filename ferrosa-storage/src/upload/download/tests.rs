@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use object_store::{
-    ListResult, MultipartUpload, ObjectMeta, PutMultipartOpts, PutOptions, PutPayload, PutResult,
+    ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
 use std::collections::HashMap;
 use std::fmt;
@@ -33,9 +33,9 @@ fn key() -> ObjectPath {
 struct ScriptedStore {
     inner: object_store::memory::InMemory,
     /// Start offset of each GET (`None` = whole-object GET), in arrival order.
-    requests: Mutex<Vec<Option<usize>>>,
+    requests: Mutex<Vec<Option<u64>>>,
     /// start -> (failures left, answer 429 instead of a generic error)
-    failures: Mutex<HashMap<usize, (u32, bool)>>,
+    failures: Mutex<HashMap<u64, (u32, bool)>>,
     delay: Duration,
     inflight: AtomicUsize,
     /// Highest in-flight GET count ever seen.
@@ -75,14 +75,14 @@ impl ScriptedStore {
         store
     }
 
-    fn fail_start(&self, start: usize, times: u32, rate_limited: bool) {
+    fn fail_start(&self, start: u64, times: u32, rate_limited: bool) {
         self.failures
             .lock()
             .unwrap()
             .insert(start, (times, rate_limited));
     }
 
-    fn requests_for(&self, start: Option<usize>) -> usize {
+    fn requests_for(&self, start: Option<u64>) -> usize {
         self.requests
             .lock()
             .unwrap()
@@ -181,6 +181,7 @@ impl ObjectStore for ScriptedStore {
                     range: 0..meta.size,
                     meta,
                     attributes: Default::default(),
+                    extensions: Default::default(),
                 };
             }
         }
@@ -199,16 +200,25 @@ impl ObjectStore for ScriptedStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjectPath,
-        opts: PutMultipartOpts,
+        opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
 
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
     }
 
-    fn list(&self, prefix: Option<&ObjectPath>) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
         self.inner.list(prefix)
     }
 
@@ -219,16 +229,13 @@ impl ObjectStore for ScriptedStore {
         self.inner.list_with_delimiter(prefix).await
     }
 
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -772,9 +779,9 @@ mod slow {
             let object = self.object.clone();
             let chunk = self.chunk;
             let link = Arc::clone(&self.link);
-            let end = result.range.end;
+            let end = result.range.end as usize;
             let stream = futures::stream::unfold(
-                (result.range.start, tokio::time::Instant::now()),
+                (result.range.start as usize, tokio::time::Instant::now()),
                 move |(pos, deadline)| {
                     let object = object.clone();
                     let link = Arc::clone(&link);
@@ -812,17 +819,24 @@ mod slow {
         async fn put_multipart_opts(
             &self,
             location: &ObjectPath,
-            opts: PutMultipartOpts,
+            opts: PutMultipartOptions,
         ) -> object_store::Result<Box<dyn MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
-        async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
         fn list(
             &self,
             prefix: Option<&ObjectPath>,
-        ) -> BoxStream<'_, object_store::Result<ObjectMeta>> {
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
             self.inner.list(prefix)
         }
         async fn list_with_delimiter(
@@ -831,15 +845,13 @@ mod slow {
         ) -> object_store::Result<ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(
+        async fn copy_opts(
             &self,
             from: &ObjectPath,
             to: &ObjectPath,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

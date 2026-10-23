@@ -15,6 +15,7 @@
 //! All commands here are **read-only** except the recovery action, which only
 //! ever moves files (never deletes) and defaults to a dry run.
 
+use object_store::ObjectStoreExt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 

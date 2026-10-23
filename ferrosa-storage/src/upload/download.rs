@@ -23,6 +23,7 @@
 //! `FERROSA_S3_DOWNLOAD_PART_BYTES`, `FERROSA_S3_DOWNLOAD_PART_CONCURRENCY`,
 //! `FERROSA_RESTORE_CONCURRENCY`.
 
+use object_store::ObjectStoreExt;
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -256,7 +257,7 @@ async fn download_once(
     let Some(result) = first_response(store, s3_path, cfg).await? else {
         return Ok(None);
     };
-    let size = result.meta.size as u64;
+    let size = result.meta.size;
     let etag = result.meta.e_tag.clone();
     let stream = result.into_stream();
     if size <= cfg.part_bytes {
@@ -286,7 +287,7 @@ async fn first_response(
     cfg: &DownloadConfig,
 ) -> Result<Option<object_store::GetResult>, Fail> {
     let options = GetOptions {
-        range: Some(GetRange::Bounded(0..cfg.part_bytes as usize)),
+        range: Some(GetRange::Bounded(0..cfg.part_bytes)),
         ..GetOptions::default()
     };
     match store.get_opts(s3_path, options).await {
@@ -619,7 +620,7 @@ enum PartError {
 
 async fn get_part(ctx: &PartContext<'_>, range: &Range<u64>) -> Result<Bytes, PartError> {
     let options = GetOptions {
-        range: Some(GetRange::Bounded(range.start as usize..range.end as usize)),
+        range: Some(GetRange::Bounded(range.clone())),
         if_match: ctx.etag.clone(),
         ..GetOptions::default()
     };

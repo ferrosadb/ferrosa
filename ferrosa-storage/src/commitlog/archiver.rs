@@ -10,6 +10,7 @@
 //! communication is via the mpsc channel. Segment files are immutable
 //! once closed (no further writes after rotation).
 
+use object_store::ObjectStoreExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;

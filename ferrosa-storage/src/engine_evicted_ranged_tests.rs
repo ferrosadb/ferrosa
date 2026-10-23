@@ -37,7 +37,7 @@ impl object_store::ObjectStore for CountingStore {
     async fn put_multipart_opts(
         &self,
         location: &object_store::path::Path,
-        opts: object_store::PutMultipartOpts,
+        opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -64,13 +64,16 @@ impl object_store::ObjectStore for CountingStore {
         }
         Ok(result)
     }
-    async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
     }
     fn list(
         &self,
         prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(
@@ -79,19 +82,13 @@ impl object_store::ObjectStore for CountingStore {
     ) -> object_store::Result<object_store::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy(
+    async fn copy_opts(
         &self,
         from: &object_store::path::Path,
         to: &object_store::path::Path,
+        options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn copy_if_not_exists(
-        &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-    ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 
@@ -189,7 +186,7 @@ async fn big_evicted_sstable(dir: &std::path::Path, prefix: &str, compression: &
 impl BigEvicted {
     /// The size of the generation's `Data.db` object in the store.
     async fn data_db_object_len(&self) -> u64 {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         let hex = crate::upload::manager::hex_prefix_for(&self.gen);
         let key = crate::upload::manager::sstable_object_key(
             &self.prefix,
@@ -272,7 +269,7 @@ impl BigEvicted {
 
     /// Flip one bit of the stored `Data.db` object at `offset`.
     async fn corrupt_data_db_at(&self, offset: usize) {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         let key = self.component_key("Data.db");
         let mut bytes = self
             .store
@@ -395,7 +392,7 @@ async fn a_corrupted_ranged_byte_is_an_error_never_a_wrong_row() {
 /// range read must not return fewer rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_ranged_read_fails_loud_when_the_data_object_disappears() {
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
     let dir = tempfile::tempdir().unwrap();
     let big = big_evicted_sstable(dir.path(), "test-ranged-gone", "lz4").await;
     big.expect_row(0); // open in ranged mode; caches only the first pages

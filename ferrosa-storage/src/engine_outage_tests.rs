@@ -176,7 +176,7 @@ impl object_store::ObjectStore for NeverAnsweringComponents {
     async fn put_multipart_opts(
         &self,
         location: &object_store::path::Path,
-        opts: object_store::PutMultipartOpts,
+        opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         self.0.put_multipart_opts(location, opts).await
     }
@@ -190,13 +190,16 @@ impl object_store::ObjectStore for NeverAnsweringComponents {
         }
         self.0.get_opts(location, options).await
     }
-    async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-        self.0.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.0.delete_stream(locations)
     }
     fn list(
         &self,
         prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         self.0.list(prefix)
     }
     async fn list_with_delimiter(
@@ -205,19 +208,13 @@ impl object_store::ObjectStore for NeverAnsweringComponents {
     ) -> object_store::Result<object_store::ListResult> {
         self.0.list_with_delimiter(prefix).await
     }
-    async fn copy(
+    async fn copy_opts(
         &self,
         from: &object_store::path::Path,
         to: &object_store::path::Path,
+        options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
-        self.0.copy(from, to).await
-    }
-    async fn copy_if_not_exists(
-        &self,
-        from: &object_store::path::Path,
-        to: &object_store::path::Path,
-    ) -> object_store::Result<()> {
-        self.0.copy_if_not_exists(from, to).await
+        self.0.copy_opts(from, to, options).await
     }
 }
 
@@ -459,7 +456,7 @@ fn backfill_of_deleted_object_reports_evicted_unavailable() {
 /// failed instead of rehydrating from the store.
 #[test]
 fn open_installs_the_rehydration_hook() {
-    use object_store::ObjectStore;
+    use object_store::ObjectStoreExt;
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let _context = runtime.enter();
     let dir = tempfile::tempdir().unwrap();

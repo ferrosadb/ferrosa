@@ -12,6 +12,7 @@
 //! SSTables are never copied — the snapshot manifest references the same
 //! object paths as the live manifest at the time of snapshotting.
 
+use object_store::ObjectStoreExt;
 use std::collections::HashSet;
 use std::fmt::Write as FmtWrite;
 use std::sync::Arc;

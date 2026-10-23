@@ -3,6 +3,7 @@
 //! Polls the engine's manifest endpoint, identifies SSTables that lack
 //! sidecar index files in S3, and enqueues build jobs for them.
 
+use object_store::ObjectStoreExt;
 use std::sync::Arc;
 use std::time::Duration;
 

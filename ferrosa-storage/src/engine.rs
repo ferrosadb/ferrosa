@@ -15,6 +15,7 @@
 //! take no global lock — the commit log uses CAS, memtable is lock-free.
 //! Only flush and compaction take per-table serialized guards.
 
+use object_store::ObjectStoreExt;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -2909,7 +2910,7 @@ impl StorageEngine {
 
                     match store.get(&s3_path).await {
                         Ok(result) => {
-                            let expected = result.meta.size as u64;
+                            let expected = result.meta.size;
                             let mut stream = result.into_stream();
                             let mut file =
                                 tokio::fs::File::create(&tmp_path).await.map_err(|e| {
@@ -36414,7 +36415,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &object_store::path::Path,
-            opts: object_store::PutMultipartOpts,
+            opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -36452,15 +36453,23 @@ mod tests {
                 meta,
                 range,
                 attributes,
+                extensions: Default::default(),
             })
         }
-        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.inner.list(prefix)
         }
@@ -36470,19 +36479,13 @@ mod tests {
         ) -> object_store::Result<object_store::ListResult> {
             self.inner.list_with_delimiter(prefix).await
         }
-        async fn copy(
+        async fn copy_opts(
             &self,
             from: &object_store::path::Path,
             to: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-        async fn copy_if_not_exists(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -36496,9 +36499,13 @@ mod tests {
         };
         let path = object_store::path::Path::from("p/ab/ks.t/7/7-Data.db");
         let body: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-        object_store::ObjectStore::put(&store, &path, object_store::PutPayload::from(body.clone()))
-            .await
-            .unwrap();
+        object_store::ObjectStoreExt::put(
+            &store,
+            &path,
+            object_store::PutPayload::from(body.clone()),
+        )
+        .await
+        .unwrap();
         store.drops.store(2, std::sync::atomic::Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("7-Data.db");
@@ -36835,7 +36842,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             _location: &object_store::path::Path,
-            _opts: object_store::PutMultipartOpts,
+            _opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             Err(object_store::Error::NotSupported {
                 source: "simulated S3 outage — multipart PUT rejected by FailOnPutStore".into(),
@@ -36850,14 +36857,21 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.inner.list(prefix)
         }
@@ -36869,20 +36883,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(
+        async fn copy_opts(
             &self,
             from: &object_store::path::Path,
             to: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 

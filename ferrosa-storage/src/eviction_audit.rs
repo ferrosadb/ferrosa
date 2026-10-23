@@ -57,6 +57,7 @@
 //! segment in place. The disk bound outranks offload: if uploads keep failing,
 //! the ring still drops the oldest un-uploaded segment by age (logged).
 
+use object_store::ObjectStoreExt;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -724,7 +725,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             _l: &object_store::path::Path,
-            _o: object_store::PutMultipartOpts,
+            _o: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             Err(object_store::Error::NotSupported {
                 source: "simulated outage".into(),
@@ -737,13 +738,20 @@ mod tests {
         ) -> object_store::Result<object_store::GetResult> {
             self.0.get_opts(l, o).await
         }
-        async fn delete(&self, l: &object_store::path::Path) -> object_store::Result<()> {
-            self.0.delete(l).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.0.delete_stream(locations)
         }
         fn list(
             &self,
             p: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.0.list(p)
         }
@@ -753,19 +761,13 @@ mod tests {
         ) -> object_store::Result<object_store::ListResult> {
             self.0.list_with_delimiter(p).await
         }
-        async fn copy(
+        async fn copy_opts(
             &self,
             f: &object_store::path::Path,
             t: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.0.copy(f, t).await
-        }
-        async fn copy_if_not_exists(
-            &self,
-            f: &object_store::path::Path,
-            t: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.0.copy_if_not_exists(f, t).await
+            self.0.copy_opts(f, t, options).await
         }
     }
 

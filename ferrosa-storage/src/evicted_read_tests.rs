@@ -33,7 +33,7 @@ impl ObjectStore for CountingStore {
     async fn put_multipart_opts(
         &self,
         location: &ObjectPath,
-        opts: object_store::PutMultipartOpts,
+        opts: object_store::PutMultipartOptions,
     ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
         self.inner.put_multipart_opts(location, opts).await
     }
@@ -53,13 +53,19 @@ impl ObjectStore for CountingStore {
         }
         Ok(result)
     }
-    async fn delete(&self, location: &ObjectPath) -> object_store::Result<()> {
-        self.inner.delete(location).await
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
     }
     fn list(
         &self,
         prefix: Option<&ObjectPath>,
-    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         self.inner.list(prefix)
     }
     async fn list_with_delimiter(
@@ -68,15 +74,13 @@ impl ObjectStore for CountingStore {
     ) -> object_store::Result<object_store::ListResult> {
         self.inner.list_with_delimiter(prefix).await
     }
-    async fn copy(&self, from: &ObjectPath, to: &ObjectPath) -> object_store::Result<()> {
-        self.inner.copy(from, to).await
-    }
-    async fn copy_if_not_exists(
+    async fn copy_opts(
         &self,
         from: &ObjectPath,
         to: &ObjectPath,
+        options: object_store::CopyOptions,
     ) -> object_store::Result<()> {
-        self.inner.copy_if_not_exists(from, to).await
+        self.inner.copy_opts(from, to, options).await
     }
 }
 

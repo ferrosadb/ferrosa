@@ -7,6 +7,7 @@
 //! panic ended the worker, the dispatcher stopped at its next send to it, and
 //! every later `submit` failed with "upload channel closed".
 
+use object_store::ObjectStoreExt;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1755,6 +1756,7 @@ mod tests {
             Ok(object_store::PutResult {
                 e_tag: None,
                 version: None,
+                extensions: Default::default(),
             })
         }
 
@@ -1771,13 +1773,16 @@ mod tests {
             _payload: object_store::PutPayload,
             _opts: object_store::PutOptions,
         ) -> object_store::Result<object_store::PutResult> {
-            Err(object_store::Error::NotImplemented)
+            Err(object_store::Error::NotImplemented {
+                operation: "put_opts".into(),
+                implementer: "PartSizeRecordingStore".into(),
+            })
         }
 
         async fn put_multipart_opts(
             &self,
             _location: &object_store::path::Path,
-            _opts: object_store::PutMultipartOpts,
+            _opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             Ok(Box::new(PartSizeRecordingUpload {
                 part_sizes: Arc::clone(&self.part_sizes),
@@ -1792,14 +1797,21 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.inner.list(prefix)
         }
@@ -1811,20 +1823,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(
+        async fn copy_opts(
             &self,
             from: &object_store::path::Path,
             to: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -1877,7 +1882,10 @@ mod tests {
         ) -> object_store::Result<object_store::PutResult> {
             self.single_put_started.fetch_add(1, Ordering::SeqCst);
             if self.reject_single_put {
-                Err(object_store::Error::NotImplemented)
+                Err(object_store::Error::NotImplemented {
+                    operation: "put_opts".into(),
+                    implementer: "RejectSinglePutStore".into(),
+                })
             } else {
                 self.inner.put_opts(location, payload, opts).await
             }
@@ -1886,7 +1894,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &object_store::path::Path,
-            opts: object_store::PutMultipartOpts,
+            opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.multipart_started.fetch_add(1, Ordering::SeqCst);
             self.inner.put_multipart_opts(location, opts).await
@@ -1900,14 +1908,21 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.inner.list(prefix)
         }
@@ -1919,20 +1934,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(
+        async fn copy_opts(
             &self,
             from: &object_store::path::Path,
             to: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -1984,7 +1992,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &object_store::path::Path,
-            opts: object_store::PutMultipartOpts,
+            opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -1997,14 +2005,21 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.inner.list(prefix)
         }
@@ -2016,20 +2031,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(
+        async fn copy_opts(
             &self,
             from: &object_store::path::Path,
             to: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 
@@ -2131,7 +2139,7 @@ mod tests {
         async fn put_multipart_opts(
             &self,
             location: &object_store::path::Path,
-            opts: object_store::PutMultipartOpts,
+            opts: object_store::PutMultipartOptions,
         ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
             self.inner.put_multipart_opts(location, opts).await
         }
@@ -2144,14 +2152,21 @@ mod tests {
             self.inner.get_opts(location, options).await
         }
 
-        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
-            self.inner.delete(location).await
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
         }
 
         fn list(
             &self,
             prefix: Option<&object_store::path::Path>,
-        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
         {
             self.inner.list(prefix)
         }
@@ -2163,20 +2178,13 @@ mod tests {
             self.inner.list_with_delimiter(prefix).await
         }
 
-        async fn copy(
+        async fn copy_opts(
             &self,
             from: &object_store::path::Path,
             to: &object_store::path::Path,
+            options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
-            self.inner.copy(from, to).await
-        }
-
-        async fn copy_if_not_exists(
-            &self,
-            from: &object_store::path::Path,
-            to: &object_store::path::Path,
-        ) -> object_store::Result<()> {
-            self.inner.copy_if_not_exists(from, to).await
+            self.inner.copy_opts(from, to, options).await
         }
     }
 }

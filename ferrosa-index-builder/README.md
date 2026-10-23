@@ -104,7 +104,7 @@ builds carry `sidecar_s3_path` + `entries_built`.
   `ClusteringComponentRef`, `SidecarWriter`, `ArtifactManifestEntry`,
   `upload::hex_prefix_for` (the actual index-build engine this service wraps).
 
-External: `axum`, `tokio`, `object_store` (aws), `reqwest`, `clap`, `serde`,
+External: `axum`, `tokio`, `object_store` 0.14 (aws), `reqwest`, `clap`, `serde`,
 `serde_json`, `bytes`, `tracing`.
 
 **Called by** (cargo path-deps on this crate):

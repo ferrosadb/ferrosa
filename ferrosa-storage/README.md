@@ -400,7 +400,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   unset means the WAN default of 64 and no rate cap, and a
   non-positive or non-integer value stops startup naming the variable. A request
   answered `429 Too Many Requests` is retried with exponential backoff (10
-  attempts, 250 ms doubling to 30 s) — `object_store` retries only 5xx — and the
+  attempts, 250 ms doubling to 30 s), here and only here: `object_store` 0.14
+  would retry a 429 inside its HTTP client, unpaced and uncounted, so the S3
+  client is built with `RateLimitSurfacing`, an HTTP connector that turns every
+  429 response into a non-retryable error for this layer (5xx retries stay in
+  the client, as on 0.11). Bulk delete is off, so each delete is one paced,
+  permitted `DELETE` request; `delete_stream` and `list` own their limits
+  (`'static` streams since 0.13). The
   log reports the start and end of a throttling episode, not every 429; the
   warning names the rate cap as the remedy and says latency is not a reason to
   lower the limits. Since the 2026-10-10 outage: a GET body that sends nothing
@@ -428,7 +434,9 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   construction),
   and `object_store_and_config` errors rather than building a second client.
   **Stats (`upload/stats.rs`, `FERROSA_S3_STATS=1`):** a `StatsStore` layer under
-  the throttle records per-operation counts, bytes, latency histograms, errors,
+  the throttle (`head`, `get_range` and `delete` are `ObjectStoreExt`
+  conveniences over `get_opts` and `delete_stream` since 0.13; each is still
+  counted as its own operation) records per-operation counts, bytes, latency histograms, errors,
   429s and retries, and per (table, component) bytes, object-size histogram,
   ranged vs whole GETs, download throughput and read amplification. Exposed as
   `ferrosa_s3_*` Prometheus series and the virtual tables
@@ -1197,7 +1205,7 @@ replayed commit log or in-process writes.
 - **`ferrosa-sstable`** — `Partition`, `Row`, `SSTableReader`/`SSTableWriter`,
   BTI format I/O.
 
-External: `object_store` (aws), `tokio`, `arc-swap`, `parking_lot`,
+External: `object_store` 0.14 (aws; quick-xml 0.41, past RUSTSEC-2026-0194/0195), `tokio`, `arc-swap`, `parking_lot`,
 `crossbeam-skiplist`, `crossbeam-channel` (T-021: `CancelToken`'s channel, the
 compaction executor's task/result queues), `crc32fast`, `sha2`, `dashmap`,
 `serde`, `bytes`, `fs2`.

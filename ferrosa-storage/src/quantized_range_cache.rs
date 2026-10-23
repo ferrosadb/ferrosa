@@ -124,7 +124,7 @@ impl ObjectRangePageStore {
         }
 
         let options = GetOptions {
-            range: Some(GetRange::Bounded(range.clone())),
+            range: Some(GetRange::Bounded(range.start as u64..range.end as u64)),
             ..GetOptions::default()
         };
         let bytes = self

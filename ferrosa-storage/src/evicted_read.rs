@@ -27,6 +27,7 @@
 //! Full-generation rehydration is unchanged and still owns startup restore and
 //! compaction inputs (`ferrosa_sstable::io::rehydrate_file`).
 
+use object_store::ObjectStoreExt;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -438,7 +439,7 @@ impl EvictedReadStore {
         let key = loc.key.clone();
         let head = StorageEngine::block_on_rehydration(async move { store.head(&key).await });
         let size = match head {
-            Ok(meta) => meta.size as u64,
+            Ok(meta) => meta.size,
             Err(object_store::Error::NotFound { .. }) => return Ok(None),
             Err(e) => {
                 return Err(Error::InvalidFormat(format!(
@@ -654,7 +655,7 @@ impl EvictedReadStore {
     /// One ranged GET of `[start, end)`; a short answer is an error.
     fn fetch_range(&self, key: &ObjectPath, start: u64, end: u64) -> Result<Bytes> {
         let store = Arc::clone(&self.store);
-        let range = start as usize..end as usize;
+        let range = start..end;
         let get_key = key.clone();
         let bytes =
             StorageEngine::block_on_rehydration(
@@ -833,7 +834,7 @@ impl EvictedReadStore {
     /// Size of an object, `None` when it does not exist.
     async fn head_size(&self, key: &ObjectPath) -> Result<Option<u64>> {
         match self.store.head(key).await {
-            Ok(meta) => Ok(Some(meta.size as u64)),
+            Ok(meta) => Ok(Some(meta.size)),
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(Error::InvalidFormat(format!(
                 "failed SSTable component head {key}: {e}"

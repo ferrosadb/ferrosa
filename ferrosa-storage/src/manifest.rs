@@ -3,6 +3,7 @@
 //! Updated atomically via conditional put (etag-based compare-and-swap).
 //! On conflict, the caller re-reads and retries.
 
+use object_store::ObjectStoreExt;
 use std::collections::HashMap;
 
 use bytes::Bytes;

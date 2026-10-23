@@ -445,6 +445,7 @@ fn promote(staging: &Path, table_dir: &Path, gen: u64) -> ferrosa_common::Result
 
 #[cfg(test)]
 mod tests {
+    use object_store::ObjectStoreExt;
     use std::path::Path;
     use std::sync::Arc;
 

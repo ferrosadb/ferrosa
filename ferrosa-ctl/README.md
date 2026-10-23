@@ -120,7 +120,7 @@ Runtime dependencies are `ferrosa-cluster`, `ferrosa-common`, `ferrosa-cql`,
 `ferrosa-sstable`, `ferrosa-storage`. `ferrosa-schema`, `ferrosa-session`, and
 `ferrosa-udf` are **dev-dependencies** used by the integration test harness.
 External: `clap`, `tokio`, `reqwest` (rustls), `ratatui`, `crossterm`,
-`tabled`, `object_store` (aws), `rpassword`, `sled`, `serde`/`serde_json`.
+`tabled`, `object_store` 0.14 (aws), `rpassword`, `sled`, `serde`/`serde_json`.
 
 **Called by**: NONE — it is a CLI binary, the leaf of the dependency graph.
 

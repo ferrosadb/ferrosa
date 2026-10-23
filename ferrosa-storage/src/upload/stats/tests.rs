@@ -156,12 +156,17 @@ async fn gets_are_attributed_to_table_and_component_whole_versus_ranged() {
     let a = object(&objects, "ks.a", "Data.db");
     assert_eq!((a.get_whole, a.get_ranged), (1, 1));
     assert_eq!(a.bytes_fetched, 4096 + 1000);
-    assert_eq!(
-        a.bytes_requested, 1000,
-        "only the ranged caller stated what it wanted"
-    );
+    // Since object_store 0.13 `get_range` is `get_opts` with a range, the
+    // path production always took (ThrottledStore sits above this store and
+    // turns every range read into `get_opts`). What a caller asked for is
+    // recorded by the download path (`record_download`), not here, so a
+    // ranged download is not counted twice.
+    assert_eq!(a.bytes_requested, 0);
     assert_eq!(a.bytes_put, 4096);
-    assert_eq!(a.objects_seen, 1, "sizes are sampled by whole GETs");
+    assert_eq!(
+        a.objects_seen, 2,
+        "each GET that reports the size samples it"
+    );
     assert_eq!(a.size_max, 4096);
     let b = object(&objects, "ks.b", "Rows.db");
     assert_eq!((b.get_whole, b.bytes_fetched), (1, 100));
@@ -270,4 +275,79 @@ fn pool_gauges_report_the_recorded_settings() {
         text.contains("ferrosa_s3_pool_max_idle_per_host 96\n"),
         "{text}"
     );
+}
+
+/// The production order is ThrottledStore over StatsStore. Since object_store
+/// 0.13 `head`, `get_range` and `delete` are `ObjectStoreExt` conveniences
+/// over `get_opts` and `delete_stream`; through both layers each must still
+/// be counted as the operation it is, once.
+#[tokio::test]
+async fn under_the_throttle_each_convenience_is_counted_as_its_own_operation() {
+    let stats = Arc::new(ObjectStoreStats::new());
+    let counted: Arc<dyn ObjectStore> = Arc::new(StatsStore::new(
+        Arc::new(InMemory::new()),
+        Arc::clone(&stats),
+    ));
+    let store = crate::upload::throttle::ThrottledStore::new(
+        counted,
+        crate::upload::throttle::ThrottleLimits {
+            requests_per_second: None,
+            max_in_flight: 4,
+            body_idle_timeout: Duration::from_secs(30),
+            wait_warn_after: crate::upload::throttle::DEFAULT_WAIT_WARN_AFTER,
+        },
+        crate::upload::throttle::RateLimitRetry::default(),
+    );
+    let path = sstable_key("ks.t", "7", "Data.db");
+    store
+        .put(&path, PutPayload::from(vec![1u8; 100]))
+        .await
+        .unwrap();
+
+    store.get(&path).await.unwrap().bytes().await.unwrap();
+    store.head(&path).await.unwrap();
+    store.get_range(&path, 10..20).await.unwrap();
+    store.delete(&path).await.unwrap();
+    let listed: Vec<_> = store.list(None).collect().await;
+    assert!(listed.is_empty());
+
+    let ops = stats.op_snapshots();
+    let count = |label| op(&ops, label).requests;
+    assert_eq!(
+        (
+            count("put"),
+            count("get"),
+            count("head"),
+            count("get_range"),
+            count("delete"),
+            count("list")
+        ),
+        (1, 1, 1, 1, 1, 1)
+    );
+    assert_eq!(op(&ops, "get_range").bytes, 10);
+    let objects = stats.object_snapshots();
+    let o = object(&objects, "ks.t", "Data.db");
+    assert_eq!((o.get_whole, o.get_ranged), (1, 1), "a HEAD is not a GET");
+}
+
+/// A multi-location `delete_stream` is one counted delete per location.
+#[tokio::test]
+async fn each_location_of_a_delete_stream_is_one_counted_delete() {
+    let (store, stats) = fixture();
+    let paths: Vec<Path> = (0..3)
+        .map(|i| sstable_key("ks.t", &i.to_string(), "Data.db"))
+        .collect();
+    for path in &paths {
+        store
+            .put(path, PutPayload::from_static(b"x"))
+            .await
+            .unwrap();
+    }
+    let deleted: Vec<Path> = store
+        .delete_stream(futures::stream::iter(paths.clone().into_iter().map(Ok)).boxed())
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(deleted, paths);
+    assert_eq!(op(&stats.op_snapshots(), "delete").requests, 3);
 }

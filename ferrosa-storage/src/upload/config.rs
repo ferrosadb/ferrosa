@@ -3,6 +3,7 @@
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::local::LocalFileSystem;
 use object_store::ObjectStore;
+use object_store::ObjectStoreExt;
 
 /// Object store configuration.
 ///
@@ -261,22 +262,7 @@ impl ObjectStoreConfig {
             return Ok(Box::new(store));
         }
 
-        let mut builder = AmazonS3Builder::new()
-            .with_endpoint(&self.endpoint)
-            .with_bucket_name(&self.bucket)
-            .with_region(&self.region)
-            .with_allow_http(self.allow_http)
-            .with_conditional_put(S3ConditionalPut::ETagMatch)
-            .with_client_options(self.client_options()?);
-
-        if let Some(ref key_id) = self.access_key_id {
-            builder = builder.with_access_key_id(key_id);
-        }
-        if let Some(ref secret) = self.secret_access_key {
-            builder = builder.with_secret_access_key(secret);
-        }
-
-        let store = builder.build().map_err(|e| {
+        let store = self.s3_builder()?.build().map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to build S3 client: {e}"))
         })?;
 
@@ -291,8 +277,8 @@ impl ObjectStoreConfig {
             None => std::sync::Arc::new(store),
         };
         // Every path shares this one store, so the caps here bound uploads,
-        // deletes, rehydration and restore together. 429 retry is always on:
-        // object_store does not retry client errors.
+        // deletes, rehydration and restore together. 429 retry is always on,
+        // and happens only here: the client surfaces every 429 to it.
         let max_in_flight = self.effective_max_in_flight();
         let pool_max_idle = self.pool_max_idle_per_host()?;
         let pool = super::pool::config()?;
@@ -324,6 +310,35 @@ impl ObjectStoreConfig {
             },
             super::throttle::RateLimitRetry::default(),
         )))
+    }
+
+    /// The S3 client builder, before the stats and throttling wrappers.
+    ///
+    /// Two settings keep the request shape `object_store` 0.11 had, which the
+    /// throttling layer is built around:
+    /// - [`RateLimitSurfacing`](super::throttle::RateLimitSurfacing) hands
+    ///   every 429 up to [`ThrottledStore`](super::throttle::ThrottledStore)
+    ///   instead of letting the client retry it unpaced and uncounted;
+    /// - bulk delete is off, so a delete is one `DELETE /key` request, paced
+    ///   and counted as one, not a `POST /?delete` batch.
+    pub(crate) fn s3_builder(&self) -> ferrosa_common::Result<AmazonS3Builder> {
+        let mut builder = AmazonS3Builder::new()
+            .with_endpoint(&self.endpoint)
+            .with_bucket_name(&self.bucket)
+            .with_region(&self.region)
+            .with_allow_http(self.allow_http)
+            .with_conditional_put(S3ConditionalPut::ETagMatch)
+            .with_disable_bulk_delete(true)
+            .with_http_connector(super::throttle::RateLimitSurfacing::default())
+            .with_client_options(self.client_options()?);
+
+        if let Some(ref key_id) = self.access_key_id {
+            builder = builder.with_access_key_id(key_id);
+        }
+        if let Some(ref secret) = self.secret_access_key {
+            builder = builder.with_secret_access_key(secret);
+        }
+        Ok(builder)
     }
 
     /// Creates a test config pointing to an in-memory store.
@@ -817,7 +832,7 @@ pub(crate) mod tests {
     /// The timeout must be the configured one.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_download_slower_than_the_request_timeout_fails_and_a_longer_timeout_completes_it() {
-        use object_store::ObjectStore;
+        use object_store::ObjectStoreExt;
         let endpoint = slow_body_server(std::time::Duration::from_millis(200)).await;
         let path = object_store::path::Path::from("big-Data.db");
 
@@ -832,10 +847,12 @@ pub(crate) mod tests {
             "{:?}",
             cut_off.expect_err("a 2 s body must not fit a 1 s timeout")
         );
-        // reqwest Decode -> Body -> TimedOut: the "error decoding response
-        // body" that ended the live restore.
+        // A timeout while reading the body: the "error decoding response
+        // body" that ended the live restore. object_store 0.11 reported it as
+        // reqwest Decode -> Body -> TimedOut; 0.14 as HttpError { kind:
+        // Timeout } over reqwest Body -> TimedOut.
         assert!(
-            err.contains("Decode") && err.contains("TimedOut"),
+            err.contains("Body") && err.contains("TimedOut"),
             "expected a body timeout, got {err}"
         );
 
@@ -991,7 +1008,17 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
         }
 
+        /// A subscriber writing into this buffer, for `with_default` or
+        /// `set_default`.
+        ///
+        /// It first installs the crate's always-interested global collector.
+        /// Without it, a parallel test that hits a callsite on a thread with
+        /// no subscriber caches that callsite's interest as "never", and a
+        /// scoped subscriber installed afterwards receives nothing from it:
+        /// `misconfigured_limits_warn_naming_both_variables` failed that way,
+        /// capturing no WARN line at all, on 2026-10-23.
         pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            crate::test_span_collector::ensure_installed();
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
                 .with_max_level(tracing::Level::INFO)

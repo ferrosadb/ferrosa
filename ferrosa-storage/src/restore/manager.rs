@@ -7,6 +7,7 @@
 //!
 //! The manager is stateless; all persistent state is in S3 and local disk.
 
+use object_store::ObjectStoreExt;
 use std::path::Path;
 use std::sync::Arc;
 

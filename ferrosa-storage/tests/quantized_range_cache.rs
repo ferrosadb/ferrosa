@@ -1,3 +1,4 @@
+use object_store::ObjectStoreExt;
 use std::sync::Arc;
 
 use bytes::Bytes;

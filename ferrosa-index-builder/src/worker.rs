@@ -4,6 +4,7 @@
 //! run [`LocalBackend::build()`] on them, write the sidecar file back
 //! to S3, and clean up the temp files.
 
+use object_store::ObjectStoreExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
