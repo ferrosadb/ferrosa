@@ -9818,6 +9818,9 @@ impl StorageEngine {
             phase_start.elapsed(),
         );
         let observer_mutation = if self.has_observers_for_table(table_id) {
+            // The row is cloned, not moved: the memtable write below takes
+            // ownership of it and the observers need it after that, so both
+            // copies are live at once. Moving needs `rows: Arc<[Row]>` (T1 P4).
             Some(Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
@@ -9935,10 +9938,15 @@ impl StorageEngine {
                 self.check_memtable_write_admission(table_id, state)?;
             }
 
+            // The key is moved in: the memtable write below borrows `mutation.key`,
+            // so nothing needs the local `key` afterwards. The row cannot be moved
+            // the same way — the memtable takes ownership of it below and the
+            // observers still need it after that, so the two owners are concurrent.
+            // Sharing them needs `rows: Arc<[Row]>` (T1 P4), not a move.
             let mutation = Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
-                key.clone(),
+                key,
                 vec![row.clone()],
                 timestamp,
             );
@@ -9954,7 +9962,7 @@ impl StorageEngine {
                         "table not registered: {table_id}"
                     ))
                 })?;
-                state.store.write(&key, row)?;
+                state.store.write(&mutation.key, row)?;
                 state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
                 if state
                     .first_unflushed_write_at_nanos
@@ -21223,6 +21231,138 @@ mod tests {
 
         let mutations: Vec<(DecoratedKey, Row, i64)> = vec![];
         engine.batch_write(&table_id(), mutations).unwrap();
+    }
+
+    /// I3: the bytes read back are the bytes written, at 1 / 100 / 10 000 rows.
+    ///
+    /// `batch_write` takes `Vec<(DecoratedKey, Row, i64)>` by value, so the
+    /// caller's rows are consumed by the call itself; the write path is handed
+    /// the rows, not a copy it could outlive.
+    #[test]
+    fn batch_write_round_trips_row_bytes_at_1_100_and_10000_rows() {
+        for count in [1usize, 100, 10_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            let payloads: Vec<Vec<u8>> = (0..count)
+                .map(|i| format!("value-{i:06}-padding-to-make-the-cell-non-trivial").into_bytes())
+                .collect();
+            let mutations: Vec<(DecoratedKey, Row, i64)> = payloads
+                .iter()
+                .enumerate()
+                .map(|(i, payload)| {
+                    let ts = 1_000 + i as i64;
+                    (make_key(&partition_key(i)), make_row(payload, ts), ts)
+                })
+                .collect();
+
+            engine.batch_write(&tid, mutations).unwrap();
+
+            for (i, payload) in payloads.iter().enumerate() {
+                let partition = engine
+                    .read(&tid, &make_key(&partition_key(i)))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {i} of {count} missing after batch_write"));
+                let cell = partition
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .find(|(index, _)| *index == 0)
+                    .map(|(_, cell)| cell)
+                    .unwrap_or_else(|| panic!("row {i} of {count} lost its value cell"));
+                assert_eq!(
+                    cell.value.as_deref(),
+                    Some(payload.as_slice()),
+                    "row {i} of {count}: bytes read back differ from bytes written"
+                );
+            }
+        }
+    }
+
+    /// The `DecoratedKey` the observers see is the caller's key: its cached
+    /// token is carried through the write path, never recomputed.
+    ///
+    /// The sentinel token is deliberately *not* the Murmur3 token of the key
+    /// bytes, so any recompute on the path shows up as a mismatch.
+    #[test]
+    fn batch_write_carries_the_cached_token_into_the_mutation() {
+        use crate::observer::{ObserverMode, WriteObserver};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct TokenSpy {
+            seen: Mutex<Vec<(i64, Option<Vec<u8>>)>>,
+        }
+        impl WriteObserver for TokenSpy {
+            fn mode(&self) -> ObserverMode {
+                ObserverMode::Sync
+            }
+            fn tables(&self) -> Vec<TableId> {
+                vec![table_id()]
+            }
+            fn on_write(&self, _: &TableId, mutation: &Mutation) -> Vec<Mutation> {
+                let value = mutation
+                    .rows
+                    .first()
+                    .and_then(|row| row.cells.iter().find(|(index, _)| *index == 0))
+                    .and_then(|(_, cell)| cell.value.clone());
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((mutation.key.token.0, value));
+                Vec::new()
+            }
+        }
+
+        fn sentinel_key() -> DecoratedKey {
+            let mut key = make_key("sentinel");
+            key.token = ferrosa_common::Token(-424_242);
+            key
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        let spy = Arc::new(TokenSpy::default());
+        engine.register_observer(spy.clone());
+
+        let sentinel = sentinel_key();
+        assert_ne!(
+            sentinel.token,
+            ferrosa_common::Token::from_key(sentinel.key.as_bytes()),
+            "the sentinel token must differ from the computed one for this test to prove anything"
+        );
+
+        let payload = b"token-preserved".to_vec();
+        engine
+            .batch_write(&tid, vec![(sentinel_key(), make_row(&payload, 7000), 7000)])
+            .unwrap();
+
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "one write must produce one observed mutation"
+        );
+        assert_eq!(
+            seen[0].0, -424_242,
+            "the cached token was recomputed instead of carried through the write path"
+        );
+        assert_eq!(
+            seen[0].1.as_deref(),
+            Some(payload.as_slice()),
+            "the row bytes reaching the observer differ from the bytes written"
+        );
+    }
+
+    fn partition_key(i: usize) -> String {
+        format!("k{i:06}")
     }
 
     #[test]
