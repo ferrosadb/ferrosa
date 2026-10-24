@@ -40,6 +40,12 @@ Per write, before any work is done: **up to 5 allocations, 2 full payload copies
 write. `T2` (`mutation.clone()` at `:9338`) then deep-clones this whole struct once per
 registered observer, so fixing T1 shrinks T2 as a side effect.
 
+## Delivery plan
+
+Split into six independently shippable pieces, ordered so value lands before risk:
+[`T1-pieces.md`](T1-pieces.md). P0 wire-format net, P1 mutation_id, P2 hot-path clones,
+P3a additive TableRef, P3b field flip, P4 rows representation (optional, measured).
+
 ## 2. Blast radius, and the decision that keeps it small
 
 `Mutation::new(` has **61 src call sites**: cluster 21, storage 9, cql 8, postgres 7, graph 6,
