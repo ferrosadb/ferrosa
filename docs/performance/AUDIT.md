@@ -16,9 +16,42 @@ first and gate the rest.
 | **C2** | `&mut` on decoded input — 17 sites | The API invites rewriting the caller's row. Any transform that takes `&mut Row` can silently alter data on a path the caller believes is read-only. Sites: `memtable/mod.rs:284-285`, `:387` (`expand_legacy_collection_blobs`), `memtable/sharded.rs:539`, flush `engine.rs:4838`. |
 | **C3** | Relationship `MERGE` key derivation on an implicit label (#610) | Write path derives 32 bytes, read path derives 32, uuid endpoint columns accept 16 — so truncating on one side only makes written edges untraversable. Both paths must change together. Acceptance test `#[ignore]`d pending this. |
 | **C4** | Bolt diagnostic loss | The driver synthesises `An unknown error occurred`, and anonymous `CREATE (:Label {…})` is rejected as `no resolved binding`. A client cannot see why a write failed. |
+| **C5** | Unjustified hardcoded constants that gate behaviour | A magic number encodes an assumption nobody stated, so nobody tests it. When the number is a capacity, a retry count, or a threshold, it decides when work is dropped, when a request fails, and when data spills — i.e. it is a correctness parameter, not tuning. |
 
 Proof for C2 is a value assertion that the input is byte-identical after the call. C1's red
 test is a capacity-1 observer with no drain.
+
+### C5 — every behavioural constant is named, justified, externalised
+
+Rule: a numeric literal that changes behaviour must (a) carry a comment naming the
+assumption it encodes (memory bound? expected write rate? tolerated drop probability?
+retry budget?), and (b) live in a tunable with a documented default — not inline at the call
+site. `runtime_tuning.rs` already exists as the home for these, so use the existing pattern
+rather than inventing a mechanism.
+
+The observer queue is the worked example: `ObserverConfig::default().queue_capacity`
+(10,000) is documented on the struct, but hardcoded at three construction sites
+(`engine.rs:3589`, `3851`, `4144`) instead of read from deployment config — so the drop
+threshold is fixed by whoever wrote the literal, and an operator cannot raise it.
+
+Inventory of constants that gate behaviour (ferrosa-storage, non-test, 69 total; the ones
+that most clearly need justification and externalisation):
+
+| site | constant | what it decides |
+|---|---|---|
+| `store.rs:1448` | `MAX_SEALED_MEMTABLE_RETRIES = 10_000` | how long a write spins before failing — 10k is a load assumption, not a bound |
+| `spill_budget.rs:38` | `DEFAULT_SPILL_THRESHOLD_PCT = 50` | when memory pressure spills — directly an OOM parameter |
+| `store.rs:3042`, `:3046` | unselective-index share `10`, min matches `50` | whether the planner uses an index; changes result path and latency |
+| `manifest.rs:14` | `MAX_CAS_RETRIES = 3` | when manifest publication gives up |
+| `evicted_read.rs:48-52` | `MIN_PAGE_BYTES 4096`, `MAX_RUN_PAGES 8`, `MAX_OBJECT_INFOS 4096` | evicted-read batching and memory ceiling |
+| `eviction_audit.rs:71-86` | max bytes 4/16/32, `MAX_RECORD_BYTES 1024` | audit ring retention |
+| `store.rs:32,1433,3962,4070` | `64`, `8`, `8`, `8` | compaction candidate and retry bounds |
+| `runtime_tuning.rs:11-18` | `DEFAULT_*` (8/64/8/8/16/8/64) | flush/compaction scheduling parallelism |
+
+Method for each: state the assumption, decide whether it is a tunable (operator-facing) or a
+named constant with a proof obligation (invariant-derived, e.g. `MIN_MAX_BYTES = 16` if a
+record header cannot be smaller), and add a test that fails if the value is changed to
+something the assumption forbids.
 
 ### Phase 2 — performance, ranked by impact
 
