@@ -33,9 +33,11 @@ the reconcile repairs it. Today: N−1 drops, no marker, N−1 untraversable edg
 
 Fix, both halves:
 1. refcounted payload so `engine.rs:9338` (`mutation.clone()` in `try_send`) is a pointer;
-2. no-loss policy — backpressure, or drop + dirty marker healed by
-   `ensure_adjacency_ready` / `ReconcileMode::Repair` (it already refuses queries during
-   heal via `record_query_refused_during_heal`).
+2. **backpressure, never drop** (owner decision, final). Index entries must never be
+   discarded — a dropped entry means committed data with no path to it. Preferred shape:
+   inline fallback, running the drain's derivation synchronously on the writer when the
+   queue is full. `blocking_send` only where the caller is provably not a runtime worker;
+   never an unbounded channel.
 
 Then brief 1 in AUDIT.md (storage data model), then cluster, graph, front ends.
 
@@ -95,8 +97,8 @@ cargo fmt -p <crate>
 
 ## Open questions for the owner
 
-1. Class F policy: **backpressure** (lossless, writer pays latency) or **drop + repair**
-   (dirty marker + reconcile)? Recommendation: drop + repair.
+1. Class F policy: **settled — backpressure only.** Dropping a derived index entry is
+   silent data loss (committed data with no path to it) and is not permitted.
 2. `FOREACH` implicitly creates labels (Neo4j-consistent). Confirm, and keep
    `foreach_with_a_create_creates_the_label` as the contract.
 3. Secondary index for graph labels: `CREATE INDEX … FOR (n:Label) ON (n.pk)` fails with

@@ -12,7 +12,7 @@ first and gate the rest.
 
 | id | item | why it is correctness |
 |---|---|---|
-| **C1** | Async observer drops lose derived index entries — `engine.rs:9333-9343` | A committed edge can have no adjacency entry: durable data with no path to it, unreachable forever. `observer_drop_count` has no production reader. Detail and both fix shapes: class F below. |
+| **C1** | Async observer drops lose derived index entries — `engine.rs:9333-9343` | A committed edge can have no adjacency entry: durable data with no path to it, unreachable forever. `observer_drop_count` has no production reader. Detail: class F below. Policy is settled — backpressure, never drop. |
 | **C2** | `&mut` on decoded input — 17 sites | The API invites rewriting the caller's row. Any transform that takes `&mut Row` can silently alter data on a path the caller believes is read-only. Sites: `memtable/mod.rs:284-285`, `:387` (`expand_legacy_collection_blobs`), `memtable/sharded.rs:539`, flush `engine.rs:4838`. |
 | **C3** | Relationship `MERGE` key derivation on an implicit label (#610) | Write path derives 32 bytes, read path derives 32, uuid endpoint columns accept 16 — so truncating on one side only makes written edges untraversable. Both paths must change together. Acceptance test `#[ignore]`d pending this. |
 | **C4** | Bolt diagnostic loss | The driver synthesises `An unknown error occurred`, and anonymous `CREATE (:Label {…})` is rejected as `no resolved binding`. A client cannot see why a write failed. |
@@ -195,20 +195,31 @@ Both halves of the fix already have homes:
    (`TableRef`/`Bytes`, class B+C), `try_send` carries a pointer instead of deep-cloning
    two Strings, the key, and every row and cell (`engine.rs:9338`). This is what makes a
    lossless or low-drop policy affordable.
-2. **Never lose the entry** — one of:
-   - **backpressure**: block/await until the queue has room, so index maintenance is
-     lossless and the writer pays the latency honestly; or
-   - **drop + repair**: on a drop, set a per-keyspace *adjacency dirty* marker and have the
-     existing `ensure_adjacency_ready` / `ReconcileMode::Repair` heal it before serving
-     traversals (the heal path already refuses queries with
-     `record_query_refused_during_heal`, so the degraded window is explicit rather than a
-     wrong answer).
+2. **Never lose the entry — backpressure is required.** (Owner decision, final.)
 
-   Either is correct. What is not correct is counting a drop that nothing reads.
+   **DROP IS NOT AN OPTION HERE.** Discarding a derived index entry is silent data loss: the
+   committed record stays on disk while the path to it disappears. Drop-plus-repair was
+   considered and rejected — a repair window is still a window in which committed data is
+   unreachable, and the rule is that committed data stays reachable.
+
+   The write path is synchronous, so backpressure has to be expressed without an `.await`:
+
+   - **preferred — inline fallback:** when `try_send` returns Full, run the same derivation
+     the drain task runs, synchronously on the writer. Nothing is lost, memory stays bounded,
+     and the writer absorbs the cost, which is what backpressure means.
+   - **blocking bounded send** only where the caller is provably not a tokio runtime worker
+     thread (`blocking_send` panics inside a runtime context).
+   - **an unbounded channel is also wrong** — "never drop" must not become "never bound"; an
+     unbounded queue on a database is an OOM waiting for load.
+
+   The existing counter is re-meant: it counts **backpressure events** (the writer paid the
+   inline cost), not lost data. It must have a production reader — it is the signal that the
+   queue is undersized, so an operator can raise the capacity.
 
 **Red test:** register an async observer with capacity 1, do not drain, write N edges, then
-drain and assert every edge is traversable — or that the keyspace is marked dirty and the
-reconcile repairs it. Today: N-1 drops, no marker, missing adjacency entries.
+drain and assert every edge is traversable, and that the backpressure counter shows the
+writer absorbed the cost. Today: N-1 entries dropped silently, no marker, missing adjacency
+entries — and nothing repairs them.
 
 ## Crate briefs — execute in this order
 
