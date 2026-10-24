@@ -142,6 +142,11 @@ Acceptance:
 4. `ferrosa-graph` lib 457/0 and `bolt_write_gaps` 15/0
 5. A cell-prefix radius query returning the same set as a linear scan over the fixture
 
+## Physical layout
+
+Where these tables live, how indexes are specialised, and how write amplification is kept under
+control: [`attribute-index-keyspace-layout.md`](attribute-index-keyspace-layout.md).
+
 ## Open questions
 
 1. Attribute map encoding: inline in the row vs a sidecar; and whether it is schemaless or
