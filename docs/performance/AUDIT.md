@@ -32,12 +32,42 @@ Ranked by *frequency on the write path*, not by raw occurrence count. Evidence i
 | **T3** | `engine.rs:9261`, `:9308`, `:9981` | Whole-row clone per derived row to satisfy a `&Row` parameter while iterating a reference | `for row in dm.rows` — move, do not clone |
 | **T4** | `engine.rs:4838` | Row clone per row during flush (background path, not ingest latency) | Take ownership into the normalisation instead of cloning |
 | **T5** | `vec![row]` one-element allocation, same sites | One allocation per call, avoidable | Pass the row or a `SmallVec` |
+| **T6** | `format!` with an allocation **per iteration** | One `String` per element (see below) | Compare/format without allocating; `write!` into a reused buffer |
+
+### T6 — `format!` is hot only where it runs per iteration
+
+`format!` allocates a `String`; `format_args!` builds a stack `fmt::Arguments` and allocates
+nothing. The measured context across 2643 src sites is what decides whether that matters:
+
+| context | count | verdict |
+|---|---|---|
+| error construction (`Err(`, `Error::*`, `anyhow!`, `expect`) | 1234 | cold — allocates only when an error is built |
+| other (path building, metrics render, query-plan debug) | 1366 | mostly cold: per file-op, per scrape, or debug-only |
+| inside a closure (`.map`/`.any(`,`.filter`) | 27 | **candidate — runs per element** |
+| inside a `tracing::` macro | 16 | small; a `tracing` event with inline args avoids the `String` entirely |
+
+So there is no logging hot path here — only 16 sites format inside `tracing`, and the
+codebase mostly builds eager error/path strings instead. The real per-iteration offenders:
+
+- `memtable/mod.rs:582`, `:596` — `format!("<index {idx}>")` inside column-name decode → per row;
+- `engine.rs:12004` — `format!("{}.{}", id.keyspace(), id.table()) == *key` inside `.any(…)`:
+  a `String` allocated per element purely to compare. Compare fields directly;
+- `engine.rs:4758` — `.entry(format!("{}.{}", mutation.keyspace, mutation.table))` per mutation
+  on the set-aside path;
+- `commitlog/mod.rs:147-404` — ~50 `push_str(&format!(…))` in one metrics renderer: one
+  `String` per line per scrape. `write!` into the existing `out` instead;
+- `cql/router.rs:25259`, `31918`, `cql/bridge.rs:1342`, `raft/log_store.rs:1410` — hex built
+  one two-char `String` per byte.
+
+Caveat that decides the rewrite shape: `format_args!` cannot be stored or returned (its
+temporaries die at the end of the statement), so it only works where the callee consumes it
+immediately — logging. For owned output the fix is `write!(&mut buf, …)` into a reused buffer.
 
 Tails, after triage: `&mut` input (17, correctness — folded into C2), identity `.to_string()`
 (185, but mostly cold — metrics, maintenance, `sort_by` keys at `engine.rs:7300`;
 roughly 10 real hot-path sites), `new_v4()` (210, verify which are per-write; cluster txn
 ids dominate), `.to_vec()` on key/cell (27), `Vec::new()` (752, overwhelmingly cold — only
-those inside row loops matter), `format!()` (2639, almost entirely error text — not a target).
+those inside row loops matter), `format!()` (2643, triaged in T6 — per-iteration sites only).
 
 **T1 outranks T2**, which inverts the earlier focus: `9338` only costs on top of what `9837`
 already paid, and only per registered observer.
