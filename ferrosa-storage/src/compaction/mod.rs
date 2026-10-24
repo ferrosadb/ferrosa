@@ -42,6 +42,7 @@ pub(crate) mod retry;
 mod stateful_model_tests;
 pub mod strategy;
 pub mod strategy_ucs;
+mod stream;
 
 /// Compaction correctness validator (oracle + differential checks). Compiled
 /// only for tests or when the `compaction-validator` feature is enabled.

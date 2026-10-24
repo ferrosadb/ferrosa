@@ -95,7 +95,9 @@ jobs:
           # as ci.yml does; they ran here and failed at 56.7 ms on 2026-09-30.
           # The `perf-regression` job below enforces them unchanged.
           # Crate excludes + skip list mirror ci.yml's proven --all-features run
-          # (jepsen/loadgen excluded; live-infra + heavy tests skipped by name).
+          # (jepsen excluded; live-infra + heavy tests skipped by name).
+          # Keep loadgen properties: exclude its binary/S3 and deterministic load
+          # smoke cases by name, rather than excluding the whole crate.
           # A live-infra test this lane forgets is a red nightly: the parity is
           # checked by scripts/ci/guard-all-features-lane-live-infra.py, so add
           # the test name here (and in ci.yml + scripts/pre-push-mirror-ci.sh)
@@ -108,14 +110,15 @@ jobs:
           # Any other non-zero is a real proptest failure and is surfaced.
           timeout --kill-after=30s "${FUZZ_BUDGET_SECS}" \
             cargo test --all-features --workspace --lib --tests \
-              --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+              --exclude ferrosa-jepsen \
               -- -Z unstable-options --report-time \
                  --skip batch_atomicity --skip pause_resume --skip recovery_coordinator \
                  --skip cassandra_reads_compacted --skip compaction_end_to_end_pipeline \
                  --skip dep_wait_ordering --skip disk_fail_no_phantom \
                  --skip packet_reorder_linearizability --skip lwt_batch_atomicity_all \
                  --skip clock_skew_large_preaccept \
-                 --skip binary_ \
+                 --skip binary_ --skip ucs_load_s3_ \
+                 --skip ucs_load_read_heavy --skip ucs_load_balanced --skip ucs_load_write_heavy \
                  --skip concurrent_write --skip many_flushes \
                  --skip flush_2000 --skip single_writer --skip write_flush_compact \
                  --skip reads_never_panic_on_arbitrary_content \

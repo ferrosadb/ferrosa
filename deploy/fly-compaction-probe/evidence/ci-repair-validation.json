@@ -1,0 +1,448 @@
+{
+  "schema": 1,
+  "prior_supported_linux_validation": {
+    "source_head": "df6f4d85c7fabdb66c42529ca24ed8d0ba8ae235",
+    "platform": "Linux x86_64",
+    "identity": "uid=1000(ci) gid=1000(ci) groups=1000(ci)",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "profile": {
+      "CARGO_PROFILE_DEV_DEBUG": "1",
+      "CARGO_INCREMENTAL": "0"
+    },
+    "gates": {
+      "workspace.log": {
+        "exit_code": 0,
+        "passed": 9821,
+        "failed": 0,
+        "ignored": 1,
+        "binaries": 252,
+        "warning_diagnostics": 0
+      },
+      "clippy.log": {
+        "exit_code": 0,
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 0,
+        "warning_diagnostics": 0
+      },
+      "docs.log": {
+        "exit_code": 0,
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 0,
+        "warning_diagnostics": 0
+      },
+      "fmt.log": {
+        "exit_code": 0,
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 0,
+        "warning_diagnostics": 0
+      },
+      "ci-contracts.log": {
+        "exit_code": 0,
+        "passed": 153,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 0,
+        "warning_diagnostics": 0,
+        "duration_seconds": 48.455
+      },
+      "port-clippy-red.log": {
+        "exit_code": 101,
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 0,
+        "warning_diagnostics": 0
+      },
+      "port-clippy-green.log": {
+        "exit_code": 0,
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 0,
+        "warning_diagnostics": 0
+      },
+      "port-test-green.log": {
+        "exit_code": 0,
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0,
+        "binaries": 1,
+        "warning_diagnostics": 0
+      }
+    },
+    "log_sha256": {
+      "workspace.log": "c5b216572c70c4b2e17a7defacdfb5f714def42699d0597b1934134418c700f9",
+      "clippy.log": "871e318377e4a0aa278478d3f065ea03e323a6efa9c0c22692b750d2f23c915f",
+      "docs.log": "4590e8386d004dbb5c8a22998bfdafb86d1ccb8f99384adc11e567e055d84eb7",
+      "fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "ci-contracts.log": "1bfdec45d915c4e59e4eb15a260b109506e9fb2c6d0bcaf8433b0b37ffbddf1d",
+      "port-clippy-red.log": "35777354b2764678d45bfc091a8ec8b5e58e6e02c2b02b9970cabbe33d5d12bd",
+      "port-clippy-green.log": "c3f8d021a3c1765fb8c56a29acb0d8c1630a64b3f703a9dfa874d1c974e9afc6",
+      "port-test-green.log": "298370276029bc6f321c09936af7bc67d47a7dc5d682df6cc5ccfffa7b1465e2"
+    },
+    "real_linux_alignment_probe_passed": true,
+    "refused_drop_permission_fixture_passed": true,
+    "permission_control": "rm: cannot remove '/scratch/tmp/permission-control.kA7R1I/table': Permission denied\nunprivileged chmod-000 removal refused",
+    "source_archive_sha256": "9c297ef50f85918210e2f9f78754107f7ada9f59ef800759cbfc92ddfac270bb",
+    "measured_production_and_probe_files_match": 18,
+    "port_test_source_sha256": "6a7b9caea0bc6c04680baeebca7bf584d003ad75dbbe38bf3ad65b8e7c0ab3a6"
+  },
+  "prior_raw_archive": {
+    "file": "/tmp/ferrosa-ci-repair-20261023/linux/gate-df6-evidence.tar.gz",
+    "sha256": "c5bc4a66f27f53a273220b32ee02d896b3d687c5846f6fd0cdbc1010656165d4",
+    "bytes": 205995
+  },
+  "independent_verifier": {
+    "path": "/tmp/combined-ci-verifier-20261023/VERIFICATION.json",
+    "sha256": "00ca9a7614019485d712e9f6bea5223326e54a9f97ee9b502de4c0763c478569",
+    "green": {
+      "smoke_ci_python": {
+        "passed": 5,
+        "exit": 0
+      },
+      "nightly_ci_python": {
+        "passed": 2,
+        "exit": 0
+      },
+      "mirror_prerequisite_python": {
+        "passed": 3,
+        "exit": 0
+      },
+      "exact_repository_port_driver_final": {
+        "passed": 10,
+        "failed": 0,
+        "skipped": 0,
+        "exit": 0
+      },
+      "shell_syntax": {
+        "exit": 0
+      }
+    },
+    "negative_controls": [
+      {
+        "case": "barrier_removed",
+        "tests": 5,
+        "failed": [
+          "test_recovery_fails_without_writing_if_replication_never_recovers (test_smoke_quorum_write_failover.RecoveryReadinessTest.test_recovery_fails_without_writing_if_replication_never_recovers)",
+          "test_recovery_waits_for_quorum_before_the_one_shot_write (test_smoke_quorum_write_failover.RecoveryReadinessTest.test_recovery_waits_for_quorum_before_the_one_shot_write)"
+        ],
+        "errors": [],
+        "skipped": 0,
+        "exit": 1
+      },
+      {
+        "case": "errors_swallowed",
+        "tests": 5,
+        "failed": [
+          "test_recovery_fails_without_writing_if_replication_never_recovers (test_smoke_quorum_write_failover.RecoveryReadinessTest.test_recovery_fails_without_writing_if_replication_never_recovers)",
+          "test_recovery_waits_for_quorum_before_the_one_shot_write (test_smoke_quorum_write_failover.RecoveryReadinessTest.test_recovery_waits_for_quorum_before_the_one_shot_write)"
+        ],
+        "errors": [],
+        "skipped": 0,
+        "exit": 1
+      },
+      {
+        "case": "loadgen_excluded",
+        "tests": 2,
+        "failed": [
+          "test_property_fuzz_keeps_loadgen_coverage_but_skips_binary_smoke (test_nightly_fuzz_workflow.NightlyFuzzWorkflowTest.test_property_fuzz_keeps_loadgen_coverage_but_skips_binary_smoke)"
+        ],
+        "errors": [],
+        "skipped": 0,
+        "exit": 1
+      },
+      {
+        "case": "asc_setup_removed",
+        "tests": 3,
+        "failed": [
+          "test_build_failure_prevents_tests_and_preserves_the_error (test_pre_push_prerequisites.PrePushPrerequisitesTest.test_build_failure_prevents_tests_and_preserves_the_error)",
+          "test_builds_and_exports_the_bundle_before_running_tests_then_cleans_it (test_pre_push_prerequisites.PrePushPrerequisitesTest.test_builds_and_exports_the_bundle_before_running_tests_then_cleans_it)"
+        ],
+        "errors": [],
+        "skipped": 0,
+        "exit": 1
+      }
+    ],
+    "extra_negative_control": {
+      "change": "scratch helper restored whole-band selector ignoring supplied allocator",
+      "test": "intentional_collision_uses_the_supplied_allocator",
+      "exit": 101,
+      "passed": 0,
+      "result": "fresh-child leased-slice assertion rejects stolen global port",
+      "outer_test_failed": 1,
+      "nested_child_test_failed": 1,
+      "forge_aggregate_failed": 2
+    },
+    "limits": [
+      "QUORUM read is a recovery health barrier; retained one-shot write remains the decisive write assertion.",
+      "Python CQL/ASC doubles verify orchestration rather than live-engine replication or compiler correctness.",
+      "Nightly static command guard verifies property selection, not completion of every property within the wall-clock budget."
+    ]
+  },
+  "docker_smoke": {
+    "exit_code": 0,
+    "phases": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13
+    ],
+    "script_sha256": "1947bde1ed3cb3b9b3e74532dd111e65177222e421abee46d31e919dbb7972d4",
+    "log_sha256": "1e9691f42bb3cec37394e30887505e605ebf81e227ce93258804e77ca8bbc754",
+    "cleanup": {
+      "containers": [],
+      "volumes": []
+    },
+    "runtime": "v2026.10.23.0449",
+    "platform": "linux/amd64 under local Podman",
+    "final_lines": [
+      "INFO:   Phase 8:     1 node down \u2014 QUORUM writes/reads succeed",
+      "INFO:   Phase 9:     2 nodes down \u2014 below QUORUM, writes fail",
+      "INFO:   Phase 10:    Cluster recovery \u2014 nodes rejoin, writes resume",
+      "INFO:   Phase 11:    DDL replication across 3 nodes",
+      "INFO:   Phase 12:    FMEA failure modes (data on 3rd node, DDL on follower,",
+      "INFO:                stale data after rejoin, write timeout, token distribution)",
+      "INFO:   Phase 13:    Cross-node subscription test"
+    ]
+  },
+  "performance_source_continuity": {
+    "measured_candidate": "f3d687d5d82af73fe676195d3122a464482687cd",
+    "matching_source_and_probe_files": 18,
+    "merged_binary_rebenchmarked": false
+  },
+  "ci_source_policy": {
+    "new_skips": false,
+    "new_retries": false,
+    "timeouts_widened": false,
+    "permission_assertion_preserved": true,
+    "linux_alignment_assertion_preserved": true
+  },
+  "final_independent_audit": {
+    "file": "/tmp/ferrosa-ci-repair-20261023/final-independent-command-and-source-audit.json",
+    "sha256": "15573495609ea47307c93b8eb4a629b1b7c4a1cc8eaac247fff1c3b9312243ea",
+    "result": "accepted",
+    "exact_ci_commands": true,
+    "measured_source_files_matching": 18
+  },
+  "publication_repair_review": {
+    "path": "/tmp/ferrosa-ci-repair-20261023/ddl-working-diff-review.json",
+    "sha256": "cc46f818aa5bbac3b85c35f274c2e0a9703dd705d00108cbb8901118a5bfc412",
+    "result": "accepted"
+  },
+  "publication_smoke_regression_review": {
+    "path": "/tmp/smoke-ddl-mode-verifier-20261023/VERIFICATION.json",
+    "sha256": "f82292dd4e252205706990d81e7ce0fc589270bcc1b56248de04a345f61a9fbc",
+    "green_tests": 7,
+    "revert_failures": 2
+  },
+  "merged_red_control": {
+    "head": "3d11922a57be1317a0ba2f5262a0d09876e21a5e",
+    "tests": 9824,
+    "passed": 9822,
+    "failed": 2,
+    "policy_skipped": 93,
+    "archive_sha256": "ad39cf494a9ced798a884f8eff921abb83ac1fb0691a83100f612807a8caacca",
+    "archive_bytes": 211515
+  },
+  "final_ci_source": {
+    "head": "5a67df9138ce7f46ac2459e3b7566321fcbade78",
+    "base": "6ba60f5705fc5da675b0cd0cfa84581e5e2c5c12",
+    "source_archive_sha256": "b57e74582dfc1bf91e0b12d72cb3eecc285f3682c614ad96ab676160f5ecbfa4",
+    "source_archive_bytes": 52879360,
+    "runtime_source_commit": "428b0393aee30db4522ca00ef4dd9dc907feff0e",
+    "documentation_overlay": {
+      "archive_sha256": "5a5079ffec1b6d16862e73660e4d465c8dc672bb743e066cfdf00f322414e3ff",
+      "files": {
+        "ferrosa-cluster/specs/fmea.md": "11f338ccbef32f86e8453ee1d07ef6e4a4a21f17418e2e5e8fca8f9eb9ea8c20",
+        "ferrosa-cluster/specs/fmea-ids.txt": "60a66ee7aaae8a4327c70b44c634b144a90f1af1f425e029160d3cfb9b64d948"
+      },
+      "registered_id_added": "CL-77 36b4236eed78fbdd ddl acknowledged on direct before cluster path publication",
+      "existing_ids_changed": 0
+    }
+  },
+  "local_policy_checks": {
+    "published_specs": 0,
+    "no_memory_public": 0,
+    "no_new_waivers": 0,
+    "unbounded_reads": 0,
+    "ci_contract_tests": 155
+  },
+  "fmea_documentation_correction": {
+    "runtime_source": "428b0393aee30db4522ca00ef4dd9dc907feff0e",
+    "documentation_commit": "5a67df9138ce7f46ac2459e3b7566321fcbade78",
+    "only_added_id": "CL-77",
+    "existing_ids_changed": 0,
+    "standalone_exact_source_tests": 3,
+    "source_unchanged": true,
+    "full_linux_selection_rerun": true,
+    "prior_full_run": {
+      "selected": 9827,
+      "passed": 9826,
+      "failed": 1,
+      "policy_skipped": 93,
+      "failure": "ferrosa-cluster::fmea_table::fmea_references_resolve_to_a_row",
+      "duration_seconds": 622.255
+    }
+  },
+  "supported_platform_final": {
+    "source_head": "5a67df9138ce7f46ac2459e3b7566321fcbade78",
+    "base": "6ba60f5705fc5da675b0cd0cfa84581e5e2c5c12",
+    "platform": "Linux x86_64",
+    "identity": "uid=1000(ci) gid=1000(ci) groups=1000(ci)",
+    "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)",
+    "nextest": "cargo-nextest 0.9.149 (3fe4ef319 2026-10-20)\nrelease: 0.9.149\ncommit-hash: 3fe4ef31972f24e0c94cfe291718eab0fe678260\ncommit-date: 2026-10-20\nhost: x86_64-unknown-linux-gnu",
+    "gates": {
+      "postdoc-nextest-general.log": {
+        "exit_code": 0,
+        "warning_diagnostics": 0,
+        "summary": "Summary [ 621.446s] 9827 tests run: 9827 passed, 93 skipped",
+        "passed": 9827,
+        "failed": 0
+      },
+      "postdoc-nextest-process.log": {
+        "exit_code": 0,
+        "warning_diagnostics": 0,
+        "summary": "Summary [  13.395s] 14 tests run: 14 passed, 0 skipped",
+        "passed": 14,
+        "failed": 0
+      },
+      "postdoc-clippy.log": {
+        "exit_code": 0,
+        "warning_diagnostics": 0
+      },
+      "postdoc-docs.log": {
+        "exit_code": 0,
+        "warning_diagnostics": 0
+      },
+      "postdoc-fmt.log": {
+        "exit_code": 0,
+        "warning_diagnostics": 0
+      },
+      "postdoc-ci-contracts.log": {
+        "exit_code": 0,
+        "warning_diagnostics": 0,
+        "passed": 155,
+        "duration_seconds": 42.367
+      }
+    },
+    "log_sha256": {
+      "postdoc-nextest-general.log": "4f27f450bb4826fb7a38f4e2d7d77c9d205d33f7bb428e4b8df2e8d6878e7894",
+      "postdoc-nextest-process.log": "02ad7983b0b563297dc3a9059470e6027e30cfb2d996c98cee52f8dd4fabd392",
+      "postdoc-clippy.log": "a4a4fde1f852a5b801bf122c83045cc0eb519863f99ff68d44228a623007067a",
+      "postdoc-docs.log": "067c1b0a1ee258b6bf5cf404803d894074312172673bf616e435af26323fe2bd",
+      "postdoc-fmt.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "postdoc-ci-contracts.log": "c79ba287efcff901ca35625cbffe2ea2470206e267930a05a4b3c4e6944740ed"
+    },
+    "real_linux_alignment_probe_passed": true,
+    "refused_drop_permission_fixture_passed": true,
+    "cross_dc_ddl_passed": true,
+    "isolated_graph_scale_passed": true,
+    "publication_http_regression_passed": true,
+    "measured_production_and_probe_files_match": 18,
+    "source_archive_sha256": "b57e74582dfc1bf91e0b12d72cb3eecc285f3682c614ad96ab676160f5ecbfa4",
+    "permission_control": "rm: cannot remove '/scratch/tmp/permission-control.kA7R1I/table': Permission denied\nunprivileged chmod-000 removal refused",
+    "source_archive_commit": "428b0393aee30db4522ca00ef4dd9dc907feff0e",
+    "documentation_overlay": {
+      "archive_sha256": "5a5079ffec1b6d16862e73660e4d465c8dc672bb743e066cfdf00f322414e3ff",
+      "files": {
+        "ferrosa-cluster/specs/fmea.md": "11f338ccbef32f86e8453ee1d07ef6e4a4a21f17418e2e5e8fca8f9eb9ea8c20",
+        "ferrosa-cluster/specs/fmea-ids.txt": "60a66ee7aaae8a4327c70b44c634b144a90f1af1f425e029160d3cfb9b64d948"
+      },
+      "registered_id_added": "CL-77 36b4236eed78fbdd ddl acknowledged on direct before cluster path publication",
+      "existing_ids_changed": 0
+    },
+    "source_git_clean": true,
+    "post_test_source_git_clean": true,
+    "asc_bundle_sha256": "087e526f3ae09f3d1094e52959e726b732a488e2de9e832a37d7ea1dd6af55bd",
+    "ddl_controls": {
+      "red_production_head": "3d11922a57be1317a0ba2f5262a0d09876e21a5e",
+      "green_production_head": "428b0393aee30db4522ca00ef4dd9dc907feff0e",
+      "cases": {
+        "ddl-transition": {
+          "red": {
+            "exit_code": 101,
+            "passed": 0,
+            "failed": 1,
+            "ignored": 0,
+            "log_sha256": "93318e6cd1c74aba33a5db3fc13680d390a7892b3005e215c5f1259b836d519e"
+          },
+          "green-final": {
+            "exit_code": 0,
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "log_sha256": "5f367773bfadf79c11959f903757c7d281a5faafb63866a3e9f3f9f49a4326b2"
+          }
+        },
+        "ddl-admission": {
+          "red": {
+            "exit_code": 101,
+            "passed": 0,
+            "failed": 1,
+            "ignored": 0,
+            "log_sha256": "4c4b8ed2272b19f0bcd787391439b13140d529d0385612c918622974b4c9ca39"
+          },
+          "green-final": {
+            "exit_code": 0,
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "log_sha256": "0ba272e6a369079210137bdbc13c2ea9130a3d2410003b3cf854ea93edd9bdb3"
+          }
+        },
+        "ddl-readiness": {
+          "red": {
+            "exit_code": 101,
+            "passed": 0,
+            "failed": 1,
+            "ignored": 0,
+            "log_sha256": "16b1b7fc300adc14b66a2574c6f00dbb0cba8ce2ca4bcec4f8b5ca124e1df1b2"
+          },
+          "green-final": {
+            "exit_code": 0,
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "log_sha256": "4bdead206e0ecf02dba91c7bcc84fb329e8329997b1ba543ee5bc209ab91fb57"
+          }
+        }
+      }
+    }
+  },
+  "final_raw_archive": {
+    "file": "/tmp/ferrosa-ci-repair-20261023/linux/gate-postdoc-evidence.tar.gz",
+    "bytes": 832892,
+    "sha256": "415961eb4e1fd9d0d0820a60eb9c0644e9e53bd4aa902a5cba126119a15d91b1"
+  },
+  "cleanup": {
+    "utc": "2026-10-23T21:31:14.992784+00:00",
+    "app": "ferrosa-ci-probe-1023",
+    "machine": "8dd144be220658",
+    "volume": "vol_v8ey6wj63xw2z75v",
+    "machine_destroy_exit": 0,
+    "volume_destroy_exit": 0,
+    "app_destroy_exit": 0,
+    "machines_before_app_destroy": [],
+    "volumes_before_app_destroy": [],
+    "app_absent": true,
+    "original_probe_app_absent": true,
+    "existing_builder_present_untouched": true,
+    "docker_containers": [],
+    "docker_volumes": []
+  }
+}

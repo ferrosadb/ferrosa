@@ -407,3 +407,39 @@ order and there is nothing for a compaction strategy to merge.
 ## jsonb (T-150)
 
 `external_sort` payload accounting counts the canonical jsonb bytes (T-150); a document-sized value never accounts as 0.
+
+## Row-streamed compaction (2026-10-23)
+
+The executor opens/validates inputs and retains publication ownership. Its
+`compaction::stream` worker pulls one reusable row per input, reconciles
+column/path identities with existing LWW rules, then emits the winning row
+through incremental staged BTI output. Full validating readback also reuses one
+row. Source and candidate scratch are local to the worker, with no shared cache
+lock on sequential chunk decode. Legacy reordering spills through the existing
+external sorter at 4 MiB plus one row; the all-purged safety fallback spools
+rows to staging disk. Working memory still includes maximum individual row
+width, input fan-in, reader metadata/read-ahead and bounded writer pumps.
+
+Deferred clustered compaction values use checked logical `ValueSpan` offsets.
+The pending cursor checks bounds first; winner and tie reads validate their own
+chunks. Before advancing a source or emitting its merged row, compaction validates
+every unread raw span, including schema-dropped columns. This avoids a separate
+validation pass over fetched values while preserving checks on discarded bytes.
+Ordinary losing values do not allocate payload buffers. Schema ordinal remapping
+moves spans and their original validation indices with cell identities. The public
+metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
+and corrupt losing/dropped-value tests cover this path alongside fully decoding
+output verification.
+
+Refactor plan for the dense compaction state machine: extract header
+reconciliation, candidate selection/output-slot updates, and purge/fallback
+preparation/finalization as separate worker-owned phases. Retain stable source
+ordering, descriptor remapping and the allocation/correctness guards during
+extraction. The current new-module coverage gate uses an isolated LCOV section
+and passes the 80% baseline (85.67% lines); this is not workspace coverage.
+
+Unresolved exact metadata ties follow `task.inputs` source priority, consistent
+with the existing `merge_partitions` oracle's supplied-source order. Adjacent
+duplicate rows cannot change which source supplies equal-timestamp row TTLs,
+delete-time metadata or otherwise equal cells; earlier duplicates from the same
+source retain priority. The timestamp/value/expiry LWW comparator is unchanged.

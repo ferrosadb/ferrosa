@@ -12,7 +12,7 @@ class NightlyFuzzWorkflowTest(unittest.TestCase):
     def test_property_fuzz_keeps_loadgen_coverage_but_skips_binary_smoke(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         match = re.search(
-            r"name: Run property tests \(45-minute fuzz session\).*?run: \|\n(?P<run>.*?)(?:\n\s{6}\S|\Z)",
+            r"name: Run property tests \([^\n]*fuzz session\).*?run: \|\n(?P<run>(?: {10}[^\n]*\n|\n)*)",
             workflow,
             flags=re.S,
         )
@@ -21,7 +21,7 @@ class NightlyFuzzWorkflowTest(unittest.TestCase):
 
         run_block = match.group("run")
         self.assertIn(
-            "cargo test --workspace",
+            "--all-features --workspace --lib --tests",
             run_block,
             "nightly fuzz must continue running the workspace property suite",
         )

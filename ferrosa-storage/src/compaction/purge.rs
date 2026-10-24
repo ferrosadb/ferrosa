@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Bound collection protection scratch without heap allocation.
+//! Correctness: Collection sentinel and purge boundary tests.
+//!
 //! Module: Tombstone purge for compaction output (`gc_grace_seconds`).
 //! Correctness: Correct when a deletion marker is dropped only if BOTH (a) its
 //!   `local_deletion_time` is older than `gc_before` (the grace period elapsed) AND
@@ -7,8 +11,6 @@
 //! Last revised: 2026-09-26
 //! Last changed: New module — compaction kept every partition/row/cell tombstone
 //!   forever because `gc_grace_seconds` was stored in the schema but never read.
-
-use std::collections::HashSet;
 
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition, Row};
 
@@ -138,12 +140,12 @@ pub fn purge_partition(partition: &mut Partition, policy: &PurgePolicy) -> Purge
 }
 
 /// A row with no cells, no deletion and no primary-key liveness carries nothing.
-fn row_is_vacant(row: &Row) -> bool {
+pub(crate) fn row_is_vacant(row: &Row) -> bool {
     row.cells.is_empty() && row.deletion.is_live() && !row.primary_key_liveness.has_timestamp()
 }
 
 /// Purge one row's markers. Returns whether anything was removed.
-fn purge_row(row: &mut Row, policy: &PurgePolicy, stats: &mut PurgeStats) -> bool {
+pub(crate) fn purge_row(row: &mut Row, policy: &PurgePolicy, stats: &mut PurgeStats) -> bool {
     let before = stats.markers();
 
     if policy.purgeable_deletion(&row.deletion) {
@@ -162,16 +164,19 @@ fn purge_row(row: &mut Row, policy: &PurgePolicy, stats: &mut PurgeStats) -> boo
     // A pathless tombstone on a column shadows that column's path-keyed element
     // cells only at read time (`merge_rows` keys cells by `(column, path)`), so it
     // is kept while any such element remains.
-    let columns_with_elements: HashSet<u16> = row
-        .cells
-        .iter()
-        .filter(|(_, cell)| cell.path.is_some())
-        .map(|(column, _)| *column)
-        .collect();
+    // Column ordinals are u16: this fixed 8 KiB bitmap covers every valid
+    // ordinal, including unsorted callers, without a per-row hash allocation.
+    let mut columns_with_elements = [0u64; 1024];
+    for (column, cell) in &row.cells {
+        if cell.path.is_some() {
+            columns_with_elements[usize::from(*column) / 64] |= 1 << (*column % 64);
+        }
+    }
     row.cells.retain(|(column, cell)| {
         let droppable = cell.is_tombstone()
             && policy.purgeable(cell.timestamp, i64::from(cell.local_deletion_time))
-            && !(cell.path.is_none() && columns_with_elements.contains(column));
+            && !(cell.path.is_none()
+                && (columns_with_elements[usize::from(*column) / 64] & (1 << (*column % 64)) != 0));
         if droppable {
             stats.cell_tombstones += 1;
         }

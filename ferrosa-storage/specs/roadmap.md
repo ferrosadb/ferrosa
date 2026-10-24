@@ -291,3 +291,14 @@ attempt. A mock-store crash sweep covers the S3 and pinned-local boundaries.
 ## jsonb (T-150)
 
 Done: type threading. Remaining: None for T-150.
+
+### Completed mechanism: compaction allocation reduction (2026-10-23)
+
+Row-streamed BTI compaction, reusable source/output and validating-readback
+buffers, retained reconciliation vectors, direct clustering decode, private
+sequential codec buffers, bounded legacy sorting and disk-spooled all-purged
+fallback are implemented. Input heads hold row/cell metadata and checked logical offsets; losing cell
+values are skipped without ownership, while equal-timestamp comparisons fetch
+bytes through reusable buffers. Source spans remain aligned through schema
+ordinal remapping. Measured
+acceptance evidence is kept with `deploy/fly-compaction-probe`.

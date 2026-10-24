@@ -172,7 +172,7 @@ fn sstable_scan_steady_state_allocation_count() {
     // Guard budget: 6/row, tightened so it catches EITHER regression — the
     // `col_meta` table (+3/row -> 8.25) and the `present_columns` Vec (+1/row ->
     // 6.25) each trip it, while the current 5.25 clears it.
-    const BUDGET_PER_ROW: usize = 6;
+    const BUDGET_PER_ROW: usize = 5;
     let budget = rows_scanned * BUDGET_PER_ROW;
     assert!(
         steady <= budget,
