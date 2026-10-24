@@ -50,6 +50,20 @@ pub trait WriteObserver: Send + Sync {
     /// Returns zero or more derived mutations to be applied (e.g., index entries).
     /// Must be non-blocking — no async I/O, disk reads, or network calls.
     fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation>;
+
+    /// Allocation-free form of [`WriteObserver::on_write`]: append the derived
+    /// mutations to a buffer the CALLER owns and reuses across writes.
+    ///
+    /// `on_write` must mint a fresh `Vec` per mutation and hand ownership over,
+    /// so a write path that observes every row allocates once per derived entry
+    /// no matter how the callee is written. An observer that can derive in place
+    /// overrides this; the default keeps every other implementor unchanged.
+    /// Callers should clear and reuse one buffer per statement rather than
+    /// allocating per mutation — the same shape the CQL session uses for its
+    /// write staging buffers.
+    fn derive_into(&self, table: &TableId, mutation: &Mutation, out: &mut Vec<Mutation>) {
+        out.extend(self.on_write(table, mutation));
+    }
 }
 
 /// Configuration for async observer dispatch.
@@ -145,6 +159,73 @@ mod tests {
 
         observer.on_write(&table, &mutation);
         assert_eq!(observer.count(), 2);
+    }
+
+    /// An observer that implements ONLY `on_write` must keep working now that the
+    /// drain loop calls `derive_into`: the trait's default forwards to `on_write`.
+    /// Without this, wiring the allocation-free path would silently stop every
+    /// observer that had not been taught the new method.
+    #[test]
+    fn derive_into_defaults_to_on_write() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+
+        let table = TableId::new("ks", "tbl");
+        let observer = CountingObserver::new(ObserverMode::Sync, vec![table.clone()]);
+        let mutation = Mutation {
+            mutation_id: [0x21u8; 16],
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+            rows: vec![],
+            timestamp: 1000,
+        };
+
+        let mut out = Vec::new();
+        observer.derive_into(&table, &mutation, &mut out);
+
+        assert_eq!(
+            observer.count(),
+            1,
+            "the default must reach the observer's on_write exactly once"
+        );
+        assert!(
+            out.is_empty(),
+            "and append whatever it derived (here: nothing)"
+        );
+    }
+
+    /// The same buffer is reused across writes, so a second write must not have to
+    /// grow it. This is the reuse contract the write path relies on; it is asserted
+    /// on capacity, not on an allocation counter.
+    #[test]
+    fn derive_into_reuses_a_callers_buffer() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+
+        let table = TableId::new("ks", "tbl");
+        let observer = CountingObserver::new(ObserverMode::Sync, vec![table.clone()]);
+        let mutation = Mutation {
+            mutation_id: [0x22u8; 16],
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+            rows: vec![],
+            timestamp: 1000,
+        };
+
+        let mut out = Vec::new();
+        observer.derive_into(&table, &mutation, &mut out);
+        let capacity_after_first = out.capacity();
+
+        // What a drain loop does between messages.
+        out.clear();
+        observer.derive_into(&table, &mutation, &mut out);
+
+        assert!(
+            out.capacity() <= capacity_after_first,
+            "a repeated write must not grow the caller's buffer: \
+             {capacity_after_first} -> {}",
+            out.capacity()
+        );
     }
 
     #[test]
