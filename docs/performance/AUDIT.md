@@ -35,7 +35,7 @@ first and gate the rest.
 
 | id | item | why it is correctness |
 |---|---|---|
-| **C1** | Async observer drops lose derived index entries — `engine.rs:9333-9343` | A committed edge can have no adjacency entry: durable data with no path to it, unreachable forever. `observer_drop_count` has no production reader. Detail: class F below. Policy is settled — backpressure, never drop. |
+| **C1 ✅** | Async observer drops lose derived index entries — `engine.rs:9333-9343` | A committed edge can have no adjacency entry: durable data with no path to it, unreachable forever. `observer_drop_count` has no production reader. Detail: class F below. Policy is settled — backpressure, never drop. |
 | **C2** | `&mut` on decoded input — 17 sites | The API invites rewriting the caller's row. Any transform that takes `&mut Row` can silently alter data on a path the caller believes is read-only. Sites: `memtable/mod.rs:284-285`, `:387` (`expand_legacy_collection_blobs`), `memtable/sharded.rs:539`, flush `engine.rs:4838`. |
 | **C3** | Relationship `MERGE` key derivation on an implicit label (#610) | Write path derives 32 bytes, read path derives 32, uuid endpoint columns accept 16 — so truncating on one side only makes written edges untraversable. Both paths must change together. Acceptance test `#[ignore]`d pending this. |
 | **C4** | Bolt diagnostic loss | The driver synthesises `An unknown error occurred`, and anonymous `CREATE (:Label {…})` is rejected as `no resolved binding`. A client cannot see why a write failed. |
@@ -227,6 +227,18 @@ Fix: `Vec::with_capacity` computed from the row count (e.g. `rows*2` for adjacen
 Proof: capacity after the write equals the predicted size (no reallocation happened).
 
 ## Class F — silent loss of derived index entries (CORRECTNESS, fix before any perf work)
+
+**RESOLVED** — `fix/observer-noloss`, commit `517a498db`. A full queue now applies the
+derivation inline on the writer thread (backpressure) instead of dropping it; the counter is
+re-meant as `observer_backpressure_count` and read in production via
+`ferrosa_storage_observer_backpressure_total` / `_observer_queue_depth` / `_observer_queue_capacity`;
+capacity is externalised to `FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY`.
+
+**Correction to this document's earlier claim.** Adjacency was *not* exposed: `AdjacencyIndexObserver`
+is `Sync` mode and `GraphEngine` already derives inline. The live exposure was
+`register_async_observer*` (which ignored `mode()`) plus the timeseries and subscription observers.
+So the "durable edge with no path to it" scenario was reachable for those, not for adjacency —
+worth stating plainly, because this document used adjacency to argue urgency.
 
 `engine.rs:9333-9343` enqueues each committed mutation to every async observer with
 `try_send(...).is_err()` → `drop_count += 1`. The write is durable; the **derived entry is
