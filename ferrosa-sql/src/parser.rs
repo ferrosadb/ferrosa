@@ -177,6 +177,7 @@ pub fn parse_statement(sql: &str) -> Result<Statement, ParseError> {
             "ROLLBACK" | "ABORT" => Ok(Statement::Rollback),
             "SET" => p.parse_set(),
             "RESET" => p.parse_reset(),
+            "DEALLOCATE" => p.parse_deallocate(),
             "INSERT" => p.parse_insert(),
             "UPDATE" => p.parse_update(),
             "DELETE" => p.parse_delete(),
@@ -882,6 +883,37 @@ impl Parser {
         self.next(); // RESET
         let name = self.ident()?;
         Ok(Statement::Reset { name })
+    }
+
+    /// `DEALLOCATE [PREPARE] { <name> | ALL }`. Assumes `self.pos` is at
+    /// `DEALLOCATE`.
+    ///
+    /// The identifier rules are PostgreSQL's: an UNQUOTED name folds to lower
+    /// case, a `"quoted"` one is exact, and the reserved `ALL` is the keyword
+    /// form — so only a quoted `"all"` names a statement called `all`.
+    fn parse_deallocate(&mut self) -> Result<Statement, ParseError> {
+        self.next(); // DEALLOCATE
+                     // `PREPARE` is an optional noise word. `DEALLOCATE PREPARE ALL` is
+                     // accepted by PostgreSQL, so it is not a name here either.
+        if matches!(self.peek(), Some(Tok::Ident(word)) if word.eq_ignore_ascii_case("PREPARE")) {
+            self.next();
+        }
+        let name = match self.next() {
+            // The keyword form deallocates EVERY statement; it is checked before
+            // the name form because `ALL` is reserved.
+            Some(Tok::Ident(word)) if word.eq_ignore_ascii_case("ALL") => None,
+            Some(Tok::Ident(word)) => Some(word.to_ascii_lowercase()),
+            Some(Tok::QuotedIdent(word)) => Some(word),
+            Some(t) => {
+                return Err(ParseError::Unexpected {
+                    expected: "a prepared statement name or ALL",
+                    found: format!("{t:?}"),
+                })
+            }
+            None => return Err(ParseError::UnexpectedEnd),
+        };
+        self.expect_end()?;
+        Ok(Statement::Deallocate { name })
     }
 
     /// Error unless all tokens are consumed (statement fully parsed).
@@ -2744,6 +2776,54 @@ mod tests {
             err.to_string().contains("ON CONFLICT"),
             "error should mention ON CONFLICT, got: {err}"
         );
+    }
+
+    #[test]
+    fn parse_statement_deallocate() {
+        // The name form, the keyword form, and the noise word.
+        assert_eq!(
+            parse_statement("DEALLOCATE prep_1").unwrap(),
+            Statement::Deallocate {
+                name: Some("prep_1".into())
+            }
+        );
+        assert_eq!(
+            parse_statement("DEALLOCATE PREPARE prep_1").unwrap(),
+            Statement::Deallocate {
+                name: Some("prep_1".into())
+            }
+        );
+        assert_eq!(
+            parse_statement("deallocate all").unwrap(),
+            Statement::Deallocate { name: None }
+        );
+        assert_eq!(
+            parse_statement("DEALLOCATE PREPARE ALL").unwrap(),
+            Statement::Deallocate { name: None }
+        );
+        // Unquoted identifiers fold to lower case (`ALL` is reserved, so it is
+        // the keyword); a quoted one is taken literally.
+        assert_eq!(
+            parse_statement("DEALLOCATE Prep_1").unwrap(),
+            Statement::Deallocate {
+                name: Some("prep_1".into())
+            }
+        );
+        assert_eq!(
+            parse_statement("DEALLOCATE \"all\"").unwrap(),
+            Statement::Deallocate {
+                name: Some("all".into())
+            }
+        );
+        assert_eq!(
+            parse_statement("DEALLOCATE \"Mixed_Case\"").unwrap(),
+            Statement::Deallocate {
+                name: Some("Mixed_Case".into())
+            }
+        );
+        // Junk after the target is a syntax error, as in PostgreSQL.
+        assert!(parse_statement("DEALLOCATE ALL EXTRA").is_err());
+        assert!(parse_statement("DEALLOCATE").is_err());
     }
 
     #[test]

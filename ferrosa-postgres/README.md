@@ -353,6 +353,17 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   `compaction_purge_enabled()`; and because that engine entry point is
   all-tables, a named `VACUUM t` flushes only `t` but submits compaction
   cluster-wide. `ANALYZE` really is a no-op — no statistics are collected.
+- **`DEALLOCATE [PREPARE] { <name> | ALL }`** — drops prepared statements from
+  this connection's registry (issue #609), so a driver that prepares server-side
+  (psycopg 3 with `prepare_threshold`, which closes its statements with
+  `DEALLOCATE <name>` on older libpq and clears its cache with `DEALLOCATE ALL`)
+  can close a prepared connection instead of being told the statement was a
+  syntax error. The tags are PostgreSQL's (`DEALLOCATE`, `DEALLOCATE ALL`); a
+  name that is not registered is `26000` `invalid_sql_statement_name`, never a
+  silent success; and it is a session operation — allowed inside a transaction
+  block and not undone by `ROLLBACK`. Names follow PostgreSQL's identifier rules,
+  so an unquoted name folds to lower case and only `"all"` names a statement
+  called `all`.
 - **TCP server** — `serve` / `QueryContext`: one spawned task per connection over
   a tokio `TcpListener`, sharing the auth store and the storage+schema context.
 

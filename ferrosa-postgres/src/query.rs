@@ -1342,6 +1342,12 @@ async fn execute_statement(
             "0A000",
             "SET/RESET session statements are not yet implemented",
         )],
+        // DEALLOCATE targets the connection's prepared-statement registry, which
+        // only the connection loop owns (see `server::execute_simple_inner`).
+        Statement::Deallocate { .. } => vec![error_response(
+            "0A000",
+            "DEALLOCATE requires a session; this path has no prepared-statement registry",
+        )],
         // DDL (T-132a): through the same schema-change path CQL DDL uses.
         Statement::CreateTable(create) => {
             crate::ddl::execute_create_table(

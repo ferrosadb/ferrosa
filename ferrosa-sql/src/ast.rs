@@ -46,6 +46,13 @@ pub enum Statement {
     Set { name: String, value: String },
     /// `RESET <name>` (`RESET ALL` carries name `ALL`).
     Reset { name: String },
+    /// `DEALLOCATE [PREPARE] { <name> | ALL }`. `None` is `ALL`: every prepared
+    /// statement of the session is dropped.
+    ///
+    /// Prepared statements are per-session state, so the front-end executes this
+    /// against its own connection registry — it touches no table and no
+    /// transaction.
+    Deallocate { name: Option<String> },
     /// `INSERT INTO t (cols) VALUES (...)`. Boxed for size parity with `Select`.
     Insert(Box<InsertStmt>),
     /// `UPDATE t SET ... WHERE ...`. Boxed for size parity with `Select`.

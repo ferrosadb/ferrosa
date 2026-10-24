@@ -123,7 +123,10 @@ pub(crate) fn statement_permissions(
         | Statement::Commit
         | Statement::Rollback
         | Statement::Set { .. }
-        | Statement::Reset { .. } => Vec::new(),
+        | Statement::Reset { .. }
+        // DEALLOCATE drops this session's prepared statements; it reads and
+        // writes no table, so it needs no permission.
+        | Statement::Deallocate { .. } => Vec::new(),
     }
 }
 

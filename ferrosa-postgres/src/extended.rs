@@ -619,6 +619,43 @@ impl Session {
         BackendMessage::CloseComplete
     }
 
+    /// Handle `DEALLOCATE [PREPARE] { <name> | ALL }`: drop one prepared
+    /// statement, or all of them, from this session's registry.
+    ///
+    /// PostgreSQL's semantics, verified against a real server:
+    ///
+    /// - the completion tag is `DEALLOCATE` for one name and `DEALLOCATE ALL`
+    ///   for the keyword form;
+    /// - a name that is not registered is `26000`
+    ///   (`invalid_sql_statement_name`), never a silent success;
+    /// - it is allowed inside a transaction block and is not undone by a
+    ///   `ROLLBACK`, because prepared statements are session state.
+    ///
+    /// It does NOT clear `error_pending`: the statement arrives on the SIMPLE
+    /// query path (drivers close prepared statements with a plain `Query`
+    /// frame), where no `Sync` follows to clear the flag — setting it would
+    /// make the backend skip every later message on the connection.
+    ///
+    /// Portals are left alone: PostgreSQL gives a portal its own plan, so
+    /// deallocating a statement does not close a portal already bound from it.
+    pub fn on_deallocate(&mut self, name: Option<&str>) -> BackendMessage {
+        let Some(name) = name else {
+            self.statements.clear();
+            return BackendMessage::CommandComplete {
+                tag: "DEALLOCATE ALL".to_string(),
+            };
+        };
+        if self.statements.remove(name).is_none() {
+            return error_response(
+                "26000",
+                &format!("prepared statement \"{name}\" does not exist"),
+            );
+        }
+        BackendMessage::CommandComplete {
+            tag: "DEALLOCATE".to_string(),
+        }
+    }
+
     /// Record that an error occurred mid-sequence (skip until `Sync`) and return
     /// the given `ErrorResponse`. Used by the async handlers in the server loop.
     pub fn fail(&mut self, err: BackendMessage) -> BackendMessage {
@@ -862,6 +899,60 @@ mod tests {
                 if fields[1] == (b'C', "08P01".to_string())
         ));
         assert!(s.portal("p").is_none());
+    }
+
+    /// `DEALLOCATE <name>` drops exactly that prepared statement; a missing name
+    /// is 26000 (never a silent success) and does NOT set the skip-until-Sync
+    /// flag — the statement arrives on the simple-query path, where no Sync
+    /// follows to clear it.
+    #[test]
+    fn deallocate_drops_the_named_statement_only() {
+        let mut s = Session::new(test_auth());
+        s.on_parse("prep_1".into(), "SELECT id FROM users", vec![]);
+        s.on_parse("prep_2".into(), "SELECT id FROM users", vec![]);
+
+        assert!(matches!(
+            s.on_deallocate(Some("prep_1")),
+            BackendMessage::CommandComplete { ref tag } if tag == "DEALLOCATE"
+        ));
+        assert!(s.statement("prep_1").is_none());
+        assert!(
+            s.statement("prep_2").is_some(),
+            "deallocating one statement must leave the others alone"
+        );
+
+        let missing = s.on_deallocate(Some("prep_missing"));
+        assert_eq!(error_code(&missing), "26000");
+        assert_eq!(
+            match &missing {
+                BackendMessage::ErrorResponse { fields } => fields[2].1.clone(),
+                other => panic!("expected ErrorResponse, got {other:?}"),
+            },
+            "prepared statement \"prep_missing\" does not exist"
+        );
+        assert!(
+            !s.is_error_pending(),
+            "the simple-query path has no Sync to clear the skip flag"
+        );
+        assert!(s.statement("prep_2").is_some());
+    }
+
+    /// `DEALLOCATE ALL` empties the registry and answers PostgreSQL's tag.
+    #[test]
+    fn deallocate_all_clears_every_statement() {
+        let mut s = Session::new(test_auth());
+        s.on_parse("prep_1".into(), "SELECT id FROM users", vec![]);
+        s.on_parse("prep_2".into(), "SELECT id FROM users", vec![]);
+        assert!(matches!(
+            s.on_deallocate(None),
+            BackendMessage::CommandComplete { ref tag } if tag == "DEALLOCATE ALL"
+        ));
+        assert!(s.statement("prep_1").is_none() && s.statement("prep_2").is_none());
+        // A second ALL on an empty registry still succeeds, as in PostgreSQL.
+        assert!(matches!(
+            s.on_deallocate(None),
+            BackendMessage::CommandComplete { ref tag } if tag == "DEALLOCATE ALL"
+        ));
     }
 
     #[test]

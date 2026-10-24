@@ -668,6 +668,13 @@ async fn execute_simple_inner<O: ReplySink>(
         ferrosa_sql::Statement::Begin { isolation } => {
             Ok(begin_block(ctx, session, isolation).await)
         }
+        // `DEALLOCATE` is session state: it drops prepared statements from this
+        // connection's registry (issue #609). Inside a transaction block it takes
+        // effect at once and survives ROLLBACK, as in PostgreSQL; the aborted
+        // block case never reaches here (the `25P02` guard above).
+        ferrosa_sql::Statement::Deallocate { name } => {
+            Ok(vec![session.on_deallocate(name.as_deref())])
+        }
         ferrosa_sql::Statement::Commit => Ok(commit_txn(ctx, session).await),
         ferrosa_sql::Statement::Rollback => {
             // ROLLBACK discards the buffered write-set — those writes were never
