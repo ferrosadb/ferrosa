@@ -9,19 +9,35 @@
 //! `create`, and any lazily initialized statics such as the dio_align
 //! once-per-device log dedup and the direct-I/O switch "warned" flags) has
 //! already happened during warm-up.
+//!
+//! The count is per THREAD. At `depth = 0` the pump does all its work on the
+//! calling thread, so the test thread's count is the pump's whole cost. A
+//! process-wide counter also saw libtest's main thread, which keeps doing its
+//! own bookkeeping after it spawns the test thread: on a loaded CPU those
+//! allocations land inside the measured loop (CI run 40051576713 counted 4;
+//! pinning the binary to one busy CPU fails 62 runs in 200, every stray
+//! allocation from the main thread).
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use ferrosa_sstable::direct::DirectWriter;
 
 struct CountingAllocator;
 
-static ALLOC_EVENTS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // const-initialized, so counting allocates nothing itself.
+    static ALLOC_EVENTS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// `try_with`: an allocation during TLS teardown must not panic.
+fn count_alloc() {
+    let _ = ALLOC_EVENTS.try_with(|events| events.set(events.get() + 1));
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOC_EVENTS.fetch_add(1, Ordering::Relaxed);
+        count_alloc();
         unsafe { System.alloc(layout) }
     }
 
@@ -30,12 +46,12 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        ALLOC_EVENTS.fetch_add(1, Ordering::Relaxed);
+        count_alloc();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOC_EVENTS.fetch_add(1, Ordering::Relaxed);
+        count_alloc();
         unsafe { System.alloc_zeroed(layout) }
     }
 }
@@ -43,8 +59,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
+/// Allocations made so far by the calling thread.
 fn alloc_events() -> usize {
-    ALLOC_EVENTS.load(Ordering::Relaxed)
+    ALLOC_EVENTS.with(Cell::get)
 }
 
 /// Streams 64 MiB through a real `DirectWriter` (the production `FileSink`
