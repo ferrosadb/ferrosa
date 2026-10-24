@@ -1,5 +1,10 @@
 # ferrosa-cql
 
+Blob-to-JSON conversion writes lowercase hex into one pre-sized output string,
+including the quotes and `0x` prefix. It preserves output bytes without allocating
+a temporary string per input byte. The bridge tests cover empty values, padding,
+mixed bytes and a larger payload.
+
 > The CQL native-protocol (v4/v5) server — the client-facing front-end to the
 > Ferrosa database. The largest, most central crate in the workspace (~54k LoC).
 

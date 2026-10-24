@@ -74,6 +74,16 @@ without changing the process environment. Digest verification is unconditional.
 
 ## Data flow
 
+After a successful write, synchronous observers borrow its mutation. All
+asynchronous observers of that write receive handles to one immutable
+`Arc<Mutation>` through bounded channels. Owned write payloads move into the
+shared allocation; borrowed batch inputs clone once only when an async observer
+watches the table. Queue saturation or closure runs derivation inline through
+the drain's application path, with a counted backpressure event. It does not
+change commit-log encoding or mutation replay IDs. The queue limit bounds
+messages, not bytes in one mutation. Derived-write errors and observer panics
+remain separate failure modes; sharing does not repair those paths.
+
 **Write path** (front-end → durable): build a `Mutation` → `commit_log.append`
 (CAS allocation into the active segment, durability governed by the sync
 strategy) → `ArcSwap::load` the `StoreView` → `active.put` into one memtable

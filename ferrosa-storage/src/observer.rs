@@ -1,4 +1,7 @@
 //! WriteObserver trait for reactive storage hooks.
+//! Correctness: bounded hand-off preserves mutation values under saturation.
+//! Last revised: 2026-10-24
+//! Last changed: Document shared queue payloads and inline backpressure.
 //!
 //! Observers receive mutations after they are committed to the write-ahead log
 //! and memtable. They can produce derived mutations (e.g., adjacency index
@@ -89,27 +92,24 @@ pub const OBSERVER_QUEUE_CAPACITY_ENV: &str = "FERROSA_ASYNC_OBSERVER_QUEUE_CAPA
 pub struct ObserverConfig {
     /// Bounded queue capacity per async observer, in mutations.
     ///
-    /// This number decides when a hand-off to an async observer is REFUSED, so
-    /// it is a correctness knob, not a tuning nicety: past it, a committed
-    /// mutation's derived entry is not produced now: the keyspace is marked for
-    /// repair (`StorageEngine::observer_gap_open`) instead of the entry simply
-    /// vanishing.
+    /// When this queue is full, the writer derives and applies that observer's
+    /// entries inline through the same path as the drain task. It absorbs the
+    /// cost as backpressure; saturation does not discard entries or defer them
+    /// to a later repair pass.
     ///
     /// The default ([`DEFAULT_OBSERVER_QUEUE_CAPACITY`], 10,000) encodes three
     /// assumptions:
     /// - **Burst, not steady state.** The queue absorbs a burst the drain task
     ///   has not caught up with yet. It cannot absorb a drain that stays behind
-    ///   forever; no finite queue can, which is why a refusal is repaired
-    ///   instead of being counted and forgotten.
-    /// - **Memory.** A staged `(TableId, Mutation)` is on the order of 0.2-1 KB
-    ///   (two owned strings, a key, and one statement's rows), so a full queue
-    ///   is a few MB per observer — small next to a memtable, and bounded
-    ///   rather than growing with a stalled consumer.
-    /// - **Repair cost.** An exceeded queue is repaired by one `Repair`
-    ///   reconcile pass over the keyspace before its traversals are served
-    ///   (hundreds of milliseconds for a locally-read index, per the graph
-    ///   engine's catch-up measurements), so the value trades write-side buffer
-    ///   memory against read-side repair frequency.
+    ///   forever; no finite queue can, which is why a full queue shifts work
+    ///   back to the writer.
+    /// - **Memory.** Queues hold `(TableId, Arc<Mutation>)`. The payload is
+    ///   shared across observers and retained until its last consumer finishes.
+    ///   Capacity bounds messages, not payload bytes: a single mutation can
+    ///   contain many rows and cells, so no fixed bytes-per-message is assumed.
+    /// - **Writer cost.** A smaller queue moves derivation onto the writer
+    ///   sooner. Queue depth, configured capacity and the backpressure counter
+    ///   expose this trade on the existing metrics surface.
     ///
     /// Override with [`OBSERVER_QUEUE_CAPACITY_ENV`].
     pub queue_capacity: usize,

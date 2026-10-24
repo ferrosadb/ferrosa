@@ -1,5 +1,12 @@
 # ferrosa-cluster
 
+Single-row replica fan-out serializes borrowed row/key fields through
+`encode_single_row_mutation`, then moves the row into the local write. It avoids
+an owned temporary mutation solely for encoding and retains a distinct mutation
+ID for each encoded mutation. `tests/single_row_encode.rs` checks wire bytes,
+cached key tokens and the borrowed input's identity. Hex diagnostics use a
+table-driven encoder while retaining the previous lowercase, padded output.
+
 > The distribution layer: Raft metadata consensus (openraft), tunable-consistency
 > read/write coordination, the cluster-formation state machine, anti-entropy
 > repair, hinted handoff, and Accord strict-serializable transactions.

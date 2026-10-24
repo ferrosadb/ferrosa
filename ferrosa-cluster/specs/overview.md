@@ -17,6 +17,12 @@ executive_summary: >
 
 ## Purpose & boundary
 
+Single-row replica writes encode borrowed inputs with
+`pair::coordinator::encode_single_row_mutation`; local application still consumes
+the original row. The helper uses the storage mutation encoder and retains its
+wire format and per-mutation replay ID. This changes allocation ownership, not
+consistency levels or acknowledgment semantics.
+
 `ferrosa-cluster` is the **distribution boundary**. Below it sits
 `ferrosa-storage` (a single-node engine); above it sit the query front-ends
 (`ferrosa-cql`, `ferrosa-graph`, `ferrosa-sparql`, `ferrosa-flight`,

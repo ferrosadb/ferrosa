@@ -15,6 +15,10 @@ executive_summary: >
 
 ## Purpose & boundary
 
+The JSON bridge renders blobs directly into one pre-sized output string. Its
+table-driven lowercase hex encoder preserves the quoted `0x` representation;
+this allocation change does not alter CQL frame or row encoding.
+
 `ferrosa-cql` is the **client-facing front-end** of Ferrosa. Its boundary spans
 from the raw TCP socket to the storage engine: it decodes CQL binary frames,
 authenticates, parses CQL text into an AST, routes statements through the schema

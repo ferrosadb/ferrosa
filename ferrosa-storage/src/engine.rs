@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-09-27
-//! Last changed: Retry output digest failures with backoff and latch table pauses for operator resume.
+//! Last revised: 2026-10-24
+//! Last changed: Share immutable observer payloads across bounded lossless queues.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -2677,7 +2677,7 @@ const DEFAULT_TIME_SERIES_MATERIALIZATION_BATCH_LIMIT: usize = 128;
 /// observer's queue was full.
 struct AsyncObserverState {
     observer: Arc<dyn crate::observer::WriteObserver>,
-    sender: tokio::sync::mpsc::Sender<(TableId, Mutation)>,
+    sender: tokio::sync::mpsc::Sender<(TableId, Arc<Mutation>)>,
     backpressure_count: Arc<AtomicU64>,
 }
 
@@ -8568,12 +8568,14 @@ impl StorageEngine {
     }
 
     /// Registers an async observer and returns the receiver end of the bounded
-    /// channel. The caller is responsible for draining the receiver.
+    /// channel. The caller is responsible for draining the receiver. All async
+    /// observers of one write share its immutable mutation payload; the queue
+    /// carries an `Arc` handle rather than a deep copy of the rows and cells.
     pub fn register_async_observer(
         &self,
         observer: Arc<dyn crate::observer::WriteObserver>,
         capacity: usize,
-    ) -> tokio::sync::mpsc::Receiver<(TableId, Mutation)> {
+    ) -> tokio::sync::mpsc::Receiver<(TableId, Arc<Mutation>)> {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let state = AsyncObserverState {
             observer,
@@ -8914,7 +8916,7 @@ impl StorageEngine {
         let target_table_id = TableId::new(&mutation.keyspace, &mutation.table);
         self.apply_derived_mutation(&mutation);
         self.dispatch_sync_observers(&target_table_id, &mutation);
-        self.dispatch_async_observers(&target_table_id, &mutation);
+        self.dispatch_async_observers(&target_table_id, || mutation);
         Ok(true)
     }
 
@@ -9379,32 +9381,45 @@ impl StorageEngine {
     /// Observers must therefore tolerate `derive_into` running on a writer
     /// thread concurrently with the drain task. They are already `Send + Sync`;
     /// they must not assume single-threaded or ordered derivation.
-    fn dispatch_async_observers(&self, table_id: &TableId, mutation: &Mutation) {
+    fn dispatch_async_observers(
+        &self,
+        table_id: &TableId,
+        make_mutation: impl FnOnce() -> Mutation,
+    ) {
         let async_obs = self.async_observers.read();
-        for state in async_obs.iter() {
-            if !state.observer.watches_table(table_id) {
-                continue;
-            }
-            let Err(unsent) = state.sender.try_send((table_id.clone(), mutation.clone())) else {
-                continue;
-            };
-            crate::metrics::inc_observer_backpressure();
-            if state.backpressure_count.fetch_add(1, Ordering::Relaxed) == 0 {
-                match &unsent {
-                    tokio::sync::mpsc::error::TrySendError::Full(_) => tracing::warn!(
-                        table = %table_id,
-                        capacity = state.sender.max_capacity(),
-                        "observer: async observer queue is full; deriving this write's entries \
-                         inline on the write path until the observer catches up"
-                    ),
-                    tokio::sync::mpsc::error::TrySendError::Closed(_) => tracing::warn!(
-                        table = %table_id,
-                        "observer: async observer has no drain task (receiver dropped); \
-                         deriving its entries inline on the write path"
-                    ),
+        let mut interested = async_obs
+            .iter()
+            .filter(|state| state.observer.watches_table(table_id));
+        if let Some(first) = interested.next() {
+            // Move an owned payload; a borrowed batch materializes once, not
+            // once per observer. With no watcher, do neither. Every queue then
+            // shares the same rows, cells, key and replay identity.
+            let mutation = Arc::new(make_mutation());
+            for state in std::iter::once(first).chain(interested) {
+                let Err(unsent) = state
+                    .sender
+                    .try_send((table_id.clone(), Arc::clone(&mutation)))
+                else {
+                    continue;
+                };
+                crate::metrics::inc_observer_backpressure();
+                if state.backpressure_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    match &unsent {
+                        tokio::sync::mpsc::error::TrySendError::Full(_) => tracing::warn!(
+                            table = %table_id,
+                            capacity = state.sender.max_capacity(),
+                            "observer: async observer queue is full; deriving this write's entries \
+                             inline on the write path until the observer catches up"
+                        ),
+                        tokio::sync::mpsc::error::TrySendError::Closed(_) => tracing::warn!(
+                            table = %table_id,
+                            "observer: async observer has no drain task (receiver dropped); \
+                             deriving its entries inline on the write path"
+                        ),
+                    }
                 }
+                self.derive_inline_on_write_path(state.observer.as_ref(), table_id, &mutation);
             }
-            self.derive_inline_on_write_path(state.observer.as_ref(), table_id, mutation);
         }
         let (depth, capacity) = observer_queue_gauges(&async_obs, self.async_observer_capacity);
         crate::metrics::set_observer_queue(depth, capacity);
@@ -9894,9 +9909,9 @@ impl StorageEngine {
 
         // 3. Notify observers after successful commit log + memtable write.
         let phase_start = Instant::now();
-        if let Some(mutation) = observer_mutation.as_ref() {
-            self.dispatch_sync_observers(table_id, mutation);
-            self.dispatch_async_observers(table_id, mutation);
+        if let Some(mutation) = observer_mutation {
+            self.dispatch_sync_observers(table_id, &mutation);
+            self.dispatch_async_observers(table_id, || mutation);
         }
         crate::metrics::observe_write_phase(
             crate::metrics::WritePhase::Observers,
@@ -9982,7 +9997,7 @@ impl StorageEngine {
 
             // Notify observers after successful commit log + memtable write.
             self.dispatch_sync_observers(table_id, &mutation);
-            self.dispatch_async_observers(table_id, &mutation);
+            self.dispatch_async_observers(table_id, || mutation);
         }
 
         Ok(())
@@ -10118,7 +10133,7 @@ impl StorageEngine {
         source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
             self.dispatch_sync_observers(&table_id, m);
-            self.dispatch_async_observers(&table_id, m);
+            self.dispatch_async_observers(&table_id, || m.clone());
             Ok(())
         })?;
 
@@ -22743,11 +22758,41 @@ mod tests {
         );
     }
 
+    /// Metrics are process-wide. Other engine tests legitimately publish their
+    /// own queue state, so an exact scrape must run alone in a child process.
+    /// Keep the real renderer and every value assertion; serialize the fixture,
+    /// not the production code or the entire storage suite.
+    fn isolated_observer_metrics_test(name: &str, test: impl FnOnce()) {
+        const CHILD_ENV: &str = "FERROSA_OBSERVER_METRICS_TEST_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            test();
+        } else {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD_ENV, name)
+                .output()
+                .expect("run isolated observer metrics test");
+            assert!(
+                output.status.success(),
+                "isolated {name} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     /// I3 — the event is observable in production: the inline fallback increments
     /// a counter published on the Prometheus surface, so an undersized queue is
     /// visible instead of being inferred from index entries that do not exist.
     #[test]
     fn queue_full_is_observable_backpressure_not_loss() {
+        isolated_observer_metrics_test(
+            "engine::tests::queue_full_is_observable_backpressure_not_loss",
+            queue_full_metrics_case,
+        );
+    }
+
+    fn queue_full_metrics_case() {
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
         let engine = StorageEngine::new(config, None).unwrap();
@@ -22794,6 +22839,13 @@ mod tests {
     /// path starts absorbing index maintenance.
     #[test]
     fn queue_capacity_gauge_is_visible_with_no_observer() {
+        isolated_observer_metrics_test(
+            "engine::tests::queue_capacity_gauge_is_visible_with_no_observer",
+            queue_capacity_metrics_case,
+        );
+    }
+
+    fn queue_capacity_metrics_case() {
         let dir = tempfile::tempdir().unwrap();
         let engine =
             StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
