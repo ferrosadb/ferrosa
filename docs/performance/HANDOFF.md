@@ -41,6 +41,12 @@ Fix, both halves:
 
 Then brief 1 in AUDIT.md (storage data model), then cluster, graph, front ends.
 
+**R-series queued behind C1:** R1 (one externalised, observable tuning struct per crate) is
+the next handoff after C1 — it is the correctness-shaped refactor from the churn/smell scan
+(four tunables carry 10 in one executor and 1000 in another; one config block is copy-pasted
+five times). R2/R3 extract the two functions whose tests keep going red. R4 splits engine.rs,
+last, after the payload work.
+
 ## Decisions already made — do not reopen
 
 - **Keep `tokio::sync::mpsc`.** Do not hand-roll a ring buffer. The two hand-rolled

@@ -248,6 +248,85 @@ drain and assert every edge is traversable, and that the backpressure counter sh
 writer absorbed the cost. Today: N-1 entries dropped silently, no marker, missing adjacency
 entries — and nothing repairs them.
 
+## R-series — refactor worklist (from churn + smell analysis)
+
+Evidence: 90-day churn from `git log`, `frg smell-detect ferrosa-graph/src`, and file sizes.
+Ordering rule: **churn x complexity**, not complexity alone — complexity in a file nobody
+touches is stable even when it is ugly.
+
+| file | commits / 90d | lines |
+|---|---|---|
+| `ferrosa-storage/src/engine.rs` | **161** | **39,323** |
+| `ferrosa-graph/src/executor/expand.rs` | 17 | 10,037 |
+| `ferrosa-graph/src/adjacency/reconcile.rs` | 10 | 1,641 |
+| `ferrosa-graph/src/engine.rs` | 8 | 4,047 |
+
+Highest cognitive complexity in the graph crate:
+
+| function | cognitive | nesting | site |
+|---|---|---|---|
+| `execute_var_length` | 215 | 10 | `varpath.rs:66` |
+| `expand_to_states` | 139 | 7 (CC 42, 371 lines) | `expand.rs:1666` |
+| `pattern_predicate_exists` | 138 | **11** | `expand.rs:912` |
+| `reconcile_once_with` | 122 | 6 | `reconcile.rs:204` |
+| `collect_merge_ops_from_path` | 109 | 5 | `physical.rs:921` |
+| `plan_match` | 104 | 7 | `physical.rs:1420` |
+| `eval_expr` | 90 | 4 (237 lines) | `eval.rs:18` |
+| `execute_optional_hops` | 86 | 6 | `expand.rs:2454` |
+| `infer_schema_aware_merge_shape` | 73 | 5 | `expand.rs:4809` |
+
+**The correlation that justifies the order:** the two tests that went red during the C4 work
+(`negative_multi_hop_pattern_predicate_filters_existing_paths`,
+`optional_match_preserves_rows_and_nulls_missing_pattern`) are the tests **of**
+`pattern_predicate_exists` and `execute_optional_hops` — the #3 and #8 most complex functions
+in the crate. At cognitive 138 with 11 levels of nesting, behaviour is not recoverable by
+reading, so every edit there is a guess. `infer_schema_aware_merge_shape` (73) is the same
+function class that broke three separate fix attempts during the merge-key work (#610).
+
+### R1 — one tuning struct per crate (do first; queued behind C1)
+
+Not merely a refactor: the smell scan shows **the same tunable name carrying 100x different
+values in different files**, and the same five-field config block copy-pasted in five places.
+
+| tunable | `expand.rs` | `varpath.rs` |
+|---|---|---|
+| `max_result_rows` | 10 | **1000** |
+| `max_fan_out_per_hop` | 10 | **1000** |
+| `max_collect_size` | 10 | **1000** |
+| `max_groups` | 100 | **1000** |
+
+Duplicated block (`segment_size`, `local_cache_max_bytes`, `flush_threshold_bytes`,
+`flush_max_age_secs`, `max_pending_replay_mutations_without_schema`):
+`expand.rs:8412`, `varpath.rs:513`, `reconcile.rs:1179`, `http.rs:1481`, `http.rs:1556`,
+`engine.rs:3288`.
+
+A row cap of 10 in one executor and 1000 in another is silent behavioural divergence that no
+test covers, because each site is exercised with its own literal. Fold them into one config
+struct per crate, externalise it (C5), and give each field a usage gauge (C5b).
+
+### R2 — extract the two functions whose tests break
+
+`pattern_predicate_exists` (138, nesting 11) and `execute_optional_hops` (86). Target nesting
+<= 4 by lifting each nesting level into a named predicate or a small step function, so failure
+modes become observable in the code rather than only in a red test.
+
+### R3 — `expand_to_states`
+
+371 lines, CC 42, cognitive 139, and it calls both R2 functions. Do it after R2, otherwise
+the extraction boundaries will be wrong.
+
+### R4 — split `ferrosa-storage/src/engine.rs`
+
+39,323 lines at 161 commits per 90 days. Last, and deliberately after the payload work (T1):
+splitting the file while its hottest type is being reshaped means doing both twice.
+
+### Deliberately not in the series
+
+`execute_var_length` has the highest cognitive score in the crate (215, nesting 10) but only
+5 commits in 90 days. Ugly and stable beats broken and churning for prioritisation; revisit
+after R3 if it becomes a churn hotspot.
+
+
 ## Crate briefs — execute in this order
 
 Each brief is self-contained: scope, invariants, gates, and what is out of scope.
