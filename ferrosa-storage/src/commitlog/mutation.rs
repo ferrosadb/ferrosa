@@ -1331,6 +1331,141 @@ mod tests {
             MutationError::InvalidRebindListPath { len: 8 }
         ));
     }
+
+    // -----------------------------------------------------------------------
+    // Wire-format golden test (T1 P0).
+    //
+    // `Mutation` is persisted to the commit log and replicated to peers, so its
+    // encoding is a compatibility surface: a segment written by an older build
+    // must still replay. Every later refactor of this type has to leave the
+    // bytes identical, and the only way to know is to pin them. The digests
+    // below were captured from the encoder BEFORE any refactor started and must
+    // NEVER be regenerated to turn a red test green — a mismatch means the wire
+    // format moved, which silently breaks replay of existing segments.
+    // -----------------------------------------------------------------------
+
+    /// Timestamp of the golden fixtures: microseconds, well below
+    /// `LEGACY_NS_THRESHOLD`, so decoding does not normalise it.
+    const GOLDEN_TS: i64 = 1_700_000_000_123_456;
+
+    /// The golden fixture: two rows carrying a text cell, an `Int32` cell, an
+    /// expiring cell and a tombstone, plus a non-zero timestamp. Everything but
+    /// `mutation_id` is fixed, so the two fixtures below differ only in the id.
+    fn golden_mutation(mutation_id: [u8; 16]) -> Mutation {
+        Mutation {
+            mutation_id,
+            keyspace: "golden_ks".to_string(),
+            table: "wire_format".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk-golden".to_vec())),
+            rows: vec![
+                Row {
+                    clustering: vec![0, 0, 0, 1],
+                    cells: vec![
+                        (0, CellValue::live(b"hello, wire".to_vec(), GOLDEN_TS)),
+                        (1, CellValue::live(42i32.to_be_bytes().to_vec(), GOLDEN_TS)),
+                        (2, CellValue::tombstone(GOLDEN_TS - 1_000, 1_700_000_000)),
+                    ],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::with_timestamp(GOLDEN_TS),
+                },
+                Row {
+                    clustering: vec![],
+                    cells: vec![
+                        (0, CellValue::live(b"second row".to_vec(), GOLDEN_TS - 1)),
+                        (
+                            3,
+                            CellValue::expiring(
+                                b"ttl".to_vec(),
+                                GOLDEN_TS - 2,
+                                3_600,
+                                1_700_003_600,
+                            ),
+                        ),
+                    ],
+                    deletion: DeletionTime::new(GOLDEN_TS - 500, 1_700_000_001),
+                    primary_key_liveness: LivenessInfo::with_timestamp(GOLDEN_TS - 1),
+                },
+            ],
+            timestamp: GOLDEN_TS,
+        }
+    }
+
+    fn encode(m: &Mutation) -> Vec<u8> {
+        let mut buf = vec![0u8; m.serialized_size()];
+        m.serialize_into(&mut buf);
+        assert_eq!(buf.len(), m.serialized_size(), "size computation");
+        buf
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(bytes))
+    }
+
+    /// The v2 on-disk encoding of a fresh mutation, byte for byte.
+    ///
+    /// Wire layout this pins (see the module docs): `mutation_id:[u8;16] |
+    /// keyspace_len:u16 | keyspace | table_len:u16 | table | key_len:u16 |
+    /// key_bytes | token:i64 | timestamp:i64 | row_count:u16 | rows...`.
+    #[test]
+    fn wire_format_golden_fresh_mutation() {
+        let id: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ];
+        let m = golden_mutation(id);
+        let buf = encode(&m);
+
+        assert_eq!(
+            sha256_hex(&buf),
+            "598ec9756f42befb79892cddb658e6d9c6698ed194d4fe8fdad5e8330d7ea289",
+            "commit-log encoding of a fresh mutation changed — this breaks replay of segments \
+             written by an earlier build. Do not regenerate this digest; restore the encoding."
+        );
+
+        // The id is the first field: exactly 16 bytes, in place, not widened or
+        // moved. Anything else silently changes replay dedup.
+        assert_eq!(&buf[..16], &id, "mutation_id must lead the encoding");
+
+        let back = Mutation::deserialize_from(&buf).expect("golden bytes must decode");
+        assert_mutations_equal(&m, &back);
+        assert_eq!(back.mutation_id, id, "id survives the round trip");
+        assert!(!back.has_legacy_id());
+    }
+
+    /// The same encoding for a mutation carrying the legacy zero id, the
+    /// sentinel that makes replay re-apply rather than deduplicate.
+    #[test]
+    fn wire_format_golden_legacy_zero_id_mutation() {
+        let zero = [0u8; 16];
+        let m = golden_mutation(zero);
+        let buf = encode(&m);
+
+        assert_eq!(
+            sha256_hex(&buf),
+            "c56a455c462081dcb71053e1282023cc1427d77120ac84418b05badf23b9a095",
+            "commit-log encoding of a zero-id (legacy) mutation changed — this breaks replay of \
+             segments written by an earlier build. Do not regenerate this digest."
+        );
+
+        assert_eq!(&buf[..16], &zero, "a zero id is written as 16 zero bytes");
+        let back = Mutation::deserialize_from(&buf).expect("golden bytes must decode");
+        assert_mutations_equal(&m, &back);
+        assert!(back.has_legacy_id(), "the zero-id sentinel must survive");
+
+        // Structural pin: the fixtures are identical except for the id, so the
+        // two encodings may differ in the leading 16 bytes and nowhere else.
+        let fresh = encode(&golden_mutation([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ]));
+        assert_eq!(
+            fresh[16..],
+            buf[16..],
+            "the id must occupy bytes 0..16 and nowhere else"
+        );
+        assert_ne!(fresh[..16], buf[..16]);
+    }
 }
 
 #[cfg(test)]
