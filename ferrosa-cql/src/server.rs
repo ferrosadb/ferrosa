@@ -302,6 +302,13 @@ impl CqlServer {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
+                        // Disable Nagle, as the PostgreSQL front end does: a CQL
+                        // reply is written as several batches (metadata, rows,
+                        // completion), and each small segment otherwise waits for
+                        // the peer's delayed ACK (~40ms) on a real network.
+                        if let Err(error) = stream.set_nodelay(true) {
+                            tracing::debug!(%peer, %error, "could not set TCP_NODELAY on CQL socket");
+                        }
                         let current = active.fetch_add(1, Ordering::Relaxed);
                         if current >= max_connections {
                             active.fetch_sub(1, Ordering::Relaxed);
