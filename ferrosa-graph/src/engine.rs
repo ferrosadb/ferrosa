@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use ferrosa_cluster::write_path::WritePath;
+use ferrosa_schema::auth::permission::{check_permission, Permission, Resource};
 use ferrosa_schema::auth::role::AuthContext;
 use ferrosa_schema::Schema;
 use ferrosa_storage::StorageEngine;
@@ -720,6 +721,13 @@ pub struct GraphEngine {
     /// Use `GraphEngine::new_with_coordinator` to inject a cluster-aware
     /// implementation so all replicas register the adjacency table.
     schema_coordinator: Arc<dyn GraphSchemaCoordinator>,
+    /// Serialises implicit table creation, so two first-writes of the same new
+    /// label submit ONE `CREATE TABLE` between them. The registry tolerates a
+    /// repeated create, but the cluster DDL path would carry a second identical
+    /// `CreateTable` entry to every replica, and a replica that already has the
+    /// table fails its apply. Held only around the creation, never around a
+    /// write.
+    implicit_schema_gate: tokio::sync::Mutex<()>,
     /// Cached at construction so the lazy adjacency-registration path
     /// (`ensure_adjacency_storage_for_keyspace`) can spawn the
     /// reconciliation loop with the configured cadence on first use of
@@ -818,6 +826,7 @@ impl GraphEngine {
             registered_adjacency_keyspaces: Mutex::new(HashSet::new()),
             adjacency_heals: ArcSwap::from_pointee(HashMap::new()),
             schema_coordinator,
+            implicit_schema_gate: tokio::sync::Mutex::new(()),
             reconciliation_interval,
         }
     }
@@ -1167,6 +1176,128 @@ impl GraphEngine {
         collect_to_graph_result(columns, rows, stats, usize::MAX).await
     }
 
+    /// Create the backing tables a write statement implies.
+    ///
+    /// Schema-on-write: `CREATE (n:BenchRow {..})` against a keyspace with no
+    /// `BenchRow` table declares that table first, then the write runs against it
+    /// exactly as if the client had issued the `CREATE TABLE` itself. Reads never
+    /// reach the creation path (`planner::implicit::labels_needing_tables` returns
+    /// nothing for them), so the empty-result behaviour of a `MATCH` on an unknown
+    /// label is untouched.
+    ///
+    /// Fails loud rather than skipping: a write whose table cannot be created must
+    /// not report success, and must not fall through to the executor to be dropped.
+    async fn ensure_write_tables(
+        &self,
+        statement: &Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<()> {
+        if crate::planner::implicit::labels_needing_tables(
+            &self.schema.snapshot(),
+            keyspace,
+            statement,
+        )?
+        .is_empty()
+        {
+            return Ok(());
+        }
+
+        let _gate = self.implicit_schema_gate.lock().await;
+        // Re-derive under the gate: a racing first-write of the same label may have
+        // created these tables while this statement waited, and only the writer that
+        // still sees them missing issues DDL.
+        let snap = self.schema.snapshot();
+        let labels = crate::planner::implicit::labels_needing_tables(&snap, keyspace, statement)?;
+        if labels.is_empty() {
+            return Ok(());
+        }
+        if !snap.keyspaces.contains_key(keyspace) {
+            return Err(GraphError::Validation(format!(
+                "keyspace '{keyspace}' does not exist, so a backing table cannot be created \
+                 for label '{}'",
+                labels[0].label
+            )));
+        }
+        // The table is DDL, so it takes the permission explicit DDL takes. Without
+        // this the write path would hand any writer the keyspace's schema.
+        check_permission(
+            &snap,
+            auth,
+            Permission::Create,
+            &Resource::Keyspace(keyspace.to_string()),
+        )
+        .map_err(|e| {
+            GraphError::PermissionDenied(format!(
+                "this write introduces label(s) {} in keyspace {keyspace}, and creating their \
+                 backing tables requires CREATE on the keyspace: {e}",
+                labels
+                    .iter()
+                    .map(|l| format!("'{}'", l.label))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+        let mut snap = snap;
+        for label in &labels {
+            let table = crate::planner::implicit::table_metadata(&snap, keyspace, label)?;
+            self.create_label_table(table, keyspace, &label.label)
+                .await?;
+            snap = self.schema.snapshot();
+        }
+        Ok(())
+    }
+
+    /// Create one label's backing table through the same schema sink the adjacency
+    /// DDL uses, then register it for storage.
+    ///
+    /// Idempotent: the table may already exist by the time this runs.
+    async fn create_label_table(
+        &self,
+        table: ferrosa_schema::metadata::table::TableMetadata,
+        keyspace: &str,
+        label: &str,
+    ) -> Result<()> {
+        let name = table.name.clone();
+        let key = (keyspace.to_string(), name.clone());
+        if let Some(existing) = self.schema.snapshot().tables.get(&key) {
+            if existing
+                .extensions
+                .get("graph.label")
+                .is_some_and(|existing_label| existing_label.eq_ignore_ascii_case(label))
+            {
+                return Ok(());
+            }
+            // Creating nothing and letting the write proceed would write nowhere:
+            // the label still would not resolve. Name the table in the way.
+            return Err(GraphError::Validation(format!(
+                "cannot create a backing table for label '{label}': {keyspace}.{name} already \
+                 exists and is not the graph table for that label. Rename the existing table, \
+                 or create the graph table with CREATE TABLE {keyspace}.{name} (...) WITH \
+                 extensions = {{'graph.type': ..., 'graph.label': '{label}'}}."
+            )));
+        }
+        // Register with storage BEFORE publishing to the schema. The schema
+        // snapshot is the gate's fast path: a racing writer that sees the table
+        // there skips the gate entirely, so publishing first would let it write
+        // into a table storage has not registered yet ("table not registered").
+        // Registering first makes schema visibility imply readiness; the call is
+        // idempotent, so a retry after a failed DDL is harmless.
+        self.storage
+            .register_table(table.to_storage_schema())
+            .map_err(GraphError::Storage)?;
+        self.schema_coordinator
+            .apply_create_table(table.clone())
+            .await
+            .map_err(|e| {
+                GraphError::Validation(format!(
+                    "failed to create the backing table {keyspace}.{name} for label '{label}': {e}"
+                ))
+            })?;
+        Ok(())
+    }
+
     /// The streaming half of [`GraphEngine::execute_statement`].
     async fn execute_statement_streaming(
         &self,
@@ -1174,6 +1305,11 @@ impl GraphEngine {
         keyspace: &str,
         auth: &AuthContext,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        // Create any table this write implies BEFORE the adjacency setup: that setup
+        // only brings up a keyspace's adjacency index once the keyspace has an edge
+        // table, so a first edge write has to exist first or it derives adjacency
+        // rows into a table that was never registered.
+        self.ensure_write_tables(&statement, keyspace, auth).await?;
         if statement_requires_adjacency(&statement) {
             self.ensure_adjacency_ready(keyspace).await?;
         }
@@ -1370,6 +1506,7 @@ impl GraphEngine {
                         plans.extend(nested.plans);
                     }
                     leaf => {
+                        self.ensure_write_tables(&leaf, keyspace, auth).await?;
                         if statement_requires_adjacency(&leaf) {
                             self.ensure_adjacency_ready(keyspace).await?;
                         }

@@ -1606,12 +1606,13 @@ async fn remove_property_unsets_it() {
     );
 }
 
-/// MERGE with an unknown label must return HTTP 400, not 500 or panic.
+/// MERGE on an unknown label creates it, the way Neo4j does: MERGE is a write and
+/// a label is a write-time concept. What must never happen is a 500 or a panic.
 #[tokio::test]
-async fn merge_missing_endpoint_returns_error() {
+async fn merge_on_an_unknown_label_is_created_not_an_error() {
     let (schema, storage, _dir) = setup();
     create_social_graph_schema(&schema);
-    let app = build_app(schema, storage);
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
 
     let req = json_request(
         "POST",
@@ -1624,8 +1625,27 @@ async fn merge_missing_endpoint_returns_error() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::BAD_REQUEST,
-        "unknown label on MERGE endpoint must return 400, not 500 or panic"
+        StatusCode::OK,
+        "MERGE on an unknown label must create it, not 400/500/panic"
+    );
+
+    // And the same MERGE matches what it wrote rather than creating a second node.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:UnknownLabel) RETURN count(n) AS c",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let rows = response_json(resp).await["rows"].clone();
+    assert_eq!(
+        rows,
+        serde_json::json!([[1]]),
+        "the MERGE-created label must hold exactly one node"
     );
 }
 
@@ -6201,16 +6221,18 @@ async fn http_foreach_creates_one_node_per_list_element() {
 /// clause fails for any element, the whole statement rolls back and no nodes
 /// are created (no partial writes from the earlier, successful elements).
 ///
-/// Here the body targets a label with no backing table (`Ghost`), which fails
-/// validation. The earlier `Person` elements must NOT be persisted.
+/// The failure is forced with an uninferable property (an arithmetic expression
+/// rather than a literal). An unknown label can no longer serve as the failure
+/// vehicle: since schema-on-write a CREATE to an unknown label creates it, which
+/// matches Neo4j, whose FOREACH body may only contain updating clauses.
 #[tokio::test]
 async fn http_foreach_partial_failure_rolls_back() {
     let (schema, storage, _dir) = setup();
     create_social_graph_schema(&schema);
     register_social_tables_with_storage(&storage);
 
-    // The body first creates a VALID Person, then a CREATE against an unknown
-    // label `Ghost`. The Person create would succeed on its own; only the Ghost
+    // The body first creates a VALID Person, then a CREATE whose property cannot
+    // be typed. The Person create would succeed on its own; only the second
     // create fails. Atomicity requires the whole FOREACH to roll back, so NONE of
     // the Person nodes (for any element) may be persisted.
     let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
@@ -6220,7 +6242,7 @@ async fn http_foreach_partial_failure_rolls_back() {
         Some(serde_json::json!({
             "query": "FOREACH (x IN ['Ada', 'Babbage'] | \
                       CREATE (p:Person {name: x}) \
-                      CREATE (g:Ghost {name: x}))",
+                      CREATE (g:Ghost {name: x, rank: x + 1}))",
             "keyspace": "social"
         })),
     );
@@ -6228,7 +6250,7 @@ async fn http_foreach_partial_failure_rolls_back() {
     assert_ne!(
         resp.status(),
         StatusCode::OK,
-        "FOREACH whose body targets a non-existent label must fail loud, not 200"
+        "FOREACH whose body cannot be planned must fail loud, not 200"
     );
 
     // No Person nodes — and critically nothing partially written — should remain.
@@ -6255,8 +6277,14 @@ async fn http_foreach_partial_failure_rolls_back() {
 /// OUTER element writes too. Previously phase 1 skipped nested-FOREACH bodies,
 /// so the outer CREATEs committed before the nested body ever validated — a
 /// partial write survived a failing FOREACH. The whole statement must be planned
-/// (recursively, including nested bodies) before any write, so an unknown label
-/// in the nested body aborts with ZERO outer writes.
+/// (recursively, including nested bodies) before any write, so a validation
+/// failure in the nested body aborts with ZERO outer writes.
+///
+/// The failure is forced with an uninferable property (an arithmetic expression,
+/// not a literal) rather than an unknown label: since schema-on-write, a CREATE
+/// targeting an unknown label legitimately creates it — Neo4j does the same, and
+/// its FOREACH body may only contain updating clauses — so an unknown label is no
+/// longer a way to make planning fail.
 #[tokio::test]
 async fn http_foreach_nested_body_failure_rolls_back_outer() {
     let (schema, storage, _dir) = setup();
@@ -6270,7 +6298,7 @@ async fn http_foreach_nested_body_failure_rolls_back_outer() {
         Some(serde_json::json!({
             "query": "FOREACH (x IN ['Ada', 'Babbage'] | \
                       CREATE (p:Person {name: x}) \
-                      FOREACH (y IN [1] | CREATE (g:Ghost {name: x})))",
+                      FOREACH (y IN [1] | CREATE (g:Ghost {name: x, rank: x + y})))",
             "keyspace": "social"
         })),
     );
@@ -6278,7 +6306,7 @@ async fn http_foreach_nested_body_failure_rolls_back_outer() {
     assert_ne!(
         resp.status(),
         StatusCode::OK,
-        "FOREACH with a nested body targeting an unknown label must fail loud"
+        "FOREACH with a nested body that cannot be planned must fail loud"
     );
 
     // The outer CREATE (Person) must NOT have persisted — the failing nested
