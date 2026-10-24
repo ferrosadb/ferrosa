@@ -56,7 +56,9 @@ x-ferrosa-secure-env: &ferrosa-secure-env
   FERROSA_TLS_REQUIRE: "true"
   # Arrow Flight binds only in `flight`/`full` builds; reachable on the
   # compose network and published on node1 for scripts/flight-tls-probe.sh.
+  # Enabled explicitly: an image may ship it off (CI's ferrosa-test-node does).
   FERROSA_FLIGHT_BIND: "0.0.0.0:8815"
+  FERROSA_FLIGHT_ENABLED: "true"
 
 x-ferrosa-secure-healthcheck: &ferrosa-secure-healthcheck
   test: ["CMD", "curl", "-sf", "--cacert", "/etc/ferrosa/tls/ca.crt", "https://127.0.0.1:9090/readyz"]
