@@ -28,8 +28,8 @@ Branch: `feat/graph-schema-on-write` in worktree `.wt-schema-on-write`, rebased 
 is the same payload model the perf work needs.
 
 Red test: register an async observer with **capacity 1**, do not drain, write N edges, then
-drain and assert **every edge is traversable** — or that the keyspace is marked dirty and
-the reconcile repairs it. Today: N−1 drops, no marker, N−1 untraversable edges.
+drain and assert **every edge is traversable**, plus that the backpressure counter shows the
+writer absorbed the cost. Today: N−1 entries are dropped silently and nothing repairs them.
 
 Fix, both halves:
 1. refcounted payload so `engine.rs:9338` (`mutation.clone()` in `try_send`) is a pointer;
