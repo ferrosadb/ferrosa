@@ -19,6 +19,7 @@ use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::write_path::{PartitionResultStream, WritePath};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+use ferrosa_schema::metadata::table::TableMetadata;
 use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{Mutation, TableId};
@@ -32,6 +33,10 @@ use crate::executor::eval;
 use crate::executor::result::{GraphResult, QueryStats};
 use crate::executor::stream::{
     chain_streams, collect_to_graph_result, dedup_stream, stream_from_rows, RowStream,
+};
+use crate::key::{
+    derive_key, encode_expr_for_column_type, expr_to_bytes, identity_digest, Key, KeyColumn,
+    KeyValue,
 };
 use crate::parser::{
     CompareOp, Direction, Expr, Literal, PatternComprehensionHop, RemoveItem, ReturnClause,
@@ -3325,41 +3330,50 @@ fn build_neighbor_vertex_lookup_shape(
 }
 
 fn build_direct_lookup_shape(
-    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    meta: &TableMetadata,
     bindings: &HashMap<String, serde_json::Value>,
     props: &[(String, Expr)],
     direct_components: &HashMap<String, Vec<u8>>,
 ) -> Result<Option<(DecoratedKey, Vec<u8>)>> {
-    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
-    for column_name in &meta.partition_key {
-        let Some(column) = meta.columns.get(column_name) else {
+    let mut columns = Vec::with_capacity(meta.partition_key.len() + meta.clustering_key.len());
+    let mut components = Vec::with_capacity(columns.capacity());
+    for name in meta
+        .partition_key
+        .iter()
+        .chain(meta.clustering_key.iter().map(|(name, _)| name))
+    {
+        let Some(column) = meta.columns.get(name) else {
             return Ok(None);
         };
         let Some(bytes) = resolve_lookup_component(column, bindings, props, direct_components)?
         else {
             return Ok(None);
         };
-        partition_components.push(bytes);
+        columns.push(KeyColumn {
+            name,
+            column_type: &column.column_type,
+        });
+        components.push(bytes);
     }
 
-    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
-    for (column_name, _) in &meta.clustering_key {
-        let Some(column) = meta.columns.get(column_name) else {
-            return Ok(None);
-        };
-        let Some(bytes) = resolve_lookup_component(column, bindings, props, direct_components)?
-        else {
-            return Ok(None);
-        };
-        clustering_components.push(bytes);
-    }
-
-    Ok(Some((
-        DecoratedKey::new(PartitionKey::new(encode_partition_components(
-            &partition_components,
-        ))),
-        encode_clustering_components(&clustering_components),
-    )))
+    // The bytes are resolved per column above; framing them — and checking each
+    // against the width its declared type stores — is the one derivation's job,
+    // so a lookup cannot build a key the write path would never have written.
+    let values: Vec<KeyValue<'_>> = components
+        .iter()
+        .map(|bytes| KeyValue::Derived(bytes))
+        .collect();
+    let split = meta.partition_key.len();
+    let (partition_columns, clustering_columns) = columns.split_at(split);
+    let (partition_values, clustering_values) = values.split_at(split);
+    let key = derive_key(
+        graph_label(meta),
+        partition_columns,
+        partition_values,
+        clustering_columns,
+        clustering_values,
+    )?;
+    Ok(Some((key.decorated_partition(), key.clustering)))
 }
 
 fn resolve_lookup_component(
@@ -3394,16 +3408,22 @@ fn resolve_lookup_component(
 async fn find_table_row_by_props(
     write_path: &WritePath,
     table_id: &TableId,
-    meta: &ferrosa_schema::metadata::table::TableMetadata,
+    meta: &TableMetadata,
     props: &[(String, Expr)],
     var_name: &str,
 ) -> Result<Option<MatchedTableRow>> {
-    if let Some((key, clustering)) =
-        build_direct_lookup_shape(meta, &HashMap::new(), props, &HashMap::new())?
-    {
-        if let Some(partition) = write_path.read(table_id, &key).await? {
+    // The write path decided this row's key through `merge_entity_key`; the read
+    // decides it through the same function, from the same values, so a MERGE'd
+    // row is addressable by its exact key instead of only by a scan. That shared
+    // call is what keeps write and read from disagreeing about the bytes (issue
+    // #610 was exactly that disagreement).
+    let props_by_name: HashMap<String, Expr> = props.iter().cloned().collect();
+    let digest = identity_digest(props)?;
+    if let Some(key) = merge_entity_key(meta, &props_by_name, None, &digest)? {
+        let partition_key = key.decorated_partition();
+        if let Some(partition) = write_path.read(table_id, &partition_key).await? {
             if let Some(row) = partition.rows.iter().find(|row| {
-                row.clustering == clustering && !crate::adjacency::schema::row_is_deleted(row)
+                row.clustering == key.clustering && !crate::adjacency::schema::row_is_deleted(row)
             }) {
                 let row_json = row_to_json(meta, &partition, row);
                 if prop_map_passes(var_name, props, &row_json)? {
@@ -3416,10 +3436,14 @@ async fn find_table_row_by_props(
             }
         }
 
-        // A complete primary-key shape is terminal: if that exact row is absent
-        // or fails the property predicates, scanning the whole graph table cannot
-        // produce the same identity and can overload live multi-tenant tables.
-        return Ok(None);
+        // A key the statement supplies in full is terminal: if that exact row is
+        // absent or fails the property predicates, scanning the whole graph table
+        // cannot produce the same identity and can overload live multi-tenant
+        // tables. A key generated from content is only a fast path — a CREATEd
+        // row has a minted key — so that one falls through to the scan below.
+        if supplied_all_key_columns(meta, &props_by_name) {
+            return Ok(None);
+        }
     }
 
     // STREAMED with an early return (t_bc5f0e6f). The comment above already
@@ -3449,6 +3473,15 @@ async fn find_table_row_by_props(
         }
     }
     Ok(None)
+}
+
+/// Did the statement supply every declared key column? Only then is a lookup
+/// miss terminal for this table.
+fn supplied_all_key_columns(meta: &TableMetadata, props: &HashMap<String, Expr>) -> bool {
+    meta.partition_key
+        .iter()
+        .chain(meta.clustering_key.iter().map(|(name, _)| name))
+        .all(|name| props.contains_key(name))
 }
 
 fn json_value_to_expr(value: &serde_json::Value) -> Option<Expr> {
@@ -3728,59 +3761,6 @@ async fn hydrate_hop_neighbor(
     }))
 }
 
-/// Convert a `Literal` from the AST into raw bytes for storage.
-fn literal_to_bytes(lit: &Literal) -> Vec<u8> {
-    match lit {
-        Literal::String(s) => s.as_bytes().to_vec(),
-        Literal::Integer(i) => i.to_be_bytes().to_vec(),
-        Literal::Float(f) => f.to_be_bytes().to_vec(),
-        Literal::Bool(b) => vec![if *b { 1 } else { 0 }],
-        Literal::Null => vec![],
-    }
-}
-
-/// Convert an `Expr` to bytes, supporting only `Expr::Literal` for now.
-fn expr_to_bytes(expr: &Expr) -> std::result::Result<Vec<u8>, GraphError> {
-    match expr {
-        Expr::Literal(lit) => Ok(literal_to_bytes(lit)),
-        other => Err(GraphError::Validation(format!(
-            "cannot convert expression to bytes: {other:?}"
-        ))),
-    }
-}
-
-fn expr_to_column_bytes(
-    expr: &Expr,
-    column_type: &str,
-) -> std::result::Result<Vec<u8>, GraphError> {
-    let Expr::Literal(lit) = expr else {
-        return Err(GraphError::Validation(format!(
-            "cannot convert expression to bytes: {expr:?}"
-        )));
-    };
-    let ty = column_type.to_ascii_lowercase();
-    match (lit, ty.as_str()) {
-        // A `uuid` key column stores the 16 raw UUID bytes. This matches both the
-        // synthesized-key path (a vertex CREATEd without an id) and the MERGE
-        // path (`try_encode_expr_for_column_type`), so one logical vertex no
-        // longer gets two different storage keys depending on whether CREATE or
-        // MERGE wrote it — and a relationship whose uuid clustering column
-        // requires 16 raw bytes can address it.
-        (Literal::String(s), ty) if ty == "uuid" || ty.ends_with("uuidtype") => {
-            let uuid = uuid::Uuid::parse_str(s).map_err(|e| {
-                GraphError::Validation(format!("invalid UUID literal '{s}' for {column_type}: {e}"))
-            })?;
-            Ok(uuid.as_bytes().to_vec())
-        }
-        (Literal::String(s), _) => Ok(s.as_bytes().to_vec()),
-        (Literal::Integer(i), "int" | "integer") => Ok((*i as i32).to_be_bytes().to_vec()),
-        (Literal::Integer(i), _) => Ok(i.to_be_bytes().to_vec()),
-        (Literal::Float(f), _) => Ok(f.to_be_bytes().to_vec()),
-        (Literal::Bool(b), _) => Ok(vec![if *b { 1 } else { 0 }]),
-        (Literal::Null, _) => Ok(vec![]),
-    }
-}
-
 /// Encode properties positionally (no table metadata) into cells.
 ///
 /// A non-literal value (map, list, computed expression) is a typed error, never
@@ -3827,7 +3807,12 @@ fn create_row_from_schema(
             .map(|(_, expr)| expr)
     };
 
-    let mut key_components = Vec::new();
+    // The key columns of a CREATE: the statement's values, plus a minted id for
+    // the partition column it leaves out (Neo4j-style CREATE does not require
+    // applications to supply one). The bytes come from the one derivation, so a
+    // CREATE and a MERGE of the same table agree on every column's width.
+    let mut columns = Vec::with_capacity(meta.partition_key.len() + meta.clustering_key.len());
+    let mut values = Vec::with_capacity(columns.capacity());
     for pk_name in &meta.partition_key {
         let column = meta.columns.get(pk_name).ok_or_else(|| {
             GraphError::Validation(format!(
@@ -3835,34 +3820,16 @@ fn create_row_from_schema(
                 meta.keyspace, meta.name
             ))
         })?;
-        let key_bytes = if let Some(expr) = prop(pk_name) {
-            expr_to_column_bytes(expr, &column.column_type)?
-        } else {
-            // Neo4j-style CREATE does not require applications to provide an
-            // id property. For schema-backed Ferrosa vertex tables, synthesize
-            // a primary key using the declared CQL type so the row can still be
-            // materialized without treating the key as a regular property.
-            match column.column_type.as_str() {
-                "text" | "varchar" | "ascii" => uuid::Uuid::new_v4().to_string().into_bytes(),
-                "uuid" => uuid::Uuid::new_v4().as_bytes().to_vec(),
-                other => {
-                    return Err(GraphError::Validation(format!(
-                        "CREATE for label {} requires partition key property {pk_name} for unsupported generated key type {other}",
-                        op.table.label
-                    )))
-                }
-            }
+        let value = match prop(pk_name) {
+            Some(expr) => KeyValue::Value(expr),
+            None => KeyValue::Generated(uuid::Uuid::new_v4()),
         };
-        key_components.push(key_bytes);
+        columns.push(KeyColumn {
+            name: pk_name,
+            column_type: &column.column_type,
+        });
+        values.push(value);
     }
-    let key_bytes = if key_components.len() == 1 {
-        key_components.remove(0)
-    } else {
-        encode_components(&key_components)
-    };
-    let hex_key = hex::encode(&key_bytes);
-
-    let mut clustering_components = Vec::new();
     for (ck_name, _) in &meta.clustering_key {
         let column = meta.columns.get(ck_name).ok_or_else(|| {
             GraphError::Validation(format!(
@@ -3876,15 +3843,21 @@ fn create_row_from_schema(
                 op.table.label
             ))
         })?;
-        clustering_components.push(expr_to_column_bytes(expr, &column.column_type)?);
+        columns.push(KeyColumn {
+            name: ck_name,
+            column_type: &column.column_type,
+        });
+        values.push(KeyValue::Value(expr));
     }
-    let clustering = if clustering_components.is_empty() {
-        vec![]
-    } else if clustering_components.len() == 1 {
-        clustering_components.remove(0)
-    } else {
-        encode_components(&clustering_components)
-    };
+    let split = meta.partition_key.len();
+    let key = derive_key(
+        graph_label(meta),
+        &columns[..split],
+        &values[..split],
+        &columns[split..],
+        &values[split..],
+    )?;
+    let hex_key = hex::encode(&key.partition);
 
     let property_exprs = op
         .props
@@ -3894,24 +3867,15 @@ fn create_row_from_schema(
     let cells = encode_storage_ordered_cells(meta, &property_exprs, timestamp)?;
 
     Ok((
-        DecoratedKey::new(PartitionKey::new(key_bytes)),
+        key.decorated_partition(),
         Row {
-            clustering,
+            clustering: key.clustering,
             cells,
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
         },
         hex_key,
     ))
-}
-
-fn encode_components(components: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for component in components {
-        out.extend_from_slice(&(component.len() as u16).to_be_bytes());
-        out.extend_from_slice(component);
-    }
-    out
 }
 
 /// Generate a current timestamp in microseconds since epoch.
@@ -4003,31 +3967,6 @@ async fn execute_create(
     })
 }
 
-/// Derive a deterministic content-addressed partition key from match-property bytes.
-///
-/// Properties are sorted by key name to ensure two callers with the same logical
-/// match properties always arrive at the same bytes regardless of insertion order.
-/// This is the R1 mitigation: concurrent MERGE calls with identical match-props
-/// will hash to the same partition key, so at-most-once write semantics hold
-/// even without row-level locks (last-write-wins on the same key is idempotent).
-///
-/// Key layout: `blake3(key_name_0 || NUL || value_bytes_0 || NUL || key_name_1 || ...)`
-/// sorted by `key_name`.
-fn content_addressed_key(match_props: &[(String, Expr)]) -> Result<Vec<u8>> {
-    let mut sorted: Vec<&(String, Expr)> = match_props.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-
-    let mut hasher = blake3::Hasher::new();
-    for (name, expr) in &sorted {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\x00");
-        let val_bytes = expr_to_bytes(expr)?;
-        hasher.update(&val_bytes);
-        hasher.update(b"\x00");
-    }
-    Ok(hasher.finalize().as_bytes().to_vec())
-}
-
 fn graph_write_consistency() -> ConsistencyLevel {
     ConsistencyLevel::Quorum
 }
@@ -4106,53 +4045,35 @@ async fn execute_merge(
         }
 
         // An edge's storage key IS its endpoints' keys: the partition is the
-        // source vertex's key and the clustering is the destination vertex's key
+        // source vertex's key and the clustering the destination vertex's key
         // (see `execute_delete`, which reconstructs the edge key exactly this
         // way, and the hop read path). A MATCH-selected endpoint is not a
         // property expression — its own MergeOp above already resolved its real
-        // storage key by reading it — so thread those raw key BYTES here instead
-        // of hashing the endpoint's match properties. `content_addressed_key`
-        // yields a 32-byte blake3 digest, which a 16-byte uuid clustering column
-        // rejects with `expects 16 raw bytes but row provided 32`. Raw bytes also
-        // keep every other key type (text, bigint, composite) byte-faithful,
-        // where re-parsing a projected `_id` hex string would not.
+        // storage key by reading it — so thread those key BYTES through the same
+        // derivation instead of hashing the endpoint's match properties. The
+        // derivation keeps them byte-faithful and rejects a width the declared
+        // endpoint column cannot store, which is where the 32-vs-16 divergence of
+        // issue #610 used to surface as an edge nobody could traverse.
         //
-        // Only the schemaless fallback is rebound: when the schema-aware path
-        // already derived the key columns (a scalar edge shape, or a composite
+        // Only the fallback is rebound: when the schema-aware path already
+        // derived the key columns (a scalar edge shape, or a composite
         // relationship table with more than one key component) it owns the
-        // shape, and the raw source/target key bytes here would truncate a
-        // composite key. The single-component check below is the exact shape the
-        // read/DELETE paths reconstruct: graph.source is the sole partition
-        // column and graph.target the sole clustering column.
+        // shape, and two raw endpoint keys would drop the other components. The
+        // single-component check is the exact shape the read and DELETE paths
+        // reconstruct: graph.source is the sole partition column and graph.target
+        // the sole clustering column.
         if op.table.graph_type == "edge" && !shape.used_schema_layout {
-            let single_component_key = schema
-                .and_then(|schema_ref| {
-                    table_metadata_for(Some(schema_ref), &op.table.keyspace, &op.table.table)
-                })
-                .is_some_and(|meta| {
-                    let src_is_partition = meta.extensions.get("graph.source").is_some_and(|src| {
-                        meta.partition_key.len() == 1 && meta.partition_key[0] == *src
-                    });
-                    let dst_is_clustering =
-                        meta.extensions.get("graph.target").is_some_and(|dst| {
-                            meta.clustering_key.len() == 1 && meta.clustering_key[0].0 == *dst
-                        });
-                    src_is_partition && dst_is_clustering
-                });
-            if single_component_key {
-                let src_key = op
-                    .src_var
-                    .as_ref()
-                    .and_then(|var| var_keys.get(var))
-                    .map(|(_, key, _, _)| key.key.as_bytes().to_vec());
-                let dst_key = op
-                    .dst_var
-                    .as_ref()
-                    .and_then(|var| var_keys.get(var))
-                    .map(|(_, key, _, _)| key.key.as_bytes().to_vec());
-                if let (Some(src_bytes), Some(dst_bytes)) = (src_key, dst_key) {
-                    shape.key = DecoratedKey::new(PartitionKey::new(src_bytes));
-                    shape.clustering = dst_bytes;
+            if let Some(meta) = table_metadata_for(schema, &op.table.keyspace, &op.table.table) {
+                if let Some((source, target)) = single_component_endpoint_keys(op, &meta, &var_keys)
+                {
+                    let digest = identity_digest(&op.match_props)?;
+                    let props = merge_property_exprs(op, &op_set_props);
+                    if let Some(key) =
+                        merge_entity_key(&meta, &props, Some((source, target)), &digest)?
+                    {
+                        shape.key = key.decorated_partition();
+                        shape.clustering = key.clustering;
+                    }
                 }
             }
         }
@@ -4593,6 +4514,169 @@ fn is_transient_replica_lag(e: &ferrosa_common::Error) -> bool {
     msg.contains("cluster: write timeout") || msg.contains("table not registered")
 }
 
+/// The properties a MERGE writes as cells: the pattern's match and create
+/// properties plus the SET clause's, by name.
+fn merge_property_exprs(op: &MergeOp, set_props: &[(String, Expr)]) -> HashMap<String, Expr> {
+    op.match_props
+        .iter()
+        .chain(op.create_props.iter())
+        .chain(set_props.iter())
+        .map(|(name, expr)| (name.clone(), expr.clone()))
+        .collect()
+}
+
+/// Where an edge's endpoint key columns come from when the statement does not
+/// spell them out: the endpoint pattern's identifying literal, if it has one.
+///
+/// This is only a fallback for the case where the endpoint's own storage key is
+/// not available (see [`merge_entity_key`]); when it is, it wins.
+fn fill_endpoint_props(op: &MergeOp, meta: &TableMetadata, props: &mut HashMap<String, Expr>) {
+    if op.table.graph_type != "edge" {
+        return;
+    }
+    for (extension, endpoint_props) in [
+        ("graph.source", op.src_match_props.as_deref()),
+        ("graph.target", op.dst_match_props.as_deref()),
+    ] {
+        let Some(column) = meta.extensions.get(extension) else {
+            continue;
+        };
+        if props.contains_key(column) {
+            continue;
+        }
+        let Some(column_type) = meta.columns.get(column).map(|c| c.column_type.as_str()) else {
+            continue;
+        };
+        if let Some(expr) = resolve_endpoint_property_expr(endpoint_props, column, column_type) {
+            props.insert(column.clone(), expr);
+        }
+    }
+}
+
+/// Which key column this is, for an edge row.
+enum KeyColumnRole<'a> {
+    /// The entity's own key column: its value comes from the properties, or is
+    /// generated from the entity's content.
+    Own,
+    /// An endpoint column: its value IS the endpoint vertex's storage key.
+    /// `key` is `None` when that key is not known at this point.
+    Endpoint { key: Option<&'a [u8]> },
+}
+
+/// One key column's value, or `None` when this table's key cannot be derived
+/// from what the statement says.
+fn key_value_for<'a>(
+    role: KeyColumnRole<'a>,
+    name: &str,
+    props: &'a HashMap<String, Expr>,
+    digest: &'a [u8; 32],
+    key_column_count: usize,
+) -> Option<KeyValue<'a>> {
+    match role {
+        // An endpoint column stores the endpoint's storage key when this path
+        // has it, and the endpoint's own property value when it does not (the
+        // write path derives from the statement; only the rebind has key
+        // bytes). Both are the same component: the vertex's key column.
+        KeyColumnRole::Endpoint { key } => match key {
+            Some(key) => Some(KeyValue::Derived(key)),
+            None => props.get(name).map(KeyValue::Value),
+        },
+        KeyColumnRole::Own => match props.get(name) {
+            Some(expr) => Some(KeyValue::Value(expr)),
+            // A single declared key column with nothing supplied is the entity's
+            // own generated key: its identity is the content digest, cut to the
+            // column's declared width (a uuid key column keeps 16 bytes, which
+            // is what a 16-byte endpoint column can address — issue #610).
+            None if key_column_count == 1 => Some(KeyValue::Content(digest)),
+            None => None,
+        },
+    }
+}
+
+fn key_column_role<'a>(
+    name: &str,
+    source_column: Option<&str>,
+    target_column: Option<&str>,
+    endpoints: Option<(&'a [u8], &'a [u8])>,
+) -> KeyColumnRole<'a> {
+    if Some(name) == source_column {
+        KeyColumnRole::Endpoint {
+            key: endpoints.map(|(source, _)| source),
+        }
+    } else if Some(name) == target_column {
+        KeyColumnRole::Endpoint {
+            key: endpoints.map(|(_, target)| target),
+        }
+    } else {
+        KeyColumnRole::Own
+    }
+}
+
+fn graph_label(meta: &TableMetadata) -> &str {
+    meta.extensions
+        .get("graph.label")
+        .map(String::as_str)
+        .unwrap_or(&meta.name)
+}
+
+/// The key of the entity one `MergeOp` writes.
+///
+/// THE derivation. A vertex's key columns come from its properties, with a
+/// single unsupplied key column taking the entity's content identity. An edge's
+/// storage key IS its endpoints' keys — the hop read path, `execute_delete` and
+/// the adjacency observer all reconstruct it that way — so its endpoint columns
+/// take the endpoints' key bytes byte-for-byte, and any other declared key
+/// column (a scoped `tenant_id`, say) comes from the properties.
+///
+/// `endpoints` is `None` when the endpoints' keys are not known here; the
+/// endpoint columns then fall back to their property values.
+///
+/// `None` means this table's key cannot be built from what the statement says,
+/// and the caller uses the content-addressed fallback (the only shape left when
+/// a declared key column has neither a value nor an endpoint to inherit from).
+fn merge_entity_key(
+    meta: &TableMetadata,
+    props: &HashMap<String, Expr>,
+    endpoints: Option<(&[u8], &[u8])>,
+    digest: &[u8; 32],
+) -> Result<Option<Key>> {
+    let source_column = meta.extensions.get("graph.source").map(String::as_str);
+    let target_column = meta.extensions.get("graph.target").map(String::as_str);
+    let key_column_count = meta.partition_key.len() + meta.clustering_key.len();
+
+    let mut columns = Vec::with_capacity(key_column_count);
+    let mut values = Vec::with_capacity(key_column_count);
+    for name in meta
+        .partition_key
+        .iter()
+        .chain(meta.clustering_key.iter().map(|(name, _)| name))
+    {
+        let Some(column) = meta.columns.get(name) else {
+            return Ok(None);
+        };
+        let role = key_column_role(name, source_column, target_column, endpoints);
+        let Some(value) = key_value_for(role, name, props, digest, key_column_count) else {
+            return Ok(None);
+        };
+        columns.push(KeyColumn {
+            name,
+            column_type: &column.column_type,
+        });
+        values.push(value);
+    }
+
+    let split = meta.partition_key.len();
+    let (partition_columns, clustering_columns) = columns.split_at(split);
+    let (partition_values, clustering_values) = values.split_at(split);
+    Ok(Some(derive_key(
+        graph_label(meta),
+        partition_columns,
+        partition_values,
+        clustering_columns,
+        clustering_values,
+    )?))
+}
+
 fn build_merge_write_shape(
     op: &MergeOp,
     set_props: &[(String, Expr)],
@@ -4603,87 +4687,26 @@ fn build_merge_write_shape(
         return Ok(shape);
     }
 
-    let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
-        match &op.src_match_props {
-            Some(src_props) => content_addressed_key(src_props)?,
-            None => {
-                tracing::error!(
-                    file = file!(),
-                    line = line!(),
-                    table = %op.table.table,
-                    graph_type = %op.table.graph_type,
-                    "execute_merge: edge MergeOp has no src_match_props — \
-                     cannot derive partition key for adjacency index. \
-                     The planner did not thread the source node's props \
-                     into this MergeOp. This is a planner bug."
-                );
-                return Err(crate::error::GraphError::Validation(format!(
-                    "execute_merge: edge MergeOp for table '{}' has no \
-                     src_match_props; cannot derive partition key \
-                     (file: {}, line: {})",
-                    op.table.table,
-                    file!(),
-                    line!()
-                )));
-            }
-        }
+    // No declared key could be built: the key IS the content digest. That is the
+    // shape of an undeclared (schemaless) table, and the one case with no key
+    // columns to derive from.
+    let (key_bytes, clustering) = if op.table.graph_type == "edge" {
+        (
+            identity_digest(edge_endpoint_props(op, Endpoint::Source)?)?.to_vec(),
+            identity_digest(edge_endpoint_props(op, Endpoint::Destination)?)?.to_vec(),
+        )
     } else {
-        content_addressed_key(&op.match_props)?
+        (identity_digest(&op.match_props)?.to_vec(), Vec::new())
     };
 
-    let clustering: Vec<u8> = if op.table.graph_type == "edge" {
-        match &op.dst_match_props {
-            Some(dst_props) => content_addressed_key(dst_props)?,
-            None => {
-                tracing::error!(
-                    file = file!(),
-                    line = line!(),
-                    table = %op.table.table,
-                    graph_type = %op.table.graph_type,
-                    "execute_merge: edge MergeOp has no dst_match_props — \
-                     cannot derive clustering key for adjacency index. \
-                     The planner did not thread the destination node's props \
-                     into this MergeOp. This is a planner bug."
-                );
-                return Err(crate::error::GraphError::Validation(format!(
-                    "execute_merge: edge MergeOp for table '{}' has no \
-                     dst_match_props; cannot derive clustering key \
-                     (file: {}, line: {})",
-                    op.table.table,
-                    file!(),
-                    line!()
-                )));
-            }
+    let create_cells = match table_metadata_for(schema, &op.table.keyspace, &op.table.table) {
+        Some(meta) => {
+            encode_storage_ordered_cells(&meta, &merge_property_exprs(op, set_props), timestamp)?
         }
-    } else {
-        vec![]
-    };
-
-    let create_cells: Vec<(u16, CellValue)> = if let Some(schema) = schema {
-        let snap = schema.snapshot();
-        if let Some(meta) = snap
-            .tables
-            .get(&(op.table.keyspace.clone(), op.table.table.clone()))
-        {
-            let property_exprs: HashMap<String, Expr> = op
-                .match_props
-                .iter()
-                .chain(op.create_props.iter())
-                .chain(set_props.iter())
-                .map(|(name, expr)| (name.clone(), expr.clone()))
-                .collect();
-            encode_storage_ordered_cells(meta, &property_exprs, timestamp)?
-        } else {
-            schemaless_cells(
-                op.match_props.iter().chain(op.create_props.iter()),
-                timestamp,
-            )?
-        }
-    } else {
-        schemaless_cells(
+        None => schemaless_cells(
             op.match_props.iter().chain(op.create_props.iter()),
             timestamp,
-        )?
+        )?,
     };
 
     Ok(MergeWriteShape {
@@ -4691,6 +4714,56 @@ fn build_merge_write_shape(
         clustering,
         create_cells,
         used_schema_layout: false,
+    })
+}
+
+/// Which end of a relationship an endpoint is.
+#[derive(Debug, Clone, Copy)]
+enum Endpoint {
+    Source,
+    Destination,
+}
+
+impl Endpoint {
+    fn label_extension(self) -> &'static str {
+        match self {
+            Endpoint::Source => "graph.source_label",
+            Endpoint::Destination => "graph.target_label",
+        }
+    }
+}
+
+/// The endpoint match properties an edge MERGE must carry to derive its key.
+///
+/// The planner threads these through from the endpoint pattern; their absence is
+/// a planner bug, so it is reported as one instead of being hashed into an empty
+/// key.
+fn edge_endpoint_props<'a>(op: &'a MergeOp, endpoint: Endpoint) -> Result<&'a [(String, Expr)]> {
+    let (props, which) = match endpoint {
+        Endpoint::Source => (op.src_match_props.as_deref(), "source"),
+        Endpoint::Destination => (op.dst_match_props.as_deref(), "destination"),
+    };
+    props.ok_or_else(|| {
+        tracing::error!(
+            file = file!(),
+            line = line!(),
+            table = %op.table.table,
+            element = op.display_name.as_deref().unwrap_or("-"),
+            "execute_merge: edge MergeOp has no {which} match props — the planner did not \
+             thread the endpoint's properties into this MergeOp"
+        );
+        GraphError::Validation(format!(
+            "execute_merge: edge MergeOp for table '{}' has no {which} match properties; \
+             cannot derive its {} key (file: {}, line: {})",
+            op.table.table,
+            if matches!(endpoint, Endpoint::Source) {
+                "partition"
+            } else {
+                "clustering"
+            },
+            file!(),
+            line!()
+        ))
     })
 }
 
@@ -4704,108 +4777,44 @@ fn merge_can_bind_schema_key_only_vertex_without_read(
         && !shape.clustering.is_empty()
 }
 
+/// The write shape of a schema-backed table: the key, the declared layout's
+/// clustering, and the cells to write. `None` when the table is not in the
+/// schema, or its key cannot be built yet (see the read-side
+/// [`infer_schema_aware_merge_shape`]).
 fn build_schema_aware_merge_shape(
     op: &MergeOp,
     set_props: &[(String, Expr)],
     schema: Option<&Schema>,
     timestamp: i64,
 ) -> Result<Option<MergeWriteShape>> {
-    let Some(schema) = schema else {
+    let Some(meta) = table_metadata_for(schema, &op.table.keyspace, &op.table.table) else {
         return Ok(None);
     };
-    let snap = schema.snapshot();
-    let Some(meta) = snap
-        .tables
-        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
-    else {
+    let mut props = merge_property_exprs(op, set_props);
+    fill_endpoint_props(op, &meta, &mut props);
+    // A key column the statement does not supply is not this builder's to
+    // invent: what the entity's key should be is only answerable by looking for
+    // a stored row first (`infer_schema_aware_merge_shape`), because the entity
+    // may already exist — bound by the statement's own MATCH, or merged under a
+    // generated key on an earlier run. Claiming a content key here would write a
+    // second row for an entity that already has one.
+    if !supplied_all_key_columns(&meta, &props) {
+        return Ok(None);
+    }
+    let digest = identity_digest(&op.match_props)?;
+    let Some(key) = merge_entity_key(&meta, &props, None, &digest)? else {
         return Ok(None);
     };
-
-    let mut property_exprs: HashMap<String, Expr> = HashMap::new();
-    for (name, expr) in op.match_props.iter().chain(op.create_props.iter()) {
-        property_exprs.insert(name.clone(), expr.clone());
-    }
-    for (name, expr) in set_props {
-        property_exprs.insert(name.clone(), expr.clone());
-    }
-
-    if op.table.graph_type == "edge" {
-        if let Some(source_col) = meta.extensions.get("graph.source") {
-            if !property_exprs.contains_key(source_col) {
-                if let Some(source_type) = meta
-                    .columns
-                    .get(source_col)
-                    .map(|col| col.column_type.as_str())
-                {
-                    if let Some(expr) = resolve_endpoint_property_expr(
-                        op.src_match_props.as_deref(),
-                        source_col,
-                        source_type,
-                    ) {
-                        property_exprs.insert(source_col.clone(), expr);
-                    }
-                }
-            }
-        }
-        if let Some(target_col) = meta.extensions.get("graph.target") {
-            if !property_exprs.contains_key(target_col) {
-                if let Some(target_type) = meta
-                    .columns
-                    .get(target_col)
-                    .map(|col| col.column_type.as_str())
-                {
-                    if let Some(expr) = resolve_endpoint_property_expr(
-                        op.dst_match_props.as_deref(),
-                        target_col,
-                        target_type,
-                    ) {
-                        property_exprs.insert(target_col.clone(), expr);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
-    for pk_name in &meta.partition_key {
-        let Some(expr) = property_exprs.get(pk_name) else {
-            return Ok(None);
-        };
-        let Some(column) = meta.columns.get(pk_name) else {
-            return Ok(None);
-        };
-        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
-            return Ok(None);
-        };
-        partition_components.push(bytes);
-    }
-
-    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
-    for (ck_name, _) in &meta.clustering_key {
-        let Some(expr) = property_exprs.get(ck_name) else {
-            return Ok(None);
-        };
-        let Some(column) = meta.columns.get(ck_name) else {
-            return Ok(None);
-        };
-        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
-            return Ok(None);
-        };
-        clustering_components.push(bytes);
-    }
-
-    let partition_key = encode_partition_components(&partition_components);
-    let clustering = encode_clustering_components(&clustering_components);
-    let create_cells = encode_storage_ordered_cells(meta, &property_exprs, timestamp)?;
-
     Ok(Some(MergeWriteShape {
-        key: DecoratedKey::new(PartitionKey::new(partition_key)),
-        clustering,
-        create_cells,
+        key: key.decorated_partition(),
+        clustering: key.clustering,
+        create_cells: encode_storage_ordered_cells(&meta, &props, timestamp)?,
         used_schema_layout: true,
     }))
 }
 
+/// The read half of the write shape: the key columns the statement leaves out,
+/// taken from the rows its endpoints (or the vertex itself) already resolved.
 async fn infer_schema_aware_merge_shape(
     write_path: &WritePath,
     op: &MergeOp,
@@ -4814,144 +4823,29 @@ async fn infer_schema_aware_merge_shape(
     timestamp: i64,
     bound_rows: &HashMap<String, serde_json::Value>,
 ) -> Result<Option<MergeWriteShape>> {
-    let snap = schema.snapshot();
-    let Some(meta) = snap
-        .tables
-        .get(&(op.table.keyspace.clone(), op.table.table.clone()))
-        .cloned()
-    else {
+    let Some(meta) = table_metadata_for(Some(schema), &op.table.keyspace, &op.table.table) else {
         return Ok(None);
     };
-
-    let mut property_exprs: HashMap<String, Expr> = HashMap::new();
-    for (name, expr) in op.match_props.iter().chain(op.create_props.iter()) {
-        property_exprs.insert(name.clone(), expr.clone());
-    }
-    for (name, expr) in set_props {
-        property_exprs.insert(name.clone(), expr.clone());
-    }
+    let mut props = merge_property_exprs(op, set_props);
+    fill_endpoint_props(op, &meta, &mut props);
 
     if op.table.graph_type == "edge" {
-        if let Some(source_col) = meta.extensions.get("graph.source") {
-            if !property_exprs.contains_key(source_col) {
-                if let Some(source_type) = meta
-                    .columns
-                    .get(source_col)
-                    .map(|col| col.column_type.as_str())
-                {
-                    if let Some(expr) = resolve_endpoint_property_expr(
-                        op.src_match_props.as_deref(),
-                        source_col,
-                        source_type,
-                    ) {
-                        property_exprs.insert(source_col.clone(), expr);
-                    }
-                }
-            }
-        }
-        if let Some(target_col) = meta.extensions.get("graph.target") {
-            if !property_exprs.contains_key(target_col) {
-                if let Some(target_type) = meta
-                    .columns
-                    .get(target_col)
-                    .map(|col| col.column_type.as_str())
-                {
-                    if let Some(expr) = resolve_endpoint_property_expr(
-                        op.dst_match_props.as_deref(),
-                        target_col,
-                        target_type,
-                    ) {
-                        property_exprs.insert(target_col.clone(), expr);
-                    }
-                }
-            }
-        }
-
-        let mut source_json = if let Some(var_name) = op.src_var.as_ref() {
-            bound_rows.get(var_name).cloned()
-        } else {
-            None
-        };
-        if source_json.is_none() {
-            if let (Some(source_label), Some(source_props)) = (
-                meta.extensions.get("graph.source_label"),
-                op.src_match_props.as_deref(),
-            ) {
-                if let Some(source_meta) =
-                    resolve_table_by_graph_label(schema, &op.table.keyspace, source_label)
-                {
-                    let source_tid = TableId::new(&source_meta.keyspace, &source_meta.name);
-                    source_json = find_table_row_by_props(
-                        write_path,
-                        &source_tid,
-                        &source_meta,
-                        source_props,
-                        "src",
-                    )
-                    .await
-                    .map(|row| row.map(|row| row.json))?;
-                }
-            }
-        }
-        let mut target_json = if let Some(var_name) = op.dst_var.as_ref() {
-            bound_rows.get(var_name).cloned()
-        } else {
-            None
-        };
-        if target_json.is_none() {
-            if let (Some(target_label), Some(target_props)) = (
-                meta.extensions.get("graph.target_label"),
-                op.dst_match_props.as_deref(),
-            ) {
-                if let Some(target_meta) =
-                    resolve_table_by_graph_label(schema, &op.table.keyspace, target_label)
-                {
-                    let target_tid = TableId::new(&target_meta.keyspace, &target_meta.name);
-                    target_json = find_table_row_by_props(
-                        write_path,
-                        &target_tid,
-                        &target_meta,
-                        target_props,
-                        "dst",
-                    )
-                    .await
-                    .map(|row| row.map(|row| row.json))?;
-                }
-            }
-        }
-
-        for key_name in meta
-            .partition_key
-            .iter()
-            .chain(meta.clustering_key.iter().map(|(name, _)| name))
-        {
-            if property_exprs.contains_key(key_name) {
-                continue;
-            }
-
-            let source_value = source_json
-                .as_ref()
-                .and_then(|row| row.get(key_name))
-                .and_then(json_value_to_expr);
-            let target_value = target_json
-                .as_ref()
-                .and_then(|row| row.get(key_name))
-                .and_then(json_value_to_expr);
-
-            let inferred = match (source_value, target_value) {
-                (Some(src), Some(dst)) if src == dst => Some(src),
-                (Some(src), None) => Some(src),
-                (None, Some(dst)) => Some(dst),
-                _ => None,
-            };
-            if let Some(expr) = inferred {
-                property_exprs.insert(key_name.clone(), expr);
-            }
-        }
+        infer_edge_key_columns_from_endpoints(
+            write_path, op, schema, &meta, &mut props, bound_rows,
+        )
+        .await?;
     } else {
-        let table_tid = TableId::new(&meta.keyspace, &meta.name);
-        if let Some(existing) =
-            find_table_row_by_props(write_path, &table_tid, &meta, &op.match_props, "n").await?
+        // A vertex whose key the statement leaves incomplete is one the MERGE
+        // matched rather than created, so its stored key is the answer.
+        let table_id = TableId::new(&meta.keyspace, &meta.name);
+        if let Some(existing) = find_table_row_by_props(
+            write_path,
+            &table_id,
+            &meta,
+            &op.match_props,
+            op.display_name.as_deref().unwrap_or("n"),
+        )
+        .await?
         {
             return Ok(Some(MergeWriteShape {
                 key: existing.key,
@@ -4962,44 +4856,137 @@ async fn infer_schema_aware_merge_shape(
         }
     }
 
-    let mut partition_components = Vec::with_capacity(meta.partition_key.len());
-    for pk_name in &meta.partition_key {
-        let Some(expr) = property_exprs.get(pk_name) else {
-            return Ok(None);
-        };
-        let Some(column) = meta.columns.get(pk_name) else {
-            return Ok(None);
-        };
-        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
-            return Ok(None);
-        };
-        partition_components.push(bytes);
-    }
-
-    let mut clustering_components = Vec::with_capacity(meta.clustering_key.len());
-    for (ck_name, _) in &meta.clustering_key {
-        let Some(expr) = property_exprs.get(ck_name) else {
-            return Ok(None);
-        };
-        let Some(column) = meta.columns.get(ck_name) else {
-            return Ok(None);
-        };
-        let Ok(bytes) = try_encode_expr_for_column_type(expr, &column.column_type) else {
-            return Ok(None);
-        };
-        clustering_components.push(bytes);
-    }
-
-    let partition_key = encode_partition_components(&partition_components);
-    let clustering = encode_clustering_components(&clustering_components);
-    let create_cells = encode_storage_ordered_cells(&meta, &property_exprs, timestamp)?;
-
+    let digest = identity_digest(&op.match_props)?;
+    let Some(key) = merge_entity_key(&meta, &props, None, &digest)? else {
+        return Ok(None);
+    };
     Ok(Some(MergeWriteShape {
-        key: DecoratedKey::new(PartitionKey::new(partition_key)),
-        clustering,
-        create_cells,
+        key: key.decorated_partition(),
+        clustering: key.clustering,
+        create_cells: encode_storage_ordered_cells(&meta, &props, timestamp)?,
         used_schema_layout: true,
     }))
+}
+
+/// Take the key columns the edge statement leaves out from the rows its
+/// endpoints resolved.
+///
+/// One question: where do a scoped edge table's non-endpoint key columns come
+/// from? From the vertex rows the endpoints already bound (or, when the endpoint
+/// pattern's properties select a stored vertex, from that row).
+async fn infer_edge_key_columns_from_endpoints(
+    write_path: &WritePath,
+    op: &MergeOp,
+    schema: &Schema,
+    meta: &TableMetadata,
+    props: &mut HashMap<String, Expr>,
+    bound_rows: &HashMap<String, serde_json::Value>,
+) -> Result<()> {
+    let source_row =
+        endpoint_row(write_path, op, schema, meta, Endpoint::Source, bound_rows).await?;
+    let target_row = endpoint_row(
+        write_path,
+        op,
+        schema,
+        meta,
+        Endpoint::Destination,
+        bound_rows,
+    )
+    .await?;
+
+    for key_name in meta
+        .partition_key
+        .iter()
+        .chain(meta.clustering_key.iter().map(|(name, _)| name))
+    {
+        if props.contains_key(key_name) {
+            continue;
+        }
+        let source_value = source_row
+            .as_ref()
+            .and_then(|row| row.get(key_name))
+            .and_then(json_value_to_expr);
+        let target_value = target_row
+            .as_ref()
+            .and_then(|row| row.get(key_name))
+            .and_then(json_value_to_expr);
+
+        let inferred = match (source_value, target_value) {
+            (Some(src), Some(dst)) if src == dst => Some(src),
+            (Some(src), None) => Some(src),
+            (None, Some(dst)) => Some(dst),
+            _ => None,
+        };
+        if let Some(expr) = inferred {
+            props.insert(key_name.clone(), expr);
+        }
+    }
+    Ok(())
+}
+
+/// The endpoints' keys for an edge whose declared layout is exactly one partition
+/// column (the source) and one clustering column (the target) — the shape the
+/// read and DELETE paths reconstruct, so the one shape a raw-key rebind may take.
+/// `None` when the layout is anything else, or either endpoint's key is unbound.
+fn single_component_endpoint_keys<'a>(
+    op: &MergeOp,
+    meta: &TableMetadata,
+    var_keys: &'a HashMap<String, (TableId, DecoratedKey, Vec<u8>, bool)>,
+) -> Option<(&'a [u8], &'a [u8])> {
+    let source_column = meta.extensions.get("graph.source")?;
+    let target_column = meta.extensions.get("graph.target")?;
+    let source_is_partition =
+        meta.partition_key.len() == 1 && meta.partition_key[0] == *source_column;
+    let target_is_clustering =
+        meta.clustering_key.len() == 1 && meta.clustering_key[0].0 == *target_column;
+    if !(source_is_partition && target_is_clustering) {
+        return None;
+    }
+    let source = op.src_var.as_ref().and_then(|var| var_keys.get(var))?;
+    let target = op.dst_var.as_ref().and_then(|var| var_keys.get(var))?;
+    Some((source.1.key.as_bytes(), target.1.key.as_bytes()))
+}
+
+/// The row an edge MERGE's endpoint already resolved: the one the endpoint's own
+/// MergeOp bound, or — when the endpoint pattern's properties select it — the
+/// stored row they match.
+async fn endpoint_row(
+    write_path: &WritePath,
+    op: &MergeOp,
+    schema: &Schema,
+    meta: &TableMetadata,
+    endpoint: Endpoint,
+    bound_rows: &HashMap<String, serde_json::Value>,
+) -> Result<Option<serde_json::Value>> {
+    let (var, match_props) = match endpoint {
+        Endpoint::Source => (op.src_var.as_ref(), op.src_match_props.as_deref()),
+        Endpoint::Destination => (op.dst_var.as_ref(), op.dst_match_props.as_deref()),
+    };
+    if let Some(row) = var.and_then(|var| bound_rows.get(var)) {
+        return Ok(Some(row.clone()));
+    }
+    let (Some(label), Some(match_props)) =
+        (meta.extensions.get(endpoint.label_extension()), match_props)
+    else {
+        return Ok(None);
+    };
+    let Some(endpoint_meta) = resolve_table_by_graph_label(schema, &op.table.keyspace, label)
+    else {
+        return Ok(None);
+    };
+    let table_id = TableId::new(&endpoint_meta.keyspace, &endpoint_meta.name);
+    Ok(find_table_row_by_props(
+        write_path,
+        &table_id,
+        &endpoint_meta,
+        match_props,
+        match endpoint {
+            Endpoint::Source => "src",
+            Endpoint::Destination => "dst",
+        },
+    )
+    .await?
+    .map(|row| row.json))
 }
 
 fn encode_storage_ordered_cells(
@@ -5139,14 +5126,13 @@ fn resolve_endpoint_property_expr(
     };
     for preferred in preferred_endpoint_ids {
         if let Some((_, expr)) = props.iter().find(|(name, expr)| {
-            name == preferred && try_encode_expr_for_column_type(expr, target_column_type).is_ok()
+            name == preferred && encode_expr_for_column_type(expr, target_column_type).is_ok()
         }) {
             return Some(expr.clone());
         }
     }
 
-    if props.len() == 1 && try_encode_expr_for_column_type(&props[0].1, target_column_type).is_ok()
-    {
+    if props.len() == 1 && encode_expr_for_column_type(&props[0].1, target_column_type).is_ok() {
         return Some(props[0].1.clone());
     }
 
@@ -5156,36 +5142,9 @@ fn resolve_endpoint_property_expr(
             name.ends_with("_id")
                 && name.as_str() != "tenant_id"
                 && name.as_str() != "session_id"
-                && try_encode_expr_for_column_type(expr, target_column_type).is_ok()
+                && encode_expr_for_column_type(expr, target_column_type).is_ok()
         })
         .map(|(_, expr)| expr.clone())
-}
-
-fn encode_partition_components(components: &[Vec<u8>]) -> Vec<u8> {
-    if components.len() == 1 {
-        return components[0].clone();
-    }
-
-    let mut buf = Vec::new();
-    for component in components {
-        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
-        buf.extend_from_slice(component);
-        buf.push(0x00);
-    }
-    buf
-}
-
-fn encode_clustering_components(components: &[Vec<u8>]) -> Vec<u8> {
-    if components.len() == 1 {
-        return components[0].clone();
-    }
-
-    let mut buf = Vec::new();
-    for component in components {
-        buf.extend_from_slice(&(component.len() as u16).to_be_bytes());
-        buf.extend_from_slice(component);
-    }
-    buf
 }
 
 fn encode_property_value_for_table(
@@ -5200,77 +5159,6 @@ fn encode_property_value_for_table(
     }
 
     expr_to_bytes(expr)
-}
-
-fn try_encode_expr_for_column_type(
-    expr: &Expr,
-    column_type: &str,
-) -> std::result::Result<Vec<u8>, GraphError> {
-    encode_expr_for_column_type(expr, column_type)
-}
-
-fn encode_expr_for_column_type(expr: &Expr, column_type: &str) -> Result<Vec<u8>> {
-    let lower = column_type.to_ascii_lowercase();
-    match expr {
-        Expr::Literal(Literal::String(s)) if lower == "uuid" || lower.ends_with("uuidtype") => {
-            let uuid = uuid::Uuid::parse_str(s).map_err(|e| {
-                GraphError::Validation(format!("invalid UUID literal '{s}' for {column_type}: {e}"))
-            })?;
-            Ok(uuid.as_bytes().to_vec())
-        }
-        Expr::Literal(Literal::String(s))
-            if lower == "text"
-                || lower == "varchar"
-                || lower.ends_with("utf8type")
-                || lower.ends_with("asciitype") =>
-        {
-            Ok(s.as_bytes().to_vec())
-        }
-        Expr::Literal(Literal::String(s))
-            if lower == "timestamp" || lower.ends_with("timestamptype") =>
-        {
-            let ms = chrono::DateTime::parse_from_rfc3339(s)
-                .map_err(|e| {
-                    GraphError::Validation(format!("invalid timestamp literal '{s}': {e}"))
-                })?
-                .timestamp_millis();
-            Ok(ms.to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Integer(i))
-            if lower == "timestamp" || lower.ends_with("timestamptype") =>
-        {
-            Ok(i.to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Float(f)) if lower == "double" || lower.ends_with("doubletype") => {
-            Ok(f.to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Integer(i))
-            if lower == "double" || lower.ends_with("doubletype") =>
-        {
-            Ok((*i as f64).to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Float(f)) if lower == "float" || lower.ends_with("floattype") => {
-            Ok((*f as f32).to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Integer(i)) if lower == "float" || lower.ends_with("floattype") => {
-            Ok((*i as f32).to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Integer(i)) if lower == "int" || lower.ends_with("int32type") => {
-            let value = i32::try_from(*i).map_err(|_| {
-                GraphError::Validation(format!("integer literal {i} does not fit in int"))
-            })?;
-            Ok(value.to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Integer(i))
-            if lower == "bigint" || lower == "long" || lower.ends_with("longtype") =>
-        {
-            Ok(i.to_be_bytes().to_vec())
-        }
-        Expr::Literal(Literal::Bool(b)) if lower == "boolean" || lower.ends_with("booleantype") => {
-            Ok(vec![u8::from(*b)])
-        }
-        _ => expr_to_bytes(expr),
-    }
 }
 
 /// Does this plan's projection READ STORAGE, rather than only the values
@@ -7088,6 +6976,7 @@ mod tests {
 
     use crate::adjacency::observer::make_adjacency_mutation;
     use crate::adjacency::schema::adjacency_table_metadata;
+    use crate::key::{encode_clustering_components, encode_partition_components};
     use indexmap::IndexMap;
     use std::sync::Arc;
 
@@ -7288,6 +7177,48 @@ mod tests {
             column_type: column_type.to_string(),
             clustering_order,
             mask: None,
+        }
+    }
+
+    /// A `Person` vertex keyed by one `uuid` column, with no scope columns: the
+    /// shape where a MERGE that supplies no key has exactly one key column to
+    /// generate — the #610 case.
+    fn single_uuid_key_vertex_meta() -> TableMetadata {
+        let mut columns = IndexMap::new();
+        columns.insert(
+            "id".to_string(),
+            test_column(
+                "id",
+                ColumnKind::PartitionKey,
+                0,
+                "uuid",
+                ClusteringOrder::None,
+            ),
+        );
+        columns.insert(
+            "name".to_string(),
+            test_column(
+                "name",
+                ColumnKind::Regular,
+                0,
+                "text",
+                ClusteringOrder::None,
+            ),
+        );
+        TableMetadata {
+            keyspace: "agent_memory".to_string(),
+            name: "person_v".to_string(),
+            id: uuid::Uuid::new_v4(),
+            columns,
+            partition_key: vec!["id".to_string()],
+            clustering_key: vec![],
+            params: Default::default(),
+            flags: HashSet::new(),
+            extensions: HashMap::from([
+                ("graph.type".to_string(), "vertex".to_string()),
+                ("graph.label".to_string(), "Person".to_string()),
+            ]),
+            is_system: false,
         }
     }
 
@@ -7610,6 +7541,7 @@ mod tests {
 
         let op = MergeOp {
             var: Some("r".to_string()),
+            display_name: None,
             table: crate::planner::ResolvedTable {
                 keyspace: "agent_memory".to_string(),
                 table: "typed_edges".to_string(),
@@ -7679,6 +7611,291 @@ mod tests {
                 b"related_to".to_vec(),
                 dst_id.as_bytes().to_vec(),
             ]),
+        );
+    }
+
+    /// I1 SAME KEY EVERYWHERE. One logical entity, every answer to "what are
+    /// this row's key bytes?" — the schema-aware write shape, the read path's
+    /// lookup shape, the inferred shape, and what storage actually holds after
+    /// the MERGE runs — must be the same bytes. Any path that derives on its own
+    /// is the defect this pins (issue #610 was two of them disagreeing).
+    ///
+    /// The expectation is asserted in the clear as well, so four paths agreeing
+    /// on a wrong key cannot pass this.
+    #[tokio::test]
+    async fn i1_write_read_and_inferred_shapes_derive_the_same_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = test_storage_engine(tmp.path());
+        let schema = Arc::new(test_schema());
+        let auth = ferrosa_schema::auth::role::AuthContext {
+            role: "cassandra".to_string(),
+            is_superuser: true,
+            must_change_password: false,
+        };
+        let user_ks = ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+            name: "agent_memory".to_string(),
+            durable_writes: true,
+            replication: ferrosa_schema::metadata::keyspace::ReplicationParams {
+                strategy: "SimpleStrategy".to_string(),
+                options: HashMap::from([("replication_factor".to_string(), "1".to_string())]),
+            },
+        };
+        schema.create_keyspace(user_ks.clone(), &auth).unwrap();
+        schema
+            .create_keyspace(
+                ferrosa_schema::metadata::keyspace::KeyspaceMetadata {
+                    name: adjacency_keyspace_name("agent_memory"),
+                    ..user_ks
+                },
+                &auth,
+            )
+            .unwrap();
+
+        let mut meta = scoped_entity_meta();
+        meta.extensions
+            .insert("graph.type".to_string(), "vertex".to_string());
+        meta.extensions
+            .insert("graph.label".to_string(), "Entity".to_string());
+        let adjacency_meta = adjacency_table_metadata("agent_memory");
+        schema.create_table(meta.clone(), &auth).unwrap();
+        schema.create_table(adjacency_meta.clone(), &auth).unwrap();
+        storage.register_table(meta.to_storage_schema()).unwrap();
+        storage
+            .register_table(adjacency_meta.to_storage_schema())
+            .unwrap();
+
+        let tenant_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
+        let session_id = uuid::Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let entity_id = uuid::Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let uuid_lit = |id: uuid::Uuid| Expr::Literal(Literal::String(id.to_string()));
+
+        let op = MergeOp {
+            var: Some("n".to_string()),
+            display_name: Some("n".into()),
+            table: crate::planner::ResolvedTable {
+                keyspace: "agent_memory".to_string(),
+                table: "entity_store".to_string(),
+                label: "Entity".to_string(),
+                graph_type: "vertex".to_string(),
+            },
+            match_props: vec![
+                ("tenant_id".to_string(), uuid_lit(tenant_id)),
+                ("session_id".to_string(), uuid_lit(session_id)),
+                ("entity_id".to_string(), uuid_lit(entity_id)),
+            ],
+            create_props: vec![(
+                "name".to_string(),
+                Expr::Literal(Literal::String("Alice".to_string())),
+            )],
+            src_match_props: None,
+            src_var: None,
+            dst_match_props: None,
+            dst_var: None,
+        };
+        let write_path = ferrosa_cluster::write_path::WritePath::direct(Arc::clone(&storage));
+        let table_id = TableId::new(&meta.keyspace, &meta.name);
+
+        // (1) the write path's shape.
+        let write_shape =
+            build_merge_write_shape(&op, &[], Some(&schema), 1000).expect("write shape ok");
+        assert!(
+            write_shape.used_schema_layout,
+            "a declared table's MERGE must derive from its declared key columns"
+        );
+
+        // (2) what storage holds once the MERGE has actually run.
+        execute_merge(
+            &write_path,
+            std::slice::from_ref(&op),
+            &[],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(&schema),
+        )
+        .await
+        .expect("the MERGE must execute");
+        let partitions = write_path.range_read(&table_id).await.expect("range read");
+        assert_eq!(partitions.len(), 1, "one entity is one partition");
+        let stored_key = partitions[0].key.key.as_bytes().to_vec();
+        let stored_clustering = partitions[0].rows[0].clustering.clone();
+
+        // (3) the read path's derivation, without touching storage.
+        let (lookup_key, lookup_clustering) =
+            build_direct_lookup_shape(&meta, &HashMap::new(), &op.match_props, &HashMap::new())
+                .expect("lookup shape ok")
+                .expect("the read path derives this key");
+
+        // (4) the inferred shape the planner-side read half builds.
+        let inferred =
+            infer_schema_aware_merge_shape(&write_path, &op, &[], &schema, 1000, &HashMap::new())
+                .await
+                .expect("infer ok")
+                .expect("the inferred shape exists");
+
+        // The expected bytes, in the clear: (tenant, session) framed as the
+        // partition, the entity id as the single clustering component.
+        assert_eq!(
+            stored_key,
+            encode_partition_components(&[
+                tenant_id.as_bytes().to_vec(),
+                session_id.as_bytes().to_vec()
+            ]),
+            "the declared key columns decide the partition, and only they do"
+        );
+        assert_eq!(
+            stored_clustering,
+            encode_clustering_components(&[entity_id.as_bytes().to_vec()]),
+        );
+
+        assert_eq!(
+            write_shape.key.key.as_bytes(),
+            stored_key.as_slice(),
+            "the write path must write at the key it derives"
+        );
+        assert_eq!(write_shape.clustering, stored_clustering);
+
+        assert_eq!(
+            lookup_key.key.as_bytes(),
+            stored_key.as_slice(),
+            "the read path must derive the bytes the write path wrote"
+        );
+        assert_eq!(lookup_clustering, stored_clustering);
+
+        assert_eq!(
+            inferred.key.key.as_bytes(),
+            stored_key.as_slice(),
+            "the inferred shape must agree with both"
+        );
+        assert_eq!(inferred.clustering, stored_clustering);
+
+        // And the read path finds that row: for a fully-supplied key the lookup
+        // is terminal, so a hit here cannot be a scan rescuing a wrong key.
+        let found = find_table_row_by_props(&write_path, &table_id, &meta, &op.match_props, "n")
+            .await
+            .expect("read ok")
+            .expect("the read path must find the row it derived the key for");
+        assert_eq!(found.key.key.as_bytes(), stored_key.as_slice());
+        assert_eq!(found.clustering, stored_clustering);
+
+        // The same four-way equality when the statement supplies NO key column.
+        // The key is then the entity's content identity cut to the declared
+        // type's width — 16 bytes for a uuid column. This is the shape that used
+        // to be 32 bytes on the write side and had to fit 16-byte endpoint
+        // columns on the other (issue #610), so it is asserted on the width.
+        let person = single_uuid_key_vertex_meta();
+        schema.create_table(person.clone(), &auth).unwrap();
+        storage.register_table(person.to_storage_schema()).unwrap();
+        let anonymous_op = MergeOp {
+            var: None,
+            display_name: Some("Person".into()),
+            table: crate::planner::ResolvedTable {
+                keyspace: "agent_memory".to_string(),
+                table: "person_v".to_string(),
+                label: "Person".to_string(),
+                graph_type: "vertex".to_string(),
+            },
+            match_props: vec![(
+                "name".to_string(),
+                Expr::Literal(Literal::String("Alice".to_string())),
+            )],
+            create_props: vec![],
+            src_match_props: None,
+            src_var: None,
+            dst_match_props: None,
+            dst_var: None,
+        };
+        let expected: Vec<u8> = identity_digest(&anonymous_op.match_props)
+            .expect("digest")
+            .get(..16)
+            .expect("a uuid column keeps 16 of the digest's 32 bytes")
+            .to_vec();
+
+        let person_write = build_merge_write_shape(&anonymous_op, &[], Some(&schema), 1000)
+            .expect("write shape ok");
+        // ... and when the statement cannot supply the key, the write path's
+        // answer is the inferred shape, as `execute_merge` itself decides it.
+        let person_write = if person_write.used_schema_layout {
+            person_write
+        } else {
+            infer_schema_aware_merge_shape(
+                &write_path,
+                &anonymous_op,
+                &[],
+                &schema,
+                1000,
+                &HashMap::new(),
+            )
+            .await
+            .expect("infer ok")
+            .expect("the write path infers a shape for an unsupplied key")
+        };
+        let person_table_id = TableId::new(&person.keyspace, &person.name);
+        // The read path's derivation: `find_table_row_by_props` decides this row's
+        // key with exactly this call before it reads anything.
+        let person_props: HashMap<String, Expr> =
+            anonymous_op.match_props.iter().cloned().collect();
+        let person_read_key = merge_entity_key(
+            &person,
+            &person_props,
+            None,
+            &identity_digest(&anonymous_op.match_props).expect("digest"),
+        )
+        .expect("read key ok")
+        .expect("the read path derives a content key too");
+        let person_inferred = infer_schema_aware_merge_shape(
+            &write_path,
+            &anonymous_op,
+            &[],
+            &schema,
+            1000,
+            &HashMap::new(),
+        )
+        .await
+        .expect("infer ok")
+        .expect("the inferred shape exists");
+
+        execute_merge(
+            &write_path,
+            std::slice::from_ref(&anonymous_op),
+            &[],
+            None,
+            &GraphEngineConfig::default(),
+            Instant::now(),
+            Some(&schema),
+        )
+        .await
+        .expect("the keyless MERGE must execute");
+        let person_partitions = write_path
+            .range_read(&person_table_id)
+            .await
+            .expect("range read");
+        assert_eq!(
+            person_partitions.len(),
+            1,
+            "one keyless entity, one partition"
+        );
+        let person_stored = person_partitions[0].key.key.as_bytes().to_vec();
+
+        assert_eq!(
+            person_stored, expected,
+            "a generated uuid key is the content identity's leading 16 bytes"
+        );
+        assert_eq!(person_stored.len(), 16, "a uuid key column stores 16 bytes");
+        assert_eq!(
+            person_write.key.key.as_bytes(),
+            person_stored.as_slice(),
+            "the write path's generated key must be the stored key"
+        );
+        assert_eq!(
+            person_read_key.decorated_partition().key.as_bytes(),
+            person_stored.as_slice(),
+            "the read path must derive the same generated key"
+        );
+        assert_eq!(
+            person_inferred.key.key.as_bytes(),
+            person_stored.as_slice(),
+            "and so must the inferred shape"
         );
     }
 
@@ -7798,6 +8015,7 @@ mod tests {
         let merges = vec![
             MergeOp {
                 var: Some("a".to_string()),
+                display_name: None,
                 table: crate::planner::ResolvedTable {
                     keyspace: "agent_memory".to_string(),
                     table: "entity_store".to_string(),
@@ -7816,6 +8034,7 @@ mod tests {
             },
             MergeOp {
                 var: Some("b".to_string()),
+                display_name: None,
                 table: crate::planner::ResolvedTable {
                     keyspace: "agent_memory".to_string(),
                     table: "entity_store".to_string(),
@@ -7834,6 +8053,7 @@ mod tests {
             },
             MergeOp {
                 var: Some("r".to_string()),
+                display_name: None,
                 table: crate::planner::ResolvedTable {
                     keyspace: "agent_memory".to_string(),
                     table: "typed_edges".to_string(),
@@ -8012,6 +8232,7 @@ mod tests {
         // Crucially: do NOT pre-write the entity row. The MERGE
         // should create it.
         let merges = vec![MergeOp {
+            display_name: None,
             var: Some("a".to_string()),
             table: crate::planner::ResolvedTable {
                 keyspace: "agent_memory".to_string(),
@@ -8734,24 +8955,6 @@ mod tests {
         assert_eq!(rows[2][0], serde_json::Value::String("row_2".into()));
     }
 
-    #[test]
-    fn literal_to_bytes_string() {
-        let bytes = literal_to_bytes(&crate::parser::Literal::String("hello".into()));
-        assert_eq!(bytes, b"hello");
-    }
-
-    #[test]
-    fn literal_to_bytes_integer() {
-        let bytes = literal_to_bytes(&crate::parser::Literal::Integer(42));
-        assert_eq!(bytes, 42_i64.to_be_bytes().to_vec());
-    }
-
-    #[test]
-    fn literal_to_bytes_null() {
-        let bytes = literal_to_bytes(&crate::parser::Literal::Null);
-        assert!(bytes.is_empty());
-    }
-
     #[tokio::test]
     async fn execute_aggregate_count() {
         // Test end-to-end aggregation: count over a virtual table.
@@ -9040,6 +9243,7 @@ mod tests {
 
         let op = MergeOp {
             var: Some("r".to_string()),
+            display_name: None,
             table: crate::planner::ResolvedTable {
                 keyspace: meta.keyspace.clone(),
                 table: meta.name.clone(),
@@ -9918,6 +10122,7 @@ mod tests {
     fn non_literal_merge_op(props: Vec<(String, Expr)>, create: Vec<(String, Expr)>) -> MergeOp {
         MergeOp {
             var: None,
+            display_name: None,
             table: non_literal_table("vertex"),
             match_props: props,
             create_props: create,
@@ -9954,7 +10159,7 @@ mod tests {
     fn graph_non_literal_property_is_typed_error_content_key() {
         for (what, expr) in non_literal_exprs() {
             let props = vec![("p".to_string(), expr)];
-            assert_typed_validation_error(what, content_addressed_key(&props));
+            assert_typed_validation_error(what, identity_digest(&props));
         }
     }
 

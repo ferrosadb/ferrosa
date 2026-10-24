@@ -275,6 +275,8 @@ fn resolve_pattern_labels(
                 check_table_permission(snap, auth, perm, &resolved)?;
                 if let Some(var_name) = var {
                     bindings.insert(var_name.clone(), resolved);
+                } else {
+                    bindings.insert(format!(":{label_str}"), resolved);
                 }
             }
         }

@@ -4,6 +4,7 @@
 //! execute the query against the storage engine.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::error::{GraphError, Result};
@@ -81,7 +82,14 @@ pub struct CreateOp {
 /// For node MergeOps (`table.graph_type == "vertex"`) both fields are `None`.
 #[derive(Debug, Clone)]
 pub struct MergeOp {
+    /// The pattern element's query-scope variable (`None` = anonymous). Scope
+    /// only: it keys SET clauses and bound rows. Key derivation never reads it —
+    /// [`crate::key::derive_key`] takes key columns and values, and has no
+    /// parameter a name could reach — so renaming a variable cannot move a row.
     pub var: Option<String>,
+    /// How a human refers to this element: the pattern's variable, else its
+    /// label. Diagnostics and EXPLAIN only; never an input to the storage key.
+    pub display_name: Option<Arc<str>>,
     pub table: ResolvedTable,
     /// Properties used to derive the edge's own content-addressed key (for
     /// idempotent read-before-write on edge properties).  For nodes this
@@ -725,11 +733,13 @@ fn collect_create_ops(
             Pattern::Node {
                 var, label, props, ..
             } => {
-                // Need either a binding via the variable or the label to resolve a table.
-                let resolved = if let Some(var_name) = var {
-                    bindings.get(var_name).cloned()
-                } else {
-                    None
+                // Need either a binding via the variable or, for an anonymous
+                // node, the one the resolver filed under the label.
+                let resolved = match var {
+                    Some(var_name) => bindings.get(var_name).cloned(),
+                    None => label
+                        .as_ref()
+                        .and_then(|label| bindings.get(&format!(":{label}")).cloned()),
                 };
                 if let Some(table) = resolved {
                     creates.push(CreateOp {
@@ -820,6 +830,31 @@ fn plan_merge(
     })
 }
 
+/// The table a MERGE node's pattern element resolved to.
+///
+/// By its variable when it has one; by the label the resolver filed the table
+/// under when it is anonymous (`:Label`), exactly as `collect_create_ops`
+/// resolves an anonymous CREATE. An anonymous element is still a real entity —
+/// naming it or not is query scope, and the key derivation never learns which.
+fn resolve_merge_node(
+    var: &Option<String>,
+    label: &Option<String>,
+    bindings: &std::collections::HashMap<String, ResolvedTable>,
+) -> Option<ResolvedTable> {
+    match var {
+        Some(var_name) => bindings.get(var_name).cloned(),
+        None => label
+            .as_ref()
+            .and_then(|label| bindings.get(&format!(":{label}")).cloned()),
+    }
+}
+
+/// How a human refers to a MERGE element: its variable, else its label.
+/// Diagnostics only — this value never reaches a storage key.
+fn display_name_for(var: &Option<String>, label: &Option<String>) -> Option<Arc<str>> {
+    var.as_deref().or(label.as_deref()).map(Arc::from)
+}
+
 /// Recursively collect `MergeOp` entries from patterns.
 ///
 /// For `Pattern::Path` elements, this function detects `[Node, Rel, Node]`
@@ -837,11 +872,7 @@ fn collect_merge_ops(
     for pat in patterns {
         match pat {
             crate::parser::Pattern::Node { var, label, props } => {
-                let resolved = if let Some(var_name) = var {
-                    bindings.get(var_name).cloned()
-                } else {
-                    None
-                };
+                let resolved = resolve_merge_node(var, label, bindings);
                 if let Some(table) = resolved {
                     if !props.is_empty() {
                         if let Some(var_name) = var.as_ref() {
@@ -850,6 +881,7 @@ fn collect_merge_ops(
                     }
                     merges.push(MergeOp {
                         var: var.clone(),
+                        display_name: display_name_for(var, label),
                         table,
                         match_props: props.clone(),
                         create_props: vec![],
@@ -889,6 +921,7 @@ fn collect_merge_ops(
                     // using empty clustering.
                     merges.push(MergeOp {
                         var: var.clone(),
+                        display_name: var.as_deref().map(Arc::from),
                         table,
                         match_props: props.clone(),
                         create_props: vec![],
@@ -936,11 +969,7 @@ fn collect_merge_ops_from_path(
                     continue;
                 }
 
-                let resolved = if let Some(var_name) = var {
-                    bindings.get(var_name).cloned()
-                } else {
-                    None
-                };
+                let resolved = resolve_merge_node(var, label, bindings);
                 if let Some(table) = resolved {
                     if !props.is_empty() {
                         if let Some(var_name) = var.as_ref() {
@@ -949,6 +978,7 @@ fn collect_merge_ops_from_path(
                     }
                     merges.push(MergeOp {
                         var: var.clone(),
+                        display_name: display_name_for(var, label),
                         table,
                         match_props: props.clone(),
                         create_props: vec![],
@@ -1049,6 +1079,7 @@ fn collect_merge_ops_from_path(
                 if let Some(table) = resolved {
                     merges.push(MergeOp {
                         var: var.clone(),
+                        display_name: var.as_deref().map(Arc::from),
                         table,
                         match_props: props.clone(),
                         create_props: vec![],
