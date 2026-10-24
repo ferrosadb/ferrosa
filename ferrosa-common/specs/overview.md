@@ -52,6 +52,12 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 
 ## Data flow / role
 
+`CellBytes` isolates cell payload ownership from the metadata that row
+reconciliation changes. It exposes immutable slices and an explicit
+`into_vec` boundary, while initially preserving the existing owned backing.
+This additive seam allows cell consumers to migrate before sharing is enabled;
+its tests pin vector ownership, ordering, debug output and serialization.
+
 `ferrosa-common` is not a pipeline; it is the **shared alphabet** the pipelines
 speak. Two representative roles:
 

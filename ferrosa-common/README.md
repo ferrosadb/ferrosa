@@ -23,6 +23,12 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 
 ## What's implemented
 
+- **Cell payload ownership** — `CellBytes` is an immutable slice-facing wrapper
+  with explicit owned-vector conversion. Its initial representation retains
+  owned vectors so consumers can migrate independently from the backing-storage
+  change. Ordering, debug output and serialized byte sequences match the owned
+  representation; construction and unique-vector extraction retain its buffer.
+
 - **Hash ring** — `Token` (`i64` newtype over Murmur3 `h1`), `Token::from_key`,
   `Token::MIN`/`MAX`; `murmur3::hash3_x64_128` (Cassandra-bit-compatible,
   including the deliberate tail sign-extension bug).

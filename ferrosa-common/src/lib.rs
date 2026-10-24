@@ -13,6 +13,7 @@
 pub mod accord;
 pub mod cancel;
 pub mod cell;
+pub mod cell_bytes;
 pub mod cell_ts;
 /// Cluster formation lifecycle. Lives here, not in ferrosa-cluster, because
 /// ferrosa-sim needs the same state machine and deliberately cannot depend on
@@ -42,6 +43,7 @@ pub use accord::{
 };
 pub use cancel::{CancelReason, CancelToken, Cancelled};
 pub use cell::{CellValue, Timestamp, NO_DELETION_TIME, NO_TIMESTAMP, NO_TTL};
+pub use cell_bytes::CellBytes;
 pub use cell_ts::{is_legacy_ns, normalize_cell_ts, LEGACY_NS_THRESHOLD};
 pub use complex_cell::{
     accord_list_cell_path, list_path_element_seq, reconcile, reconcile_ref, CellPath,
