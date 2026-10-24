@@ -1964,6 +1964,18 @@ where
         .map_err(std::io::Error::other)?;
     loop {
         let (stream, peer) = listener.accept().await?;
+        // Disable Nagle. A PostgreSQL front end answers one statement with
+        // several small batches (RowDescription, DataRow, CommandComplete,
+        // ReadyForQuery), and each batch is its own write. With Nagle on, the
+        // second and later segments wait for the peer's delayed ACK (~40ms on
+        // Linux), so every statement pays a fixed penalty on a real network.
+        // Measured: ~46ms per statement over Fly 6PN, including `SELECT 1`,
+        // while the same binary on loopback answers `SELECT 1` in ~70us and
+        // real PostgreSQL (which sets TCP_NODELAY) answers it over the same
+        // path in ~0.4ms.
+        if let Err(error) = stream.set_nodelay(true) {
+            tracing::debug!(%peer, %error, "could not set TCP_NODELAY on PostgreSQL socket");
+        }
         let store = Arc::clone(&store);
         let ctx = Arc::clone(&ctx);
         let tls = Arc::clone(&tls);
