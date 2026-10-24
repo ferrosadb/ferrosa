@@ -311,22 +311,10 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(m) => m,
             Err(e) => {
                 tracing::debug!(%e, "failed to decode Bolt message");
-                let failure = BoltMessage::Failure {
-                    metadata: vec![
-                        (
-                            "code".into(),
-                            PackValue::String("Neo.ClientError.Request.Invalid".into()),
-                        ),
-                        (
-                            "neo4j_code".into(),
-                            PackValue::String("Neo.ClientError.Request.Invalid".into()),
-                        ),
-                        (
-                            "message".into(),
-                            PackValue::String(format!("message decode error: {e}")),
-                        ),
-                    ],
-                };
+                let failure = failure_message(
+                    "Neo.ClientError.Request.Invalid",
+                    format!("message decode error: {e}"),
+                );
                 send_message(&mut stream, &failure).await?;
                 // A nesting-depth violation is a hostile or broken client, not
                 // a typo: reply FAILURE once, then close so the peer cannot
@@ -382,17 +370,11 @@ fn handle_tx_message(msg: &BoltMessage, _state: &mut ConnectionState) -> Vec<Bol
         ),
         // Not a transaction control message — caller guarantees this is unreachable.
         _ => (
-            "Neo.DatabaseError.General.UnknownError",
+            "Neo.ClientError.Request.Invalid",
             "handle_tx_message called with a non-transaction message",
         ),
     };
-    vec![BoltMessage::Failure {
-        metadata: vec![
-            ("code".into(), PackValue::String(code.into())),
-            ("neo4j_code".into(), PackValue::String(code.into())),
-            ("message".into(), PackValue::String(message.into())),
-        ],
-    }]
+    vec![failure_message(code, message)]
 }
 
 /// Process a single message and produce response messages.
@@ -449,15 +431,12 @@ async fn process_message(
                     Ok(vec![success])
                 }
                 Err(e) => {
-                    let code = error_code(&e);
-                    let failure = BoltMessage::Failure {
-                        metadata: vec![
-                            ("code".into(), PackValue::String(code.into())),
-                            ("neo4j_code".into(), PackValue::String(code.into())),
-                            ("message".into(), PackValue::String(e.to_string())),
-                        ],
-                    };
-                    Ok(vec![failure])
+                    // A failed RUN supersedes whatever the previous statement
+                    // left pending: keeping it would let the PULL that follows
+                    // this failure serve the earlier query's rows as if they
+                    // were its own.
+                    state.pending_result = None;
+                    Ok(vec![failure_for(&e)])
                 }
             }
         }
@@ -480,7 +459,16 @@ async fn process_message(
                 // The remainder is now a stream, so the SERVER no longer holds
                 // every undelivered row either: this pulls `n` from the query
                 // and looks one past them to answer `has_more`.
-                let (batch, has_more) = result.take_batch(requested_batch_size(&extra)).await?;
+                let (batch, has_more) = match result.take_batch(requested_batch_size(&extra)).await
+                {
+                    Ok(batch) => batch,
+                    // A row stream can fail mid-result (a storage read, a spill
+                    // file). That is still a statement error: send it as a
+                    // FAILURE with its own text. Propagating it with `?` tore
+                    // the connection down, so the client saw a dead socket
+                    // instead of the reason the read failed.
+                    Err(e) => return Ok(vec![failure_for(&e)]),
+                };
 
                 // Send a RECORD for each row in this batch.
                 for row in &batch {
@@ -554,7 +542,13 @@ async fn process_message(
                     // not "throw the whole result away". Pulling them from the
                     // stream discards without materialising them.
                     let (_dropped, has_more) =
-                        result.take_batch(requested_batch_size(&extra)).await?;
+                        match result.take_batch(requested_batch_size(&extra)).await {
+                            Ok(batch) => batch,
+                            // Same contract as PULL: a mid-stream failure is the
+                            // statement's error, reported with its text, not a
+                            // reason to drop the connection.
+                            Err(e) => return Ok(vec![failure_for(&e)]),
+                        };
                     if has_more {
                         state.pending_result = Some(result);
                         return Ok(vec![BoltMessage::Success {
@@ -580,36 +574,20 @@ async fn process_message(
 
         // HELLO arriving after handshake — protocol error.
         BoltMessage::Hello { .. } | BoltMessage::Logon { .. } | BoltMessage::Logoff => {
-            Ok(vec![BoltMessage::Failure {
-                metadata: vec![
-                    (
-                        "code".into(),
-                        PackValue::String("Neo.ClientError.Request.Invalid".into()),
-                    ),
-                    (
-                        "message".into(),
-                        PackValue::String("unexpected HELLO/LOGON after handshake".into()),
-                    ),
-                ],
-            }])
+            Ok(vec![failure_message(
+                "Neo.ClientError.Request.Invalid",
+                "unexpected HELLO/LOGON after handshake",
+            )])
         }
 
         // Server-to-client messages should never be received from the client.
         BoltMessage::Success { .. }
         | BoltMessage::Failure { .. }
         | BoltMessage::Record { .. }
-        | BoltMessage::Ignored => Ok(vec![BoltMessage::Failure {
-            metadata: vec![
-                (
-                    "code".into(),
-                    PackValue::String("Neo.ClientError.Request.Invalid".into()),
-                ),
-                (
-                    "message".into(),
-                    PackValue::String("unexpected server message from client".into()),
-                ),
-            ],
-        }]),
+        | BoltMessage::Ignored => Ok(vec![failure_message(
+            "Neo.ClientError.Request.Invalid",
+            "unexpected server message from client",
+        )]),
     }
 }
 
@@ -617,22 +595,10 @@ async fn process_message(
 /// dropping the connection) is what makes a Bolt driver raise an auth error
 /// instead of a generic `SessionExpired` / `ServiceUnavailable`.
 fn auth_failure_message() -> BoltMessage {
-    BoltMessage::Failure {
-        metadata: vec![
-            (
-                "code".into(),
-                PackValue::String("Neo.ClientError.Security.Unauthorized".into()),
-            ),
-            (
-                "neo4j_code".into(),
-                PackValue::String("Neo.ClientError.Security.Unauthorized".into()),
-            ),
-            (
-                "message".into(),
-                PackValue::String("authentication failed".into()),
-            ),
-        ],
-    }
+    failure_message(
+        "Neo.ClientError.Security.Unauthorized",
+        "authentication failed",
+    )
 }
 
 async fn authenticate_bolt_fields(
@@ -910,6 +876,12 @@ fn json_to_pack_value(v: &serde_json::Value) -> PackValue {
 }
 
 /// Map a `GraphError` to a Neo4j-style error code string.
+///
+/// A driver reports the code's *class* and the metadata's `message`. The code
+/// therefore has to name the class, not shrug: `Neo.DatabaseError.General.
+/// UnknownError` is what a driver falls back to when it has nothing better, and
+/// some drivers then present their own generic text instead of our message.
+/// Only `Internal` — an error the engine could not classify — may use it.
 fn error_code(err: &GraphError) -> &'static str {
     match err {
         GraphError::Parse(_) => "Neo.ClientError.Statement.SyntaxError",
@@ -917,12 +889,43 @@ fn error_code(err: &GraphError) -> &'static str {
         GraphError::PermissionDenied(_) => "Neo.ClientError.Security.Forbidden",
         GraphError::ResourceLimit(_) => "Neo.TransientError.General.OutOfMemoryError",
         GraphError::ConstraintViolation(_) => "Neo.ClientError.Schema.ConstraintValidationFailed",
-        GraphError::Timeout => "Neo.TransientError.Transaction.LockClientStopped",
+        // A query that ran out of time is a transaction timeout, not a
+        // resolved deadlock (which is what `LockClientStopped` means) — the
+        // distinction is what tells a driver whether retrying can help.
+        GraphError::Timeout => "Neo.TransientError.Transaction.TransactionTimedOut",
         GraphError::Unavailable(_) => "Neo.TransientError.General.DatabaseUnavailable",
-        GraphError::Storage(_) | GraphError::Schema(_) | GraphError::Internal(_) => {
-            "Neo.DatabaseError.General.UnknownError"
+        // Storage and schema failures happen *while executing* the statement —
+        // the engine could not complete it, which is exactly `ExecutionFailed`.
+        // Both keep their own text in `message`.
+        GraphError::Storage(_) | GraphError::Schema(_) => {
+            "Neo.DatabaseError.Statement.ExecutionFailed"
         }
+        GraphError::Internal(_) => "Neo.DatabaseError.General.UnknownError",
     }
+}
+
+/// Build a Bolt `FAILURE` carrying a code **and** the statement's own message.
+///
+/// Every failure path in this server goes through here. `message` is not
+/// decoration: the Neo4j drivers hydrate their exception from it, and a FAILURE
+/// without one is presented to the user as the driver's own placeholder text
+/// (`An unknown error occurred`). A failure whose cause the client cannot read
+/// is a failure the client cannot fix.
+fn failure_message(code: &str, message: impl Into<String>) -> BoltMessage {
+    BoltMessage::Failure {
+        metadata: vec![
+            ("code".into(), PackValue::String(code.into())),
+            // Kept for clients that read the duplicated key; `code` is the
+            // Bolt-spec name and the one drivers hydrate from.
+            ("neo4j_code".into(), PackValue::String(code.into())),
+            ("message".into(), PackValue::String(message.into())),
+        ],
+    }
+}
+
+/// The `FAILURE` a driver sees for an engine error: its code and its full text.
+fn failure_for(err: &GraphError) -> BoltMessage {
+    failure_message(error_code(err), err.to_string())
 }
 
 #[cfg(test)]
@@ -1067,7 +1070,7 @@ mod tests {
     fn error_code_mapping() {
         assert_eq!(
             error_code(&GraphError::Timeout),
-            "Neo.TransientError.Transaction.LockClientStopped"
+            "Neo.TransientError.Transaction.TransactionTimedOut"
         );
         assert_eq!(
             error_code(&GraphError::Validation("x".into())),
@@ -1081,6 +1084,101 @@ mod tests {
             error_code(&GraphError::Internal("x".into())),
             "Neo.DatabaseError.General.UnknownError"
         );
+    }
+
+    /// I2: every *classified* engine error maps to a code that names its class.
+    /// `Neo.DatabaseError.General.UnknownError` is the code a driver substitutes
+    /// when it has nothing to go on, so it may only stand for an error the
+    /// engine itself could not classify (`Internal`) — never for a typed one.
+    #[test]
+    fn only_an_unclassified_error_maps_to_the_generic_code() {
+        let typed = [
+            GraphError::Parse(crate::parser::ParseError::new(
+                "boom",
+                crate::parser::Span { start: 0, end: 0 },
+            )),
+            GraphError::Validation("boom".into()),
+            GraphError::PermissionDenied("boom".into()),
+            GraphError::ResourceLimit("boom".into()),
+            GraphError::ConstraintViolation("boom".into()),
+            GraphError::Timeout,
+            GraphError::Unavailable("boom".into()),
+            GraphError::Storage(ferrosa_common::Error::InvalidData(
+                "sstable checksum mismatch".into(),
+            )),
+        ];
+        for err in &typed {
+            let code = error_code(err);
+            assert_ne!(
+                code, "Neo.DatabaseError.General.UnknownError",
+                "{err:?} is a typed engine error and must not be reported as the \
+                 generic unknown error"
+            );
+            assert!(
+                code.starts_with("Neo.ClientError.")
+                    || code.starts_with("Neo.TransientError.")
+                    || code.starts_with("Neo.DatabaseError."),
+                "{err:?} mapped to a code outside Neo4j's status-code namespaces: {code}"
+            );
+        }
+        // The unclassified bucket keeps the generic code but still says why.
+        let failure = failure_for(&GraphError::Internal("index handle closed".into()));
+        match failure {
+            BoltMessage::Failure { metadata } => {
+                assert_eq!(
+                    find_string_field(&metadata, "code").as_deref(),
+                    Some("Neo.DatabaseError.General.UnknownError")
+                );
+                let message = find_string_field(&metadata, "message").expect("message field");
+                assert!(
+                    message.contains("index handle closed"),
+                    "the internal error's own text must survive, got: {message}"
+                );
+            }
+            other => panic!("expected FAILURE, got {other:?}"),
+        }
+    }
+
+    /// A row stream that fails mid-result is a statement error: the client must
+    /// get a FAILURE with that error's text — not a torn-down connection (the
+    /// `?` this replaced) and not a silent success.
+    #[tokio::test]
+    async fn a_mid_stream_failure_is_reported_as_a_failure_with_its_own_text() {
+        let err = GraphError::Storage(ferrosa_common::Error::InvalidData(
+            "sstable checksum mismatch in benchrow_v".into(),
+        ));
+        let stream: crate::executor::RowStream<'static> =
+            Box::pin(futures::stream::iter(vec![Err(err)]));
+        let mut pending = PendingRows {
+            stats: Default::default(),
+            rows: stream,
+            peeked: None,
+        };
+
+        let failure = pending
+            .take_batch(None)
+            .await
+            .expect_err("the stream's error must reach the caller");
+        let message = failure_for(&failure);
+        match message {
+            BoltMessage::Failure { metadata } => {
+                assert_eq!(
+                    find_string_field(&metadata, "code").as_deref(),
+                    Some("Neo.DatabaseError.Statement.ExecutionFailed"),
+                    "a storage failure during the scan must say so"
+                );
+                let text = find_string_field(&metadata, "message").expect("message field");
+                assert!(
+                    text.contains("sstable checksum mismatch in benchrow_v"),
+                    "the client must see the storage error's own text, got: {text}"
+                );
+                assert!(
+                    !text.to_ascii_lowercase().contains("unknown error"),
+                    "the client must not be given a placeholder, got: {text}"
+                );
+            }
+            other => panic!("expected FAILURE, got {other:?}"),
+        }
     }
 
     #[test]
