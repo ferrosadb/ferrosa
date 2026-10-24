@@ -5,6 +5,25 @@ how to prove each fix, and how to hand a crate to a sub-agent mechanically.
 
 ## Order of work — correctness first, then performance
 
+### Programme order — owner decision (final)
+
+1. **Class F backpressure (C1) — load-bearing, not optional.** Index maintenance IS the
+   observer path, so every index we add is another derived structure whose updates can vanish
+   through a dropped queue entry. Fixing allocation or adding indexes before this multiplies the
+   ways committed data can become unreachable.
+2. **Allocation model (T1 -> T6).** The write path first: `Mutation::new` per write (T1) is the
+   head of the chain, `9338` (T2) becomes a refcount bump once T1 carries `TableRef`/`Bytes`.
+3. **Graph secondary indexes.** `CREATE INDEX ... FOR (n:Label) ON (n.pk)` currently fails with
+   `CypherSyntaxError`, so every graph "point read" is a label scan — measured 136 ms versus
+   Neo4j's 2 ms at 20k nodes. This is a BUG, and it is the next performance lever after
+   allocation: it dominates any per-row allocation win. It lands after (1) because an index is a
+   derived structure maintained by the observer path.
+4. **R-series refactors** (R1 tuning structs, R2/R3 the two hot functions, R4 engine.rs split).
+
+Sequencing rationale: correctness before speed, and *cheap* correctness before *speculative*
+speed — but the index bug outranks micro-optimisation because it is order-of-magnitude, not
+percentage.
+
 A performance win that leaves data unreachable is worthless, so the correctness items come
 first and gate the rest.
 
