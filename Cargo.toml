@@ -127,7 +127,7 @@ opt-level = 3
 opt-level = 3
 
 [workspace.package]
-version = "0.28.0"
+version = "0.28.1"
 edition = "2021"
 license = "Apache-2.0"
 # No workspace crate is published to crates.io. Saying so lets cargo-deny
