@@ -68,6 +68,71 @@ real write path with zero blast radius.
 same record-buffer capacity as a 10k-row write.
 **Gate:** `cargo test -p ferrosa-storage -p ferrosa-cluster`, P0 still green.
 
+## Why the type change is hard — and the two pieces that make it easy
+
+The difficulty of P3b is not incidental, it is the smell. `Mutation` is a **persisted** type (so
+the encoding is frozen), with **61 constructors**, and **`pub` fields** (so every reader is part
+of its API). Three jobs in one type:
+
+1. a wire DTO (frozen encoding),
+2. a domain value (owned identity),
+3. a public struct that 700+ sites read field-by-field.
+
+The rule applies: **make the change easy, then make the easy change.** Do these first, and P3b
+stops being a 700-site migration:
+
+### PA — a `Name` newtype that derefs to `str`
+
+```rust
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct Name(Arc<str>);
+impl Deref for Name { type Target = str; }          // .as_bytes() / .len() / starts_with() still work
+impl AsRef<str> for Name { .. }
+impl fmt::Display for Name { .. }
+impl PartialEq<str> for Name { .. }                 // m.keyspace == "bench" still compiles
+impl From<&str> / From<String> for Name { .. }      // construction stays frictionless
+```
+
+Because it derefs to `str`, a field of type `Name` satisfies almost every read site unchanged —
+method calls, comparison, `&str` coercion. Only sites that *require an owned `String`* break, and
+those are the sites worth looking at. Its `Clone` is a refcount bump, which is the entire point.
+
+Standalone and additive: no field changes, no call-site changes. Test that three clones share one
+allocation (`Arc::as_ptr`), and that `Name` compares equal to a `&str`.
+
+### PB — constructors accept `impl Into<Name>`
+
+```rust
+pub fn new(keyspace: impl Into<Name>, table: impl Into<Name>, ...) -> Self
+```
+
+One signature edit, and **all 61 call sites keep compiling** untouched: `"x".into()`, `String`,
+`&str` and `Name` all satisfy `Into<Name>`. The hot path passes a `Name` it already shares; the
+cold sites pass what they always passed.
+
+After PA and PB, P3b is literally:
+
+```rust
+pub keyspace: Name,   // was String
+pub table: Name,      // was String
+```
+
+and the compiler's remaining errors are only the places that genuinely need an owned `String` —
+a handful, each a real decision rather than mechanical churn.
+
+### The same trick for `rows`, if P4 ever happens
+
+`Rows(Vec<Row>)` with `Deref<Target = [Row]>` keeps `.iter()`, `.len()`, indexing and slicing
+working; `impl Into<Rows>` for `Row`, `Vec<Row>` and `SmallVec` keeps all 1460 read sites and
+every constructor unchanged. That is what turns P4 from "the largest blast radius" into a
+representation swap behind a newtype.
+
+### What stays genuinely hard
+
+The **frozen encoding** is not a smell to be refactored away — `Mutation` must decode what old
+binaries wrote. That is why P0 exists and why it is not negotiable: the wire format is a contract
+with data already on disk, and only additive encoders can change.
+
 ## P3a — introduce `TableRef` without changing `Mutation`'s fields
 
 Additive only:
@@ -120,7 +185,7 @@ before choosing an inline size above one row.
 
 ## Order and why
 
-`P0 → P1 → P2 → P3a → P3b → (P4 if measured)`.
+`P0 → P1 → P2 → PA → PB → P3a → P3b → (P4 if measured)`.
 
 P0 first because it is the only thing that catches a wire-format change smuggled in with a type
 change. P1 and P2 next because they are small and carry real value at low risk — they prove the
