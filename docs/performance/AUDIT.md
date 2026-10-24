@@ -53,6 +53,33 @@ named constant with a proof obligation (invariant-derived, e.g. `MIN_MAX_BYTES =
 record header cannot be smaller), and add a test that fails if the value is changed to
 something the assumption forbids.
 
+#### C5b — every externalised value is also observable
+
+A tunable you cannot see is untunable. Each externalised value must publish, on the metrics
+surface the crate already uses (no new endpoint):
+
+1. the **configured** value (the limit),
+2. the **current usage** gauge against that limit,
+3. a **saturation or rejection counter** if the limit can be hit.
+
+Without (2) an operator cannot tell whether the setting is too tight until something fails;
+without (3) they cannot tell it was hit at all. The ratio usage/limit is then derivable
+without a second metric.
+
+Observer queue as the worked example — `Sender` has no length accessor, so:
+
+```rust
+// depth = bound - remaining; max_capacity() is the bound, capacity() is what is left.
+// Snapshot, not an invariant: a concurrent send can make it briefly stale.
+let depth = sender.max_capacity() - sender.capacity();
+```
+
+Expose depth, capacity, and the backpressure-event counter, so an undersized queue is
+visible before it is diagnosed from latency. The same treatment applies to the other
+behavioural constants in the table above: `DEFAULT_SPILL_THRESHOLD_PCT` needs current
+spill volume against the budget, and `MAX_SEALED_MEMTABLE_RETRIES` needs a retry-exhausted
+counter — a retry bound with no counter fails silently by definition.
+
 ### Phase 2 — performance, ranked by impact
 
 Ranked by *frequency on the write path*, not by raw occurrence count. Evidence is
