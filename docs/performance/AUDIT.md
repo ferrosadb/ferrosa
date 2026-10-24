@@ -3,6 +3,45 @@
 Companion to [PATTERNS.md](PATTERNS.md). This is the worklist: what to fix, in what order,
 how to prove each fix, and how to hand a crate to a sub-agent mechanically.
 
+## Order of work — correctness first, then performance
+
+A performance win that leaves data unreachable is worthless, so the correctness items come
+first and gate the rest.
+
+### Phase 1 — correctness
+
+| id | item | why it is correctness |
+|---|---|---|
+| **C1** | Async observer drops lose derived index entries — `engine.rs:9333-9343` | A committed edge can have no adjacency entry: durable data with no path to it, unreachable forever. `observer_drop_count` has no production reader. Detail and both fix shapes: class F below. |
+| **C2** | `&mut` on decoded input — 17 sites | The API invites rewriting the caller's row. Any transform that takes `&mut Row` can silently alter data on a path the caller believes is read-only. Sites: `memtable/mod.rs:284-285`, `:387` (`expand_legacy_collection_blobs`), `memtable/sharded.rs:539`, flush `engine.rs:4838`. |
+| **C3** | Relationship `MERGE` key derivation on an implicit label (#610) | Write path derives 32 bytes, read path derives 32, uuid endpoint columns accept 16 — so truncating on one side only makes written edges untraversable. Both paths must change together. Acceptance test `#[ignore]`d pending this. |
+| **C4** | Bolt diagnostic loss | The driver synthesises `An unknown error occurred`, and anonymous `CREATE (:Label {…})` is rejected as `no resolved binding`. A client cannot see why a write failed. |
+
+Proof for C2 is a value assertion that the input is byte-identical after the call. C1's red
+test is a capacity-1 observer with no drain.
+
+### Phase 2 — performance, ranked by impact
+
+Ranked by *frequency on the write path*, not by raw occurrence count. Evidence is
+`file:line`; these are counts and shapes, not yet measurements.
+
+| tier | site | cost per write | fix |
+|---|---|---|---|
+| **T1** | `engine.rs:9837` (and `:9720` when observers exist) | Up to 5 allocations and two full payload copies, **unconditional**, before any observer is consulted: `Mutation::new(keyspace.clone(), table.clone(), key.clone(), vec![row.clone()], ts)` | `TableRef { Arc<str>, Arc<str> }` + `Bytes` keys/cells; reuse one mutation buffer |
+| **T2** | `engine.rs:9338` | Deep clone per observer per write, on top of T1 | Becomes a refcount bump for free once T1 lands |
+| **T3** | `engine.rs:9261`, `:9308`, `:9981` | Whole-row clone per derived row to satisfy a `&Row` parameter while iterating a reference | `for row in dm.rows` — move, do not clone |
+| **T4** | `engine.rs:4838` | Row clone per row during flush (background path, not ingest latency) | Take ownership into the normalisation instead of cloning |
+| **T5** | `vec![row]` one-element allocation, same sites | One allocation per call, avoidable | Pass the row or a `SmallVec` |
+
+Tails, after triage: `&mut` input (17, correctness — folded into C2), identity `.to_string()`
+(185, but mostly cold — metrics, maintenance, `sort_by` keys at `engine.rs:7300`;
+roughly 10 real hot-path sites), `new_v4()` (210, verify which are per-write; cluster txn
+ids dominate), `.to_vec()` on key/cell (27), `Vec::new()` (752, overwhelmingly cold — only
+those inside row loops matter), `format!()` (2639, almost entirely error text — not a target).
+
+**T1 outranks T2**, which inverts the earlier focus: `9338` only costs on top of what `9837`
+already paid, and only per registered observer.
+
 ## Measured inventory (working tree, `src/` only, tests excluded)
 
 Counts are **smell indicators, not defects** — each must be triaged before it is fixed.

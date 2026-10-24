@@ -21,8 +21,11 @@ Branch: `feat/graph-schema-on-write` in worktree `.wt-schema-on-write`, rebased 
 
 ## Next action, precisely
 
-**Class F first**, because it is a correctness bug and because the Arc payload that fixes
-its cost is the same payload model the perf work needs.
+**Correctness first (Phase 1: C1–C4 in AUDIT.md § Order of work), then performance
+(Phase 2: T1–T5).** A perf win that leaves data unreachable is worthless.
+
+**C1 first**, because it is a correctness bug and because the Arc payload that fixes its cost
+is the same payload model the perf work needs.
 
 Red test: register an async observer with **capacity 1**, do not drain, write N edges, then
 drain and assert **every edge is traversable** — or that the keyspace is marked dirty and
