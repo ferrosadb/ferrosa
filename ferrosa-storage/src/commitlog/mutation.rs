@@ -65,6 +65,18 @@ pub struct Mutation {
     /// replay to deduplicate mutations that were written more than once (e.g.
     /// because a crash occurred during a previous replay).
     ///
+    /// **One id per mutation — never one id per statement or per batch.** Replay
+    /// dedup keys on this id alone: it keeps one set of already-applied ids for a
+    /// whole replay pass, spanning every table, and skips any mutation whose
+    /// non-zero id is in that set (`StorageEngine::open` for the streaming pass,
+    /// `StorageEngine::replay_mutations` for the pending one). So mutations of
+    /// one statement must each carry a distinct id: sharing one would make replay
+    /// apply the batch's first mutation and silently drop the rest. The cost of a
+    /// v4 per mutation is one OS-entropy call (`getrandom` → `getentropy`) per
+    /// write, which is accepted — a batched, derived or counter-based id is only
+    /// safe if it is still unique per mutation across the whole log, and a
+    /// collision here is silent data loss on replay.
+    ///
     /// A zero value (`[0u8; 16]`) is the legacy sentinel for mutations read
     /// from old commit-log segments that pre-date this field.  Zero ids are
     /// **not** deduplicated — they are always re-applied.
@@ -83,6 +95,11 @@ pub struct Mutation {
 
 impl Mutation {
     /// Creates a new mutation with a freshly-generated UUID.
+    ///
+    /// The id is minted per mutation on purpose: replay dedup keys on it alone,
+    /// so it must not be shared across the mutations of one statement or batch.
+    /// See the `mutation_id` field for the reasoning and the accepted cost of the
+    /// OS-entropy call.
     pub fn new(
         keyspace: String,
         table: String,
@@ -1400,6 +1417,34 @@ mod tests {
     fn sha256_hex(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(bytes))
+    }
+
+    /// T1 P1 decision: one id per mutation, never one id per statement or batch.
+    ///
+    /// Replay dedup keys on the id alone and spans every table in a pass (see
+    /// `replay_dedup_tests`), so a shared id would apply the batch's first
+    /// mutation and drop the rest. Minting must therefore stay per mutation.
+    #[test]
+    fn every_mutation_mints_its_own_non_zero_id() {
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..16 {
+            let m = Mutation::new(
+                "ks".to_string(),
+                "t".to_string(),
+                DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+                vec![],
+                GOLDEN_TS,
+            );
+            assert_ne!(
+                m.mutation_id, [0u8; 16],
+                "a fresh id must never be the legacy zero sentinel"
+            );
+            assert!(
+                ids.insert(m.mutation_id),
+                "id {:?} was minted twice; ids must be unique per mutation",
+                m.mutation_id
+            );
+        }
     }
 
     /// The v2 on-disk encoding of a fresh mutation, byte for byte.
