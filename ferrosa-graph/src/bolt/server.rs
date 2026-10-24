@@ -122,6 +122,13 @@ pub async fn start_bolt_server(
                 };
 
                 let current = active_connections.load(Ordering::Relaxed);
+                // Disable Nagle, as the PostgreSQL and CQL front ends do: a Bolt
+                // reply is several small messages (RECORDs, then the PULL
+                // summary), so each segment after the first otherwise waits for
+                // the peer's delayed ACK (~40ms) on a real network.
+                if let Err(error) = stream.set_nodelay(true) {
+                    tracing::debug!(%peer_addr, %error, "could not set TCP_NODELAY on Bolt socket");
+                }
                 if current >= config.max_connections {
                     tracing::warn!(
                         %peer_addr,
