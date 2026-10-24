@@ -9190,15 +9190,22 @@ impl StorageEngine {
         let mut rx = self.register_async_observer(observer.clone(), capacity);
 
         TaskPool::current("storage-observer-drain").spawn(async move {
+            // One buffer for the drain's whole lifetime, cleared per message.
+            // `derive_into` fills it in place, so observing a write adds no
+            // per-write allocation; observers that only implement `on_write`
+            // still work through the trait's default.
+            let mut derived: Vec<Mutation> = Vec::new();
             while let Some((table_id, mutation)) = rx.recv().await {
-                // observer.on_write is synchronous and non-blocking.
+                // observer.derive_into is synchronous and non-blocking.
                 // Wrap in catch_unwind so a panicking observer does not kill the drain loop.
+                derived.clear();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    observer.on_write(&table_id, &mutation)
+                    observer.derive_into(&table_id, &mutation, &mut derived)
                 }));
                 match result {
-                    Ok(derived) => {
-                        for dm in derived {
+                    Ok(()) => {
+                        // Move each derived mutation out; the buffer keeps its capacity.
+                        for dm in derived.drain(..) {
                             engine.apply_derived_mutation(&dm);
                         }
                     }
