@@ -599,7 +599,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "dist/${{ matrix.arch }}"
-          tarball=$(find artifacts -name "ferrosa-gnu-${{ matrix.arch }}.tar.gz" -print -quit)
+          tarball=$(find artifacts -name "image-bundle-gnu-${{ matrix.arch }}.tar.gz" -print -quit)
           test -n "$tarball" || { echo "ERROR: glibc tarball for ${{ matrix.arch }} not found" >&2; exit 1; }
           # Contains production/ and profiling/ side by side; Dockerfile.glibc
           # picks the variant by build target.

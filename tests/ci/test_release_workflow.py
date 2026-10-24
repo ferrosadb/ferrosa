@@ -175,7 +175,15 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # targets the GHCR images ship. A second compile inside the publish job
         # is the thing this replaced: it duplicated the build and carried its own
         # musl-libunwind failure modes.
-        self.assertIn("ferrosa-gnu-${{ matrix.arch }}.tar.gz", job)
+        #
+        # The name must be the one build-linux-gnu actually uploads. Its bundle
+        # cannot be `ferrosa-*`, or the release job would publish it as an asset
+        # (see tests/ci/test_release_glibc.py), so it is `image-bundle-gnu-<arch>`
+        # -- the same name docker-image-glibc consumes. Assert both ends, because
+        # asserting each job against its own literal is how they drifted apart.
+        self.assertIn("image-bundle-gnu-${{ matrix.arch }}.tar.gz", job)
+        gnu = workflow.split("  build-linux-gnu:\n", 1)[1].split("\n  docker-image-glibc:\n", 1)[0]
+        self.assertIn("name: image-bundle-gnu-${{ matrix.arch }}", gnu)
         self.assertIn("-f Dockerfile.glibc", job)
         self.assertIn("target=production", job)
         self.assertIn("target=profiling", job)
