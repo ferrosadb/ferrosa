@@ -110,7 +110,7 @@ Ranked by *frequency on the write path*, not by raw occurrence count. Evidence i
 
 | tier | site | cost per write | fix |
 |---|---|---|---|
-| **T1** | `engine.rs:9837` (and `:9720` when observers exist) | Up to 5 allocations and two full payload copies, **unconditional**, before any observer is consulted: `Mutation::new(keyspace.clone(), table.clone(), key.clone(), vec![row.clone()], ts)` | `TableRef { Arc<str>, Arc<str> }` + `Bytes` keys/cells; reuse one mutation buffer |
+| **T1** · [scoped](scopes/T1-mutation-payload.md) | `engine.rs:9837` (and `:9720` when observers exist) | Up to 5 allocations and two full payload copies, **unconditional**, before any observer is consulted: `Mutation::new(keyspace.clone(), table.clone(), key.clone(), vec![row.clone()], ts)` | `TableRef { Arc<str>, Arc<str> }` + `Bytes` keys/cells; reuse one mutation buffer |
 | **T2** | `engine.rs:9338` | Deep clone per observer per write, on top of T1 | Becomes a refcount bump for free once T1 lands |
 | **T3** | `engine.rs:9261`, `:9308`, `:9981` | Whole-row clone per derived row to satisfy a `&Row` parameter while iterating a reference | `for row in dm.rows` — move, do not clone |
 | **T4** | `engine.rs:4838` | Row clone per row during flush (background path, not ingest latency) | Take ownership into the normalisation instead of cloning |
