@@ -74,6 +74,40 @@ Fix: `Vec::with_capacity` computed from the row count (e.g. `rows*2` for adjacen
 
 Proof: capacity after the write equals the predicted size (no reallocation happened).
 
+## Class F — silent loss of derived index entries (CORRECTNESS, fix before any perf work)
+
+`engine.rs:9333-9343` enqueues each committed mutation to every async observer with
+`try_send(...).is_err()` → `drop_count += 1`. The write is durable; the **derived entry is
+discarded**. For adjacency that means a written edge exists on disk and can never be
+traversed — silent data inaccessibility, not a lost sample.
+
+Nothing repairs it:
+
+- `observer_drop_count` has **no production reader** — the only call sites are tests
+  (`engine.rs:22355, 22367`);
+- no drop path sets a dirty marker or triggers `reconcile_once_with(…, Repair)`.
+
+Both halves of the fix already have homes:
+
+1. **Make the hand-off cheap — "streaming with Arc".** With the payload refcounted
+   (`TableRef`/`Bytes`, class B+C), `try_send` carries a pointer instead of deep-cloning
+   two Strings, the key, and every row and cell (`engine.rs:9338`). This is what makes a
+   lossless or low-drop policy affordable.
+2. **Never lose the entry** — one of:
+   - **backpressure**: block/await until the queue has room, so index maintenance is
+     lossless and the writer pays the latency honestly; or
+   - **drop + repair**: on a drop, set a per-keyspace *adjacency dirty* marker and have the
+     existing `ensure_adjacency_ready` / `ReconcileMode::Repair` heal it before serving
+     traversals (the heal path already refuses queries with
+     `record_query_refused_during_heal`, so the degraded window is explicit rather than a
+     wrong answer).
+
+   Either is correct. What is not correct is counting a drop that nothing reads.
+
+**Red test:** register an async observer with capacity 1, do not drain, write N edges, then
+drain and assert every edge is traversable — or that the keyspace is marked dirty and the
+reconcile repairs it. Today: N-1 drops, no marker, missing adjacency entries.
+
 ## Crate briefs — execute in this order
 
 Each brief is self-contained: scope, invariants, gates, and what is out of scope.
