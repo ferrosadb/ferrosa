@@ -1603,7 +1603,8 @@ pub struct StorageEngine {
     time_series_consolidators: RwLock<HashMap<TableId, TimeSeriesConsolidatorHandle>>,
     time_series_runtime_settings: Arc<TimeSeriesRuntimeSettings>,
     time_series_wasm_aggregates: RwLock<Option<Arc<dyn TimeSeriesWasmAggregateExecutor>>>,
-    /// Default channel capacity for async observers.
+    /// Bounded queue capacity per async observer, from
+    /// [`crate::observer::ObserverConfig::from_env`] (deployment-tunable).
     async_observer_capacity: usize,
     /// Index build scheduler — rebuilds secondary indexes after compaction.
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
@@ -2672,11 +2673,34 @@ const DEFAULT_TIME_SERIES_MATERIALIZATION_POLL_INTERVAL: std::time::Duration =
 const DEFAULT_TIME_SERIES_MATERIALIZATION_BATCH_LIMIT: usize = 128;
 
 /// State for a single async observer: the observer, its sender half, and a
-/// drop counter for backpressure metrics.
+/// count of how often the write path had to derive inline because this
+/// observer's queue was full.
 struct AsyncObserverState {
     observer: Arc<dyn crate::observer::WriteObserver>,
     sender: tokio::sync::mpsc::Sender<(TableId, Mutation)>,
-    drop_count: Arc<AtomicU64>,
+    backpressure_count: Arc<AtomicU64>,
+}
+
+/// Async-observer queue gauges: `(staged mutations, bound in force)`.
+///
+/// `Sender::capacity()` is the REMAINING permits and `Sender::max_capacity()` the
+/// bound, so in-flight depth is the difference. This is a snapshot: a concurrent
+/// send or drain can make it read one message stale, which is why it is a gauge
+/// and nothing in the write path depends on it. With no observer registered the
+/// bound reported is the CONFIGURED capacity, so the tunable is visible before a
+/// first observer exists.
+fn observer_queue_gauges(states: &[AsyncObserverState], configured_capacity: usize) -> (u64, u64) {
+    if states.is_empty() {
+        return (0, configured_capacity as u64);
+    }
+    let mut depth = 0u64;
+    let mut capacity = 0u64;
+    for state in states {
+        let bound = state.sender.max_capacity() as u64;
+        capacity += bound;
+        depth += bound.saturating_sub(state.sender.capacity() as u64);
+    }
+    (depth, capacity)
 }
 
 struct TimeSeriesConsolidatorHandle {
@@ -3586,7 +3610,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -3848,7 +3872,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -4141,7 +4165,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -8536,7 +8560,7 @@ impl StorageEngine {
                 let state = AsyncObserverState {
                     observer,
                     sender: tx,
-                    drop_count: Arc::new(AtomicU64::new(0)),
+                    backpressure_count: Arc::new(AtomicU64::new(0)),
                 };
                 self.async_observers.write().push(state);
             }
@@ -8554,7 +8578,7 @@ impl StorageEngine {
         let state = AsyncObserverState {
             observer,
             sender: tx,
-            drop_count: Arc::new(AtomicU64::new(0)),
+            backpressure_count: Arc::new(AtomicU64::new(0)),
         };
         self.async_observers.write().push(state);
         rx
@@ -9225,6 +9249,9 @@ impl StorageEngine {
                         );
                     }
                 }
+                // The queue just lost a message: refresh the depth gauge so an
+                // operator sees the observer keeping up (and a stalled one not).
+                engine.publish_observer_queue_gauges();
             }
         });
     }
@@ -9327,29 +9354,107 @@ impl StorageEngine {
 
     /// Dispatches a mutation to all async observers watching the given table.
     ///
-    /// Uses `try_send` — never blocks the write path. If the channel is full,
-    /// the mutation is dropped and the drop counter is incremented.
+    /// The hand-off is `try_send`: never blocks, never awaits. That is required,
+    /// not incidental — this runs on the synchronous write path, and every
+    /// caller of it (`write`, `write_batch`, `write_mixed_batch`, the
+    /// timeseries materializer) may be executing on a tokio worker thread, where
+    /// `blocking_send` panics. An unbounded channel is equally unacceptable: a
+    /// stalled observer would grow the queue until the node OOMs.
+    ///
+    /// So when the queue is full (`TrySendError::Full`), or its drain task is
+    /// gone (`TrySendError::Closed`, e.g. an `Async` observer registered through
+    /// `register_observer`, which drops the receiver), the write path takes the
+    /// observer's work inline: `derive_into` + `apply_derived_mutation` — the
+    /// exact pair the drain task runs. No derived entry is ever discarded; the
+    /// writer pays the derivation instead, which is what backpressure means for
+    /// a synchronous producer. The cost per write stays bounded by one
+    /// derivation (it never waits for the consumer), and memory stays bounded by
+    /// the channel capacity.
+    ///
+    /// Each inline fallback is counted as a backpressure event
+    /// ([`StorageEngine::observer_backpressure_count`]): a rising count means the
+    /// queue is undersized for the write rate, and the write path is absorbing
+    /// index maintenance it was meant to keep off the durability path.
+    ///
+    /// Observers must therefore tolerate `derive_into` running on a writer
+    /// thread concurrently with the drain task. They are already `Send + Sync`;
+    /// they must not assume single-threaded or ordered derivation.
     fn dispatch_async_observers(&self, table_id: &TableId, mutation: &Mutation) {
         let async_obs = self.async_observers.read();
         for state in async_obs.iter() {
-            if state.observer.watches_table(table_id)
-                && state
-                    .sender
-                    .try_send((table_id.clone(), mutation.clone()))
-                    .is_err()
-            {
-                state.drop_count.fetch_add(1, Ordering::Relaxed);
+            if !state.observer.watches_table(table_id) {
+                continue;
             }
+            let Err(unsent) = state.sender.try_send((table_id.clone(), mutation.clone())) else {
+                continue;
+            };
+            crate::metrics::inc_observer_backpressure();
+            if state.backpressure_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                match &unsent {
+                    tokio::sync::mpsc::error::TrySendError::Full(_) => tracing::warn!(
+                        table = %table_id,
+                        capacity = state.sender.max_capacity(),
+                        "observer: async observer queue is full; deriving this write's entries \
+                         inline on the write path until the observer catches up"
+                    ),
+                    tokio::sync::mpsc::error::TrySendError::Closed(_) => tracing::warn!(
+                        table = %table_id,
+                        "observer: async observer has no drain task (receiver dropped); \
+                         deriving its entries inline on the write path"
+                    ),
+                }
+            }
+            self.derive_inline_on_write_path(state.observer.as_ref(), table_id, mutation);
+        }
+        let (depth, capacity) = observer_queue_gauges(&async_obs, self.async_observer_capacity);
+        crate::metrics::set_observer_queue(depth, capacity);
+    }
+
+    /// Publish the async-observer queue gauges from a caller that does NOT
+    /// already hold the observer lock (the drain loop, after applying a batch).
+    fn publish_observer_queue_gauges(&self) {
+        let async_obs = self.async_observers.read();
+        let (depth, capacity) = observer_queue_gauges(&async_obs, self.async_observer_capacity);
+        crate::metrics::set_observer_queue(depth, capacity);
+    }
+
+    /// The drain task's work, run on the calling thread: derive this write's
+    /// entries and apply them through the same durable path the drain task uses
+    /// (`apply_derived_mutation`), so a full queue costs latency instead of an
+    /// entry.
+    ///
+    /// `apply_derived_mutation` writes straight to the commit log and the target
+    /// memtable rather than calling `write`, so this cannot re-enter observer
+    /// dispatch. The caller holds `async_observers` read-locked across it, so an
+    /// observer that registers another observer from `derive_into` would
+    /// self-deadlock (the sync path has the same rule over `observers`).
+    fn derive_inline_on_write_path(
+        &self,
+        observer: &dyn crate::observer::WriteObserver,
+        table_id: &TableId,
+        mutation: &Mutation,
+    ) {
+        let mut derived: Vec<Mutation> = Vec::new();
+        observer.derive_into(table_id, mutation, &mut derived);
+        for dm in &derived {
+            self.apply_derived_mutation(dm);
         }
     }
 
-    /// Returns the total number of mutations dropped by async observers due to
-    /// backpressure (channel full).
-    pub fn observer_drop_count(&self) -> u64 {
+    /// Total number of times the write path derived an async observer's entries
+    /// inline because that observer's queue was full (or had no drain task),
+    /// across all observers.
+    ///
+    /// Not an error counter and not a data-loss counter: no entry was lost. It
+    /// is the signal that the queue capacity is undersized for the write rate
+    /// (see `ObserverConfig::queue_capacity` and
+    /// `FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY`), so index maintenance is landing
+    /// on the write path.
+    pub fn observer_backpressure_count(&self) -> u64 {
         let async_obs = self.async_observers.read();
         async_obs
             .iter()
-            .map(|s| s.drop_count.load(Ordering::Relaxed))
+            .map(|s| s.backpressure_count.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -16629,7 +16734,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -22340,33 +22445,231 @@ mod tests {
         assert_eq!(recv_mutation.keyspace, "test_ks");
     }
 
+    /// The smallest capacity `tokio::sync::mpsc::channel` accepts. ONE slot
+    /// guarantees the second write of a burst meets a FULL queue (the first is
+    /// still queued, nothing consumes it), so the inline backpressure path runs
+    /// after exactly one queued mutation — the minimum setup that exercises it
+    /// without depending on scheduling.
+    const STALLED_QUEUE_CAPACITY: usize = 1;
+
+    /// Three writes that each derive one row inline cost microseconds. Five
+    /// seconds is orders of magnitude above any legitimate inline derivation and
+    /// far below "waiting for a stalled consumer", so this bound fails on a
+    /// blocking regression rather than on a slow machine.
+    const STALLED_QUEUE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// An async observer over `test_ks.test_table` that derives one entry per
+    /// write into `test_ks.derived_table`, keyed by the source key — the shape of
+    /// the adjacency index, whose entries the old drop path discarded.
+    struct DerivingAsyncObserver {
+        watched: TableId,
+        derived_table: TableId,
+    }
+
+    impl DerivingAsyncObserver {
+        fn new(watched: TableId, derived_table: TableId) -> Self {
+            Self {
+                watched,
+                derived_table,
+            }
+        }
+    }
+
+    impl crate::observer::WriteObserver for DerivingAsyncObserver {
+        fn mode(&self) -> crate::observer::ObserverMode {
+            crate::observer::ObserverMode::Async
+        }
+
+        fn tables(&self) -> Vec<TableId> {
+            vec![self.watched.clone()]
+        }
+
+        fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation> {
+            let mut out = Vec::new();
+            self.derive_into(table, mutation, &mut out);
+            out
+        }
+
+        fn derive_into(&self, table: &TableId, mutation: &Mutation, out: &mut Vec<Mutation>) {
+            if table != &self.watched {
+                return;
+            }
+            out.push(Mutation {
+                mutation_id: [0x5a; 16],
+                keyspace: self.derived_table.keyspace.clone(),
+                table: self.derived_table.table.clone(),
+                key: mutation.key.clone(),
+                rows: mutation.rows.clone(),
+                timestamp: mutation.timestamp,
+            });
+        }
+    }
+
+    /// `test_schema` under another table name, for the derived entries to land in.
+    fn derived_schema() -> TableSchema {
+        TableSchema {
+            table: "derived_table".to_string(),
+            ..test_schema()
+        }
+    }
+
+    fn derived_table_id() -> TableId {
+        TableId::new("test_ks", "derived_table")
+    }
+
+    /// I1 — a committed write's derived entry is never lost. With a full queue
+    /// and a stalled drain, the write path derives inline, so every write of the
+    /// burst is accounted for: N-1 entries are already durable and the Nth is
+    /// pending in the queue, exactly as an unfull queue would leave it.
+    ///
+    /// Red on the base: the queue held one mutation, the other N-1 were
+    /// discarded, and reading the derived table found only the queued one, at
+    /// best (the drain never ran, so nothing at all).
     #[test]
-    fn async_observer_backpressure_drops() {
+    fn full_queue_never_loses_a_derived_entry() {
+        const BURST: usize = 3;
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
         let engine = StorageEngine::new(config, None).unwrap();
         engine.register_table(test_schema()).unwrap();
+        engine.register_table(derived_schema()).unwrap();
 
         let tid = table_id();
-        let observer = Arc::new(AsyncCountingObserver::new(vec![tid.clone()]));
-        // Tiny channel capacity of 2 to test backpressure.
-        let _rx = engine.register_async_observer(observer, 2);
+        let derived_tid = derived_table_id();
+        let observer = Arc::new(DerivingAsyncObserver::new(tid.clone(), derived_tid.clone()));
+        let mut rx = engine.register_async_observer(observer, STALLED_QUEUE_CAPACITY);
 
-        assert_eq!(engine.observer_drop_count(), 0);
-
-        // Write 5 mutations — channel holds 2, so at least 3 should be dropped.
-        for i in 0..5 {
+        for i in 0..BURST {
             let key = make_key(&format!("k{i}"));
-            engine
-                .write(&tid, &key, make_row(b"val", 1000 + i), 1000 + i)
-                .unwrap();
+            let ts = 1000 + i as i64;
+            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
         }
 
-        // Drop count should be >= 3 (channel capacity 2, 5 writes).
+        // Nothing drained the queue: k0 is still in it, and that is the only
+        // write whose entry may legitimately be outstanding.
+        let queued = rx.try_recv().expect("the first write must be queued");
+        assert!(rx.try_recv().is_err(), "capacity is one slot");
+        let queued_entry_derived = engine.read(&derived_tid, &queued.1.key).unwrap().is_none();
+
+        let mut derived_inline = 0;
+        for i in 0..BURST {
+            let key = make_key(&format!("k{i}"));
+            if engine.read(&derived_tid, &key).unwrap().is_some() {
+                derived_inline += 1;
+            }
+        }
+
         assert!(
-            engine.observer_drop_count() >= 3,
-            "expected >= 3 drops, got {}",
-            engine.observer_drop_count()
+            queued_entry_derived,
+            "the queued write must not also have been derived inline (that would double-apply)"
+        );
+        assert_eq!(
+            derived_inline,
+            BURST - 1,
+            "{} of {BURST} committed writes left NO derived entry behind while the drain was \
+             stalled; a committed write whose entry is missing is data the index cannot reach",
+            BURST - derived_inline - 1
+        );
+    }
+
+    /// I2 + I4 — durability and progress are unchanged: writes return while the
+    /// observer is stalled, and the inline fallback never waits for it, so a full
+    /// queue cannot hang the writer.
+    #[test]
+    fn full_queue_does_not_block_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(derived_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(DerivingAsyncObserver::new(tid.clone(), derived_table_id()));
+        // Held, never polled: the observer is stalled for the whole test.
+        let _rx = engine.register_async_observer(observer, STALLED_QUEUE_CAPACITY);
+
+        let started = std::time::Instant::now();
+        for i in 0..3 {
+            let key = make_key(&format!("k{i}"));
+            let ts = 1000 + i as i64;
+            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STALLED_QUEUE_WRITE_BOUND,
+            "three writes against a stalled observer took {elapsed:?}; the write path must \
+             never wait for the consumer"
+        );
+    }
+
+    /// I3 — the event is observable in production: the inline fallback increments
+    /// a counter published on the Prometheus surface, so an undersized queue is
+    /// visible instead of being inferred from index entries that do not exist.
+    #[test]
+    fn queue_full_is_observable_backpressure_not_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(derived_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(DerivingAsyncObserver::new(tid.clone(), derived_table_id()));
+        let _rx = engine.register_async_observer(observer, STALLED_QUEUE_CAPACITY);
+
+        let before = engine.observer_backpressure_count();
+        for i in 0..3 {
+            let key = make_key(&format!("k{i}"));
+            let ts = 1000 + i as i64;
+            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+        }
+        let events = engine.observer_backpressure_count() - before;
+
+        assert_eq!(
+            events, 2,
+            "expected 2 of 3 writes to fall back inline (one fits in the queue), got {events}"
+        );
+        let rendered = crate::metrics::render_prometheus();
+        assert!(
+            rendered.contains("ferrosa_storage_observer_backpressure_total"),
+            "the backpressure counter must be scrapeable in production, not test-only"
+        );
+        // Usage and limit, so `depth / capacity` is derivable by an operator:
+        // one observer, one slot, one message parked in it (nothing drains).
+        assert!(
+            rendered.contains("ferrosa_storage_observer_queue_depth 1\n"),
+            "the queue depth gauge must report the one staged mutation; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "ferrosa_storage_observer_queue_capacity {STALLED_QUEUE_CAPACITY}\n"
+            )),
+            "the configured capacity must be on the same surface as the depth"
+        );
+    }
+
+    /// The capacity gauge reports the CONFIGURED bound even before any observer
+    /// registers, so an operator can see the tunable that decides when the write
+    /// path starts absorbing index maintenance.
+    #[test]
+    fn queue_capacity_gauge_is_visible_with_no_observer() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.publish_observer_queue_gauges();
+        let expected = format!(
+            "ferrosa_storage_observer_queue_capacity {}\n",
+            crate::observer::DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+        let rendered = crate::metrics::render_prometheus();
+        assert!(
+            rendered.contains(&expected),
+            "expected {expected:?} in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ferrosa_storage_observer_queue_depth 0\n"),
+            "no observer means nothing staged"
         );
     }
 

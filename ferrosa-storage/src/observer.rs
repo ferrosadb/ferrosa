@@ -13,6 +13,15 @@
 //!
 //! `on_write` must be **non-blocking**. Do not perform async I/O, disk reads, or
 //! network calls inside `on_write`.
+//!
+//! # Concurrency contract
+//!
+//! An `Async` observer's derivation normally runs on its drain task, but when
+//! that observer's queue is full the write path derives inline instead
+//! (`StorageEngine::dispatch_async_observers`) so no entry is ever discarded.
+//! Implementations must therefore tolerate `derive_into`/`on_write` being called
+//! concurrently from a writer thread and the drain task, and must not assume
+//! derivation order between the two.
 
 use crate::commitlog::config::TableId;
 use crate::commitlog::mutation::Mutation;
@@ -66,10 +75,43 @@ pub trait WriteObserver: Send + Sync {
     }
 }
 
+/// The capacity a bounded channel falls back to when the deployment does not
+/// name one. See [`ObserverConfig::queue_capacity`] for what it assumes.
+pub const DEFAULT_OBSERVER_QUEUE_CAPACITY: usize = 10_000;
+
+/// Environment variable that overrides
+/// [`ObserverConfig::queue_capacity`]. A value below 1 is refused (tokio's
+/// `mpsc::channel(0)` panics) and the default is used, with a WARN.
+pub const OBSERVER_QUEUE_CAPACITY_ENV: &str = "FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY";
+
 /// Configuration for async observer dispatch.
 #[derive(Debug, Clone)]
 pub struct ObserverConfig {
-    /// Bounded channel capacity for async observers (default 10,000).
+    /// Bounded queue capacity per async observer, in mutations.
+    ///
+    /// This number decides when a hand-off to an async observer is REFUSED, so
+    /// it is a correctness knob, not a tuning nicety: past it, a committed
+    /// mutation's derived entry is not produced now: the keyspace is marked for
+    /// repair (`StorageEngine::observer_gap_open`) instead of the entry simply
+    /// vanishing.
+    ///
+    /// The default ([`DEFAULT_OBSERVER_QUEUE_CAPACITY`], 10,000) encodes three
+    /// assumptions:
+    /// - **Burst, not steady state.** The queue absorbs a burst the drain task
+    ///   has not caught up with yet. It cannot absorb a drain that stays behind
+    ///   forever; no finite queue can, which is why a refusal is repaired
+    ///   instead of being counted and forgotten.
+    /// - **Memory.** A staged `(TableId, Mutation)` is on the order of 0.2-1 KB
+    ///   (two owned strings, a key, and one statement's rows), so a full queue
+    ///   is a few MB per observer — small next to a memtable, and bounded
+    ///   rather than growing with a stalled consumer.
+    /// - **Repair cost.** An exceeded queue is repaired by one `Repair`
+    ///   reconcile pass over the keyspace before its traversals are served
+    ///   (hundreds of milliseconds for a locally-read index, per the graph
+    ///   engine's catch-up measurements), so the value trades write-side buffer
+    ///   memory against read-side repair frequency.
+    ///
+    /// Override with [`OBSERVER_QUEUE_CAPACITY_ENV`].
     pub queue_capacity: usize,
     /// Batch drain interval in milliseconds (default 10).
     pub batch_interval_ms: u64,
@@ -78,8 +120,47 @@ pub struct ObserverConfig {
 impl Default for ObserverConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 10_000,
+            queue_capacity: DEFAULT_OBSERVER_QUEUE_CAPACITY,
             batch_interval_ms: 10,
+        }
+    }
+}
+
+impl ObserverConfig {
+    /// [`ObserverConfig::default`] with deployment overrides applied. Every
+    /// engine constructor uses this, so a deployment tunes the drop threshold
+    /// without a rebuild.
+    pub fn from_env() -> Self {
+        Self {
+            queue_capacity: queue_capacity_from_env(),
+            ..Self::default()
+        }
+    }
+}
+
+/// [`OBSERVER_QUEUE_CAPACITY_ENV`], or the default when unset or unusable.
+pub fn queue_capacity_from_env() -> usize {
+    queue_capacity_from(std::env::var(OBSERVER_QUEUE_CAPACITY_ENV).ok().as_deref())
+}
+
+/// Parse an operator-supplied capacity. A missing, unparsable or zero value is
+/// the default: the queue is what stands between a full observer and a dropped
+/// derived entry, and `mpsc::channel(0)` panics, so a bad override must not
+/// become a startup failure or an always-full queue.
+fn queue_capacity_from(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_OBSERVER_QUEUE_CAPACITY;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(capacity) if capacity >= 1 => capacity,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                variable = OBSERVER_QUEUE_CAPACITY_ENV,
+                default = DEFAULT_OBSERVER_QUEUE_CAPACITY,
+                "observer: unusable async observer queue capacity; using the default"
+            );
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
         }
     }
 }
@@ -89,6 +170,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn queue_capacity_override_is_external_and_validated() {
+        assert_eq!(queue_capacity_from(None), DEFAULT_OBSERVER_QUEUE_CAPACITY);
+        // An operator's value is honoured exactly: it sets the drop threshold.
+        assert_eq!(queue_capacity_from(Some("64")), 64);
+        assert_eq!(queue_capacity_from(Some(" 512 ")), 512);
+        // Unusable values must not become an always-full queue or a panic.
+        assert_eq!(
+            queue_capacity_from(Some("0")),
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            queue_capacity_from(Some("not-a-number")),
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            queue_capacity_from(Some("-1")),
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+    }
 
     #[test]
     fn observer_mode_values() {
