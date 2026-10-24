@@ -1339,8 +1339,11 @@ pub fn cql_value_to_json(value: &CqlValue) -> String {
 
         // Blob — quoted hex
         CqlValue::Blob(b) => {
-            let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
-            format!("\"0x{}\"", hex)
+            let mut out = String::with_capacity(b.len() * 2 + 4);
+            out.push_str("\"0x");
+            crate::hex::push_lower(&mut out, b);
+            out.push('"');
+            out
         }
 
         // List and Set — JSON array
@@ -3129,6 +3132,25 @@ mod tests {
     fn tojson_blob() {
         let json = cql_value_to_json(&CqlValue::Blob(vec![0xDE, 0xAD]));
         assert_eq!(json, "\"0xdead\"");
+        // Lowercase, two digits per byte, `0x`-prefixed (T6 replaced the
+        // per-byte `format!` with a table-driven encoder).
+        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![])), "\"0x\"");
+        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![0x00])), "\"0x00\"");
+        assert_eq!(cql_value_to_json(&CqlValue::Blob(vec![0xff])), "\"0xff\"");
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Blob(vec![0xFF, 0x0F, 0x80, 0x7f])),
+            "\"0xff0f807f\""
+        );
+        let key: Vec<u8> = (0u8..32).collect();
+        assert_eq!(
+            cql_value_to_json(&CqlValue::Blob(key)),
+            "\"0x000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f\"",
+            "32-byte key hex must stay lowercase and zero-padded"
+        );
+        // One allocation for the whole JSON value, however many bytes.
+        let json = cql_value_to_json(&CqlValue::Blob(vec![0xAB; 1024]));
+        assert_eq!(json.len(), 1024 * 2 + 4);
+        assert_eq!(json.capacity(), json.len());
     }
 
     #[test]
