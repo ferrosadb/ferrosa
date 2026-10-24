@@ -13,6 +13,10 @@ how to prove each fix, and how to hand a crate to a sub-agent mechanically.
    ways committed data can become unreachable.
 2. **Allocation model (T1 -> T6).** The write path first: `Mutation::new` per write (T1) is the
    head of the chain, `9338` (T2) becomes a refcount bump once T1 carries `TableRef`/`Bytes`.
+   Design: `docs/design/graph-identity-and-attributes.md` — identity is the declared key
+   tuple (any arity), attributes are a typed map, access paths are derived index tables, and
+   proximity is a cell-prefix scan rather than a key ordering. Read it before implementing.
+
 3. **Graph secondary indexes.** `CREATE INDEX ... FOR (n:Label) ON (n.pk)` currently fails with
    `CypherSyntaxError`, so every graph "point read" is a label scan — measured 136 ms versus
    Neo4j's 2 ms at 20k nodes. This is a BUG, and it is the next performance lever after
