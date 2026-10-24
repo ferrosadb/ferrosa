@@ -55,12 +55,6 @@ jobs:
       # refuse to release below the latest stable tag.
       - name: Check release version comes from main
         run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
-      # Pins the musl profiling link: both libunwinds (the hand-built one for
-      # jemalloc's unw_backtrace, Rust's sysroot one for _Unwind_Resume) must be
-      # passed as link args, because `-L` makes one shadow the other and the
-      # profiling image silently stops shipping.
-      - name: Check musl profiling libunwind link contract
-        run: python3 -m unittest -q tests/ci/test_profiling_libunwind_link.py
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check CI builds the shipped binary once

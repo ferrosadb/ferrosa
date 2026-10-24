@@ -385,6 +385,17 @@ jobs:
           readelf --sections "$profiling_binary" | grep -q '\.debug_info'
           "$profiling_binary" --version
           ldd "$profiling_binary" || true
+          # Prove the shipped profiling binary can actually EMIT a heap profile.
+          # Symbols are useless if jemalloc's runtime profiler is inert, and on
+          # musl that was a live failure mode (wrong backtracer -> segfault on
+          # the first sampled allocation). On glibc the distro's libunwind-dev
+          # satisfies jemalloc's configure directly, so the musl-only
+          # hand-built-libunwind + `ld --start-group` dance is not needed --
+          # but the end-to-end probe still is.
+          MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile" \
+            "$profiling_binary" --version
+          profile_file=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit)
+          test -s "$profile_file"
 
       - name: Stage both variants for the image build
         run: |
@@ -540,9 +551,14 @@ jobs:
   # ── Downloadable production and profiling OCI archives ───────────────
   publish-oci-downloads:
     name: Publish ${{ matrix.image }} OCI / ${{ matrix.arch }}
+    # Consumes the glibc binaries from build-linux-gnu (production + profiling
+    # variants, already built once per arch) and packages them with the SAME
+    # Dockerfile.glibc targets the GHCR images use. Previously this job consumed
+    # the musl tarballs and recompiled the profiling binary from source on the
+    # runner to satisfy musl's libunwind requirement -- a second build of the
+    # same thing, with its own failure modes. glibc needs no such workaround.
     needs:
-      - build-linux-x86_64
-      - build-linux-aarch64
+      - build-linux-gnu
     runs-on: ${{ matrix.runner }}
     permissions:
       actions: read
@@ -552,22 +568,18 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            target: x86_64-unknown-linux-musl
             platform: linux/amd64
             runner: ubuntu-latest
             image: ferrosa-minimal
           - arch: arm64
-            target: aarch64-unknown-linux-musl
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             image: ferrosa-minimal
           - arch: amd64
-            target: x86_64-unknown-linux-musl
             platform: linux/amd64
             runner: ubuntu-latest
             image: ferrosa-profiling
           - arch: arm64
-            target: aarch64-unknown-linux-musl
             platform: linux/arm64
             runner: ubuntu-24.04-arm
             image: ferrosa-profiling
@@ -583,129 +595,18 @@ jobs:
             "${GITHUB_REPOSITORY}" \
             artifacts
 
-      - name: Stage production runtime binaries
+      - name: Stage the glibc binaries for the image build
         run: |
           set -euo pipefail
           mkdir -p "dist/${{ matrix.arch }}"
-          case "${{ matrix.arch }}" in
-            amd64)
-              tarball=$(find artifacts -name 'ferrosa-*-x86_64-unknown-linux-musl.tar.gz' -print -quit)
-              test -n "$tarball" || { echo "ERROR: x86_64 release tarball not found" >&2; exit 1; }
-              tar -xzf "$tarball" -C "dist/${{ matrix.arch }}" ./ferrosa ./ferrosa-ctl
-              ;;
-            arm64)
-              arm_tarball=$(find artifacts -name 'ferrosa-*-aarch64-unknown-linux-musl.tar.gz' -print -quit)
-              test -n "$arm_tarball" || { echo "ERROR: arm64 release tarball not found" >&2; exit 1; }
-              tar -xzf "$arm_tarball" -C "dist/${{ matrix.arch }}" ./ferrosa ./ferrosa-ctl
-              ;;
-          esac
-          chmod 0755 "dist/${{ matrix.arch }}/ferrosa" "dist/${{ matrix.arch }}/ferrosa-ctl"
+          tarball=$(find artifacts -name "ferrosa-gnu-${{ matrix.arch }}.tar.gz" -print -quit)
+          test -n "$tarball" || { echo "ERROR: glibc tarball for ${{ matrix.arch }} not found" >&2; exit 1; }
+          # Contains production/ and profiling/ side by side; Dockerfile.glibc
+          # picks the variant by build target.
+          tar -xzf "$tarball" -C "dist/${{ matrix.arch }}"
+          ls -l "dist/${{ matrix.arch }}/production" "dist/${{ matrix.arch }}/profiling"
 
-      - name: Install profiling build prerequisites
-        if: matrix.image == 'ferrosa-profiling'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
 
-      - name: Build musl libunwind for profiling
-        if: matrix.image == 'ferrosa-profiling'
-        run: |
-          unwind_prefix="$RUNNER_TEMP/musl-libunwind"
-          bash .github/scripts/build-musl-libunwind.sh "${{ matrix.target }}" "$unwind_prefix"
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        if: matrix.image == 'ferrosa-profiling'
-        with:
-          targets: ${{ matrix.target }}
-
-      - name: Build optimized Ferrosa with DWARF symbols
-        if: matrix.image == 'ferrosa-profiling'
-        env:
-          CC_aarch64_unknown_linux_musl: musl-gcc
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
-          CFLAGS_aarch64_unknown_linux_musl: -mno-outline-atomics
-        run: |
-          set -euo pipefail
-          unwind_prefix="$RUNNER_TEMP/musl-libunwind"
-
-          # THREE things must hold for jemalloc's heap profiler to work on musl.
-          # Each is a distinct failure mode; all three were previously wrong.
-          #
-          # 1. jemalloc's configure must FIND libunwind, or it silently falls
-          #    back to the JEMALLOC_PROF_GCC frame-pointer walker and the first
-          #    sampled allocation segfaults in an optimized (frameless) build:
-          #      prof_backtrace_impl (prof_sys.c, BT_FRAME(4)) -> SIGSEGV
-          #    configure gates libunwind on
-          #      AC_CHECK_HEADERS([libunwind.h])          # satisfied by CPPFLAGS
-          #      AC_CHECK_LIB([unwind],[unw_backtrace])   # needs -L, not headers
-          #    so LDFLAGS must expose the library path. That -L is consumed only
-          #    by jemalloc-sys's configure; it is NOT a Rust link search path.
-          #
-          # 2. BOTH libunwinds are needed, linked by explicit path (a Rust `-L`
-          #    search path would let `-lunwind` bind to whichever comes first):
-          #      * the sysroot archive supplies the C++ ABI symbols the Rust link
-          #        needs -- _Unwind_Resume, __register_frame, __deregister_frame.
-          #        Nothing else defines them: the link runs with -nodefaultlibs,
-          #        so libgcc is never pulled in.
-          #      * the hand-built archive supplies the libunwind C API jemalloc's
-          #        profiler calls -- unw_backtrace, unw_flush_cache,
-          #        unw_set_caching_policy. The sysroot archive lacks those.
-          #
-          # 3. Both archives and the musl libc must sit in ONE ld --start-group.
-          #    Pulling the hand-built archive's objects in makes ld need musl
-          #    libc (`strcat`, `sigprocmask`), which under -nodefaultlibs is only
-          #    in scope inside the group. Measured on x86_64 musl:
-          #      group(custom, sysroot)          -> exit 101, sigprocmask undefined
-          #      group(custom, sysroot, libc.a)  -> exit 0, unw_backtrace linked,
-          #                                         --version ok, .heap written
-          # See tests/ci/test_profiling_libunwind_link.py.
-          sysroot_libunwind=""
-          for candidate in "$(rustc --print target-libdir --target "${{ matrix.target }}")/self-contained/libunwind.a" \
-                           "$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib/self-contained/libunwind.a"; do
-            if [ -f "$candidate" ]; then sysroot_libunwind="$candidate"; break; fi
-          done
-          if [ -z "$sysroot_libunwind" ]; then
-            echo "::error::no sysroot libunwind for ${{ matrix.target }}; it is what defines _Unwind_Resume under -nodefaultlibs" >&2
-            exit 1
-          fi
-          sysroot_libc=""
-          for candidate in "$(rustc --print target-libdir --target "${{ matrix.target }}")/self-contained/libc.a" \
-                           "$(rustc --print sysroot)/lib/rustlib/${{ matrix.target }}/lib/self-contained/libc.a"; do
-            if [ -f "$candidate" ]; then sysroot_libc="$candidate"; break; fi
-          done
-          if [ -z "$sysroot_libc" ]; then
-            echo "::error::no sysroot libc.a for ${{ matrix.target }}; the hand-built libunwind needs musl libc (strcat, sigprocmask) inside the ld --start-group" >&2
-            exit 1
-          fi
-          echo "custom  libunwind: $unwind_prefix/lib/libunwind.a"
-          echo "sysroot libunwind: $sysroot_libunwind"
-          echo "sysroot libc     : $sysroot_libc"
-
-          export CPPFLAGS="-I$unwind_prefix/include"
-          # Consumed by jemalloc-sys's configure only (see 1.); not a Rust search path.
-          export LDFLAGS="-L$unwind_prefix/lib"
-          # Frame pointers so a sampled CPU profile can unwind THROUGH assembly leaves.
-          # The musl `memcpy`/`memmove` fast paths are hand-written asm with no CFI, so
-          # --call-graph dwarf stops dead at them: measured on a loaded node, 12,506 of
-          # 16,285 memcpy samples (77 %) had a 2-frame stack (`cql-rt;memcpy`) and 6.5 % of
-          # total CPU was un-attributable. Ordinary Rust frames unwind fine without this
-          # (79.8 % of samples reach depth >= 5), so the flag is narrow: it fixes the leaf.
-          # PROFILING IMAGE ONLY -- never release; frame pointers cost a register there.
-          # Pair with `perf record --call-graph fp`.
-          export RUSTFLAGS="${RUSTFLAGS:-} -C force-frame-pointers=yes -C link-arg=-Wl,--start-group -C link-arg=$unwind_prefix/lib/libunwind.a -C link-arg=$sysroot_libunwind -C link-arg=$sysroot_libc -C link-arg=-Wl,--end-group"
-          cargo build --locked --profile profiling \
-            --target "${{ matrix.target }}" \
-            -p ferrosa --bin ferrosa --features ferrosa/full,ferrosa/profiling
-          profiling_binary="target/${{ matrix.target }}/profiling/ferrosa"
-          test -x "$profiling_binary"
-          readelf --sections "$profiling_binary" | grep -q '\.debug_info'
-          if readelf --program-headers "$profiling_binary" | grep 'INTERP'; then
-            echo "profiling binary unexpectedly requires a dynamic loader" >&2
-            exit 1
-          fi
-          MALLOC_CONF="prof:true,prof_active:true,prof_final:true,lg_prof_sample:0,prof_prefix:$RUNNER_TEMP/ferrosa-profile" \
-            "$profiling_binary" --version
-          profile_file=$(find "$RUNNER_TEMP" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit)
-          test -s "$profile_file"
-          install -m 0755 "$profiling_binary" "dist/${{ matrix.arch }}/ferrosa"
 
       - name: Build a single-architecture OCI archive
         run: |
@@ -713,9 +614,14 @@ jobs:
           docker buildx create --name ferrosa-oci --use 2>/dev/null || docker buildx use ferrosa-oci
           docker buildx inspect --bootstrap
           mkdir -p "$RUNNER_TEMP/stage/oci"
+          # ferrosa-minimal is the stripped production image; ferrosa-profiling
+          # is the DWARF + perf/jeprof image. Same targets the GHCR images ship.
+          target=production
+          [ "${{ matrix.image }}" = "ferrosa-profiling" ] && target=profiling
           docker buildx build \
             --platform "${{ matrix.platform }}" \
-            -f Dockerfile.release \
+            --target "$target" \
+            -f Dockerfile.glibc \
             --output "type=oci,dest=$RUNNER_TEMP/stage/oci/oci.tar" \
             .
           tar -tf "$RUNNER_TEMP/stage/oci/oci.tar" | grep -qx 'index.json'
@@ -879,6 +785,30 @@ jobs:
           unstripped, with `perf` for CPU flame graphs and `jeprof` for jemalloc
           heap profiles. Use the production image for measurement and the
           profiling image when you need to explain what a measurement is made of.
+
+          ### Downloadable OCI archives
+
+          The same two images are published as OCI archives on
+          `downloads.ferrosa.ai` for scripted or air-gapped fetches, so a
+          performance rig does not need GHCR credentials:
+
+          ```
+          https://downloads.ferrosa.ai/images/<arch>/<channel>/<image>/linux/oci/<version>/oci.tar
+          ```
+
+          - `<arch>`: `amd64` or `arm64`
+          - `<channel>`: `nightly` or `stable`
+          - `<image>`: `ferrosa-minimal` (production) or `ferrosa-profiling`
+          - `<version>`: the release version without the leading `v`
+
+          Each version directory also carries `MANIFEST` and `SHA256SUMS`.
+          Both images carry the glibc binaries; `ferrosa-profiling` adds `perf`,
+          `gdb` and `jeprof`. Load and run with:
+
+          ```bash
+          curl -fLO https://downloads.ferrosa.ai/images/amd64/nightly/ferrosa-profiling/linux/oci/VERSION/oci.tar
+          podman load -i oci.tar
+          ```
 
           ### Verifying downloads
 
