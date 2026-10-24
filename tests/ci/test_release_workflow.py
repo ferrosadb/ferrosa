@@ -169,8 +169,17 @@ class ReleaseWorkflowTest(unittest.TestCase):
         job = workflow.split("  publish-oci-downloads:\n", 1)[1].split("\n  release:\n", 1)[0]
         self.assertIn("ferrosa-minimal", job)
         self.assertIn("ferrosa-profiling", job)
-        self.assertIn("--profile profiling", job)
-        self.assertIn("ferrosa/full,ferrosa/profiling", job)
+        # The publisher packages the binaries build-linux-gnu already compiled
+        # (production + profiling, once per arch) using the same Dockerfile.glibc
+        # targets the GHCR images ship. A second compile inside the publish job
+        # is the thing this replaced: it duplicated the build and carried its own
+        # musl-libunwind failure modes.
+        self.assertIn("ferrosa-gnu-${{ matrix.arch }}.tar.gz", job)
+        self.assertIn("-f Dockerfile.glibc", job)
+        self.assertIn("target=production", job)
+        self.assertIn("target=profiling", job)
+        self.assertNotIn("Dockerfile.release", job)
+        self.assertNotIn("cargo build", job)
         self.assertIn("images/${{ matrix.arch }}/${{ steps.identity.outputs.channel }}", job)
         self.assertIn("scripts/publish-images.sh", job)
         self.assertIn("R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}", job)
@@ -184,52 +193,43 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertIn("profile_file=$(find \"$RUNNER_TEMP\" -maxdepth 1 -name 'ferrosa-profile.*.heap' -print -quit)", workflow)
         self.assertIn('test -s "$profile_file"', workflow)
 
-    def test_profiling_feature_uses_libunwind_for_musl_stack_samples(self):
+    def test_profiling_feature_links_libunwind_for_stack_samples(self):
+        """The profiling build must still have a working backtracer.
+
+        ferrosa's `profiling` feature turns on jemalloc's heap profiler through
+        libunwind (`profiling = ["tikv-jemallocator/profiling_libunwind"]`).
+        On glibc the distro's libunwind-dev satisfies jemalloc's configure, so
+        the musl-only workarounds -- a hand-built libunwind archive plus a single
+        `ld --start-group` of (custom archive, sysroot archive, musl libc.a) --
+        are not needed and must not come back.
+        """
         manifest = (ROOT / "ferrosa" / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn('version = "0.7"', manifest)
         self.assertIn('profiling = ["tikv-jemallocator/profiling_libunwind"]', manifest)
 
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn('bash .github/scripts/build-musl-libunwind.sh "${{ matrix.target }}" "$unwind_prefix"', workflow)
-        self.assertIn('CPPFLAGS="-I$unwind_prefix/include"', workflow)
-        # jemalloc's configure must FIND libunwind: AC_CHECK_HEADERS is satisfied
-        # by CPPFLAGS, but AC_CHECK_LIB([unwind],[unw_backtrace]) needs -L. With
-        # headers and no library path the check fails, enable_prof_libunwind
-        # silently reverts, and jemalloc uses the JEMALLOC_PROF_GCC
-        # frame-pointer walker, which segfaults on the first sampled allocation.
-        # This LDFLAGS is consumed only by jemalloc-sys's configure; it is not a
-        # Rust link search path.
-        self.assertIn('LDFLAGS="-L$unwind_prefix/lib"', workflow)
-        # For the RUST link, both libunwinds (and musl libc) go in one
-        # --start-group, by explicit path. `-Lnative`/`-L` on the Rust side
-        # shadowed Rust's sysroot libunwind, so `-lunwind` stopped resolving
-        # _Unwind_Resume; and without libc.a in the group the hand-built
-        # archive's musl-libc references (strcat, sigprocmask) go unresolved.
-        self.assertNotIn("Lnative=$unwind_prefix/lib", workflow)
-        self.assertIn("-Wl,--start-group", workflow)
-        self.assertIn("-Wl,--end-group", workflow)
-        self.assertIn('link-arg=$unwind_prefix/lib/libunwind.a', workflow)
-        self.assertIn('link-arg=$sysroot_libunwind', workflow)
-        self.assertIn('link-arg=$sysroot_libc', workflow)
-        self.assertIn("self-contained/libunwind.a", workflow)
-        self.assertIn("self-contained/libc.a", workflow)
-        self.assertIn("if readelf --program-headers \"$profiling_binary\" | grep 'INTERP'; then", workflow)
-        # Frame pointers, so `perf record --call-graph fp` can unwind through the
-        # musl assembly `memcpy`/`memmove` leaves, which carry no CFI. Without it the
-        # DWARF unwinder stops at those leaves: measured 12,506/16,285 (77 %) of memcpy
-        # samples were 2-frame (`cql-rt;memcpy`) and 6.5 % of CPU was un-attributable.
-        # Profiling image ONLY -- the release build must not pay the register cost.
-        self.assertIn("-C force-frame-pointers=yes", workflow)
+        job = workflow.split("  build-linux-gnu:\n", 1)[1].split("\n  docker-image-glibc:\n", 1)[0]
+        # libunwind-dev is what makes jemalloc's unw_backtrace link on glibc.
+        self.assertIn("libunwind-dev", job)
+        self.assertIn("--profile profiling", job)
+        self.assertIn("ferrosa/full,ferrosa/profiling", job)
+        # Frame pointers, so `perf record --call-graph fp` can unwind through
+        # optimized code. Profiling binary ONLY -- a release build must not pay
+        # the register cost.
+        self.assertIn("-C force-frame-pointers=yes", job)
+        # The profiling binary must be asserted to still carry DWARF, and the
+        # production one to have been stripped.
+        self.assertIn("readelf --sections", job)
+        self.assertIn(".debug_info", job)
 
-        build_script = ROOT / ".github" / "scripts" / "build-musl-libunwind.sh"
-        script = build_script.read_text(encoding="utf-8")
-        self.assertIn("ddf0e32dd5fafe5283198d37e4bf9decf7ba1770b6e7e006c33e6df79e6a6157", script)
-        self.assertIn('x86_64-unknown-linux-musl)', script)
-        self.assertIn('aarch64-unknown-linux-musl)', script)
-        self.assertIn("--disable-shared", script)
-        self.assertIn("--disable-minidebuginfo", script)
-        self.assertIn("--disable-zlibdebuginfo", script)
-        self.assertIn("cflags=\"-O2 -mno-outline-atomics\"", script)
+        # The hand-built musl libunwind link contract is retired.
+        self.assertNotIn("build-musl-libunwind.sh", workflow)
+        self.assertNotIn("-Wl,--start-group", workflow)
+        self.assertNotIn("sysroot_libc", workflow)
+        self.assertFalse(
+            (ROOT / ".github" / "scripts" / "build-musl-libunwind.sh").exists(),
+            "the hand-built musl libunwind script should be deleted, not left as dead code",
+        )
 
     def test_all_feature_test_workflows_install_host_libunwind(self):
         for workflow_path in (

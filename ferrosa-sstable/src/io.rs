@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Add checked skipped-range validation to positional readers.
+//! Correctness: Cursor parity, corruption and ordinal-remap tests.
+//!
 //! Positional I/O traits and file-system implementations.
 //!
 //! [`ReadAt`] and [`WriteAt`] decouple SSTable logic from the backing store.
@@ -47,6 +51,33 @@ pub trait ReadAt {
     /// Returns the number of bytes read (may be less than `buf.len()` at EOF).
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize>;
 
+    /// Read a sparse range without disturbing sequential read-ahead state.
+    /// The byte/error contract matches `read_at`; adapters may ignore the hint.
+    fn read_at_sparse(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        self.read_at(buf, offset)
+    }
+
+    /// Validate a skipped payload without retaining it. Adapters with checksum
+    /// chunks may override this to verify chunks without copying their payloads.
+    fn validate_range(&self, offset: u64, len: usize) -> Result<()> {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| ferrosa_common::Error::InvalidData("payload extent overflow".into()))?;
+        if end > self.len()? {
+            return Err(ferrosa_common::Error::InvalidData(
+                "payload extends beyond data".into(),
+            ));
+        }
+        let mut scratch = [0u8; 4096];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(scratch.len());
+            self.read_exact_at(&mut scratch[..n], offset + done as u64)?;
+            done += n;
+        }
+        Ok(())
+    }
+
     /// Returns the total length of the underlying data.
     fn len(&self) -> Result<u64>;
 
@@ -73,8 +104,15 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
         (**self).read_at(buf, offset)
     }
 
+    fn read_at_sparse(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        (**self).read_at_sparse(buf, offset)
+    }
+
     fn len(&self) -> Result<u64> {
         (**self).len()
+    }
+    fn validate_range(&self, offset: u64, len: usize) -> Result<()> {
+        (**self).validate_range(offset, len)
     }
 }
 
@@ -630,6 +668,14 @@ impl Drop for FileReadAt {
 }
 
 impl ReadAt for FileReadAt {
+    fn read_at_sparse(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
+        #[cfg(unix)]
+        if let FileReadAtInner::Scan(reader) = &self.inner {
+            return reader.read_at_sparse(buf, offset);
+        }
+        self.read_at(buf, offset)
+    }
+
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<usize> {
         match &self.inner {
             FileReadAtInner::Mmap { mmap, len, .. } => {

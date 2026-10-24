@@ -1812,17 +1812,17 @@ impl ModeController {
         self.write_path
             .store(Arc::new(WritePath::cluster(coordinator)));
 
-        // DdlPath::Cluster needs the Raft instance — Raft initialization is async
-        // and happens in a background task. Keep DDL on Direct path during the
-        // transition window so standalone/pair DDL continues to work. Once Raft
-        // is initialized and a leader is elected, the background task will:
-        //   1. Swap DDL path to DdlPath::Cluster
-        //   2. Replay the current local schema state through Raft so all
-        //      followers converge on the same schema
-        self.ddl_path.store(Arc::new(DdlPath::Direct {
-            schema: self.schema.clone(),
-            engine: self.storage.clone(),
-        }));
+        // Raft initialization and Cluster DDL publication happen asynchronously.
+        // A Direct CREATE here would acknowledge only a local change: subsequent
+        // local-schema replay does not invoke the remote-DC relay. Keep an
+        // existing formation queue, or install one for a direct cluster entry,
+        // so early callers get the retriable formation error until publication.
+        if !matches!(&**self.ddl_path.load(), DdlPath::Forming { .. }) {
+            let (queue, receiver) =
+                tokio::sync::mpsc::channel(crate::ddl_path::FORMING_DDL_QUEUE_CAPACITY);
+            *self.ddl_queue_rx.lock() = Some(receiver);
+            self.ddl_path.store(Arc::new(DdlPath::Forming { queue }));
+        }
 
         // Swap cluster state to Raft-based
         self.cluster_state

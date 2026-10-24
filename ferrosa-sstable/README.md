@@ -574,3 +574,43 @@ three-segment submissions into a two-segment ring: zero allocation events and
 zero allocated bytes (0 bytes/wait). This supersedes the earlier T-034 residual
 park-allocation claim for the measured built-in `NeverAbort` path. Custom abort
 implementations and transport/read-ahead allocation surfaces remain separate.
+
+## Incremental compaction cursors (2026-10-23)
+
+`SSTableWriter::begin_partition`, `write_partition_row` and `end_partition`
+accept a partition header followed by individually validated rows, writing
+directly to the existing staging sinks. A failed row poisons the writer; an
+unfinished or failed streamed partition cannot finish. Streamed clustered
+partitions index every row; the existing owned `add_partition` path keeps its
+row-index threshold and golden encoding.
+
+`SSTableReader::scan_iter` owns reusable compressed and decompressed/CRC buffers
+and bypasses shared chunk-cache locks. `next_clustered_row_into` reuses caller-
+owned clustering, cell, path and value storage. It fully decodes and validates
+values; EOF before the partition end marker is an error. New maxima and varying
+row shapes may grow buffers, while fixed-shape steady scans reuse them.
+
+`next_clustered_row_metadata_into` exposes liveness/identity plus `ValueSpan`
+offsets for compaction. Its value slots describe presence and contain empty
+placeholders until `read_value_span` fetches the selected opaque bytes. Skipping
+still traverses/validates every checksum chunk through `ReadAt::validate_range`;
+this is not permission to ignore corrupt losing values. Read-ahead readers
+support bounded refills when a descriptor revisits an earlier value.
+`next_clustered_row_pending_into` checks bounds first and requires its caller to
+fetch or validate every span before advancing or publishing the row. Compaction
+uses this contract to validate winners during fetch and unread values, including
+schema-dropped columns, before source advancement.
+
+The cache-backed point-read APIs remain available. No dependency was added.
+`tests/scan_cursor.rs` checks Data.db encoding parity, exact values, BTI point
+lookups, pull-driven reads, steady allocation budgets, codec variants, and
+unfinished/failed-writer and truncation errors.
+
+Deferred-value metadata can seek past a read-ahead window and revisit it.
+`ReadAt::read_at_sparse` preserves the byte/error contract while allowing a
+source to keep its sequential window and pending prefetch. Task-owned chunk
+scans use this hint for nonadjacent chunk misses. Sequential reads retain the
+existing two-buffer contract; sparse reads reuse the caller's chunk buffer.
+`tests/scan_cursor_io.rs` bounds physical bytes on the public pending-value
+API with synchronous and background-prefetched inputs, in addition to exact
+payload checks. This prevents metadata seeks from multiplying full-window I/O.

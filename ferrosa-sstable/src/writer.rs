@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Add staged incremental partition writing with poisoned failure state.
+//! Correctness: Streamed and owned roundtrip plus unfinished-writer rejection tests.
+//!
 //! SSTableWriter — write BTI format SSTables from sorted partitions.
 //!
 //! The writer accepts partitions in token order and produces all component
@@ -1043,9 +1047,21 @@ impl SSTableOutputFiles {
 }
 
 /// SSTable writer that accumulates partitions and produces all component files.
+/// Metadata for one unfinished partition; rows pass directly to the sinks.
+struct OpenPartition {
+    data_pos: u64,
+    row_index_start: u64,
+    rows: usize,
+    deletion: crate::types::DeletionTime,
+    hashes: (i64, i64),
+}
+
 pub struct SSTableWriter {
     options: WriteOptions,
     header: SerializationHeader,
+    open_partition: Option<OpenPartition>,
+    stream_key: Vec<u8>,
+    stream_failed: bool,
     /// Raw (uncompressed) data buffer — the Data.db content.
     data_buf: DataSink,
     /// Reusable row trie; production nodes go straight to the Rows.db pump.
@@ -1105,6 +1121,9 @@ impl SSTableWriter {
             cancel: None,
             total_rows: 0,
             total_columns_set: 0,
+            open_partition: None,
+            stream_key: Vec::new(),
+            stream_failed: false,
             present_columns_scratch: Vec::new(),
             complex_order_scratch: Vec::new(),
         }
@@ -1191,9 +1210,158 @@ impl SSTableWriter {
             cancel: None,
             total_rows: 0,
             total_columns_set: 0,
+            open_partition: None,
+            stream_key: Vec::new(),
+            stream_failed: false,
             present_columns_scratch: Vec::new(),
             complex_order_scratch: Vec::new(),
         })
+    }
+
+    fn check_stream_closed(&self) -> Result<()> {
+        if self.open_partition.is_some() || self.stream_failed {
+            return Err(ferrosa_common::Error::InvalidData(
+                "unfinished or failed streamed partition".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Start a partition whose rows will be supplied one at a time.
+    /// All writes remain staged. Any failed operation poisons the writer;
+    /// finishing an incomplete partition is refused, so partial data cannot publish.
+    pub fn begin_partition(
+        &mut self,
+        key: &ferrosa_common::DecoratedKey,
+        deletion: crate::types::DeletionTime,
+        static_row: Option<&crate::types::Row>,
+    ) -> Result<()> {
+        self.check_stream_closed()?;
+        if let Some(cancel) = &self.cancel {
+            cancel
+                .check()
+                .map_err(|e| ferrosa_common::Error::InvalidData(e.to_string()))?;
+        }
+        if let Some(row) = static_row {
+            validate_row_cells(&self.header, row, true)
+                .map_err(ferrosa_common::Error::InvalidData)?;
+        }
+        self.stream_failed = true;
+        self.stream_key.clear();
+        self.stream_key.extend_from_slice(key.key.as_bytes());
+        byte_comparable::encode_into(&mut self.encoded_key_scratch, key);
+        self.open_partition = Some(OpenPartition {
+            data_pos: self.data_buf.len(),
+            row_index_start: self.row_trie.sink_mut().len(),
+            rows: 0,
+            deletion,
+            hashes: key.filter_hash(),
+        });
+        self.data_buf
+            .extend_from_slice(&(self.stream_key.len() as u16).to_be_bytes())?;
+        self.data_buf.extend_from_slice(&self.stream_key)?;
+        if deletion.is_live() {
+            self.data_buf.push(DELETION_IS_LIVE)?;
+        } else {
+            self.data_buf
+                .extend_from_slice(&deletion.marked_for_delete_at.to_be_bytes())?;
+            self.data_buf
+                .extend_from_slice(&deletion.local_deletion_time.to_be_bytes())?;
+        }
+        if let Some(row) = static_row {
+            self.serialize_row(row, true)?;
+            self.total_columns_set += row.cells.len() as u64;
+        }
+        self.stream_failed = false;
+        Ok(())
+    }
+
+    /// Validate and write one row without retaining it. The caller controls pull rate.
+    /// Streamed partitions index all clustered rows; no row-count lookahead is needed.
+    pub fn write_partition_row(&mut self, row: &crate::types::Row) -> Result<()> {
+        if self.stream_failed {
+            return Err(ferrosa_common::Error::InvalidData(
+                "failed streamed partition".into(),
+            ));
+        }
+        let state = self
+            .open_partition
+            .as_ref()
+            .ok_or_else(|| ferrosa_common::Error::InvalidData("no open partition".into()))?;
+        self.stream_failed = true;
+        if let Some(cancel) = &self.cancel {
+            cancel
+                .check()
+                .map_err(|e| ferrosa_common::Error::InvalidData(e.to_string()))?;
+        }
+        let partition_tombstone =
+            row.clustering.is_empty() && row.cells.is_empty() && !row.deletion.is_live();
+        if !partition_tombstone {
+            Self::validate_clustering_shape(&self.header, state.rows, &row.clustering)
+                .map_err(ferrosa_common::Error::InvalidData)?;
+        }
+        validate_row_cells(&self.header, row, false).map_err(ferrosa_common::Error::InvalidData)?;
+        if !self.header.clustering_types.is_empty() {
+            self.row_trie.add(
+                &row.clustering,
+                TriePayload {
+                    hash: None,
+                    position: (self.data_buf.len() - state.data_pos) as i64,
+                },
+            )?;
+        }
+        self.serialize_row(row, false)?;
+        self.open_partition.as_mut().expect("open partition").rows += 1;
+        self.total_rows += 1;
+        self.total_columns_set += row.cells.len() as u64;
+        self.stream_failed = false;
+        Ok(())
+    }
+
+    /// Complete the partition and publish its BTI index entry to the staging sinks.
+    pub fn end_partition(&mut self) -> Result<()> {
+        if self.stream_failed {
+            return Err(ferrosa_common::Error::InvalidData(
+                "failed streamed partition".into(),
+            ));
+        }
+        let state = self
+            .open_partition
+            .as_ref()
+            .ok_or_else(|| ferrosa_common::Error::InvalidData("no open partition".into()))?;
+        self.stream_failed = true;
+        self.data_buf.push(END_OF_PARTITION)?;
+        let mut index_pos = !(state.data_pos as i64);
+        if state.rows > 0 && !self.header.clustering_types.is_empty() {
+            let root = self.row_trie.finish_trie()?;
+            let sink = self.row_trie.sink_mut();
+            index_pos = sink.len() as i64;
+            sink.append(&(self.stream_key.len() as u16).to_be_bytes())?;
+            sink.append(&self.stream_key)?;
+            sink.append(&(state.data_pos as i64).to_be_bytes())?;
+            sink.append(&((state.row_index_start + root) as i64).to_be_bytes())?;
+            sink.append(&(state.rows as i32).to_be_bytes())?;
+            sink.append(&(state.deletion.local_deletion_time as i32).to_be_bytes())?;
+            sink.append(&state.deletion.marked_for_delete_at.to_be_bytes())?;
+        }
+        self.bloom.add(state.hashes.0, state.hashes.1);
+        self.trie_builder.add(
+            &self.encoded_key_scratch,
+            TriePayload {
+                hash: Some((state.hashes.1 & 0xff) as u8),
+                position: index_pos,
+            },
+        )?;
+        if self.first_key.is_none() {
+            self.first_key = Some(self.stream_key.clone());
+            self.first_index_key = Some(self.encoded_key_scratch.clone());
+        }
+        replace_owned_bytes(&mut self.last_key, &self.stream_key);
+        replace_owned_bytes(&mut self.last_index_key, &self.encoded_key_scratch);
+        self.partition_count += 1;
+        self.open_partition = None;
+        self.stream_failed = false;
+        Ok(())
     }
 
     /// Add a partition to the SSTable. Partitions must be added in token order.
@@ -1201,6 +1369,7 @@ impl SSTableWriter {
     /// This serializes the partition data, adds the key to the bloom filter,
     /// adds a trie entry for the partition index, and tracks statistics.
     pub fn add_partition(&mut self, partition: &Partition) -> Result<()> {
+        self.check_stream_closed()?;
         if let Some(cancel) = &self.cancel {
             cancel
                 .check()
@@ -1294,6 +1463,7 @@ impl SSTableWriter {
 
     /// Finalize the SSTable and produce all component files.
     pub fn finish(self) -> Result<SSTableOutput> {
+        self.check_stream_closed()?;
         let first_key = self.first_key.unwrap_or_default();
         let last_key = self.last_key.unwrap_or_default();
         let first_index_key = self.first_index_key.unwrap_or_default();
@@ -1460,6 +1630,7 @@ impl SSTableWriter {
         staging_dir: &Path,
         sync_components: bool,
     ) -> Result<SSTableOutputFiles> {
+        self.check_stream_closed()?;
         let staging_dir = staging_dir.to_path_buf();
         std::fs::create_dir_all(&staging_dir)?;
 
