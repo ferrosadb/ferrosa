@@ -5322,6 +5322,41 @@ fn write_path_is_cluster(controller: &ModeController) -> bool {
 }
 
 #[tokio::test]
+async fn cluster_transition_never_acknowledges_local_only_ddl_before_raft_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
+    controller.transition_to_cluster(vec![(peer_id, peer_addr)]);
+    assert!(
+        write_path_is_cluster(&controller),
+        "exercise the transition window"
+    );
+    assert!(
+        controller.raft().is_none(),
+        "Raft initialization has not run yet"
+    );
+
+    let result = controller
+        .ddl_path
+        .load_full()
+        .execute(crate::pair::ddl::DdlOperation::CreateKeyspace(
+            simple_strategy_ks("transition_window_probe", 1),
+        ))
+        .await;
+    assert!(
+        result.is_err(),
+        "a pre-Raft CREATE must report unavailable, never acknowledge a local-only schema"
+    );
+    assert!(
+        !controller
+            .schema
+            .snapshot()
+            .keyspaces
+            .contains_key("transition_window_probe"),
+        "the rejected CREATE must not bypass Raft and remote-DC relay"
+    );
+}
+
+#[tokio::test]
 async fn boot_gate_defers_cluster_transition_until_state_loaded() {
     let dir = tempfile::tempdir().unwrap();
     let (controller, peer_id, peer_addr) = boot_gate_controller(dir.path()).await;
@@ -6584,6 +6619,86 @@ mod raft_leader_liveness_after_restart {
 
         // the leader is live.
         assert_eq!(controller.raft_leader_liveness(&raft), LeaderLiveness::Live);
+        raft.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn declared_cluster_waits_for_ddl_publication_after_leader_election() {
+        let dir = tempfile::tempdir().unwrap();
+        let raft = raft_over(&dir.path().join("raft")).await;
+        let members: std::collections::BTreeMap<u64, openraft::BasicNode> = [1, 2, LEADER]
+            .into_iter()
+            .map(|id| (id, openraft::BasicNode::default()))
+            .collect();
+        raft.initialize(members)
+            .await
+            .expect("initialize three voters");
+        raft.append_entries(heartbeat())
+            .await
+            .expect("leader heartbeat");
+        raft.wait(Some(std::time::Duration::from_secs(10)))
+            .current_leader(LEADER, "leader has contacted this node")
+            .await
+            .expect("leader is visible");
+
+        let mut controller = ModeController::standalone_for_test(
+            test_schema(),
+            test_storage(&dir.path().join("data")),
+        );
+        Arc::get_mut(&mut controller).unwrap().config = Arc::new(ClusterConfig {
+            expected_cluster_size: 3,
+            ..ClusterConfig::default()
+        });
+        controller.mode.store(Arc::new(DeploymentMode::Cluster));
+        controller.set_raft_for_group(RaftGroupId::default_dc(), raft.clone());
+        assert!(declared_topology_is_ready(
+            3,
+            controller.mode(),
+            None,
+            true,
+            3
+        ));
+        assert_eq!(
+            raft.metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .voter_ids()
+                .count(),
+            3
+        );
+        assert!(controller.declared_topology_is_ready());
+        assert!(
+            !controller.accepts_cql_connections(),
+            "Direct DDL must not pass the formation gate"
+        );
+        assert!(!controller.is_cql_ready());
+        let (queue, _receiver) = tokio::sync::mpsc::channel(1);
+        controller
+            .ddl_path
+            .store(Arc::new(DdlPath::Forming { queue }));
+        assert!(controller.declared_topology_is_ready());
+        assert!(
+            !controller.accepts_cql_connections(),
+            "queued DDL is not published Raft DDL"
+        );
+
+        let peer_manager = Arc::new(PeerManager::new(
+            Arc::new(ferrosa_net::config::NetConfig::default()),
+            Uuid::new_v4(),
+            Arc::new(NoopListener),
+        ));
+        controller.ddl_path.store(Arc::new(DdlPath::Cluster {
+            raft: raft.clone(),
+            peer_manager,
+            node_map: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            relay: None,
+        }));
+        assert!(
+            controller.accepts_cql_connections(),
+            "the same topology becomes available when DDL is published"
+        );
+        assert!(controller.is_cql_ready());
         raft.shutdown().await.expect("clean shutdown");
     }
 

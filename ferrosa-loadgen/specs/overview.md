@@ -89,3 +89,12 @@ Leaf binary. **Calls** `ferrosa-storage` (with `compaction-validator`),
 `ferrosa-common`, `ferrosa-cql`, `ferrosa-sstable`, `ferrosa-schema`.
 **Called by** nothing. See the [root crate index](../../specs/crates.md) for the
 full graph.
+
+## Nightly property coverage
+
+The all-features nightly workspace fuzz lane includes this crate. Its generator
+properties and `ucs_load_random_profile` stay selected while the three long
+fixed-profile scenarios and infrastructure-dependent binary/S3 smoke cases are
+filtered by name. `tests/ci/test_nightly_fuzz_workflow.py` enforces this boundary
+in PR CI. The wall-clock budget can end a session before all selected properties
+complete; selection coverage is distinct from a completed fuzz campaign.

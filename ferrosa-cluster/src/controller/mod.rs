@@ -970,6 +970,22 @@ impl ModeController {
     /// answer OPTIONS/STARTUP and return typed errors for data opcodes.
     pub fn accepts_cql_connections(&self) -> bool {
         let expected = self.config.expected_cluster_size;
+        // Membership/leadership is observable before the asynchronous bootstrap
+        // publishes Raft-backed DDL. Declared clusters must not admit clients
+        // into a local-only or queued DDL path during that publication gap.
+        if expected >= 3 && !matches!(&**self.ddl_path.load(), DdlPath::Cluster { .. }) {
+            return false;
+        }
+        self.declared_topology_is_ready()
+    }
+
+    /// Whether declared mode, leadership and voter count are established.
+    ///
+    /// This excludes DDL publication and consensus health so readiness can name
+    /// those missing conditions separately. Native admission additionally checks
+    /// DDL publication through [`Self::accepts_cql_connections`].
+    pub fn declared_topology_is_ready(&self) -> bool {
+        let expected = self.config.expected_cluster_size;
         let (has_raft_leader, committed_voters) = if expected >= 3 {
             self.raft()
                 .map(|raft| {

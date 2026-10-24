@@ -112,8 +112,9 @@ graph TB
 
 ## Data flow
 
-**Write path** (engine memtable/compaction → disk): the caller adds `Partition`
-values in token order via `add_partition`. Cell timestamps, TTLs, and local
+**Write path** (engine memtable/compaction → disk): flush callers add `Partition`
+values in token order via `add_partition`; compaction uses the incremental
+partition/row API described below. Cell timestamps, TTLs, and local
 deletion times are **delta-encoded** as unsigned VInts against the baseline in
 the `SerializationHeader`. The writer builds the bloom filter, the partition
 trie, and — for wide clustered partitions past `ROW_INDEX_MIN_ROWS` — the row
@@ -285,3 +286,33 @@ buffer moves through the existing request channel as the next spare; the worker
 returns that same buffer on success or error. No new lock, payload copy or
 per-window payload allocation is added. Random access, failed request sends and
 cancelled in-flight input reads have explicit ownership regression tests.
+
+## Sequential cursor and incremental writer (2026-10-23)
+
+Compaction uses `scan_iter` and `next_clustered_row_into`, which retain local
+compressed/decoded chunk buffers and caller-owned row/cell/value capacities.
+Compressed extents and CRCs are validated before bounded decompression into
+caller storage. Point reads retain the shared caches. Incremental partition
+writing validates rows as pulled and keeps only header/index metadata, writing
+all clustered-row index entries without row-count lookahead. Failed/unfinished
+streams cannot finalize; staged output is discarded by its owner.
+
+Deferred clustered compaction values use checked logical `ValueSpan` offsets.
+The pending cursor checks bounds first; winner and tie reads validate their own
+chunks. Before advancing a source or emitting its merged row, compaction validates
+every unread raw span, including schema-dropped columns. This avoids a separate
+validation pass over fetched values while preserving checks on discarded bytes.
+Ordinary losing values do not allocate payload buffers. Schema ordinal remapping
+moves spans and their original validation indices with cell identities. The public
+metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
+and corrupt losing/dropped-value tests cover this path alongside fully decoding
+output verification.
+
+Deferred-value metadata can seek past a read-ahead window and revisit it.
+`ReadAt::read_at_sparse` preserves the byte/error contract while allowing a
+source to keep its sequential window and pending prefetch. Task-owned chunk
+scans use this hint for nonadjacent chunk misses. Sequential reads retain the
+existing two-buffer contract; sparse reads reuse the caller's chunk buffer.
+`tests/scan_cursor_io.rs` bounds physical bytes on the public pending-value
+API with synchronous and background-prefetched inputs, in addition to exact
+payload checks. This prevents metadata seeks from multiplying full-window I/O.

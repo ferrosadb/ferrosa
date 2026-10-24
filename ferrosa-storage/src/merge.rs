@@ -1,3 +1,7 @@
+//! Last revised: 2026-10-23
+//! Last changed: Fold rows and cells in retained storage.
+//! Correctness: Stable LWW reconciliation and collection-path tests.
+//!
 //! Read-path merge for partitions from multiple SSTables and memtables.
 //!
 //! Cassandra's storage model is append-only: writes never update in place.
@@ -84,19 +88,13 @@ pub fn merge_partitions(sources: Vec<Partition>) -> Partition {
 /// two paths produce identical row order.
 fn sort_and_fold_rows(rows: &mut Vec<Row>) {
     rows.sort_by(|a, b| a.clustering.cmp(&b.clustering));
-    // Fold adjacent same-clustering rows by rebuilding into the same Vec.
-    let sorted = std::mem::take(rows);
-    for row in sorted {
-        if rows
-            .last()
-            .is_some_and(|last| last.clustering == row.clustering)
-        {
-            let prev = rows.pop().unwrap();
-            rows.push(merge_rows(prev, row));
-        } else {
-            rows.push(row);
+    rows.dedup_by(|later, earlier| {
+        if later.clustering != earlier.clustering {
+            return false;
         }
-    }
+        merge_rows_into(earlier, later);
+        true
+    });
 }
 
 /// Guarantee a partition's rows are in clustering order, sorting + folding
@@ -129,58 +127,32 @@ pub fn ensure_partition_rows_sorted(partition: &mut Partition) {
 /// rows arriving one-at-a-time from N SSTable iterators into the
 /// merged row that gets hashed into a `PartitionDigestStream` —
 /// without ever materialising the full multi-source partition.
-pub fn merge_rows(a: Row, b: Row) -> Row {
-    // Row-level deletion: newer wins
-    let deletion = if b.deletion.marked_for_delete_at > a.deletion.marked_for_delete_at {
-        b.deletion
-    } else {
-        a.deletion
-    };
+pub fn merge_rows(mut a: Row, mut b: Row) -> Row {
+    merge_rows_into(&mut a, &mut b);
+    a
+}
 
-    // Primary key liveness: newer wins
-    let primary_key_liveness =
-        if b.primary_key_liveness.timestamp > a.primary_key_liveness.timestamp {
-            b.primary_key_liveness
-        } else {
-            a.primary_key_liveness
-        };
-
-    // Cell-level LWW: merge cells from both rows, keyed by (column index, cell
-    // path). A simple column has one cell (path == None); a complex (collection)
-    // column has one cell per element, distinguished by path — so two cells with
-    // the same column but different paths are distinct elements that BOTH survive,
-    // NOT competing writes. Keying by column index alone would collapse a
-    // collection to a single element on every cross-SSTable merge / compaction.
-    let mut cells: Vec<(u16, ferrosa_common::CellValue)> = Vec::new();
-
-    // Collect all cells from both rows and sort by (column index, path).
-    let mut all_cells: Vec<(u16, ferrosa_common::CellValue)> =
-        Vec::with_capacity(a.cells.len() + b.cells.len());
-    all_cells.extend(a.cells);
-    all_cells.extend(b.cells);
-    all_cells.sort_by(|(ca, cella), (cb, cellb)| (ca, &cella.path).cmp(&(cb, &cellb.path)));
-
-    // Merge cells with the same (column_index, path) using LWW.
-    for (col, cell) in all_cells {
-        if let Some(last) = cells.last() {
-            if last.0 == col && last.1.path == cell.path {
-                // Same (column, path) — deterministic last-write-wins.
-                if cell_supersedes(&cell, &last.1) {
-                    cells.pop();
-                    cells.push((col, cell));
-                }
-                continue;
-            }
+/// Fold a consumed row into existing storage, retaining the winner's buffers.
+/// Stable ordering preserves the first source on exact metadata ties.
+fn merge_rows_into(a: &mut Row, b: &mut Row) {
+    if b.deletion.marked_for_delete_at > a.deletion.marked_for_delete_at {
+        a.deletion = b.deletion;
+    }
+    if b.primary_key_liveness.timestamp > a.primary_key_liveness.timestamp {
+        a.primary_key_liveness = b.primary_key_liveness;
+    }
+    a.cells.append(&mut b.cells);
+    a.cells
+        .sort_by(|(ca, va), (cb, vb)| (ca, &va.path).cmp(&(cb, &vb.path)));
+    a.cells.dedup_by(|later, earlier| {
+        if later.0 != earlier.0 || later.1.path != earlier.1.path {
+            return false;
         }
-        cells.push((col, cell));
-    }
-
-    Row {
-        clustering: a.clustering,
-        cells,
-        deletion,
-        primary_key_liveness,
-    }
+        if cell_supersedes(&later.1, &earlier.1) {
+            std::mem::swap(&mut later.1, &mut earlier.1);
+        }
+        true
+    });
 }
 
 /// Deterministic last-write-wins comparison for a single cell.

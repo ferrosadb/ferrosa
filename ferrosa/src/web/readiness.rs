@@ -277,7 +277,7 @@ pub async fn readyz_handler(
     // Pair, and both used to answer 200 below. Undeclared nodes (size 0) and a
     // degraded cluster (which has its own, more specific answer) are unchanged.
     let expected = mc.expected_cluster_size();
-    if expected > 0 && mode != DeploymentMode::DegradedCluster && !mc.accepts_cql_connections() {
+    if expected > 0 && mode != DeploymentMode::DegradedCluster && !mc.declared_topology_is_ready() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({
@@ -345,7 +345,18 @@ pub async fn readyz_handler(
                 // heard from and answered ready (the 2026-10-23 control roll).
                 // Require evidence from this process that the leader is live.
                 Some(raft) => match mc.raft_leader_liveness(&raft).reason() {
-                    None => ready_response(&storage, &replication),
+                    None if mc.ddl_path_kind() == "cluster" => {
+                        ready_response(&storage, &replication)
+                    }
+                    None => (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({
+                            "ready": false,
+                            "waiting_for": "ddl_path",
+                            "ddl_path": mc.ddl_path_kind(),
+                            "detail": "Raft leadership is live but Cluster DDL is not published yet"
+                        })),
+                    ),
                     Some(detail) => (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({
@@ -1107,6 +1118,93 @@ what made this failure invisible"
             "applied rows clear the state: {body}"
         );
         assert_eq!(body["ready"], true);
+    }
+
+    /// Live leadership cannot advertise readiness before Raft-backed DDL publication.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn readyz_waits_for_cluster_ddl_publication_after_live_leader_election() {
+        use ferrosa_cluster::ddl_path::DdlPath;
+        use ferrosa_cluster::raft::log_store::SledLogStore;
+        use ferrosa_cluster::raft::network::FerrosRaftNetworkFactory;
+        use ferrosa_cluster::raft::state_machine::FerrosStateMachine;
+        use ferrosa_cluster::raft::FerrosRaft;
+        use ferrosa_net::peer::PeerManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = make_state();
+        let net_config = Arc::new(ferrosa_net::config::NetConfig::default());
+        let (mc, handles) = ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            net_config.clone(),
+            state.host_id,
+            state.storage.clone(),
+            state.schema.clone(),
+            Arc::new(HandlerRegistry::new()),
+        );
+        let peers = Arc::new(PeerManager::with_weak_listener(
+            net_config,
+            state.host_id,
+            mc.as_peer_listener(),
+        ));
+        let raft = Arc::new(
+            FerrosRaft::new(
+                1,
+                Arc::new(Default::default()),
+                FerrosRaftNetworkFactory::new(peers.clone(), mc.replication_health()),
+                SledLogStore::new(dir.path()).unwrap(),
+                FerrosStateMachine::new(),
+            )
+            .await
+            .unwrap(),
+        );
+        raft.initialize(std::collections::BTreeMap::from([(1, Default::default())]))
+            .await
+            .unwrap();
+        raft.trigger().elect().await.unwrap();
+        raft.wait(Some(std::time::Duration::from_secs(10)))
+            .current_leader(1, "single voter elects itself")
+            .await
+            .unwrap();
+        mc.set_raft_for_dc("default", raft.clone());
+        mc.set_mode_for_test(DeploymentMode::Cluster);
+        assert_eq!(
+            mc.raft_leader_liveness(&raft).reason(),
+            None,
+            "a real live leader is insufficient without DDL publication"
+        );
+        state.mode_controller = mc;
+
+        let (status, body) = probe(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Direct DDL must not probe ready: {body}"
+        );
+        assert_eq!(body["waiting_for"], "ddl_path");
+        let (queue, _receiver) = tokio::sync::mpsc::channel(1);
+        handles.ddl_path.store(Arc::new(DdlPath::Forming { queue }));
+        let (status, body) = probe(state.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Forming DDL must not probe ready: {body}"
+        );
+        assert_eq!(body["waiting_for"], "ddl_path");
+
+        handles.ddl_path.store(Arc::new(DdlPath::Cluster {
+            raft: raft.clone(),
+            peer_manager: peers,
+            node_map: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            relay: None,
+        }));
+        let (status, body) = probe(state).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "published DDL must permit readiness: {body}"
+        );
+        assert_eq!(body["ready"], true);
+        raft.shutdown().await.unwrap();
     }
 
     /// The Cluster mode (no Raft instance installed yet) must return 503.

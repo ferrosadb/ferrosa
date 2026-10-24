@@ -14,6 +14,10 @@
 # that's gated behind FERROSA_PRE_PUSH_INTEGRATION=1 in
 # .pre-commit-config.yaml.
 #
+# Run this all-features gate as an unprivileged Linux user: live-infra-tests
+# includes the real-file STATX_DIOALIGN probe, which rejects other platforms,
+# and root bypasses the permission-failure fixtures' filesystem controls.
+#
 # Speed: ~30-50% faster via cargo-nextest when installed (parallel
 # by binary AND by test). Falls back to `cargo test` otherwise.
 #
@@ -86,8 +90,21 @@ SKIPS=(
 # previous `--test-threads=1` here turned a ~10–15 min mirror into a
 # ~3 h sequential run with no documented justification, and CI itself
 # never passed that flag (see .github/workflows/ci.yml).
+# The CI job builds the pinned AssemblyScript compiler before --all-features
+# tests. Reuse an explicit bundle, or build the same prerequisite locally.
+if [ -z "${FERROSA_ASC_BUNDLE:-}" ]; then
+  asc_dir=$(mktemp -d "${TMPDIR:-/tmp}/ferrosa-prepush-asc.XXXXXX")
+  trap 'rm -rf "$asc_dir"' EXIT
+  export FERROSA_ASC_BUNDLE="$asc_dir/asc-bundle.mjs"
+  bash ferrosa-udf/examples/asc-poc/build-bundle.sh "$FERROSA_ASC_BUNDLE"
+fi
+if [ ! -s "$FERROSA_ASC_BUNDLE" ]; then
+  echo "FERROSA_ASC_BUNDLE must name a non-empty compiler bundle: $FERROSA_ASC_BUNDLE" >&2
+  exit 1
+fi
+
 echo "=== cargo test --workspace --lib --tests (mirrors CI) ==="
-exec cargo test \
+cargo test \
   --all-features \
   --workspace --lib --tests \
   --exclude ferrosa-jepsen --exclude ferrosa-loadgen \

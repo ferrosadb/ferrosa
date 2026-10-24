@@ -338,9 +338,12 @@ build; the codec's own cost is its delta against `none`.
   which isolates the leader of a real three-voter in-process cluster.
 - `DdlPath::kind()` / `ModeController::ddl_path_kind()` name the live DDL path
   (`direct`, `pair`, `cluster`, `forming`, `unavailable`). The mode reads
-  `cluster` from the start of `transition_to_cluster`, but DDL stays `direct`
-  until Raft has a leader, so readiness probes wait on `ddl_path == "cluster"`
-  (exposed on `/api/cluster/status`; CQL-T467ci-01).
+  `cluster` from the start of `transition_to_cluster`, while DDL stays `forming`
+  until the Raft-backed path is published. A CREATE in this window returns a
+  retriable formation error and cannot acknowledge a local-only schema change.
+  Existing formation queues are retained. Declared cluster admission and
+  readiness wait for `ddl_path == "cluster"` as well as membership/leadership
+  (the path is also exposed on `/api/cluster/status`; CQL-T467ci-01).
   Snapshot install no longer treats `previous - next` as authority to unregister
   local tables. A table that is absent from an incoming snapshot is considered
   ambiguous until snapshots carry explicit identity-scoped drop markers; if the

@@ -170,13 +170,10 @@ fn claim_slice_lease() -> Option<u16> {
 /// A listening port must be BELOW this to be safe on both platforms, so we read
 /// the platform's own value rather than assuming one.
 ///
-/// Read ONCE per process. On macOS the value comes from spawning `sysctl`, and
-/// [`PortAllocator::get`] asks on every allocation: a child spawned while another
-/// thread is between `socket()` and setting `FD_CLOEXEC` on its listener (macOS
-/// has no atomic `SOCK_CLOEXEC`) inherits that listener and keeps the port bound
-/// for as long as `sysctl` runs. The owner's next bind then fails with `Address
-/// already in use` -- 11,497 of 13,828 binds in
-/// `a_port_handed_out_is_never_probed_by_a_sibling_allocation` (t_470b78c6).
+/// The range is host configuration for the lifetime of a test process. Read it
+/// once, before handing out the first port. Re-running `sysctl` during a sibling
+/// listener's bind/drop loop can briefly inherit its descriptor into the helper
+/// process, keeping the port occupied even though no allocator probes it.
 pub fn kernel_ephemeral_floor() -> u16 {
     static FLOOR: OnceLock<u16> = OnceLock::new();
     *FLOOR.get_or_init(read_kernel_ephemeral_floor)
@@ -212,6 +209,9 @@ fn read_kernel_ephemeral_floor() -> u16 {
 /// BEFORE calling this, so the probe never lands on a port another test thread
 /// has been handed.
 pub fn port_is_free(port: u16) -> bool {
+    // Complete the one-time host query before creating a transient listener.
+    // A concurrent initializer may launch sysctl and inherit open descriptors.
+    let _ = kernel_ephemeral_floor();
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     match std::net::TcpListener::bind(addr) {
         Ok(listener) => {
@@ -344,4 +344,11 @@ impl Default for PortAllocator {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Hold an intentionally occupied port for a listener-collision fixture.
+/// The allocator owns the process slice and every intentional collision must use it.
+pub fn hold_collision_port(alloc: &mut PortAllocator) -> std::net::TcpListener {
+    let port = alloc.get();
+    std::net::TcpListener::bind(("127.0.0.1", port)).expect("hold an allocated collision port")
 }

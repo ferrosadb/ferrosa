@@ -114,6 +114,12 @@ External: `clap`, `tokio`, `ratatui`/`crossterm`, `hdrhistogram`, `parking_lot`,
   `FERROSA_TEST_CONTAINERS=1`), `binary_smoke.rs` (spawns the binary, gated on
   `FERROSA_TEST_LOADGEN=1`).
 
+Nightly fuzzing includes this crate's unit/property tests, including
+`ucs_load_random_profile`. The existing deterministic load scenarios and
+binary/S3 cases are selected separately from that fuzz workload; the workflow
+contract test prevents excluding the whole crate again. The bounded nightly
+budget does not guarantee every selected property finishes all cases.
+
 ## Specs
 
 - [Architecture overview](specs/overview.md) — module map, run modes, data flow

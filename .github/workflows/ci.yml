@@ -55,6 +55,10 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check the no-new-waivers guard
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
+      - name: Check local CI mirror prerequisites
+        run: python3 -m unittest tests.ci.test_pre_push_prerequisites
+      - name: Check nightly property-fuzz coverage
+        run: python3 -m unittest tests.ci.test_nightly_fuzz_workflow
       # Pins the smoke harness's client side: Phase 8's QUORUM write must walk
       # every surviving contact point before it declares the cluster
       # unreachable. Nightly 38533936817 failed because it did not — node1's

@@ -153,3 +153,33 @@ A controlled cancelled input proves reader drop joins and releases ownership.
 Two buffers allow one current window and one asynchronous prefetch. There is no
 third payload allocation or payload copy in this hand-back. Existing transport
 channel and underlying direct-I/O scratch allocations are separate surfaces.
+
+### Incremental cursor validation (2026-10-23)
+
+Sequential scans avoid shared chunk-cache locks but retain CRC, length and
+full row/cell decoding checks. Reusable-row reads reject missing partition end
+markers. Incremental writer state prevents finalization after a failed row or
+before `end_partition`; no partly streamed output is publishable. The tests
+in `scan_cursor.rs` cover codecs, exact values, lookup indexes, byte parity,
+pull rate, allocation count and failure states. The maximum row/cell width
+remains part of the memory bound.
+
+Deferred clustered compaction values use checked logical `ValueSpan` offsets.
+The pending cursor checks bounds first; winner and tie reads validate their own
+chunks. Before advancing a source or emitting its merged row, compaction validates
+every unread raw span, including schema-dropped columns. This avoids a separate
+validation pass over fetched values while preserving checks on discarded bytes.
+Ordinary losing values do not allocate payload buffers. Schema ordinal remapping
+moves spans and their original validation indices with cell identities. The public
+metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
+and corrupt losing/dropped-value tests cover this path alongside fully decoding
+output verification.
+
+Deferred-value metadata can seek past a read-ahead window and revisit it.
+`ReadAt::read_at_sparse` preserves the byte/error contract while allowing a
+source to keep its sequential window and pending prefetch. Task-owned chunk
+scans use this hint for nonadjacent chunk misses. Sequential reads retain the
+existing two-buffer contract; sparse reads reuse the caller's chunk buffer.
+`tests/scan_cursor_io.rs` bounds physical bytes on the public pending-value
+API with synchronous and background-prefetched inputs, in addition to exact
+payload checks. This prevents metadata seeks from multiplying full-window I/O.
