@@ -99,17 +99,64 @@ fn empty_match_for_missing_label(statement: &Statement) -> bool {
 }
 
 fn empty_match_result(statement: &Statement) -> GraphResult {
-    let columns = match statement {
+    let return_clause = match statement {
         Statement::Match { return_clause, .. }
         | Statement::MatchWith { return_clause, .. }
-        | Statement::MatchWithOptional { return_clause, .. } => build_columns(return_clause),
+        | Statement::MatchWithOptional { return_clause, .. } => Some(return_clause),
+        _ => None,
+    };
+    let columns = return_clause.map(build_columns).unwrap_or_default();
+
+    // Cypher: an aggregation with no grouping keys produces exactly one row even
+    // over an empty input — `count` is 0, not absent. Without this, a client
+    // asking "how many nodes have this label" gets an empty result it has to
+    // special-case, and `count(n)` disagrees with `count(*)` on the same query.
+    //
+    // Only when EVERY item is an aggregate: `RETURN n.name, count(n)` groups by
+    // `n.name`, so with no rows there is genuinely no group to report.
+    let rows = match return_clause {
+        Some(rc) if !rc.items.is_empty() && rc.items.iter().all(|it| is_aggregate(&it.expr)) => {
+            vec![rc
+                .items
+                .iter()
+                .map(|it| empty_aggregate_value(&it.expr))
+                .collect()]
+        }
         _ => vec![],
     };
 
     GraphResult {
         columns,
-        rows: vec![],
+        rows,
         stats: QueryStats::default(),
+    }
+}
+
+/// Whether `expr` is a call to an aggregate function.
+fn is_aggregate(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Function { name, .. } if crate::executor::aggregate::is_aggregate_function(name)
+    )
+}
+
+/// The value an aggregate produces over zero rows: `count` → 0, `sum` → 0,
+/// `min`/`max`/`avg` → null, `collect` → `[]`.
+///
+/// Reuses the real accumulator so the identity value cannot drift from what the
+/// executor produces for the same function over an empty set.
+fn empty_aggregate_value(expr: &Expr) -> serde_json::Value {
+    let Expr::Function { name, args } = expr else {
+        return serde_json::Value::Null;
+    };
+    let count_star = name.eq_ignore_ascii_case("count")
+        && matches!(args.first(), Some(Expr::Var(v)) if v == "*");
+    match crate::executor::aggregate::create_accumulator(name, count_star, 1) {
+        Ok(acc) => acc.finish(),
+        // An aggregate name the accumulator does not model: report null rather
+        // than inventing a value. The executor will have rejected it earlier for
+        // any statement that reaches validation.
+        Err(_) => serde_json::Value::Null,
     }
 }
 
@@ -3138,6 +3185,44 @@ mod tests {
         assert!(background_reconciliation_enabled(
             std::time::Duration::from_secs(300)
         ));
+    }
+
+    /// Cypher: an aggregation with no grouping keys always produces exactly one
+    /// row, even over an empty input — `count` is 0, not absent. A client asking
+    /// "how many nodes have this label" must get a number, not an empty result
+    /// it has to special-case.
+    ///
+    /// RED before the fix: `empty_match_result` returned `rows: vec![]` for
+    /// every statement, so `RETURN count(n)` over a label with no backing table
+    /// came back with zero rows.
+    #[test]
+    fn an_empty_match_returns_one_row_for_an_ungrouped_aggregate() {
+        let stmt = crate::parser::parse("MATCH (n:Missing) RETURN count(n) AS c")
+            .expect("statement parses");
+        let result = empty_match_result(&stmt);
+
+        assert_eq!(result.columns, vec!["c".to_string()]);
+        assert_eq!(
+            result.rows.len(),
+            1,
+            "an ungrouped aggregate over an empty match must yield exactly one row"
+        );
+        assert_eq!(result.rows[0], vec![serde_json::json!(0)]);
+    }
+
+    /// The shortcut's original, correct behaviour: a plain projection over no
+    /// rows is empty. This pins it so the aggregate fix above cannot regress it.
+    #[test]
+    fn an_empty_match_returns_no_rows_for_a_plain_projection() {
+        let stmt = crate::parser::parse("MATCH (n:Missing) RETURN n.name AS name")
+            .expect("statement parses");
+        let result = empty_match_result(&stmt);
+
+        assert_eq!(result.columns, vec!["name".to_string()]);
+        assert!(
+            result.rows.is_empty(),
+            "a non-aggregate projection over an empty match must stay empty"
+        );
     }
 
     /// Helper to create a StorageEngine for tests using a temp directory.

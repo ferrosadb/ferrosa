@@ -264,6 +264,13 @@ impl RpcServer {
             };
 
             let current = self.active_connections.load(Ordering::Relaxed);
+            // Disable Nagle, as the client-facing front ends do. A peer reply is
+            // written in several small messages, and each segment after the first
+            // otherwise waits for the peer's delayed ACK (~40ms) on a real
+            // network — the same defect measured on the PostgreSQL front end.
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::debug!(%peer_addr, %error, "could not set TCP_NODELAY on RPC socket");
+            }
             if current >= self.config.max_connections {
                 tracing::warn!(%peer_addr, "rejecting: max connections reached");
                 let config = self.config.clone();
