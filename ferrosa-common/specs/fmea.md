@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-common
 doc: fmea
-last_updated: 2026-10-10
+last_updated: 2026-10-24
 ---
 
 # ferrosa-common — FMEA / Known Issues
@@ -65,3 +65,14 @@ exhaustive `CqlValue` ordering property test (FC-3), and no observability on the
 | COM-T150-01 | Jsonb variant compares Equal across kinds or ignores D18 | ORDER BY, MIN, MAX and frozen equality wrong | 9 | 2 | 2 | 36 | Same-variant arm delegates to `JsonbValue::cmp`; the cross-variant arm lists `Jsonb` explicitly. Tests: `cqlvalue_cmp_jsonb_is_not_always_equal`, `cqlvalue_jsonb_ord_eq_hash_delegate_to_jsonb_value`. |
 | COM-T150-02 | Unknown quoted custom class accepted as a type | A schema silently means something else | 7 | 2 | 2 | 28 | `custom_class_type` resolves only the D20 class; anything else is `UnknownCustomClass`. Test: `type_names_jsonb_and_poc_alias`. |
 | COM-T150-03 | set/map-key/vector of jsonb constructed | Needs a jsonb order in key bytes (D3) | 8 | 2 | 2 | 32 | `check_jsonb_nesting` is exhaustive and recursive. Test: `nesting_rules_d21`. |
+
+## Shared cell payload allocation
+
+Small decoder payloads use bounded inline storage inside their shared owner,
+avoiding the separate Vec allocation that raised SSTable scan allocation counts
+to 6.25 per row. Every adopted vector retains its original storage, including small and empty
+over-reserved vectors.
+`cell_bytes::tests` cover alias isolation, unique scratch reuse, boundary growth,
+empty retained capacity, and byte-identical sequence serialization;
+`sstable_read_alloc` retains the existing five-allocation-per-row gate. Heap
+accounting charges the whole owner plus separate vector capacity conservatively.

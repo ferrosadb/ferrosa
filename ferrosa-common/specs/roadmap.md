@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-common
 doc: roadmap
-last_updated: 2026-06-19
+last_updated: 2026-10-24
 ---
 
 # ferrosa-common — Roadmap
@@ -58,3 +58,9 @@ the code, not from leftover tags.
 ## jsonb (T-150)
 
 Done: type threading. Remaining: T-154a: refuse jsonb in key positions at DDL; T-161a: PG OID 3802.
+
+## Shared cell payloads
+
+Done: small decoded payloads share a bounded inline owner; all adopted vectors and
+unique decoding scratch retain ownership and capacity. The existing SSTable
+allocation gate remains unchanged.

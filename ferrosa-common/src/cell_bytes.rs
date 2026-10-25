@@ -1,7 +1,7 @@
 //! Encapsulate cell payload ownership independently from row merge metadata.
-//! Correctness: byte order, serialization and owned-buffer identity are stable.
+//! Correctness: bytes, serialization, aliases and owned-buffer identity are stable.
 //! Last revised: 2026-10-24
-//! Last changed: Share payloads while keeping mutable I/O scratch uniquely owned.
+//! Last changed: Inline small shared payloads without a separate Vec allocation.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -12,20 +12,92 @@ use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+// Covers decoded scalar cells and short strings without growing the public handle.
+// Adopted vectors always retain their existing allocation, independently of size.
+const INLINE_CAPACITY: usize = 32;
+
+enum Backing {
+    Inline {
+        len: usize,
+        bytes: [u8; INLINE_CAPACITY],
+    },
+    Owned(Vec<u8>),
+}
+
+impl Backing {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Inline { len, bytes } => &bytes[..*len],
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Inline { len, bytes } => &mut bytes[..*len],
+            Self::Owned(bytes) => bytes.as_mut_slice(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Inline { .. } => INLINE_CAPACITY,
+            Self::Owned(bytes) => bytes.capacity(),
+        }
+    }
+
+    fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Inline { len, bytes } => bytes[..len].to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    fn clear(&mut self) {
+        match self {
+            Self::Inline { len, .. } => *len = 0,
+            Self::Owned(bytes) => bytes.clear(),
+        }
+    }
+
+    /// Grow past the fixed inline bound once; retain a Vec's capacity thereafter.
+    fn resize(&mut self, new_len: usize, value: u8) {
+        match self {
+            Self::Inline { len, bytes } if new_len <= INLINE_CAPACITY => {
+                if new_len > *len {
+                    bytes[*len..new_len].fill(value);
+                }
+                *len = new_len;
+            }
+            Self::Inline { len, bytes } => {
+                let mut owned = Vec::with_capacity(new_len);
+                owned.extend_from_slice(&bytes[..*len]);
+                owned.resize(new_len, value);
+                *self = Self::Owned(owned);
+            }
+            Self::Owned(bytes) => bytes.resize(new_len, value),
+        }
+    }
+}
+
 /// Immutable cell bytes. Cloning shares the payload; merge metadata stays owned.
 ///
 /// Capacity is read from the owner for accounting. Equality, hashing and
 /// ordering depend exclusively on bytes, preserving cell tie-break semantics.
-#[derive(Clone, Eq)]
+#[derive(Clone)]
 pub struct CellBytes {
-    bytes: Arc<Vec<u8>>,
+    bytes: Arc<Backing>,
 }
+
+impl Eq for CellBytes {}
 
 impl Default for CellBytes {
     fn default() -> Self {
-        static EMPTY: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+        static EMPTY: OnceLock<Arc<Backing>> = OnceLock::new();
         Self {
-            bytes: EMPTY.get_or_init(|| Arc::new(Vec::new())).clone(),
+            bytes: EMPTY
+                .get_or_init(|| Arc::new(Backing::Owned(Vec::new())))
+                .clone(),
         }
     }
 }
@@ -56,10 +128,13 @@ impl CellBytes {
 
     /// Convert to an owned vector at an API that requires one.
     ///
-    /// Ownership is transferred when possible. A shared representation may
-    /// need to copy here; hot read/serialization paths should borrow instead.
+    /// A unique owned vector transfers its allocation. Inline or shared bytes
+    /// copy here; hot read/serialization paths should borrow instead.
     pub fn into_vec(self) -> Vec<u8> {
-        Arc::try_unwrap(self.bytes).unwrap_or_else(|shared| (*shared).clone())
+        match Arc::try_unwrap(self.bytes) {
+            Ok(unique) => unique.into_vec(),
+            Err(shared) => shared.as_slice().to_vec(),
+        }
     }
 
     /// Recover unique I/O scratch, discarding its logical contents.
@@ -80,7 +155,7 @@ impl CellBytes {
         self.bytes.capacity()
     }
 
-    /// Heap charge including Arc's strong/weak counters and owned Vec metadata.
+    /// Heap charge including the full backing and Arc's strong/weak counters.
     /// Shared allocations may be charged more than once; this is a conservative
     /// per-handle estimate, not physical RSS or allocator size-class accounting.
     pub fn retained_heap_bytes(&self) -> usize {
@@ -88,7 +163,11 @@ impl CellBytes {
         if capacity == 0 {
             return 0;
         }
-        capacity.saturating_add(std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>())
+        let owner = std::mem::size_of::<Backing>() + 2 * std::mem::size_of::<usize>();
+        match self.bytes.as_ref() {
+            Backing::Inline { .. } => owner,
+            Backing::Owned(_) => capacity.saturating_add(owner),
+        }
     }
 }
 
@@ -97,12 +176,20 @@ impl CellBytes {
 /// Keeping this type separate from `CellBytes` lets a decoder reuse unique
 /// storage without ever mutating bytes retained by an earlier consumer.
 #[derive(Default)]
-pub struct CellBytesMut(Option<Arc<Vec<u8>>>);
+pub struct CellBytesMut(Option<Arc<Backing>>);
 
 impl CellBytesMut {
     /// Resize owned scratch before an initialized read.
     pub fn resize(&mut self, len: usize, value: u8) {
-        let bytes = self.0.get_or_insert_with(|| Arc::new(Vec::new()));
+        if len == 0 && self.0.is_none() {
+            return;
+        }
+        let bytes = self.0.get_or_insert_with(|| {
+            Arc::new(Backing::Inline {
+                len: 0,
+                bytes: [0; INLINE_CAPACITY],
+            })
+        });
         Arc::get_mut(bytes)
             .expect("scratch is uniquely owned")
             .resize(len, value);
@@ -185,7 +272,7 @@ impl From<Vec<u8>> for CellBytes {
             Self::default()
         } else {
             Self {
-                bytes: Arc::new(bytes),
+                bytes: Arc::new(Backing::Owned(bytes)),
             }
         }
     }
@@ -234,6 +321,35 @@ mod tests {
         let payload = CellBytes::from(input);
         assert_eq!(payload.as_ptr(), address);
         assert_eq!(payload.as_slice(), [3, 1, 4, 1, 5]);
+        let returned = payload.into_vec();
+        assert_eq!(returned.as_ptr(), address);
+    }
+
+    #[test]
+    fn adopting_a_small_reserved_vector_retains_pointer_and_spare_capacity() {
+        let mut input = Vec::with_capacity(16);
+        input.extend_from_slice(b"tiny");
+        let address = input.as_ptr();
+        let capacity = input.capacity();
+        let payload = CellBytes::from(input);
+        assert_eq!(payload.as_ptr(), address);
+        assert_eq!(payload.retained_capacity(), capacity);
+        let mut scratch = payload.into_scratch();
+        assert_eq!(scratch.capacity(), capacity);
+        scratch.resize(8, 9);
+        let returned = scratch.freeze().into_vec();
+        assert_eq!(returned.as_ptr(), address);
+        assert_eq!(returned.capacity(), capacity);
+        assert_eq!(returned, [9; 8]);
+    }
+
+    #[test]
+    fn adopting_and_returning_a_unique_large_vector_keeps_its_allocation() {
+        let input: Vec<u8> = (0..128).collect();
+        let address = input.as_ptr();
+        let payload = CellBytes::from(input);
+        assert_eq!(payload.as_ptr(), address);
+        assert_eq!(payload.as_slice(), (0..128).collect::<Vec<u8>>());
         let returned = payload.into_vec();
         assert_eq!(returned.as_ptr(), address);
     }
@@ -295,6 +411,107 @@ mod tests {
             frozen = scratch.freeze();
             assert_eq!(frozen.as_ptr(), address);
             assert_eq!(frozen.as_slice(), b"xxxxxxx");
+        }
+    }
+
+    #[test]
+    fn small_scratch_reuses_its_shared_owner_without_a_vector_buffer() {
+        let mut scratch = CellBytesMut::default();
+        scratch.resize(16, 7);
+        let mut frozen = scratch.freeze();
+        let address = frozen.as_ptr();
+        assert_eq!(frozen.retained_capacity(), INLINE_CAPACITY);
+        for _ in 0..64 {
+            let mut scratch = frozen.into_scratch();
+            scratch.resize(16, 9);
+            frozen = scratch.freeze();
+            assert_eq!(frozen.as_ptr(), address);
+            assert_eq!(frozen.as_slice(), [9; 16]);
+        }
+        let retained = frozen.clone();
+        assert_eq!(retained.as_ptr(), address, "small clones share their owner");
+        let mut scratch = frozen.into_scratch();
+        assert_eq!(
+            scratch.capacity(),
+            0,
+            "shared bytes are not copied for scratch"
+        );
+        scratch.resize(16, 3);
+        assert_eq!(scratch.freeze().as_slice(), [3; 16]);
+        assert_eq!(
+            retained.as_slice(),
+            [9; 16],
+            "scratch cannot mutate an alias"
+        );
+    }
+
+    #[test]
+    fn scratch_growth_and_regrowth_initialize_bytes_without_losing_contents() {
+        let mut scratch = CellBytesMut::default();
+        scratch.resize(4, 1);
+        scratch.as_mut()[1] = 2;
+        scratch.resize(2, 0);
+        scratch.resize(4, 3);
+        assert_eq!(scratch.as_mut(), [1, 2, 3, 3]);
+        scratch.resize(INLINE_CAPACITY + 1, 5);
+        assert_eq!(&scratch.as_mut()[..4], [1, 2, 3, 3]);
+        assert!(scratch.as_mut()[4..].iter().all(|byte| *byte == 5));
+        let frozen = scratch.freeze();
+        let address = frozen.as_ptr();
+        let capacity = frozen.retained_capacity();
+        let mut scratch = frozen.into_scratch();
+        scratch.resize(3, 8);
+        let frozen = scratch.freeze();
+        assert_eq!(
+            frozen.as_ptr(),
+            address,
+            "promoted Vec is retained after shrinking"
+        );
+        assert_eq!(frozen.retained_capacity(), capacity);
+        assert_eq!(frozen.as_slice(), [8; 3]);
+    }
+
+    #[test]
+    fn owned_capacity_is_preserved_and_charged_even_for_an_empty_payload() {
+        let bytes = Vec::with_capacity(4096);
+        let address = bytes.as_ptr();
+        let payload = CellBytes::from(bytes);
+        assert!(payload.is_empty());
+        assert_eq!(payload.as_ptr(), address);
+        assert!(payload.retained_capacity() >= 4096);
+        assert!(payload.retained_heap_bytes() >= 4096 + std::mem::size_of::<Backing>());
+        let returned = payload.into_vec();
+        assert_eq!(returned.as_ptr(), address);
+        assert_eq!(CellBytes::default().retained_heap_bytes(), 0);
+    }
+
+    #[test]
+    fn serialization_and_owned_conversion_match_across_the_inline_boundary() {
+        for len in [
+            0,
+            1,
+            INLINE_CAPACITY - 1,
+            INLINE_CAPACITY,
+            INLINE_CAPACITY + 1,
+            1024,
+        ] {
+            let expected: Vec<u8> = (0..len).map(|idx| idx as u8).collect();
+            let mut scratch = CellBytesMut::default();
+            scratch.resize(len, 0);
+            scratch.as_mut().copy_from_slice(&expected);
+            let payload = scratch.freeze();
+            assert_eq!(payload.as_slice(), expected);
+            let retained = payload.clone();
+            assert_eq!(retained.as_ptr(), payload.as_ptr());
+            let encoded = serde_json::to_vec(&payload).unwrap();
+            assert_eq!(encoded, serde_json::to_vec(&expected).unwrap());
+            let decoded: CellBytes = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(decoded, payload);
+            assert_eq!(payload.into_vec(), expected);
+            assert_eq!(retained.as_slice(), expected);
+            if len > 0 {
+                assert!(retained.retained_heap_bytes() >= retained.retained_capacity());
+            }
         }
     }
 }
