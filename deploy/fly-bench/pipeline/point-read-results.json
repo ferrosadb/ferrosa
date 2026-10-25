@@ -1,0 +1,139 @@
+{
+  "date": "2026-10-25",
+  "sequence": [
+    "C12",
+    "D12",
+    "D13",
+    "C13"
+  ],
+  "profiled": false,
+  "workload": {
+    "rows": 5000,
+    "payload_bytes": 512,
+    "workers": 8,
+    "point_reads": 400
+  },
+  "legs": {
+    "C12": {
+      "revision": "ffa19340355e3c32e4671e949042485e7a2dc425",
+      "rows": 5000,
+      "concurrency": 8,
+      "reads": 400,
+      "insert_rows_per_s": 20312.8286107846,
+      "read_operations_per_s": 34.019381562887276,
+      "read_or_operation_p50_ms": 232.97382000000155,
+      "read_or_operation_p99_ms": 325.74920500000104,
+      "rows_after": 5000,
+      "validated": true
+    },
+    "D12": {
+      "revision": "e8772cf29ec756d63278cf25d6db4836cdf1ee88",
+      "rows": 5000,
+      "concurrency": 8,
+      "reads": 400,
+      "insert_rows_per_s": 22108.875617845704,
+      "read_operations_per_s": 3063.2039055909813,
+      "read_or_operation_p50_ms": 2.433812999996121,
+      "read_or_operation_p99_ms": 5.977702999985013,
+      "rows_after": 5000,
+      "validated": true
+    },
+    "D13": {
+      "revision": "e8772cf29ec756d63278cf25d6db4836cdf1ee88",
+      "rows": 5000,
+      "concurrency": 8,
+      "reads": 400,
+      "insert_rows_per_s": 20362.884853229152,
+      "read_operations_per_s": 2899.4869437594343,
+      "read_or_operation_p50_ms": 2.591743000010638,
+      "read_or_operation_p99_ms": 5.23506499999371,
+      "rows_after": 5000,
+      "validated": true
+    },
+    "C13": {
+      "revision": "ffa19340355e3c32e4671e949042485e7a2dc425",
+      "rows": 5000,
+      "concurrency": 8,
+      "reads": 400,
+      "insert_rows_per_s": 22207.271201559364,
+      "read_operations_per_s": 32.5725655181308,
+      "read_or_operation_p50_ms": 240.9200129999931,
+      "read_or_operation_p99_ms": 360.7057979999695,
+      "rows_after": 5000,
+      "validated": true
+    }
+  },
+  "summaries": {
+    "C": {
+      "insert_rows_per_s": {
+        "mean": 21260.049906171982,
+        "min": 20312.8286107846,
+        "max": 22207.271201559364,
+        "n": 2
+      },
+      "read_operations_per_s": {
+        "mean": 33.29597354050904,
+        "min": 32.5725655181308,
+        "max": 34.019381562887276,
+        "n": 2
+      },
+      "read_or_operation_p50_ms": {
+        "mean": 236.94691649999731,
+        "min": 232.97382000000155,
+        "max": 240.9200129999931,
+        "n": 2
+      },
+      "read_or_operation_p99_ms": {
+        "mean": 343.22750149998524,
+        "min": 325.74920500000104,
+        "max": 360.7057979999695,
+        "n": 2
+      }
+    },
+    "D": {
+      "insert_rows_per_s": {
+        "mean": 21235.88023553743,
+        "min": 20362.884853229152,
+        "max": 22108.875617845704,
+        "n": 2
+      },
+      "read_operations_per_s": {
+        "mean": 2981.345424675208,
+        "min": 2899.4869437594343,
+        "max": 3063.2039055909813,
+        "n": 2
+      },
+      "read_or_operation_p50_ms": {
+        "mean": 2.5127780000033795,
+        "min": 2.433812999996121,
+        "max": 2.591743000010638,
+        "n": 2
+      },
+      "read_or_operation_p99_ms": {
+        "mean": 5.606383999989362,
+        "min": 5.23506499999371,
+        "max": 5.977702999985013,
+        "n": 2
+      }
+    }
+  },
+  "native_postgresql_18_6_means": {
+    "insert_rows_per_s": 25278.95292475364,
+    "read_operations_per_s": 9497.84189655353
+  },
+  "ratios": {
+    "read_after_over_before": 89.54071942206464,
+    "read_after_over_postgres": 0.3138971418082928,
+    "insert_after_over_postgres": 0.8400617026642287
+  },
+  "instrument_sha256": {
+    "workload.py": "b784140f914a8ad8764ff824eb3f53786b482da77af70f669fa39d72394da207",
+    "validated_multimetric_bench.py": "9e832ac7563a5333a4a940e850c5c7d95e4a2150f900454560836ee7e18be9f1"
+  },
+  "scope": [
+    "Candidate includes exact-key reads and inline decoder backing.",
+    "Only the CLI arm-label acceptance changed in the client; timed implementation is unchanged.",
+    "Two repeats, descriptive comparisons; not significance evidence.",
+    "Same 2-performance-CPU/4-GiB LAX class; native PostgreSQL root filesystem versus Ferrosa attached volume."
+  ]
+}

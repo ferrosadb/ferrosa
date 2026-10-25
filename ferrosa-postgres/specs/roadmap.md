@@ -385,4 +385,6 @@ and replication strategy; failures propagate without a local fallback. Joins,
 compound/clustering keys, floating/decimal keys and other unproved key families
 retain scans. Floating signed zero cannot use byte-key equality because SQL
 equates both signs. Selective-decode, recording-reader and snapshot tests cover
-this path. Fly read throughput for this change remains to be measured.
+this path. The two-repeat Fly comparison measured point reads at 33.3→2,981.3 ops/s
+versus PostgreSQL 9,497.8 ops/s, with all 5,000 rows validated; the combined
+candidate and native-comparison limits are recorded in the benchmark report.

@@ -62,7 +62,7 @@ synchronous_commit and full_page_writes enabled. Both servers used the same
 2-performance-CPU/4-GiB service class and region; PostgreSQL used its root
 filesystem and Ferrosa an attached volume, so storage was not identical.
 
-Reads remain 34.7 ops/s after Sync versus PostgreSQL's 9,497.8. The exact-key
+In that Sync comparison, reads measured 34.7 ops/s after Sync versus PostgreSQL's 9,497.8. The exact-key
 read fix and decoder allocation fix are later source changes and are **not**
 measured by this table.
 
@@ -74,3 +74,36 @@ so those captures do not establish a precise remaining CPU ranking. Flame
 graphs, process/run-queue samples, disk and network counters are retained in
 the private evidence. These runs do not measure individual mutex wait time
 or Fly heap allocation counts. Profiled throughput is excluded above.
+
+## Exact-key reads and decoder backing (2026-10-25)
+
+The combined candidate `e8772cf29ec756d63278cf25d6db4836cdf1ee88`
+adds safe scalar primary-key I/O and the decoder backing fix to Sync source
+`ffa19340355e3c32e4671e949042485e7a2dc425`. C12/D12/D13/C13 uses the same
+primary workload and client implementation, with only CLI label validation
+extended to accept D. Every 5,000-row keyset/value/count check passed.
+
+| Operation | Before | After | PostgreSQL 18.6 | After / PostgreSQL |
+| --- | ---: | ---: | ---: | ---: |
+| INSERT rows/s | 21,260.0 | 21,235.9 | 25,279.0 | 84.0% |
+| Point reads/s | 33.3 | 2,981.3 | 9,497.8 | 31.4% |
+
+These are means of two unprofiled repetitions, with raw run values/ranges in
+[point-read-results.json](point-read-results.json). Reads improved 89.5 times;
+a 3.19× gap to native PostgreSQL remains. INSERT throughput is effectively
+unchanged within these run ranges. The key-read tests require the exact storage
+operation and preserve late-delete snapshots, staged inserts, cluster failures
+and floating signed-zero SQL equality. Allocation testing separately measured
+6.25→4.25 allocations/decoded row under the unchanged 5/row budget.
+
+The candidate is a bundle, so this is not isolated throughput attribution to
+the decoder change. The same storage-placement and two-repetition limits above
+apply. Separate read profiles are collected outside these timing legs.
+
+Separate read CPU profiles used a freshly seeded fixture in the same process
+and validated it after 30 seconds of reads. The candidate has 447 user CPU
+samples: allocator frames appear on 49 stacks (11.0% inclusive); libc leaves
+remain unattributed. No dominant CPU-spin hotspot was identified. Blocked
+mutex/request time is not measured by a CPU flame graph, so the remaining
+3.19× read gap still needs request/handoff/off-CPU tracing. Raw profiles and
+resource counters are retained in the private evidence.
