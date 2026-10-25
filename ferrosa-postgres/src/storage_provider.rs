@@ -558,6 +558,87 @@ async fn open_partition_stream(ctx: &Arc<ScanContext>) -> Result<PartitionStream
     }
 }
 
+/// Check SQL representability without retaining a converted row.
+fn validate_decoded_row(row: &[Option<CqlValue>]) -> Result<(), String> {
+    for value in row.iter().flatten() {
+        match value {
+            // Already validated by the shared physical decoder. These SQL
+            // representations are infallible, so no owned payload is needed.
+            CqlValue::Text(_)
+            | CqlValue::Ascii(_)
+            | CqlValue::Blob(_)
+            | CqlValue::Decimal { .. }
+            | CqlValue::Varint(_)
+            | CqlValue::Jsonb(_) => {}
+            // Keep checked timestamp widening and unsupported-type errors in
+            // the existing converter, including its error text.
+            _ => {
+                cql_to_value(value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn physical_validation_does_not_materialize_payloads() {
+        let row = vec![
+            Some(CqlValue::Text("x".repeat(4096))),
+            Some(CqlValue::Ascii("y".repeat(4096))),
+            Some(CqlValue::Blob(vec![7; 4096])),
+            Some(CqlValue::Int(12)),
+            None,
+        ];
+        let pointers: Vec<_> = row
+            .iter()
+            .flatten()
+            .filter_map(|v| match v {
+                CqlValue::Text(s) | CqlValue::Ascii(s) => Some(s.as_ptr()),
+                CqlValue::Blob(b) => Some(b.as_ptr()),
+                _ => None,
+            })
+            .collect();
+        let allocations = crate::mvcc::MvccManager::count_allocations_for_test(|| {
+            validate_decoded_row(&row).unwrap()
+        });
+        assert_eq!(allocations, 0);
+        let after: Vec<_> = row
+            .iter()
+            .flatten()
+            .filter_map(|v| match v {
+                CqlValue::Text(s) | CqlValue::Ascii(s) => Some(s.as_ptr()),
+                CqlValue::Blob(b) => Some(b.as_ptr()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pointers, after);
+    }
+
+    #[test]
+    fn physical_validation_matches_conversion_errors() {
+        let cases = vec![
+            CqlValue::Timestamp(i64::MAX),
+            CqlValue::Timestamp(1),
+            CqlValue::Duration {
+                months: 1,
+                days: 0,
+                nanos: 0,
+            },
+            CqlValue::List(vec![CqlValue::Int(1)]),
+            CqlValue::Text("valid".into()),
+            CqlValue::Null,
+        ];
+        for value in cases {
+            let expected = cql_to_value(&value).map(|_| ());
+            assert_eq!(validate_decoded_row(&[Some(value)]), expected);
+        }
+    }
+}
+
 /// Drain `range_iter` into `tx`, decoding one partition at a time.
 ///
 /// Returns — releasing the storage stream and the engine handle — on any of the
@@ -617,22 +698,30 @@ async fn produce_scan(
             }
         };
         for cql_row in cql_rows {
-            let values: Vec<Value> = match decoded_row_values(cql_row) {
-                Ok(values) => values,
-                Err(error) => {
-                    failure.record(format!(
-                        "scan of {}.{} cannot represent a stored value: {error}",
-                        ctx.table_id.keyspace, ctx.table_id.table
-                    ));
-                    return;
-                }
-            };
-            let key: Vec<Value> = ctx
+            if let Err(error) = validate_decoded_row(&cql_row) {
+                failure.record(format!(
+                    "scan of {}.{} cannot represent a stored value: {error}",
+                    ctx.table_id.keyspace, ctx.table_id.table
+                ));
+                return;
+            }
+            let key = match ctx
                 .pk_idx
                 .iter()
                 .chain(ctx.ck_idx.iter())
-                .map(|index| values[*index].clone())
-                .collect();
+                .map(|index| {
+                    cql_row[*index]
+                        .as_ref()
+                        .map_or(Ok(Value::Null), cql_to_value)
+                })
+                .collect::<Result<Vec<Value>, String>>()
+            {
+                Ok(key) => key,
+                Err(error) => {
+                    failure.record(error);
+                    return;
+                }
+            };
             // Resolve AFTER the physical read. A key can first acquire a
             // before-image while this scan is in progress. Staged own writes
             // have precedence over the snapshot root.
@@ -647,7 +736,13 @@ async fn produce_scan(
             let row = match replacement {
                 Some(Some(row)) => Some(row.clone()),
                 Some(None) => None,
-                None => Some(Row::new(values)),
+                None => match decoded_row_values(cql_row) {
+                    Ok(values) => Some(Row::new(values)),
+                    Err(error) => {
+                        failure.record(error);
+                        return;
+                    }
+                },
             };
             if view.is_some() || ctx.overlay.contains_key(&key) {
                 overlay_seen.insert(key);

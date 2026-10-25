@@ -4865,6 +4865,35 @@ pub(crate) mod txn_atomicity_tests {
         );
     }
 
+    #[tokio::test]
+    async fn point_read_valid_mvcc_image_still_reports_corrupt_physical_payload() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"good".to_vec()));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![(0, ferrosa_common::CellValue::live(vec![0xff], i64::MAX - 1))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                i64::MAX - 1,
+            ),
+        };
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "kv"),
+                &key,
+                row,
+                i64::MAX - 1,
+            )
+            .unwrap();
+        let mut reader = Session::new(superuser());
+        let replies = execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'good'").await;
+        assert_eq!(error_sqlstate(&replies).as_deref(), Some("58000"));
+        assert!(!replies
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { .. })));
+    }
+
     /// A keyed SELECT must not decode unrelated partitions. The deliberately
     /// corrupt UTF-8 value is readable only through a scan, never through k=good.
     async fn point_lookup_fixture() -> (tempfile::TempDir, QueryContext) {

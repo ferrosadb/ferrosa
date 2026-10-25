@@ -800,3 +800,15 @@ A failed row rolls back its partial bytes while preserving earlier rows. Collect
 ReplySink callers keep the existing message interface. Ownership/allocation tests,
 wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
 change. Runtime throughput is reported only after the staged Fly walk.
+
+
+### Point-read walk, step 4 (2026-10-25)
+
+Storage reads retain their configured consistency path and complete shared CQL
+decoding. A borrowed validation pass preserves SQL representability errors before
+MVCC lookup. Only key fields become SQL values before lookup; a full SQL row is
+materialized when no MVCC or staged image replaces it. This removes throwaway SQL
+row materialization, while physical CQL decoding and the owned MVCC image copy
+remain. Tests pin zero-allocation payload validation, conversion-error parity, and
+a corrupt physical payload failing even when MVCC holds a valid replacement.
+No throughput improvement is assumed before the staged Fly measurements.
