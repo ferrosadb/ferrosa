@@ -183,3 +183,7 @@ row channel does not bound this key set. Cancellation releases it; an eventual
 spillable key set is a remaining memory improvement, not implemented here.
 Applied Accord transaction identities also remain resident without a configured
 cap. Neither residual is hidden by a write-count refusal.
+
+### Extended-protocol transaction boundary
+
+Pipeline atomicity guard: `extended_pipeline_sync_publishes_one_atomic_batch` and `extended_pipeline_error_rolls_back_all_pre_sync_writes` prevent early publication and partial rollback. Additional tests retain explicit transactions across Sync, discard disconnected staging, and require a commit conflict to emit40001 then ReadyForQuery Idle.

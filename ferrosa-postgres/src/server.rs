@@ -482,6 +482,16 @@ where
             }
         }
         FrontendMessage::Execute { portal, max_rows } => {
+            // A pipeline is one implicit transaction until Sync, including on
+            // a standalone node. Do not commit each Execute independently.
+            if !session.in_txn() {
+                if let Err(error) = begin_implicit_transaction(ctx, session).await {
+                    session.fail(error).encode(&mut out);
+                    stream.write_all(&out).await?;
+                    return Ok(false);
+                }
+                session.mark_extended_implicit();
+            }
             let tail = execute_portal_to(
                 ctx,
                 session,
@@ -498,8 +508,7 @@ where
             session.on_close(kind, &name).encode(&mut out);
         }
         FrontendMessage::Sync => {
-            session.on_sync();
-            BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
+            finish_extended_pipeline(ctx, session, &mut out).await;
         }
         FrontendMessage::Terminate => return Ok(true),
         // COPY data with no COPY in progress. The wire layer understands these frames so a COPY
@@ -522,6 +531,26 @@ where
     Ok(false)
 }
 
+/// Finish the implicit extended-protocol group before ReadyForQuery.
+/// Explicit BEGIN blocks retain their caller-controlled commit boundary.
+async fn finish_extended_pipeline(ctx: &QueryContext, session: &mut Session, out: &mut BytesMut) {
+    if session.is_extended_implicit() {
+        if session.is_error_pending() || session.in_failed_txn() {
+            session.end_txn();
+        } else {
+            for message in commit_txn(ctx, session).await {
+                // Sync has no COMMIT command tag; commit errors precede
+                // ReadyForQuery, exactly as the wire protocol requires.
+                if matches!(message, BackendMessage::ErrorResponse { .. }) {
+                    message.encode(out);
+                }
+            }
+        }
+    }
+    session.on_sync();
+    BackendMessage::ReadyForQuery(session.txn_status()).encode(out);
+}
+
 async fn begin_implicit_transaction(
     ctx: &QueryContext,
     session: &mut Session,
@@ -529,6 +558,10 @@ async fn begin_implicit_transaction(
     // Per statement: this node may have become a cluster (or lost its write
     // path) since the listener was built.
     let Some(committer) = ctx.accord.committer() else {
+        session.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot(),
+        );
         return Ok(());
     };
     let cluster_ts = committer
@@ -2379,6 +2412,227 @@ pub(crate) mod txn_atomicity_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    async fn pipeline_insert_frame<St>(
+        stream: &mut St,
+        ctx: &QueryContext,
+        session: &mut Session,
+        key: &str,
+        value: &str,
+    ) where
+        St: AsyncRead + AsyncWrite + Unpin,
+    {
+        if session.statement("pipeline_insert").is_none() {
+            handle_frontend(
+                stream,
+                ctx,
+                session,
+                FrontendMessage::Parse {
+                    stmt_name: "pipeline_insert".into(),
+                    query: "INSERT INTO kv (k,v) VALUES ($1,$2)".into(),
+                    param_types: vec![25, 25],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!session.is_error_pending(), "valid Parse was refused");
+        }
+        for frame in [
+            FrontendMessage::Bind {
+                portal: "".into(),
+                stmt_name: "pipeline_insert".into(),
+                param_formats: vec![0],
+                param_values: vec![
+                    Some(key.as_bytes().to_vec()),
+                    Some(value.as_bytes().to_vec()),
+                ],
+                result_formats: vec![],
+            },
+            FrontendMessage::Execute {
+                portal: "".into(),
+                max_rows: 0,
+            },
+        ] {
+            handle_frontend(stream, ctx, session, frame).await.unwrap();
+            assert!(
+                !session.is_error_pending(),
+                "valid pipeline frame was refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_sync_publishes_one_atomic_batch() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        let before = ctx.mvcc.current_commit_seq();
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "pipe_a", "first").await;
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "pipe_b", "second").await;
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_a").await,
+            Vec::new(),
+            "Execute must not publish before Sync"
+        );
+        assert_eq!(read_kv_values(&ctx, "pipe_b").await, Vec::new());
+        assert_eq!(
+            ctx.mvcc.current_commit_seq(),
+            before,
+            "no per-Execute commit"
+        );
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_a").await,
+            vec![(Some("pipe_a".into()), Some("first".into()))]
+        );
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_b").await,
+            vec![(Some("pipe_b".into()), Some("second".into()))]
+        );
+        assert_eq!(
+            ctx.mvcc.current_commit_seq(),
+            before + 1,
+            "one Sync is one committed batch"
+        );
+        assert!(!session.in_txn());
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_error_rolls_back_all_pre_sync_writes() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        pipeline_insert_frame(
+            &mut stream,
+            &ctx,
+            &mut session,
+            "pipe_rollback",
+            "must_not_survive",
+        )
+        .await;
+        for frame in [
+            FrontendMessage::Parse {
+                stmt_name: "bad_pipeline".into(),
+                query: "INSERT INTO missing_pipeline_table (k,v) VALUES ('bad','bad')".into(),
+                param_types: vec![],
+            },
+            FrontendMessage::Bind {
+                portal: "".into(),
+                stmt_name: "bad_pipeline".into(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+            FrontendMessage::Execute {
+                portal: "".into(),
+                max_rows: 0,
+            },
+        ] {
+            handle_frontend(&mut stream, &ctx, &mut session, frame)
+                .await
+                .unwrap();
+        }
+        assert!(session.is_error_pending(), "missing table must fail");
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_rollback").await,
+            Vec::new(),
+            "failed pipeline must roll back its earlier successful Execute"
+        );
+        assert!(!session.in_txn());
+        assert!(!session.is_error_pending());
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_sync_preserves_an_explicit_transaction() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "explicit_pipe", "held").await;
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        assert!(session.in_txn(), "Sync must not commit an explicit BEGIN");
+        assert!(read_kv_values(&ctx, "explicit_pipe").await.is_empty());
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "{messages:?}"
+        );
+        assert_eq!(
+            read_kv_values(&ctx, "explicit_pipe").await,
+            vec![(Some("explicit_pipe".into()), Some("held".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_disconnect_discards_uncommitted_writes() {
+        let (_dir, ctx) = make_ctx().await;
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        let mut session = Session::new(superuser());
+        pipeline_insert_frame(
+            &mut stream,
+            &ctx,
+            &mut session,
+            "disconnected_pipe",
+            "discard",
+        )
+        .await;
+        drop(session);
+        assert!(read_kv_values(&ctx, "disconnected_pipe").await.is_empty());
+        assert_eq!(
+            ctx.mvcc.active_snapshot_count(),
+            0,
+            "disconnect must release its snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_sync_reports_a_commit_conflict_and_returns_idle() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let (mut stream, mut client) = tokio::io::duplex(64 * 1024);
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "sync_conflict", "loser").await;
+        let mut other = Session::new(superuser());
+        let messages = execute_simple(
+            &ctx,
+            &mut other,
+            "INSERT INTO kv (k,v) VALUES ('sync_conflict','winner')",
+        )
+        .await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "{messages:?}"
+        );
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        drop(stream);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            bytes.windows(7).any(|w| w == b"C40001\0"),
+            "Sync must report the refused commit, not acknowledge it"
+        );
+        assert!(
+            bytes.ends_with(b"Z\0\0\0\x05I"),
+            "failed implicit commit must return ReadyForQuery Idle"
+        );
+        assert_eq!(
+            read_kv_values(&ctx, "sync_conflict").await,
+            vec![(Some("sync_conflict".into()), Some("winner".into()))]
+        );
+        assert!(!session.in_txn());
     }
 
     /// INVARIANT (transactionality): a multi-row INSERT buffered inside an explicit

@@ -371,3 +371,7 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 Done: type threading (T-150); engine `Value::Jsonb` and the storage mapping (T-160); OID 3802 text/binary codec, jsonb input parsing under the configured limits, `jsonb`/`json` DDL names, catalog row (T-161a). Remaining: json 114 and jsonpath 4072 result codecs, casts and operators (T-161b, T-162); the per-edge `jsonb_duplicate_keys_dropped_total` counter (only the edge log line exists here); the strict duplicate-key mode is honored from `[jsonb]` but has no per-session or table switch; a typed `CorruptJsonb` from the row bridge (T-151) so a corrupt stored cell reports `XX001` instead of the scan-failure `58000`.
 
 T-301 (PG-first slice acceptance) is done: `tests/jsonb_slice.rs` and the postgres:16 differential over jsonb DDL, INSERT and SELECT, with no unexplained differences. Deferred: the cluster-mode refusal test (waits on the T-300 gate), operators and SRFs against the oracle (T-162).
+
+### Extended-protocol transaction boundary
+
+Implemented: implicit extended-protocol pipelines commit once at Sync, preserving rollback and explicit transaction boundaries. Matched Fly throughput and separate insertion profiles are required before attributing a performance gain to this change.

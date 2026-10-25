@@ -744,3 +744,7 @@ differences, both fixed: a `\u0000` escape was accepted (Postgres: `22P05`), and
 a bad binary version byte answered `22P03` (Postgres: `XX000`; `08P01` for an
 empty value). There are no named divergences: `NAMED_DIVERGENCES` in the oracle is
 empty and fails if an entry stops differing.
+
+### Extended-protocol transaction boundary
+
+Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.
