@@ -386,6 +386,13 @@ writers and snapshot reads can progress while another storage apply pauses.
 Overlapping reservations or stale reads fail with `40001` before storage effects.
 
 
+
+Cursor resolution and the first bounded row fetch run in one blocking job.
+A one-shot column publication preserves early metadata without requeueing the
+cursor. The stream owns cancellation before awaiting that publication, so a
+dropped opening future stops its producer. Queue-order and cancellation
+regressions exercise the production opening path with one blocking worker.
+
 Owned decoded storage rows move text, ASCII, blob, numeric and validated JSON
 payloads into SQL values. The borrowed conversion API remains available for
 callers retaining their input. Production-path identity/capacity tests require

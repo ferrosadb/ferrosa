@@ -179,7 +179,8 @@ pub(crate) struct ResultStream {
 }
 
 /// Resolve and open `stmt` on a blocking thread, so a resolution error is
-/// reported before any output, and start fetching its first batch.
+/// reported before any output. The same blocking job fetches its first batch,
+/// publishing columns separately so metadata need not wait for storage rows.
 ///
 /// # Errors
 ///
@@ -201,25 +202,64 @@ where
 {
     // Captured before `stmt` moves into the executor thread; needs no clone.
     let is_star = matches!(stmt.projection, ferrosa_sql::Projection::Star);
-    let opened = tokio::task::spawn_blocking(move || {
-        ferrosa_sql::open_cursor(
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    let (columns_tx, columns_rx) = tokio::sync::oneshot::channel();
+    let handle = tokio::task::spawn_blocking(move || {
+        let cursor = match ferrosa_sql::open_cursor(
             &stmt,
             &catalog,
             &default_schema,
             &params,
             &SpillCtx::default(),
-        )
-    })
-    .await;
-    let cursor = match opened {
-        Ok(Ok(cursor)) => cursor,
-        Ok(Err(error)) => {
-            return Err(check_scan_failure(&failure).unwrap_or_else(|| exec_error_response(&error)))
+        ) {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                let _ = columns_tx.send(Err(error));
+                return Fetched {
+                    rows: Vec::new(),
+                    end: FetchEnd::Done,
+                };
+            }
+        };
+        // Publish metadata without requeueing the cursor's first fetch. A caller
+        // that disappeared during opening needs no rows or lingering producer.
+        if columns_tx.send(Ok(cursor.columns().to_vec())).is_err() {
+            return Fetched {
+                rows: Vec::new(),
+                end: FetchEnd::Cancelled,
+            };
         }
-        Err(join_error) => return Err(executor_died(join_error)),
+        fetch(cursor, &worker_cancel)
+    });
+    // Own the in-flight job before awaiting its metadata. Dropping this opening
+    // future then uses ResultStream's existing cancellation/cleanup invariant.
+    let mut stream = ResultStream {
+        columns: Vec::new(),
+        hidden: Vec::new(),
+        exec: Exec::Fetching(handle),
+        buffered: VecDeque::new(),
+        failure,
+        cancel,
     };
-    let cancel = Arc::new(AtomicBool::new(false));
-    let mut columns = cursor.columns().to_vec();
+    let mut columns = match columns_rx.await {
+        Ok(Ok(columns)) => columns,
+        Ok(Err(error)) => {
+            return Err(
+                check_scan_failure(&stream.failure).unwrap_or_else(|| exec_error_response(&error))
+            );
+        }
+        Err(_) => {
+            let Exec::Fetching(handle) = std::mem::replace(&mut stream.exec, Exec::Abandoned)
+            else {
+                unreachable!("opening stream owns its first fetch")
+            };
+            return Err(match handle.await {
+                Err(join_error) => executor_died(join_error),
+                Ok(_) => error_response("XX000", "executor closed its column channel"),
+            });
+        }
+    };
     // A `SELECT *` must not reveal ferrosa's synthetic key column; an explicit column list
     // naming it must still return it.
     let hidden: Vec<usize> = if is_star {
@@ -240,14 +280,9 @@ where
             .map(|(_, c)| c)
             .collect();
     }
-    Ok(ResultStream {
-        columns,
-        hidden,
-        exec: Exec::Fetching(spawn_fetch(cursor, &cancel)),
-        buffered: VecDeque::new(),
-        failure,
-        cancel,
-    })
+    stream.columns = columns;
+    stream.hidden = hidden;
+    Ok(stream)
 }
 
 /// Pull the next batch from `cursor` on a blocking thread.
@@ -479,6 +514,133 @@ mod tests {
             ferrosa_sql::Statement::Select(s) => *s,
             other => panic!("expected SELECT, got {other:?}"),
         }
+    }
+
+    struct OpeningCatalog {
+        inner: ferrosa_sql::MapCatalog,
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl ferrosa_sql::Catalog for OpeningCatalog {
+        fn resolve(
+            &self,
+            schema: &str,
+            table: &str,
+        ) -> Option<Arc<dyn TableProvider + Send + Sync>> {
+            if let Some(entered) = self.entered.lock().unwrap().take() {
+                let _ = entered.send(());
+                self.release
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("opening gate must be released");
+            }
+            ferrosa_sql::Catalog::resolve(&self.inner, schema, table)
+        }
+    }
+
+    struct OpeningFixture {
+        catalog: OpeningCatalog,
+        entered: tokio::sync::oneshot::Receiver<()>,
+        release: std::sync::mpsc::SyncSender<()>,
+        produced: Arc<AtomicUsize>,
+    }
+
+    fn opening_fixture() -> OpeningFixture {
+        let produced = Arc::new(AtomicUsize::new(0));
+        let table = Numbers {
+            schema: RelSchema::new(vec![Column::new("id", ColumnType::Int)]),
+            n: 1,
+            poison_at: None,
+            produced: Arc::clone(&produced),
+        };
+        let inner = ferrosa_sql::MapCatalog::new().with_table("public", "t", Arc::new(table));
+        let (entered_tx, entered) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::sync_channel(1);
+        OpeningFixture {
+            catalog: OpeningCatalog {
+                inner,
+                entered: std::sync::Mutex::new(Some(entered_tx)),
+                release: std::sync::Mutex::new(release_rx),
+            },
+            entered,
+            release,
+            produced,
+        }
+    }
+
+    #[test]
+    fn opening_and_first_fetch_share_the_blocking_job() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fixture = opening_fixture();
+            let opening = tokio::spawn(open_stream(
+                select("SELECT id FROM t"),
+                fixture.catalog,
+                ScanFailure::default(),
+                "public".into(),
+                Vec::new(),
+            ));
+            fixture.entered.await.unwrap();
+            let (blocked_tx, blocked_rx) = tokio::sync::oneshot::channel();
+            let (release_blocker, blocker_release) = std::sync::mpsc::sync_channel(1);
+            let blocker = tokio::task::spawn_blocking(move || {
+                let _ = blocked_tx.send(());
+                blocker_release
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("blocking sentinel must be released");
+            });
+            fixture.release.send(()).unwrap();
+            // The sentinel starts only after the opening job has ended. A
+            // separately queued first fetch cannot run while it owns the worker.
+            blocked_rx.await.unwrap();
+            let mut stream = opening.await.unwrap().unwrap();
+            let first = tokio::time::timeout(Duration::from_secs(1), stream.next_batch()).await;
+            let ready = matches!(first, Ok(Batch::Rows));
+            let row = stream.buffered.front().cloned();
+            drop(stream);
+            release_blocker.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(
+                ready,
+                "first fetch was requeued behind unrelated blocking work"
+            );
+            assert_eq!(row, Some(Row::new(vec![Value::Int(0)])));
+            assert_eq!(fixture.produced.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn opening_cancellation_does_not_pull_rows() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let fixture = opening_fixture();
+            let opening = tokio::spawn(open_stream(
+                select("SELECT id FROM t"),
+                fixture.catalog,
+                ScanFailure::default(),
+                "public".into(),
+                Vec::new(),
+            ));
+            fixture.entered.await.unwrap();
+            opening.abort();
+            match opening.await {
+                Err(error) => assert!(error.is_cancelled()),
+                Ok(_) => panic!("opening task must have been cancelled"),
+            }
+            fixture.release.send(()).unwrap();
+            tokio::task::spawn_blocking(|| {}).await.unwrap();
+            assert_eq!(fixture.produced.load(Ordering::SeqCst), 0);
+        });
     }
 
     async fn open(n: i64, poison_at: Option<i64>) -> (ResultStream, Arc<AtomicUsize>) {

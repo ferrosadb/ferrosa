@@ -210,3 +210,5 @@ value validation; storage placement differs. Earlier revision rates are historic
 See the benchmark report for current results, observed ranges and scope.
 
 Decoded storage rows consume their owned text/blob/numeric/JSON payloads during SQL conversion; identity/capacity and value/error parity tests prevent a clone from reappearing there. Physical decoding before MVCC row replacement and per-query execution/response overhead remain separate measured follow-ups.
+
+Cursor opening and first fetch now share a blocking job with separate early metadata publication; opening cancellation owns the existing stream drop guard before awaiting columns. Explicit gated regressions preserve liveness and prevent first-fetch queue interposition.

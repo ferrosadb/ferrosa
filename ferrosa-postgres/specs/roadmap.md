@@ -393,3 +393,5 @@ value validation; storage placement differs. Earlier revision rates are historic
 See the benchmark report for current results, observed ranges and scope.
 
 Owned decoded-row conversion now moves variable-size values into SQL; pointer/capacity regressions preserve ownership and conversion/error semantics. Sequential point-read measurements are tracked in the benchmark journey.
+
+Cursor opening and first fetch now share a blocking job with separate early metadata publication; opening cancellation owns the existing stream drop guard before awaiting columns. Explicit gated regressions preserve liveness and prevent first-fetch queue interposition.
