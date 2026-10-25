@@ -54,91 +54,12 @@ jobs:
             x86_64-unknown-linux-musl \
             target/x86_64-unknown-linux-musl/release
 
-      - name: Build Debian package
-        run: |
-          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
-          ARCH="amd64"
-          PKG_DIR="dist/ferrosa_${VERSION}_${ARCH}"
-          DEB_FILE="dist/ferrosa_${VERSION}_${ARCH}.deb"
-
-          mkdir -p "${PKG_DIR}/DEBIAN"
-          cat > "${PKG_DIR}/DEBIAN/control" <<CTRL
-          Package: ferrosa
-          Version: ${VERSION}
-          Section: database
-          Priority: optional
-          Architecture: ${ARCH}
-          Depends: ca-certificates
-          Maintainer: Ferrosa Team <ferrosa@ferrosadb.com>
-          Homepage: https://www.ferrosa.ai
-          Description: CQL-compatible distributed database with S3-backed storage
-           Ferrosa is a Rust reimplementation of Apache Cassandra with S3-backed
-           storage, pluggable secondary indexes, built-in graph queries, and
-           pair-mode high availability with automatic failover.
-          CTRL
-          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/control"
-
-          cat > "${PKG_DIR}/DEBIAN/postinst" <<'POSTINST'
-          #!/bin/sh
-          set -e
-          if ! id -u ferrosa >/dev/null 2>&1; then
-              useradd --system --no-create-home --shell /usr/sbin/nologin ferrosa
-          fi
-          mkdir -p /var/lib/ferrosa && chown ferrosa:ferrosa /var/lib/ferrosa
-          mkdir -p /var/log/ferrosa && chown ferrosa:ferrosa /var/log/ferrosa
-          POSTINST
-          sed -i 's/^          //' "${PKG_DIR}/DEBIAN/postinst"
-          chmod 755 "${PKG_DIR}/DEBIAN/postinst"
-
-          mkdir -p "${PKG_DIR}/usr/bin"
-          cp target/x86_64-unknown-linux-musl/release/ferrosa "${PKG_DIR}/usr/bin/"
-          cp target/x86_64-unknown-linux-musl/release/ferrosa-ctl "${PKG_DIR}/usr/bin/"
-
-          mkdir -p "${PKG_DIR}/lib/systemd/system"
-          if [ -f systemd/ferrosa.service ]; then
-            cp systemd/ferrosa.service "${PKG_DIR}/lib/systemd/system/ferrosa.service"
-          else
-            cat > "${PKG_DIR}/lib/systemd/system/ferrosa.service" <<SERVICE
-          [Unit]
-          Description=Ferrosa Database Server
-          After=network-online.target
-          Wants=network-online.target
-          Documentation=https://www.ferrosa.ai
-
-          [Service]
-          Type=simple
-          User=ferrosa
-          Group=ferrosa
-          ExecStart=/usr/bin/ferrosa
-          Restart=on-failure
-          RestartSec=5s
-          LimitNOFILE=65536
-          LimitMEMLOCK=infinity
-          Environment=FERROSA_DATA_DIR=/var/lib/ferrosa
-          Environment=FERROSA_LOG_DIR=/var/log/ferrosa
-          Environment=RUST_LOG=info
-
-          [Install]
-          WantedBy=multi-user.target
-          SERVICE
-            sed -i 's/^          //' "${PKG_DIR}/lib/systemd/system/ferrosa.service"
-          fi
-
-          mkdir -p "${PKG_DIR}/etc/ferrosa"
-          mkdir -p "${PKG_DIR}/var/lib/ferrosa"
-          mkdir -p "${PKG_DIR}/usr/share/doc/ferrosa"
-          echo "Copyright 2026 Ferrosa Contributors. All rights reserved." \
-              > "${PKG_DIR}/usr/share/doc/ferrosa/copyright"
-
-          dpkg-deb --build --root-owner-group "$PKG_DIR" "$DEB_FILE"
-
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tarball-x86_64-unknown-linux-musl
           path: |
             dist/ferrosa-*-x86_64-unknown-linux-musl.tar.gz
-            dist/ferrosa_*_amd64.deb
           retention-days: 90
           if-no-files-found: error
 
@@ -332,10 +253,12 @@ jobs:
             # Stable: latest + full + rolling major.minor + major.
             MAJOR="${VERSION%%.*}"
             MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
-            TAGS="${IMAGE}:latest ${IMAGE}:v${VERSION} ${IMAGE}:${MAJOR}.${MINOR} ${IMAGE}:${MAJOR}"
+            # glibc takes the plain tags (docker-image-glibc); musl keeps
+            # shipping under -musl tags.
+            TAGS="${IMAGE}:latest-musl ${IMAGE}:v${VERSION}-musl ${IMAGE}:${MAJOR}.${MINOR}-musl ${IMAGE}:${MAJOR}-musl"
           else
             # Nightly: moving :nightly + the exact CalVer ref.
-            TAGS="${IMAGE}:nightly ${IMAGE}:${REF}"
+            TAGS="${IMAGE}:nightly-musl ${IMAGE}:${REF}-musl"
           fi
           echo "Computed tags: ${TAGS}"
           # Emit as space-separated for the build step.
@@ -387,20 +310,41 @@ jobs:
             target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Built on Ubuntu 22.04 (glibc 2.35), so the tarball, the images and the .deb
+    # all run on Ubuntu 22.04 / Debian 12 and newer. Linking an older glibc
+    # costs no speed: the binary uses the host's glibc at run time. Pinned by
+    # digest; not yet mirrored to downloads.ferrosa.ai (forge t_df6a29de).
+    container:
+      image: docker.io/library/ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
+    # Inside a container GitHub's default shell is `sh -e`, and this image's sh
+    # is dash, which rejects `set -o pipefail` (CI run 40039687871).
+    defaults:
+      run:
+        shell: bash
     env:
+      # The oldest glibc every glibc artifact must run on: Ubuntu 22.04. The
+      # build fails if the binary needs newer, and the .deb declares the exact
+      # libc6 version it needs (.github/scripts/build-deb.sh).
+      GLIBC_FLOOR: "2.35"
       # The Dockerfile.glibc base is pinned to Debian trixie (glibc 2.41). A glibc
       # binary built against a newer runtime links fine and then fails at RUN
       # time, so the version the binary actually needs is asserted below rather
       # than assumed from the runner. Bump this together with that digest.
       GLIBC_RUNTIME_MAX: "2.41"
     steps:
+      - name: Install glibc build dependencies
+        # Before checkout: the bare 22.04 image has no git, and the toolchain
+        # action needs curl. libunwind-dev: jemalloc's heap profiler needs
+        # unw_backtrace; on glibc the distro library satisfies its configure,
+        # unlike the musl target which hand-builds libunwind. dpkg-dev provides
+        # dpkg-deb for the .deb. The job runs as root in the container.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential pkg-config perl file \
+            capnproto libunwind-dev dpkg-dev
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      - name: Install glibc build dependencies
-        # libunwind-dev: jemalloc's heap profiler needs unw_backtrace. On glibc
-        # the distro headers and library satisfy its configure directly, unlike
-        # the musl target which has to hand-build libunwind.
-        run: sudo apt-get update && sudo apt-get install -y capnproto libunwind-dev
 
       - name: Build production binaries (glibc, stripped)
         run: |
@@ -420,6 +364,10 @@ jobs:
           echo "binary requires glibc ${required}; pinned runtime provides ${GLIBC_RUNTIME_MAX}"
           if [ "$(printf '%s\n%s\n' "$GLIBC_RUNTIME_MAX" "$required" | sort -V | tail -n1)" != "$GLIBC_RUNTIME_MAX" ]; then
             echo "::error::binary needs glibc ${required} but the pinned runtime base provides ${GLIBC_RUNTIME_MAX}" >&2
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$required" | sort -V | tail -n1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::binary needs glibc ${required}, newer than ${GLIBC_FLOOR} (Ubuntu 22.04): the build did not run on the 22.04 container" >&2
             exit 1
           fi
 
@@ -456,14 +404,51 @@ jobs:
           install -m 0755 "target/${{ matrix.target }}/release/ferrosa"     "dist/gnu/${{ matrix.arch }}/production/ferrosa"
           install -m 0755 "target/${{ matrix.target }}/release/ferrosa-ctl" "dist/gnu/${{ matrix.arch }}/production/ferrosa-ctl"
           install -m 0755 "target/${{ matrix.target }}/profiling/ferrosa"   "dist/gnu/${{ matrix.arch }}/profiling/ferrosa"
-          tar -czf "dist/ferrosa-gnu-${{ matrix.arch }}.tar.gz" \
+          # Not `ferrosa-*`: the release job publishes every `ferrosa-*.tar.gz`
+          # it downloads, and this bundle (with its profiling binary) is for
+          # docker-image-glibc only.
+          tar -czf "dist/image-bundle-gnu-${{ matrix.arch }}.tar.gz" \
             -C "dist/gnu/${{ matrix.arch }}" production profiling
 
       - name: Upload artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: tarball-gnu-${{ matrix.arch }}
-          path: dist/ferrosa-gnu-${{ matrix.arch }}.tar.gz
+          name: image-bundle-gnu-${{ matrix.arch }}
+          path: dist/image-bundle-gnu-${{ matrix.arch }}.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+      # glibc is 15-20% faster than musl, so its tarball ships too, for hosts
+      # with a new enough glibc (the requirement is asserted above). It is
+      # additive: the musl tarballs, which install/install.sh picks on Linux,
+      # are unchanged. Same stager and layout as the musl tarballs.
+      - name: Stage glibc release tarball
+        run: |
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          FERROSA_RELEASE_TAG="v${VERSION}" bash .github/scripts/stage-release-tarball.sh "${{ matrix.target }}" \
+            "target/${{ matrix.target }}/release"
+
+      - name: Upload glibc release tarball
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: tarball-${{ matrix.target }}
+          path: dist/ferrosa-*-${{ matrix.target }}.tar.gz
+          retention-days: 90
+          if-no-files-found: error
+
+      # The .deb carries the glibc build too: a Debian/Ubuntu host always has
+      # glibc, and the package declares the version it needs, so apt refuses a
+      # host that is too old rather than the binary failing at start.
+      - name: Build Debian package (glibc)
+        run: |
+          VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
+          bash .github/scripts/build-deb.sh "${{ matrix.arch }}" "target/${{ matrix.target }}/release" "$VERSION" "$GLIBC_FLOOR" dist
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/ferrosa_*_${{ matrix.arch }}.deb
           retention-days: 90
           if-no-files-found: error
 
@@ -494,7 +479,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist/amd64 dist/arm64
           for arch in amd64 arm64; do
-            tarball=$(find artifacts -name "ferrosa-gnu-${arch}.tar.gz" -print -quit)
+            tarball=$(find artifacts -name "image-bundle-gnu-${arch}.tar.gz" -print -quit)
             test -n "$tarball" || { echo "ERROR: glibc tarball for ${arch} not found" >&2; exit 1; }
             tar -xzf "$tarball" -C "dist/${arch}"
           done
@@ -508,15 +493,16 @@ jobs:
           VERSION="$(bash .github/scripts/release-version.sh "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"
           PRERELEASE="${{ github.event.inputs.prerelease }}"
           if [ "${PRERELEASE}" = "false" ]; then
-            # Stable: the same tag set the musl image gets, suffixed so neither
-            # image can overwrite the other.
+            # Stable: glibc is the default image (15-20% faster than musl), so it
+            # takes the plain tags. The -glibc aliases keep existing pins
+            # resolving; the musl image ships under -musl tags.
             MAJOR="${VERSION%%.*}"
             MINOR="${VERSION#*.}"; MINOR="${MINOR%%.*}"
-            PRODUCTION="${IMAGE}:latest-glibc ${IMAGE}:v${VERSION}-glibc ${IMAGE}:${MAJOR}.${MINOR}-glibc ${IMAGE}:${MAJOR}-glibc"
+            PRODUCTION="${IMAGE}:latest ${IMAGE}:v${VERSION} ${IMAGE}:${MAJOR}.${MINOR} ${IMAGE}:${MAJOR} ${IMAGE}:latest-glibc ${IMAGE}:v${VERSION}-glibc ${IMAGE}:${MAJOR}.${MINOR}-glibc ${IMAGE}:${MAJOR}-glibc"
             PROFILING="${IMAGE}:latest-glibc-profiling ${IMAGE}:v${VERSION}-glibc-profiling ${IMAGE}:${MAJOR}.${MINOR}-glibc-profiling ${IMAGE}:${MAJOR}-glibc-profiling"
           else
             # Nightly: moving channel tag plus the exact CalVer ref.
-            PRODUCTION="${IMAGE}:nightly-glibc ${IMAGE}:v${VERSION}-glibc"
+            PRODUCTION="${IMAGE}:nightly ${IMAGE}:v${VERSION} ${IMAGE}:nightly-glibc ${IMAGE}:v${VERSION}-glibc"
             PROFILING="${IMAGE}:nightly-glibc-profiling ${IMAGE}:v${VERSION}-glibc-profiling"
           fi
           echo "Production tags: ${PRODUCTION}"
@@ -613,7 +599,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "dist/${{ matrix.arch }}"
-          tarball=$(find artifacts -name "ferrosa-gnu-${{ matrix.arch }}.tar.gz" -print -quit)
+          tarball=$(find artifacts -name "image-bundle-gnu-${{ matrix.arch }}.tar.gz" -print -quit)
           test -n "$tarball" || { echo "ERROR: glibc tarball for ${{ matrix.arch }} not found" >&2; exit 1; }
           # Contains production/ and profiling/ side by side; Dockerfile.glibc
           # picks the variant by build target.
@@ -694,6 +680,7 @@ jobs:
     needs:
       - build-linux-x86_64
       - build-linux-aarch64
+      - build-linux-gnu
       - build-macos-aarch64
     runs-on: ubuntu-latest
     permissions:
@@ -765,18 +752,20 @@ jobs:
           NOTES=$(cat <<'NOTES'
           ## What's Included
 
-          Ferrosa is published as compressed tarballs for four target triples:
+          Ferrosa is published as compressed tarballs for six target triples:
 
           | Tarball | Platform |
           |---------|----------|
           | `ferrosa-vVERSION-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static musl) |
           | `ferrosa-vVERSION-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 (static musl) |
+          | `ferrosa-vVERSION-x86_64-unknown-linux-gnu.tar.gz` | Linux x86_64 (glibc 2.35+, e.g. Ubuntu 22.04; 15-20% faster) |
+          | `ferrosa-vVERSION-aarch64-unknown-linux-gnu.tar.gz` | Linux aarch64 (glibc 2.35+, e.g. Ubuntu 22.04; 15-20% faster) |
           | `ferrosa-vVERSION-x86_64-apple-darwin.tar.gz` | macOS Intel |
           | `ferrosa-vVERSION-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
           | `SHA256SUMS` | Checksums for all tarballs |
 
           Additional packages:
-          - `ferrosa_VERSION_amd64.deb` — Debian/Ubuntu package with systemd unit
+          - `ferrosa_VERSION_amd64.deb`, `ferrosa_VERSION_arm64.deb` — Debian/Ubuntu packages with systemd unit (glibc build; Ubuntu 22.04 / Debian 12 or newer, enforced by `Depends: libc6`)
           - `ferrosa-VERSION.arm64_sonoma.bottle.tar.gz` — Homebrew bottle for tap install
 
           ### Container images
@@ -785,11 +774,12 @@ jobs:
 
           | Tag | Runtime | Binary |
           |-----|---------|--------|
-          | `vVERSION`, `nightly`/`latest` | Alpine (musl) | static, stripped |
-          | `vVERSION-glibc` | Debian (glibc 2.41) | dynamic, stripped |
+          | `vVERSION`, `nightly`/`latest` (alias `-glibc`) | Debian (glibc 2.41) | dynamic, stripped |
+          | `vVERSION-musl`, `nightly-musl`/`latest-musl` | Alpine (musl) | static, stripped |
           | `vVERSION-glibc-profiling` | Debian (glibc 2.41) | dynamic, full DWARF, unstripped |
 
-          The `-glibc` images run the same engine on glibc rather than musl. The
+          The default images run on glibc, 15-20% faster than musl; the `-musl`
+          images run the same engine statically linked. The
           `-glibc-profiling` image exists to make profiles resolvable: it is built
           with `--profile profiling` (full DWARF, frame pointers) and shipped
           unstripped, with `perf` for CPU flame graphs and `jeprof` for jemalloc

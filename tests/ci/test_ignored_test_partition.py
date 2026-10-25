@@ -78,6 +78,34 @@ def excluded_packages(command: str) -> set[str]:
     return set(re.findall(r"--exclude\s+(\S+)", command))
 
 
+# Packages no --workspace test lane runs (they need Firecracker / a load rig).
+WORKSPACE_EXCLUDES = {"ferrosa-jepsen", "ferrosa-loadgen"}
+# A real `#[ignore` attribute starts its line; mentions in comments do not.
+IGNORE_ATTR = re.compile(r"(?m)^\s*#\[ignore\b")
+
+
+def ignored_test_targets() -> set[tuple[str, str]]:
+    """(package, test target) for every integration-test file holding an
+    `#[ignore]`d test, outside the packages no workspace lane runs."""
+    targets = set()
+    for path in REPO_ROOT.glob("*/tests/*.rs"):
+        package = path.parts[-3]
+        if package in WORKSPACE_EXCLUDES or package == "cassandra":
+            continue
+        if IGNORE_ATTR.search(path.read_text(encoding="utf-8")):
+            targets.add((package, path.stem))
+    return targets
+
+
+def lib_files_with_ignored_tests() -> list[Path]:
+    return [
+        path
+        for path in REPO_ROOT.glob("*/src/**/*.rs")
+        if path.parts[len(REPO_ROOT.parts)] not in WORKSPACE_EXCLUDES | {"cassandra", "target"}
+        and IGNORE_ATTR.search(path.read_text(encoding="utf-8"))
+    ]
+
+
 class NightlyRunsEveryIgnoredTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -98,10 +126,36 @@ class NightlyRunsEveryIgnoredTest(unittest.TestCase):
                 "give the test what it needs instead",
             )
 
-    def test_the_nightly_covers_the_same_packages_as_pr_ci(self):
-        self.assertTrue(excluded_packages(self.pr_cmd), "PR CI excludes nothing; the premise is gone")
-        # Most thorough: the nightly may exclude nothing PR CI runs.
-        self.assertLessEqual(excluded_packages(self.run_cmd), excluded_packages(self.pr_cmd))
+    def test_the_nightly_runs_the_whole_workspace_selection(self):
+        # Most thorough: the nightly selects every ignored test in every
+        # package a workspace lane runs, so one PR CI does not target is still
+        # run nightly.
+        self.assertIn("--workspace", self.run_cmd)
+        self.assertLessEqual(excluded_packages(self.run_cmd), WORKSPACE_EXCLUDES)
+
+    def test_pr_ci_targets_every_ignored_test_without_a_workspace_compile(self):
+        # PR CI used to run `cargo test --workspace --all-features -- --ignored`,
+        # compiling all ~214 test binaries a second time to run ONE test. It
+        # now names the targets that hold ignored tests, so this must fail when
+        # a new `#[ignore]` appears in a target it does not name.
+        self.assertNotIn("--workspace", self.pr_cmd)
+        self.assertIn("--ignored", self.pr_cmd)
+        self.assertIn("--all-features", self.pr_cmd)
+        targets = ignored_test_targets()
+        self.assertTrue(targets, "no #[ignore]d test found; the premise is gone")
+        for package, target in sorted(targets):
+            self.assertRegex(
+                self.pr_cmd, rf"-p {re.escape(package)}\b", f"PR CI does not build {package}"
+            )
+            self.assertRegex(
+                self.pr_cmd, rf"--test {re.escape(target)}\b",
+                f"{package}/tests/{target}.rs holds an #[ignore]d test PR CI does not run",
+            )
+
+    def test_no_lib_test_is_ignored(self):
+        # A targeted `--test` list cannot reach an ignored unit test in src/.
+        # None exists; one appearing must widen the PR selection, not vanish.
+        self.assertEqual(lib_files_with_ignored_tests(), [])
 
     def test_the_nightly_brings_up_the_cluster_before_the_tests(self):
         self.assertIn("test-cluster-up-ci.sh", self.nightly)
