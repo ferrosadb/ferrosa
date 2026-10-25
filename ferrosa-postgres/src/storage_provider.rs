@@ -173,6 +173,21 @@ pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
     })
 }
 
+/// Convert one owned decoded storage row to the SQL executor's positional values.
+fn decoded_row_values(row: Vec<Option<CqlValue>>) -> Result<Vec<Value>, String> {
+    row.into_iter()
+        .map(|cell| match cell {
+            Some(CqlValue::Text(text) | CqlValue::Ascii(text)) => Ok(Value::Text(text)),
+            Some(CqlValue::Blob(bytes)) => Ok(Value::Bytea(bytes)),
+            Some(CqlValue::Decimal { scale, unscaled }) => Ok(Value::numeric(unscaled, scale)),
+            Some(CqlValue::Varint(unscaled)) => Ok(Value::numeric(unscaled, 0)),
+            Some(CqlValue::Jsonb(doc)) => Ok(Value::Jsonb(doc)),
+            Some(value) => cql_to_value(&value),
+            None => Ok(Value::Null),
+        })
+        .collect()
+}
+
 /// Failure modes of [`load_table`].
 ///
 /// [`LoadError::NoSuchTable`] is deliberately distinct from a successful load of
@@ -602,14 +617,7 @@ async fn produce_scan(
             }
         };
         for cql_row in cql_rows {
-            let values: Vec<Value> = match cql_row
-                .iter()
-                .map(|cell| match cell {
-                    Some(value) => cql_to_value(value),
-                    None => Ok(Value::Null),
-                })
-                .collect()
-            {
+            let values: Vec<Value> = match decoded_row_values(cql_row) {
                 Ok(values) => values,
                 Err(error) => {
                     failure.record(format!(
@@ -1384,6 +1392,83 @@ mod tests {
     use uuid::Uuid;
 
     // ── Pure conversion tests (no infra) ──────────────────────────────────
+
+    #[test]
+    fn owned_row_conversion_moves_text_and_blob_allocations() {
+        let mut text = String::with_capacity(1024);
+        text.push_str("owned text");
+        let mut ascii = String::with_capacity(512);
+        ascii.push_str("owned ascii");
+        let mut blob = Vec::with_capacity(2048);
+        blob.extend_from_slice(b"owned blob");
+        let allocations = [
+            (text.as_ptr(), text.capacity()),
+            (ascii.as_ptr(), ascii.capacity()),
+            (blob.as_ptr(), blob.capacity()),
+        ];
+        let values = super::decoded_row_values(vec![
+            Some(CqlValue::Text(text)),
+            Some(CqlValue::Ascii(ascii)),
+            Some(CqlValue::Blob(blob)),
+            None,
+            Some(CqlValue::Int(42)),
+        ])
+        .unwrap();
+        for (value, (pointer, capacity)) in values.iter().zip(allocations) {
+            let (actual_pointer, actual_capacity) = match value {
+                Value::Text(text) => (text.as_ptr(), text.capacity()),
+                Value::Bytea(bytes) => (bytes.as_ptr(), bytes.capacity()),
+                _ => panic!("expected an owned payload"),
+            };
+            assert_eq!(actual_pointer, pointer, "payload must move without a copy");
+            assert_eq!(actual_capacity, capacity, "retain the original allocation");
+        }
+        assert_eq!(values[3], Value::Null);
+        assert_eq!(values[4], Value::Int(42));
+    }
+
+    #[test]
+    fn owned_row_conversion_preserves_values_and_errors() {
+        use num_bigint::BigInt;
+        let values = vec![
+            CqlValue::Null,
+            CqlValue::Int(42),
+            CqlValue::Bigint(i64::MIN),
+            CqlValue::Counter(7),
+            CqlValue::Smallint(-3),
+            CqlValue::Tinyint(5),
+            CqlValue::Text("text".into()),
+            CqlValue::Ascii("ascii".into()),
+            CqlValue::Boolean(true),
+            CqlValue::Float(1.5_f32.to_bits()),
+            CqlValue::Double((-0.0_f64).to_bits()),
+            CqlValue::Uuid(Uuid::nil()),
+            CqlValue::Timeuuid(Uuid::nil()),
+            CqlValue::Blob(vec![0, 255]),
+            CqlValue::Timestamp(1000),
+            CqlValue::Timestamp(i64::MAX),
+            CqlValue::Date(u32::MAX),
+            CqlValue::Time(1_500_000),
+            CqlValue::Inet("::1".parse().unwrap()),
+            CqlValue::Decimal {
+                scale: 2,
+                unscaled: BigInt::from(12300),
+            },
+            CqlValue::Varint(BigInt::from(9_999_999_999_i64)),
+            CqlValue::Duration {
+                months: 1,
+                days: 2,
+                nanos: 3,
+            },
+            CqlValue::List(vec![CqlValue::Int(1)]),
+        ];
+        for value in values {
+            let expected = super::cql_to_value(&value);
+            let actual =
+                super::decoded_row_values(vec![Some(value)]).map(|mut values| values.remove(0));
+            assert_eq!(actual, expected);
+        }
+    }
 
     #[test]
     fn cql_to_value_maps_supported_scalars() {

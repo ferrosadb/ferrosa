@@ -391,3 +391,5 @@ PostgreSQL 18.6 at 26,392 (92.0%) for 100k rows. The 5k follow-on fixture gives
 (28.6%; a 3.50× remaining read gap). These are two-run unprofiled means with full
 value validation; storage placement differs. Earlier revision rates are historical.
 See the benchmark report for current results, observed ranges and scope.
+
+Owned decoded-row conversion now moves variable-size values into SQL; pointer/capacity regressions preserve ownership and conversion/error semantics. Sequential point-read measurements are tracked in the benchmark journey.

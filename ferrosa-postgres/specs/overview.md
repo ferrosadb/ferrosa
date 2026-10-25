@@ -233,6 +233,14 @@ change, and invoke storage exactly once outside metadata CAS retries. Disjoint
 writers and snapshot reads can progress while another storage apply pauses.
 Overlapping reservations or stale reads fail with `40001` before storage effects.
 
+
+Owned decoded storage rows move text, ASCII, blob, numeric and validated JSON
+payloads into SQL values. The borrowed conversion API remains available for
+callers retaining their input. Production-path identity/capacity tests require
+text/blob allocations to survive the conversion unchanged; scalar/error results
+match the borrowed conversion. This removes one intermediate payload copy and
+does not change cluster reads, snapshot selection or wire encoding.
+
 Fresh local inserts represent their pre-insert absence once in the current head.
 An older snapshot missing that key resolves this shared absence without copying
 an entry into every reader root. First-touch rows that already exist physically
