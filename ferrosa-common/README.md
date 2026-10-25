@@ -27,8 +27,8 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
   payload independently from its merge metadata. Existing vector constructors
   remain available, alongside payload-handle constructors. `CellBytesMut` owns
   reusable decoding scratch and freezes it for publication; `CellReadBuffer`
-  lets readers accept scratch or legacy vectors. The initial representation
-  retains vectors so consumers migrate separately from the backing swap.
+  lets readers accept scratch or legacy vectors. A compact shared owner
+  adopts each vector without copying its bytes.
   Ordering, debug output and serialized byte sequences match owned bytes.
 
 - **Hash ring** — `Token` (`i64` newtype over Murmur3 `h1`), `Token::from_key`,
@@ -270,8 +270,10 @@ avoids Crossbeam rendezvous select packets during waits (T-081).
 
 `CqlType::Jsonb` and `CqlValue::Jsonb(ferrosa_jsonb::JsonbValue)` (T-150). The value is validated and never raw bytes; `Ord`/`Eq`/`Hash` delegate to `JsonbValue` (D18, D2a) and `discriminant_index` gives it index 27. The name registry has `jsonb` with the POC marshal class `org.apache.cassandra.db.marshal.JsonbType`; `custom_class_type` resolves only that class (D20) and `check_jsonb_nesting` rejects `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb>` at any depth (D21). `jsonb_canonical_text` prints a value. New edge: `ferrosa-common` -> `ferrosa-jsonb` (leaf; `guard-arrow-free.sh` passes).
 
-CellBytes now uses bytes::Bytes with byte-only ordering, hashing and sequence
-serialization. Clones share payloads; adoption preserves the input allocation.
-Unique BytesMut decoding scratch reuses capacity; shared buffers are discarded
-without copying when a decoder needs new scratch. Spill/memtable accounting
-conservatively charges retained capacity and a possible shared owner.
+`CellBytes` uses `Arc<Vec<u8>>` with byte-only ordering, hashing and sequence
+serialization. Clones share payloads; adoption moves the vector without copying
+its bytes. Scratch retains a unique owner and its capacity across freezes; a
+shared owner is discarded without copying when new scratch is needed. Empty
+payloads share one immutable empty owner. Spill/memtable estimates charge full
+retained capacity and the shared-owner metadata. Each nonempty input pays one
+owner allocation; this is a measured tradeoff, not an allocation-free claim.

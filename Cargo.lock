@@ -2375,7 +2375,6 @@ dependencies = [
 name = "ferrosa-common"
 version = "0.28.2"
 dependencies = [
- "bytes",
  "crossbeam-channel",
  "ferrosa-jsonb",
  "num-bigint",

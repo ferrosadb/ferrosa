@@ -3,23 +3,31 @@
 //! Last revised: 2026-10-24
 //! Last changed: Share payloads while keeping mutable I/O scratch uniquely owned.
 
-use bytes::{Bytes, BytesMut};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// Immutable cell bytes. Cloning shares the payload; merge metadata stays owned.
 ///
-/// The retained capacity is accounting metadata only. Equality, hashing and
+/// Capacity is read from the owner for accounting. Equality, hashing and
 /// ordering depend exclusively on bytes, preserving cell tie-break semantics.
-#[derive(Clone, Default, Eq)]
+#[derive(Clone, Eq)]
 pub struct CellBytes {
-    bytes: Bytes,
-    retained_capacity: usize,
+    bytes: Arc<Vec<u8>>,
+}
+
+impl Default for CellBytes {
+    fn default() -> Self {
+        static EMPTY: OnceLock<Arc<Vec<u8>>> = OnceLock::new();
+        Self {
+            bytes: EMPTY.get_or_init(|| Arc::new(Vec::new())).clone(),
+        }
+    }
 }
 
 impl Ord for CellBytes {
@@ -43,7 +51,7 @@ impl Hash for CellBytes {
 impl CellBytes {
     /// Borrow the payload without copying it.
     pub fn as_slice(&self) -> &[u8] {
-        &self.bytes
+        self.bytes.as_slice()
     }
 
     /// Convert to an owned vector at an API that requires one.
@@ -51,36 +59,36 @@ impl CellBytes {
     /// Ownership is transferred when possible. A shared representation may
     /// need to copy here; hot read/serialization paths should borrow instead.
     pub fn into_vec(self) -> Vec<u8> {
-        self.bytes.into()
+        Arc::try_unwrap(self.bytes).unwrap_or_else(|shared| (*shared).clone())
     }
 
     /// Recover unique I/O scratch, discarding its logical contents.
     ///
     /// Shared bytes are never copied just to overwrite them: use fresh empty
     /// scratch when a previous consumer still retains the payload.
-    pub fn into_scratch(self) -> CellBytesMut {
-        let mut buffer = self.bytes.try_into_mut().unwrap_or_default();
-        buffer.clear();
-        CellBytesMut(buffer)
+    pub fn into_scratch(mut self) -> CellBytesMut {
+        if let Some(unique) = Arc::get_mut(&mut self.bytes) {
+            unique.clear();
+            CellBytesMut(Some(self.bytes))
+        } else {
+            CellBytesMut::default()
+        }
     }
 
     /// Payload backing capacity retained by this handle, even when shared.
     pub fn retained_capacity(&self) -> usize {
-        self.retained_capacity
+        self.bytes.capacity()
     }
 
-    /// Conservative heap charge, including a possible shared-owner allocation.
-    ///
-    /// bytes 1.11.1's largest owner (BytesMut::Shared) contains a Vec and two
-    /// usize-sized fields. Charge it for every nonempty allocation, including
-    /// unique buffers that have not yet allocated that owner. Shared allocations
-    /// may be charged more than once; this is a bound, not physical RSS.
+    /// Heap charge including Arc's strong/weak counters and owned Vec metadata.
+    /// Shared allocations may be charged more than once; this is a conservative
+    /// per-handle estimate, not physical RSS or allocator size-class accounting.
     pub fn retained_heap_bytes(&self) -> usize {
-        if self.retained_capacity == 0 {
+        let capacity = self.bytes.capacity();
+        if capacity == 0 {
             return 0;
         }
-        self.retained_capacity
-            .saturating_add(std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>())
+        capacity.saturating_add(std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>())
     }
 }
 
@@ -89,37 +97,45 @@ impl CellBytes {
 /// Keeping this type separate from `CellBytes` lets a decoder reuse unique
 /// storage without ever mutating bytes retained by an earlier consumer.
 #[derive(Default)]
-pub struct CellBytesMut(BytesMut);
+pub struct CellBytesMut(Option<Arc<Vec<u8>>>);
 
 impl CellBytesMut {
     /// Resize owned scratch before an initialized read.
     pub fn resize(&mut self, len: usize, value: u8) {
-        self.0.resize(len, value);
+        let bytes = self.0.get_or_insert_with(|| Arc::new(Vec::new()));
+        Arc::get_mut(bytes)
+            .expect("scratch is uniquely owned")
+            .resize(len, value);
     }
 
     /// Clear the logical contents while retaining unique capacity.
     pub fn clear(&mut self) {
-        self.0.clear();
+        if let Some(bytes) = self.0.as_mut() {
+            Arc::get_mut(bytes)
+                .expect("scratch is uniquely owned")
+                .clear();
+        }
     }
 
     /// The scratch capacity available without growing its backing allocation.
     pub fn capacity(&self) -> usize {
-        self.0.capacity()
+        self.0.as_ref().map_or(0, |bytes| bytes.capacity())
     }
 
     /// Publish the initialized contents without copying their bytes.
     pub fn freeze(self) -> CellBytes {
-        let retained_capacity = self.0.capacity();
-        CellBytes {
-            bytes: self.0.freeze(),
-            retained_capacity,
-        }
+        self.0
+            .map_or_else(CellBytes::default, |bytes| CellBytes { bytes })
     }
 }
 
 impl AsMut<[u8]> for CellBytesMut {
     fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.0
+        self.0.as_mut().map_or(&mut [], |bytes| {
+            Arc::get_mut(bytes)
+                .expect("scratch is uniquely owned")
+                .as_mut_slice()
+        })
     }
 }
 
@@ -165,10 +181,12 @@ impl Borrow<[u8]> for CellBytes {
 
 impl From<Vec<u8>> for CellBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        let retained_capacity = bytes.capacity();
-        Self {
-            bytes: Bytes::from(bytes),
-            retained_capacity,
+        if bytes.capacity() == 0 {
+            Self::default()
+        } else {
+            Self {
+                bytes: Arc::new(bytes),
+            }
         }
     }
 }
