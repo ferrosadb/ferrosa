@@ -123,7 +123,7 @@ fn visible(p: &Partition) -> BTreeMap<Vec<u8>, BTreeMap<u16, Option<Vec<u8>>>> {
                 row.clustering.clone(),
                 cells
                     .into_iter()
-                    .map(|(i, c)| (i, c.value.clone()))
+                    .map(|(i, c)| (i, c.value.as_ref().map(|value| value.to_vec())))
                     .collect(),
             )
         })

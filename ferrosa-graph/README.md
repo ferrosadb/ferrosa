@@ -425,3 +425,9 @@ No `#[ignore]`, no `TODO`/`FIXME` markers in source. Most test functions:
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
 - [Data flow](specs/data-flow.md) — MATCH expand + adjacency-consistent write
+
+### Cell payload boundary
+
+Graph column extraction retains immutable `CellBytes` handles for regular
+cells. Adjacency repair carries those handles into new cells; visited traversal
+keys remain independently owned at the key boundary.

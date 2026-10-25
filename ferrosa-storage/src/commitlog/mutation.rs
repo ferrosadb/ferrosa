@@ -753,7 +753,7 @@ impl Mutation {
         Ok((
             column_index,
             CellValue {
-                value,
+                value: value.map(Into::into),
                 timestamp,
                 ttl,
                 local_deletion_time,

@@ -16,14 +16,14 @@ use crate::{
     IndexBuilder, IndexCapabilities, IndexConfig, IndexError, IndexFactory, IndexFileMeta,
     IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
 };
-use ferrosa_common::CellValue;
+use ferrosa_common::{CellBytes, CellValue};
 use std::ops::{Bound, ControlFlow};
 use std::path::PathBuf;
 
 /// Entry stored in the B-tree index: a key and its corresponding row position.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BTreeEntry {
-    key: Vec<u8>,
+    key: CellBytes,
     position: RowPosition,
 }
 
@@ -242,7 +242,7 @@ fn deserialize_entries(data: &[u8]) -> IndexResult<Vec<BTreeEntry>> {
         let ck = read_length_prefixed(data, &mut offset)?;
 
         entries.push(BTreeEntry {
-            key,
+            key: key.into(),
             position: RowPosition {
                 partition_key: pk,
                 clustering_key: ck,
@@ -463,14 +463,14 @@ mod tests {
     fn serialization_roundtrip() {
         let entries = vec![
             BTreeEntry {
-                key: b"key1".to_vec(),
+                key: b"key1".to_vec().into(),
                 position: RowPosition {
                     partition_key: b"pk1".to_vec(),
                     clustering_key: b"ck1".to_vec(),
                 },
             },
             BTreeEntry {
-                key: b"key2".to_vec(),
+                key: b"key2".to_vec().into(),
                 position: RowPosition {
                     partition_key: b"pk2".to_vec(),
                     clustering_key: vec![],

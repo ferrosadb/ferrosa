@@ -234,7 +234,7 @@ fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
     );
     let key = DecoratedKey::new(PartitionKey::from(b"p".as_slice()));
     let mut large = row(0, false);
-    large.cells[0].1.value = Some(vec![7; 128 * 1024]);
+    large.cells[0].1.value = Some(vec![7; 128 * 1024].into());
     w.begin_partition(&key, DeletionTime::LIVE, None).unwrap();
     w.write_partition_row(&large).unwrap();
     w.end_partition().unwrap();

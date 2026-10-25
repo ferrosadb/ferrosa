@@ -116,7 +116,7 @@ fn read_value(engine: &StorageEngine, table: &TableId, id: u8) -> Option<Vec<u8>
                 .rows
                 .iter()
                 .flat_map(|row| row.cells.iter())
-                .find_map(|(_, cell)| cell.value.clone())
+                .find_map(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
         })
 }
 

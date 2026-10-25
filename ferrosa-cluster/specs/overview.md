@@ -231,3 +231,9 @@ than a total wait budget (CL-63). See
 It is a hub crate: a wide fan-in of front-ends depend on its coordinator/consensus
 API, so its public surface (CL semantics, `ModeController`, `MembershipChanger`,
 repair) changes ripple broadly. See the [root crate index](../../specs/crates.md).
+
+### Cell payload boundary
+
+Raft cell DTOs carry `CellBytes` and serialize the same byte sequence as
+the former owned vector. Frozen legacy-format tests cover this boundary; replay
+identities and digest ordering are unchanged.

@@ -94,7 +94,7 @@ fn read_value(engine: &StorageEngine, pk: &str) -> Option<Vec<u8>> {
                 .iter()
                 .flat_map(|row| row.cells.iter())
                 .find(|(idx, _)| *idx == 0)
-                .and_then(|(_, cell)| cell.value.clone())
+                .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
         })
 }
 

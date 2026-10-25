@@ -8558,7 +8558,7 @@ fn cell_to_cql_value(
             16 => CqlValue::Inet(IpAddr::V6(std::net::Ipv6Addr::from(
                 <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]),
             ))),
-            _ => CqlValue::Blob(bytes.clone()),
+            _ => CqlValue::Blob(bytes.to_vec()),
         },
         DataType::Timestamp => {
             let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
@@ -8576,10 +8576,10 @@ fn cell_to_cql_value(
             })?;
             CqlValue::Timestamp(ms)
         }
-        DataType::Blob => CqlValue::Blob(bytes.clone()),
+        DataType::Blob => CqlValue::Blob(bytes.to_vec()),
         // Duration has no virtual-cell decoder yet; it is surfaced as a blob
         // (pre-existing silent fallback, tracked as a fail-loud follow-up).
-        DataType::Duration => CqlValue::Blob(bytes.clone()),
+        DataType::Duration => CqlValue::Blob(bytes.to_vec()),
     }))
 }
 

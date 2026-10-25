@@ -199,7 +199,7 @@ fn extract_graph_column_bytes(
     mutation: &Mutation,
     row: &ferrosa_sstable::types::Row,
     column_name: &str,
-) -> Option<Vec<u8>> {
+) -> Option<ferrosa_common::CellBytes> {
     let column = meta.columns.get(column_name)?;
     match column.kind {
         ferrosa_schema::metadata::column::ColumnKind::PartitionKey => {
@@ -209,7 +209,7 @@ fn extract_graph_column_bytes(
                 .position(|name| name == column_name)?;
             let components =
                 decode_partition_components(mutation.key.key.as_bytes(), meta.partition_key.len())?;
-            components.get(idx).cloned()
+            components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Clustering => {
             let idx = meta
@@ -218,7 +218,7 @@ fn extract_graph_column_bytes(
                 .position(|(name, _)| name == column_name)?;
             let components =
                 decode_clustering_components(&row.clustering, meta.clustering_key.len())?;
-            components.get(idx).cloned()
+            components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Regular
         | ferrosa_schema::metadata::column::ColumnKind::Static => {

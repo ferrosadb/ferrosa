@@ -167,3 +167,9 @@ Sits near the top of the stack: depends on `ferrosa-cluster`, `ferrosa-storage`,
 integration test harness only). Depended on by the `ferrosa` binary, which mounts
 its HTTP + Bolt servers. See the [root crate index](../../specs/crates.md) for the
 full graph.
+
+### Cell payload boundary
+
+Graph column extraction retains immutable `CellBytes` handles for regular
+cells. Adjacency repair carries those handles into new cells; visited traversal
+keys remain independently owned at the key boundary.

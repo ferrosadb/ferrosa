@@ -453,3 +453,9 @@ with the existing `merge_partitions` oracle's supplied-source order. Adjacent
 duplicate rows cannot change which source supplies equal-timestamp row TTLs,
 delete-time metadata or otherwise equal cells; earlier duplicates from the same
 source retain priority. The timestamp/value/expiry LWW comparator is unchanged.
+
+### Cell payload boundary
+
+Cell payloads use `CellBytes`; merge metadata stays independently owned.
+Compaction and SSTable reads use caller-owned mutable scratch before publishing
+immutable payloads. Commit-log and spill encodings retain their byte sequences.

@@ -82,7 +82,7 @@ fn read_value(engine: &StorageEngine, name: &str) -> Vec<u8> {
         .unwrap_or_else(|| panic!("partition {name} has no rows"));
     row.cells
         .first()
-        .and_then(|(_, cell)| cell.value.clone())
+        .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
         .unwrap_or_else(|| panic!("row {name} has no value"))
 }
 

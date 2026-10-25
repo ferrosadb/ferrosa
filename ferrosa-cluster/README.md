@@ -1215,3 +1215,9 @@ Related reference specs: `specs/reference/cluster-formation-architecture.md`,
 `specs/reference/anti-entropy-repair-architecture.md`,
 `specs/decisions/015-multi-dc-raft-per-dc-accord.md`,
 `specs/todo/jepsen-e2e-test-plan.md`.
+
+### Cell payload boundary
+
+Raft cell DTOs carry `CellBytes` and serialize the same byte sequence as
+the former owned vector. Frozen legacy-format tests cover this boundary; replay
+identities and digest ordering are unchanged.

@@ -143,7 +143,7 @@ fn backpressure_codec_and_data_sink_are_independent_bounded_stages() {
                 seed ^= seed << 5;
                 seed as u8
             })
-            .collect(),
+            .collect::<Vec<u8>>().into(),
     );
     let mut baseline = SSTableWriter::new(options.clone(), test_header());
     baseline.add_partition(&partition).unwrap();

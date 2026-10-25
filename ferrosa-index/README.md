@@ -21,6 +21,10 @@ routing, schema DDL, or the SSTable file layout itself. Those callers
 
 ## What's implemented
 
+The B-tree and hash builders retain cell keys as immutable `CellBytes`, so their
+ownership does not require a conversion back to a vector. Their file encoders
+continue to read the same byte slices and retain the existing on-disk layout.
+
 The crate exposes **four distinct API surfaces** (an honest map matters here —
 they are not one uniform trait):
 

@@ -21323,7 +21323,7 @@ mod tests {
                     .rows
                     .first()
                     .and_then(|row| row.cells.iter().find(|(index, _)| *index == 0))
-                    .and_then(|(_, cell)| cell.value.clone());
+                    .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()));
                 self.seen
                     .lock()
                     .unwrap()

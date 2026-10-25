@@ -1,5 +1,5 @@
-//! Last revised: 2026-10-23
-//! Last changed: Decode clustering bytes directly into owned row storage.
+//! Last revised: 2026-10-24
+//! Last changed: Separate reusable decoding scratch from immutable cell payloads.
 //! Correctness: Decoder allocation and corrupt-length regressions.
 //!
 //! Data.db reader for Cassandra BTI SSTables.
@@ -19,7 +19,9 @@
 //!
 //! [`SerializationHeader`]: crate::statistics::SerializationHeader
 
-use ferrosa_common::{CellValue, DecoratedKey, Error, PartitionKey, Result};
+use ferrosa_common::{
+    CellBytes, CellReadBuffer, CellValue, DecoratedKey, Error, PartitionKey, Result,
+};
 
 use crate::io::ReadAt;
 use crate::marshal;
@@ -2057,7 +2059,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
     fn read_value_or_span(
         &mut self,
         len: usize,
-        buffer: &mut Vec<u8>,
+        buffer: &mut CellBytes,
         span: Option<&mut ValueSpan>,
     ) -> Result<()> {
         if let Some(span) = span {
@@ -2081,10 +2083,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 len,
             };
             self.pos += len as u64;
-            buffer.clear();
+            let mut scratch = std::mem::take(buffer).into_mut();
+            scratch.clear();
+            *buffer = scratch.freeze();
             Ok(())
         } else {
-            self.read_value_bytes_into(len, "cell value", buffer)
+            let mut scratch = std::mem::take(buffer).into_mut();
+            let result = self.read_value_bytes_into(len, "cell value", &mut scratch);
+            *buffer = scratch.freeze();
+            result
         }
     }
 
@@ -2093,15 +2100,15 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         &mut self,
         len: usize,
         what: &str,
-        buffer: &mut Vec<u8>,
+        buffer: &mut impl CellReadBuffer,
     ) -> Result<()> {
         if len > MAX_VALUE_LEN {
             return Err(Error::InvalidData(format!(
                 "{what} length {len} exceeds maximum ({MAX_VALUE_LEN})"
             )));
         }
-        buffer.resize(len, 0);
-        self.reader.read_exact_at(buffer, self.pos)?;
+        buffer.resize_for_read(len);
+        self.reader.read_exact_at(buffer.as_mut(), self.pos)?;
         self.pos += len as u64;
         Ok(())
     }
@@ -2222,7 +2229,9 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // Value (absent if HAS_EMPTY_VALUE is set). `value_type` is the
         // element/value type for a complex column, the column type for a simple one.
         if has_empty_value {
-            out.value.get_or_insert_with(Vec::new).clear();
+            let mut scratch = out.value.take().unwrap_or_default().into_mut();
+            scratch.clear();
+            out.value = Some(scratch.freeze());
             if let Some(span) = span.as_mut() {
                 **span = ValueSpan {
                     offset: self.pos,
@@ -2234,7 +2243,11 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             // when its element type is fixed-width — matching Cassandra.
             let (vlen, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
             self.pos += n as u64;
-            self.read_value_or_span(vlen as usize, out.value.get_or_insert_with(Vec::new), span)?;
+            self.read_value_or_span(
+                vlen as usize,
+                out.value.get_or_insert_with(CellBytes::default),
+                span,
+            )?;
         } else {
             let vlen = if let Some(fixed_len) = marshal::value_length_if_fixed(value_type) {
                 if self.legacy_fixed_value_lengths {
@@ -2252,7 +2265,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 self.pos += n as u64;
                 vlen as usize
             };
-            self.read_value_or_span(vlen, out.value.get_or_insert_with(Vec::new), span)?;
+            self.read_value_or_span(vlen, out.value.get_or_insert_with(CellBytes::default), span)?;
         };
 
         out.timestamp = timestamp;

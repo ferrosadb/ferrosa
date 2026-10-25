@@ -1600,3 +1600,9 @@ the public executor with allocation counts, allocated bytes, peak live heap,
 exact row/cell assertions, BTI point lookups and optional measured budgets.
 The reproducible Fly runner and evidence contract are in
 `../deploy/fly-compaction-probe/README.md`.
+
+### Cell payload boundary
+
+Cell payloads use `CellBytes`; merge metadata stays independently owned.
+Compaction and SSTable reads use caller-owned mutable scratch before publishing
+immutable payloads. Commit-log and spill encodings retain their byte sequences.

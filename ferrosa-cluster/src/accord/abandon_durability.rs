@@ -120,7 +120,9 @@ mod tests {
             .read(&TableId::new(KS, TABLE), key)
             .expect("engine read")?;
         let row = partition.rows.first()?;
-        row.cells.first().and_then(|(_, c)| c.value.clone())
+        row.cells
+            .first()
+            .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
     }
 
     /// Two remote replicas that agree on PreAccept and Commit and answer `Apply`

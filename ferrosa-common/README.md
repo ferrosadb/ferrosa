@@ -23,11 +23,13 @@ here — it lives in `ferrosa-cql` / `ferrosa-row-bridge`.
 
 ## What's implemented
 
-- **Cell payload ownership** — `CellBytes` is an immutable slice-facing wrapper
-  with explicit owned-vector conversion. Its initial representation retains
-  owned vectors so consumers can migrate independently from the backing-storage
-  change. Ordering, debug output and serialized byte sequences match the owned
-  representation; construction and unique-vector extraction retain its buffer.
+- **Cell payload ownership** — `CellValue` holds an immutable `CellBytes`
+  payload independently from its merge metadata. Existing vector constructors
+  remain available, alongside payload-handle constructors. `CellBytesMut` owns
+  reusable decoding scratch and freezes it for publication; `CellReadBuffer`
+  lets readers accept scratch or legacy vectors. The initial representation
+  retains vectors so consumers migrate separately from the backing swap.
+  Ordering, debug output and serialized byte sequences match owned bytes.
 
 - **Hash ring** — `Token` (`i64` newtype over Murmur3 `h1`), `Token::from_key`,
   `Token::MIN`/`MAX`; `murmur3::hash3_x64_128` (Cassandra-bit-compatible,

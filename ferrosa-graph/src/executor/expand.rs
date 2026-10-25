@@ -2829,7 +2829,7 @@ async fn try_edge_anchored_initial_states(
             push_state_with_fan_out_limit(
                 &mut states,
                 ExpandState {
-                    current_key: DecoratedKey::new(PartitionKey::new(target_id)),
+                    current_key: DecoratedKey::new(PartitionKey::new(target_id.into_vec())),
                     bindings,
                 },
                 max_fan_out_per_hop,
@@ -3133,7 +3133,7 @@ pub(super) fn extract_column_bytes_from_row(
     partition_key: &[u8],
     row: &Row,
     column_name: &str,
-) -> Option<Vec<u8>> {
+) -> Option<ferrosa_common::CellBytes> {
     let column = meta.columns.get(column_name)?;
     match column.kind {
         ferrosa_schema::metadata::column::ColumnKind::PartitionKey => {
@@ -3142,7 +3142,7 @@ pub(super) fn extract_column_bytes_from_row(
                 .iter()
                 .position(|name| name == column_name)?;
             let components = decode_partition_components(partition_key, meta.partition_key.len())?;
-            components.get(idx).cloned()
+            components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Clustering => {
             let idx = meta
@@ -3151,7 +3151,7 @@ pub(super) fn extract_column_bytes_from_row(
                 .position(|(name, _)| name == column_name)?;
             let components =
                 decode_clustering_components(&row.clustering, meta.clustering_key.len())?;
-            components.get(idx).cloned()
+            components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Regular
         | ferrosa_schema::metadata::column::ColumnKind::Static => {

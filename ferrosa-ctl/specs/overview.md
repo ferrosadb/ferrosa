@@ -124,3 +124,8 @@ means the request was accepted. Cancellation completes asynchronously; committed
 replacements finish normally, and future compaction scheduling remains enabled.
 An idle node is a successful zero-task request. Errors, malformed replies and
 scope mismatches return a nonzero exit status.
+
+### Cell payload boundary
+
+SSTable restore borrows immutable cell payloads for validation and explicitly
+creates owned vectors for the existing CQL restore request values.

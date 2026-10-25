@@ -109,7 +109,7 @@ impl WriteOracle {
                 row.cells
                     .iter()
                     .find(|(idx, _)| *idx == 0)
-                    .and_then(|(_, c)| c.value.clone())
+                    .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
             });
             if actual != expected.value {
                 mismatches.push(format!(

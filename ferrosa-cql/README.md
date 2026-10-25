@@ -438,3 +438,9 @@ pair or Raft path sees the statement.
 create or add a jsonb column or field (top level, nested, or through a UDT) are
 InvalidRequest (0x2200) on a node that is not standalone. The message names the
 mode and says the capability ledger (D15a) is required; there is no bypass.
+
+### Cell payload boundary
+
+Storage cells expose immutable `CellBytes` slices. Typed result decoding
+borrows these bytes; legacy blob result values still explicitly own vectors at
+the `CqlValue::Blob` boundary.

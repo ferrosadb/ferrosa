@@ -112,6 +112,12 @@ graph TB
 
 ## Data flow
 
+Cell payload reads resize initialized caller-owned `CellReadBuffer` storage,
+validate lengths and extents, and freeze typed decoding scratch before
+publishing it in a `CellValue`. Payload scratch and collection-path vectors use
+the same read implementation and bounds. This ownership seam leaves Data.db
+encoding and deferred-value span semantics unchanged.
+
 **Write path** (engine memtable/compaction → disk): flush callers add `Partition`
 values in token order via `add_partition`; compaction uses the incremental
 partition/row API described below. Cell timestamps, TTLs, and local
