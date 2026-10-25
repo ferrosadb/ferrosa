@@ -4013,7 +4013,7 @@ async fn execute_create(
 ///
 /// Key layout: `blake3(key_name_0 || NUL || value_bytes_0 || NUL || key_name_1 || ...)`
 /// sorted by `key_name`.
-fn content_addressed_key(match_props: &[(String, Expr)]) -> Result<Vec<u8>> {
+fn content_addressed_digest(match_props: &[(String, Expr)]) -> Result<blake3::Hash> {
     let mut sorted: Vec<&(String, Expr)> = match_props.iter().collect();
     sorted.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -4025,7 +4025,11 @@ fn content_addressed_key(match_props: &[(String, Expr)]) -> Result<Vec<u8>> {
         hasher.update(&val_bytes);
         hasher.update(b"\x00");
     }
-    Ok(hasher.finalize().as_bytes().to_vec())
+    Ok(hasher.finalize())
+}
+
+fn content_addressed_key(match_props: &[(String, Expr)]) -> Result<Vec<u8>> {
+    Ok(content_addressed_digest(match_props)?.as_bytes().to_vec())
 }
 
 fn graph_write_consistency() -> ConsistencyLevel {
@@ -4038,11 +4042,13 @@ fn content_addressed_key_for_type(
     match_props: &[(String, Expr)],
     column_type: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let mut bytes = content_addressed_key(match_props)?;
     if column_type.is_some_and(|ty| ty.eq_ignore_ascii_case("uuid")) {
-        bytes.truncate(16);
+        // Encode exactly one UUID's key bytes, allocating only the final width.
+        let digest = content_addressed_digest(match_props)?;
+        Ok(digest.as_bytes()[..16].to_vec())
+    } else {
+        content_addressed_key(match_props)
     }
-    Ok(bytes)
 }
 
 fn fallback_merge_key_type(
