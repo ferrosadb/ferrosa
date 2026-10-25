@@ -75,6 +75,12 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Implemented since the last revision
 
+- **MERGE endpoint identity (2026-10-24).** Schema-on-write UUID fallback keys
+  use 16 bytes, and each relationship is scheduled after both endpoint nodes
+  bind. Tests cover new relationships, explicit UUID destinations, existing
+  opaque keys, traversal, idempotency and deletion. Existing raw keys are not
+  rewritten.
+
 - **G-14 — a completed deploy heal is not repeated (2026-10-19).** The heal
   writes `<data_dir>/graph-adjacency-heals.json` once it completes with zero
   errors, and later starts serve at once instead of rerunning a CL ALL rewrite

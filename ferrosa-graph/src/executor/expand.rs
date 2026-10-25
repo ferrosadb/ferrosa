@@ -4032,6 +4032,40 @@ fn graph_write_consistency() -> ConsistencyLevel {
     ConsistencyLevel::Quorum
 }
 
+/// Preserve the declared identity width on both vertex creation and unresolved
+/// edge endpoints. Bound keys and fully schema-derived shapes bypass this.
+fn content_addressed_key_for_type(
+    match_props: &[(String, Expr)],
+    column_type: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut bytes = content_addressed_key(match_props)?;
+    if column_type.is_some_and(|ty| ty.eq_ignore_ascii_case("uuid")) {
+        bytes.truncate(16);
+    }
+    Ok(bytes)
+}
+
+fn fallback_merge_key_type(
+    meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
+    clustering: bool,
+) -> Option<&str> {
+    let meta = meta?;
+    let name = if clustering {
+        if meta.clustering_key.len() != 1 {
+            return None;
+        }
+        &meta.clustering_key[0].0
+    } else {
+        if meta.partition_key.len() != 1 {
+            return None;
+        }
+        &meta.partition_key[0]
+    };
+    meta.columns
+        .get(name)
+        .map(|column| column.column_type.as_str())
+}
+
 /// Execute a MERGE plan: match-or-create with content-addressed deterministic key.
 ///
 /// For each MergeOp (in declaration order, preserving R2 binding dependency):
@@ -4150,8 +4184,10 @@ async fn execute_merge(
                     .as_ref()
                     .and_then(|var| var_keys.get(var))
                     .map(|(_, key, _, _)| key.key.as_bytes().to_vec());
-                if let (Some(src_bytes), Some(dst_bytes)) = (src_key, dst_key) {
+                if let Some(src_bytes) = src_key {
                     shape.key = DecoratedKey::new(PartitionKey::new(src_bytes));
+                }
+                if let Some(dst_bytes) = dst_key {
                     shape.clustering = dst_bytes;
                 }
             }
@@ -4603,9 +4639,13 @@ fn build_merge_write_shape(
         return Ok(shape);
     }
 
+    let fallback_meta = table_metadata_for(schema, &op.table.keyspace, &op.table.table);
     let key_bytes: Vec<u8> = if op.table.graph_type == "edge" {
         match &op.src_match_props {
-            Some(src_props) => content_addressed_key(src_props)?,
+            Some(src_props) => content_addressed_key_for_type(
+                src_props,
+                fallback_merge_key_type(fallback_meta.as_ref(), false),
+            )?,
             None => {
                 tracing::error!(
                     file = file!(),
@@ -4628,12 +4668,18 @@ fn build_merge_write_shape(
             }
         }
     } else {
-        content_addressed_key(&op.match_props)?
+        content_addressed_key_for_type(
+            &op.match_props,
+            fallback_merge_key_type(fallback_meta.as_ref(), false),
+        )?
     };
 
     let clustering: Vec<u8> = if op.table.graph_type == "edge" {
         match &op.dst_match_props {
-            Some(dst_props) => content_addressed_key(dst_props)?,
+            Some(dst_props) => content_addressed_key_for_type(
+                dst_props,
+                fallback_merge_key_type(fallback_meta.as_ref(), true),
+            )?,
             None => {
                 tracing::error!(
                     file = file!(),

@@ -57,6 +57,12 @@ network listeners, so consistency and DoS modes dominate.
 
 ## Detection assets
 
+- MERGE endpoint identity: `schema_on_write` covers unknown relationship DDL;
+  `graph_http_integration` checks explicit UUID and existing raw destinations,
+  repeated MERGE, traversal, and edge/deletion storage identity. Relationships
+  bind after both endpoints, and UUID fallback generation respects key width.
+  This does not migrate previously malformed stored keys.
+
 - `adjacency/reconcile.rs` tests: repair-missing, idempotency, orphan-removal,
   partial-direction repair, yield policy (`tests` module).
 - `tests/adjacency_replication.rs` — adjacency DDL/replication integration.

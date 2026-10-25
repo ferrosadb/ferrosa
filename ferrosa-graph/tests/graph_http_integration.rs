@@ -3613,19 +3613,39 @@ async fn merge_edge_clustering_matches_dst_key() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "MERGE edge must return 200");
 
-    // Derive the expected src and dst partition key bytes using the same
-    // blake3 content-addressing that `execute_merge` / `content_addressed_key` uses.
-    // `content_addressed_key` sorts by key name then hashes: `name\x00<value>\x00`.
-    let src_key_bytes: Vec<u8> = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"name\x00EdgeSrc\x00");
-        h.finalize().as_bytes().to_vec()
-    };
-    let dst_key_bytes: Vec<u8> = {
-        let mut h = blake3::Hasher::new();
-        h.update(b"name\x00EdgeDst\x00");
-        h.finalize().as_bytes().to_vec()
-    };
+    // Observe the endpoint identities through the public read path. The edge
+    // must reference these exact stored keys, independently of their derivation.
+    let app = build_app(Arc::clone(&schema), Arc::clone(&storage));
+    let req = json_request(
+        "POST",
+        "/graph/query",
+        Some(serde_json::json!({
+            "query": "MATCH (n:Person) RETURN n.name, id(n)",
+            "keyspace": "social"
+        })),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = response_json(resp).await;
+    let vertex_keys: HashMap<String, Vec<u8>> = body["rows"]
+        .as_array()
+        .expect("MATCH returns endpoint rows")
+        .iter()
+        .map(|row| {
+            let name = row[0].as_str().expect("endpoint name is text").to_string();
+            let key = hex::decode(row[1].as_str().expect("id(n) is a hex string"))
+                .expect("id(n) encodes the raw storage key");
+            assert_eq!(key.len(), 16, "Person's UUID key must occupy 16 bytes");
+            (name, key)
+        })
+        .collect();
+    assert_eq!(vertex_keys.len(), 2, "both endpoint vertices must exist");
+    let src_key_bytes = vertex_keys["EdgeSrc"].clone();
+    let dst_key_bytes = vertex_keys["EdgeDst"].clone();
+    assert_ne!(
+        src_key_bytes, dst_key_bytes,
+        "distinct endpoints retain distinct identities"
+    );
 
     // Read the edge row from knows_e using the src partition key.
     let src_key = DecoratedKey::new(PartitionKey::new(src_key_bytes));
@@ -5311,6 +5331,178 @@ fn live_row_count(storage: &StorageEngine, keyspace: &str, table: &str, key_byte
     }
 }
 
+/// Inline MERGE must bind an explicit UUID destination before deriving its edge.
+#[tokio::test]
+async fn inline_merge_reuses_explicit_uuid_destination_identity() {
+    use ferrosa_common::{DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let (engine, storage, _schema, _dir) = detach_delete_engine();
+    let auth = superuser_auth();
+    let destination = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
+    let query = format!(
+        "MERGE (a:Person {{name: 'TypedSrc'}})-[r:KNOWS]->(b:Person {{id: '{destination}', name: 'TypedDst'}}) RETURN r"
+    );
+    for _ in 0..2 {
+        engine
+            .execute(&query, "social", &auth)
+            .await
+            .expect("inline MERGE succeeds");
+    }
+
+    let target = engine
+        .execute(
+            "MATCH (b:Person {name: 'TypedDst'}) RETURN b.id, id(b), b.name",
+            "social",
+            &auth,
+        )
+        .await
+        .expect("explicit destination is readable");
+    assert_eq!(
+        target.rows,
+        vec![vec![
+            serde_json::json!(destination.to_string()),
+            serde_json::json!(hex::encode(destination.as_bytes())),
+            serde_json::json!("TypedDst"),
+        ]],
+        "destination retains its declared UUID value and exact storage key"
+    );
+
+    let traversal = engine
+        .execute(&format!("MATCH (a:Person {{name: 'TypedSrc'}})-[:KNOWS]->(b:Person {{id: '{destination}'}}) RETURN b.id, b.name"), "social", &auth)
+        .await
+        .expect("typed endpoint traversal succeeds");
+    assert_eq!(
+        traversal.rows,
+        vec![vec![
+            serde_json::json!(destination.to_string()),
+            serde_json::json!("TypedDst"),
+        ]],
+        "inline edge must traverse to the explicitly keyed destination"
+    );
+
+    let source = engine
+        .execute(
+            "MATCH (a:Person {name: 'TypedSrc'}) RETURN id(a)",
+            "social",
+            &auth,
+        )
+        .await
+        .unwrap();
+    assert_eq!(source.rows.len(), 1);
+    let source_bytes = hex::decode(source.rows[0][0].as_str().unwrap()).unwrap();
+    assert_eq!(
+        source_bytes.len(),
+        16,
+        "implicit UUID source has UUID storage width"
+    );
+    let source_key = DecoratedKey::new(PartitionKey::new(source_bytes));
+    let edge = storage
+        .read(&TableId::new("social", "knows_e"), &source_key)
+        .unwrap()
+        .expect("edge partition exists");
+    assert_eq!(
+        edge.rows.len(),
+        1,
+        "repeated MERGE materializes exactly one edge"
+    );
+    assert_eq!(
+        edge.rows[0].clustering,
+        destination.as_bytes(),
+        "edge stores the explicit destination key, not a digest of its properties"
+    );
+}
+
+/// A previously stored 32-byte identity remains authoritative when MERGE reuses it.
+#[tokio::test]
+async fn inline_merge_reuses_legacy_destination_storage_identity() {
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+    use ferrosa_storage::TableId;
+
+    let (engine, storage, _schema, _dir) = detach_delete_engine();
+    let auth = superuser_auth();
+    // This BytesType fixture can represent keys written before UUID width was
+    // enforced. Seed an opaque legacy key rather than reproducing its old hash.
+    let legacy_bytes = vec![0xa5; 32];
+    let legacy_key = DecoratedKey::new(PartitionKey::new(legacy_bytes.clone()));
+    storage
+        .write(
+            &TableId::new("social", "person_v"),
+            &legacy_key,
+            Row {
+                clustering: vec![],
+                cells: vec![(1, CellValue::live(b"LegacyDst".to_vec(), 1))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            },
+            1,
+        )
+        .expect("seed the existing legacy vertex");
+    let expected_destination = vec![vec![
+        serde_json::json!(hex::encode(&legacy_bytes)),
+        serde_json::json!("LegacyDst"),
+    ]];
+    let before = engine
+        .execute(
+            "MATCH (b:Person {name: 'LegacyDst'}) RETURN id(b), b.name",
+            "social",
+            &auth,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        before.rows, expected_destination,
+        "fixture exposes its actual legacy identity"
+    );
+
+    for _ in 0..2 {
+        engine.execute("MERGE (a:Person {name: 'LegacySrc'})-[r:KNOWS]->(b:Person {name: 'LegacyDst'}) RETURN r", "social", &auth).await.expect("inline MERGE reuses existing destination");
+    }
+    let after = engine
+        .execute(
+            "MATCH (b:Person {name: 'LegacyDst'}) RETURN id(b), b.name",
+            "social",
+            &auth,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        after.rows, expected_destination,
+        "MERGE retains one destination at its existing raw key"
+    );
+    let traversal = engine.execute("MATCH (a:Person {name: 'LegacySrc'})-[:KNOWS]->(b:Person {name: 'LegacyDst'}) RETURN id(b), b.name", "social", &auth).await.unwrap();
+    assert_eq!(
+        traversal.rows, expected_destination,
+        "edge must target the existing legacy key rather than a guessed UUID-width key"
+    );
+
+    let source = engine
+        .execute(
+            "MATCH (a:Person {name: 'LegacySrc'}) RETURN id(a)",
+            "social",
+            &auth,
+        )
+        .await
+        .unwrap();
+    assert_eq!(source.rows.len(), 1);
+    let source_bytes = hex::decode(source.rows[0][0].as_str().unwrap()).unwrap();
+    assert_eq!(source_bytes.len(), 16);
+    let source_key = DecoratedKey::new(PartitionKey::new(source_bytes));
+    let edge = storage
+        .read(&TableId::new("social", "knows_e"), &source_key)
+        .unwrap()
+        .expect("edge partition exists");
+    assert_eq!(
+        edge.rows.len(),
+        1,
+        "repeated MERGE materializes exactly one edge"
+    );
+    assert_eq!(
+        edge.rows[0].clustering, legacy_bytes,
+        "edge retains the full legacy destination key"
+    );
+}
+
 /// T-QEC-D01 / T-QEC-D03 (URS-QEC-D01/D03/D07): a node with N inbound +
 /// M outbound edges, on `DETACH DELETE`, loses the node and **all** N+M
 /// incident edges, and the adjacency index has **zero** references to the
@@ -5361,7 +5553,25 @@ async fn detach_delete_removes_node_all_incident_edges_and_adjacency() {
             .expect("inbound edge MERGE must succeed");
     }
 
-    let center = vertex_key_bytes("Center");
+    // Capture each authoritative vertex key before deletion; do not reproduce
+    // the writer's content-addressing algorithm in storage assertions.
+    let vertices = engine
+        .execute("MATCH (n:Person) RETURN n.name, id(n)", ks, &auth)
+        .await
+        .expect("endpoint identity read must succeed");
+    let vertex_keys: HashMap<String, Vec<u8>> = vertices
+        .rows
+        .iter()
+        .map(|row| {
+            let name = row[0].as_str().expect("vertex name is text").to_string();
+            let key = hex::decode(row[1].as_str().expect("id(n) is a hex string"))
+                .expect("id(n) encodes the raw storage key");
+            assert_eq!(key.len(), 16, "Person's UUID key must occupy 16 bytes");
+            (name, key)
+        })
+        .collect();
+    assert_eq!(vertex_keys.len(), 5, "all seeded vertices must exist");
+    let center = vertex_keys["Center"].clone();
 
     // Precondition: edges + adjacency exist before the delete.
     assert_eq!(
@@ -5371,7 +5581,7 @@ async fn detach_delete_removes_node_all_incident_edges_and_adjacency() {
     );
     for src in in_neighbors {
         assert_eq!(
-            live_row_count(&storage, ks, "knows_e", &vertex_key_bytes(src)),
+            live_row_count(&storage, ks, "knows_e", &vertex_keys[src]),
             1,
             "precondition: inbound edge {src}->Center must exist"
         );
@@ -5420,7 +5630,7 @@ async fn detach_delete_removes_node_all_incident_edges_and_adjacency() {
     // (3) ALL inbound edges gone: each inbound src->Center knows_e row tombstoned.
     for src in in_neighbors {
         assert_eq!(
-            live_row_count(&storage, ks, "knows_e", &vertex_key_bytes(src)),
+            live_row_count(&storage, ks, "knows_e", &vertex_keys[src]),
             0,
             "inbound edge {src}->Center must be tombstoned in knows_e"
         );
@@ -5437,8 +5647,8 @@ async fn detach_delete_removes_node_all_incident_edges_and_adjacency() {
     //         Out-neighbors held an IN entry (Center as neighbor); in-neighbors
     //         held an OUT entry (Center as neighbor).
     for name in out_neighbors.iter().chain(in_neighbors.iter()) {
-        let nbr_key = vertex_key_bytes(name);
-        let refs_center = adjacency_partition_references(&storage, adj_ks, &nbr_key, &center);
+        let nbr_key = &vertex_keys[*name];
+        let refs_center = adjacency_partition_references(&storage, adj_ks, nbr_key, &center);
         assert!(
             !refs_center,
             "neighbor {name} adjacency partition must not reference Center after DETACH DELETE"
@@ -5501,7 +5711,25 @@ async fn plain_delete_with_surviving_relationships_fails_loud_deletes_nothing() 
         .await
         .expect("inbound edge MERGE must succeed");
 
-    let center = vertex_key_bytes("Center");
+    // Capture each authoritative vertex key before deletion; do not reproduce
+    // the writer's content-addressing algorithm in storage assertions.
+    let vertices = engine
+        .execute("MATCH (n:Person) RETURN n.name, id(n)", ks, &auth)
+        .await
+        .expect("endpoint identity read must succeed");
+    let vertex_keys: HashMap<String, Vec<u8>> = vertices
+        .rows
+        .iter()
+        .map(|row| {
+            let name = row[0].as_str().expect("vertex name is text").to_string();
+            let key = hex::decode(row[1].as_str().expect("id(n) is a hex string"))
+                .expect("id(n) encodes the raw storage key");
+            assert_eq!(key.len(), 16, "Person's UUID key must occupy 16 bytes");
+            (name, key)
+        })
+        .collect();
+    assert_eq!(vertex_keys.len(), 3, "all seeded vertices must exist");
+    let center = vertex_keys["Center"].clone();
     let adj_ks = "system_graph_social";
 
     // Preconditions: node, both edges, and adjacency entries exist.
@@ -5516,7 +5744,7 @@ async fn plain_delete_with_surviving_relationships_fails_loud_deletes_nothing() 
         "precondition: Center outbound edge must exist"
     );
     assert_eq!(
-        live_row_count(&storage, ks, "knows_e", &vertex_key_bytes("In")),
+        live_row_count(&storage, ks, "knows_e", &vertex_keys["In"]),
         1,
         "precondition: inbound In->Center edge must exist"
     );
@@ -5549,7 +5777,7 @@ async fn plain_delete_with_surviving_relationships_fails_loud_deletes_nothing() 
         "Center outbound edge must survive a failed DELETE"
     );
     assert_eq!(
-        live_row_count(&storage, ks, "knows_e", &vertex_key_bytes("In")),
+        live_row_count(&storage, ks, "knows_e", &vertex_keys["In"]),
         1,
         "inbound In->Center edge must survive a failed DELETE"
     );

@@ -924,6 +924,10 @@ fn collect_merge_ops_from_path(
     merge_props_by_var: &mut HashMap<String, Vec<(String, crate::parser::Expr)>>,
     merges: &mut Vec<MergeOp>,
 ) -> Result<()> {
+    // Bind a relationship only after both endpoint node ops have resolved their
+    // real storage keys, including existing keys and explicit UUIDs. Keep this
+    // deferred edge local to one path so clause ordering remains intact.
+    let mut pending_edge = None;
     let mut i = 0;
     while i < elements.len() {
         match &elements[i] {
@@ -932,6 +936,9 @@ fn collect_merge_ops_from_path(
                     props.is_empty() && merge_props_by_var.contains_key(var_name)
                 });
                 if reuses_prior_binding {
+                    if let Some(edge) = pending_edge.take() {
+                        merges.push(edge);
+                    }
                     i += 1;
                     continue;
                 }
@@ -962,6 +969,9 @@ fn collect_merge_ops_from_path(
                         "MERGE node with label '{}' has no resolved binding",
                         label.as_deref().unwrap_or("?")
                     )));
+                }
+                if let Some(edge) = pending_edge.take() {
+                    merges.push(edge);
                 }
                 i += 1;
             }
@@ -1047,7 +1057,7 @@ fn collect_merge_ops_from_path(
                 };
 
                 if let Some(table) = resolved {
-                    merges.push(MergeOp {
+                    pending_edge = Some(MergeOp {
                         var: var.clone(),
                         table,
                         match_props: props.clone(),
@@ -1072,6 +1082,9 @@ fn collect_merge_ops_from_path(
                 i += 1;
             }
         }
+    }
+    if let Some(edge) = pending_edge {
+        merges.push(edge);
     }
     Ok(())
 }

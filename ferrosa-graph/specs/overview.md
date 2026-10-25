@@ -98,6 +98,11 @@ full sequence.
 
 ## Key invariants
 
+**MERGE endpoint identity.** Within each path, bind the source and destination
+nodes before the edge. Bound raw keys take precedence over fallback derivation;
+UUID fallback keys are 16 bytes. Preserve existing raw identities and explicit,
+scoped and composite encodings rather than rehashing an endpoint's properties.
+
 1. **Adjacency-consistency invariant.** For every live edge `(src)-[label]->(tgt)`
    there exist exactly two adjacency rows: an OUT row under `src` and an IN row
    under `tgt`, both keyed by `(direction, edge_label, neighbor_id)`. This is

@@ -617,18 +617,9 @@ async fn merge_on_an_unknown_label_creates_then_upserts() {
     );
 }
 
-// The realistic Neo4j shape: no client-supplied key. This is the acceptance test
-// for schema-on-write on relationships. It is blocked because the write and read
-// paths derive vertex keys differently and must change together:
-//
-//  - a vertex MERGE with no `id` writes a 32-byte content-addressed key, which a
-//    `uuid` endpoint column rejects ("expects 16 raw bytes but row provided 32");
-//  - truncating that key to 16 bytes at the write side (in
-//    `build_merge_write_shape`) does make this test pass, but the read/traversal
-//    path still derives 32 bytes, so `exists_pattern_*` and
-//    `concurrent_merge_node_and_relationship_remain_idempotent` then return no
-//    edges at all. Changing only one side trades one break for another.
-#[ignore = "blocked: merge key derivation must change in the write AND read paths together (issue #610)"]
+// Schema-on-write relationships must reuse both endpoints' storage keys. UUID
+// fallback keys are 16 bytes; inline and MATCH-bound endpoints must agree so
+// the new edge is also visible to traversal and deletion.
 #[tokio::test]
 async fn merge_of_an_unknown_relationship_type_creates_the_edge_table() {
     let h = Harness::new();

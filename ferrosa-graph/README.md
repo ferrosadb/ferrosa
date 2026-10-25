@@ -31,6 +31,12 @@ resolved port.
 
 ## What's implemented
 
+MERGE resolves both endpoint nodes before writing their relationship, so explicit
+UUIDs and existing raw keys remain the edge's source/destination identity. New
+content-addressed fallback keys use 16 bytes for UUID columns; explicit, scoped
+and composite key layouts keep their schema encoding. Traversal and deletion
+use those same stored endpoint keys.
+
 - **Cypher parser** — lexer + recursive-descent parser (`parser/`) covering
   `MATCH` / `OPTIONAL MATCH`, `WHERE`, `WITH` pipelines, `RETURN` (DISTINCT,
   `ORDER BY`, `LIMIT`), `CREATE` / `SET` / `REMOVE` / `DELETE` / `DETACH DELETE`,
