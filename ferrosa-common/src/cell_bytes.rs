@@ -1,36 +1,49 @@
 //! Encapsulate cell payload ownership independently from row merge metadata.
 //! Correctness: byte order, serialization and owned-buffer identity are stable.
 //! Last revised: 2026-10-24
-//! Last changed: Added the immutable payload seam before changing cell storage.
+//! Last changed: Share payloads while keeping mutable I/O scratch uniquely owned.
 
+use bytes::{Bytes, BytesMut};
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Immutable cell payload bytes, with an explicit owned-vector boundary.
+/// Immutable cell bytes. Cloning shares the payload; merge metadata stays owned.
 ///
-/// Callers read slices; they do not depend on the backing allocation type. This
-/// first, additive step retains the owned representation. Sharing can then be a
-/// local representation change without exposing mutation through `DerefMut`.
-#[derive(Default, Eq, Hash, Ord, PartialOrd)]
-pub struct CellBytes(Vec<u8>);
+/// The retained capacity is accounting metadata only. Equality, hashing and
+/// ordering depend exclusively on bytes, preserving cell tie-break semantics.
+#[derive(Clone, Default, Eq)]
+pub struct CellBytes {
+    bytes: Bytes,
+    retained_capacity: usize,
+}
 
-impl Clone for CellBytes {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
+impl Ord for CellBytes {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
     }
+}
 
-    fn clone_from(&mut self, source: &Self) {
-        self.0.clone_from(&source.0);
+impl PartialOrd for CellBytes {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Hash for CellBytes {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
     }
 }
 
 impl CellBytes {
     /// Borrow the payload without copying it.
     pub fn as_slice(&self) -> &[u8] {
-        &self.0
+        &self.bytes
     }
 
     /// Convert to an owned vector at an API that requires one.
@@ -38,17 +51,36 @@ impl CellBytes {
     /// Ownership is transferred when possible. A shared representation may
     /// need to copy here; hot read/serialization paths should borrow instead.
     pub fn into_vec(self) -> Vec<u8> {
-        self.0
+        self.bytes.into()
     }
 
-    /// Recover caller-owned decoding scratch without exposing mutable payloads.
-    pub fn into_mut(self) -> CellBytesMut {
-        CellBytesMut(self.0)
+    /// Recover unique I/O scratch, discarding its logical contents.
+    ///
+    /// Shared bytes are never copied just to overwrite them: use fresh empty
+    /// scratch when a previous consumer still retains the payload.
+    pub fn into_scratch(self) -> CellBytesMut {
+        let mut buffer = self.bytes.try_into_mut().unwrap_or_default();
+        buffer.clear();
+        CellBytesMut(buffer)
     }
 
-    /// Backing capacity retained by this payload, for spill/memory accounting.
+    /// Payload backing capacity retained by this handle, even when shared.
     pub fn retained_capacity(&self) -> usize {
-        self.0.capacity()
+        self.retained_capacity
+    }
+
+    /// Conservative heap charge, including a possible shared-owner allocation.
+    ///
+    /// bytes 1.11.1's largest owner (BytesMut::Shared) contains a Vec and two
+    /// usize-sized fields. Charge it for every nonempty allocation, including
+    /// unique buffers that have not yet allocated that owner. Shared allocations
+    /// may be charged more than once; this is a bound, not physical RSS.
+    pub fn retained_heap_bytes(&self) -> usize {
+        if self.retained_capacity == 0 {
+            return 0;
+        }
+        self.retained_capacity
+            .saturating_add(std::mem::size_of::<Vec<u8>>() + 2 * std::mem::size_of::<usize>())
     }
 }
 
@@ -57,7 +89,7 @@ impl CellBytes {
 /// Keeping this type separate from `CellBytes` lets a decoder reuse unique
 /// storage without ever mutating bytes retained by an earlier consumer.
 #[derive(Default)]
-pub struct CellBytesMut(Vec<u8>);
+pub struct CellBytesMut(BytesMut);
 
 impl CellBytesMut {
     /// Resize owned scratch before an initialized read.
@@ -77,7 +109,11 @@ impl CellBytesMut {
 
     /// Publish the initialized contents without copying their bytes.
     pub fn freeze(self) -> CellBytes {
-        CellBytes(self.0)
+        let retained_capacity = self.0.capacity();
+        CellBytes {
+            bytes: self.0.freeze(),
+            retained_capacity,
+        }
     }
 }
 
@@ -129,7 +165,11 @@ impl Borrow<[u8]> for CellBytes {
 
 impl From<Vec<u8>> for CellBytes {
     fn from(bytes: Vec<u8>) -> Self {
-        Self(bytes)
+        let retained_capacity = bytes.capacity();
+        Self {
+            bytes: Bytes::from(bytes),
+            retained_capacity,
+        }
     }
 }
 
@@ -195,13 +235,42 @@ mod tests {
     }
 
     #[test]
+    fn shared_payload_keeps_bytes_and_capacity_out_of_value_ordering() {
+        let mut spare = Vec::with_capacity(4096);
+        spare.extend_from_slice(b"payload");
+        let a = CellBytes::from(spare);
+        let b = CellBytes::from(b"payload".to_vec());
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        use std::hash::{Hash, Hasher};
+        let hash = |value: &CellBytes| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash(&a), hash(&b));
+        assert!(a.retained_capacity() >= 4096);
+        let retained = a.clone();
+        assert_eq!(
+            a.as_ptr(),
+            retained.as_ptr(),
+            "clone copied immutable payload"
+        );
+        let mut scratch = a.into_scratch();
+        scratch.clear();
+        scratch.resize(7, b'x');
+        assert_eq!(scratch.freeze().as_slice(), b"xxxxxxx");
+        assert_eq!(retained.as_slice(), b"payload");
+    }
+
+    #[test]
     fn decoder_scratch_reuses_unique_capacity_across_freezes() {
         let mut input = Vec::with_capacity(4096);
         input.extend_from_slice(b"payload");
         let address = input.as_ptr();
         let mut frozen = CellBytes::from(input);
         for _ in 0..64 {
-            let mut scratch = frozen.into_mut();
+            let mut scratch = frozen.into_scratch();
             assert!(scratch.capacity() >= 4096);
             scratch.clear();
             scratch.resize(7, b'x');

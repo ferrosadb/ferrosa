@@ -110,7 +110,7 @@ impl SpillRow for StoredRow {
                 .cells
                 .iter()
                 .map(|(_, c)| {
-                    c.value.as_ref().map_or(0, CellBytes::retained_capacity)
+                    c.value.as_ref().map_or(0, CellBytes::retained_heap_bytes)
                         + c.path.as_ref().map_or(0, Vec::capacity)
                 })
                 .sum::<usize>()
@@ -336,7 +336,7 @@ fn copy_candidate(
         // A deferred head carries an empty payload and a span. Keep the previous
         // destination's unique capacity instead of replacing it with that empty
         // handle before the read.
-        let mut buffer = out.value.take().unwrap_or_default().into_mut();
+        let mut buffer = out.value.take().unwrap_or_default().into_scratch();
         let result = source
             .iter
             .read_value_span(source.spans[candidate.1], &mut buffer);

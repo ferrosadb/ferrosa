@@ -322,3 +322,7 @@ existing two-buffer contract; sparse reads reuse the caller's chunk buffer.
 `tests/scan_cursor_io.rs` bounds physical bytes on the public pending-value
 API with synchronous and background-prefetched inputs, in addition to exact
 payload checks. This prevents metadata seeks from multiplying full-window I/O.
+
+Published cell bytes are shared across row copies. Readers recover only unique
+scratch capacity; retained older payloads remain immutable. Memory estimates
+charge the full retained backing and a conservative shared-owner allowance.

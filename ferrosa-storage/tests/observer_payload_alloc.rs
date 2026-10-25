@@ -150,8 +150,10 @@ fn measure_observer_write_allocations() {
             let mut samples = Vec::with_capacity(8);
             for iteration in 0..12 {
                 let timestamp = 1_800_000_000_000_000 + iteration;
-                let input = row(cells, timestamp);
-                let expected = input.clone();
+                let (input, input_calls, input_bytes) = measured(|| row(cells, timestamp));
+                // Build the oracle independently: cloning input here could
+                // promote shared backing before the write's measured window.
+                let expected = row(cells, timestamp);
                 let (result, calls, bytes) =
                     measured(|| engine.write(&table, &key, input, timestamp));
                 result.unwrap();
@@ -165,15 +167,16 @@ fn measure_observer_write_allocations() {
                 let stored = engine.read(&table, &key).unwrap().unwrap();
                 assert_eq!(stored.rows, [expected]);
                 if iteration >= 4 {
-                    samples.push((calls, bytes));
+                    samples.push((calls, bytes, input_calls, input_bytes));
                 }
             }
             println!(
                 "OBSERVER_ALLOC {}",
                 serde_json::json!({
                     "cells": cells, "observers": observers,
-                    "samples": samples.iter().map(|(calls, bytes)| serde_json::json!({
-                        "allocation_calls": calls, "requested_bytes": bytes
+                    "samples": samples.iter().map(|(calls, bytes, input_calls, input_bytes)| serde_json::json!({
+                        "allocation_calls": calls, "requested_bytes": bytes,
+                        "input_allocation_calls": input_calls, "input_requested_bytes": input_bytes
                     })).collect::<Vec<_>>()
                 })
             );
@@ -246,5 +249,50 @@ fn owned_and_borrowed_batches_share_observer_payloads() {
         assert!(std::ptr::eq(a.rows.as_ptr(), b.rows.as_ptr()));
         assert!(std::ptr::eq(a.keyspace.as_ptr(), b.keyspace.as_ptr()));
         assert_eq!(engine.read(&table, &key).unwrap().unwrap().rows, [expected]);
+    }
+}
+
+#[test]
+fn input_memtable_and_observers_share_bytes_and_keep_old_versions() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), 4);
+    let table = TableId::new("payload_probe", "rows");
+    let observer = Arc::new(Observer(table.clone()));
+    let mut left = engine.register_async_observer(observer.clone(), 1);
+    let mut right = engine.register_async_observer(observer, 1);
+    let key = DecoratedKey::new(PartitionKey::new(b"key".to_vec()));
+    let timestamp = 1_800_000_000_000_000;
+    // Hold the original input AND all consumers alive. A deep copy cannot pass
+    // by freeing the original allocation and accidentally reusing its address.
+    let input = row(4, timestamp);
+    engine
+        .write(&table, &key, input.clone(), timestamp)
+        .unwrap();
+    let (_, a) = left.try_recv().unwrap();
+    let (_, b) = right.try_recv().unwrap();
+    let old_read = engine.read(&table, &key).unwrap().unwrap();
+    for (index, (_, original)) in input.cells.iter().enumerate() {
+        let original_bytes = original.value.as_ref().unwrap();
+        for view in [&a.rows[0], &b.rows[0], &old_read.rows[0]] {
+            let actual = view.cells[index].1.value.as_ref().unwrap();
+            assert_eq!(actual.as_slice(), original_bytes.as_slice());
+            assert!(
+                std::ptr::eq(actual.as_ptr(), original_bytes.as_ptr()),
+                "cell payload copied between input, observers and memtable read"
+            );
+        }
+    }
+
+    let mut newer = row(4, timestamp + 1);
+    for (_, cell) in &mut newer.cells {
+        *cell = CellValue::live(vec![b'y'; 64], timestamp + 1);
+    }
+    engine
+        .write(&table, &key, newer.clone(), timestamp + 1)
+        .unwrap();
+    let latest = engine.read(&table, &key).unwrap().unwrap();
+    assert_eq!(latest.rows.as_slice(), std::slice::from_ref(&newer));
+    for old in [&a.rows[0], &b.rows[0], &old_read.rows[0]] {
+        assert_eq!(old, &input, "a later merge mutated an earlier view");
     }
 }

@@ -2083,12 +2083,12 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 len,
             };
             self.pos += len as u64;
-            let mut scratch = std::mem::take(buffer).into_mut();
+            let mut scratch = std::mem::take(buffer).into_scratch();
             scratch.clear();
             *buffer = scratch.freeze();
             Ok(())
         } else {
-            let mut scratch = std::mem::take(buffer).into_mut();
+            let mut scratch = std::mem::take(buffer).into_scratch();
             let result = self.read_value_bytes_into(len, "cell value", &mut scratch);
             *buffer = scratch.freeze();
             result
@@ -2229,7 +2229,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         // Value (absent if HAS_EMPTY_VALUE is set). `value_type` is the
         // element/value type for a complex column, the column type for a simple one.
         if has_empty_value {
-            let mut scratch = out.value.take().unwrap_or_default().into_mut();
+            let mut scratch = out.value.take().unwrap_or_default().into_scratch();
             scratch.clear();
             out.value = Some(scratch.freeze());
             if let Some(span) = span.as_mut() {

@@ -409,7 +409,10 @@ pub(crate) fn estimate_row_size(row: &Row) -> usize {
     let mut size = std::mem::size_of::<Row>() + row.clustering.len();
     for (_, cell) in &row.cells {
         size += std::mem::size_of::<(u16, ferrosa_common::cell::CellValue)>();
-        size += cell.value.as_ref().map_or(0, |value| value.len());
+        size += cell
+            .value
+            .as_ref()
+            .map_or(0, |value| value.retained_heap_bytes());
         size += cell.path.as_ref().map_or(0, Vec::len);
     }
     size

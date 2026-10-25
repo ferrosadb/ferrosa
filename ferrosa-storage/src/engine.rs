@@ -9833,9 +9833,8 @@ impl StorageEngine {
             phase_start.elapsed(),
         );
         let observer_mutation = if self.has_observers_for_table(table_id) {
-            // The row is cloned, not moved: the memtable write below takes
-            // ownership of it and the observers need it after that, so both
-            // copies are live at once. Moving needs `rows: Arc<[Row]>` (T1 P4).
+            // Clone row metadata for the observer lifetime. CellBytes shares
+            // immutable payloads with the row moved into the memtable.
             Some(Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
@@ -9957,7 +9956,7 @@ impl StorageEngine {
             // so nothing needs the local `key` afterwards. The row cannot be moved
             // the same way — the memtable takes ownership of it below and the
             // observers still need it after that, so the two owners are concurrent.
-            // Sharing them needs `rows: Arc<[Row]>` (T1 P4), not a move.
+            // CellBytes shares the immutable bytes across these row metadata copies.
             let mutation = Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),

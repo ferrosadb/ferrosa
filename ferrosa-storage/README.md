@@ -1606,3 +1606,7 @@ The reproducible Fly runner and evidence contract are in
 Cell payloads use `CellBytes`; merge metadata stays independently owned.
 Compaction and SSTable reads use caller-owned mutable scratch before publishing
 immutable payloads. Commit-log and spill encodings retain their byte sequences.
+
+Published cell bytes are shared across row copies. Readers recover only unique
+scratch capacity; retained older payloads remain immutable. Memory estimates
+charge the full retained backing and a conservative shared-owner allowance.
