@@ -376,6 +376,11 @@ spills) and its constant, config field and accessor were removed. Neither it nor
 the consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` is read anywhere any
 more — the conflict index grows rather than refusing (see `ferrosa-cluster` CL-49).
 
+MVCC history pruning keeps empty and single-version histories in place. No
+version can be discarded in either case, so pruning avoids rebuilding the map
+and preserves the existing row owner without an allocation. Multi-version
+snapshot retention follows the existing oldest-snapshot boundary.
+
 ### Cap census (no-hard-bounds rule)
 
 Every remaining bound in this crate, with a verdict. The rule: a bound on the SIZE

@@ -224,6 +224,11 @@ on subsequent snapshot validation with SQLSTATE `40001`. Tuning guidance and
 query-materialization caveats are in the public
 [`PROFILE.md`](../../PROFILE.md).
 
+MVCC history pruning keeps empty and single-version histories in place. No
+version can be discarded in either case, so pruning avoids rebuilding the map
+and preserves the existing row owner without an allocation. Multi-version
+snapshot retention follows the existing oldest-snapshot boundary.
+
 ### Coherence with the consensus write path
 
 A buffered transaction is not committed here — it is committed by Accord, which

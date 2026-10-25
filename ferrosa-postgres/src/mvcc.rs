@@ -898,6 +898,11 @@ fn retain_snapshot_history<K: Copy + Ord, V>(
     versions: &mut BTreeMap<K, V>,
     oldest_snapshot: Option<K>,
 ) -> bool {
+    // Empty and singleton histories are already minimal for every horizon.
+    // Leave their BTreeMap allocation and payload owner in place.
+    if versions.len() <= 1 {
+        return !versions.is_empty();
+    }
     if let Some(oldest_snapshot) = oldest_snapshot {
         let mut retained = versions.split_off(&oldest_snapshot);
         if let Some((timestamp, row)) = versions.pop_last() {
@@ -936,6 +941,95 @@ pub(crate) enum MvccCommitError {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    // Count only allocations made by the current test thread. Other tests and
+    // background runtimes must not affect this allocation regression.
+    mod allocation_probe {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        thread_local! {
+            static COUNT: Cell<Option<usize>> = const { Cell::new(None) };
+        }
+
+        struct CountingAllocator;
+
+        fn record() {
+            let _ = COUNT.try_with(|count| {
+                if let Some(value) = count.get() {
+                    count.set(Some(value + 1));
+                }
+            });
+        }
+
+        unsafe impl GlobalAlloc for CountingAllocator {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                record();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                record();
+                unsafe { System.alloc_zeroed(layout) }
+            }
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                record();
+                unsafe { System.realloc(ptr, layout, size) }
+            }
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+        pub fn count(f: impl FnOnce()) -> usize {
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    COUNT.with(|count| count.set(None));
+                }
+            }
+            COUNT.with(|count| {
+                assert!(count.get().is_none());
+                count.set(Some(0));
+            });
+            let reset = Reset;
+            f();
+            let result = COUNT.with(|count| count.get().unwrap());
+            drop(reset);
+            result
+        }
+    }
+
+    #[test]
+    fn singleton_history_retention_does_not_reallocate() {
+        // Non-Clone payload also proves that pruning needs no cloned row.
+        struct Payload(Vec<u8>);
+        for horizon in [None, Some(0), Some(10), Some(20)] {
+            let mut versions = BTreeMap::from([(10, Payload(vec![7; 1024]))]);
+            let pointer = versions[&10].0.as_ptr();
+            let allocations = allocation_probe::count(|| {
+                assert!(retain_snapshot_history(&mut versions, horizon));
+            });
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[&10].0.as_ptr(), pointer);
+            assert_eq!(versions[&10].0, vec![7; 1024]);
+            assert_eq!(allocations, 0, "horizon {horizon:?}");
+        }
+    }
+
+    #[test]
+    fn empty_history_retention_removes_the_entry() {
+        for horizon in [None, Some(0), Some(10), Some(20)] {
+            let mut versions = BTreeMap::<u64, Vec<u8>>::new();
+            let allocations = allocation_probe::count(|| {
+                assert!(!retain_snapshot_history(&mut versions, horizon));
+            });
+            assert!(versions.is_empty());
+            assert_eq!(allocations, 0);
+        }
+    }
 
     fn row(value: &str) -> Row {
         Row::new(vec![Value::Text(value.to_string())])
