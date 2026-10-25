@@ -132,7 +132,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--runtime-config', type=Path, required=True,
         help='Private connection JSON; never copy this file into results')
-    parser.add_argument('--arm', choices=['A', 'B', 'C'], required=True)
+    parser.add_argument('--arm', choices=['A', 'B', 'C', 'D'], required=True)
     parser.add_argument('--round', type=int, required=True)
     parser.add_argument('--protocol', choices=['pg', 'bolt'], required=True)
     parser.add_argument('--target', choices=['ferrosa', 'postgres', 'neo4j'], default='ferrosa')
