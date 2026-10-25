@@ -6,7 +6,8 @@ volume, native x86-64 builds and a separate client. No significance or general
 database performance claim follows from two repetitions. All accepted legs
 validated counts, every scanned key and row values.
 
-PostgreSQL: 5,000 rows, 96-byte payloads, 8 workers, 400 seeded point reads.
+Unless stated otherwise: PostgreSQL uses 5,000 rows, 96-byte payloads, 8 workers,
+and 400 seeded point reads.
 Bolt: 20,000 existing nodes, 500 point updates, 8 workers, 400 seeded reads.
 These are protocol-specific workloads; their rates are not comparable to each
 other. Older native PostgreSQL/Neo4j measurements used different workloads and
@@ -117,3 +118,50 @@ are unchanged. The extracted metadata is corrected, and the client now records
 actual UTF-8 byte length and variant count in every result. A contract test
 checks the JSON emitted by the real client entry point. No 512-byte workload
 performance claim follows from the measurements above.
+
+## Shared fresh-INSERT absence (2026-10-25)
+
+The earlier MVCC and Sync rows are successive historical checkpoints. The current
+comparison is exact-key/decoder source `e8772cf29ec756d63278cf25d6db4836cdf1ee88`
+against `15d9e7f0e6991301d304fbf0034877b9cd514d76`. The latter represents a newly
+tracked key's original absence once, avoiding one persistent-map entry per key
+per active reader. Actual physical before-images and historical snapshot rows
+remain protected before storage apply. Already tracked keys skip redundant
+baseline entry mutation.
+
+Order D41/E41/P41/P42/E42/D42, two unprofiled repetitions per Ferrosa arm. Each
+fresh Ferrosa process runs a 100k fixture, then a distinct 5k fixture; every
+key/value/count check passed. Fresh PostgreSQL 100k controls are in that sequence.
+The separate fresh PostgreSQL 5k controls also follow a validated 100k workload
+in the same process. All use 96-byte payloads and 8 workers.
+
+| INSERT fixture | Before rows/s | After rows/s | PostgreSQL 18.6 rows/s | After / PostgreSQL |
+| --- | ---: | ---: | ---: | ---: |
+| 100,000 rows | 17,138 | 24,275 | 26,392 | 92.0% |
+| 5,000 rows after 100k | 22,038 | 22,842 | 24,900 | 91.7% |
+
+The 100k improvement is **41.6%**, from 64.9% to 92.0% of PostgreSQL. The 5k
+mean improves 3.6%, but observed ranges overlap (before 19.7–24.4k, after
+21.6–24.0k); this does not establish a small-load speedup. Two repetitions do
+not establish significance or general database performance. The storage
+placement difference above still applies. Individual rates/ranges and profile
+summaries are in [mvcc-absence-results.json](mvcc-absence-results.json).
+
+A real-manager allocation test keeps 1 or 16 readers alive while committing
+128/256 fresh keys, excluding fixture construction. At 256 keys, allocations
+change from 3,543/7,913 to 2,704/2,704. Restoring only the None fanout fails this
+regression; suppressing only the known-absence fallback fails a paused-apply
+visibility test. Both controls were restored before verification.
+
+Separate 200k-row software CPU captures show persistent-map frames on 534/972
+stacks before (54.9%) and 225/647 after (34.8%); categories are inclusive.
+Captured process CPU is 26.26s versus 17.93s, including collector gates beyond
+the load interval. Sampled peak RSS **increases** from 455 to 503 MiB. Fewer
+allocations do not establish lower resident memory. Disk/network counters and
+summed thread run-queue samples are retained; these are not individual mutex
+waits or request latency. Background I/O and network totals differ across the
+captures, so their whole-process deltas are diagnostic, not precise isolated
+attribution. Profiled throughput is excluded from the table.
+
+The remaining read gap is still open. This change targets INSERT metadata; it
+does not establish bounded MVCC residency or eliminate query/protocol handoffs.
