@@ -81,8 +81,53 @@ opt-level = 3
 [profile.dev.package.argon2]
 opt-level = 3
 
+# The engines tests run inside, for the same reason: the AssemblyScript UDF
+# tests spend nearly all their time in QuickJS (running `asc`) and Cranelift /
+# wasmtime (compiling and running its output), and `pump_loom` in loom's model
+# checker. Unoptimized, they formed a ~12-minute serial tail in PR CI (nextest's
+# `compile-bound` group runs them one at a time). Optimized, the five ferrosa-udf
+# asc tests take 8.2 s instead of 52.1 s and pump_loom 15.6 s instead of 45.7 s
+# (local debug build), with no measurable compile-time cost. Speed only: the
+# code under test and its assertions are unchanged.
+# tests/ci/test_dev_profile_optimizes_test_engines.py pins this list.
+[profile.dev.package.rquickjs-sys]
+opt-level = 3
+
+[profile.dev.package.rquickjs-core]
+opt-level = 3
+
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+
+[profile.dev.package.regalloc2]
+opt-level = 3
+
+[profile.dev.package.wasmtime]
+opt-level = 3
+
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+
+[profile.dev.package.wasmparser]
+opt-level = 3
+
+[profile.dev.package.wit-component]
+opt-level = 3
+
+[profile.dev.package.wasm-encoder]
+opt-level = 3
+
+[profile.dev.package.loom]
+opt-level = 3
+
 [workspace.package]
-version = "0.27.7"
+version = "0.28.2"
 edition = "2021"
 license = "Apache-2.0"
 # No workspace crate is published to crates.io. Saying so lets cargo-deny

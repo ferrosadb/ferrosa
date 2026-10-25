@@ -35,7 +35,7 @@ class ReleaseWorkflowTest(unittest.TestCase):
         self.assertEqual("0.13.2", tagged_version)
 
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
-        debian_job = workflow.split("      - name: Build Debian package\n", 1)[1].split("\n      - name:", 1)[0]
+        debian_job = workflow.split("      - name: Build Debian package (glibc)\n", 1)[1].split("\n      - name:", 1)[0]
         self.assertIn(
             'VERSION="$(bash .github/scripts/release-version.sh '
             '"$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$GITHUB_RUN_NUMBER")"',
@@ -44,8 +44,9 @@ class ReleaseWorkflowTest(unittest.TestCase):
 
     def test_manual_branch_release_uses_the_same_version_in_all_tarballs(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        # x86_64 musl, aarch64 musl, macOS, and the glibc matrix job.
         self.assertEqual(
-            3,
+            4,
             workflow.count(
                 'FERROSA_RELEASE_TAG="v${VERSION}" bash .github/scripts/stage-release-tarball.sh'
             ),
@@ -174,7 +175,12 @@ class ReleaseWorkflowTest(unittest.TestCase):
         # targets the GHCR images ship. A second compile inside the publish job
         # is the thing this replaced: it duplicated the build and carried its own
         # musl-libunwind failure modes.
-        self.assertIn("ferrosa-gnu-${{ matrix.arch }}.tar.gz", job)
+        # build-linux-gnu uploads this bundle as image-bundle-gnu-<arch> (see
+        # test_release_glibc.test_the_image_bundle_cannot_become_a_release_asset);
+        # a consumer asking for any other name finds nothing to extract.
+        self.assertIn("image-bundle-gnu-${{ matrix.arch }}.tar.gz", job)
+        glibc_build = workflow.split("  build-linux-gnu:\n", 1)[1].split("\n  docker-image-glibc:\n", 1)[0]
+        self.assertIn("name: image-bundle-gnu-${{ matrix.arch }}", glibc_build)
         self.assertIn("-f Dockerfile.glibc", job)
         self.assertIn("target=production", job)
         self.assertIn("target=profiling", job)

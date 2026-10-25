@@ -47,12 +47,24 @@ jobs:
         run: python3 -m unittest tests.ci.test_resolve_release_bin_dir
       - name: Check release workflow contract
         run: python3 -m unittest -q tests/ci/test_release_workflow.py
+      - name: Check releases ship glibc alongside musl
+        run: python3 -m unittest -q tests/ci/test_release_glibc.py
+      - name: Check the .deb declares the glibc its binary needs
+        run: python3 -m unittest -q tests/ci/test_build_deb.py
       # Nightly and stable releases take main's Cargo version (main leads) and
       # refuse to release below the latest stable tag.
       - name: Check release version comes from main
         run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
       - name: Check CI cache workflow contract
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
+      - name: Check CI builds the shipped binary once
+        run: python3 -m unittest -q tests/ci/test_ci_build_once.py
+      - name: Check every ignored and slow test still runs somewhere
+        run: python3 -m unittest -q tests/ci/test_ignored_test_partition.py
+      - name: Check every slow test is selectable by the slow-module filters
+        run: python3 -m unittest -q tests/ci/test_slow_tests_are_selectable.py
+      - name: Check test builds optimize the engines tests run inside
+        run: python3 -m unittest -q tests/ci/test_dev_profile_optimizes_test_engines.py
       - name: Check the no-new-waivers guard
         run: python3 -m unittest -q tests/ci/test_check_no_new_waivers.py
       - name: Check local CI mirror prerequisites
@@ -366,20 +378,20 @@ jobs:
         # indistinguishable from a hang from the outside, so no harness-side budget
         # rule can tell the two apart, and lengthening the budget would only mask it.
         # The step above excludes these binaries; this one gives them the machine.
-        # Named as explicit `--test` targets rather than a binary-name
-        # filterset: this step carries no `--skip` list, so anything it selects
-        # by accident RUNS, and the file-IO-heavy tests (differential_oracle,
+        # The SAME package selection as the step above (`--workspace`, the same
+        # excludes, `--lib --tests`), narrowed by a filterset. `-p ferrosa`
+        # resolved features differently and rebuilt the workspace: 2m55s of
+        # compile for 24s of tests. tests/ci/test_ci_build_once.py pins both.
+        # This step carries no `--skip` list, so anything it selects by
+        # accident RUNS, and the file-IO-heavy tests (differential_oracle,
         # cassandra_reads_compacted, compaction_end_to_end_pipeline, lazyfs
         # promote, the typed-edge count merger) fail in ~0.1s without their
-        # infrastructure. A target list cannot over-select.
+        # infrastructure. `binary()` matches a binary name exactly, so the
+        # filterset selects these six binaries and nothing else.
         run: |
-          cargo nextest run --all-features -p ferrosa \
-            --test commit_guarantee_replica_process \
-            --test drop_table_replica_process \
-            --test jsonb_first_class_cluster_process \
-            --test pg_public_keyspace_rf_process \
-            --test pg_select_cluster_read_process \
-            --test pg_txn_value_process
+          cargo nextest run --all-features --workspace --lib --tests \
+            --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+            -E 'package(ferrosa) and (binary(commit_guarantee_replica_process) or binary(drop_table_replica_process) or binary(jsonb_first_class_cluster_process) or binary(pg_public_keyspace_rf_process) or binary(pg_select_cluster_read_process) or binary(pg_txn_value_process))'
 
   # ── Stage 2a': Differential oracle vs real PostgreSQL ──────────────
   # The `test` job above skips `differential_oracle` because it has no
@@ -423,45 +435,6 @@ jobs:
           cargo test -p ferrosa-postgres --all-features \
             --test differential_oracle -- --test-threads=1 --nocapture
 
-  # ── Stage 2b: Musl static build ───────────────────────────────────
-  musl:
-    name: Static Build (musl)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-        with:
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: musl
-          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
-      - name: Install musl tools and capnproto
-        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
-      - name: Build static binary
-        # Curated `ferrosa/full`, NOT --all-features: this is the release
-        # binary's feature set, and the examples job runs this binary.
-        run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
-      - name: Verify statically linked
-        run: |
-          file target/x86_64-unknown-linux-musl/release/ferrosa
-          file target/x86_64-unknown-linux-musl/release/ferrosa | grep -qE "statically linked|static-pie linked|static"
-          echo "Binary size: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
-      - name: Strip and report
-        run: |
-          strip target/x86_64-unknown-linux-musl/release/ferrosa
-          strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
-          echo "Stripped ferrosa: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
-          echo "Stripped ferrosa-ctl: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa-ctl | cut -f1)"
-      - name: Upload musl binaries
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ferrosa-musl-static
-          path: |
-            target/x86_64-unknown-linux-musl/release/ferrosa
-            target/x86_64-unknown-linux-musl/release/ferrosa-ctl
-          retention-days: 14
-
   # ── aarch64 musl release target (native arm64) ───────────────────────
   # release.yml builds the aarch64 tarball natively on ubuntu-24.04-arm, but
   # only when a tag is pushed. This checks the same target, packages and
@@ -496,36 +469,139 @@ jobs:
         # aarch64 build, checked without the release profile or the link.
         run: cargo check --target aarch64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
 
-  # ── Build the runtime node image ONCE (12-factor build/release/run) ──
-  # Compile the glibc release binary exactly once (cached via rust-cache; glibc
-  # for allocator performance — musl's allocator is slow, so the static musl
-  # binary above is only for distribution, not for the test node). Package it
-  # into an immutable `ferrosa-test-node:latest` image saved as an artifact. The
-  # cluster-integration and driver-smoke jobs RUN that artifact instead of
-  # recompiling the release binary inside Docker (previously done twice/run).
+  # ── Build each shipped binary ONCE (12-factor build/release/run) ─────
+  # Two binaries ship on Linux, and this workflow compiles each exactly once,
+  # with the command release.yml ships it with (tests/ci/test_ci_build_once.py
+  # pins both):
+  #
+  #   * `musl`: static x86_64 musl, `ferrosa/full`, for hosts without a usable
+  #     glibc. The main ruleset requires its check, "Static Build (musl)".
+  #   * `build-node-image`: x86_64 glibc, `ferrosa/full`. 15-20% faster than
+  #     musl, so it ships wherever the host's glibc allows, and it is what every
+  #     job here that runs a server runs, packaged once into the immutable
+  #     `ferrosa-test-node:latest` image: examples, secure-compose,
+  #     integration, the PostgreSQL Jepsen cluster, driver smoke and the paired
+  #     repositories that pull it from GHCR.
+  #
+  # This replaced five release compiles per run (musl, a glibc default-features
+  # node image, a glibc `flight` binary, and install-smoke's glibc and macOS
+  # tarballs). Whether Arrow Flight listens is runtime config, not a build:
+  # the image ships FERROSA_FLIGHT_ENABLED=false so a paired repository sees no
+  # new listener, and a job that needs Flight sets it to true.
+  musl:
+    name: Static Build (musl)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: musl
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Install musl tools and capnproto
+        run: sudo apt-get update && sudo apt-get install -y musl-tools capnproto
+      - name: Build the musl release binary (once)
+        # Curated `ferrosa/full`, NOT --all-features: this is the release
+        # binary's feature set.
+        run: cargo build --release --target x86_64-unknown-linux-musl -p ferrosa -p ferrosa-ctl --features ferrosa/full
+      - name: Verify statically linked
+        run: |
+          file target/x86_64-unknown-linux-musl/release/ferrosa
+          file target/x86_64-unknown-linux-musl/release/ferrosa | grep -qE "statically linked|static-pie linked|static"
+          echo "Binary size: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
+      - name: Strip and report
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/ferrosa
+          strip target/x86_64-unknown-linux-musl/release/ferrosa-ctl
+          echo "Stripped ferrosa: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa | cut -f1)"
+          echo "Stripped ferrosa-ctl: $(du -h target/x86_64-unknown-linux-musl/release/ferrosa-ctl | cut -f1)"
+      - name: Upload musl binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-musl-static
+          path: |
+            target/x86_64-unknown-linux-musl/release/ferrosa
+            target/x86_64-unknown-linux-musl/release/ferrosa-ctl
+          retention-days: 14
+
+  glibc:
+    name: Build glibc (Ubuntu 22.04)
+    # release.yml's build-linux-gnu container: Ubuntu 22.04 (glibc 2.35), so
+    # CI tests the binary with the glibc requirement that ships. Pinned by
+    # digest; not yet mirrored to downloads.ferrosa.ai (forge t_df6a29de).
+    runs-on: ubuntu-24.04
+    container:
+      image: docker.io/library/ubuntu@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956
+    # Inside a container GitHub's default shell is `sh -e`, and this image's sh
+    # is dash, which rejects `set -o pipefail` (CI run 40039687871).
+    defaults:
+      run:
+        shell: bash
+    env:
+      # The oldest glibc every glibc artifact must run on (Ubuntu 22.04).
+      GLIBC_FLOOR: "2.35"
+    steps:
+      - name: Install glibc build dependencies
+        # Same packages as release.yml's build-linux-gnu, before checkout: the
+        # bare image has no git, and the toolchain action needs curl.
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential pkg-config perl file \
+            capnproto libunwind-dev
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: glibc-ubuntu2204
+          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
+      - name: Build the glibc release binary (once)
+        # Curated `ferrosa/full`, NOT --all-features: this is the release
+        # binary's feature set.
+        run: cargo build --locked --release --target x86_64-unknown-linux-gnu -p ferrosa -p ferrosa-ctl --features ferrosa/full
+      - name: Strip, and check the glibc floor
+        run: |
+          set -euo pipefail
+          strip target/x86_64-unknown-linux-gnu/release/ferrosa
+          strip target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
+          file target/x86_64-unknown-linux-gnu/release/ferrosa
+          required="$(objdump -T target/x86_64-unknown-linux-gnu/release/ferrosa | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -n1 | sed 's/^GLIBC_//')"
+          echo "glibc required: ${required} (floor ${GLIBC_FLOOR})"
+          if [ "$(printf '%s\n%s\n' "$GLIBC_FLOOR" "$required" | sort -V | tail -n1)" != "$GLIBC_FLOOR" ]; then
+            echo "::error::binary needs glibc ${required}, newer than ${GLIBC_FLOOR} (Ubuntu 22.04)"
+            exit 1
+          fi
+      - name: Upload glibc binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ferrosa-glibc
+          path: |
+            target/x86_64-unknown-linux-gnu/release/ferrosa
+            target/x86_64-unknown-linux-gnu/release/ferrosa-ctl
+          retention-days: 14
+
   build-node-image:
     name: Build node image
+    # Packages the glibc job's binaries; a container job has no docker daemon,
+    # so the image is built here, on the host, without compiling anything.
+    needs: glibc
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Download the glibc binaries
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          key: node-image
-          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
-      - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
-      - name: Build glibc release binary (once)
-        # Default features, NOT --all-features: this binary becomes an image
-        # pushed to GHCR for paired repositories to run.
-        run: cargo build --release -p ferrosa -p ferrosa-ctl
+          name: ferrosa-glibc
+          path: node-bin
       - name: Package into a thin runtime image
         run: |
           mkdir -p node-bin
-          cp target/release/ferrosa target/release/ferrosa-ctl node-bin/
+          # upload-artifact does not keep file modes.
+          chmod +x node-bin/ferrosa node-bin/ferrosa-ctl
           cat > node-bin/Dockerfile <<'DEOF'
           FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
           RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -535,6 +611,7 @@ jobs:
           COPY ferrosa-ctl /usr/local/bin/ferrosa-ctl
           EXPOSE 9042 7000 9090 7474 7687
           ENV FERROSA_DATA_DIR=/var/lib/ferrosa
+          ENV FERROSA_FLIGHT_ENABLED=false
           CMD ["ferrosa"]
           DEOF
           # Retry: pulling the debian:trixie-slim base from Docker Hub
@@ -828,34 +905,12 @@ jobs:
   # 3-node overlay with the node image built earlier in CI, waits for /readyz
   # over HTTPS on every node, runs one authenticated CQL query over TLS, and
   # tears down. Before this job the overlay had no TLS settings at all, so
-  # nothing proved it could start.
-  # A `flight`-feature release binary for the secure-compose job only. The
-  # shared ferrosa-test-node image stays on default features: paired
-  # repositories run it, and it must not start binding Arrow Flight for them.
-  build-flight-binary:
-    name: Build flight release binary
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: flight-binary
-          save-if: ${{ github.ref == 'refs/heads/main' && runner.environment == 'github-hosted' }}
-      - name: Install capnproto
-        run: sudo apt-get update && sudo apt-get install -y capnproto
-      - name: Build glibc release binary with Arrow Flight
-        run: cargo build --release -p ferrosa --features flight
-      - name: Upload flight binary
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: ferrosa-flight-binary
-          path: target/release/ferrosa
-          retention-days: 7
-
+  # nothing proved it could start. The node image's binary is `ferrosa/full`,
+  # so it carries Arrow Flight; docker-compose.secure.yml turns it on
+  # (FERROSA_FLIGHT_ENABLED) for the TLS probe.
   secure-compose:
     name: Production Compose overlay (TLS + auth)
-    needs: [build-node-image, build-flight-binary]
+    needs: build-node-image
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -877,23 +932,16 @@ jobs:
         with:
           name: ferrosa-node-image
           path: /tmp/ferrosa-node-image
-      - name: Download the flight release binary
-        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
-        with:
-          name: ferrosa-flight-binary
-          path: /tmp/secure-smoke-image
-      - name: Load the node image, swap in the flight binary, add curl
+      - name: Load the node image and add curl
         run: |
           set -euo pipefail
           docker load --input /tmp/ferrosa-node-image/ferrosa-node-image.tar.gz
           # docker-compose.yml names node images ferrosa-smoke:latest; the
-          # healthcheck needs curl, which the thin CI image does not carry,
-          # and the Arrow Flight probe needs a binary built with `flight`.
-          chmod +x /tmp/secure-smoke-image/ferrosa
+          # healthcheck needs curl, which the thin CI image does not carry.
+          mkdir -p /tmp/secure-smoke-image
           printf '%s\n' \
             'FROM ferrosa-test-node:latest' \
             'RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*' \
-            'COPY ferrosa /usr/local/bin/ferrosa' \
             'EXPOSE 8815' \
             > /tmp/secure-smoke-image/Dockerfile
           for attempt in 1 2 3 4; do
@@ -918,41 +966,23 @@ jobs:
           export FERROSA_SEED_ADMIN_PASSWORD
           scripts/secure-compose-smoke.sh
 
-  # ── Stage 2c: Example CQL tests (reuses musl binary) ───────────────
+  # ── Stage 2c: Example CQL tests (runs the node image) ──────────────
   examples:
     name: Example CQL Scripts
     runs-on: ubuntu-latest
-    needs: musl
+    needs: build-node-image
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
-      - name: Download musl binary
+      - name: Download the node image built earlier in CI
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          name: ferrosa-musl-static
-          path: /tmp/ferrosa-bin
+          name: ferrosa-node-image
+          path: /tmp/ferrosa-node-image
 
-      - name: Build lightweight Docker image from musl binary
-        run: |
-          chmod +x /tmp/ferrosa-bin/ferrosa
-          cat > /tmp/Dockerfile.ci <<'DEOF'
-          FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
-          RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-          COPY ferrosa /usr/local/bin/
-          EXPOSE 9042 17000 9090
-          ENV FERROSA_DATA_DIR=/var/lib/ferrosa
-          CMD ["ferrosa"]
-          DEOF
-          # Retry: the debian:trixie-slim base pull from Docker Hub
-          # intermittently times out and fails the job (dropping the PR from the
-          # merge queue). A bounded retry rides it out (see forge t_75ec87fd).
-          for attempt in 1 2 3 4; do
-            docker build -t ferrosa-ci:latest -f /tmp/Dockerfile.ci /tmp/ferrosa-bin && break
-            [ "$attempt" = 4 ] && { echo "docker build failed after 4 attempts"; exit 1; }
-            echo "docker build attempt $attempt failed (likely Docker Hub base-image pull); retrying in $((attempt * 10))s…"
-            sleep $((attempt * 10))
-          done
+      - name: Load the node image
+        run: docker load --input /tmp/ferrosa-node-image/ferrosa-node-image.tar.gz
 
       - name: Start single-node Ferrosa with RustFS
         run: |
@@ -988,7 +1018,7 @@ jobs:
                        echo 'bucket ready'"
               restart: "no"
             node1:
-              image: ferrosa-ci:latest
+              image: ferrosa-test-node:latest
               depends_on:
                 rustfs-init:
                   condition: service_completed_successfully
@@ -996,6 +1026,8 @@ jobs:
                 - "9042:9042"
                 - "9090:9090"
               environment:
+                # The image ships Flight off; the examples include one for it.
+                FERROSA_FLIGHT_ENABLED: "true"
                 FERROSA_HOST_ID: "11111111-1111-1111-1111-111111111111"
                 FERROSA_CQL_BIND: "0.0.0.0:9042"
                 FERROSA_WEB_BIND: "0.0.0.0:9090"
@@ -1107,6 +1139,42 @@ jobs:
         if: always()
         run: docker compose -f /tmp/docker-compose.ci.yml down -v 2>/dev/null || true
 
+  # ── Stage 2c': Install smoke on the tarballs users get ─────────────
+  # Both shipped Linux tarballs, staged from the two release builds above,
+  # each installed by the real installer: glibc (the faster build, shipped
+  # wherever the host's glibc allows) and static musl. install-smoke.yml
+  # (macOS, and ferrosa-memory compiled from source) runs on main, nightly,
+  # and as the release gate; it no longer compiles three binaries per PR.
+  install-smoke:
+    name: Install smoke (${{ matrix.libc }} tarball)
+    needs: [glibc, musl]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - libc: glibc
+            artifact: ferrosa-glibc
+            target: x86_64-unknown-linux-gnu
+          - libc: musl
+            artifact: ferrosa-musl-static
+            target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Download the binaries built earlier in CI
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ${{ matrix.artifact }}
+          path: /tmp/ferrosa-bin
+      - name: Stage the release tarball from those binaries
+        # upload-artifact does not keep file modes.
+        run: |
+          chmod +x /tmp/ferrosa-bin/ferrosa /tmp/ferrosa-bin/ferrosa-ctl
+          GITHUB_REF_NAME=v0.0.0-smoke bash .github/scripts/stage-release-tarball.sh ${{ matrix.target }} /tmp/ferrosa-bin
+      - name: Run the user-grade install smoke against it
+        run: bash tests/install_smoke.sh --ferrosa-tarball dist/ferrosa-v0.0.0-smoke-${{ matrix.target }}.tar.gz
+
   # ── Stage 2d: Cluster integration tests (--ignored, Docker) ────────
   integration:
     name: Cluster integration tests
@@ -1160,11 +1228,13 @@ jobs:
       - name: Run ignored (cluster-gated) tests
         env:
           FERROSA_TEST_CONTAINERS: "1"
+        # Named targets, not `--workspace`: the workspace form compiled all ~214
+        # test binaries a second time (Test + Coverage already builds them) to
+        # run the ONE ignored test in the tree. tests/ci/test_ignored_test_partition.py
+        # fails when an #[ignore] appears in a target this list does not name,
+        # and nightly-slow-tests.yml still runs the whole workspace selection.
         run: |
-          # --all-features adds no ignored tests: no #[ignore] test sits behind
-          # a feature gate, so --ignored selects the same set as before.
-          cargo test --workspace --all-features \
-            --exclude ferrosa-jepsen --exclude ferrosa-loadgen \
+          cargo test --all-features -p ferrosa-cql --test fts_live_cluster \
             -- --ignored
       - name: Put cqlsh on PATH (docker, no host install)
         # The live test shells out to `cqlsh <host> <port> -e <stmt>`. This

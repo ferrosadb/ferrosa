@@ -13,11 +13,16 @@ name: Install Smoke
 # gate that was missing when issue #172 shipped.
 
 on:
-  # Runs from the trusted default-branch workflow. The author gate below is
-  # therefore not editable by the pull request whose code will be tested.
-  pull_request_target:
+  # Not per pull request. Every PR's Linux install is covered by ci.yml's
+  # `install-smoke` job, which installs the shipped musl tarball from that
+  # run's one release build. This workflow compiles ferrosa again on Linux and
+  # macOS and ferrosa-memory from source, so it runs after merge, nightly, and
+  # as the release gate. A macOS-only install break now shows up on main or
+  # overnight instead of on the PR.
   push:
     branches: [main]
+  schedule:
+    - cron: '30 4 * * *' # 4:30 AM UTC daily, between slow tests and the sim sweep
   workflow_call: {}   # so release.yml can gate publish on this
 
 permissions:

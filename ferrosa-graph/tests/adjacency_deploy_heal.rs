@@ -2018,189 +2018,198 @@ async fn edge_count_skips_a_deleted_edge_in_a_live_partition() {
 /// The deploy heal at the live memory cluster's size. Run it with
 /// `cargo test --release -p ferrosa-graph --features slow-tests --test
 /// adjacency_deploy_heal -- ::slow:: --nocapture` for timings worth quoting.
+///
+/// `slow` is nested, not at the file root: a root `mod slow` names its tests
+/// `slow::...`, which neither PR CI's `--skip ::slow::` nor the nightly's
+/// `::slow::` selection matches (tests/ci/test_slow_tests_are_selectable.py).
 #[cfg(feature = "slow-tests")]
-mod slow {
+mod at_scale {
     use super::*;
 
-    /// The memory cluster on 2026-09-29: 102,853 entities; typed_edges ~21k.
-    const ENTITIES: usize = 102_853;
-    const TYPED_EDGES: usize = 21_000;
-    const TENANTS: usize = 3;
-    const SESSIONS_PER_TENANT: usize = 30;
-    const EDGE_TYPES: [&str; 3] = ["related_to", "depends_on", "part_of"];
+    mod slow {
+        use super::*;
 
-    fn write_entity(node: &Node, t: usize, s: usize, i: usize) {
-        let probe = Edge {
-            tenant: tenant_id(t),
-            session: session_id(t, s),
-            src: entity(t, s, i),
-            edge_type: "",
-            dst: entity(t, s, i),
-        };
-        let (key, _) = typed_edge_key(&probe);
-        let row = Row {
-            clustering: entity(t, s, i).as_bytes().to_vec(),
-            cells: vec![(0, CellValue::live(format!("entity-{i}").into_bytes(), 1))],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(1),
-        };
-        node.storage
-            .write(&TableId::new(KEYSPACE, "entity_store"), &key, row, 1)
-            .unwrap();
-    }
+        /// The memory cluster on 2026-09-29: 102,853 entities; typed_edges ~21k.
+        const ENTITIES: usize = 102_853;
+        const TYPED_EDGES: usize = 21_000;
+        const TENANTS: usize = 3;
+        const SESSIONS_PER_TENANT: usize = 30;
+        const EDGE_TYPES: [&str; 3] = ["related_to", "depends_on", "part_of"];
 
-    /// An edge row written as a typed_edges INSERT lands; the adjacency
-    /// observer (registered by the engine) derives its entries.
-    fn write_edge(node: &Node, e: &Edge, ts: i64) {
-        let (key, clustering) = typed_edge_key(e);
-        let row = Row {
-            clustering,
-            cells: vec![],
-            deletion: DeletionTime::LIVE,
-            primary_key_liveness: LivenessInfo::with_timestamp(ts),
-        };
-        node.storage
-            .write(&TableId::new(KEYSPACE, "typed_edges"), &key, row, ts)
-            .unwrap();
-    }
-
-    fn production_shaped_edges() -> Vec<Edge> {
-        let sessions = TENANTS * SESSIONS_PER_TENANT;
-        let per_session = ENTITIES / sessions;
-        let mut edges = BTreeSet::new();
-        let mut k = 0usize;
-        while edges.len() < TYPED_EDGES {
-            let session = k % sessions;
-            let (t, s) = (session / SESSIONS_PER_TENANT, session % SESSIONS_PER_TENANT);
-            let i = (k / sessions) % per_session;
-            let j = (i * 7 + 3 + k / (sessions * per_session)) % per_session;
-            edges.insert(Edge {
+        fn write_entity(node: &Node, t: usize, s: usize, i: usize) {
+            let probe = Edge {
                 tenant: tenant_id(t),
                 session: session_id(t, s),
                 src: entity(t, s, i),
-                edge_type: EDGE_TYPES[k % EDGE_TYPES.len()],
-                dst: entity(t, s, j),
-            });
-            k += 1;
+                edge_type: "",
+                dst: entity(t, s, i),
+            };
+            let (key, _) = typed_edge_key(&probe);
+            let row = Row {
+                clustering: entity(t, s, i).as_bytes().to_vec(),
+                cells: vec![(0, CellValue::live(format!("entity-{i}").into_bytes(), 1))],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(1),
+            };
+            node.storage
+                .write(&TableId::new(KEYSPACE, "entity_store"), &key, row, 1)
+                .unwrap();
         }
-        edges.into_iter().collect()
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deploy_heal_at_memory_cluster_scale() {
-        let node = Node::new();
-        let sessions = TENANTS * SESSIONS_PER_TENANT;
-        let per_session = ENTITIES / sessions;
-        let mut entities = 0;
-        for session in 0..sessions {
-            for i in 0..per_session {
-                write_entity(
-                    &node,
-                    session / SESSIONS_PER_TENANT,
-                    session % SESSIONS_PER_TENANT,
-                    i,
-                );
-                entities += 1;
+        /// An edge row written as a typed_edges INSERT lands; the adjacency
+        /// observer (registered by the engine) derives its entries.
+        fn write_edge(node: &Node, e: &Edge, ts: i64) {
+            let (key, clustering) = typed_edge_key(e);
+            let row = Row {
+                clustering,
+                cells: vec![],
+                deletion: DeletionTime::LIVE,
+                primary_key_liveness: LivenessInfo::with_timestamp(ts),
+            };
+            node.storage
+                .write(&TableId::new(KEYSPACE, "typed_edges"), &key, row, ts)
+                .unwrap();
+        }
+
+        fn production_shaped_edges() -> Vec<Edge> {
+            let sessions = TENANTS * SESSIONS_PER_TENANT;
+            let per_session = ENTITIES / sessions;
+            let mut edges = BTreeSet::new();
+            let mut k = 0usize;
+            while edges.len() < TYPED_EDGES {
+                let session = k % sessions;
+                let (t, s) = (session / SESSIONS_PER_TENANT, session % SESSIONS_PER_TENANT);
+                let i = (k / sessions) % per_session;
+                let j = (i * 7 + 3 + k / (sessions * per_session)) % per_session;
+                edges.insert(Edge {
+                    tenant: tenant_id(t),
+                    session: session_id(t, s),
+                    src: entity(t, s, i),
+                    edge_type: EDGE_TYPES[k % EDGE_TYPES.len()],
+                    dst: entity(t, s, j),
+                });
+                k += 1;
             }
+            edges.into_iter().collect()
         }
 
-        // Register the observer the way the old build's first query did.
-        let old = node.healed_engine().await;
-        let all = production_shaped_edges();
-        run_ok(
-            &old,
-            &related_query(all[0].tenant, all[0].session, all[0].src),
-        )
-        .await;
-        let mut live: BTreeSet<Edge> = BTreeSet::new();
-        let seed_ts = now_micros();
-        for e in &all {
-            write_edge(&node, e, seed_ts);
-            live.insert(*e);
-        }
-        for (i, e) in all.iter().enumerate() {
-            if i % 40 == 7 {
-                run_ok(&old, &delete_query(e)).await;
-                live.remove(e);
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn deploy_heal_at_memory_cluster_scale() {
+            let node = Node::new();
+            let sessions = TENANTS * SESSIONS_PER_TENANT;
+            let per_session = ENTITIES / sessions;
+            let mut entities = 0;
+            for session in 0..sessions {
+                for i in 0..per_session {
+                    write_entity(
+                        &node,
+                        session / SESSIONS_PER_TENANT,
+                        session % SESSIONS_PER_TENANT,
+                        i,
+                    );
+                    entities += 1;
+                }
             }
-        }
-        eprintln!("SCALE seeded {entities} entities, {} edges", all.len());
-        let started = std::time::Instant::now();
-        let damage = old_build::reconcile_once(&node.schema, &node.write_path(), KEYSPACE).await;
-        let damage_ms = started.elapsed().as_millis();
-        assert_eq!(live_entries_of(&node, &live), 0, "{damage:?}");
-        for (i, e) in all.iter().enumerate() {
-            if i % 50 == 11 && live.contains(e) {
-                delete_as_prefix_build(&node, e);
-                live.remove(e);
+
+            // Register the observer the way the old build's first query did.
+            let old = node.healed_engine().await;
+            let all = production_shaped_edges();
+            run_ok(
+                &old,
+                &related_query(all[0].tenant, all[0].session, all[0].src),
+            )
+            .await;
+            let mut live: BTreeSet<Edge> = BTreeSet::new();
+            let seed_ts = now_micros();
+            for e in &all {
+                write_edge(&node, e, seed_ts);
+                live.insert(*e);
             }
-        }
-        drop(old);
-        as_left_by_prefix_build(&node);
+            for (i, e) in all.iter().enumerate() {
+                if i % 40 == 7 {
+                    run_ok(&old, &delete_query(e)).await;
+                    live.remove(e);
+                }
+            }
+            eprintln!("SCALE seeded {entities} entities, {} edges", all.len());
+            let started = std::time::Instant::now();
+            let damage =
+                old_build::reconcile_once(&node.schema, &node.write_path(), KEYSPACE).await;
+            let damage_ms = started.elapsed().as_millis();
+            assert_eq!(live_entries_of(&node, &live), 0, "{damage:?}");
+            for (i, e) in all.iter().enumerate() {
+                if i % 50 == 11 && live.contains(e) {
+                    delete_as_prefix_build(&node, e);
+                    live.remove(e);
+                }
+            }
+            drop(old);
+            as_left_by_prefix_build(&node);
 
-        // First start of the fixed build: the first queries start the heal,
-        // and are refused retryably if it outlasts the wait budget.
-        let fresh = node.start_engine();
-        let some = *live.iter().next().unwrap();
-        let started = std::time::Instant::now();
-        healed(&fresh).await;
-        let first = run_ok(&fresh, &related_query(some.tenant, some.session, some.src)).await;
-        let first_query_ms = started.elapsed().as_millis();
-        assert!(
-            !first.is_empty(),
-            "the first query answers from the healed index"
-        );
+            // First start of the fixed build: the first queries start the heal,
+            // and are refused retryably if it outlasts the wait budget.
+            let fresh = node.start_engine();
+            let some = *live.iter().next().unwrap();
+            let started = std::time::Instant::now();
+            healed(&fresh).await;
+            let first = run_ok(&fresh, &related_query(some.tenant, some.session, some.src)).await;
+            let first_query_ms = started.elapsed().as_millis();
+            assert!(
+                !first.is_empty(),
+                "the first query answers from the healed index"
+            );
 
-        // Steady state: a second pass finds nothing to do.
-        let started = std::time::Instant::now();
-        let second = ferrosa_graph::adjacency::reconcile::reconcile_once(
-            &node.schema,
-            &node.write_path(),
-            KEYSPACE,
-        )
-        .await;
-        let second_ms = started.elapsed().as_millis();
-        assert!(second.is_complete(), "{second:?}");
-        assert_eq!(
-            (second.entries_repaired, second.orphans_removed),
-            (0, 0),
-            "the heal left nothing for the next pass: {second:?}"
-        );
+            // Steady state: a second pass finds nothing to do.
+            let started = std::time::Instant::now();
+            let second = ferrosa_graph::adjacency::reconcile::reconcile_once(
+                &node.schema,
+                &node.write_path(),
+                KEYSPACE,
+            )
+            .await;
+            let second_ms = started.elapsed().as_millis();
+            assert!(second.is_complete(), "{second:?}");
+            assert_eq!(
+                (second.entries_repaired, second.orphans_removed),
+                (0, 0),
+                "the heal left nothing for the next pass: {second:?}"
+            );
 
-        eprintln!(
-            "SCALE entities={entities} typed_edges={} live={} \
+            eprintln!(
+                "SCALE entities={entities} typed_edges={} live={} \
              prefix_reconcile_ms={damage_ms} prefix_damage={damage:?} \
              first_query_with_heal_ms={first_query_ms} \
              second_pass_ms={second_ms} second_pass={second:?}",
-            all.len(),
-            live.len(),
-        );
+                all.len(),
+                live.len(),
+            );
 
-        // Answers: the OUT hops ferrosa-memory issues, for the sources of a
-        // sample of live edges, against the whole live set.
-        let full = Reference::new(&all, &live);
-        let sources: BTreeSet<(Uuid, Uuid, Uuid)> = live
-            .iter()
-            .step_by(live.len() / 60)
-            .map(|e| (e.tenant, e.session, e.src))
-            .collect();
-        let started = std::time::Instant::now();
-        let mut mismatches = Vec::new();
-        for &(t, s, v) in &sources {
-            let want = full.out.get(&(t, s, v)).cloned().unwrap_or_default();
-            for query in [related_query(t, s, v), bare_hop_query(t, s, v)] {
-                let rows = run_ok(&fresh, &query).await;
-                let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
-                if got != want {
-                    mismatches.push(format!("OUT {v}: got {got:?}, want {want:?}"));
+            // Answers: the OUT hops ferrosa-memory issues, for the sources of a
+            // sample of live edges, against the whole live set.
+            let full = Reference::new(&all, &live);
+            let sources: BTreeSet<(Uuid, Uuid, Uuid)> = live
+                .iter()
+                .step_by(live.len() / 60)
+                .map(|e| (e.tenant, e.session, e.src))
+                .collect();
+            let started = std::time::Instant::now();
+            let mut mismatches = Vec::new();
+            for &(t, s, v) in &sources {
+                let want = full.out.get(&(t, s, v)).cloned().unwrap_or_default();
+                for query in [related_query(t, s, v), bare_hop_query(t, s, v)] {
+                    let rows = run_ok(&fresh, &query).await;
+                    let got: BTreeSet<String> = rows.iter().map(|r| text(&r[0])).collect();
+                    if got != want {
+                        mismatches.push(format!("OUT {v}: got {got:?}, want {want:?}"));
+                    }
                 }
             }
+            assert_clean("sampled OUT traversals at scale", &mismatches);
+            eprintln!(
+                "SCALE checked OUT hops of {} sources in {} ms",
+                sources.len(),
+                started.elapsed().as_millis()
+            );
         }
-        assert_clean("sampled OUT traversals at scale", &mismatches);
-        eprintln!(
-            "SCALE checked OUT hops of {} sources in {} ms",
-            sources.len(),
-            started.elapsed().as_millis()
-        );
     }
 }

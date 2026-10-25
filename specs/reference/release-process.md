@@ -134,16 +134,27 @@ Channel resolution:
 
 ## Container image
 
-Every release publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
-`ghcr.io/ferrosadb/ferrosa`, built by the `docker-image` job in `release.yml`.
+Every release publishes multi-arch (`linux/amd64`, `linux/arm64`) images to
+`ghcr.io/ferrosadb/ferrosa` in two libc variants. Where we choose the libc, we
+choose glibc: it is 15-20% faster than musl, so it is the default image.
 
-- **Base:** `alpine:3.20` + `ca-certificates` + `tzdata`. Built by COPYing the
-  prebuilt musl static binary — no compilation in Docker, no QEMU.
-- **Features:** built with `--features ferrosa/full` (otel + flight + asc-udf),
-  identical to the `.deb`/tarball binaries.
+- **Default (glibc), `docker-image-glibc`:** Debian trixie (glibc 2.41), built
+  by COPYing the `build-linux-gnu` binaries, whose glibc requirement is asserted
+  against that base at build time.
+- **musl, `docker-image`:** `alpine:3.20` + `ca-certificates` + `tzdata`,
+  COPYing the static musl binary.
+- Neither compiles in Docker or uses QEMU.
+- **Features:** both are built with `--features ferrosa/full` (otel + flight +
+  asc-udf), identical to the `.deb`/tarball binaries.
 - **Tags:**
-  - Stable (`prerelease=false`): `:latest`, `:vX.Y.Z`, `:X.Y`, `:X`.
-  - Nightly (`prerelease=true`): `:nightly`, `:<CalVer>` (e.g. `:v2026.06.19.0017`).
+  - Stable (`prerelease=false`): glibc `:latest`, `:vX.Y.Z`, `:X.Y`, `:X` (also
+    `-glibc` aliases); musl the same set suffixed `-musl`.
+  - Nightly (`prerelease=true`): glibc `:nightly`, `:<CalVer>` (e.g.
+    `:v2026.06.19.0017`, also `-glibc`); musl `:nightly-musl`, `:<CalVer>-musl`.
+  - Profiling: `-glibc-profiling` (unstripped, full DWARF).
+- **Tarballs:** musl tarballs remain what `install/install.sh` installs on
+  Linux, since a host may lack a usable glibc. The glibc tarballs
+  (`*-unknown-linux-gnu.tar.gz`, glibc 2.39+) ship alongside them.
 - **Runs as** non-root UID 10001; `--read-only` rootfs compatible (only the
   `/var/lib/ferrosa` volume is written).
 - **Exposed ports:** 9042 (CQL), 17000 (internode), 9090 (web/Prometheus),
