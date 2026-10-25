@@ -9,9 +9,10 @@
   "profiled": false,
   "workload": {
     "rows": 5000,
-    "payload_bytes": 512,
+    "payload_bytes": 96,
     "workers": 8,
-    "point_reads": 400
+    "point_reads": 400,
+    "payload_variants": 512
   },
   "legs": {
     "C12": {
@@ -135,5 +136,6 @@
     "Only the CLI arm-label acceptance changed in the client; timed implementation is unchanged.",
     "Two repeats, descriptive comparisons; not significance evidence.",
     "Same 2-performance-CPU/4-GiB LAX class; native PostgreSQL root filesystem versus Ferrosa attached volume."
-  ]
+  ],
+  "payload_metadata_correction": "Earlier reports mislabeled 512 payload variants as 512 bytes. The unchanged generator emits 96 ASCII bytes per payload; all engines used the same bytes and measured rates are unchanged."
 }

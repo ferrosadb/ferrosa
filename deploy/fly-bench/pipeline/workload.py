@@ -161,6 +161,10 @@ def main():
         started_at=time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
     latencies = []
     try:
+        sizes = {len(payload.encode('utf-8')) for payload in workload.payloads}
+        if len(sizes) != 1:
+            raise ValueError('payload sizes must be uniform for this workload')
+        result.update(payload_bytes=sizes.pop(), payload_variants=len(workload.payloads))
         if args.profile_seconds:
             if workload.count() != args.rows:
                 raise ValueError('profile fixture census mismatch')

@@ -6,7 +6,7 @@ volume, native x86-64 builds and a separate client. No significance or general
 database performance claim follows from two repetitions. All accepted legs
 validated counts, every scanned key and row values.
 
-PostgreSQL: 5,000 rows, 512-byte payloads, 8 workers, 400 seeded point reads.
+PostgreSQL: 5,000 rows, 96-byte payloads, 8 workers, 400 seeded point reads.
 Bolt: 20,000 existing nodes, 500 point updates, 8 workers, 400 seeded reads.
 These are protocol-specific workloads; their rates are not comparable to each
 other. Older native PostgreSQL/Neo4j measurements used different workloads and
@@ -107,3 +107,13 @@ remain unattributed. No dominant CPU-spin hotspot was identified. Blocked
 mutex/request time is not measured by a CPU flame graph, so the remaining
 3.19× read gap still needs request/handoff/off-CPU tracing. Raw profiles and
 resource counters are retained in the private evidence.
+
+## Payload-label correction (2026-10-25)
+
+Earlier text and result extracts incorrectly called these 512-byte payloads.
+`make_payloads(512)` creates 512 variants; `PAYLOAD_LEN = 96` sets each payload
+to 96 ASCII bytes. The timed workload and Ferrosa/PostgreSQL comparison bytes
+are unchanged. The extracted metadata is corrected, and the client now records
+actual UTF-8 byte length and variant count in every result. A contract test
+checks the JSON emitted by the real client entry point. No 512-byte workload
+performance claim follows from the measurements above.

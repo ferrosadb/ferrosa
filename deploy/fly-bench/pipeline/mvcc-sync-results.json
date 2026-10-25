@@ -2,11 +2,12 @@
   "date": "2026-10-24",
   "workload": {
     "rows": 5000,
-    "payload_bytes": 512,
+    "payload_bytes": 96,
     "workers": 8,
     "point_reads": 400,
     "client": "same psycopg executemany instrument",
-    "rows_and_values_validated": true
+    "rows_and_values_validated": true,
+    "payload_variants": 512
   },
   "environment": {
     "region": "LAX",
@@ -148,5 +149,6 @@
     "Two repeats are descriptive, not significance evidence.",
     "Key-lookup and decoder-inline changes are not represented in these throughput numbers.",
     "Different storage placement remains a comparison limit."
-  ]
+  ],
+  "payload_metadata_correction": "Earlier reports mislabeled 512 payload variants as 512 bytes. The unchanged generator emits 96 ASCII bytes per payload; all engines used the same bytes and measured rates are unchanged."
 }

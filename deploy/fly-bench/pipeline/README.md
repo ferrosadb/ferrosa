@@ -21,8 +21,8 @@ to `host`, `user`, `password`, and `pg_port` or `bolt_port`. The workload accept
 its path through `--runtime-config` and omits that path and its contents from the
 result. Use a dedicated benchmark database: the PostgreSQL timing leg creates
 and clears its own table. Bolt requires a separately loaded and validated
-`BenchRow` fixture with `pk`, `bucket=pk%64`, and the deterministic 512-byte
-payloads from `make_payloads(512)`.
+`BenchRow` fixture with `pk`, `bucket=pk%64`, and the 512 deterministic 96-byte
+payload variants from `make_payloads(512)`.
 
 ```sh
 python3 deploy/fly-bench/pipeline/workload.py \
