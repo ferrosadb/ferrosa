@@ -1,3 +1,7 @@
+//! Correctness: point reads preserve SQL equality, snapshot visibility and cluster consistency.
+//! Last revised: 2026-10-24
+//! Last changed: Route safe scalar key equalities through exact partition reads and MVCC lookup.
+//!
 //! Query execution: lower a simple-query SQL string onto the bespoke relational
 //! engine ([`ferrosa_sql`]) over live ferrosa storage, and render the result set
 //! as Postgres backend messages.
@@ -6,7 +10,7 @@
 //!
 //! 1. `parse(sql)` → [`ferrosa_sql::SelectStmt`] (syntax errors → `42601`).
 //! 2. For every referenced table (`FROM` plus an optional `JOIN`), resolve its
-//!    keyspace and `storage_provider::load_table`s it into an in-memory snapshot,
+//!    keyspace and a lazy storage provider, narrowing safe scalar key equalities,
 //!    registering it in a [`ferrosa_sql::MapCatalog`]. A missing table is
 //!    `42P01` (undefined_table) — never a silently-empty relation (the R15 guard).
 //! 3. `execute(&stmt, &catalog, default_schema)` runs the sync operators.
@@ -1066,6 +1070,7 @@ pub(crate) async fn open_select_stream(
         env.snapshot,
         pending_writes,
         cluster_read,
+        Some((&params, env.jsonb_limits)),
     )
     .await?;
     open_stream(
@@ -4540,7 +4545,100 @@ pub(crate) async fn load_catalog(
 ) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
     // The Describe-only path resolves columns without reading rows, so it needs
     // no cluster range-read handle.
-    load_catalog_with_mvcc(engine, schema, stmt, default_schema, None, None, None, None).await
+    load_catalog_with_mvcc(
+        engine,
+        schema,
+        stmt,
+        default_schema,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// Narrow only a complete, canonically encodable scalar primary-key equality.
+/// Joins, compound/clustering keys, other predicates and coercions retain scans.
+/// The executor still validates qualifiers and evaluates the original predicate.
+fn exact_point_lookup(
+    select: &ferrosa_sql::SelectStmt,
+    schema: &Schema,
+    default_schema: &str,
+    params: &[SqlValue],
+    limits: &ferrosa_jsonb::Limits,
+) -> Option<crate::storage_provider::PointLookup> {
+    use ferrosa_sql::{CmpOp, Expr, Operand, Term};
+    if select.join.is_some() {
+        return None;
+    }
+    let Expr::Compare {
+        left: Operand::Column(column),
+        op: CmpOp::Eq,
+        value,
+    } = select.filter.as_ref()?
+    else {
+        return None;
+    };
+    if column
+        .qualifier
+        .as_ref()
+        .is_some_and(|q| q != select.from.alias.as_ref().unwrap_or(&select.from.table))
+    {
+        return None;
+    }
+    let value = match value {
+        Term::Literal(value) => value,
+        Term::Param(index) => params.get(index.checked_sub(1)?)?,
+        _ => return None,
+    };
+    let keyspace = select.from.schema.as_deref().unwrap_or(default_schema);
+    let snapshot = schema.snapshot();
+    let meta = snapshot
+        .tables
+        .get(&(keyspace.to_string(), select.from.table.clone()))?;
+    if meta.partition_key.len() != 1
+        || !meta.clustering_key.is_empty()
+        || meta.partition_key[0] != column.name
+    {
+        return None;
+    }
+    let column = meta.columns.get(&column.name)?;
+    let ty = ferrosa_row_bridge::parse_cql_type_in_keyspace(&column.column_type, keyspace, schema)
+        .ok()?;
+    // SQL equality must imply identical physical key bytes. In particular,
+    // float signed zero and decimal scale violate that implication, so keep
+    // those and unproved key families on the general scan path.
+    if !matches!(
+        ty,
+        CqlType::Ascii
+            | CqlType::Varchar
+            | CqlType::Boolean
+            | CqlType::Tinyint
+            | CqlType::Smallint
+            | CqlType::Int
+            | CqlType::Bigint
+            | CqlType::Uuid
+            | CqlType::Timeuuid
+    ) {
+        return None;
+    }
+    let encoded = value_to_cql(value, &ty, limits).ok()?;
+    // Refuse lossy/implicit coercions rather than deriving a key the SQL
+    // predicate could not have named. NULL is never a physical key.
+    if matches!(value, SqlValue::Null)
+        || crate::storage_provider::cql_to_value(&encoded)
+            .ok()?
+            .ne(value)
+    {
+        return None;
+    }
+    let storage_key = ferrosa_row_bridge::build_decorated_key(&[encoded], &[]).ok()?;
+    Some(crate::storage_provider::PointLookup {
+        storage_key,
+        row_key: vec![value.clone()],
+    })
 }
 
 // The read path threads its whole context through here: engine, schema, the
@@ -4558,6 +4656,7 @@ pub(crate) async fn load_catalog_with_mvcc(
     snapshot: Option<&MvccSnapshot>,
     pending_writes: Option<&[PgWrite]>,
     cluster_read: Option<Arc<dyn crate::RangeRead>>,
+    bindings: Option<(&[SqlValue], &ferrosa_jsonb::Limits)>,
 ) -> Result<(MapCatalog, ScanFailure), BackendMessage> {
     let mut catalog = MapCatalog::new();
     if let (Some(mvcc), Some(snapshot)) = (mvcc, snapshot) {
@@ -4654,6 +4753,10 @@ pub(crate) async fn load_catalog_with_mvcc(
         .await
         {
             Ok(table) => {
+                let point = bindings.and_then(|(params, limits)| {
+                    exact_point_lookup(stmt, schema, default_schema, params, limits)
+                });
+                let table = table.with_point_lookup(point);
                 let table = match view {
                     Some(view) => table.with_mvcc_view(view),
                     None => table,

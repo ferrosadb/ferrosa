@@ -187,3 +187,14 @@ cap. Neither residual is hidden by a write-count refusal.
 ### Extended-protocol transaction boundary
 
 Pipeline atomicity guard: `extended_pipeline_sync_publishes_one_atomic_batch` and `extended_pipeline_error_rolls_back_all_pre_sync_writes` prevent early publication and partial rollback. Additional tests retain explicit transactions across Sync, discard disconnected staging, and require a commit conflict to emit40001 then ReadyForQuery Idle.
+
+
+Scalar primary-key SELECTs now request exactly one physical partition for
+literal and bound-parameter equality, using the canonical write-side key codec.
+The snapshot tail resolves only that row, including a late delete and own staged
+insert. Cluster reads use `WritePath::pk_read` with the configured consistency
+and replication strategy; failures propagate without a local fallback. Joins,
+compound/clustering keys, floating/decimal keys and other unproved key families
+retain scans. Floating signed zero cannot use byte-key equality because SQL
+equates both signs. Selective-decode, recording-reader and snapshot tests cover
+this path. Fly read throughput for this change remains to be measured.

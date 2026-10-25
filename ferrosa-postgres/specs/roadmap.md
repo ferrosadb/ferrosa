@@ -375,3 +375,14 @@ T-301 (PG-first slice acceptance) is done: `tests/jsonb_slice.rs` and the postgr
 ### Extended-protocol transaction boundary
 
 Implemented: implicit extended-protocol pipelines commit once at Sync, preserving rollback and explicit transaction boundaries. Matched Fly throughput and separate insertion profiles are required before attributing a performance gain to this change.
+
+
+Scalar primary-key SELECTs now request exactly one physical partition for
+literal and bound-parameter equality, using the canonical write-side key codec.
+The snapshot tail resolves only that row, including a late delete and own staged
+insert. Cluster reads use `WritePath::pk_read` with the configured consistency
+and replication strategy; failures propagate without a local fallback. Joins,
+compound/clustering keys, floating/decimal keys and other unproved key families
+retain scans. Floating signed zero cannot use byte-key equality because SQL
+equates both signs. Selective-decode, recording-reader and snapshot tests cover
+this path. Fly read throughput for this change remains to be measured.

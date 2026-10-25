@@ -1,3 +1,7 @@
+//! Correctness: point reads preserve SQL equality, snapshot visibility and cluster consistency.
+//! Last revised: 2026-10-24
+//! Last changed: Route safe scalar key equalities through exact partition reads and MVCC lookup.
+//!
 //! Storage-backed table loading: bridge real ferrosa storage to the bespoke
 //! relational engine's row model (`ferrosa-sql`).
 //!
@@ -476,9 +480,17 @@ struct ScanContext {
     /// The keyspace's replication strategy, used only by the cluster read. It
     /// is resolved once here rather than per scan.
     replication: ferrosa_cluster::ring::strategy::ReplicationStrategy,
+    /// Complete key for a single-row table. The relational executor still
+    /// evaluates the predicate; this only narrows physical I/O and MVCC tails.
+    point: Option<PointLookup>,
 }
 
-/// Open the partition stream for one full-table scan.
+pub(crate) struct PointLookup {
+    pub(crate) storage_key: ferrosa_common::DecoratedKey,
+    pub(crate) row_key: Vec<Value>,
+}
+
+/// Open the partition stream for a scan or an exact key lookup.
 ///
 /// The **cluster** range read is used when this deployment has one: it fans out
 /// across the ring at the level [`read_consistency`] resolves
@@ -499,17 +511,29 @@ async fn open_partition_stream(ctx: &Arc<ScanContext>) -> Result<PartitionStream
                     ctx.table_id.keyspace, ctx.table_id.table
                 )
             })?;
-            reader
-                .stream_all(&ctx.table_id, cl, &ctx.replication)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "cluster range read of {}.{} failed: {error}",
-                        ctx.table_id.keyspace, ctx.table_id.table
-                    )
-                })
+            let stream = match &ctx.point {
+                Some(point) => {
+                    reader
+                        .stream_key(&ctx.table_id, &point.storage_key, cl, &ctx.replication)
+                        .await
+                }
+                None => reader.stream_all(&ctx.table_id, cl, &ctx.replication).await,
+            };
+            stream.map_err(|error| {
+                format!(
+                    "cluster range read of {}.{} failed: {error}",
+                    ctx.table_id.keyspace, ctx.table_id.table
+                )
+            })
         }
         None => {
+            if let Some(point) = &ctx.point {
+                let partition = ctx
+                    .engine
+                    .read(&ctx.table_id, &point.storage_key)
+                    .map_err(|error| error.to_string())?;
+                return Ok(Box::pin(futures::stream::iter(partition.map(Ok))));
+            }
             let stream = ctx
                 .engine
                 .range_iter(&ctx.table_id, None, None)
@@ -630,6 +654,28 @@ async fn produce_scan(
             }
         }
     }
+    // A missing physical key can still have a visible before-image or staged
+    // insert. Resolve only that key: enumerating every historical key would
+    // turn a physical point lookup back into an O(table size) read.
+    if let Some(point) = &ctx.point {
+        if !overlay_seen.contains(&point.row_key) {
+            let historical = match view
+                .as_ref()
+                .map(|view| view.row(&point.row_key))
+                .transpose()
+            {
+                Ok(row) => row.flatten(),
+                Err(_) => {
+                    failure.expired();
+                    return;
+                }
+            };
+            if let Some(Some(row)) = ctx.overlay.get(&point.row_key).or(historical.as_deref()) {
+                let _ = tx.send(row.clone()).await;
+            }
+        }
+        return;
+    }
     // Reconcile late deletes exactly once. This set retains keys, not rows;
     // each self-join scan has its own set and its own bounded row channel.
     if let Some(view) = view {
@@ -720,6 +766,13 @@ pub struct StreamingTable {
 }
 
 impl StreamingTable {
+    pub(crate) fn with_point_lookup(mut self, point: Option<PointLookup>) -> Self {
+        // Providers are uniquely owned until installed in the catalog.
+        Arc::get_mut(&mut self.ctx)
+            .expect("unpublished scan context")
+            .point = point;
+        self
+    }
     pub(crate) fn with_mvcc_view(mut self, view: crate::mvcc::MvccTableView) -> Self {
         self.mvcc_view = Some(view);
         self
@@ -866,6 +919,7 @@ pub(crate) async fn load_table_with_overlay(
             overlay: Arc::new(overlay),
             cluster_read,
             replication,
+            point: None,
         }),
         handle: Handle::current(),
         failure,
@@ -1738,6 +1792,7 @@ mod tests {
             Some(&snapshot),
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1820,6 +1875,7 @@ mod tests {
             Some(&snapshot),
             Some(&staged),
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1862,6 +1918,7 @@ mod tests {
             Some(&manager),
             Some(&racing_snapshot),
             Some(&staged),
+            None,
             None,
         )
         .await;
@@ -2026,6 +2083,7 @@ mod tests {
                         Some(&manager),
                         Some(&snapshot),
                         writes,
+                        None,
                         None,
                     )
                     .now_or_never()

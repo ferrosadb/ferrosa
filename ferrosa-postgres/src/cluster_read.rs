@@ -1,4 +1,8 @@
-//! How the PostgreSQL front-end reaches the cluster's **range-read** path,
+//! Correctness: point reads preserve SQL equality, snapshot visibility and cluster consistency.
+//! Last revised: 2026-10-24
+//! Last changed: Route safe scalar key equalities through exact partition reads and MVCC lookup.
+//!
+//! How the PostgreSQL front-end reaches the cluster's keyed and range-read paths,
 //! without depending on `ferrosa-cluster`'s coordinator type.
 //!
 //! ## Why this exists
@@ -118,6 +122,27 @@ pub type PartitionStream = Pin<Box<dyn Stream<Item = Result<Partition, String>> 
 /// empty or short stream.
 #[async_trait::async_trait]
 pub trait RangeRead: Send + Sync {
+    /// Read exactly one partition at the same consistency and replication policy
+    /// as a scan. Implementations without a keyed operation retain the complete
+    /// cluster scan; they must never substitute local storage on a read failure.
+    async fn stream_key(
+        &self,
+        table_id: &TableId,
+        key: &ferrosa_common::DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> Result<PartitionStream, String> {
+        let stream = self.stream_all(table_id, cl, strategy).await?;
+        let key = key.clone();
+        Ok(Box::pin(stream.filter_map(move |item| {
+            let keep = match &item {
+                Ok(partition) => partition.key == key,
+                Err(_) => true,
+            };
+            futures::future::ready(keep.then_some(item))
+        })))
+    }
+
     /// Open the stream of every partition of `table_id`, reading at `cl` with
     /// the keyspace's `strategy`.
     async fn stream_all(
@@ -143,6 +168,21 @@ impl ClusterRangeRead {
 
 #[async_trait::async_trait]
 impl RangeRead for ClusterRangeRead {
+    async fn stream_key(
+        &self,
+        table_id: &TableId,
+        key: &ferrosa_common::DecoratedKey,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+    ) -> Result<PartitionStream, String> {
+        let path = self.path.load_full();
+        let partition = path
+            .pk_read(table_id, key, cl, strategy)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(Box::pin(futures::stream::iter(partition.map(Ok))))
+    }
+
     async fn stream_all(
         &self,
         table_id: &TableId,

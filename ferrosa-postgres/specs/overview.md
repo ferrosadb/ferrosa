@@ -323,3 +323,14 @@ T-301 acceptance: `tests/jsonb_slice.rs` (no infrastructure) and the `differenti
 ### Extended-protocol transaction boundary
 
 Extended protocol: each implicit pipeline owns one snapshot and staged write-set until `Sync`. `handle_frontend` commits or rolls it back at that boundary; each `Execute` does not independently publish its write. Explicit transactions retain their existing COMMIT/ROLLBACK boundary.
+
+
+Scalar primary-key SELECTs now request exactly one physical partition for
+literal and bound-parameter equality, using the canonical write-side key codec.
+The snapshot tail resolves only that row, including a late delete and own staged
+insert. Cluster reads use `WritePath::pk_read` with the configured consistency
+and replication strategy; failures propagate without a local fallback. Joins,
+compound/clustering keys, floating/decimal keys and other unproved key families
+retain scans. Floating signed zero cannot use byte-key equality because SQL
+equates both signs. Selective-decode, recording-reader and snapshot tests cover
+this path. Fly read throughput for this change remains to be measured.

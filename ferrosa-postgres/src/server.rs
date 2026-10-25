@@ -4649,4 +4649,269 @@ pub(crate) mod txn_atomicity_tests {
             "the row before the marker must land on COMMIT"
         );
     }
+    /// A keyed SELECT must not decode unrelated partitions. The deliberately
+    /// corrupt UTF-8 value is readable only through a scan, never through k=good.
+    async fn point_lookup_fixture() -> (tempfile::TempDir, QueryContext) {
+        let (dir, ctx) = make_ctx().await;
+        let mut writer = Session::new(superuser());
+        let result = execute_simple(
+            &ctx,
+            &mut writer,
+            "INSERT INTO kv (k, v) VALUES ('good', 'expected')",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&result), None);
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"corrupt".to_vec(),
+        ));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![(0, ferrosa_common::CellValue::live(vec![0xff], 9000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(9000),
+        };
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "kv"),
+                &key,
+                row,
+                9000,
+            )
+            .unwrap();
+        (dir, ctx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_skips_unrelated_partition_decode() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let mut reader = Session::new(superuser());
+        let result = execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'good'").await;
+        assert_eq!(
+            error_sqlstate(&result),
+            None,
+            "point read touched unrelated corrupt row: {result:?}"
+        );
+        let rows: Vec<_> = result
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns: cells } => Some(cells),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, vec![&vec![Some(b"expected".to_vec())]]);
+        let missing =
+            execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'missing'").await;
+        assert_eq!(
+            error_sqlstate(&missing),
+            None,
+            "missing point read scanned table: {missing:?}"
+        );
+        assert!(!missing
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { .. })));
+        let scan = execute_simple(&ctx, &mut reader, "SELECT v FROM kv").await;
+        assert_eq!(error_sqlstate(&scan).as_deref(), Some("58000"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_bound_parameter_skips_unrelated_partition_decode() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let mut reader = Session::new(superuser());
+        reader.on_parse(
+            "point".into(),
+            "SELECT v FROM kv WHERE k = $1".into(),
+            vec![25],
+        );
+        reader.on_bind(
+            "point".into(),
+            "point".into(),
+            &[],
+            &[Some(b"good".to_vec())],
+            vec![],
+            &ctx.jsonb_limits,
+        );
+        let result = execute_portal(&ctx, &mut reader, "point").await;
+        assert_eq!(
+            error_sqlstate(&result),
+            None,
+            "bound point read touched unrelated row: {result:?}"
+        );
+        assert!(result
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { columns: cells }
+            if cells == &vec![Some(b"expected".to_vec())])));
+    }
+
+    /// The read adapter must request the exact key at the configured cluster
+    /// consistency. A full scan fails even if it would filter before decoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_uses_cluster_key_operation_and_propagates_errors() {
+        use crate::cluster_read::{PartitionStream, RangeRead};
+        use ferrosa_cluster::{consistency::ConsistencyLevel, ring::strategy::ReplicationStrategy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct KeyRead {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl RangeRead for KeyRead {
+            async fn stream_all(
+                &self,
+                _: &ferrosa_storage::TableId,
+                _: ConsistencyLevel,
+                _: &ReplicationStrategy,
+            ) -> Result<PartitionStream, String> {
+                Err("point SELECT opened a full scan".into())
+            }
+            async fn stream_key(
+                &self,
+                table: &ferrosa_storage::TableId,
+                key: &ferrosa_common::DecoratedKey,
+                cl: ConsistencyLevel,
+                strategy: &ReplicationStrategy,
+            ) -> Result<PartitionStream, String> {
+                assert_eq!(table, &ferrosa_storage::TableId::new("public", "kv"));
+                assert_eq!(key.key.as_bytes(), b"good");
+                assert_eq!(cl, crate::cluster_read::read_consistency().unwrap());
+                assert_eq!(strategy.replication_factor(), 1);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err("required replica unavailable".into())
+            }
+        }
+        let (_dir, mut ctx) = make_ctx().await;
+        let adapter = Arc::new(KeyRead {
+            calls: AtomicUsize::new(0),
+        });
+        let reader = adapter.clone();
+        ctx.cluster_read = crate::ClusterRead::live(move || Some(reader.clone()));
+        let mut session = Session::new(superuser());
+        let result = execute_simple(&ctx, &mut session, "SELECT v FROM kv WHERE k='good'").await;
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            1,
+            "must request key, not scan"
+        );
+        assert_eq!(error_sqlstate(&result).as_deref(), Some("58000"));
+        assert!(format!("{result:?}").contains("required replica unavailable"));
+    }
+
+    /// A catalog opened before the first MVCC touch must restore a subsequently
+    /// deleted key without enumerating historical keys or reading current data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_catalog_keeps_late_delete_before_image() {
+        use ferrosa_sql::Catalog;
+        let (_dir, ctx) = make_ctx().await;
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"good".to_vec()));
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "kv"),
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(0, ferrosa_common::CellValue::live(b"before".to_vec(), 9000))],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        9000,
+                    ),
+                },
+                9000,
+            )
+            .unwrap();
+        let snapshot = ctx.mvcc.snapshot();
+        let ferrosa_sql::Statement::Select(select) =
+            ferrosa_sql::parse_statement("SELECT * FROM kv WHERE k='good'").unwrap()
+        else {
+            panic!("select");
+        };
+        let (catalog, failure) = crate::query::load_catalog_with_mvcc(
+            &ctx.engine,
+            &ctx.schema,
+            &select,
+            "public",
+            Some(&ctx.mvcc),
+            Some(&snapshot),
+            None,
+            None,
+            Some((&[], &ctx.jsonb_limits)),
+        )
+        .await
+        .unwrap();
+        let mut writer = Session::new(superuser());
+        let deleted = execute_simple(&ctx, &mut writer, "DELETE FROM kv WHERE k='good'").await;
+        assert_eq!(error_sqlstate(&deleted), None, "{deleted:?}");
+        let table = catalog.resolve("public", "kv").unwrap();
+        let rows: Vec<_> = tokio::task::spawn_blocking(move || table.scan().collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(failure.take().is_none());
+        assert_eq!(
+            rows,
+            vec![ferrosa_sql::Row::new(vec![
+                ferrosa_sql::Value::Text("good".into()),
+                ferrosa_sql::Value::Text("before".into())
+            ])]
+        );
+        let mut own = Session::new(superuser());
+        execute_simple(&ctx, &mut own, "BEGIN").await;
+        execute_simple(&ctx, &mut own, "INSERT INTO kv (k,v) VALUES ('good','own')").await;
+        let visible = execute_simple(&ctx, &mut own, "SELECT v FROM kv WHERE k='good'").await;
+        assert_eq!(error_sqlstate(&visible), None);
+        assert!(visible
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { columns }
+            if columns == &vec![Some(b"own".to_vec())])));
+    }
+    /// SQL equates signed zero but Cassandra floating partition keys preserve
+    /// its sign bit. Such keys must retain the scan path to avoid a false miss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_float_signed_zero_keeps_sql_equality() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut meta = ctx
+            .schema
+            .snapshot()
+            .tables
+            .get(&("public".into(), "kv".into()))
+            .unwrap()
+            .clone();
+        meta.name = "float_keys".into();
+        meta.id = Uuid::new_v4();
+        meta.columns.get_mut("k").unwrap().column_type = "float".into();
+        ctx.schema.create_table(meta, &superuser()).unwrap();
+        let mut storage = kv_storage_schema();
+        storage.table = "float_keys".into();
+        storage.key_type = "org.apache.cassandra.db.marshal.FloatType".into();
+        ctx.engine.register_table(storage).unwrap();
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            (-0.0_f32).to_be_bytes().to_vec(),
+        ));
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "float_keys"),
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        ferrosa_common::CellValue::live(b"negative zero".to_vec(), 9000),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        9000,
+                    ),
+                },
+                9000,
+            )
+            .unwrap();
+        let mut reader = Session::new(superuser());
+        let result =
+            execute_simple(&ctx, &mut reader, "SELECT v FROM float_keys WHERE k=0.0").await;
+        assert_eq!(error_sqlstate(&result), None, "{result:?}");
+        assert!(
+            result
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { columns }
+            if columns == &vec![Some(b"negative zero".to_vec())])),
+            "SQL signed-zero equality lost a key: {result:?}"
+        );
+    }
 }
