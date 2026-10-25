@@ -212,3 +212,15 @@ See the benchmark report for current results, observed ranges and scope.
 Decoded storage rows consume their owned text/blob/numeric/JSON payloads during SQL conversion; identity/capacity and value/error parity tests prevent a clone from reappearing there. Physical decoding before MVCC row replacement and per-query execution/response overhead remain separate measured follow-ups.
 
 Cursor opening and first fetch now share a blocking job with separate early metadata publication; opening cancellation owns the existing stream drop guard before awaiting columns. Explicit gated regressions preserve liveness and prevent first-fetch queue interposition.
+
+
+### Point-read walk, step 3 (2026-10-25)
+
+The connection reuses one response buffer, flushing at Sync, simple-query completion,
+explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
+COPY flushes pending replies before its input handshake. Common scalar DataRows
+encode directly into that buffer; specialized codecs retain their checked fallback.
+A failed row rolls back its partial bytes while preserving earlier rows. Collecting
+ReplySink callers keep the existing message interface. Ownership/allocation tests,
+wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
+change. Runtime throughput is reported only after the staged Fly walk.

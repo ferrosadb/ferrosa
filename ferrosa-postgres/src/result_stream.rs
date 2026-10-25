@@ -52,10 +52,7 @@ use ferrosa_sql::{Catalog, Column, ColumnType, ExecError, Row, RowCursor, Select
 use tokio::task::JoinHandle;
 
 use crate::messages::BackendMessage;
-use crate::query::{
-    check_scan_failure, encode_data_row, encode_error_response, error_response,
-    exec_error_response, ReplySink,
-};
+use crate::query::{check_scan_failure, error_response, exec_error_response, ReplySink};
 use crate::storage_provider::ScanFailure;
 
 /// Rows one fetch pulls from the executor: the unit of work a blocking thread
@@ -426,33 +423,15 @@ impl ResultStream {
                 }
             }
             let take = room.min(self.buffered.len());
-            let (messages, encode_error) = self.encode_next(take, &types, formats);
-            sent += messages.len();
-            out.send(messages).await?;
+            let (count, encode_error) = out
+                .send_rows(self.buffered.drain(..take), &types, formats)
+                .await?;
+            sent += count;
             if let Some(error) = encode_error {
                 self.abandon();
                 return Ok(PumpEnd::Failed(error));
             }
         }
-    }
-
-    /// Encode the next `take` buffered rows, stopping at the first that cannot
-    /// be encoded. Rows before it are still returned so they reach the client
-    /// ahead of the error, as they would have from PostgreSQL.
-    fn encode_next(
-        &mut self,
-        take: usize,
-        types: &[ColumnType],
-        formats: &[i16],
-    ) -> (Vec<BackendMessage>, Option<BackendMessage>) {
-        let mut messages = Vec::with_capacity(take);
-        for row in self.buffered.drain(..take) {
-            match encode_data_row(&row, types, formats) {
-                Ok(message) => messages.push(message),
-                Err(error) => return (messages, Some(encode_error_response(&error))),
-            }
-        }
-        (messages, None)
     }
 
     /// Stop the executor. An in-flight fetch stops at its next row and drops

@@ -362,3 +362,15 @@ PostgreSQL 18.6 at 26,392 (92.0%) for 100k rows. The 5k follow-on fixture gives
 (28.6%; a 3.50× remaining read gap). These are two-run unprofiled means with full
 value validation; storage placement differs. Earlier revision rates are historical.
 See the benchmark report for current results, observed ranges and scope.
+
+
+### Point-read walk, step 3 (2026-10-25)
+
+The connection reuses one response buffer, flushing at Sync, simple-query completion,
+explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
+COPY flushes pending replies before its input handshake. Common scalar DataRows
+encode directly into that buffer; specialized codecs retain their checked fallback.
+A failed row rolls back its partial bytes while preserving earlier rows. Collecting
+ReplySink callers keep the existing message interface. Ownership/allocation tests,
+wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
+change. Runtime throughput is reported only after the staged Fly walk.

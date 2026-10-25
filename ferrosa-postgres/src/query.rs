@@ -1221,6 +1221,30 @@ fn value_type_name(value: &SqlValue) -> &'static str {
 pub(crate) trait ReplySink {
     /// Deliver `messages` in order. An error means the peer is gone.
     async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()>;
+
+    /// Deliver a bounded row batch. Collectors retain the legacy message API;
+    /// the socket overrides this to encode directly into its reusable buffer.
+    async fn send_rows<I: Iterator<Item = Row>>(
+        &mut self,
+        rows: I,
+        types: &[ColumnType],
+        formats: &[i16],
+    ) -> std::io::Result<(usize, Option<BackendMessage>)> {
+        let mut messages = Vec::new();
+        let mut error = None;
+        for row in rows {
+            match encode_data_row(&row, types, formats) {
+                Ok(message) => messages.push(message),
+                Err(failure) => {
+                    error = Some(encode_error_response(&failure));
+                    break;
+                }
+            }
+        }
+        let count = messages.len();
+        self.send(messages).await?;
+        Ok((count, error))
+    }
 }
 
 impl ReplySink for Vec<BackendMessage> {
@@ -1247,6 +1271,151 @@ pub(crate) fn encode_data_row(
         .map(|(i, v)| encode_value(result_format_for(result_formats, i), col_types[i], v))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BackendMessage::DataRow { columns })
+}
+
+/// Append one complete row, retaining prior output when encoding fails.
+pub(crate) fn encode_data_row_into(
+    row: &Row,
+    types: &[ColumnType],
+    formats: &[i16],
+    out: &mut bytes::BytesMut,
+) -> Result<(), EncodeError> {
+    use bytes::BufMut;
+    let start = out.len();
+    out.put_u8(b'D');
+    out.put_i32(0);
+    out.put_i16(row.0.len() as i16);
+    for (i, value) in row.0.iter().enumerate() {
+        let length_at = out.len();
+        out.put_i32(-1);
+        if value.is_null() {
+            continue;
+        }
+        let format = result_format_for(formats, i);
+        if let Err(error) = encode_scalar_into(value, types[i], format, out) {
+            out.truncate(start);
+            return Err(error);
+        }
+        let length = (out.len() - length_at - 4) as i32;
+        out[length_at..length_at + 4].copy_from_slice(&length.to_be_bytes());
+    }
+    let length = (out.len() - start - 1) as i32;
+    out[start + 1..start + 5].copy_from_slice(&length.to_be_bytes());
+    Ok(())
+}
+
+/// Common scalar values append directly; specialized codecs keep their existing
+/// checked encoders. The row wrapper rolls back any partial output on error.
+fn encode_scalar_into(
+    value: &SqlValue,
+    ty: ColumnType,
+    format: i16,
+    out: &mut bytes::BytesMut,
+) -> Result<(), EncodeError> {
+    use bytes::BufMut;
+    if format == 1 && ty == ColumnType::Numeric {
+        return Err(EncodeError::unsupported(
+            "binary result format for numeric is not implemented",
+        ));
+    }
+    match (value, format == 1) {
+        (SqlValue::Text(text), _) => out.extend_from_slice(text.as_bytes()),
+        (SqlValue::Bool(value), true) => out.put_u8(u8::from(*value)),
+        (SqlValue::Bool(value), false) => out.extend_from_slice(if *value { b"t" } else { b"f" }),
+        (SqlValue::Int(value), true) if ty == ColumnType::Int => {
+            let value = i32::try_from(*value)
+                .map_err(|_| format!("integer {value} is outside the PostgreSQL int4 range"))?;
+            out.put_i32(value);
+        }
+        (SqlValue::Int(value), true) => out.put_i64(*value),
+        (SqlValue::Int(value), false) => {
+            // fmt writes into BytesMut through a stack adapter, without a String.
+            struct Text<'a>(&'a mut bytes::BytesMut);
+            impl std::fmt::Write for Text<'_> {
+                fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                    self.0.extend_from_slice(value.as_bytes());
+                    Ok(())
+                }
+            }
+            use std::fmt::Write;
+            write!(Text(out), "{value}")
+                .map_err(|_| EncodeError::unsupported("integer formatting failed"))?;
+        }
+        (SqlValue::Bytea(bytes), true) => out.extend_from_slice(bytes),
+        (SqlValue::Float(value), true) => out.put_f64(value.0),
+        (SqlValue::Uuid(value), true) => out.extend_from_slice(value.as_bytes()),
+        _ => {
+            if let Some(bytes) = encode_value(format, ty, value)? {
+                out.extend_from_slice(&bytes);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod direct_row_tests {
+    use super::*;
+
+    #[test]
+    fn direct_scalar_row_reuses_output_without_allocations() {
+        let row = Row(vec![
+            SqlValue::Text("payload".repeat(12)),
+            SqlValue::Int(123),
+            SqlValue::Bool(true),
+            SqlValue::Null,
+        ]);
+        let types = [
+            ColumnType::Text,
+            ColumnType::Int,
+            ColumnType::Bool,
+            ColumnType::Text,
+        ];
+        for format in [0, 1] {
+            let mut out = bytes::BytesMut::with_capacity(1024);
+            let pointer = out.as_ptr();
+            let capacity = out.capacity();
+            for count in [1, 100, 10_000] {
+                let allocations = crate::mvcc::MvccManager::count_allocations_for_test(|| {
+                    for _ in 0..count {
+                        out.clear();
+                        encode_data_row_into(&row, &types, &[format], &mut out).unwrap();
+                    }
+                });
+                assert_eq!(allocations, 0, "format={format}, rows={count}");
+                assert_eq!(out.as_ptr(), pointer);
+                assert_eq!(out.capacity(), capacity);
+            }
+        }
+    }
+
+    #[test]
+    fn direct_row_matches_legacy_and_retains_prior_bytes_on_error() {
+        let cases = [
+            (SqlValue::Text("héllo".into()), ColumnType::Text),
+            (SqlValue::Int(7), ColumnType::Int),
+            (SqlValue::Bool(false), ColumnType::Bool),
+            (SqlValue::Null, ColumnType::Numeric),
+            (SqlValue::Bytea(vec![0, 255]), ColumnType::Bytea),
+            (SqlValue::Int(i64::MAX), ColumnType::Int),
+            (SqlValue::Int(42), ColumnType::Numeric),
+        ];
+        for (value, ty) in cases {
+            for format in [0, 1] {
+                let row = Row(vec![SqlValue::Text("first".into()), value.clone()]);
+                let types = [ColumnType::Text, ty];
+                let mut expected = bytes::BytesMut::from(&b"prior"[..]);
+                let legacy = encode_data_row(&row, &types, &[format]);
+                if let Ok(message) = &legacy {
+                    message.encode(&mut expected);
+                }
+                let mut actual = bytes::BytesMut::from(&b"prior"[..]);
+                let result = encode_data_row_into(&row, &types, &[format], &mut actual);
+                assert_eq!(result.as_ref().err(), legacy.as_ref().err());
+                assert_eq!(actual, expected);
+            }
+        }
+    }
 }
 
 /// Every statement that is not a table `SELECT`: bounded replies, returned whole.

@@ -347,6 +347,7 @@ where
     St: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = Session::new(auth);
+    let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
     let idle_timeout = ctx.portals.limits().idle_timeout;
     loop {
         match codec::read_frontend(frames) {
@@ -367,6 +368,7 @@ where
                         if let Ok(ferrosa_sql::Statement::CopyFromStdin(copy)) =
                             ferrosa_sql::parse_statement(sql)
                         {
+                            flush_output(stream, &mut output).await?;
                             crate::copy_stdin::drive(
                                 stream,
                                 frames,
@@ -380,8 +382,13 @@ where
                         }
                     }
                 }
-                if handle_frontend(stream, ctx, &mut session, msg).await? {
+                let flush = matches!(&msg, FrontendMessage::Query(_) | FrontendMessage::Sync)
+                    || matches!(&msg, FrontendMessage::Unknown { tag: b'H', body } if body.is_empty());
+                if handle_frontend_buffered(stream, ctx, &mut session, msg, &mut output).await? {
                     return Ok(()); // Terminate
+                }
+                if flush || output.len() >= RESPONSE_BUFFER_BYTES {
+                    flush_output(stream, &mut output).await?;
                 }
             }
             Ok(None) => {
@@ -409,6 +416,7 @@ where
             }
             Err(e) => {
                 // Fail loud on a protocol violation, then close.
+                flush_output(stream, &mut output).await?;
                 if let Err(write_error) =
                     write_fatal(stream, codec_sqlstate(&e), &e.to_string()).await
                 {
@@ -426,11 +434,12 @@ where
 /// Extended-protocol error skipping: while `session.is_error_pending()`, every
 /// message except `Sync` is ignored (Postgres semantics — the backend discards
 /// messages until the next Sync after an error).
-async fn handle_frontend<St>(
+async fn handle_frontend_buffered<St>(
     stream: &mut St,
     ctx: &QueryContext,
     session: &mut Session,
     msg: FrontendMessage,
+    out: &mut BytesMut,
 ) -> std::io::Result<bool>
 where
     St: AsyncRead + AsyncWrite + Unpin,
@@ -440,23 +449,29 @@ where
         return Ok(false);
     }
 
-    let mut out = BytesMut::new();
     match msg {
         FrontendMessage::Query(sql) => {
-            let msgs = execute_simple_to(ctx, session, &sql, &mut SocketSink(&mut *stream)).await?;
+            let msgs = execute_simple_to(
+                ctx,
+                session,
+                &sql,
+                &mut SocketSink {
+                    stream: &mut *stream,
+                    output: out,
+                },
+            )
+            .await?;
             for m in &msgs {
-                m.encode(&mut out);
+                m.encode(out);
             }
-            BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
+            BackendMessage::ReadyForQuery(session.txn_status()).encode(out);
         }
         FrontendMessage::Parse {
             stmt_name,
             query,
             param_types,
         } => {
-            session
-                .on_parse(stmt_name, &query, param_types)
-                .encode(&mut out);
+            session.on_parse(stmt_name, &query, param_types).encode(out);
         }
         FrontendMessage::Bind {
             portal,
@@ -474,11 +489,11 @@ where
                     result_formats,
                     &ctx.jsonb_limits,
                 )
-                .encode(&mut out);
+                .encode(out);
         }
         FrontendMessage::Describe { kind, name } => {
             for m in describe(ctx, session, kind, &name).await {
-                m.encode(&mut out);
+                m.encode(out);
             }
         }
         FrontendMessage::Execute { portal, max_rows } => {
@@ -486,8 +501,7 @@ where
             // a standalone node. Do not commit each Execute independently.
             if !session.in_txn() {
                 if let Err(error) = begin_implicit_transaction(ctx, session).await {
-                    session.fail(error).encode(&mut out);
-                    stream.write_all(&out).await?;
+                    session.fail(error).encode(out);
                     return Ok(false);
                 }
                 session.mark_extended_implicit();
@@ -497,18 +511,21 @@ where
                 session,
                 &portal,
                 max_rows,
-                &mut SocketSink(&mut *stream),
+                &mut SocketSink {
+                    stream: &mut *stream,
+                    output: out,
+                },
             )
             .await?;
             for m in &tail {
-                m.encode(&mut out);
+                m.encode(out);
             }
         }
         FrontendMessage::Close { kind, name } => {
-            session.on_close(kind, &name).encode(&mut out);
+            session.on_close(kind, &name).encode(out);
         }
         FrontendMessage::Sync => {
-            finish_extended_pipeline(ctx, session, &mut out).await;
+            finish_extended_pipeline(ctx, session, out).await;
         }
         FrontendMessage::Terminate => return Ok(true),
         // COPY data with no COPY in progress. The wire layer understands these frames so a COPY
@@ -519,16 +536,26 @@ where
         | FrontendMessage::CopyDone
         | FrontendMessage::CopyFail { .. } => {
             crate::query::error_response("08P01", "COPY data received outside a COPY operation")
-                .encode(&mut out);
+                .encode(out);
         }
         // SASL after auth, or any other unexpected message: ignore.
         FrontendMessage::SaslResponse { .. } | FrontendMessage::Unknown { .. } => {}
     }
 
-    if !out.is_empty() {
-        stream.write_all(&out).await?;
-    }
     Ok(false)
+}
+
+#[cfg(test)]
+async fn handle_frontend<St: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut St,
+    ctx: &QueryContext,
+    session: &mut Session,
+    msg: FrontendMessage,
+) -> std::io::Result<bool> {
+    let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
+    let end = handle_frontend_buffered(stream, ctx, session, msg, &mut output).await?;
+    flush_output(stream, &mut output).await?;
+    Ok(end)
 }
 
 /// Finish the implicit extended-protocol group before ReadyForQuery.
@@ -580,17 +607,56 @@ async fn begin_implicit_transaction(
     Ok(())
 }
 
-/// Writes each batch of messages to the socket as it is produced, so a streaming
-/// `SELECT` never gathers its rows.
-struct SocketSink<'a, St>(&'a mut St);
+/// Flush at protocol boundaries and in bounded chunks during streaming.
+const RESPONSE_BUFFER_BYTES: usize = 8192;
+
+async fn flush_output<St: AsyncWrite + Unpin>(
+    stream: &mut St,
+    output: &mut BytesMut,
+) -> std::io::Result<()> {
+    if !output.is_empty() {
+        stream.write_all(output).await?;
+        output.clear();
+    }
+    Ok(())
+}
+
+/// Encodes directly into a reusable connection buffer; never gathers a result.
+struct SocketSink<'a, St> {
+    stream: &'a mut St,
+    output: &'a mut BytesMut,
+}
 
 impl<St: AsyncWrite + Unpin> ReplySink for SocketSink<'_, St> {
     async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
-        let mut buf = BytesMut::new();
         for message in &messages {
-            message.encode(&mut buf);
+            message.encode(self.output);
+            if self.output.len() >= RESPONSE_BUFFER_BYTES {
+                flush_output(self.stream, self.output).await?;
+            }
         }
-        self.0.write_all(&buf).await
+        Ok(())
+    }
+
+    async fn send_rows<I: Iterator<Item = ferrosa_sql::Row>>(
+        &mut self,
+        rows: I,
+        types: &[ferrosa_sql::ColumnType],
+        formats: &[i16],
+    ) -> std::io::Result<(usize, Option<BackendMessage>)> {
+        let mut count = 0;
+        for row in rows {
+            let result = query::encode_data_row_into(&row, types, formats, self.output);
+            drop(row);
+            if let Err(error) = result {
+                return Ok((count, Some(query::encode_error_response(&error))));
+            }
+            count += 1;
+            if self.output.len() >= RESPONSE_BUFFER_BYTES {
+                flush_output(self.stream, self.output).await?;
+            }
+        }
+        Ok((count, None))
     }
 }
 
@@ -4649,6 +4715,156 @@ pub(crate) mod txn_atomicity_tests {
             "the row before the marker must land on COMMIT"
         );
     }
+    #[derive(Default)]
+    struct RecordedWire {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncRead for RecordedWire {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for RecordedWire {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_point_reply_is_batched_at_sync() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let mut frames = BytesMut::new();
+        frames.extend_from_slice(&pg_frame(
+            b'P',
+            b"\0SELECT v FROM kv WHERE k = 'good'\0\0\0",
+        ));
+        frames.extend_from_slice(&pg_frame(b'B', &[0; 8]));
+        frames.extend_from_slice(&pg_frame(b'D', b"P\0"));
+        frames.extend_from_slice(&pg_frame(b'E', &[0; 5]));
+        frames.extend_from_slice(&pg_frame(b'S', &[]));
+        frames.extend_from_slice(&pg_frame(b'X', &[]));
+        let mut wire = RecordedWire::default();
+        query_loop(&mut wire, &mut frames, &ctx, superuser(), &mut [0; 4096])
+            .await
+            .unwrap();
+        let mut tags = Vec::new();
+        let mut rest = wire.bytes.as_slice();
+        while !rest.is_empty() {
+            tags.push(rest[0]);
+            let len = i32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+            if rest[0] == b'D' {
+                assert_eq!(&rest[11..1 + len], b"expected");
+            }
+            rest = &rest[1 + len..];
+        }
+        assert_eq!(tags, b"12TDCZ");
+        assert_eq!(
+            wire.writes, 1,
+            "all replies for the bounded point read flush at Sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_flush_delivers_parse_and_pending_error_before_sync() {
+        let (_dir, ctx) = make_ctx().await;
+        for query in ["SELECT 1", "SELECT FROM"] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let mut frames = BytesMut::new();
+            let mut parse = vec![0];
+            parse.extend_from_slice(query.as_bytes());
+            parse.extend_from_slice(&[0, 0, 0]);
+            frames.extend_from_slice(&pg_frame(b'P', &parse));
+            frames.extend_from_slice(&pg_frame(b'H', &[]));
+            let serving = async {
+                query_loop(&mut server, &mut frames, &ctx, superuser(), &mut [0; 1024])
+                    .await
+                    .unwrap();
+            };
+            let receiving = async {
+                let mut response = [0; 5];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.read_exact(&mut response),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response[0], if query == "SELECT 1" { b'1' } else { b'E' });
+                client.write_all(&pg_frame(b'S', &[])).await.unwrap();
+                client.write_all(&pg_frame(b'X', &[])).await.unwrap();
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(serving, receiving);
+            })
+            .await
+            .expect("wire fixture completes");
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_sink_streams_bounded_rows_and_preserves_error_prefix() {
+        use ferrosa_sql::{ColumnType, Row, Value};
+        let mut wire = RecordedWire::default();
+        let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
+        let rows = (0..100).map(|_| Row(vec![Value::Text("x".repeat(1024))]));
+        let mut sink = SocketSink {
+            stream: &mut wire,
+            output: &mut output,
+        };
+        assert_eq!(
+            sink.send_rows(rows, &[ColumnType::Text], &[0])
+                .await
+                .unwrap(),
+            (100, None)
+        );
+        assert!(sink.stream.writes > 1);
+        assert!(sink.output.len() < RESPONSE_BUFFER_BYTES);
+        let prefix = sink.output.clone();
+        let (sent, error) = sink
+            .send_rows(
+                std::iter::once(Row(vec![
+                    Value::Text("partial".into()),
+                    Value::Int(i64::MAX),
+                ])),
+                &[ColumnType::Text, ColumnType::Int],
+                &[1],
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent, 0);
+        assert!(error.is_some());
+        assert_eq!(sink.output.as_ref(), prefix.as_ref());
+        flush_output(sink.stream, sink.output).await.unwrap();
+        assert_eq!(
+            wire.bytes.iter().filter(|b| **b == b'x').count(),
+            100 * 1024
+        );
+    }
+
     /// A keyed SELECT must not decode unrelated partitions. The deliberately
     /// corrupt UTF-8 value is readable only through a scan, never through k=good.
     async fn point_lookup_fixture() -> (tempfile::TempDir, QueryContext) {

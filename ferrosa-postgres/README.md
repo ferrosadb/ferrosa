@@ -788,3 +788,15 @@ PostgreSQL 18.6 at 26,392 (92.0%) with 100k rows. The 5k follow-on fixture reach
 two unprofiled runs with 8 workers, 96-byte payloads and full value validation;
 storage placement differs. Earlier revision comparisons are historical;
 see [current results, ranges and scope](../deploy/fly-bench/pipeline/RESULTS.md).
+
+
+### Point-read walk, step 3 (2026-10-25)
+
+The connection reuses one response buffer, flushing at Sync, simple-query completion,
+explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
+COPY flushes pending replies before its input handshake. Common scalar DataRows
+encode directly into that buffer; specialized codecs retain their checked fallback.
+A failed row rolls back its partial bytes while preserving earlier rows. Collecting
+ReplySink callers keep the existing message interface. Ownership/allocation tests,
+wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
+change. Runtime throughput is reported only after the staged Fly walk.
