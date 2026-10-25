@@ -4719,7 +4719,7 @@ pub(crate) mod txn_atomicity_tests {
         let mut reader = Session::new(superuser());
         reader.on_parse(
             "point".into(),
-            "SELECT v FROM kv WHERE k = $1".into(),
+            "SELECT v FROM kv WHERE k = $1",
             vec![25],
         );
         reader.on_bind(
