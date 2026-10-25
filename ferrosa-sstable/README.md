@@ -624,3 +624,7 @@ payload checks. This prevents metadata seeks from multiplying full-window I/O.
 Published cell bytes are shared across row copies. Readers recover only unique
 scratch capacity; retained older payloads remain immutable. Memory estimates
 charge the full retained backing and a conservative shared-owner allowance.
+
+Reusable cursor allocation guards count only the decoder thread. A controlled
+foreign-thread allocation verifies attribution; the existing allocation bound
+and byte/corruption assertions are retained.
