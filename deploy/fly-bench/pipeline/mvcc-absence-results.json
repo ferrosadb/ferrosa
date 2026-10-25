@@ -304,5 +304,28 @@
     "native5k controls ran later with matching 100k-to-5k sequence",
     "profile RSS increased despite fewer allocations; no heap allocation totals inferred from RSS",
     "raw profiles and machine evidence retained privately"
-  ]
+  ],
+  "read_summary_5000": {
+    "ferrosa_ops_per_s": {
+      "runs": [
+        2874.411334930652,
+        2753.8475880710953
+      ],
+      "mean": 2814.1294615008737,
+      "min": 2753.8475880710953,
+      "max": 2874.411334930652
+    },
+    "postgres_ops_per_s": {
+      "runs": [
+        9708.865823159349,
+        10001.507727288712
+      ],
+      "mean": 9855.18677522403,
+      "min": 9708.865823159349,
+      "max": 10001.507727288712
+    },
+    "ferrosa_fraction_postgres": 0.28554805968524144,
+    "postgres_over_ferrosa": 3.502037454228532,
+    "scope": "400 seeded point reads with 8 warmed workers after a 100k fixture then a 5k fixture; 2 unprofiled repetitions per system; all values validated"
+  }
 }

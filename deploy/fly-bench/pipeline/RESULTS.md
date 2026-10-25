@@ -1,5 +1,40 @@
 # Measured pipeline changes
 
+## Current results — 2026-10-25
+
+Latest measured Ferrosa runtime: `15d9e7f0e6991301d304fbf0034877b9cd514d76`.
+Native comparison: PostgreSQL 18.6. These are means of two unprofiled runs per
+system, with full key/value/count validation. Eight workers, 96-byte payloads
+and 400 seeded point reads; the 5k fixture follows a 100k workload in the same
+process.
+
+| Current operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL | Remaining gap |
+| --- | ---: | ---: | ---: | --- |
+| INSERT, 100k rows, rows/s | **24,275** | 26,392 | **92.0%** | PostgreSQL 1.09× faster |
+| INSERT, 5k follow-on, rows/s | **22,842** | 24,900 | **91.7%** | PostgreSQL 1.09× faster |
+| Point reads, 5k follow-on, ops/s | **2,814** | 9,855 | **28.6%** | PostgreSQL **3.50× faster** |
+
+INSERT is within roughly 8% of PostgreSQL in these workloads. Point reads remain
+the main measured PostgreSQL gap. Older intermediate-revision measurements
+are retained below as history.
+
+The latest INSERT change improved the paired 100k rate from 17,138 to 24,275
+rows/s (+41.6%). The 5k before/after ranges overlap, so its smaller mean change
+does not establish a speedup. Sampled peak RSS rose from 455 to 503 MiB despite
+fewer allocations. Two runs do not establish statistical significance. Both
+servers use the same 2-performance-CPU/4-GiB class and region; Ferrosa uses an
+attached volume and PostgreSQL its root filesystem, so storage is not identical.
+
+Neo4j: **no current matched Ferrosa-versus-Neo4j result is established here**.
+The older Bolt numbers below are Ferrosa revision comparisons. Different older
+native Neo4j workloads cannot establish the current product gap.
+
+Source values/ranges: [latest INSERT and point-read results](mvcc-absence-results.json).
+The sections below preserve the measured journey at their named revisions;
+their before/after rates are **historical**, not current comparison-product results.
+
+## Historical measurements
+
 These are descriptive means of two unprofiled repetitions per arm on one Fly
 LAX performance VM with 2 CPUs and 4 GiB RAM, using the same attached data
 volume, native x86-64 builds and a separate client. No significance or general
@@ -34,10 +69,9 @@ and [history-guard-results.json](history-guard-results.json).
 
 Separately sampled write stacks implicated history pruning: approximately 83%
 of user CPU samples before the guard versus 28% afterwards. Profiling overhead
-prevents using those legs for throughput. The guard still leaves a global MVCC
-critical section and traversal of unrelated history. A persistent-root MVCC
-replacement needs its own controlled comparison; the table above does not
-measure that replacement.
+prevents using those legs for throughput. At that revision, the guard left a
+global MVCC critical section and traversal of unrelated history. The persistent-root MVCC
+replacement and its later comparisons are recorded below.
 
 Local System-allocator probes also showed a tradeoff: shared cell payloads
 reduced requested allocation bytes by 20.4% with four observers, while increasing
@@ -91,7 +125,7 @@ extended to accept D. Every 5,000-row keyset/value/count check passed.
 
 These are means of two unprofiled repetitions, with raw run values/ranges in
 [point-read-results.json](point-read-results.json). Reads improved 89.5 times;
-a 3.19× gap to native PostgreSQL remains. INSERT throughput is effectively
+the remaining gap at that revision was 3.19×. INSERT throughput is effectively
 unchanged within these run ranges. The key-read tests require the exact storage
 operation and preserve late-delete snapshots, staged inserts, cluster failures
 and floating signed-zero SQL equality. Allocation testing separately measured
@@ -105,9 +139,9 @@ Separate read CPU profiles used a freshly seeded fixture in the same process
 and validated it after 30 seconds of reads. The candidate has 447 user CPU
 samples: allocator frames appear on 49 stacks (11.0% inclusive); libc leaves
 remain unattributed. No dominant CPU-spin hotspot was identified. Blocked
-mutex/request time is not measured by a CPU flame graph, so the remaining
-3.19× read gap still needs request/handoff/off-CPU tracing. Raw profiles and
-resource counters are retained in the private evidence.
+mutex/request time is not measured by a CPU flame graph. Those profiles do
+not establish request/handoff/off-CPU timing; the latest read gap is above. Raw
+profiles and resource counters are retained in the private evidence.
 
 ## Payload-label correction (2026-10-25)
 

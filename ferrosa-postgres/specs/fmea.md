@@ -202,6 +202,9 @@ and replication strategy; failures propagate without a local fallback. Joins,
 compound/clustering keys, floating/decimal keys and other unproved key families
 retain scans. Floating signed zero cannot use byte-key equality because SQL
 equates both signs. Selective-decode, recording-reader and snapshot tests cover
-this path. The two-repeat Fly comparison measured point reads at 33.3→2,981.3 ops/s
-versus PostgreSQL 9,497.8 ops/s, with all 5,000 rows validated; the combined
-candidate and native-comparison limits are recorded in the benchmark report.
+this path. Latest measured runtime `15d9e7f0e` delivers 24,275 INSERT rows/s versus
+PostgreSQL 18.6 at 26,392 (92.0%) for 100k rows. The 5k follow-on fixture gives
+22,842 versus 24,900 INSERT rows/s (91.7%) and 2,814 versus 9,855 point reads/s
+(28.6%; a 3.50× remaining read gap). These are two-run unprofiled means with full
+value validation; storage placement differs. Earlier revision rates are historical.
+See the benchmark report for current results, observed ranges and scope.
