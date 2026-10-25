@@ -38,7 +38,7 @@ sequenceDiagram
     Eng-->>SP: Partition*
     SP->>RB: partition_to_rows_with_storage_mapping
     RB-->>SP: one partition's decoded rows
-    SP->>SP: bounded channel (64 rows) + sparse MVCC overlay
+    SP->>SP: bounded channel (64 rows) + live MVCC root + emitted keys
     SP-->>Q: MapCatalog (re-scannable streaming provider)
     Q->>RS: open_stream(select, catalog, params)
     RS->>SQL: execute_streaming(.., ChannelSink)

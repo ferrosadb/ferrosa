@@ -7,15 +7,20 @@
 //! environment settings log and use defaults. There is deliberately NO bound on
 //! a transaction's write count: the front end's write-set SPILLS to disk (see
 //! `txn_write_set`), so the retired `FERROSA_POSTGRES_MAX_TXN_WRITES` knob is gone.
-//! Last revised: 2026-10-10
-//! Last changed: Removed the vestigial `FERROSA_POSTGRES_MAX_TXN_WRITES` knob.
+//! Last revised: 2026-10-24
+//! Last changed: Persistent snapshot roots with per-scope apply reservations.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::env;
 use std::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+
+use arc_swap::ArcSwap;
+use imbl::{HashMap as PersistentMap, HashSet as PersistentSet, OrdMap};
 use std::time::{Duration, Instant};
 
 use ferrosa_common::accord::{Timestamp, TxnId};
@@ -76,8 +81,8 @@ impl MvccProfile {
 
 /// Resident byte accounting for the two MVCC history maps, plus the entry
 /// counts needed to read the numbers as a per-key cost. The byte figure is a
-/// deterministic ESTIMATE of the payload + per-node overhead (not an allocator
-/// probe): it is meant to compare before/after and to separate MVCC history
+/// deterministic ESTIMATE of row payloads and logical key bytes (not HAMT
+/// structural overhead or an allocator probe): it is meant to compare before/after and to separate MVCC history
 /// residency from the rest of the process, not to be byte-exact.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct MvccHistoryStats {
@@ -244,35 +249,97 @@ pub(crate) struct RowChange {
     pub after: Option<Row>,
 }
 
-#[derive(Clone, Copy)]
+// Immutable HAMT paths and row payloads are structurally shared. A snapshot
+// owns its root through the registry; expiry drops ownership without a sweep.
+type SharedRow = Arc<Option<Row>>;
+type TableRows<V> = PersistentMap<String, PersistentMap<Arc<Vec<Value>>, V>>;
+type LocalRows = TableRows<LocalVersion>;
+type ClusterRows = TableRows<OrdMap<Timestamp, SharedRow>>;
+
+#[derive(Clone)]
+struct LocalVersion {
+    seq: u64,
+    row: SharedRow,
+}
+#[derive(Clone)]
 struct ActiveSnapshot {
-    read_ts: u64,
     cluster_ts: Option<Timestamp>,
     started_at: Instant,
+    local: LocalRows,
+    cluster: ClusterRows,
+    reads: PersistentSet<RowKey>,
 }
-
-#[derive(Default)]
+#[derive(Clone)]
+struct Reservation {
+    writes: PersistentSet<RowKey>,
+    reads: PersistentSet<RowKey>,
+    tables: HashSet<String>,
+}
+#[derive(Clone, Default)]
 struct State {
     commit_seq: u64,
     next_snapshot_id: u64,
-    active_snapshots: HashMap<u64, ActiveSnapshot>,
-    versions: HashMap<RowKey, BTreeMap<u64, Option<Row>>>,
-    distributed_versions: HashMap<RowKey, BTreeMap<Timestamp, Option<Row>>>,
-    /// Rows read BY KEY by each live snapshot. A point read is judged by the row
-    /// it named, never by table identity (RT-2). Entries are pruned with the
-    /// snapshot they belong to, in [`prune_versions`].
-    read_rows: HashMap<u64, HashSet<RowKey>>,
-    applied_accord_txns: HashSet<(TxnId, Timestamp)>,
-    table_epochs: HashMap<String, u64>,
+    active_snapshots: PersistentMap<u64, ActiveSnapshot>,
+    local: LocalRows,
+    cluster: ClusterRows,
+    cluster_applied: TableRows<Timestamp>,
+    keys: TableRows<()>,
+    reservations: PersistentMap<u64, Reservation>,
+    applied_accord_txns: PersistentSet<(TxnId, Timestamp)>,
+    table_epochs: PersistentMap<String, u64>,
 }
 
-/// Shared PostgreSQL version history. History stores only rows changed through
-/// PostgreSQL; CQL mutations remain on their existing Accord path.
+/// Atomic persistent metadata publication. Physical storage/WAL work remains
+/// external, with no metadata mutex or global pending owner held across it.
 pub struct MvccManager {
-    state: Arc<Mutex<State>>,
-    commit_gate: Arc<tokio::sync::Mutex<()>>,
+    state: Arc<ArcSwap<State>>,
+    next_reservation: AtomicU64,
     config: MvccConfig,
     profile: Arc<MvccProfile>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_CAS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static AFTER_LIVENESS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static CAS_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Retry pure metadata only. Never invoke storage or a user callback here.
+fn update<R>(state: &ArcSwap<State>, f: impl Fn(&mut State) -> R) -> R {
+    loop {
+        let old = state.load_full();
+        let mut next = (*old).clone();
+        let result = f(&mut next);
+        #[cfg(test)]
+        {
+            let hook = BEFORE_CAS.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let previous = state.compare_and_swap(&old, Arc::new(next));
+        if Arc::ptr_eq(&old, &previous) {
+            return result;
+        }
+        #[cfg(test)]
+        CAS_RETRIES.with(|retries| retries.set(retries.get() + 1));
+    }
+}
+
+struct ApplyReservation<'a> {
+    manager: &'a MvccManager,
+    id: u64,
+    armed: bool,
+}
+impl Drop for ApplyReservation<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            update(&self.manager.state, |state| {
+                state.reservations.remove(&self.id);
+            });
+        }
+    }
 }
 
 impl Default for MvccManager {
@@ -297,16 +364,15 @@ impl MvccSnapshot {
 
 struct SnapshotLease {
     id: u64,
-    state: Weak<Mutex<State>>,
+    state: Weak<ArcSwap<State>>,
 }
 
 impl Drop for SnapshotLease {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
-            if let Ok(mut state) = state.lock() {
+            update(&state, |state| {
                 state.active_snapshots.remove(&self.id);
-                prune_versions(&mut state);
-            }
+            });
         }
     }
 }
@@ -320,8 +386,8 @@ impl MvccManager {
 
     fn with_config(config: MvccConfig) -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::default())),
-            commit_gate: Arc::new(tokio::sync::Mutex::new(())),
+            state: Arc::new(ArcSwap::from_pointee(State::default())),
+            next_reservation: AtomicU64::new(1),
             config,
             profile: Arc::new(MvccProfile::from_env()),
         }
@@ -331,7 +397,7 @@ impl MvccManager {
     /// both version maps. Used to attribute the resident term of a large commit
     /// and to prove the size bound holds.
     pub(crate) fn history_stats(&self) -> MvccHistoryStats {
-        let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        let state = self.state.load();
         history_stats(&state)
     }
 
@@ -393,17 +459,21 @@ impl MvccManager {
     }
 
     fn expire_snapshots_before(&self, now: Instant) -> usize {
-        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        let max_age = self.config.max_snapshot_age;
-        let before = state.active_snapshots.len();
-        state
-            .active_snapshots
-            .retain(|_, snapshot| now.saturating_duration_since(snapshot.started_at) < max_age);
-        let expired = before - state.active_snapshots.len();
-        if expired > 0 {
-            prune_versions(&mut state);
-        }
-        expired
+        update(&self.state, |state| {
+            let expired: Vec<_> = state
+                .active_snapshots
+                .iter()
+                .filter(|(_, snapshot)| {
+                    now.saturating_duration_since(snapshot.started_at)
+                        >= self.config.max_snapshot_age
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &expired {
+                state.active_snapshots.remove(id);
+            }
+            expired.len()
+        })
     }
 
     #[cfg(test)]
@@ -411,12 +481,6 @@ impl MvccManager {
         self.expire_snapshots_before(
             Instant::now() + self.config.max_snapshot_age + Duration::from_millis(1),
         )
-    }
-
-    /// Serialize PostgreSQL commit orchestration on this node while a
-    /// distributed commit is in flight. Accord supplies the cross-node order.
-    pub(crate) async fn commit_guard(&self) -> tokio::sync::OwnedMutexGuard<()> {
-        self.commit_gate.clone().lock_owned().await
     }
 
     pub(crate) fn snapshot(&self) -> MvccSnapshot {
@@ -428,18 +492,21 @@ impl MvccManager {
     }
 
     fn snapshot_at(&self, cluster_ts: Option<Timestamp>) -> MvccSnapshot {
-        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        state.next_snapshot_id = state.next_snapshot_id.wrapping_add(1).max(1);
-        let id = state.next_snapshot_id;
-        let read_ts = state.commit_seq;
-        state.active_snapshots.insert(
-            id,
-            ActiveSnapshot {
-                read_ts,
-                cluster_ts,
-                started_at: Instant::now(),
-            },
-        );
+        let (id, read_ts) = update(&self.state, |state| {
+            state.next_snapshot_id = state.next_snapshot_id.wrapping_add(1).max(1);
+            let id = state.next_snapshot_id;
+            state.active_snapshots.insert(
+                id,
+                ActiveSnapshot {
+                    cluster_ts,
+                    started_at: Instant::now(),
+                    local: state.local.clone(),
+                    cluster: state.cluster.clone(),
+                    reads: PersistentSet::new(),
+                },
+            );
+            (id, state.commit_seq)
+        });
         MvccSnapshot {
             id,
             read_ts,
@@ -452,10 +519,7 @@ impl MvccManager {
     }
 
     pub(crate) fn current_commit_seq(&self) -> u64 {
-        self.state
-            .lock()
-            .expect("PostgreSQL MVCC state poisoned")
-            .commit_seq
+        self.state.load().commit_seq
     }
 
     pub(crate) fn validate_commit(
@@ -463,7 +527,7 @@ impl MvccManager {
         snapshot: &MvccSnapshot,
         read_tables: &HashSet<String>,
     ) -> Result<(), MvccCommitError> {
-        let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
+        let state = self.state.load();
         validate_snapshot(&state, snapshot, read_tables)
     }
 
@@ -472,8 +536,25 @@ impl MvccManager {
     /// conflict is a COMMIT-time decision, and must not abort a later read on a
     /// still-valid snapshot (which must keep reading from its BEGIN snapshot).
     pub(crate) fn snapshot_is_active(&self, snapshot: &MvccSnapshot) -> bool {
-        let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        state.active_snapshots.contains_key(&snapshot.id)
+        let state = self.state.load();
+        let active = state.active_snapshots.contains_key(&snapshot.id);
+        #[cfg(test)]
+        {
+            let hook = AFTER_LIVENESS.with(|slot| slot.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        active
+    }
+
+    #[cfg(test)]
+    pub(crate) fn expire_after_liveness_for_test(manager: Arc<Self>) {
+        AFTER_LIVENESS.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                manager.expire_all_snapshots_for_test();
+            }))
+        });
     }
 
     /// Record a row read BY KEY under `snapshot`, so commit judges that read at
@@ -482,115 +563,145 @@ impl MvccManager {
     /// entry would be pruned anyway. Called only for an exact-key point read on
     /// a table's partition key (see `server::track_select_reads`).
     pub(crate) fn record_point_read(&self, snapshot: &MvccSnapshot, row: RowKey) {
-        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        if state.active_snapshots.contains_key(&snapshot.id) {
-            state.read_rows.entry(snapshot.id).or_default().insert(row);
+        update(&self.state, |state| {
+            if let Some(active) = state.active_snapshots.get_mut(&snapshot.id) {
+                active.reads.insert(row.clone());
+            }
+        });
+    }
+
+    pub(crate) fn table_view(&self, snapshot: &MvccSnapshot, table: &str) -> MvccTableView {
+        MvccTableView {
+            state: self.state.clone(),
+            snapshot: snapshot.clone(),
+            table: table.to_owned(),
         }
     }
 
-    /// Returns the versioned rows for one table at a snapshot. The storage scan
-    /// uses this sparse overlay to replace changed rows and restore deleted rows
-    /// without copying the table into each transaction.
+    /// Value-assertion convenience over the real production view iterator.
+    #[cfg(test)]
     pub(crate) fn table_overlay(
         &self,
         snapshot: &MvccSnapshot,
         table: &str,
-    ) -> HashMap<Vec<Value>, Option<Row>> {
-        let state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        // Pre-size the returned overlay to the exact number of changed keys for
-        // this table, so its backing table is allocated ONCE instead of growing
-        // (and reallocating/rehashing) as keys are inserted. The overlay stays
-        // sparse — bounded by MVCC-changed keys, never by table size. The
-        // per-key `row.clone()` transfers a versioned row out of the shared
-        // state under the lock; a sparse overlay of that many owned Rows is the
-        // contract and is not a table-scale copy.
-        if let Some(cluster_ts) = snapshot.cluster_ts {
-            let mut overlay = HashMap::with_capacity(
-                state
-                    .distributed_versions
-                    .keys()
-                    .filter(|key| key.table == table)
-                    .count(),
-            );
-            for (key, versions) in &state.distributed_versions {
-                if key.table != table {
-                    continue;
-                }
-                if let Some((_, row)) = versions.range(..=cluster_ts).next_back() {
-                    overlay.insert(key.key.clone(), row.clone());
-                }
-            }
-            return overlay;
-        }
-        let mut overlay = HashMap::with_capacity(
-            state
-                .versions
-                .keys()
-                .filter(|key| key.table == table)
-                .count(),
-        );
-        for (key, versions) in &state.versions {
-            if key.table != table {
-                continue;
-            }
-            if let Some((_, row)) = versions.range(..=snapshot.read_ts).next_back() {
-                overlay.insert(key.key.clone(), row.clone());
-            }
-        }
-        overlay
+    ) -> Result<HashMap<Vec<Value>, Option<Row>>, MvccCommitError> {
+        self.table_view(snapshot, table)
+            .rows()?
+            .map(|image| {
+                let (key, row) = image?;
+                Ok(((*key).clone(), (*row).clone()))
+            })
+            .collect()
     }
 
-    /// Applies a PostgreSQL commit while holding the PG commit-order lock.
-    /// Table-level read validation conservatively catches both row conflicts
-    /// and predicate phantoms. `apply` must make the write batch atomic.
+    /// Reserve scopes and publish before-images before the single storage effect.
     pub(crate) fn commit(
         &self,
         snapshot: &MvccSnapshot,
         read_tables: &HashSet<String>,
-        apply: impl FnOnce() -> Result<Vec<RowChange>, ferrosa_common::Error>,
+        changes: Vec<RowChange>,
+        apply: impl FnOnce() -> Result<(), ferrosa_common::Error>,
     ) -> Result<u64, MvccCommitError> {
-        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        validate_snapshot(&state, snapshot, read_tables)?;
-        let changes = apply().map_err(MvccCommitError::Storage)?;
-        if changes.is_empty() {
-            return Ok(state.commit_seq);
-        }
-        let previous_commit_seq = state.commit_seq;
-        let commit_seq = state.commit_seq.saturating_add(1);
-        for change in &changes {
-            let key = RowKey {
-                table: change.table.clone(),
-                key: change.key.clone(),
+        let id = self.next_reservation.fetch_add(1, Ordering::Relaxed);
+        let prepared: Vec<_> = changes
+            .into_iter()
+            .map(|change| {
+                (
+                    RowKey {
+                        table: change.table.clone(),
+                        key: change.key.clone(),
+                    },
+                    Arc::new(change.key),
+                    Arc::new(change.before),
+                    Arc::new(change.after),
+                )
+            })
+            .collect();
+        update(&self.state, |state| {
+            validate_snapshot(state, snapshot, read_tables)?;
+            let request = Reservation {
+                writes: prepared.iter().map(|(key, ..)| key.clone()).collect(),
+                reads: state.active_snapshots[&snapshot.id].reads.clone(),
+                tables: read_tables.clone(),
             };
-            let versions = state.versions.entry(key).or_default();
-            if versions.is_empty() {
-                versions.insert(previous_commit_seq, change.before.clone());
+            for (key, ..) in &prepared {
+                if row_changed(state, snapshot, key) {
+                    return Err(MvccCommitError::SerializationFailure);
+                }
             }
-            versions.insert(commit_seq, change.after.clone());
-            state.table_epochs.insert(change.table.clone(), commit_seq);
-        }
+            if state
+                .reservations
+                .values()
+                .any(|other| reservations_conflict(&request, other))
+            {
+                return Err(MvccCommitError::SerializationFailure);
+            }
+            for (key, owned_key, before, _) in &prepared {
+                state
+                    .keys
+                    .entry(key.table.clone())
+                    .or_default()
+                    .insert(owned_key.clone(), ());
+                // A first-touch baseline has never been committed by MVCC.
+                // Inheriting an unrelated global epoch would manufacture a
+                // conflict even when physical apply later fails.
+                let seq = 0;
+                state
+                    .local
+                    .entry(key.table.clone())
+                    .or_default()
+                    .entry(owned_key.clone())
+                    .or_insert_with(|| LocalVersion {
+                        seq,
+                        row: before.clone(),
+                    });
+                // Only changed paths, never unrelated row histories.
+                for (_, active) in state.active_snapshots.iter_mut() {
+                    active
+                        .local
+                        .entry(key.table.clone())
+                        .or_default()
+                        .entry(owned_key.clone())
+                        .or_insert_with(|| LocalVersion {
+                            seq,
+                            row: before.clone(),
+                        });
+                }
+            }
+            state.reservations.insert(id, request);
+            Ok(())
+        })?;
+        let mut reservation = ApplyReservation {
+            manager: self,
+            id,
+            armed: true,
+        };
+        apply().map_err(MvccCommitError::Storage)?;
+        let seq = update(&self.state, |state| {
+            if !prepared.is_empty() {
+                state.commit_seq = state.commit_seq.saturating_add(1);
+                for (key, owned_key, _, after) in &prepared {
+                    state.local.entry(key.table.clone()).or_default().insert(
+                        owned_key.clone(),
+                        LocalVersion {
+                            seq: state.commit_seq,
+                            row: after.clone(),
+                        },
+                    );
+                    state
+                        .table_epochs
+                        .insert(key.table.clone(), state.commit_seq);
+                }
+            }
+            state.reservations.remove(&id);
+            state.commit_seq
+        });
+        reservation.armed = false;
+        drop(reservation);
         if self.profile.is_enabled() {
-            MvccProfile::add(
-                &self.profile.versions_inserted,
-                u64::try_from(changes.len()).unwrap_or(u64::MAX),
-            );
+            MvccProfile::add(&self.profile.versions_inserted, prepared.len() as u64);
         }
-        state.commit_seq = commit_seq;
-        self.timed_prune_versions(&mut state);
-        Ok(commit_seq)
-    }
-
-    /// Run [`prune_versions`] under the phase timer when profiling is on.
-    fn timed_prune_versions(&self, state: &mut State) {
-        if !self.profile.is_enabled() {
-            prune_versions(state);
-            return;
-        }
-        let started = Instant::now();
-        prune_versions(state);
-        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        MvccProfile::add(&self.profile.prune_calls, 1);
-        MvccProfile::add(&self.profile.prune_ns, elapsed);
+        Ok(seq)
     }
 
     fn record_applied_accord_commit(
@@ -599,93 +710,195 @@ impl MvccManager {
         timestamp: Timestamp,
         changes: Vec<RowChange>,
     ) -> u64 {
-        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        if changes.is_empty() || !state.applied_accord_txns.insert((txn_id, timestamp)) {
-            return state.commit_seq;
-        }
-        let commit_seq = state.commit_seq.saturating_add(1);
-        let changes_len = changes.len();
-        for change in changes {
-            let key = RowKey {
-                table: change.table.clone(),
-                key: change.key,
-            };
-            let versions = state.distributed_versions.entry(key).or_default();
-            // `prepare` inserted these row images before the storage batch so
-            // scans racing apply can safely retain their Accord snapshot. Keep
-            // these inserts idempotent in case a custom applier skips prepare.
-            let baseline = Timestamp {
-                epoch: 0,
-                time: 0,
-                seq: 0,
-                node: 0,
-            };
-            if versions.is_empty() {
-                versions.insert(baseline, change.before);
+        let images = cluster_images(changes);
+        let (seq, inserted) = update(&self.state, |state| {
+            if images.is_empty() || state.applied_accord_txns.contains(&(txn_id, timestamp)) {
+                return (state.commit_seq, false);
             }
-            versions.entry(timestamp).or_insert(change.after);
-            state.table_epochs.insert(change.table, commit_seq);
+            publish_cluster_images(state, timestamp, &images);
+            state.applied_accord_txns.insert((txn_id, timestamp));
+            state.commit_seq = state.commit_seq.saturating_add(1);
+            for (table, key, _, _) in &images {
+                state.table_epochs.insert(table.clone(), state.commit_seq);
+                let applied = state
+                    .cluster_applied
+                    .entry(table.clone())
+                    .or_default()
+                    .entry(key.clone())
+                    .or_insert(timestamp);
+                *applied = (*applied).max(timestamp);
+                let latest = *applied;
+                // Compact this head only; active roots own older versions.
+                let versions = state.cluster.get_mut(table).unwrap().get_mut(key).unwrap();
+                *versions = versions
+                    .range(latest..)
+                    .map(|(ts, row)| (*ts, row.clone()))
+                    .collect();
+            }
+            (state.commit_seq, true)
+        });
+        if inserted && self.profile.is_enabled() {
+            MvccProfile::add(&self.profile.versions_inserted, images.len() as u64);
         }
-        if self.profile.is_enabled() {
-            MvccProfile::add(
-                &self.profile.versions_inserted,
-                u64::try_from(changes_len).unwrap_or(u64::MAX),
-            );
-        }
-        state.commit_seq = commit_seq;
-        self.timed_prune_versions(&mut state);
-        commit_seq
+        seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn count_allocations_for_test(f: impl FnOnce()) -> usize {
+        tests::allocation_probe::count(f)
     }
 
     #[cfg(test)]
     pub(crate) fn active_snapshot_count(&self) -> usize {
-        self.state
-            .lock()
-            .expect("PostgreSQL MVCC state poisoned")
-            .active_snapshots
-            .len()
+        self.state.load().active_snapshots.len()
     }
-
     #[cfg(test)]
     fn retained_version_count(&self) -> usize {
-        self.state
-            .lock()
-            .expect("PostgreSQL MVCC state poisoned")
-            .versions
-            .values()
-            .map(BTreeMap::len)
-            .sum()
+        self.history_stats().local_versions
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct MvccTableView {
+    state: Arc<ArcSwap<State>>,
+    snapshot: MvccSnapshot,
+    table: String,
+}
+impl MvccTableView {
+    pub(crate) fn ensure_active(&self) -> Result<(), MvccCommitError> {
+        if self
+            .state
+            .load()
+            .active_snapshots
+            .contains_key(&self.snapshot.id)
+        {
+            Ok(())
+        } else {
+            Err(MvccCommitError::SnapshotExpired)
+        }
+    }
+
+    pub(crate) fn row(&self, key: &Vec<Value>) -> Result<Option<SharedRow>, MvccCommitError> {
+        let state = self.state.load();
+        let active = state
+            .active_snapshots
+            .get(&self.snapshot.id)
+            .ok_or(MvccCommitError::SnapshotExpired)?;
+        if let Some(ts) = active.cluster_ts {
+            match active
+                .cluster
+                .get(&self.table)
+                .and_then(|table| table.get(key))
+            {
+                Some(versions) => versions
+                    .range(..=ts)
+                    .next_back()
+                    .map(|(_, row)| Some(row.clone()))
+                    .ok_or(MvccCommitError::SnapshotExpired),
+                None => Ok(None),
+            }
+        } else {
+            Ok(active
+                .local
+                .get(&self.table)
+                .and_then(|table| table.get(key))
+                .map(|version| version.row.clone()))
+        }
+    }
+    /// Enumerate a persistent KEY-ONLY root. Each payload is resolved from the
+    /// current active registry just before yielding. An unpolled iterator pins
+    /// no historical row root, so expiry frees payloads even while it is held.
+    pub(crate) fn rows(&self) -> Result<SnapshotRows, MvccCommitError> {
+        self.ensure_active()?;
+        let keys = self
+            .state
+            .load()
+            .keys
+            .get(&self.table)
+            .cloned()
+            .unwrap_or_default();
+        let view = self.clone();
+        Ok(Box::new(keys.into_iter().filter_map(
+            move |(key, ())| match view.row(key.as_ref()) {
+                Ok(Some(row)) => Some(Ok((key, row))),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )))
+    }
+}
+
+type SnapshotRows =
+    Box<dyn Iterator<Item = Result<(Arc<Vec<Value>>, SharedRow), MvccCommitError>> + Send>;
+
+type ClusterImage = (String, Arc<Vec<Value>>, SharedRow, SharedRow);
+fn cluster_images(changes: Vec<RowChange>) -> Vec<ClusterImage> {
+    changes
+        .into_iter()
+        .map(|c| {
+            (
+                c.table,
+                Arc::new(c.key),
+                Arc::new(c.before),
+                Arc::new(c.after),
+            )
+        })
+        .collect()
+}
+fn publish_cluster_images(state: &mut State, timestamp: Timestamp, images: &[ClusterImage]) {
+    let baseline = Timestamp::synthetic(0);
+    for (table, key, before, after) in images {
+        state
+            .keys
+            .entry(table.clone())
+            .or_default()
+            .insert(key.clone(), ());
+        let publish = |root: &mut ClusterRows| {
+            let versions = root
+                .entry(table.clone())
+                .or_default()
+                .entry(key.clone())
+                .or_default();
+            if versions.is_empty() {
+                versions.insert(baseline, before.clone());
+            }
+            if !versions.contains_key(&timestamp) {
+                versions.insert(timestamp, after.clone());
+            }
+        };
+        publish(&mut state.cluster);
+        for (_, active) in state.active_snapshots.iter_mut() {
+            if active.cluster_ts.is_some() {
+                publish(&mut active.cluster);
+            }
+        }
+    }
+}
+fn reservations_conflict(a: &Reservation, b: &Reservation) -> bool {
+    a.writes
+        .iter()
+        .any(|key| b.writes.contains(key) || b.reads.contains(key) || b.tables.contains(&key.table))
+        || b.writes
+            .iter()
+            .any(|key| a.reads.contains(key) || a.tables.contains(&key.table))
 }
 
 impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
     fn prepare_postgres_apply(
         &self,
-        _txn_id: TxnId,
+        txn_id: TxnId,
         timestamp: Timestamp,
         metadata: &[Vec<u8>],
     ) -> Result<(), String> {
         let started = self.profile.is_enabled().then(Instant::now);
-        let mut changes = decode_row_changes(metadata)?;
+        let changes = decode_row_changes(metadata)?;
         let decoded = changes.len();
-        let mut state = self.state.lock().expect("PostgreSQL MVCC state poisoned");
-        let baseline = Timestamp {
-            epoch: 0,
-            time: 0,
-            seq: 0,
-            node: 0,
-        };
-        for change in changes.drain(..) {
-            let key = RowKey {
-                table: change.table,
-                key: change.key,
-            };
-            let versions = state.distributed_versions.entry(key).or_default();
-            if versions.is_empty() {
-                versions.insert(baseline, change.before);
+        let images = cluster_images(changes);
+        update(&self.state, |state| {
+            if !state.applied_accord_txns.contains(&(txn_id, timestamp)) {
+                publish_cluster_images(state, timestamp, &images);
             }
-            versions.entry(timestamp).or_insert(change.after);
-        }
+        });
         if let Some(started) = started {
             let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
             MvccProfile::add(&self.profile.prepare_calls, 1);
@@ -747,51 +960,47 @@ fn decode_row_changes(metadata: &[Vec<u8>]) -> Result<Vec<RowChange>, String> {
     Ok(changes)
 }
 
+fn row_changed(state: &State, snapshot: &MvccSnapshot, row: &RowKey) -> bool {
+    state
+        .local
+        .get(&row.table)
+        .and_then(|table| table.get(&row.key))
+        .is_some_and(|v| v.seq > snapshot.read_ts)
+        || snapshot.cluster_ts.is_some_and(|ts| {
+            state
+                .cluster
+                .get(&row.table)
+                .and_then(|table| table.get(&row.key))
+                .and_then(|v| v.get_max())
+                .is_some_and(|(latest, _)| *latest > ts)
+        })
+}
 fn validate_snapshot(
     state: &State,
     snapshot: &MvccSnapshot,
-    read_tables: &HashSet<String>,
+    tables: &HashSet<String>,
 ) -> Result<(), MvccCommitError> {
-    if !state.active_snapshots.contains_key(&snapshot.id) {
-        return Err(MvccCommitError::SnapshotExpired);
-    }
-    // ROW-granular FIRST: a row this transaction read BY KEY that has since been
-    // written conflicts. Two transactions touching DISJOINT keys of one table
-    // are independent — PostgreSQL conflicts on read-set/write-set overlap, never
-    // on table identity — so refusing one on table identity alone is a false
-    // conflict (RT-2). `versions` is keyed by commit sequence (`u64`), compared
-    // against `snapshot.read_ts`; `distributed_versions` is keyed by Accord
-    // timestamp, compared against `snapshot.cluster_ts` when the snapshot has one.
-    if let Some(read_rows) = state.read_rows.get(&snapshot.id) {
-        for row in read_rows {
-            if state
-                .versions
-                .get(row)
-                .is_some_and(|versions| versions.keys().any(|seq| *seq > snapshot.read_ts))
-            {
-                return Err(MvccCommitError::SerializationFailure);
-            }
-            if let Some(cluster_ts) = snapshot.cluster_ts {
-                if state
-                    .distributed_versions
-                    .get(row)
-                    .is_some_and(|versions| versions.keys().any(|ts| *ts > cluster_ts))
-                {
-                    return Err(MvccCommitError::SerializationFailure);
-                }
-            }
-        }
-    }
-    // TABLE-granular, retained for SCANS: a scan does not enumerate its rows, so
-    // a phantom written into the scanned table must still conflict. A read
-    // recorded as an exact-key point read records its ROW and not its table, so
-    // it no longer reaches this check.
-    if read_tables.iter().any(|table| {
-        state
-            .table_epochs
-            .get(table)
-            .is_some_and(|epoch| *epoch > snapshot.read_ts)
-    }) {
+    let active = state
+        .active_snapshots
+        .get(&snapshot.id)
+        .ok_or(MvccCommitError::SnapshotExpired)?;
+    if active
+        .reads
+        .iter()
+        .any(|row| row_changed(state, snapshot, row))
+        || tables.iter().any(|table| {
+            state
+                .table_epochs
+                .get(table)
+                .is_some_and(|epoch| *epoch > snapshot.read_ts)
+        })
+        || state.reservations.values().any(|other| {
+            other
+                .writes
+                .iter()
+                .any(|row| active.reads.contains(row) || tables.contains(&row.table))
+        })
+    {
         return Err(MvccCommitError::SerializationFailure);
     }
     Ok(())
@@ -830,93 +1039,44 @@ fn row_bytes(row: &Row) -> usize {
     values_bytes(&row.0)
 }
 
-fn row_key_bytes(key: &RowKey) -> usize {
-    std::mem::size_of::<RowKey>() + key.table.capacity() + values_bytes(&key.key)
-}
-
-/// Resident history accounting. See [`MvccHistoryStats`] for the contract: a
-/// deterministic estimate used to compare configurations, not an allocator
-/// probe.
 fn history_stats(state: &State) -> MvccHistoryStats {
     let mut stats = MvccHistoryStats {
         applied_accord_txns: state.applied_accord_txns.len(),
         ..Default::default()
     };
-    let version_slot = std::mem::size_of::<Option<Row>>();
-    for (key, versions) in &state.versions {
-        stats.local_keys += 1;
-        stats.local_versions += versions.len();
-        stats.local_bytes +=
-            row_key_bytes(key) + versions.len() * (std::mem::size_of::<u64>() + version_slot);
-        for row in versions.values().flatten() {
-            stats.local_bytes += row_bytes(row);
+    let mut local = HashSet::new();
+    let mut cluster = HashSet::new();
+    for root in
+        std::iter::once(&state.local).chain(state.active_snapshots.values().map(|a| &a.local))
+    {
+        for (table, rows) in root {
+            for (key, version) in rows {
+                if local.insert((table, key, Arc::as_ptr(&version.row))) {
+                    stats.local_versions += 1;
+                    stats.local_bytes +=
+                        values_bytes(key) + version.row.as_ref().as_ref().map_or(0, row_bytes);
+                }
+            }
         }
     }
-    for (key, versions) in &state.distributed_versions {
-        stats.distributed_keys += 1;
-        stats.distributed_versions += versions.len();
-        stats.distributed_bytes +=
-            row_key_bytes(key) + versions.len() * (std::mem::size_of::<Timestamp>() + version_slot);
-        for row in versions.values().flatten() {
-            stats.distributed_bytes += row_bytes(row);
+    for root in
+        std::iter::once(&state.cluster).chain(state.active_snapshots.values().map(|a| &a.cluster))
+    {
+        for (table, rows) in root {
+            for (key, versions) in rows {
+                for (ts, row) in versions {
+                    if cluster.insert((table, key, ts, Arc::as_ptr(row))) {
+                        stats.distributed_versions += 1;
+                        stats.distributed_bytes +=
+                            values_bytes(key) + row.as_ref().as_ref().map_or(0, row_bytes);
+                    }
+                }
+            }
         }
     }
+    stats.local_keys = state.local.values().map(PersistentMap::len).sum();
+    stats.distributed_keys = state.cluster.values().map(PersistentMap::len).sum();
     stats
-}
-
-fn prune_versions(state: &mut State) {
-    let oldest_live = state
-        .active_snapshots
-        .values()
-        .map(|snapshot| snapshot.read_ts)
-        .min();
-    state
-        .versions
-        .retain(|_, versions| retain_snapshot_history(versions, oldest_live));
-
-    let oldest_cluster = state
-        .active_snapshots
-        .values()
-        .filter_map(|snapshot| snapshot.cluster_ts)
-        .min();
-    state
-        .distributed_versions
-        .retain(|_, versions| retain_snapshot_history(versions, oldest_cluster));
-
-    // Drop the read set of every snapshot that has left `active_snapshots`, so a
-    // finished transaction's point reads do not accumulate. Both removal sites
-    // (`SnapshotLease::drop` and `expire_snapshots_before`) call this.
-    let live_snapshots = &state.active_snapshots;
-    state
-        .read_rows
-        .retain(|id, _| live_snapshots.contains_key(id));
-}
-
-/// Keep the version visible at the oldest active snapshot and every later
-/// version. Move rows between BTreeMaps so pruning does not copy row payloads.
-fn retain_snapshot_history<K: Copy + Ord, V>(
-    versions: &mut BTreeMap<K, V>,
-    oldest_snapshot: Option<K>,
-) -> bool {
-    // Empty and singleton histories are already minimal for every horizon.
-    // Leave their BTreeMap allocation and payload owner in place.
-    if versions.len() <= 1 {
-        return !versions.is_empty();
-    }
-    if let Some(oldest_snapshot) = oldest_snapshot {
-        let mut retained = versions.split_off(&oldest_snapshot);
-        if let Some((timestamp, row)) = versions.pop_last() {
-            retained.insert(timestamp, row);
-        }
-        *versions = retained;
-    } else if let Some(timestamp) = versions.last_key_value().map(|(timestamp, _)| *timestamp) {
-        let latest = versions
-            .remove(&timestamp)
-            .expect("timestamp came from the same version map");
-        versions.clear();
-        versions.insert(timestamp, latest);
-    }
-    !versions.is_empty()
 }
 
 // No `PartialEq`/`Eq`: `Storage` now carries `ferrosa_common::Error`, which
@@ -944,7 +1104,7 @@ mod tests {
 
     // Count only allocations made by the current test thread. Other tests and
     // background runtimes must not affect this allocation regression.
-    mod allocation_probe {
+    pub(super) mod allocation_probe {
         use std::alloc::{GlobalAlloc, Layout, System};
         use std::cell::Cell;
 
@@ -1002,35 +1162,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn singleton_history_retention_does_not_reallocate() {
-        // Non-Clone payload also proves that pruning needs no cloned row.
-        struct Payload(Vec<u8>);
-        for horizon in [None, Some(0), Some(10), Some(20)] {
-            let mut versions = BTreeMap::from([(10, Payload(vec![7; 1024]))]);
-            let pointer = versions[&10].0.as_ptr();
-            let allocations = allocation_probe::count(|| {
-                assert!(retain_snapshot_history(&mut versions, horizon));
-            });
-            assert_eq!(versions.len(), 1);
-            assert_eq!(versions[&10].0.as_ptr(), pointer);
-            assert_eq!(versions[&10].0, vec![7; 1024]);
-            assert_eq!(allocations, 0, "horizon {horizon:?}");
-        }
-    }
-
-    #[test]
-    fn empty_history_retention_removes_the_entry() {
-        for horizon in [None, Some(0), Some(10), Some(20)] {
-            let mut versions = BTreeMap::<u64, Vec<u8>>::new();
-            let allocations = allocation_probe::count(|| {
-                assert!(!retain_snapshot_history(&mut versions, horizon));
-            });
-            assert!(versions.is_empty());
-            assert_eq!(allocations, 0);
-        }
-    }
-
     fn row(value: &str) -> Row {
         Row::new(vec![Value::Text(value.to_string())])
     }
@@ -1042,19 +1173,8 @@ mod tests {
         key: &[Value],
         expected: Option<Row>,
     ) {
-        let state = manager
-            .state
-            .lock()
-            .expect("PostgreSQL MVCC state poisoned");
-        let actual = state
-            .versions
-            .get(&RowKey {
-                table: table.to_string(),
-                key: key.to_vec(),
-            })
-            .and_then(|versions| versions.range(..=snapshot.read_ts).next_back())
-            .map(|(_, row)| row);
-        assert_eq!(actual, Some(&expected));
+        let overlay = manager.table_overlay(snapshot, table).unwrap();
+        assert_eq!(overlay.get(key), Some(&expected));
     }
 
     fn change(before: Option<Row>, after: Option<Row>) -> RowChange {
@@ -1067,21 +1187,88 @@ mod tests {
         }
     }
 
+    /// Behavioral liveness red: the old state mutex blocks BEGIN and its read
+    /// while another commit is paused inside apply. Release the writer before
+    /// asserting, so even the negative control leaves no blocked test threads.
+    #[test]
+    fn snapshot_reads_progress_while_an_apply_is_paused() {
+        let manager = Arc::new(MvccManager::default());
+        let initial = manager.snapshot();
+        manager
+            .commit(
+                &initial,
+                &HashSet::new(),
+                vec![change(None, Some(row("before")))],
+                || Ok(()),
+            )
+            .unwrap();
+        drop(initial);
+
+        let writer_snapshot = manager.snapshot();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_manager = manager.clone();
+        let writer = std::thread::spawn(move || {
+            writer_manager
+                .commit(
+                    &writer_snapshot,
+                    &HashSet::new(),
+                    vec![change(Some(row("before")), Some(row("after")))],
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader_manager = manager.clone();
+        let reader = std::thread::spawn(move || {
+            let snapshot = reader_manager.snapshot();
+            let value = reader_manager
+                .table_overlay(&snapshot, "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)])
+                .cloned()
+                .flatten();
+            read_tx.send(value).unwrap();
+        });
+        let observed = read_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+
+        assert!(
+            observed.is_ok(),
+            "snapshot read waited for a paused storage apply"
+        );
+        assert_eq!(observed.unwrap(), Some(row("before")));
+    }
+
     #[test]
     fn snapshot_reads_the_version_visible_at_begin() {
         let manager = Arc::new(MvccManager::default());
         let initial = manager.snapshot();
         manager
-            .commit(&initial, &HashSet::new(), || {
-                Ok(vec![change(None, Some(row("before")))])
-            })
+            .commit(
+                &initial,
+                &HashSet::new(),
+                vec![change(None, Some(row("before")))],
+                || Ok(()),
+            )
             .unwrap();
         let reader = manager.snapshot();
         let writer = manager.snapshot();
         manager
-            .commit(&writer, &HashSet::new(), || {
-                Ok(vec![change(Some(row("before")), Some(row("after")))])
-            })
+            .commit(
+                &writer,
+                &HashSet::new(),
+                vec![change(Some(row("before")), Some(row("after")))],
+                || Ok(()),
+            )
             .unwrap();
 
         assert_snapshot_row(
@@ -1099,15 +1286,19 @@ mod tests {
         let reader = manager.snapshot();
         let writer = manager.snapshot();
         manager
-            .commit(&writer, &HashSet::new(), || {
-                Ok(vec![change(None, Some(row("new")))])
-            })
+            .commit(
+                &writer,
+                &HashSet::new(),
+                vec![change(None, Some(row("new")))],
+                || Ok(()),
+            )
             .unwrap();
 
         let result = manager.commit(
             &reader,
             &HashSet::from(["public.items".to_string()]),
-            || Ok(Vec::new()),
+            Vec::new(),
+            || Ok(()),
         );
         assert!(
             matches!(result, Err(MvccCommitError::SerializationFailure)),
@@ -1129,18 +1320,24 @@ mod tests {
         let manager = Arc::new(MvccManager::default());
         let setup = manager.snapshot();
         manager
-            .commit(&setup, &HashSet::new(), || {
-                Ok(vec![change(None, Some(row("v1")))])
-            })
+            .commit(
+                &setup,
+                &HashSet::new(),
+                vec![change(None, Some(row("v1")))],
+                || Ok(()),
+            )
             .unwrap();
         drop(setup);
 
         let reader = manager.snapshot();
         let writer = manager.snapshot();
         manager
-            .commit(&writer, &HashSet::new(), || {
-                Ok(vec![change(Some(row("v1")), Some(row("v2")))])
-            })
+            .commit(
+                &writer,
+                &HashSet::new(),
+                vec![change(Some(row("v1")), Some(row("v2")))],
+                || Ok(()),
+            )
             .unwrap();
         assert_eq!(manager.retained_version_count(), 2);
         assert_snapshot_row(
@@ -1156,6 +1353,506 @@ mod tests {
         assert_eq!(manager.retained_version_count(), 1);
     }
 
+    // Regression controls for the new reservation path. These complement the
+    // original paused-apply behavioral red; each mutation is exercised below.
+    #[test]
+    fn disjoint_writer_progresses_and_overlap_is_refused_before_effects() {
+        let manager = Arc::new(MvccManager::default());
+        let writer_snapshot = manager.snapshot();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_manager = manager.clone();
+        let writer = std::thread::spawn(move || {
+            writer_manager.commit(
+                &writer_snapshot,
+                &HashSet::new(),
+                vec![change(Some(row("before")), Some(row("after")))],
+                || {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                },
+            )
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let during = manager.snapshot();
+        let view = manager.table_view(&during, "public.items");
+        assert_eq!(
+            view.row(&vec![Value::Int(1)]).unwrap().unwrap().as_ref(),
+            &Some(row("before"))
+        );
+        let effects = AtomicU64::new(0);
+        for kind in ["write", "point", "scan"] {
+            let snapshot = manager.snapshot();
+            let mut tables = HashSet::new();
+            let mut changes = Vec::new();
+            match kind {
+                "write" => changes.push(change(Some(row("before")), Some(row("overlap")))),
+                "point" => manager.record_point_read(
+                    &snapshot,
+                    RowKey {
+                        table: "public.items".into(),
+                        key: vec![Value::Int(1)],
+                    },
+                ),
+                "scan" => {
+                    tables.insert("public.items".into());
+                }
+                _ => unreachable!(),
+            }
+            let result = manager.commit(&snapshot, &tables, changes, || {
+                effects.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            });
+            assert!(
+                matches!(result, Err(MvccCommitError::SerializationFailure)),
+                "{kind}: {result:?}"
+            );
+        }
+        assert_eq!(effects.load(Ordering::Relaxed), 0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other_manager = manager.clone();
+        let other = std::thread::spawn(move || {
+            let mut disjoint = change(None, Some(row("disjoint")));
+            disjoint.key = vec![Value::Int(2)];
+            let result = other_manager.commit(
+                &other_manager.snapshot(),
+                &HashSet::new(),
+                vec![disjoint],
+                || Ok(()),
+            );
+            done_tx.send(result).unwrap();
+        });
+        let progressed = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap().unwrap();
+        other.join().unwrap();
+        assert!(
+            progressed.is_ok(),
+            "disjoint writer waited for paused apply"
+        );
+        progressed.unwrap().unwrap();
+        let latest = manager
+            .table_overlay(&manager.snapshot(), "public.items")
+            .unwrap();
+        assert_eq!(latest.get(&vec![Value::Int(1)]), Some(&Some(row("after"))));
+        assert_eq!(
+            latest.get(&vec![Value::Int(2)]),
+            Some(&Some(row("disjoint")))
+        );
+        assert_eq!(
+            view.row(&vec![Value::Int(1)]).unwrap().unwrap().as_ref(),
+            &Some(row("before"))
+        );
+    }
+
+    #[test]
+    fn metadata_cas_interference_never_repeats_apply_and_failure_releases_reservation() {
+        let manager = Arc::new(MvccManager::default());
+        let calls = AtomicU64::new(0);
+        let snapshot = manager.snapshot();
+        manager
+            .commit(
+                &snapshot,
+                &HashSet::new(),
+                vec![change(Some(row("before")), Some(row("after")))],
+                || {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    // Additional root replacement after reservation.
+                    for _ in 0..32 {
+                        let concurrent = manager.snapshot();
+                        manager.record_point_read(
+                            &concurrent,
+                            RowKey {
+                                table: "other".into(),
+                                key: vec![Value::Int(5)],
+                            },
+                        );
+                    }
+                    // Force an actual failed metadata CAS in final publication, not
+                    // merely a root replacement somewhere before that CAS loads.
+                    let interfering = manager.clone();
+                    BEFORE_CAS.with(|slot| {
+                        *slot.borrow_mut() = Some(Box::new(move || {
+                            let concurrent = interfering.snapshot();
+                            drop(concurrent);
+                        }))
+                    });
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(CAS_RETRIES.with(|retries| retries.get()) >= 1);
+        let snapshot = manager.snapshot();
+        let result = manager.commit(
+            &snapshot,
+            &HashSet::new(),
+            vec![change(Some(row("after")), Some(row("failed")))],
+            || {
+                Err(ferrosa_common::Error::InvalidData(
+                    "injected storage failure".into(),
+                ))
+            },
+        );
+        assert!(matches!(result, Err(MvccCommitError::Storage(_))));
+        assert!(manager.state.load().reservations.is_empty());
+        assert_eq!(
+            manager
+                .table_overlay(&manager.snapshot(), "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("after")))
+        );
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = manager.commit(
+                &snapshot,
+                &HashSet::new(),
+                vec![change(Some(row("after")), None)],
+                || panic!("injected apply unwind"),
+            );
+        }));
+        assert!(unwound.is_err());
+        assert!(manager.state.load().reservations.is_empty());
+        manager
+            .commit(
+                &snapshot,
+                &HashSet::new(),
+                vec![change(Some(row("after")), Some(row("retry")))],
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            manager
+                .table_overlay(&manager.snapshot(), "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("retry")))
+        );
+    }
+
+    /// A failed first touch must not manufacture a write epoch from unrelated
+    /// commits. The old reader's key has never successfully changed.
+    #[test]
+    fn failed_first_touch_does_not_conflict_with_an_unchanged_old_point_read() {
+        let manager = MvccManager::default();
+        let old = manager.snapshot();
+        manager.record_point_read(
+            &old,
+            RowKey {
+                table: "public.items".into(),
+                key: vec![Value::Int(1)],
+            },
+        );
+        let mut unrelated = change(None, Some(row("other")));
+        unrelated.key = vec![Value::Int(2)];
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![unrelated],
+                || Ok(()),
+            )
+            .unwrap();
+        let failed = manager.commit(
+            &manager.snapshot(),
+            &HashSet::new(),
+            vec![change(Some(row("before")), Some(row("failed")))],
+            || {
+                Err(ferrosa_common::Error::InvalidData(
+                    "injected storage failure".into(),
+                ))
+            },
+        );
+        assert!(matches!(failed, Err(MvccCommitError::Storage(_))));
+        manager
+            .validate_commit(&old, &HashSet::new())
+            .expect("failed first touch must not create a committed version");
+        assert_eq!(
+            manager
+                .table_overlay(&old, "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("before")))
+        );
+    }
+
+    #[test]
+    fn genuinely_racing_overlapping_writers_publish_exactly_one_value() {
+        let manager = Arc::new(MvccManager::default());
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let effects = Arc::new(AtomicU64::new(0));
+        let handles: Vec<_> = ["left", "right"]
+            .into_iter()
+            .map(|value| {
+                let snapshot = manager.snapshot();
+                let manager = manager.clone();
+                let barrier = barrier.clone();
+                let effects = effects.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (
+                        value,
+                        manager.commit(
+                            &snapshot,
+                            &HashSet::new(),
+                            vec![change(None, Some(row(value)))],
+                            || {
+                                effects.fetch_add(1, Ordering::Relaxed);
+                                Ok(())
+                            },
+                        ),
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(effects.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+            1
+        );
+        for (value, result) in outcomes {
+            match result {
+                Ok(_) => assert_eq!(
+                    manager
+                        .table_overlay(&manager.snapshot(), "public.items")
+                        .unwrap()
+                        .get(&vec![Value::Int(1)]),
+                    Some(&Some(row(value)))
+                ),
+                Err(MvccCommitError::SerializationFailure) => {}
+                Err(error) => panic!("unexpected refusal: {error:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_lease_clones_and_expiry_release_actual_payload_owners() {
+        let manager = MvccManager::default();
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![change(None, Some(row("v1")))],
+                || Ok(()),
+            )
+            .unwrap();
+        let old = manager.snapshot();
+        let cloned = old.clone();
+        let shared = manager
+            .table_view(&old, "public.items")
+            .row(&vec![Value::Int(1)])
+            .unwrap()
+            .unwrap();
+        let weak = Arc::downgrade(&shared);
+        drop(shared);
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![change(Some(row("v1")), None)],
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(weak.upgrade().is_some());
+        drop(old);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            manager
+                .table_overlay(&cloned, "public.items")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("v1")))
+        );
+        drop(cloned);
+        assert!(
+            weak.upgrade().is_none(),
+            "last lease must free historical payload"
+        );
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![change(None, Some(row("v2")))],
+                || Ok(()),
+            )
+            .unwrap();
+        let expired = manager.snapshot();
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![change(Some(row("v2")), Some(row("v3")))],
+                || Ok(()),
+            )
+            .unwrap();
+        let view = manager.table_view(&expired, "public.items");
+        let shared = view.row(&vec![Value::Int(1)]).unwrap().unwrap();
+        let weak = Arc::downgrade(&shared);
+        drop(shared);
+        assert!(weak.upgrade().is_some());
+        let mut held_iterator = view.rows().unwrap();
+        manager.expire_all_snapshots_for_test();
+        assert!(
+            weak.upgrade().is_none(),
+            "expired handles must not pin roots"
+        );
+        assert!(matches!(
+            held_iterator.next().unwrap(),
+            Err(MvccCommitError::SnapshotExpired)
+        ));
+        drop(held_iterator);
+        assert!(matches!(
+            view.row(&vec![Value::Int(1)]),
+            Err(MvccCommitError::SnapshotExpired)
+        ));
+    }
+
+    #[test]
+    fn cluster_late_prepare_out_of_order_apply_and_replay_preserve_timestamp_views() {
+        use ferrosa_storage::accord::PostgresMvccApplyObserver;
+        let manager = MvccManager::default();
+        let early = manager.snapshot_with_cluster_ts(Timestamp::synthetic(15));
+        let middle = manager.snapshot_with_cluster_ts(Timestamp::synthetic(25));
+        let latest = manager.snapshot_with_cluster_ts(Timestamp::synthetic(35));
+        let encode = |before, after| {
+            crate::row_change_codec::encode_partition(&[change(
+                Some(row(before)),
+                Some(row(after)),
+            )])
+            .unwrap()
+        };
+        let t30 = Timestamp::synthetic(30);
+        let id30 = TxnId::new(1, t30);
+        manager
+            .prepare_postgres_apply(id30, t30, &[encode("v0", "v30")])
+            .unwrap();
+        let t20 = Timestamp::synthetic(20);
+        let id20 = TxnId::new(1, t20);
+        // Skipping prepare must still preserve metadata, and must not overwrite
+        // a newer physical/apply head when callbacks arrive out of order.
+        manager
+            .on_postgres_apply(id30, t30, &[encode("v0", "v30")])
+            .unwrap();
+        manager
+            .on_postgres_apply(id20, t20, &[encode("v0", "v20")])
+            .unwrap();
+        for (snapshot, expected) in [(&early, "v0"), (&middle, "v20"), (&latest, "v30")] {
+            assert_eq!(
+                manager
+                    .table_overlay(snapshot, "public.items")
+                    .unwrap()
+                    .get(&vec![Value::Int(1)]),
+                Some(&Some(row(expected)))
+            );
+        }
+        let seq = manager.current_commit_seq();
+        manager
+            .prepare_postgres_apply(id20, t20, &[encode("v0", "v20")])
+            .unwrap();
+        manager
+            .on_postgres_apply(id20, t20, &[encode("v0", "v20")])
+            .unwrap();
+        assert_eq!(manager.current_commit_seq(), seq);
+        assert_eq!(
+            manager
+                .table_overlay(
+                    &manager.snapshot_with_cluster_ts(Timestamp::synthetic(40)),
+                    "public.items"
+                )
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("v30")))
+        );
+        drop(early);
+        drop(middle);
+        drop(latest);
+        assert_eq!(
+            manager.history_stats().distributed_versions,
+            1,
+            "replay must not repopulate obsolete head history"
+        );
+    }
+
+    /// A timestamp older than the retained head cannot fall through to latest
+    /// physical storage. Reject unavailable history rather than leaking it.
+    #[test]
+    fn unavailable_cluster_history_fails_instead_of_reading_latest_storage() {
+        use ferrosa_storage::accord::PostgresMvccApplyObserver;
+        let manager = MvccManager::default();
+        let ts = Timestamp::synthetic(30);
+        let metadata = crate::row_change_codec::encode_partition(&[change(
+            Some(row("old")),
+            Some(row("latest")),
+        )])
+        .unwrap();
+        manager
+            .on_postgres_apply(TxnId::new(1, ts), ts, &[metadata])
+            .unwrap();
+        let stale = manager.snapshot_with_cluster_ts(Timestamp::synthetic(25));
+        let view = manager.table_view(&stale, "public.items");
+        assert!(
+            matches!(
+                view.row(&vec![Value::Int(1)]),
+                Err(MvccCommitError::SnapshotExpired)
+            ),
+            "missing history must not use the current physical row"
+        );
+        assert!(matches!(
+            view.rows().unwrap().next().unwrap(),
+            Err(MvccCommitError::SnapshotExpired)
+        ));
+    }
+
+    #[test]
+    fn per_key_commit_work_does_not_copy_unrelated_row_history() {
+        let mut curve = Vec::new();
+        for size in [128, 1024, 8192] {
+            let manager = MvccManager::default();
+            let changes = (0..size)
+                .map(|i| {
+                    let mut item = change(None, Some(row("resident")));
+                    item.key = vec![Value::Int(i)];
+                    item
+                })
+                .collect();
+            manager
+                .commit(&manager.snapshot(), &HashSet::new(), changes, || Ok(()))
+                .unwrap();
+            let snapshot = manager.snapshot();
+            let allocations = allocation_probe::count(|| {
+                manager
+                    .commit(
+                        &snapshot,
+                        &HashSet::new(),
+                        vec![change(Some(row("resident")), Some(row("changed")))],
+                        || Ok(()),
+                    )
+                    .unwrap();
+            });
+            curve.push((size, allocations));
+            assert_eq!(
+                manager
+                    .table_overlay(&manager.snapshot(), "public.items")
+                    .unwrap()
+                    .get(&vec![Value::Int(size - 1)]),
+                Some(&Some(row("resident")))
+            );
+        }
+        if let Ok(path) = env::var("FERROSA_MVCC_SCALE_EVIDENCE") {
+            std::fs::write(path, format!("{curve:?}\n")).unwrap();
+        }
+        // Measured on the production entry point: 42 / 45 / 45 allocations at
+        // 128 / 1024 / 8192 resident keys. A 64x resident-size increase can add
+        // HAMT depth, never a copy per row. 4x allows randomized HAMT shape
+        // variation while rejecting whole-root copying (64x). No timing gate.
+        assert!(curve[2].1 < curve[0].1 * 4, "allocation curve {curve:?}");
+    }
     #[test]
     fn mvcc_config_defaults_scan_buffer_and_snapshot_max_age() {
         let config = MvccConfig::from_overrides(None, None, None).unwrap();
@@ -1235,18 +1932,24 @@ mod tests {
         let manager = MvccManager::with_config(config);
         let setup = manager.snapshot();
         manager
-            .commit(&setup, &HashSet::new(), || {
-                Ok(vec![change(None, Some(row("v1")))])
-            })
+            .commit(
+                &setup,
+                &HashSet::new(),
+                vec![change(None, Some(row("v1")))],
+                || Ok(()),
+            )
             .unwrap();
         drop(setup);
 
         let old_snapshot = manager.snapshot();
         let writer = manager.snapshot();
         manager
-            .commit(&writer, &HashSet::new(), || {
-                Ok(vec![change(Some(row("v1")), Some(row("v2")))])
-            })
+            .commit(
+                &writer,
+                &HashSet::new(),
+                vec![change(Some(row("v1")), Some(row("v2")))],
+                || Ok(()),
+            )
             .unwrap();
         drop(writer);
         assert_eq!(manager.retained_version_count(), 2);
@@ -1295,8 +1998,12 @@ mod tests {
 
         let old_snapshot = manager.snapshot_at(Some(Timestamp::synthetic(19)));
         let committed_snapshot = manager.snapshot_at(Some(commit_ts));
-        let old_rows = manager.table_overlay(&old_snapshot, "public.items");
-        let committed_rows = manager.table_overlay(&committed_snapshot, "public.items");
+        let old_rows = manager
+            .table_overlay(&old_snapshot, "public.items")
+            .unwrap();
+        let committed_rows = manager
+            .table_overlay(&committed_snapshot, "public.items")
+            .unwrap();
 
         assert_eq!(
             old_rows.get(&vec![Value::Int(1)]).and_then(Option::as_ref),

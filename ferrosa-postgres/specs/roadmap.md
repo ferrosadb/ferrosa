@@ -188,13 +188,13 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 - **PostgreSQL MVCC transaction semantics.** Explicit SERIALIZABLE begins
   pin a read timestamp; simple and extended SELECT use version overlays; buffered
-  writes are visible to their own transaction; commit checks table-level read
-  and write epochs in standalone mode and atomically applies through the local
-  storage engine. In cluster mode a global PostgreSQL commit marker currently
+  writes are visible to their own transaction; commit validates exact-key reads and table scans, reserves overlapping
+  scopes, and atomically applies through the local storage engine. Metadata roots
+  are persistent and atomically published; disjoint writers need no global gate. In cluster mode a global PostgreSQL commit marker currently
   validates snapshots, conservatively aborting after any intervening PG commit.
   Write skew, predicate conflicts, lost updates, and real-time-order violations
-  abort or return the committed value as appropriate; versions are reclaimed
-  after the oldest active snapshot advances. Explicit isolation levels other
+  abort or return the committed value as appropriate; historical payloads are reclaimed
+  when the owning snapshot roots are dropped or expire. Explicit isolation levels other
   than SERIALIZABLE fail loud. CQL transactions remain on Accord.
 - **PostgreSQL strict-serializability workload.** The native-driver Jepsen test
   checks transfers, register updates, predicate/phantom histories, and

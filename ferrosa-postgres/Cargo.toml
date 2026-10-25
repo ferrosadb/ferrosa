@@ -59,6 +59,7 @@ tokio-rustls = "0.26"
 # path. `ClusterDdl` in `ddl.rs` is the only user of these three crates.
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 arc-swap = "1.7"
+imbl = "=7.0.2"
 async-trait = "0.1"
 indexmap = "2"
 

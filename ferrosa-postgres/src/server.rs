@@ -1087,7 +1087,6 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // registered as a conflict key would re-serialize every disjoint-key writer of
     // that table, so only the tables the transaction actually READ participate.
     let scanned_tables = read_tables.clone();
-    let _commit_guard = ctx.mvcc.commit_guard().await;
     // Per-phase attribution for the COMMIT (see `MvccProfile`). Zero-valued and
     // unused unless `FERROSA_PG_COMMIT_PROFILE` is set.
     let commit_started = std::time::Instant::now();

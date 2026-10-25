@@ -218,16 +218,36 @@ transaction's write-set may hold before it SPILLS to a staging file (default
 sets the storage-to-executor row channel capacity (64), and
 `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` expires older active snapshots
 (600,000 ms). `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` controls the
-expiry/pruning sweep cadence (1,000 ms). Invalid values log an error and select
+snapshot-registry expiry cadence (1,000 ms). Invalid values log an error and select
 the complete default set without stopping startup. Expired transactions fail
 on subsequent snapshot validation with SQLSTATE `40001`. Tuning guidance and
 query-materialization caveats are in the public
 [`PROFILE.md`](../../PROFILE.md).
 
-MVCC history pruning keeps empty and single-version histories in place. No
-version can be discarded in either case, so pruning avoids rebuilding the map
-and preserves the existing row owner without an allocation. Multi-version
-snapshot retention follows the existing oldest-snapshot boundary.
+MVCC publishes persistent `imbl` HAMT roots through `arc-swap`. Active snapshots
+own structurally shared roots and immutable `Arc` row payloads. Dropping the last
+lease or expiring a snapshot removes its registry root; neither path sweeps
+unrelated row histories. Local commits reserve changed keys and their point/scan
+read scopes before storage apply, publish before-images before any physical
+change, and invoke storage exactly once outside metadata CAS retries. Disjoint
+writers and snapshot reads can progress while another storage apply pauses.
+Overlapping reservations or stale reads fail with `40001` before storage effects.
+Storage/WAL work itself may block. Cluster prepare publishes timestamped images;
+apply retains each key's latest applied image and future prepares, while active
+roots retain their historical images. Applied-transaction replay is idempotent. A new cluster snapshot requesting
+history older than a retained head fails with `40001` instead of falling through
+to current physical storage.
+
+Streaming providers resolve the live snapshot root after each physical read,
+restore deleted rows once, and keep staged own writes ahead of snapshot images.
+Restoration enumerates shared key-only roots and resolves each payload through
+the live registry, so a held iterator cannot pin an expired historical table.
+They retain an emitted-key set of O(scanned keys) for late-delete reconciliation,
+in addition to the bounded row channel; they do not retain the scanned rows.
+Cancellation drops the producer's keys and lease. Expiry is checked during the
+scan and returns `40001`. Current heads, active roots, outstanding prepares and
+the applied-transaction identity set remain resident; this is no total MVCC
+memory cap or durable version store.
 
 ### Coherence with the consensus write path
 

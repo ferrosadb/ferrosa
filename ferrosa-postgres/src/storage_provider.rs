@@ -352,7 +352,66 @@ pub const SCAN_BUFFER_ROWS: usize = crate::mvcc::DEFAULT_SCAN_BUFFER_ROWS;
 /// instead of a short, successful-looking result. First failure wins — later
 /// ones are consequences of the same collapse and would only obscure it.
 #[derive(Clone, Default)]
-pub struct ScanFailure(Arc<Mutex<Option<String>>>);
+pub struct ScanFailure(
+    Arc<Mutex<Option<ScanCause>>>,
+    #[cfg(test)] Arc<ScanKeyMetrics>,
+);
+
+#[cfg(test)]
+#[derive(Default)]
+struct ScanKeyMetrics {
+    live: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    capacity: std::sync::atomic::AtomicUsize,
+}
+
+/// Exact membership is needed to restore a row first deleted AFTER a physical
+/// row was emitted without emitting it twice. Own decoded keys, never rows.
+struct ScanSeen {
+    keys: std::collections::HashSet<Vec<Value>>,
+    #[cfg(test)]
+    metrics: Arc<ScanKeyMetrics>,
+}
+impl ScanSeen {
+    fn new(_failure: &ScanFailure) -> Self {
+        Self {
+            keys: Default::default(),
+            #[cfg(test)]
+            metrics: _failure.1.clone(),
+        }
+    }
+    fn insert(&mut self, key: Vec<Value>) {
+        let inserted = self.keys.insert(key);
+        #[cfg(test)]
+        if inserted {
+            use std::sync::atomic::Ordering::Relaxed;
+            let live = self.metrics.live.fetch_add(1, Relaxed) + 1;
+            self.metrics.peak.fetch_max(live, Relaxed);
+            self.metrics
+                .capacity
+                .fetch_max(self.keys.capacity(), Relaxed);
+        }
+        #[cfg(not(test))]
+        let _ = inserted;
+    }
+    fn contains(&self, key: &Vec<Value>) -> bool {
+        self.keys.contains(key)
+    }
+}
+#[cfg(test)]
+impl Drop for ScanSeen {
+    fn drop(&mut self) {
+        self.metrics
+            .live
+            .fetch_sub(self.keys.len(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug)]
+struct ScanCause {
+    code: &'static str,
+    message: String,
+}
 
 impl ScanFailure {
     /// Record `message` unless a failure is already recorded.
@@ -362,15 +421,31 @@ impl ScanFailure {
     /// poisoned lock still reports the error instead of masking it with a panic
     /// on the way out.
     pub fn record(&self, message: String) {
+        self.record_cause("58000", message);
+    }
+
+    fn record_cause(&self, code: &'static str, message: String) {
         let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
-            *slot = Some(message);
+            *slot = Some(ScanCause { code, message });
         }
+    }
+
+    fn expired(&self) {
+        self.record_cause("40001", "PostgreSQL transaction snapshot expired".into());
+    }
+
+    pub(crate) fn take_with_code(&self) -> Option<(&'static str, String)> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|cause| (cause.code, cause.message))
     }
 
     /// Take the recorded failure, if any, leaving the slot empty.
     pub fn take(&self) -> Option<String> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
+        self.take_with_code().map(|(_, message)| message)
     }
 }
 
@@ -450,7 +525,12 @@ async fn open_partition_stream(ctx: &Arc<ScanContext>) -> Result<PartitionStream
 /// three exits: the stream ends, storage errors (recorded in `failure` first),
 /// or the consumer drops its receiver. Nothing is left running behind a
 /// cancelled or short-circuited query.
-async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: ScanFailure) {
+async fn produce_scan(
+    ctx: Arc<ScanContext>,
+    tx: mpsc::Sender<Row>,
+    failure: ScanFailure,
+    view: Option<crate::mvcc::MvccTableView>,
+) {
     let mut stream = match open_partition_stream(&ctx).await {
         Ok(stream) => stream,
         Err(message) => {
@@ -461,7 +541,7 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
             return;
         }
     };
-    let mut overlay_seen = std::collections::HashSet::new();
+    let mut overlay_seen = ScanSeen::new(&failure);
     while let Some(item) = stream.next().await {
         let partition = match item {
             Ok(p) => p,
@@ -521,26 +601,27 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
                 .chain(ctx.ck_idx.iter())
                 .map(|index| values[*index].clone())
                 .collect();
-            // `row.clone()` here is REQUIRED, not wasteful. `ctx.overlay` is an
-            // `Arc` shared by every scan in one query (a self-join opens two
-            // independent scans over the same overlay), so the substituted row
-            // must be CLONED out — mutating the overlay (`remove`) to move the
-            // row would make the second scan miss a restored historical row and
-            // silently return a wrong result. The key clone is likewise needed
-            // because `values` is MOVED into `Row::new` on the no-overlay path.
-            // Both copies are sparse (one per MVCC-changed key, not per table
-            // row) and are the documented, correctness-required exceptions
-            // (t_110dd8a5).
-            let row = match ctx.overlay.get(&key) {
-                Some(Some(row)) => {
-                    overlay_seen.insert(key);
-                    row.clone()
+            // Resolve AFTER the physical read. A key can first acquire a
+            // before-image while this scan is in progress. Staged own writes
+            // have precedence over the snapshot root.
+            let historical = match view.as_ref().map(|view| view.row(&key)).transpose() {
+                Ok(row) => row.flatten(),
+                Err(_) => {
+                    failure.expired();
+                    return;
                 }
-                Some(None) => {
-                    overlay_seen.insert(key);
-                    continue;
-                }
-                None => Row::new(values),
+            };
+            let replacement = ctx.overlay.get(&key).or(historical.as_deref());
+            let row = match replacement {
+                Some(Some(row)) => Some(row.clone()),
+                Some(None) => None,
+                None => Some(Row::new(values)),
+            };
+            if view.is_some() || ctx.overlay.contains_key(&key) {
+                overlay_seen.insert(key);
+            }
+            let Some(row) = row else {
+                continue;
             };
             if tx.send(row).await.is_err() {
                 // The consumer is gone: the executor short-circuited, errored,
@@ -549,10 +630,33 @@ async fn produce_scan(ctx: Arc<ScanContext>, tx: mpsc::Sender<Row>, failure: Sca
             }
         }
     }
-    // A snapshot can contain a row deleted from current storage, or omit a row
-    // inserted after its read timestamp. Re-add historical rows absent from the
-    // latest storage scan; the overlay remains sparse and table scans stay
-    // streamed.
+    // Reconcile late deletes exactly once. This set retains keys, not rows;
+    // each self-join scan has its own set and its own bounded row channel.
+    if let Some(view) = view {
+        let historical = match view.rows() {
+            Ok(rows) => rows,
+            Err(_) => {
+                failure.expired();
+                return;
+            }
+        };
+        for image in historical {
+            let (key, row) = match image {
+                Ok(image) => image,
+                Err(_) => {
+                    failure.expired();
+                    return;
+                }
+            };
+            if !overlay_seen.contains(key.as_ref()) && !ctx.overlay.contains_key(key.as_ref()) {
+                if let Some(row) = row.as_ref() {
+                    if tx.send(row.clone()).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    }
     for (key, row) in ctx.overlay.iter() {
         if !overlay_seen.contains(key) {
             if let Some(row) = row {
@@ -612,6 +716,14 @@ pub struct StreamingTable {
     handle: Handle,
     failure: ScanFailure,
     scan_buffer_rows: usize,
+    mvcc_view: Option<crate::mvcc::MvccTableView>,
+}
+
+impl StreamingTable {
+    pub(crate) fn with_mvcc_view(mut self, view: crate::mvcc::MvccTableView) -> Self {
+        self.mvcc_view = Some(view);
+        self
+    }
 }
 
 impl fmt::Debug for StreamingTable {
@@ -631,7 +743,12 @@ impl TableProvider for StreamingTable {
     fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
         let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
         self.handle.spawn(guard_scan_producer(
-            produce_scan(self.ctx.clone(), tx, self.failure.clone()),
+            produce_scan(
+                self.ctx.clone(),
+                tx,
+                self.failure.clone(),
+                self.mvcc_view.clone(),
+            ),
             self.failure.clone(),
         ));
         Box::new(ScanIter { rx })
@@ -753,6 +870,7 @@ pub(crate) async fn load_table_with_overlay(
         handle: Handle::current(),
         failure,
         scan_buffer_rows,
+        mvcc_view: None,
     })
 }
 
@@ -776,6 +894,74 @@ pub(crate) fn apply_pending_writes(
         writes.iter().map(|w| &w.0),
         ApplyOutputs::default(),
     )
+}
+
+/// Keep only the keys explicitly staged by the transaction. Other snapshot
+/// images must remain live so changes after query construction are observed.
+pub(crate) fn staged_overlay(
+    engine: &StorageEngine,
+    schema: &Schema,
+    keyspace: &str,
+    table: &str,
+    overlay: &mut std::collections::HashMap<Vec<Value>, Option<Row>>,
+    writes: &[crate::mvcc::PgWrite],
+    view: Option<&crate::mvcc::MvccTableView>,
+) -> Result<(), crate::mvcc::MvccCommitError> {
+    use crate::mvcc::MvccCommitError;
+    let storage_error =
+        |message: String| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(message));
+    let codec = TableCodec::build(keyspace, table, schema).map_err(storage_error)?;
+    // Resolve only the keys the transaction actually staged. Building a whole
+    // snapshot overlay here made even one own write clone unrelated payloads.
+    if let Some(view) = view {
+        view.ensure_active()?;
+        for write in writes
+            .iter()
+            .map(|write| &write.0)
+            .filter(|write| write.keyspace == keyspace && write.table == table)
+        {
+            if ferrosa_storage::table_tombstone::is_table_tombstone_key(&write.key) {
+                continue;
+            }
+            let pk = ferrosa_row_bridge::decode_pk(&write.key, codec.pk.len());
+            for row in &write.rows {
+                let ck = ferrosa_row_bridge::decode_clustering(&row.clustering, codec.ck.len());
+                let key = codec
+                    .pk
+                    .iter()
+                    .zip(pk.iter())
+                    .chain(codec.ck.iter().zip(ck.iter()))
+                    .map(|(index, part)| {
+                        let cell = ferrosa_row_bridge::decode_value(&codec.types[*index], part)
+                            .map_err(|error| storage_error(error.to_string()))?;
+                        cql_to_value(&cell).map_err(storage_error)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some(image) = view.row(&key)? {
+                    overlay.insert(key, (*image).clone());
+                }
+            }
+        }
+    }
+    let mut keys = std::collections::HashMap::new();
+    apply_pending_writes_with_partition_keys(
+        engine,
+        &codec,
+        keyspace,
+        table,
+        overlay,
+        writes.iter().map(|write| &write.0),
+        ApplyOutputs {
+            partition_keys: Some(&mut keys),
+            ..Default::default()
+        },
+    )
+    .map_err(storage_error)?;
+    overlay.retain(|key, _| keys.contains_key(key));
+    if let Some(view) = view {
+        view.ensure_active()?;
+    }
+    Ok(())
 }
 
 ///
@@ -1520,6 +1706,348 @@ mod tests {
         assert_eq!(rows[2].0[2], Value::Text("bob".to_string()));
         assert_eq!(rows[2].0[3], Value::Int(30));
 
+        engine.shutdown().unwrap();
+    }
+
+    /// Behavioral RED: construct the real query catalog before a row first
+    /// enters MVCC, then apply an update and scan. The static overlay leaks amy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_constructed_before_first_mvcc_change_reads_its_before_image() {
+        use ferrosa_sql::Catalog;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let tid = TableId::new("ks", "t");
+        let key = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
+        engine
+            .write(&tid, &key, storage_row(1, "ann", 10, 1000), 1000)
+            .unwrap();
+        let manager = Arc::new(crate::mvcc::MvccManager::default());
+        let snapshot = manager.snapshot();
+        let stmt = match ferrosa_sql::parse_statement("SELECT * FROM ks.t").unwrap() {
+            ferrosa_sql::Statement::Select(stmt) => *stmt,
+            _ => panic!("SELECT required"),
+        };
+        let (catalog, failure) = crate::query::load_catalog_with_mvcc(
+            &engine,
+            &schema,
+            &stmt,
+            "ks",
+            Some(&manager),
+            Some(&snapshot),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let before = Row::new(vec![
+            Value::Text("alpha".into()),
+            Value::Int(1),
+            Value::Text("ann".into()),
+            Value::Int(10),
+        ]);
+        let after = Row::new(vec![
+            Value::Text("alpha".into()),
+            Value::Int(1),
+            Value::Text("amy".into()),
+            Value::Int(20),
+        ]);
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![crate::mvcc::RowChange {
+                    table: "ks.t".into(),
+                    key: vec![Value::Text("alpha".into()), Value::Int(1)],
+                    partition_key: b"alpha".to_vec(),
+                    before: Some(before.clone()),
+                    after: Some(after),
+                }],
+                || engine.write(&tid, &key, storage_row(1, "amy", 20, 2000), 2000),
+            )
+            .unwrap();
+        let table = catalog.resolve("ks", "t").unwrap();
+        let rows: Vec<Row> = tokio::task::spawn_blocking(move || table.scan().collect())
+            .await
+            .unwrap();
+        assert!(failure.take().is_none());
+        assert_eq!(rows, vec![before.clone()]);
+        // A deletion after construction must be restored once on EVERY scan;
+        // two self-join scans cannot consume one another's historical rows.
+        let mut tombstone = storage_row(1, "", 0, 3000);
+        tombstone.cells.clear();
+        tombstone.deletion = DeletionTime::new(3000, 3);
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![crate::mvcc::RowChange {
+                    table: "ks.t".into(),
+                    key: vec![Value::Text("alpha".into()), Value::Int(1)],
+                    partition_key: b"alpha".to_vec(),
+                    before: Some(Row::new(vec![
+                        Value::Text("alpha".into()),
+                        Value::Int(1),
+                        Value::Text("amy".into()),
+                        Value::Int(20),
+                    ])),
+                    after: None,
+                }],
+                || engine.write(&tid, &key, tombstone, 3000),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let table = catalog.resolve("ks", "t").unwrap();
+            let rows: Vec<Row> = tokio::task::spawn_blocking(move || table.scan().collect())
+                .await
+                .unwrap();
+            assert_eq!(rows, vec![before.clone()]);
+        }
+        let staged = vec![crate::mvcc::PgWrite(ferrosa_storage::Mutation::new(
+            "ks".into(),
+            "t".into(),
+            key.clone(),
+            vec![storage_row(1, "own", 40, 4000)],
+            4000,
+        ))];
+        let (own_catalog, own_failure) = crate::query::load_catalog_with_mvcc(
+            &engine,
+            &schema,
+            &stmt,
+            "ks",
+            Some(&manager),
+            Some(&snapshot),
+            Some(&staged),
+            None,
+        )
+        .await
+        .unwrap();
+        let own_table = own_catalog.resolve("ks", "t").unwrap();
+        let rows: Vec<Row> = tokio::task::spawn_blocking(move || own_table.scan().collect())
+            .await
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![Row::new(vec![
+                Value::Text("alpha".into()),
+                Value::Int(1),
+                Value::Text("own".into()),
+                Value::Int(40)
+            ])]
+        );
+        assert!(own_failure.take().is_none());
+        // A catalog owns a lease, not a historical root: reaping invalidates it
+        // and the real query error mapper preserves serialization SQLSTATE.
+        manager.expire_all_snapshots_for_test();
+        let table = catalog.resolve("ks", "t").unwrap();
+        let rows: Vec<Row> = tokio::task::spawn_blocking(move || table.scan().collect())
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        let message = crate::query::check_scan_failure(&failure).expect("expired scan must fail");
+        match message {
+            crate::messages::BackendMessage::ErrorResponse { fields } => assert!(fields
+                .iter()
+                .any(|(tag, value)| *tag == b'C' && value == "40001")),
+            other => panic!("expected SQLSTATE40001, got {other:?}"),
+        }
+        let racing_snapshot = manager.snapshot();
+        crate::mvcc::MvccManager::expire_after_liveness_for_test(manager.clone());
+        let expired_load = crate::query::load_catalog_with_mvcc(
+            &engine,
+            &schema,
+            &stmt,
+            "ks",
+            Some(&manager),
+            Some(&racing_snapshot),
+            Some(&staged),
+            None,
+        )
+        .await;
+        match expired_load {
+            Err(crate::messages::BackendMessage::ErrorResponse { fields }) => assert!(fields
+                .iter()
+                .any(|(tag, value)| *tag == b'C' && value == "40001")),
+            _ => {
+                panic!("expiry after liveness must refuse overlay construction with SQLSTATE40001")
+            }
+        }
+        drop(catalog);
+        drop(own_catalog);
+        engine.shutdown().unwrap();
+    }
+
+    /// Deterministic retained-key allocation/lifetime curve; row values are
+    /// compared separately. No wall-clock performance threshold is involved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_scan_key_capacity_grows_with_rows_and_drop_releases_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut curve = Vec::new();
+        for size in [128, 1024, 4096] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = engine_config(dir.path());
+            config.commit_log.segment_size = 1024 * 1024;
+            let engine = Arc::new(StorageEngine::new(config, None).unwrap());
+            engine.register_table(storage_schema()).unwrap();
+            let schema = schema_with_table();
+            let key = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
+            engine
+                .write_atomic_batch(vec![ferrosa_storage::Mutation::new(
+                    "ks".into(),
+                    "t".into(),
+                    key,
+                    (0..size).map(|i| storage_row(i, "row", i, 1000)).collect(),
+                    1000,
+                )])
+                .unwrap();
+            let baseline_failure = ScanFailure::default();
+            let baseline = Arc::new(
+                load_table(&engine, &schema, "ks", "t", baseline_failure.clone())
+                    .await
+                    .unwrap(),
+            );
+            let baseline_rows = scan_rows(baseline.clone()).await;
+            assert_eq!(baseline_rows.len(), size as usize);
+            assert_eq!(
+                baseline_failure.1.peak.load(Relaxed),
+                0,
+                "ordinary scan keeps no emitted-key set"
+            );
+            let manager = crate::mvcc::MvccManager::default();
+            let snapshot = manager.snapshot();
+            let failure = ScanFailure::default();
+            let table = Arc::new(
+                load_table(&engine, &schema, "ks", "t", failure.clone())
+                    .await
+                    .unwrap()
+                    .with_mvcc_view(manager.table_view(&snapshot, "ks.t")),
+            );
+            let rows = scan_rows(table.clone()).await;
+            assert_eq!(rows, baseline_rows);
+            assert_eq!(failure.1.peak.load(Relaxed), size as usize);
+            assert_eq!(failure.1.live.load(Relaxed), 0);
+            curve.push((
+                size,
+                baseline_failure.1.capacity.load(Relaxed),
+                failure.1.capacity.load(Relaxed),
+            ));
+            // Model LIMIT/cancellation: consume one physical row then drop the
+            // iterator while the bounded producer still owns emitted keys.
+            let cancelled_table = table.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut scan = cancelled_table.scan();
+                assert!(scan.next().is_some());
+                drop(scan);
+            })
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while failure.1.live.load(Relaxed) != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled producer must release its keys");
+            assert!(failure.take().is_none());
+            drop(table);
+            drop(snapshot);
+            // The producer's parameter lease drops after its ScanSeen local.
+            // Wait for the actual registry state, not that earlier destructor.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while manager.active_snapshot_count() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("cancelled producer must release its lease");
+            drop(baseline);
+            engine.shutdown().unwrap();
+        }
+        if let Ok(path) = std::env::var("FERROSA_MVCC_SCAN_EVIDENCE") {
+            std::fs::write(
+                path,
+                format!("(rows, baseline key capacity, live key capacity): {curve:?}\n"),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Behavioral RED at real catalog construction: unrelated MVCC rows must
+    /// not be cloned for a read-only catalog or a catalog with one own write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_construction_does_not_copy_unrelated_mvcc_rows() {
+        use crate::mvcc::{MvccManager, PgWrite, RowChange};
+        use ferrosa_sql::Catalog;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let stmt = match ferrosa_sql::parse_statement("SELECT * FROM ks.t").unwrap() {
+            ferrosa_sql::Statement::Select(stmt) => *stmt,
+            _ => panic!("SELECT required"),
+        };
+        let mut curve = Vec::new();
+        for size in [128, 1024, 4096] {
+            let manager = MvccManager::default();
+            let changes = (0..size)
+                .map(|i| RowChange {
+                    table: "ks.t".into(),
+                    key: vec![Value::Text("alpha".into()), Value::Int(i)],
+                    partition_key: b"alpha".to_vec(),
+                    before: None,
+                    after: Some(Row::new(vec![
+                        Value::Text("alpha".into()),
+                        Value::Int(i),
+                        Value::Text("resident".into()),
+                        Value::Int(i),
+                    ])),
+                })
+                .collect();
+            manager
+                .commit(&manager.snapshot(), &HashSet::new(), changes, || Ok(()))
+                .unwrap();
+            let snapshot = manager.snapshot();
+            let staged = vec![PgWrite(ferrosa_storage::Mutation::new(
+                "ks".into(),
+                "t".into(),
+                DecoratedKey::new(PartitionKey::new(b"alpha".to_vec())),
+                vec![storage_row(1, "own", 40, 4000)],
+                4000,
+            ))];
+            let mut counts = Vec::new();
+            for writes in [None, Some(staged.as_slice())] {
+                let count = MvccManager::count_allocations_for_test(|| {
+                    let (catalog, _) = crate::query::load_catalog_with_mvcc(
+                        &engine,
+                        &schema,
+                        &stmt,
+                        "ks",
+                        Some(&manager),
+                        Some(&snapshot),
+                        writes,
+                        None,
+                    )
+                    .now_or_never()
+                    .expect("catalog metadata construction must complete immediately")
+                    .unwrap();
+                    assert!(catalog.resolve("ks", "t").is_some());
+                });
+                counts.push(count);
+            }
+            curve.push((size, counts));
+        }
+        if let Ok(path) = std::env::var("FERROSA_MVCC_CATALOG_EVIDENCE") {
+            std::fs::write(path, format!("(resident rows, [read-only allocations, one-own-write allocations]): {curve:?}\n")).unwrap();
+        }
+        assert!(
+            curve[2].1[0] < curve[0].1[0] * 4,
+            "read-only allocation curve {curve:?}"
+        );
+        assert!(
+            curve[2].1[1] < curve[0].1[1] * 4,
+            "own-write allocation curve {curve:?}"
+        );
         engine.shutdown().unwrap();
     }
 

@@ -366,7 +366,7 @@ values log an error and the process uses the complete defaults:
 | `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | `8388608` | Resident buffer a transaction's write-set may hold before it SPILLS (a streaming buffer size, never a cap) |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
-| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
+| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry interval |
 | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS_PER_CONNECTION` | `64` | Concurrent SUSPENDED portals one connection may hold — a concurrency bound, not a data cap (see the census) |
 | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS` | `2048` | Concurrent suspended portals per node — a concurrency bound, not a data cap (see the census) |
 | `FERROSA_POSTGRES_SUSPENDED_PORTAL_IDLE_TIMEOUT_MS` | `600000` | Idle timeout after which a suspended portal is closed (`57014`) |
@@ -376,10 +376,30 @@ spills) and its constant, config field and accessor were removed. Neither it nor
 the consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` is read anywhere any
 more — the conflict index grows rather than refusing (see `ferrosa-cluster` CL-49).
 
-MVCC history pruning keeps empty and single-version histories in place. No
-version can be discarded in either case, so pruning avoids rebuilding the map
-and preserves the existing row owner without an allocation. Multi-version
-snapshot retention follows the existing oldest-snapshot boundary.
+MVCC publishes persistent `imbl` HAMT roots through `arc-swap`. Active snapshots
+own structurally shared roots and immutable `Arc` row payloads. Dropping the last
+lease or expiring a snapshot removes its registry root; neither path sweeps
+unrelated row histories. Local commits reserve changed keys and their point/scan
+read scopes before storage apply, publish before-images before any physical
+change, and invoke storage exactly once outside metadata CAS retries. Disjoint
+writers and snapshot reads can progress while another storage apply pauses.
+Overlapping reservations or stale reads fail with `40001` before storage effects.
+Storage/WAL work itself may block. Cluster prepare publishes timestamped images;
+apply retains each key's latest applied image and future prepares, while active
+roots retain their historical images. Applied-transaction replay is idempotent. A new cluster snapshot requesting
+history older than a retained head fails with `40001` instead of falling through
+to current physical storage.
+
+Streaming providers resolve the live snapshot root after each physical read,
+restore deleted rows once, and keep staged own writes ahead of snapshot images.
+Restoration enumerates shared key-only roots and resolves each payload through
+the live registry, so a held iterator cannot pin an expired historical table.
+They retain an emitted-key set of O(scanned keys) for late-delete reconciliation,
+in addition to the bounded row channel; they do not retain the scanned rows.
+Cancellation drops the producer's keys and lease. Expiry is checked during the
+scan and returns `40001`. Current heads, active roots, outstanding prepares and
+the applied-transaction identity set remain resident; this is no total MVCC
+memory cap or durable version store.
 
 ### Cap census (no-hard-bounds rule)
 
@@ -606,6 +626,9 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 | Codec / messages | `codec::{read_startup, read_frontend, MAX_MESSAGE_LEN}`, `messages::{FrontendMessage, BackendMessage, TransactionStatus, …}` |
 
 ## Dependencies
+
+Persistent MVCC metadata uses `imbl = 7.0.2` (MPL-2.0) for structurally shared
+HAMTs/ordered maps and `arc-swap` for atomic root publication.
 
 **Calls** (ferrosa crates this depends on):
 

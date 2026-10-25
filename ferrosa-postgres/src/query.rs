@@ -1573,7 +1573,6 @@ async fn apply_or_buffer_silent(
         }
         None => match mvcc {
             Some(mvcc) => {
-                let _commit_guard = mvcc.commit_guard().await;
                 match commit_mutations(
                     engine,
                     schema,
@@ -1659,7 +1658,6 @@ async fn apply_batch_or_buffer_silent(
         }
         None => match mvcc {
             Some(mvcc) => {
-                let _commit_guard = mvcc.commit_guard().await;
                 match commit_mutations(
                     engine,
                     schema,
@@ -1806,23 +1804,22 @@ pub(crate) fn commit_mutations<S: ferrosa_storage::write_set_stage::WriteSetSour
             },
         );
     }
-    mvcc.commit(snapshot, read_tables, || {
+    mvcc.commit(snapshot, read_tables, changes, || {
         // The durable apply reads the write-set as a STREAM: a staged, spilled
         // write-set is decoded one mutation at a time, so the apply never
         // re-materializes the whole set. The source's residency is its own
         // tunable staging buffer.
         engine.write_atomic_batch(source)?;
-        Ok(changes)
+        Ok(())
     })
 }
 
 /// Build the MVCC row images for a write-set read from a [`WriteSetSource`].
 ///
-/// The row-image build still resolves a whole-table overlay, so the set is
-/// materialized for [`prepare_row_changes`] and DROPPED before the durable apply
-/// runs — the COMMIT's apply pass reads the source as a stream. Bounding THIS
-/// build (and the MVCC history it feeds) needs an on-disk version store and is
-/// the named follow-up for FMEA PG-12/#2.
+/// This build materializes the mutation set for [`prepare_row_changes`], which
+/// resolves before-images for touched rows. The materialized set is dropped
+/// before durable apply streams the source again. Bounding row-image preparation
+/// and total retained MVCC state remains a follow-up for FMEA PG-12/#2.
 pub(crate) fn prepare_row_changes_from_source<
     S: ferrosa_storage::write_set_stage::WriteSetSource,
 >(
@@ -4613,24 +4610,36 @@ pub(crate) async fn load_catalog_with_mvcc(
             continue;
         }
         let table_name = format!("{keyspace}.{}", table_ref.table);
-        let mut overlay = match (mvcc, snapshot) {
-            (Some(mvcc), Some(snapshot)) => mvcc.table_overlay(snapshot, &table_name),
-            _ => Default::default(),
+        let view = match (mvcc, snapshot) {
+            (Some(mvcc), Some(snapshot)) => Some(mvcc.table_view(snapshot, &table_name)),
+            _ => None,
         };
+        let overlay_error = |error| match error {
+            MvccCommitError::SnapshotExpired => {
+                error_response("40001", "PostgreSQL transaction snapshot expired")
+            }
+            MvccCommitError::SerializationFailure => {
+                error_response("40001", "could not serialize PostgreSQL transaction")
+            }
+            MvccCommitError::Storage(error) => {
+                error_response("58000", &format!("transaction overlay failed: {error}"))
+            }
+        };
+        if let Some(view) = &view {
+            view.ensure_active().map_err(overlay_error)?;
+        }
+        let mut overlay = Default::default();
         if let Some(writes) = pending_writes {
-            if let Err(error) = crate::storage_provider::apply_pending_writes(
+            crate::storage_provider::staged_overlay(
                 engine,
                 schema,
                 keyspace,
                 &table_ref.table,
                 &mut overlay,
                 writes,
-            ) {
-                return Err(error_response(
-                    "58000",
-                    &format!("transaction overlay failed: {error}"),
-                ));
-            }
+                view.as_ref(),
+            )
+            .map_err(overlay_error)?;
         }
         match load_table_with_overlay(
             engine,
@@ -4645,6 +4654,10 @@ pub(crate) async fn load_catalog_with_mvcc(
         .await
         {
             Ok(table) => {
+                let table = match view {
+                    Some(view) => table.with_mvcc_view(view),
+                    None => table,
+                };
                 catalog = catalog.with_table(keyspace, &table_ref.table, Arc::new(table));
             }
             Err(LoadError::NoSuchTable { .. }) => {
@@ -4668,9 +4681,9 @@ pub(crate) async fn load_catalog_with_mvcc(
 /// arrived", not "these are all the rows". The storage error is the real cause
 /// and outranks any `ExecError` computed from the fragment.
 pub(crate) fn check_scan_failure(failure: &ScanFailure) -> Option<BackendMessage> {
-    failure
-        .take()
-        .map(|msg| error_response("58000", &format!("{msg} (query aborted; result discarded)")))
+    failure.take_with_code().map(|(code, msg)| {
+        error_response(code, &format!("{msg} (query aborted; result discarded)"))
+    })
 }
 
 /// Render a `QueryResult` (or an `ExecError`) into backend messages for the
