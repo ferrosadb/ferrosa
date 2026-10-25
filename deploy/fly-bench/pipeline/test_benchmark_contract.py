@@ -99,7 +99,7 @@ class ContractTests(unittest.TestCase):
             return 1.0
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "result.json"
-            argv = ["workload.py", "--runtime-config", "unused.json", "--arm", "D",
+            argv = ["workload.py", "--runtime-config", "unused.json", "--arm", "E",
                     "--round", "1", "--protocol", "pg", "--revision", "fixture",
                     "--image", "fixture", "--rows", "8", "--reads", "8",
                     "--concurrency", "1", "--out", str(output)]

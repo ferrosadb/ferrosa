@@ -7,7 +7,7 @@ revision and image supplied by the controller; independently record the running
 binary checksum and image digest with the collector.
 
 Use Python 3.11+ with `psycopg[binary]` and `neo4j`. Record installed package
-versions and use the same client environment for both arms. Contract tests need
+versions and use the same client environment for both arms. Arm labels A–E identify experiment candidates; source revision and immutable image identity are the authoritative implementation metadata. Contract tests need
 only the standard library:
 
 ```sh
