@@ -42,3 +42,35 @@ Local System-allocator probes also showed a tradeoff: shared cell payloads
 reduced requested allocation bytes by 20.4% with four observers, while increasing
 them by 17.6% with no observers for the measured 128-cell/64-byte workload.
 Requested allocation bytes are neither peak RSS nor a Fly heap profile.
+
+## Persistent MVCC and PostgreSQL Sync (2026-10-24)
+
+New native PostgreSQL controls use the same client and workload as these
+Ferrosa runs. Each value below is the mean of two unprofiled repetitions;
+full run values and ranges are in [mvcc-sync-results.json](mvcc-sync-results.json).
+
+| INSERT comparison | Before rows/s | After rows/s | PostgreSQL rows/s | After / PostgreSQL |
+| --- | ---: | ---: | ---: | ---: |
+| Persistent MVCC, A5/B5/B6/A6 | 2,098 | 2,684 | 25,279 | 10.6% |
+| Commit pipelined statements at Sync, B7/C7/C8/B8 | 2,737 | 21,275 | 25,279 | 84.2% |
+
+The MVCC change improved INSERT throughput by 27.9%. The Sync fix improved it
+7.77 times: the previous path committed each Execute independently, whereas
+PostgreSQL groups the implicit transaction through Sync. Regression tests also
+verify all-or-nothing rollback of that group. PostgreSQL 18.6 had fsync,
+synchronous_commit and full_page_writes enabled. Both servers used the same
+2-performance-CPU/4-GiB service class and region; PostgreSQL used its root
+filesystem and Ferrosa an attached volume, so storage was not identical.
+
+Reads remain 34.7 ops/s after Sync versus PostgreSQL's 9,497.8. The exact-key
+read fix and decoder allocation fix are later source changes and are **not**
+measured by this table.
+
+Separate 20,000-row INSERT-only software CPU captures validate every row after
+the collector stops. The old MVCC history-pruning functions accounted for
+111/201 user CPU samples (55.2%); neither function appears in the persistent
+candidate captures. Sample counts are only 116 before Sync and 52 after Sync,
+so those captures do not establish a precise remaining CPU ranking. Flame
+graphs, process/run-queue samples, disk and network counters are retained in
+the private evidence. These runs do not measure individual mutex wait time
+or Fly heap allocation counts. Profiled throughput is excluded above.
