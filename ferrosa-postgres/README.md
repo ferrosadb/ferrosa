@@ -384,6 +384,14 @@ read scopes before storage apply, publish before-images before any physical
 change, and invoke storage exactly once outside metadata CAS retries. Disjoint
 writers and snapshot reads can progress while another storage apply pauses.
 Overlapping reservations or stale reads fail with `40001` before storage effects.
+
+Fresh local inserts represent their pre-insert absence once in the current head.
+An older snapshot missing that key resolves this shared absence without copying
+an entry into every reader root. First-touch rows that already exist physically
+still publish their before-image to active roots before storage apply; later
+updates preserve the original absence fact and each snapshot's existing image.
+The allocation regression compares 128/256-key commits with 1 versus 16 held
+readers, and a paused-apply test checks both absent and pre-existing rows.
 Storage/WAL work itself may block. Cluster prepare publishes timestamped images;
 apply retains each key's latest applied image and future prepares, while active
 roots retain their historical images. Applied-transaction replay is idempotent. A new cluster snapshot requesting

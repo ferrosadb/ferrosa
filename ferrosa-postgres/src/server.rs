@@ -4717,11 +4717,7 @@ pub(crate) mod txn_atomicity_tests {
     async fn point_lookup_bound_parameter_skips_unrelated_partition_decode() {
         let (_dir, ctx) = point_lookup_fixture().await;
         let mut reader = Session::new(superuser());
-        reader.on_parse(
-            "point".into(),
-            "SELECT v FROM kv WHERE k = $1",
-            vec![25],
-        );
+        reader.on_parse("point".into(), "SELECT v FROM kv WHERE k = $1", vec![25]);
         reader.on_bind(
             "point".into(),
             "point".into(),

@@ -260,6 +260,10 @@ type ClusterRows = TableRows<OrdMap<Timestamp, SharedRow>>;
 struct LocalVersion {
     seq: u64,
     row: SharedRow,
+    /// A snapshot root missing this key predates its first admission to local
+    /// MVCC, when physical storage also had no row. Preserve that fact across
+    /// later head updates instead of inserting None into every older root.
+    baseline_absent: bool,
 }
 #[derive(Clone)]
 struct ActiveSnapshot {
@@ -287,6 +291,8 @@ struct State {
     reservations: PersistentMap<u64, Reservation>,
     applied_accord_txns: PersistentSet<(TxnId, Timestamp)>,
     table_epochs: PersistentMap<String, u64>,
+    /// Allocated once with the manager, so implicit absence reads never allocate.
+    absent: SharedRow,
 }
 
 /// Atomic persistent metadata publication. Physical storage/WAL work remains
@@ -637,6 +643,16 @@ impl MvccManager {
                 return Err(MvccCommitError::SerializationFailure);
             }
             for (key, owned_key, before, _) in &prepared {
+                // Existing keys already have either their snapshot version or
+                // an implicit absence marker. A mutable entry lookup here
+                // would copy shared paths even when or_insert changed nothing.
+                if state
+                    .local
+                    .get(&key.table)
+                    .is_some_and(|table| table.contains_key(owned_key))
+                {
+                    continue;
+                }
                 state
                     .keys
                     .entry(key.table.clone())
@@ -646,15 +662,20 @@ impl MvccManager {
                 // Inheriting an unrelated global epoch would manufacture a
                 // conflict even when physical apply later fails.
                 let seq = 0;
-                state
-                    .local
-                    .entry(key.table.clone())
-                    .or_default()
-                    .entry(owned_key.clone())
-                    .or_insert_with(|| LocalVersion {
+                state.local.entry(key.table.clone()).or_default().insert(
+                    owned_key.clone(),
+                    LocalVersion {
                         seq,
                         row: before.clone(),
-                    });
+                        baseline_absent: before.is_none(),
+                    },
+                );
+                if before.is_none() {
+                    // Missing older roots can resolve the same known absence
+                    // through this head. Do not build readers × inserted-keys
+                    // persistent entries for a row that never existed there.
+                    continue;
+                }
                 // Only changed paths, never unrelated row histories.
                 for (_, active) in state.active_snapshots.iter_mut() {
                     active
@@ -665,6 +686,7 @@ impl MvccManager {
                         .or_insert_with(|| LocalVersion {
                             seq,
                             row: before.clone(),
+                            baseline_absent: false,
                         });
                 }
             }
@@ -681,13 +703,13 @@ impl MvccManager {
             if !prepared.is_empty() {
                 state.commit_seq = state.commit_seq.saturating_add(1);
                 for (key, owned_key, _, after) in &prepared {
-                    state.local.entry(key.table.clone()).or_default().insert(
-                        owned_key.clone(),
-                        LocalVersion {
-                            seq: state.commit_seq,
-                            row: after.clone(),
-                        },
-                    );
+                    let version = state
+                        .local
+                        .get_mut(&key.table)
+                        .and_then(|table| table.get_mut(owned_key))
+                        .expect("reservation published the local baseline");
+                    version.seq = state.commit_seq;
+                    version.row = after.clone();
                     state
                         .table_epochs
                         .insert(key.table.clone(), state.commit_seq);
@@ -798,11 +820,22 @@ impl MvccTableView {
                 None => Ok(None),
             }
         } else {
-            Ok(active
+            let historical = active
                 .local
                 .get(&self.table)
                 .and_then(|table| table.get(key))
-                .map(|version| version.row.clone()))
+                .map(|version| version.row.clone());
+            if historical.is_some() {
+                return Ok(historical);
+            }
+            // This root predates a key whose first physical image was absent.
+            // Distinguish that known absence from an untracked physical row.
+            let absent = state
+                .local
+                .get(&self.table)
+                .and_then(|table| table.get(key))
+                .is_some_and(|version| version.baseline_absent);
+            Ok(absent.then(|| state.absent.clone()))
         }
     }
     /// Enumerate a persistent KEY-ONLY root. Each payload is resolved from the
@@ -1807,6 +1840,168 @@ mod tests {
             view.rows().unwrap().next().unwrap(),
             Err(MvccCommitError::SnapshotExpired)
         ));
+    }
+
+    /// Fresh rows require one commit's metadata, not a row image per held reader.
+    /// Compare real commits in the same run, excluding fixture construction.
+    #[test]
+    fn fresh_insert_reader_fanout_does_not_multiply_commit_allocations() {
+        fn measured_commit(rows: usize, readers: usize) -> usize {
+            let manager = MvccManager::default();
+            let held: Vec<_> = (0..readers).map(|_| manager.snapshot()).collect();
+            let writer = manager.snapshot();
+            let read_tables = HashSet::new();
+            let changes = (0..rows)
+                .map(|key| RowChange {
+                    table: "public.items".into(),
+                    key: vec![Value::Int(key as i64)],
+                    partition_key: (key as u64).to_be_bytes().to_vec(),
+                    before: None,
+                    after: Some(row("inserted")),
+                })
+                .collect();
+            let allocations = MvccManager::count_allocations_for_test(|| {
+                manager
+                    .commit(&writer, &read_tables, changes, || Ok(()))
+                    .unwrap();
+            });
+            // Keep every reader live through the measured commit and verify the
+            // absence is known, rather than an unknown physical-row fallback.
+            for snapshot in &held {
+                for key in [0, rows - 1] {
+                    let view = manager.table_view(snapshot, "public.items");
+                    let visible = view.row(&vec![Value::Int(key as i64)]).unwrap();
+                    assert_eq!(visible.as_deref(), Some(&None));
+                }
+            }
+            let new = manager.snapshot();
+            let visible = manager
+                .table_view(&new, "public.items")
+                .row(&vec![Value::Int((rows - 1) as i64)])
+                .unwrap();
+            assert_eq!(visible.as_deref(), Some(&Some(row("inserted"))));
+            allocations
+        }
+
+        let curve: Vec<_> = [128, 256]
+            .into_iter()
+            .map(|rows| {
+                let one_reader = measured_commit(rows, 1);
+                let sixteen_readers = measured_commit(rows, 16);
+                (rows, one_reader, sixteen_readers)
+            })
+            .collect();
+        for (rows, one_reader, sixteen_readers) in curve {
+            assert!(
+                one_reader > 0,
+                "allocation probe must observe real commit work"
+            );
+            // Holding 16x as many readers must not double the whole commit's
+            // allocations. 2x leaves room for HAMT depth/registry differences;
+            // it rejects per-key work replicated into each reader's row map.
+            assert!(sixteen_readers <= one_reader * 2,
+                "fresh INSERT allocation work multiplied with held readers: rows={rows}, one_reader={one_reader}, sixteen_readers={sixteen_readers}, budget={}", one_reader * 2);
+        }
+    }
+
+    /// Publish known absence before storage apply, while retaining real first-
+    /// touch before-images. Both snapshots must keep that view after publication.
+    #[test]
+    fn fresh_insert_reader_views_keep_known_absence_and_first_touch_before_images() {
+        let manager = Arc::new(MvccManager::default());
+        let old = manager.snapshot();
+        let writer_snapshot = manager.snapshot();
+        let fresh_key = vec![Value::Int(2)];
+        let existing_key = vec![Value::Int(1)];
+        assert!(
+            manager
+                .table_view(&old, "public.items")
+                .row(&fresh_key)
+                .unwrap()
+                .is_none(),
+            "fixture starts with no MVCC baseline for the fresh key"
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let writer_manager = manager.clone();
+        let writer = std::thread::spawn(move || {
+            let mut fresh = change(None, Some(row("inserted")));
+            fresh.key = vec![Value::Int(2)];
+            fresh.partition_key = vec![2];
+            writer_manager
+                .commit(
+                    &writer_snapshot,
+                    &HashSet::new(),
+                    vec![
+                        change(Some(row("physical-before")), Some(row("updated"))),
+                        fresh,
+                    ],
+                    || {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        let reader_manager = manager.clone();
+        let reader_old = old.clone();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let during = reader_manager.snapshot();
+            let observations: Vec<_> = [&reader_old, &during]
+                .into_iter()
+                .map(|snapshot| {
+                    let view = reader_manager.table_view(snapshot, "public.items");
+                    (
+                        view.row(&vec![Value::Int(2)])
+                            .map(|row| row.map(|shared| (*shared).clone())),
+                        view.row(&vec![Value::Int(1)])
+                            .map(|row| row.map(|shared| (*shared).clone())),
+                    )
+                })
+                .collect();
+            read_tx.send((during, observations)).unwrap();
+        });
+        // Release and join before asserting, so a visibility/liveness failure
+        // cannot leave the writer blocked inside the apply callback.
+        let observed = read_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        reader.join().unwrap();
+        let (during, observations) = observed.expect("snapshot reads progress during paused apply");
+        for (fresh, existing) in observations {
+            assert_eq!(
+                fresh.unwrap(),
+                Some(None),
+                "fresh key has known absence during apply"
+            );
+            assert_eq!(
+                existing.unwrap(),
+                Some(Some(row("physical-before"))),
+                "first-touch before-image remains visible during apply"
+            );
+        }
+        for snapshot in [&old, &during] {
+            let view = manager.table_view(snapshot, "public.items");
+            assert_eq!(view.row(&fresh_key).unwrap().as_deref(), Some(&None));
+            assert_eq!(
+                view.row(&existing_key).unwrap().as_deref(),
+                Some(&Some(row("physical-before")))
+            );
+        }
+        let new = manager.snapshot();
+        let view = manager.table_view(&new, "public.items");
+        assert_eq!(
+            view.row(&fresh_key).unwrap().as_deref(),
+            Some(&Some(row("inserted")))
+        );
+        assert_eq!(
+            view.row(&existing_key).unwrap().as_deref(),
+            Some(&Some(row("updated")))
+        );
     }
 
     #[test]

@@ -190,7 +190,7 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
   pin a read timestamp; simple and extended SELECT use version overlays; buffered
   writes are visible to their own transaction; commit validates exact-key reads and table scans, reserves overlapping
   scopes, and atomically applies through the local storage engine. Metadata roots
-  are persistent and atomically published; disjoint writers need no global gate. In cluster mode a global PostgreSQL commit marker currently
+  are persistent and atomically published; disjoint writers need no global gate. Fresh INSERT absence is represented once instead of copied into every active reader root; first-touch physical before-images remain protected. In cluster mode a global PostgreSQL commit marker currently
   validates snapshots, conservatively aborting after any intervening PG commit.
   Write skew, predicate conflicts, lost updates, and real-time-order violations
   abort or return the committed value as appropriate; historical payloads are reclaimed
