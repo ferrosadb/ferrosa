@@ -587,6 +587,7 @@ mod tests {
             region: "us-east-1".into(),
             access_key_id: None,
             secret_access_key: None,
+            skip_signature: false,
             allow_http: true,
             prefix: "pitr-http".into(),
             upload_queue_depth: 16,

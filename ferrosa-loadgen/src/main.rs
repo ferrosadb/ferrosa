@@ -245,6 +245,7 @@ fn main() {
         region: "us-east-1".into(),
         access_key_id: Some(args.s3_access_key),
         secret_access_key: Some(args.s3_secret_key),
+        skip_signature: false,
         allow_http: true,
         prefix: format!("loadgen-{}", uuid::Uuid::new_v4()),
         upload_queue_depth: 16,

@@ -404,6 +404,12 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   warning. With it, a missing or invalid S3 configuration, a local `file://`
   backend, or a failed bucket check stops startup with an error naming the switch.
   A value that is not a boolean is an error, not "off".
+  **Unsigned requests (`FERROSA_S3_SKIP_SIGNATURE=true`, default off):** for a
+  host with no credentials whose access is granted by the bucket policy alone
+  (for example to a VPC endpoint and the host's private address). Building the
+  store logs a WARN naming the bucket every time it is on; any value other than
+  `true`/`false`, or `true` together with `FERROSA_S3_ACCESS_KEY_ID` or
+  `FERROSA_S3_SECRET_ACCESS_KEY`, stops startup naming the variable.
   **Request throttling (`upload/throttle.rs`):** every path shares one object
   store, wrapped in `ThrottledStore`. `FERROSA_S3_MAX_REQUESTS_PER_SECOND` paces
   requests evenly (no burst) and `FERROSA_S3_MAX_CONCURRENT_REQUESTS` caps them

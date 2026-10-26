@@ -34,6 +34,11 @@ pub struct ObjectStoreConfig {
     pub access_key_id: Option<String>,
     /// Secret access key (optional).
     pub secret_access_key: Option<String>,
+    /// Send every request unsigned (`FERROSA_S3_SKIP_SIGNATURE=true`; default
+    /// `false`). For hosts with no credentials at all, whose access is granted
+    /// by the bucket policy (for example to a VPC endpoint and the host's
+    /// address) rather than by an identity. Never combined with access keys.
+    pub skip_signature: bool,
     /// Allow non-TLS connections (for MinIO local dev).
     pub allow_http: bool,
     /// Key prefix for multi-tenant separation.
@@ -127,6 +132,7 @@ impl ObjectStoreConfig {
                     region: String::new(),
                     access_key_id: None,
                     secret_access_key: None,
+                    skip_signature: false,
                     allow_http: false,
                     prefix,
                     upload_queue_depth,
@@ -158,6 +164,10 @@ impl ObjectStoreConfig {
 
         let access_key_id = std::env::var("FERROSA_S3_ACCESS_KEY_ID").ok();
         let secret_access_key = std::env::var("FERROSA_S3_SECRET_ACCESS_KEY").ok();
+        let skip_signature = parse_skip_signature(
+            std::env::var("FERROSA_S3_SKIP_SIGNATURE").ok().as_deref(),
+            access_key_id.is_some() || secret_access_key.is_some(),
+        )?;
 
         let allow_http = std::env::var("FERROSA_S3_ALLOW_HTTP")
             .ok()
@@ -171,6 +181,7 @@ impl ObjectStoreConfig {
             region,
             access_key_id,
             secret_access_key,
+            skip_signature,
             allow_http,
             prefix,
             upload_queue_depth,
@@ -275,6 +286,17 @@ impl ObjectStoreConfig {
         if let Some(ref secret) = self.secret_access_key {
             builder = builder.with_secret_access_key(secret);
         }
+        if self.skip_signature {
+            parse_skip_signature(
+                Some("true"),
+                self.access_key_id.is_some() || self.secret_access_key.is_some(),
+            )?;
+            tracing::warn!(
+                bucket = %self.bucket,
+                "object store requests are UNSIGNED (FERROSA_S3_SKIP_SIGNATURE=true): access rests on the bucket policy, not on a credential"
+            );
+            builder = builder.with_skip_signature(true);
+        }
 
         let store = builder.build().map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to build S3 client: {e}"))
@@ -336,6 +358,7 @@ impl ObjectStoreConfig {
             region: "us-east-1".into(),
             access_key_id: Some("minioadmin".into()),
             secret_access_key: Some("minioadmin".into()),
+            skip_signature: false,
             allow_http: true,
             prefix: String::new(),
             upload_queue_depth: 16,
@@ -576,9 +599,80 @@ pub fn parse_body_idle_timeout(value: Option<&str>) -> ferrosa_common::Result<st
     Ok(std::time::Duration::from_secs(secs))
 }
 
+/// Parse `FERROSA_S3_SKIP_SIGNATURE`. Unset or empty is `false`; otherwise it
+/// must be exactly `true` or `false`, and `true` is refused when access keys
+/// are also configured, since a request cannot be both signed and unsigned.
+pub fn parse_skip_signature(value: Option<&str>, has_keys: bool) -> ferrosa_common::Result<bool> {
+    let skip = match value.map(str::trim) {
+        None | Some("") | Some("false") => false,
+        Some("true") => true,
+        Some(other) => {
+            return Err(ferrosa_common::Error::InvalidFormat(format!(
+                "FERROSA_S3_SKIP_SIGNATURE must be true or false, got {other:?}"
+            )))
+        }
+    };
+    if skip && has_keys {
+        return Err(ferrosa_common::Error::InvalidFormat(
+            "FERROSA_S3_SKIP_SIGNATURE=true cannot be combined with FERROSA_S3_ACCESS_KEY_ID or FERROSA_S3_SECRET_ACCESS_KEY".into(),
+        ));
+    }
+    Ok(skip)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn skip_signature_is_off_unless_exactly_true() {
+        assert!(!parse_skip_signature(None, false).unwrap());
+        assert!(!parse_skip_signature(Some(""), false).unwrap());
+        assert!(!parse_skip_signature(Some("false"), true).unwrap());
+        assert!(parse_skip_signature(Some("true"), false).unwrap());
+        assert!(parse_skip_signature(Some("yes"), false).is_err());
+        assert!(parse_skip_signature(Some("1"), false).is_err());
+    }
+
+    #[test]
+    fn skip_signature_refuses_access_keys() {
+        let err = parse_skip_signature(Some("true"), true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot be combined"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_unsigned_client_sends_no_authorization_header() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+            let _ = sock.write_all(b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+            req
+        });
+        let cfg = ObjectStoreConfig {
+            endpoint: format!("http://{addr}"),
+            bucket: "b".into(),
+            allow_http: true,
+            access_key_id: None,
+            secret_access_key: None,
+            skip_signature: true,
+            ..ObjectStoreConfig::test_config()
+        };
+        let store = cfg.build_object_store().unwrap();
+        let _ = store.head(&object_store::path::Path::from("k")).await;
+        let req = server.join().unwrap();
+        assert!(req.starts_with("head /b/k"), "{req}");
+        assert!(
+            !req.contains("authorization:"),
+            "an unsigned request carried a signature: {req}"
+        );
+    }
 
     #[test]
     fn the_pool_is_sized_from_in_flight_and_ignores_workers_and_cores() {

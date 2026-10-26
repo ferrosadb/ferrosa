@@ -35,6 +35,7 @@ fn s3_config(dir: &Path, profile: &LoadProfile) -> StorageEngineConfig {
         region: "us-east-1".into(),
         access_key_id: Some("rustfsadmin".into()),
         secret_access_key: Some("rustfsadmin".into()),
+        skip_signature: false,
         allow_http: true,
         prefix: format!("test-{}", uuid::Uuid::new_v4()),
         upload_queue_depth: 8,
