@@ -91,8 +91,16 @@ RUN test -x target/release/ferrosa
 FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
 # gdb + procps available in the runtime image so crashes produce readable backtraces
 # (paired with `[profile.release] debug = "line-tables-only"` in the workspace Cargo.toml).
+# curl is not for the engine. Our own roll and provisioning tooling probes the
+# engine's /readyz from inside the container, over HTTPS on loopback, because
+# that is the only view that proves this node serves traffic. The image must
+# therefore ship an HTTP client: without one the probe cannot run at all, and a
+# missing binary is reported upstream as a node that "never became ready", which
+# is indistinguishable from a real failure. Do not make the probe depend on a
+# shell utility this image may not have.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         gdb \
         procps \
     && rm -rf /var/lib/apt/lists/*

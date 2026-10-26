@@ -108,6 +108,7 @@ static GLOBAL: counting_alloc::CountingJemalloc = counting_alloc::CountingJemall
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:0,muzzy_decay_ms:0\0";
 
 mod cql_broadcast;
+mod data_dir_lock;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_tuning;
 mod lifecycle;
@@ -1401,6 +1402,55 @@ fn resolve_hinted_handoff_dir(
         .unwrap_or_else(|| data_dir.join("hints"))
 }
 
+/// Every directory this node keeps state in that can be configured apart from
+/// the data dir: Raft (`FERROSA_RAFT_DATA_DIR`, or a per-DC override for the
+/// local DC) and hinted handoff (`[cluster].hinted_handoff_dir` /
+/// `FERROSA_HINTED_HANDOFF_DIR`). The commit log, compaction staging,
+/// SSTables, indexes, Accord and the schema snapshot are always under the
+/// data dir. The `file://` object store (`FERROSA_LOCAL_STORE_PATH`) is not
+/// listed: it stands in for a bucket, which several nodes may share by prefix.
+fn separately_configured_state_dirs(
+    file_config: &toml::Value,
+    data_dir: &Path,
+) -> Vec<std::path::PathBuf> {
+    let cluster = ferrosa_cluster::ClusterConfig::from_env();
+    let raft = cluster.raft_data_dir_for_dc(&cluster.data_center);
+    let hints = resolve_hinted_handoff_dir(
+        file_config,
+        data_dir,
+        std::env::var("FERROSA_HINTED_HANDOFF_DIR").ok().as_deref(),
+    );
+    raft.into_iter().chain(std::iter::once(hints)).collect()
+}
+
+/// Lock the data dir and every separately configured state dir for the life of
+/// the process, or exit with [`data_dir_lock::EXIT_DATA_DIR_LOCKED`] naming the
+/// holder. A refused process has touched nothing but the lock file it opened.
+fn lock_node_dirs_or_exit(file_config: &toml::Value, data_dir: &Path) {
+    let extra = separately_configured_state_dirs(file_config, data_dir);
+    let locks = match data_dir_lock::lock_node_dirs(data_dir, &extra) {
+        Ok(locks) => locks,
+        Err(error) => {
+            let code = match error {
+                data_dir_lock::LockError::Held { .. } => data_dir_lock::EXIT_DATA_DIR_LOCKED,
+                data_dir_lock::LockError::Io { .. } => 1,
+            };
+            // stderr as well as the log: a supervisor's stderr capture is
+            // where a refused second job is most likely to be read.
+            eprintln!("ferrosa: refusing to start: {error}");
+            lifecycle::fatal_exit(code, &format!("refusing to start: {error}"));
+        }
+    };
+    let held: Vec<String> = locks
+        .iter()
+        .map(|lock| lock.dir().display().to_string())
+        .collect();
+    if let Err(error) = data_dir_lock::hold_for_process_lifetime(locks) {
+        lifecycle::fatal_exit(1, &error);
+    }
+    tracing::info!(dirs = ?held, pid = std::process::id(), "holding exclusive data directory locks");
+}
+
 /// Outcome of classifying the on-disk host_id state.
 ///
 /// Extracted from [`load_or_generate_host_id_with`] so the decision
@@ -2117,11 +2167,15 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
         "data_dir",
         "/var/lib/ferrosa",
     ));
+    std::fs::create_dir_all(&data_dir)?;
+    // One process per data dir (P0, t_34e20fa6), before ANYTHING below reads,
+    // quarantines, replays, cleans or creates a file under it. See
+    // `data_dir_lock` for what a second process did on 2026-10-25.
+    lock_node_dirs_or_exit(&file_config, Path::new(&data_dir));
     // Parse and validate the authoritative registry snapshot before opening
     // storage or serving any protocol. Corrupt or storage-only legacy input is
     // quarantined and aborts startup instead of becoming an empty live schema.
     let local_schema_snapshot = load_local_schema(Path::new(&data_dir))?;
-    std::fs::create_dir_all(&data_dir)?;
     let host_id = load_or_generate_host_id(Path::new(&data_dir));
 
     // Pin the data dir the storage engine will use to the one we just resolved

@@ -3159,7 +3159,18 @@ impl StorageEngine {
     fn cleanup_stale_compaction_staging(
         config: &StorageEngineConfig,
     ) -> ferrosa_common::Result<()> {
-        let output_dir = &config.compaction.output_dir;
+        Self::cleanup_staging_dir(&config.compaction.output_dir, |dir| {
+            std::fs::remove_dir_all(dir)
+        })
+    }
+
+    /// [`Self::cleanup_stale_compaction_staging`] with the removal injectable,
+    /// so a test can make the directory vanish between the scan and the
+    /// removal.
+    fn cleanup_staging_dir(
+        output_dir: &Path,
+        remove_dir_all: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> ferrosa_common::Result<()> {
         if !output_dir.exists() {
             std::fs::create_dir_all(output_dir).map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
@@ -3171,12 +3182,23 @@ impl StorageEngine {
         }
 
         let removed_files = Self::count_regular_files(output_dir)?;
-        std::fs::remove_dir_all(output_dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to remove stale compaction staging dir {}: {e}",
-                output_dir.display()
-            ))
-        })?;
+        match remove_dir_all(output_dir) {
+            Ok(()) => {}
+            // Already gone (t_a3395843): nothing to clean is not a failure.
+            // Exiting here killed a node at boot on 2026-10-25.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    path = %output_dir.display(),
+                    "storage startup: compaction staging dir was already gone; nothing to clean"
+                );
+            }
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to remove stale compaction staging dir {}: {e}",
+                    output_dir.display()
+                )))
+            }
+        }
         std::fs::create_dir_all(output_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "failed to recreate compaction staging dir {}: {e}",
@@ -3195,14 +3217,21 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Regular files under `dir`, for the cleanup log line. A directory that is
+    /// gone holds none (t_a3395843); every other error names the path.
     fn count_regular_files(dir: &Path) -> ferrosa_common::Result<usize> {
         let mut count = 0usize;
-        for entry in std::fs::read_dir(dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to read compaction staging dir {}: {e}",
-                dir.display()
-            ))
-        })? {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to read compaction staging dir {}: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        for entry in entries {
             let entry = entry.map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
                     "failed to read compaction staging entry in {}: {e}",
@@ -18611,6 +18640,60 @@ mod tests {
         assert!(
             live_data.exists(),
             "startup cleanup must not remove normal SSTable files"
+        );
+    }
+
+    /// t_a3395843: on 2026-10-25 a node died at boot with "failed to remove
+    /// stale compaction staging dir ...: No such file or directory". The dir
+    /// was gone by the time it was removed. Nothing left to clean is not a
+    /// failure: startup goes on and leaves an empty staging dir.
+    #[test]
+    fn staging_dir_that_vanishes_before_removal_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("compaction");
+        std::fs::create_dir_all(staging.join("ks.t")).unwrap();
+        std::fs::write(staging.join("ks.t").join("7-Data.db"), b"debris").unwrap();
+
+        StorageEngine::cleanup_staging_dir(&staging, |path| {
+            // Someone else (crash residue being cleaned, an operator) removes
+            // it first; the real removal then sees ENOENT.
+            std::fs::remove_dir_all(path).unwrap();
+            std::fs::remove_dir_all(path)
+        })
+        .expect("a staging dir that is already gone has nothing to clean");
+
+        assert!(staging.is_dir(), "the staging dir is recreated");
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// The count that precedes the removal has the same race: a dir gone
+    /// between the existence check and the scan holds no files.
+    #[test]
+    fn counting_a_staging_dir_that_is_gone_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("compaction");
+        assert_eq!(StorageEngine::count_regular_files(&gone).unwrap(), 0);
+    }
+
+    /// Every error other than NotFound stays fatal and names the path.
+    #[test]
+    fn staging_dir_removal_failure_other_than_not_found_is_fatal_and_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("compaction");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let err = StorageEngine::cleanup_staging_dir(&staging, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("a permission error must stop startup");
+        let message = err.to_string();
+        assert!(
+            message.contains(&staging.display().to_string()),
+            "the error names the staging dir: {message}"
+        );
+        assert!(
+            message.contains("failed to remove stale compaction staging dir"),
+            "{message}"
         );
     }
 

@@ -19,8 +19,11 @@ RUN cargo build --release -p ferrosa -p ferrosa-ctl \
     ${FERROSA_FEATURES:+--features "$FERROSA_FEATURES"}
 
 FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+# Same client set as Dockerfile's runtime stage: roll and provisioning tooling
+# probes /readyz from inside the container over HTTPS on loopback, so the image
+# must ship an HTTP client of its own.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates gdb procps \
+        ca-certificates curl gdb procps \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /build/target/release/ferrosa /usr/local/bin/ferrosa
 COPY --from=builder /build/target/release/ferrosa-ctl /usr/local/bin/ferrosa-ctl

@@ -27,8 +27,16 @@
 FROM downloads.ferrosa.ai/debian@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a AS production
 
 # ca-certificates: required for TLS to S3. tzdata: correct timestamps/logs.
+# curl: not for the engine. Our own roll tooling (ferrosa-dbaas
+# scripts/roll-fly-control-cluster.sh) probes this node's /readyz from inside
+# the container, over HTTPS on loopback, because that is the only view that
+# proves the node serves traffic. Without an HTTP client in the image that gate
+# cannot run, and the failure surfaces as "did not become ready" — a missing
+# binary reported as an unhealthy node. curl is chosen over busybox wget because
+# this is a Debian base with no busybox, and over a wget dependency because the
+# probe needs a client that exists, not one that might.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates curl tzdata \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 ferrosa \
     && useradd --system --uid 10001 --gid ferrosa --no-create-home --shell /usr/sbin/nologin ferrosa \
