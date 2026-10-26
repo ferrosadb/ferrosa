@@ -1252,7 +1252,7 @@ mod tests {
         assert_eq!(plan.b_to_a.len(), 1, "B is newer, must be sent");
         assert_eq!(
             plan.b_to_a[0].rows[0].cells[0].1.value,
-            Some(b"new".to_vec())
+            Some(b"new".to_vec().into())
         );
 
         // Symmetric: same data, swap sides.
@@ -1260,7 +1260,7 @@ mod tests {
         assert_eq!(plan.a_to_b.len(), 1, "now A (formerly B) is newer");
         assert_eq!(
             plan.a_to_b[0].rows[0].cells[0].1.value,
-            Some(b"new".to_vec())
+            Some(b"new".to_vec().into())
         );
         assert!(plan.b_to_a.is_empty());
     }

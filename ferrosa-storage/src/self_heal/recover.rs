@@ -569,7 +569,7 @@ mod tests {
             .flatten()
             .and_then(|partition| partition.rows.first().cloned())
             .and_then(|r| r.cells.first().cloned())
-            .and_then(|(_, cell)| cell.value)
+            .and_then(|(_, cell)| cell.value.map(|value| value.into_vec()))
     }
 
     struct NoPeers;

@@ -140,3 +140,8 @@ The smoke harness also requires `ddl_path == "cluster"` inside its existing
 cluster-formation wait, so its one-shot CREATE cannot race publication.
 Behavioral shell regressions cover delayed and permanently missing publication
 without extending the wait or retrying writes.
+
+PostgreSQL is registered as starting before the web readiness endpoint is
+exposed. It becomes up only after its background TCP bind succeeds; pending or
+failed binds keep readiness false. This closes the startup window where an
+empty listener-status map could briefly make an occupied-port node look ready.

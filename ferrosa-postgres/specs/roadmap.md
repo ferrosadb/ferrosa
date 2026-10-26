@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: roadmap
-last_updated: 2026-10-11
+last_updated: 2026-10-26
 ---
 
 # ferrosa-postgres — Roadmap
@@ -188,13 +188,13 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 - **PostgreSQL MVCC transaction semantics.** Explicit SERIALIZABLE begins
   pin a read timestamp; simple and extended SELECT use version overlays; buffered
-  writes are visible to their own transaction; commit checks table-level read
-  and write epochs in standalone mode and atomically applies through the local
-  storage engine. In cluster mode a global PostgreSQL commit marker currently
+  writes are visible to their own transaction; commit validates exact-key reads and table scans, reserves overlapping
+  scopes, and atomically applies through the local storage engine. Metadata roots
+  are persistent and atomically published; disjoint writers need no global gate. Fresh INSERT absence is represented once instead of copied into every active reader root; first-touch physical before-images remain protected. In cluster mode a global PostgreSQL commit marker currently
   validates snapshots, conservatively aborting after any intervening PG commit.
   Write skew, predicate conflicts, lost updates, and real-time-order violations
-  abort or return the committed value as appropriate; versions are reclaimed
-  after the oldest active snapshot advances. Explicit isolation levels other
+  abort or return the committed value as appropriate; historical payloads are reclaimed
+  when the owning snapshot roots are dropped or expire. Explicit isolation levels other
   than SERIALIZABLE fail loud. CQL transactions remain on Accord.
 - **PostgreSQL strict-serializability workload.** The native-driver Jepsen test
   checks transfers, register updates, predicate/phantom histories, and
@@ -371,3 +371,49 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 Done: type threading (T-150); engine `Value::Jsonb` and the storage mapping (T-160); OID 3802 text/binary codec, jsonb input parsing under the configured limits, `jsonb`/`json` DDL names, catalog row (T-161a). Remaining: json 114 and jsonpath 4072 result codecs, casts and operators (T-161b, T-162); the per-edge `jsonb_duplicate_keys_dropped_total` counter (only the edge log line exists here); the strict duplicate-key mode is honored from `[jsonb]` but has no per-session or table switch; a typed `CorruptJsonb` from the row bridge (T-151) so a corrupt stored cell reports `XX001` instead of the scan-failure `58000`.
 
 T-301 (PG-first slice acceptance) is done: `tests/jsonb_slice.rs` and the postgres:16 differential over jsonb DDL, INSERT and SELECT, with no unexplained differences. Deferred: the cluster-mode refusal test (waits on the T-300 gate), operators and SRFs against the oracle (T-162).
+
+### Extended-protocol transaction boundary
+
+Implemented: implicit extended-protocol pipelines commit once at Sync, preserving rollback and explicit transaction boundaries. Matched Fly throughput and separate insertion profiles are required before attributing a performance gain to this change.
+
+
+Scalar primary-key SELECTs now request exactly one physical partition for
+literal and bound-parameter equality, using the canonical write-side key codec.
+The snapshot tail resolves only that row, including a late delete and own staged
+insert. Cluster reads use `WritePath::pk_read` with the configured consistency
+and replication strategy; failures propagate without a local fallback. Joins,
+compound/clustering keys, floating/decimal keys and other unproved key families
+retain scans. Floating signed zero cannot use byte-key equality because SQL
+equates both signs. Selective-decode, recording-reader and snapshot tests cover
+this path. [Current PR #613 results](../../deploy/fly-bench/pipeline/RESULTS.md)
+measure roughly 90% of PostgreSQL throughput in the small warm workload and
+retain the local lookup gap. The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md)
+contains earlier revisions, staged measurements and placement controls.
+
+Owned decoded-row conversion now moves variable-size values into SQL; pointer/capacity regressions preserve ownership and conversion/error semantics. Sequential point-read measurements are tracked in the benchmark journey.
+
+Cursor opening and first fetch now share a blocking job with separate early metadata publication; opening cancellation owns the existing stream drop guard before awaiting columns. Explicit gated regressions preserve liveness and prevent first-fetch queue interposition.
+
+
+### Response buffering and encoding
+
+The connection reuses one response buffer, flushing at Sync, simple-query completion,
+explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
+COPY flushes pending replies before its input handshake. Common scalar DataRows
+encode directly into that buffer; specialized codecs retain their checked fallback.
+A failed row rolls back its partial bytes while preserving earlier rows. Collecting
+ReplySink callers keep the existing message interface. Ownership/allocation tests,
+wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
+change. Current measurements and limits are in [the benchmark results](../../deploy/fly-bench/pipeline/RESULTS.md).
+
+
+### Row validation and MVCC replacement
+
+Storage reads retain their configured consistency path and complete shared CQL
+decoding. A borrowed validation pass preserves SQL representability errors before
+MVCC lookup. Only key fields become SQL values before lookup; a full SQL row is
+materialized when no MVCC or staged image replaces it. This removes throwaway SQL
+row materialization, while physical CQL decoding and the owned MVCC image copy
+remain. Tests pin zero-allocation payload validation, conversion-error parity, and
+a corrupt physical payload failing even when MVCC holds a valid replacement.
+The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.

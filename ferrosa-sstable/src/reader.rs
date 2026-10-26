@@ -10,7 +10,7 @@
 //!   Last revised: 2026-09-27
 //!   Last changed: Bound chunk-cache residency by configured entry and byte budgets.
 
-use ferrosa_common::{DecoratedKey, Result};
+use ferrosa_common::{CellReadBuffer, DecoratedKey, Result};
 
 use crate::bloom::BloomFilter;
 use crate::checksum::{self, ChunkCrcTable};
@@ -1580,7 +1580,7 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     pub fn read_value_span(
         &self,
         span: crate::data::ValueSpan,
-        buffer: &mut Vec<u8>,
+        buffer: &mut impl CellReadBuffer,
     ) -> Result<()> {
         let end = span
             .offset
@@ -1591,8 +1591,8 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
                 "invalid deferred value extent".into(),
             ));
         }
-        buffer.resize(span.len, 0);
-        self.source.read_exact_at(buffer, span.offset)
+        buffer.resize_for_read(span.len);
+        self.source.read_exact_at(buffer.as_mut(), span.offset)
     }
 
     /// Yield the next partition in storage order. Returns `Ok(None)` when

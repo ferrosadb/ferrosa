@@ -9,13 +9,13 @@ use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
 use ferrosa_sstable::types::Row;
-use ferrosa_storage::{Mutation, TableId};
+use ferrosa_storage::TableId;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 
 use crate::consistency::ConsistencyLevel;
 use crate::error::ClusterError;
-use crate::pair::coordinator::encode_mutation;
+use crate::pair::coordinator::encode_single_row_mutation;
 
 use super::metrics;
 use super::ClusterCoordinator;
@@ -341,14 +341,15 @@ impl ClusterCoordinator {
             .iter()
             .any(|(replica_id, _)| *replica_id != self.local_node_id);
         let body = if has_remote {
-            let mutation = Mutation::new(
-                table_id.keyspace.clone(),
-                table_id.table.clone(),
-                key.clone(),
-                vec![row.clone()],
+            // The row is only borrowed: it is moved into the local replica write
+            // below, so encoding must not take ownership of it either.
+            Some(encode_single_row_mutation(
+                &table_id.keyspace,
+                &table_id.table,
+                key,
+                &row,
                 timestamp,
-            );
-            Some(encode_mutation(&mutation))
+            ))
         } else {
             None
         };
@@ -645,14 +646,11 @@ impl ClusterCoordinator {
             .collect();
         drop(ring);
 
-        let mutation = Mutation::new(
-            table_id.keyspace.clone(),
-            table_id.table.clone(),
-            key.clone(),
-            vec![row.clone()],
-            timestamp,
-        );
-        let body = encode_mutation(&mutation);
+        // Build the mutation payload. Encoded from borrowed parts: the row is
+        // needed owned by the local replica write below, so it is not cloned
+        // into a throwaway Mutation just to be serialized.
+        let body =
+            encode_single_row_mutation(&table_id.keyspace, &table_id.table, key, &row, timestamp);
 
         let mut local_row = Some(row);
         // Build the fan-out: local write when self is a target, `MutationForward`
@@ -851,15 +849,11 @@ impl ClusterCoordinator {
             })?;
         }
 
-        // Build the mutation payload.
-        let mutation = Mutation::new(
-            table_id.keyspace.clone(),
-            table_id.table.clone(),
-            key.clone(),
-            vec![row.clone()],
-            timestamp,
-        );
-        let body = encode_mutation(&mutation);
+        // Build the mutation payload. Encoded from borrowed parts: the row is
+        // needed owned by the local replica write below, so it is not cloned
+        // into a throwaway Mutation just to be serialized.
+        let body =
+            encode_single_row_mutation(&table_id.keyspace, &table_id.table, key, &row, timestamp);
 
         let replica_targets: Vec<ReplicaWriteTarget> = replicas
             .iter()

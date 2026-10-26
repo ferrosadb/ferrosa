@@ -127,7 +127,9 @@ fn bigint(value: i64) -> CellValue {
 
 fn decode_text(cell: &CellValue) -> Result<String, String> {
     let bytes = cell.value.as_ref().ok_or("setting_name must not be null")?;
-    String::from_utf8(bytes.clone()).map_err(|_| "setting_name must be UTF-8 text".to_string())
+    std::str::from_utf8(bytes)
+        .map(str::to_owned)
+        .map_err(|_| "setting_name must be UTF-8 text".to_string())
 }
 
 fn decode_bigint(cell: &CellValue) -> Result<i64, String> {

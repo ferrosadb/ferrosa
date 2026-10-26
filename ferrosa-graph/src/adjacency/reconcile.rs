@@ -560,7 +560,7 @@ struct ExpectedEntry {
     vertex_key: DecoratedKey,
     clustering: Vec<u8>,
     /// The entry's `edge_table` cell value, from a live edge.
-    edge_table_cell: Option<Vec<u8>>,
+    edge_table_cell: Option<ferrosa_common::CellBytes>,
     /// Newest write timestamp among the live edges deriving this entry.
     live_at: Option<i64>,
     /// Newest deletion timestamp among the deleted edges deriving it.
@@ -761,7 +761,7 @@ fn entry_repair(
         let cells = entry
             .edge_table_cell
             .clone()
-            .map(|value| vec![(0, CellValue::live(value, at))])
+            .map(|value| vec![(0, CellValue::live_bytes(value, at))])
             .unwrap_or_default();
         let row = Row {
             clustering: entry.clustering.clone(),

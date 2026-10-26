@@ -120,12 +120,7 @@ pub(crate) fn resume_filtered_stream(
             for row in &p.rows {
                 if let Some(ref last) = last_clustering {
                     if row.clustering.as_slice() < last.as_slice() {
-                        let hx = |b: &[u8]| {
-                            b[..b.len().min(24)]
-                                .iter()
-                                .map(|x| format!("{x:02x}"))
-                                .collect::<String>()
-                        };
+                        let hx = |b: &[u8]| crate::hex::lower_prefix(b, 24);
                         return Err(ClusterError::Storage(ferrosa_common::Error::InvalidData(
                             format!(
                                 "resumed range scan received a non-monotonic fragment for the \
@@ -2306,9 +2301,15 @@ mod tests {
         let mut saw_err = false;
         while let Some(item) = out.next().await {
             if let Err(e) = item {
+                let msg = format!("{e}");
+                assert!(msg.contains("non-monotonic"), "unexpected error: {e}");
+                // The hex previews in the message are the operator's only clue
+                // about which clusterings regressed: lowercase, two digits per
+                // byte, straight from the bytes (T6 replaced the per-byte
+                // `format!` with a table-driven encoder).
                 assert!(
-                    format!("{e}").contains("non-monotonic"),
-                    "unexpected error: {e}"
+                    msg.contains("prev=30 > next=01"),
+                    "hex preview changed: {e}"
                 );
                 saw_err = true;
                 break;

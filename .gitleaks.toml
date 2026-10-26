@@ -1,0 +1,15 @@
+title = "Ferrosa secret detection"
+
+[extend]
+useDefault = true
+
+# The generic rule mistakes this published SQL-type phrase for a credential.
+# Keep every default rule and require BOTH this exact nonsecret literal and
+# one of the four PostgreSQL documentation paths; no commit or file is skipped.
+[[allowlists]]
+description = "SQL numeric-type prose in PostgreSQL documentation"
+targetRules = ["generic-api-key"]
+condition = "AND"
+regexTarget = "secret"
+regexes = ['''^floating/decimal$''']
+paths = ['''(^|/)ferrosa-postgres/(README\.md|specs/(overview|fmea|roadmap)\.md)$''']

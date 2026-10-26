@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-common
 status: implemented
-last_updated: 2026-06-19
+last_updated: 2026-10-24
 executive_summary: >
   The leaf crate at the bottom of the Ferrosa dependency graph. It owns the
   shared low-level type vocabulary — Token/DecoratedKey, CellValue, the full
@@ -51,6 +51,13 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 | `lib` (`src/lib.rs`) | 39 | module declarations + headline re-exports |
 
 ## Data flow / role
+
+`CellValue` separates its `CellBytes` payload from mutable merge metadata.
+The payload exposes immutable slices and explicit owned-vector conversion;
+`CellBytesMut` is caller-owned decoding scratch that freezes into a payload.
+`CellReadBuffer` gives readers one initialized-buffer interface for scratch and
+legacy vectors. The payload uses a compact shared owner; tests pin ownership,
+buffer reuse, ordering, debug output and serialization.
 
 `ferrosa-common` is not a pipeline; it is the **shared alphabet** the pipelines
 speak. Two representative roles:
@@ -117,3 +124,17 @@ packet allocations in storage pump waits (T-081).
 ## jsonb (T-150)
 
 `CqlType::Jsonb` and `CqlValue::Jsonb(ferrosa_jsonb::JsonbValue)` (T-150). The value is validated and never raw bytes; `Ord`/`Eq`/`Hash` delegate to `JsonbValue` (D18, D2a) and `discriminant_index` gives it index 27. The name registry has `jsonb` with the POC marshal class `org.apache.cassandra.db.marshal.JsonbType`; `custom_class_type` resolves only that class (D20) and `check_jsonb_nesting` rejects `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb>` at any depth (D21). `jsonb_canonical_text` prints a value. New edge: `ferrosa-common` -> `ferrosa-jsonb` (leaf; `guard-arrow-free.sh` passes).
+
+`CellBytes` uses one shared owner with either up to 32 inline payload bytes or
+an owned `Vec<u8>`. Small decoding scratch therefore needs one allocation rather
+than a separate owner and byte buffer. Clones share the same immutable bytes in
+both forms. Adopting any vector preserves its allocation, pointer and spare
+capacity without copying, regardless of payload size. Inline storage is created
+only for decoder-owned scratch. Unique scratch keeps its owner across freezes and promotes to a vector only when
+it grows beyond the inline bound. Shared scratch starts fresh without copying
+retained bytes. Empty payloads share one immutable empty owner. Ordering, hashing
+and sequence serialization depend only on bytes. Heap estimates charge the full
+backing and Arc counters, plus a separate vector's entire capacity; inline
+capacity is included in the owner charge. The SSTable allocation regression keeps
+its existing five-allocation-per-row budget. On the 384-row macOS fixture, steady
+allocations fell from 2,400 (6.25/row) to 1,632 (4.25/row).

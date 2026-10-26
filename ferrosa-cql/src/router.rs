@@ -8558,7 +8558,7 @@ fn cell_to_cql_value(
             16 => CqlValue::Inet(IpAddr::V6(std::net::Ipv6Addr::from(
                 <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]),
             ))),
-            _ => CqlValue::Blob(bytes.clone()),
+            _ => CqlValue::Blob(bytes.to_vec()),
         },
         DataType::Timestamp => {
             let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
@@ -8576,10 +8576,10 @@ fn cell_to_cql_value(
             })?;
             CqlValue::Timestamp(ms)
         }
-        DataType::Blob => CqlValue::Blob(bytes.clone()),
+        DataType::Blob => CqlValue::Blob(bytes.to_vec()),
         // Duration has no virtual-cell decoder yet; it is surfaced as a blob
         // (pre-existing silent fallback, tracked as a fail-loud follow-up).
-        DataType::Duration => CqlValue::Blob(bytes.clone()),
+        DataType::Duration => CqlValue::Blob(bytes.to_vec()),
     }))
 }
 
@@ -25256,7 +25256,9 @@ mod tests {
 
     /// Helper: hex-encode a byte slice.
     fn hex_encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        let mut out = String::with_capacity(bytes.len() * 2);
+        crate::hex::push_lower(&mut out, bytes);
+        out
     }
 
     /// Minimal valid WASM component bytes (same as in ferrosa-udf tests).
@@ -31915,7 +31917,7 @@ mod tests {
                 .iter()
                 .flat_map(|value| value.to_be_bytes())
                 .collect();
-            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            hex_encode(&bytes)
         };
         let far = vector_blob(&[0.0, 1.0, 0.0]);
         let exact = vector_blob(&[1.0, 0.0, 0.0]);

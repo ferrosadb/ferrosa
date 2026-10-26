@@ -29,7 +29,31 @@ matching environment variables, then supplies these config objects to the HTTP
 and Bolt servers. Bolt uses the resolved Graph HTTP host with its separately
 resolved port.
 
+## Current performance
+
+Native-key lookup remains the first anchor path. Equality on a regular `int`,
+`bigint` or `uuid` property can use a CQL-declared BTree/Hash secondary index,
+including property maps and simple WHERE equality in either operand order. The
+reader requires both a declaration and completed backfill, preserves duplicate
+matches, and rechecks predicates. Other shapes retain the range reader. Cypher
+index DDL remains unsupported. Integer comparisons preserve their full precision.
+
+Unfiltered `count(n)` and `count(*)` over physical vertex tables use the existing
+metadata count API, without building vertex maps or decoding payloads. Property
+counts, DISTINCT, filters, grouping, traversal, virtual tables and static columns
+retain the general evaluator. Aggregation folds incrementally, but an inner
+expansion can still materialize its frontier. New timing comparisons are pending;
+the results page identifies the exact last measured revision.
+See [current comparator results and scope](../deploy/fly-bench/pipeline/RESULTS.md)
+and the [detailed experiment record](../deploy/fly-bench/pipeline/HISTORY.md).
+
 ## What's implemented
+
+MERGE resolves both endpoint nodes before writing their relationship, so explicit
+UUIDs and existing raw keys remain the edge's source/destination identity. New
+content-addressed fallback keys use 16 bytes for UUID columns; explicit, scoped
+and composite key layouts keep their schema encoding. Traversal and deletion
+use those same stored endpoint keys.
 
 - **Cypher parser** — lexer + recursive-descent parser (`parser/`) covering
   `MATCH` / `OPTIONAL MATCH`, `WHERE`, `WITH` pipelines, `RETURN` (DISTINCT,
@@ -383,6 +407,7 @@ label, is what would attribute it.
   the materializing `range_read` is deliberately unused here), `DdlPath` +
   `DdlOperation` for replicated adjacency DDL, `ConsistencyLevel`,
   `ReplicationStrategy`, `ClusterError`.
+- **`ferrosa-index`** — typed `IndexKey` and supported scalar `IndexType` declarations.
 - **`ferrosa-common`** — `DecoratedKey`, `PartitionKey`, `CellValue`, `Error`.
 - **`ferrosa-net`** — `tls::optional_server_config` / `crypto_provider` build
   the graph HTTP and Bolt TLS configs (production path). The integration test
@@ -425,3 +450,9 @@ No `#[ignore]`, no `TODO`/`FIXME` markers in source. Most test functions:
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
 - [Data flow](specs/data-flow.md) — MATCH expand + adjacency-consistent write
+
+### Cell payload boundary
+
+Graph column extraction retains immutable `CellBytes` handles for regular
+cells. Adjacency repair carries those handles into new cells; visited traversal
+keys remain independently owned at the key boundary.

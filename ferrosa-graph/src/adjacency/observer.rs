@@ -49,6 +49,12 @@ impl WriteObserver for AdjacencyIndexObserver {
     fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation> {
         derive_adjacency_mutations(&self.schema, table, mutation)
     }
+
+    /// Derive in place: the caller owns `out` and reuses it, so this path adds no
+    /// per-write buffer. Every input is borrowed; the derived entries are moved in.
+    fn derive_into(&self, table: &TableId, mutation: &Mutation, out: &mut Vec<Mutation>) {
+        derive_adjacency_into(&self.schema, table, mutation, out)
+    }
 }
 
 pub(crate) fn derive_adjacency_mutations(
@@ -56,11 +62,24 @@ pub(crate) fn derive_adjacency_mutations(
     table: &TableId,
     mutation: &Mutation,
 ) -> Vec<Mutation> {
+    let mut derived = Vec::new();
+    derive_adjacency_into(schema, table, mutation, &mut derived);
+    derived
+}
+
+/// Append this write's adjacency entries to `out`, which the caller owns and
+/// reuses across writes. Inputs are borrowed; nothing is cloned to derive.
+pub(crate) fn derive_adjacency_into(
+    schema: &Schema,
+    table: &TableId,
+    mutation: &Mutation,
+    out: &mut Vec<Mutation>,
+) {
     let snap = schema.schema_ref().load();
     let key = (table.keyspace.clone(), table.table.clone());
     let meta = match snap.tables.get(&key) {
         Some(m) => m,
-        None => return vec![],
+        None => return,
     };
 
     // Verify this is a valid edge table with source and target extensions.
@@ -69,13 +88,13 @@ pub(crate) fn derive_adjacency_mutations(
     if !meta.extensions.contains_key("graph.source")
         || !meta.extensions.contains_key("graph.target")
     {
-        return vec![];
+        return;
     }
     let Some(source_col) = meta.extensions.get("graph.source") else {
-        return vec![];
+        return;
     };
     let Some(target_col) = meta.extensions.get("graph.target") else {
-        return vec![];
+        return;
     };
 
     let adj_ks = adjacency_keyspace_name(&table.keyspace);
@@ -89,7 +108,8 @@ pub(crate) fn derive_adjacency_mutations(
         .unwrap_or_else(|| table.table.clone());
     let edge_table = format!("{}.{}", table.keyspace, table.table);
 
-    let mut derived = Vec::new();
+    // Two entries per live edge row, so reserve exactly once instead of growing.
+    out.reserve(mutation.rows.len() * 2);
     for row in &mutation.rows {
         let Some(source_id) = extract_graph_column_bytes(meta, mutation, row, source_col) else {
             continue;
@@ -120,11 +140,9 @@ pub(crate) fn derive_adjacency_mutations(
                     adjacency_row.primary_key_liveness = ferrosa_sstable::types::LivenessInfo::NONE;
                 }
             }
-            derived.push(entry);
+            out.push(entry);
         }
     }
-
-    derived
 }
 
 /// Build an adjacency table mutation.
@@ -149,7 +167,7 @@ pub(crate) fn make_adjacency_mutation(
     //   0: direction (tinyint, 1 byte)
     //   1: edge_label (text)
     //   2: neighbor_id (blob)
-    let mut clustering = Vec::new();
+    let mut clustering = Vec::with_capacity(2 + 1 + 2 + edge_label.len() + 2 + neighbor_id.len());
     clustering.extend_from_slice(&1u16.to_be_bytes()); // direction is 1 byte
     clustering.push(direction);
     clustering.extend_from_slice(&(edge_label.len() as u16).to_be_bytes());
@@ -181,7 +199,7 @@ fn extract_graph_column_bytes(
     mutation: &Mutation,
     row: &ferrosa_sstable::types::Row,
     column_name: &str,
-) -> Option<Vec<u8>> {
+) -> Option<ferrosa_common::CellBytes> {
     let column = meta.columns.get(column_name)?;
     match column.kind {
         ferrosa_schema::metadata::column::ColumnKind::PartitionKey => {
@@ -191,7 +209,7 @@ fn extract_graph_column_bytes(
                 .position(|name| name == column_name)?;
             let components =
                 decode_partition_components(mutation.key.key.as_bytes(), meta.partition_key.len())?;
-            components.get(idx).cloned()
+            components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Clustering => {
             let idx = meta
@@ -200,7 +218,7 @@ fn extract_graph_column_bytes(
                 .position(|(name, _)| name == column_name)?;
             let components =
                 decode_clustering_components(&row.clustering, meta.clustering_key.len())?;
-            components.get(idx).cloned()
+            components.get(idx).cloned().map(Into::into)
         }
         ferrosa_schema::metadata::column::ColumnKind::Regular
         | ferrosa_schema::metadata::column::ColumnKind::Static => {

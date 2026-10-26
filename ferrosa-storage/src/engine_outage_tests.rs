@@ -351,7 +351,7 @@ fn partition_keys_and_values(partitions: &[Partition]) -> std::collections::BTre
         .map(|p| {
             (
                 p.key.key.as_bytes().to_vec(),
-                p.rows[0].cells[0].1.value.clone().expect("live cell"),
+                p.rows[0].cells[0].1.value.as_ref().expect("live cell").to_vec(),
             )
         })
         .collect()

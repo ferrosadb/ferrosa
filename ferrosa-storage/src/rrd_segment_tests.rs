@@ -405,7 +405,7 @@ fn rrd_segment_generation_holds_rows_from_exactly_one_window() {
             let value = row
                 .cells
                 .first()
-                .and_then(|(_, cell)| cell.value.clone())
+                .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
                 .expect("value");
             by_value.push((value, window_start(clustered_ts(row))));
         }
@@ -553,7 +553,7 @@ fn rrd_partition_spanning_two_windows_reads_across_both_in_order() {
         .map(|row| {
             row.cells
                 .first()
-                .and_then(|(_, cell)| cell.value.clone())
+                .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
                 .expect("value")
         })
         .collect();

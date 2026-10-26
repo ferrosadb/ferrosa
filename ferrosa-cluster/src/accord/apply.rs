@@ -3063,7 +3063,9 @@ mod engine_applier_tests {
     fn read_cell0(engine: &StorageEngine, key: &DecoratedKey) -> Option<Vec<u8>> {
         let partition = engine.read(&TableId::new(KS, TABLE), key).unwrap()?;
         let row = partition.rows.first()?;
-        row.cells.first().and_then(|(_, c)| c.value.clone())
+        row.cells
+            .first()
+            .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
     }
 
     /// Read the LWW cell timestamp persisted for column 0 of the first row.
@@ -3459,7 +3461,11 @@ mod engine_applier_tests {
         let mut got: Vec<Vec<u8>> = partition
             .rows
             .iter()
-            .filter_map(|row| row.cells.first().and_then(|(_, cell)| cell.value.clone()))
+            .filter_map(|row| {
+                row.cells
+                    .first()
+                    .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
+            })
             .collect();
         got.sort();
         assert_eq!(
@@ -3934,7 +3940,9 @@ mod engine_applier_tests {
     fn decode_cell0(bytes: &[u8]) -> Option<Vec<u8>> {
         let m = Mutation::deserialize_from(bytes).expect("reader bytes must decode as a Mutation");
         let row = m.rows.first()?;
-        row.cells.first().and_then(|(_, c)| c.value.clone())
+        row.cells
+            .first()
+            .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
     }
 
     #[test]

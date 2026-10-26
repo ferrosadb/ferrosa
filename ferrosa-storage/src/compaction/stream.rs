@@ -16,7 +16,7 @@ use crate::{
     merge,
     range_merger::ColumnOrdinalMapping,
 };
-use ferrosa_common::{CancelToken, CellValue, Error, Result};
+use ferrosa_common::{CancelToken, CellBytes, CellReadBuffer, CellValue, Error, Result};
 use ferrosa_sstable::{
     io::FileReadAt,
     reader::{PartitionIter, SSTableReader},
@@ -82,7 +82,7 @@ impl<'de> Deserialize<'de> for StoredRow {
                     (
                         i,
                         CellValue {
-                            value,
+                            value: value.map(Into::into),
                             timestamp,
                             ttl,
                             local_deletion_time,
@@ -110,7 +110,7 @@ impl SpillRow for StoredRow {
                 .cells
                 .iter()
                 .map(|(_, c)| {
-                    c.value.as_ref().map_or(0, Vec::capacity)
+                    c.value.as_ref().map_or(0, CellBytes::retained_heap_bytes)
                         + c.path.as_ref().map_or(0, Vec::capacity)
                 })
                 .sum::<usize>()
@@ -207,23 +207,7 @@ impl Source<'_> {
         }
         Ok(())
     }
-    fn copy_value(&self, cell: usize, out: &mut Vec<u8>) -> Result<()> {
-        if self.legacy {
-            out.clear();
-            out.extend_from_slice(
-                self.head.as_ref().expect("head").cells[cell]
-                    .1
-                    .value
-                    .as_deref()
-                    .unwrap_or(&[]),
-            );
-            Ok(())
-        } else {
-            self.iter.read_value_span(self.spans[cell], out)?;
-            self.fetched.borrow_mut()[self.span_indices[cell]] = true;
-            Ok(())
-        }
-    }
+
     fn next_partition(&mut self, dir: &Path, cancel: &CancelToken) -> Result<()> {
         let Some((key, deletion, mut static_row)) = self.iter.next_partition_header_only()? else {
             self.header = None;
@@ -270,6 +254,20 @@ impl Source<'_> {
         }
         self.next_row()
     }
+    fn copy_value(&self, cell: usize, out: &mut impl CellReadBuffer) -> Result<()> {
+        if self.legacy {
+            let value = self.head.as_ref().expect("head").cells[cell]
+                .1
+                .value
+                .as_deref()
+                .unwrap_or(&[]);
+            out.resize_for_read(value.len());
+            out.as_mut().copy_from_slice(value);
+            Ok(())
+        } else {
+            self.iter.read_value_span(self.spans[cell], out)
+        }
+    }
 }
 
 fn empty_row() -> Row {
@@ -280,14 +278,13 @@ fn empty_row() -> Row {
         primary_key_liveness: LivenessInfo::NONE,
     }
 }
-fn copy_optional(src: &Option<Vec<u8>>, dst: &mut Option<Vec<u8>>) {
+fn copy_optional<T: Clone>(src: &Option<T>, dst: &mut Option<T>) {
     match (src, dst.as_mut()) {
         (Some(src), Some(dst)) => dst.clone_from(src),
         _ => *dst = src.clone(),
     }
 }
-fn copy_cell(src: &CellValue, dst: &mut CellValue) {
-    copy_optional(&src.value, &mut dst.value);
+fn copy_cell_metadata(src: &CellValue, dst: &mut CellValue) {
     copy_optional(&src.path, &mut dst.path);
     dst.timestamp = src.timestamp;
     dst.ttl = src.ttl;
@@ -329,10 +326,24 @@ fn copy_candidate(
     candidate: (usize, usize),
     out: &mut CellValue,
 ) -> Result<()> {
-    let value = &sources[candidate.0].head.as_ref().expect("candidate").cells[candidate.1].1;
-    copy_cell(value, out);
-    if let Some(buffer) = &mut out.value {
-        sources[candidate.0].copy_value(candidate.1, buffer)?;
+    let source = &sources[candidate.0];
+    let value = &source.head.as_ref().expect("candidate").cells[candidate.1].1;
+    copy_cell_metadata(value, out);
+    if source.legacy {
+        // Legacy heads already contain their payload. Retain it directly.
+        copy_optional(&value.value, &mut out.value);
+    } else if value.value.is_some() {
+        // A deferred head carries an empty payload and a span. Keep the previous
+        // destination's unique capacity instead of replacing it with that empty
+        // handle before the read.
+        let mut buffer = out.value.take().unwrap_or_default().into_scratch();
+        let result = source
+            .iter
+            .read_value_span(source.spans[candidate.1], &mut buffer);
+        out.value = Some(buffer.freeze());
+        result?;
+    } else {
+        out.value = None;
     }
     Ok(())
 }

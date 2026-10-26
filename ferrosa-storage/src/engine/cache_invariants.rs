@@ -195,7 +195,7 @@ fn add_partition(out: &mut RowMap, partition: &Partition) {
         let val = row
             .cells
             .first()
-            .and_then(|(_, cell)| cell.value.clone())
+            .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()))
             .expect("every test row has a live val cell");
         out.insert((pk.clone(), i32::from_be_bytes(ck_bytes)), val);
     }

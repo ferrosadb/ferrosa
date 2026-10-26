@@ -12,6 +12,7 @@ pub mod controller;
 pub mod coordinator;
 pub mod ddl_path;
 pub mod error;
+mod hex;
 pub mod hints;
 pub mod index_coordination;
 pub mod membership;

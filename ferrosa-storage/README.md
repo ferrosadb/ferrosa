@@ -19,6 +19,15 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 
 ## What's implemented
 
+- **Write observers** — synchronous derivation borrows the write's mutation;
+  asynchronous queues share one `Arc<Mutation>` per write instead of copying
+  rows and cells for every observer. A full or closed async queue derives inline
+  on the writer. Queue capacity comes from
+  `FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY`; depth, capacity and backpressure
+  events are exported in storage metrics. This covers queue hand-off: derived
+  write errors and observer panics retain their existing error handling.
+  `tests/observer_payload_alloc.rs` measures allocation requests at the real
+  write entry point and checks payload sharing plus stored/queued values.
 - **Memtable** — sharded write buffer behind the `Memtable` trait. Default build
   uses `SkipListMemtable` (crossbeam skiplist, feature `skiplist-memtable`);
   `ShardedBTreeMemtable` (64 `parking_lot::RwLock` shards) is the alternative.
@@ -1591,3 +1600,13 @@ the public executor with allocation counts, allocated bytes, peak live heap,
 exact row/cell assertions, BTI point lookups and optional measured budgets.
 The reproducible Fly runner and evidence contract are in
 `../deploy/fly-compaction-probe/README.md`.
+
+### Cell payload boundary
+
+Cell payloads use `CellBytes`; merge metadata stays independently owned.
+Compaction and SSTable reads use caller-owned mutable scratch before publishing
+immutable payloads. Commit-log and spill encodings retain their byte sequences.
+
+Published cell bytes are shared across row copies. Readers recover only unique
+scratch capacity; retained older payloads remain immutable. Memory estimates
+charge the full retained backing and a conservative shared-owner allowance.

@@ -112,6 +112,12 @@ graph TB
 
 ## Data flow
 
+Cell payload reads resize initialized caller-owned `CellReadBuffer` storage,
+validate lengths and extents, and freeze typed decoding scratch before
+publishing it in a `CellValue`. Payload scratch and collection-path vectors use
+the same read implementation and bounds. This ownership seam leaves Data.db
+encoding and deferred-value span semantics unchanged.
+
 **Write path** (engine memtable/compaction → disk): flush callers add `Partition`
 values in token order via `add_partition`; compaction uses the incremental
 partition/row API described below. Cell timestamps, TTLs, and local
@@ -316,3 +322,11 @@ existing two-buffer contract; sparse reads reuse the caller's chunk buffer.
 `tests/scan_cursor_io.rs` bounds physical bytes on the public pending-value
 API with synchronous and background-prefetched inputs, in addition to exact
 payload checks. This prevents metadata seeks from multiplying full-window I/O.
+
+Published cell bytes are shared across row copies. Readers recover only unique
+scratch capacity; retained older payloads remain immutable. Memory estimates
+charge the full retained backing and a conservative shared-owner allowance.
+
+Reusable cursor allocation guards count only the decoder thread. A controlled
+foreign-thread allocation verifies attribution; the existing allocation bound
+and byte/corruption assertions are retained.

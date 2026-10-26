@@ -26,6 +26,7 @@ pub mod duration;
 pub mod error;
 pub mod event;
 pub mod frame;
+mod hex;
 pub mod lexer;
 pub mod local_lwt;
 pub mod observability;

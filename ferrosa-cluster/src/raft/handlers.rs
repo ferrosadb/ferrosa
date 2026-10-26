@@ -36,7 +36,7 @@ use openraft::raft::{
 };
 use serde::{Deserialize, Serialize};
 
-use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+use ferrosa_common::{CellBytes, CellValue, DecoratedKey, PartitionKey, Token};
 use ferrosa_index::IndexKey;
 use ferrosa_net::message::Message;
 use ferrosa_net::rpc::error_reply::RemoteFailureKind;
@@ -245,7 +245,7 @@ impl From<LivenessInfoWire> for LivenessInfo {
 /// Before this format the sender asserted and the receiver dropped every path.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellValueWire {
-    pub value: Option<Vec<u8>>,
+    pub value: Option<CellBytes>,
     pub timestamp: i64,
     pub ttl: i32,
     pub local_deletion_time: i32,
@@ -336,9 +336,9 @@ impl<'de> serde::de::Visitor<'de> for CellValueWireVisitor {
         let tag: u8 = next(&mut seq, "leading tag")?;
         let (value, path) = match tag {
             0 => (None, None),
-            1 => (Some(next::<Vec<u8>, _>(&mut seq, "value")?), None),
+            1 => (Some(next::<CellBytes, _>(&mut seq, "value")?), None),
             COMPLEX_CELL_TAG => {
-                let value: Option<Vec<u8>> = next(&mut seq, "complex value")?;
+                let value: Option<CellBytes> = next(&mut seq, "complex value")?;
                 let path: Vec<u8> = next(&mut seq, "complex path")?;
                 (value, Some(path))
             }
@@ -2203,7 +2203,7 @@ mod tests {
                 cells: vec![(
                     0,
                     legacy::CellValueWire {
-                        value: row.cells[0].1.value.clone(),
+                        value: row.cells[0].1.value.as_ref().map(|value| value.to_vec()),
                         timestamp: row.cells[0].1.timestamp,
                         ttl: row.cells[0].1.ttl,
                         local_deletion_time: row.cells[0].1.local_deletion_time,
@@ -2389,7 +2389,7 @@ mod tests {
         let p1 = make_partition(b"abc", 999);
         let mut p2 = make_partition(b"abc", 999);
         // Change the cell value
-        p2.rows[0].cells[0].1.value = Some(b"different".to_vec());
+        p2.rows[0].cells[0].1.value = Some(b"different".to_vec().into());
 
         let d1 = compute_partition_digest(&p1).unwrap();
         let d2 = compute_partition_digest(&p2).unwrap();

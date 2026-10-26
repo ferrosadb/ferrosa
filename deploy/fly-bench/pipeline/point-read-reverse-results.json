@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-10-26",
+  "experiment": "Reverse placement on original native PostgreSQL VM",
+  "ferrosa_revision": "a948ed1df48fd955bc144956b3d50546512665e2",
+  "ferrosa_image": "registry.fly.io/ferrosa-bench-main@sha256:1ed2555fb9f17d604273c3ef00e4736b803faa5135d6394b1c7b275b40deab32",
+  "ferrosa_binary_sha256": "3f3ad18ee2aefb462d4e4847eb006829000827bad1ab5cfc8d7690921d338638",
+  "postgres_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+  "server_class": "performance-2CPU/4096MiB/lax",
+  "workload_order": [
+    {
+      "target": "postgres",
+      "round": 108,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "insert_rows_per_s": 24906.585485013904,
+      "insert_elapsed_s": 0.20079507799999874,
+      "read_operations_per_s": 10564.648962112402,
+      "read_elapsed_s": 1.8931059680000004,
+      "read_or_operation_p50_ms": 0.6101479999998105,
+      "read_or_operation_p99_ms": 2.323754000002509,
+      "rows_after": 5000,
+      "query_plan": [
+        [
+          "Index Scan using pipeline_pipelinee108pg_pkey on pipeline_pipelinee108pg  (cost=0.29..8.30 rows=1 width=40)"
+        ],
+        [
+          "  Index Cond: (pk = 42)"
+        ]
+      ],
+      "validated": true,
+      "source_sha256": "2151556bf004666f13006f1f53dcf315237b799847399d80f314e6d4dfc17c7e"
+    },
+    {
+      "target": "ferrosa",
+      "round": 109,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "insert_rows_per_s": 22358.564250161533,
+      "insert_elapsed_s": 0.22366185500000313,
+      "read_operations_per_s": 9666.631355267868,
+      "read_elapsed_s": 2.0689730750000024,
+      "read_or_operation_p50_ms": 0.7164579999994203,
+      "read_or_operation_p99_ms": 2.2761040000034427,
+      "rows_after": 5000,
+      "query_plan": {
+        "unsupported_or_failed": "SyntaxError",
+        "message": "expected a statement, found `EXPLAIN`"
+      },
+      "validated": true,
+      "source_sha256": "4b782e9d8932bd5bc866ed51bb52a27b168004a64f4725c6a7bc5c18ccf2d90e"
+    },
+    {
+      "target": "ferrosa",
+      "round": 110,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "insert_rows_per_s": 19848.52179801118,
+      "insert_elapsed_s": 0.2519400480000087,
+      "read_operations_per_s": 9823.382966360576,
+      "read_elapsed_s": 2.0359584949999885,
+      "read_or_operation_p50_ms": 0.7020130000015001,
+      "read_or_operation_p99_ms": 2.056074999998714,
+      "rows_after": 5000,
+      "query_plan": {
+        "unsupported_or_failed": "SyntaxError",
+        "message": "expected a statement, found `EXPLAIN`"
+      },
+      "validated": true,
+      "source_sha256": "6a12a5452a936c89e6c9e449826389eee2c579c809cfba46dc50ba1a2f753be0"
+    },
+    {
+      "target": "postgres",
+      "round": 111,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "insert_rows_per_s": 22439.107868103503,
+      "insert_elapsed_s": 0.2228578980000009,
+      "read_operations_per_s": 11030.473642449337,
+      "read_elapsed_s": 1.813158768000008,
+      "read_or_operation_p50_ms": 0.6002934999997933,
+      "read_or_operation_p99_ms": 2.0353750000055015,
+      "rows_after": 5000,
+      "query_plan": [
+        [
+          "Index Scan using pipeline_pipelinee111pg_pkey on pipeline_pipelinee111pg  (cost=0.29..8.30 rows=1 width=40)"
+        ],
+        [
+          "  Index Cond: (pk = 42)"
+        ]
+      ],
+      "validated": true,
+      "source_sha256": "9cea40312d6f015e417916dd01d68afc5d263e6d401470a7364e600145f714e1"
+    }
+  ],
+  "means": {
+    "ferrosa": {
+      "insert_rows_per_s": 21103.543024086357,
+      "read_operations_per_s": 9745.00716081422
+    },
+    "postgres": {
+      "insert_rows_per_s": 23672.846676558704,
+      "read_operations_per_s": 10797.561302280868
+    }
+  },
+  "transport_controls": {
+    "ferrosa": {
+      "source_sha256": "730d9ca0157996e0ab5638abffb3239f7351d637afce4c81ec345bf509a6ae51",
+      "connect_samples": 32,
+      "kernel_syn_rtt_us_p50": 297.0,
+      "kernel_syn_rtt_us_min": 254,
+      "kernel_syn_rtt_us_max": 608,
+      "cases": [
+        {
+          "mode": "sync",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 0.367389,
+          "p99_ms": 1.020547,
+          "validated": true
+        },
+        {
+          "mode": "sync",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 0.458769,
+          "p99_ms": 1.626275,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 0.399319,
+          "p99_ms": 1.043767,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 0.715618,
+          "p99_ms": 1.909874,
+          "validated": true
+        }
+      ]
+    },
+    "postgres": {
+      "source_sha256": "5c3b6252d20b245155c887bf53cd970d4a004fdfef41082c556da631bcf2215a",
+      "connect_samples": 32,
+      "kernel_syn_rtt_us_p50": 315.0,
+      "kernel_syn_rtt_us_min": 246,
+      "kernel_syn_rtt_us_max": 520,
+      "cases": [
+        {
+          "mode": "sync",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 0.335709,
+          "p99_ms": 0.709708,
+          "validated": true
+        },
+        {
+          "mode": "sync",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 0.429189,
+          "p99_ms": 1.919785,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 0.414509,
+          "p99_ms": 1.603245,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 0.712709,
+          "p99_ms": 2.444873,
+          "validated": true
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "Same original client; one destination VM; native5432 and Ferrosa55432.",
+    "Both services resident; one receives timed benchmark queries at a time.",
+    "Both data directories on comparator root filesystem; fresh Ferrosa data directory.",
+    "Original separate-machine Ferrosa used an attached volume and older fixture state.",
+    "Fresh 5k tables, reused processes, 20k reads per leg, eight warmed workers,96B payloads.",
+    "Two observations per engine are descriptive, not statistical significance.",
+    "This is a placement/storage fixture control, not a source-code speedup or crash recovery test.",
+    "CPU profiling and extra fixture loads occur after all primary timings."
+  ]
+}

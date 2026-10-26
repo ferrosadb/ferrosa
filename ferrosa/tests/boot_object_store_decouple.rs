@@ -178,7 +178,11 @@ fn internode_lane_comes_up_in_bounded_time_while_object_store_is_black_holed() {
         if node.child.try_wait().expect("wait node").is_some() {
             break; // node exited early — do not spin
         }
-        if internode_accepts(node.internode) {
+        // Binding the socket and writing the startup witness are separate
+        // observations. A successful TCP probe cannot synchronize the child's
+        // next log write; require both within the same original bound.
+        let log = std::fs::read_to_string(node.log_path()).unwrap_or_default();
+        if internode_accepts(node.internode) && log.contains("internode server listening") {
             listened = Some(start.elapsed());
             break;
         }

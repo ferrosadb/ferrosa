@@ -696,7 +696,7 @@ fn reconstruct_row(
             }
         }
         columns.push(String::from_utf8_lossy(name_bytes).into_owned());
-        values.push(Some(value.clone()));
+        values.push(Some(value.to_vec()));
         regular_cells += 1;
         if cell.timestamp != NO_TIMESTAMP {
             timestamp = Some(timestamp.map_or(cell.timestamp, |t| t.max(cell.timestamp)));

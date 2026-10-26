@@ -22,6 +22,14 @@ executive_summary: >
 
 ## Purpose & boundary
 
+Native-primary-key equality uses the keyed reader. Eligible integer/UUID equality
+uses a CQL-declared, current BTree/Hash secondary index; unsupported predicates or
+unready indexes use the range reader. All candidates retain predicate checks.
+Cypher index DDL remains unsupported. Simple unfiltered vertex counts use row
+metadata without materializing payloads; other aggregate shapes retain the
+general evaluator. See the [measurement status](../../deploy/fly-bench/pipeline/RESULTS.md)
+and [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md).
+
 `ferrosa-graph` turns a ferrosa keyspace into a queryable property graph without
 a dedicated graph store. There is no separate graph storage engine: vertices and
 edges are **plain CQL tables** distinguished only by schema extensions
@@ -84,8 +92,10 @@ Bolt streams records the same way. Anchor partitions are **streamed** via
 table at once (t_bc5f0e6f); each hop reads `system_graph_<ks>.adjacency` to find
 neighbors. **Aggregation is incremental:** `execute_aggregate`
 (executor/expand.rs:6046) streams its inner plan and folds each row into per-group
-`Accumulator`s, so `count()` memory is proportional to the number of groups
-(bounded by `config.max_groups`), never to the input row count. `ORDER BY` (with
+`Accumulator`s, whose memory is proportional to groups (`config.max_groups`).
+An inner expansion can still materialize its frontier. Eligible unfiltered
+vertex counts bypass that expansion and call `WritePath::count_range_with` at
+CL ONE with the keyspace replication strategy. `ORDER BY` (with
 optional `LIMIT`) spills to disk through `executor::spill` when the sort would
 exceed the memory budget.
 
@@ -97,6 +107,11 @@ committed edge under normal operation. See [data-flow.md](data-flow.md) for the
 full sequence.
 
 ## Key invariants
+
+**MERGE endpoint identity.** Within each path, bind the source and destination
+nodes before the edge. Bound raw keys take precedence over fallback derivation;
+UUID fallback keys are 16 bytes. Preserve existing raw identities and explicit,
+scoped and composite encodings rather than rehashing an endpoint's properties.
 
 1. **Adjacency-consistency invariant.** For every live edge `(src)-[label]->(tgt)`
    there exist exactly two adjacency rows: an OUT row under `src` and an IN row
@@ -167,3 +182,9 @@ Sits near the top of the stack: depends on `ferrosa-cluster`, `ferrosa-storage`,
 integration test harness only). Depended on by the `ferrosa` binary, which mounts
 its HTTP + Bolt servers. See the [root crate index](../../specs/crates.md) for the
 full graph.
+
+### Cell payload boundary
+
+Graph column extraction retains immutable `CellBytes` handles for regular
+cells. Adjacency repair carries those handles into new cells; visited traversal
+keys remain independently owned at the key boundary.

@@ -1407,7 +1407,7 @@ fn to_any_error(e: impl std::error::Error + Send + Sync + 'static) -> AnyError {
 
 /// Lowercase hex of the first `max` bytes of `bytes`.
 fn hex_preview(bytes: &[u8], max: usize) -> String {
-    bytes.iter().take(max).map(|b| format!("{b:02x}")).collect()
+    crate::hex::lower_prefix(bytes, max)
 }
 
 // ---------------------------------------------------------------------------
@@ -1420,6 +1420,36 @@ mod tests {
 
     use openraft::storage::RaftLogStorage;
     use openraft::{CommittedLeaderId, EntryPayload};
+
+    /// The hex preview in an `UndecodableEntry` report is what an operator
+    /// reads to identify a damaged log tail: lowercase, two digits per byte,
+    /// bounded by `max` (T6 replaced the per-byte `format!`).
+    #[test]
+    fn hex_preview_is_lowercase_zero_padded_and_bounded() {
+        assert_eq!(hex_preview(&[], 16), "");
+        assert_eq!(hex_preview(&[0x00], 16), "00");
+        assert_eq!(hex_preview(&[0x09], 16), "09");
+        assert_eq!(hex_preview(&[0xff], 16), "ff");
+        let key: Vec<u8> = (0u8..32).collect();
+        assert_eq!(
+            hex_preview(&key, 32),
+            "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+        );
+        assert_eq!(hex_preview(&key, 16), "000102030405060708090a0b0c0d0e0f");
+        assert_eq!(hex_preview(&key, 0), "");
+        assert_eq!(hex_preview(&key, 99), hex_preview(&key, 32));
+    }
+
+    /// Differential oracle: `take(max).map(|b| format!("{b:02x}"))`, the
+    /// expression `hex_preview` used to be.
+    #[test]
+    fn hex_preview_matches_the_old_expression() {
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(40).collect();
+        for max in 0..=bytes.len() + 2 {
+            let expected: String = bytes.iter().take(max).map(|b| format!("{b:02x}")).collect();
+            assert_eq!(hex_preview(&bytes, max), expected, "max={max}");
+        }
+    }
 
     /// Helper: create a blank entry at the given index.
     fn blank_entry(term: u64, index: u64) -> Entry<FerrosRaftConfig> {

@@ -106,7 +106,7 @@ fn read_v(engine: &StorageEngine, pk: &str) -> Option<Vec<u8>> {
     row.cells
         .iter()
         .find(|(col, _)| *col == 0)
-        .and_then(|(_, c)| c.value.clone())
+        .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
 }
 
 fn read_v_ts(engine: &StorageEngine, pk: &str) -> Option<i64> {

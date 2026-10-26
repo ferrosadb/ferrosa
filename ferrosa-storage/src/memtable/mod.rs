@@ -223,7 +223,7 @@ fn expand_legacy_collection_cell(
             RawCollectionKind::Map => (first.to_vec(), second.to_vec()),
         };
         elements.push(CellValue {
-            value: Some(value),
+            value: Some(value.into()),
             timestamp: blob.timestamp,
             ttl: blob.ttl,
             local_deletion_time: blob.local_deletion_time,

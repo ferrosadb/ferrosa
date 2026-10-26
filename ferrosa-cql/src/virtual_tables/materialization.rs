@@ -340,14 +340,16 @@ mod tests {
     use std::sync::Arc;
 
     fn text_cell(row: &ferrosa_schema::VirtualRow, idx: usize) -> String {
-        String::from_utf8(row.cells[idx].value.clone().expect("text cell")).unwrap()
+        std::str::from_utf8(row.cells[idx].value.as_deref().expect("text cell"))
+            .unwrap()
+            .to_owned()
     }
 
     fn bigint_cell(row: &ferrosa_schema::VirtualRow, idx: usize) -> i64 {
         i64::from_be_bytes(
             row.cells[idx]
                 .value
-                .clone()
+                .as_deref()
                 .expect("bigint cell")
                 .try_into()
                 .unwrap(),

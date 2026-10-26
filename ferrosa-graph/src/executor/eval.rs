@@ -370,11 +370,46 @@ fn as_bool(v: &Value) -> Option<bool> {
     }
 }
 
+/// Order integer JSON numbers without rounding either operand through f64.
+/// A mixed signed/unsigned pair is comparable even outside the i64 domain;
+/// floating-point numbers retain the evaluator's existing coercion rules.
+fn integer_ordering(left: &Value, right: &Value) -> Option<std::cmp::Ordering> {
+    let (Value::Number(left), Value::Number(right)) = (left, right) else {
+        return None;
+    };
+    if let (Some(left), Some(right)) = (left.as_i64(), right.as_i64()) {
+        return Some(left.cmp(&right));
+    }
+    if let (Some(left), Some(right)) = (left.as_u64(), right.as_u64()) {
+        return Some(left.cmp(&right));
+    }
+    match (left.as_i64(), right.as_i64()) {
+        (Some(signed), None) if signed < 0 && right.as_u64().is_some() => {
+            Some(std::cmp::Ordering::Less)
+        }
+        (None, Some(signed)) if signed < 0 && left.as_u64().is_some() => {
+            Some(std::cmp::Ordering::Greater)
+        }
+        _ => None,
+    }
+}
+
 /// Evaluate a comparison, returning Bool or Null.
 fn eval_compare(left: &Value, op: &CompareOp, right: &Value) -> Value {
     // NULL propagation: if either side is null, result is null.
     if left.is_null() || right.is_null() {
         return Value::Null;
+    }
+
+    if let Some(ordering) = integer_ordering(left, right) {
+        return Value::Bool(match op {
+            CompareOp::Eq => ordering.is_eq(),
+            CompareOp::Neq => !ordering.is_eq(),
+            CompareOp::Lt => ordering.is_lt(),
+            CompareOp::Gt => ordering.is_gt(),
+            CompareOp::LtEq => !ordering.is_gt(),
+            CompareOp::GtEq => !ordering.is_lt(),
+        });
     }
 
     // Try numeric comparison first.
@@ -765,6 +800,28 @@ mod tests {
     // -----------------------------------------------------------------------
     // Comparison
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn integer_comparisons_are_exact_across_signed_and_unsigned_limits() {
+        let a = serde_json::json!(i64::MAX - 1);
+        let b = serde_json::json!(i64::MAX);
+        assert_eq!(eval_compare(&a, &CompareOp::Eq, &b), Value::Bool(false));
+        assert_eq!(eval_compare(&a, &CompareOp::Lt, &b), Value::Bool(true));
+        let unsigned = serde_json::json!(u64::MAX);
+        let negative = serde_json::json!(-1);
+        assert_eq!(
+            eval_compare(&b, &CompareOp::Lt, &unsigned),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_compare(&negative, &CompareOp::Lt, &unsigned),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            eval_compare(&unsigned, &CompareOp::Gt, &negative),
+            Value::Bool(true)
+        );
+    }
 
     #[test]
     fn eval_compare_eq() {

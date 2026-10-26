@@ -4530,7 +4530,9 @@ mod production_wiring_tests {
     fn read_cell0(engine: &StorageEngine, key: &DecoratedKey) -> Option<Vec<u8>> {
         let partition = engine.read(&TableId::new(KS, TABLE), key).unwrap()?;
         let row = partition.rows.first()?;
-        row.cells.first().and_then(|(_, c)| c.value.clone())
+        row.cells
+            .first()
+            .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
     }
 
     /// RED (inc6 / task #31): the PRODUCTION state machine built by

@@ -59,6 +59,10 @@ jobs:
         run: python3 -m unittest -q tests/ci/test_ci_cache_workflow.py
       - name: Check CI builds the shipped binary once
         run: python3 -m unittest -q tests/ci/test_ci_build_once.py
+      - name: Check Bolt benchmarks require indexed schemas
+        run: python3 -m unittest -q tests/ci/test_bolt_benchmark_schema.py
+      - name: Check SPARQL benchmark HTTP contract
+        run: python3 -m unittest -q tests/ci/test_sparql_benchmark_adapter.py
       - name: Check every ignored and slow test still runs somewhere
         run: python3 -m unittest -q tests/ci/test_ignored_test_partition.py
       - name: Check every slow test is selectable by the slow-module filters

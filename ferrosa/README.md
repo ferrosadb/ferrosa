@@ -424,3 +424,8 @@ Two operational consequences are load-bearing:
   write fans out to all three nodes. With the cluster read in place a **quorum**
   factor is sufficient for a `QUORUM` read, so the write cost can be held at
   `floor(N/2)+1` rather than `N`.
+
+PostgreSQL is registered as starting before the web readiness endpoint is
+exposed. It becomes up only after its background TCP bind succeeds; pending or
+failed binds keep readiness false. This closes the startup window where an
+empty listener-status map could briefly make an occupied-port node look ready.

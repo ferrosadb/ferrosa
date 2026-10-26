@@ -49,6 +49,8 @@ pub mod quantized_range_cache;
 pub mod quarantine;
 pub mod range_merger;
 pub mod reader_pool;
+#[cfg(test)]
+mod replay_dedup_tests;
 pub mod replay_set_aside;
 pub mod restore;
 pub mod rrd;

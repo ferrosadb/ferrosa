@@ -31,7 +31,10 @@ pub fn logical_projection(partitions: &[Partition]) -> LogicalProjection {
             for (col, cell) in &row.cells {
                 map.insert(
                     (p.key.clone(), row.clustering.clone(), *col),
-                    (cell.value.clone(), cell.timestamp),
+                    (
+                        cell.value.as_ref().map(|value| value.to_vec()),
+                        cell.timestamp,
+                    ),
                 );
             }
         }

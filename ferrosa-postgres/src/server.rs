@@ -347,6 +347,7 @@ where
     St: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = Session::new(auth);
+    let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
     let idle_timeout = ctx.portals.limits().idle_timeout;
     loop {
         match codec::read_frontend(frames) {
@@ -367,6 +368,7 @@ where
                         if let Ok(ferrosa_sql::Statement::CopyFromStdin(copy)) =
                             ferrosa_sql::parse_statement(sql)
                         {
+                            flush_output(stream, &mut output).await?;
                             crate::copy_stdin::drive(
                                 stream,
                                 frames,
@@ -380,8 +382,13 @@ where
                         }
                     }
                 }
-                if handle_frontend(stream, ctx, &mut session, msg).await? {
+                let flush = matches!(&msg, FrontendMessage::Query(_) | FrontendMessage::Sync)
+                    || matches!(&msg, FrontendMessage::Unknown { tag: b'H', body } if body.is_empty());
+                if handle_frontend_buffered(stream, ctx, &mut session, msg, &mut output).await? {
                     return Ok(()); // Terminate
+                }
+                if flush || output.len() >= RESPONSE_BUFFER_BYTES {
+                    flush_output(stream, &mut output).await?;
                 }
             }
             Ok(None) => {
@@ -409,6 +416,7 @@ where
             }
             Err(e) => {
                 // Fail loud on a protocol violation, then close.
+                flush_output(stream, &mut output).await?;
                 if let Err(write_error) =
                     write_fatal(stream, codec_sqlstate(&e), &e.to_string()).await
                 {
@@ -426,11 +434,12 @@ where
 /// Extended-protocol error skipping: while `session.is_error_pending()`, every
 /// message except `Sync` is ignored (Postgres semantics — the backend discards
 /// messages until the next Sync after an error).
-async fn handle_frontend<St>(
+async fn handle_frontend_buffered<St>(
     stream: &mut St,
     ctx: &QueryContext,
     session: &mut Session,
     msg: FrontendMessage,
+    out: &mut BytesMut,
 ) -> std::io::Result<bool>
 where
     St: AsyncRead + AsyncWrite + Unpin,
@@ -440,23 +449,29 @@ where
         return Ok(false);
     }
 
-    let mut out = BytesMut::new();
     match msg {
         FrontendMessage::Query(sql) => {
-            let msgs = execute_simple_to(ctx, session, &sql, &mut SocketSink(&mut *stream)).await?;
+            let msgs = execute_simple_to(
+                ctx,
+                session,
+                &sql,
+                &mut SocketSink {
+                    stream: &mut *stream,
+                    output: out,
+                },
+            )
+            .await?;
             for m in &msgs {
-                m.encode(&mut out);
+                m.encode(out);
             }
-            BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
+            BackendMessage::ReadyForQuery(session.txn_status()).encode(out);
         }
         FrontendMessage::Parse {
             stmt_name,
             query,
             param_types,
         } => {
-            session
-                .on_parse(stmt_name, &query, param_types)
-                .encode(&mut out);
+            session.on_parse(stmt_name, &query, param_types).encode(out);
         }
         FrontendMessage::Bind {
             portal,
@@ -474,32 +489,43 @@ where
                     result_formats,
                     &ctx.jsonb_limits,
                 )
-                .encode(&mut out);
+                .encode(out);
         }
         FrontendMessage::Describe { kind, name } => {
             for m in describe(ctx, session, kind, &name).await {
-                m.encode(&mut out);
+                m.encode(out);
             }
         }
         FrontendMessage::Execute { portal, max_rows } => {
+            // A pipeline is one implicit transaction until Sync, including on
+            // a standalone node. Do not commit each Execute independently.
+            if !session.in_txn() {
+                if let Err(error) = begin_implicit_transaction(ctx, session).await {
+                    session.fail(error).encode(out);
+                    return Ok(false);
+                }
+                session.mark_extended_implicit();
+            }
             let tail = execute_portal_to(
                 ctx,
                 session,
                 &portal,
                 max_rows,
-                &mut SocketSink(&mut *stream),
+                &mut SocketSink {
+                    stream: &mut *stream,
+                    output: out,
+                },
             )
             .await?;
             for m in &tail {
-                m.encode(&mut out);
+                m.encode(out);
             }
         }
         FrontendMessage::Close { kind, name } => {
-            session.on_close(kind, &name).encode(&mut out);
+            session.on_close(kind, &name).encode(out);
         }
         FrontendMessage::Sync => {
-            session.on_sync();
-            BackendMessage::ReadyForQuery(session.txn_status()).encode(&mut out);
+            finish_extended_pipeline(ctx, session, out).await;
         }
         FrontendMessage::Terminate => return Ok(true),
         // COPY data with no COPY in progress. The wire layer understands these frames so a COPY
@@ -510,16 +536,46 @@ where
         | FrontendMessage::CopyDone
         | FrontendMessage::CopyFail { .. } => {
             crate::query::error_response("08P01", "COPY data received outside a COPY operation")
-                .encode(&mut out);
+                .encode(out);
         }
         // SASL after auth, or any other unexpected message: ignore.
         FrontendMessage::SaslResponse { .. } | FrontendMessage::Unknown { .. } => {}
     }
 
-    if !out.is_empty() {
-        stream.write_all(&out).await?;
-    }
     Ok(false)
+}
+
+#[cfg(test)]
+async fn handle_frontend<St: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut St,
+    ctx: &QueryContext,
+    session: &mut Session,
+    msg: FrontendMessage,
+) -> std::io::Result<bool> {
+    let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
+    let end = handle_frontend_buffered(stream, ctx, session, msg, &mut output).await?;
+    flush_output(stream, &mut output).await?;
+    Ok(end)
+}
+
+/// Finish the implicit extended-protocol group before ReadyForQuery.
+/// Explicit BEGIN blocks retain their caller-controlled commit boundary.
+async fn finish_extended_pipeline(ctx: &QueryContext, session: &mut Session, out: &mut BytesMut) {
+    if session.is_extended_implicit() {
+        if session.is_error_pending() || session.in_failed_txn() {
+            session.end_txn();
+        } else {
+            for message in commit_txn(ctx, session).await {
+                // Sync has no COMMIT command tag; commit errors precede
+                // ReadyForQuery, exactly as the wire protocol requires.
+                if matches!(message, BackendMessage::ErrorResponse { .. }) {
+                    message.encode(out);
+                }
+            }
+        }
+    }
+    session.on_sync();
+    BackendMessage::ReadyForQuery(session.txn_status()).encode(out);
 }
 
 async fn begin_implicit_transaction(
@@ -529,6 +585,10 @@ async fn begin_implicit_transaction(
     // Per statement: this node may have become a cluster (or lost its write
     // path) since the listener was built.
     let Some(committer) = ctx.accord.committer() else {
+        session.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot(),
+        );
         return Ok(());
     };
     let cluster_ts = committer
@@ -547,17 +607,56 @@ async fn begin_implicit_transaction(
     Ok(())
 }
 
-/// Writes each batch of messages to the socket as it is produced, so a streaming
-/// `SELECT` never gathers its rows.
-struct SocketSink<'a, St>(&'a mut St);
+/// Flush at protocol boundaries and in bounded chunks during streaming.
+const RESPONSE_BUFFER_BYTES: usize = 8192;
+
+async fn flush_output<St: AsyncWrite + Unpin>(
+    stream: &mut St,
+    output: &mut BytesMut,
+) -> std::io::Result<()> {
+    if !output.is_empty() {
+        stream.write_all(output).await?;
+        output.clear();
+    }
+    Ok(())
+}
+
+/// Encodes directly into a reusable connection buffer; never gathers a result.
+struct SocketSink<'a, St> {
+    stream: &'a mut St,
+    output: &'a mut BytesMut,
+}
 
 impl<St: AsyncWrite + Unpin> ReplySink for SocketSink<'_, St> {
     async fn send(&mut self, messages: Vec<BackendMessage>) -> std::io::Result<()> {
-        let mut buf = BytesMut::new();
         for message in &messages {
-            message.encode(&mut buf);
+            message.encode(self.output);
+            if self.output.len() >= RESPONSE_BUFFER_BYTES {
+                flush_output(self.stream, self.output).await?;
+            }
         }
-        self.0.write_all(&buf).await
+        Ok(())
+    }
+
+    async fn send_rows<I: Iterator<Item = ferrosa_sql::Row>>(
+        &mut self,
+        rows: I,
+        types: &[ferrosa_sql::ColumnType],
+        formats: &[i16],
+    ) -> std::io::Result<(usize, Option<BackendMessage>)> {
+        let mut count = 0;
+        for row in rows {
+            let result = query::encode_data_row_into(&row, types, formats, self.output);
+            drop(row);
+            if let Err(error) = result {
+                return Ok((count, Some(query::encode_error_response(&error))));
+            }
+            count += 1;
+            if self.output.len() >= RESPONSE_BUFFER_BYTES {
+                flush_output(self.stream, self.output).await?;
+            }
+        }
+        Ok((count, None))
     }
 }
 
@@ -1087,7 +1186,6 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // registered as a conflict key would re-serialize every disjoint-key writer of
     // that table, so only the tables the transaction actually READ participate.
     let scanned_tables = read_tables.clone();
-    let _commit_guard = ctx.mvcc.commit_guard().await;
     // Per-phase attribution for the COMMIT (see `MvccProfile`). Zero-valued and
     // unused unless `FERROSA_PG_COMMIT_PROFILE` is set.
     let commit_started = std::time::Instant::now();
@@ -2380,6 +2478,227 @@ pub(crate) mod txn_atomicity_tests {
                 _ => None,
             })
             .collect()
+    }
+
+    async fn pipeline_insert_frame<St>(
+        stream: &mut St,
+        ctx: &QueryContext,
+        session: &mut Session,
+        key: &str,
+        value: &str,
+    ) where
+        St: AsyncRead + AsyncWrite + Unpin,
+    {
+        if session.statement("pipeline_insert").is_none() {
+            handle_frontend(
+                stream,
+                ctx,
+                session,
+                FrontendMessage::Parse {
+                    stmt_name: "pipeline_insert".into(),
+                    query: "INSERT INTO kv (k,v) VALUES ($1,$2)".into(),
+                    param_types: vec![25, 25],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(!session.is_error_pending(), "valid Parse was refused");
+        }
+        for frame in [
+            FrontendMessage::Bind {
+                portal: "".into(),
+                stmt_name: "pipeline_insert".into(),
+                param_formats: vec![0],
+                param_values: vec![
+                    Some(key.as_bytes().to_vec()),
+                    Some(value.as_bytes().to_vec()),
+                ],
+                result_formats: vec![],
+            },
+            FrontendMessage::Execute {
+                portal: "".into(),
+                max_rows: 0,
+            },
+        ] {
+            handle_frontend(stream, ctx, session, frame).await.unwrap();
+            assert!(
+                !session.is_error_pending(),
+                "valid pipeline frame was refused"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_sync_publishes_one_atomic_batch() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        let before = ctx.mvcc.current_commit_seq();
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "pipe_a", "first").await;
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "pipe_b", "second").await;
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_a").await,
+            Vec::new(),
+            "Execute must not publish before Sync"
+        );
+        assert_eq!(read_kv_values(&ctx, "pipe_b").await, Vec::new());
+        assert_eq!(
+            ctx.mvcc.current_commit_seq(),
+            before,
+            "no per-Execute commit"
+        );
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_a").await,
+            vec![(Some("pipe_a".into()), Some("first".into()))]
+        );
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_b").await,
+            vec![(Some("pipe_b".into()), Some("second".into()))]
+        );
+        assert_eq!(
+            ctx.mvcc.current_commit_seq(),
+            before + 1,
+            "one Sync is one committed batch"
+        );
+        assert!(!session.in_txn());
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_error_rolls_back_all_pre_sync_writes() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        pipeline_insert_frame(
+            &mut stream,
+            &ctx,
+            &mut session,
+            "pipe_rollback",
+            "must_not_survive",
+        )
+        .await;
+        for frame in [
+            FrontendMessage::Parse {
+                stmt_name: "bad_pipeline".into(),
+                query: "INSERT INTO missing_pipeline_table (k,v) VALUES ('bad','bad')".into(),
+                param_types: vec![],
+            },
+            FrontendMessage::Bind {
+                portal: "".into(),
+                stmt_name: "bad_pipeline".into(),
+                param_formats: vec![],
+                param_values: vec![],
+                result_formats: vec![],
+            },
+            FrontendMessage::Execute {
+                portal: "".into(),
+                max_rows: 0,
+            },
+        ] {
+            handle_frontend(&mut stream, &ctx, &mut session, frame)
+                .await
+                .unwrap();
+        }
+        assert!(session.is_error_pending(), "missing table must fail");
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_kv_values(&ctx, "pipe_rollback").await,
+            Vec::new(),
+            "failed pipeline must roll back its earlier successful Execute"
+        );
+        assert!(!session.in_txn());
+        assert!(!session.is_error_pending());
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_sync_preserves_an_explicit_transaction() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "explicit_pipe", "held").await;
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        assert!(session.in_txn(), "Sync must not commit an explicit BEGIN");
+        assert!(read_kv_values(&ctx, "explicit_pipe").await.is_empty());
+        let messages = execute_simple(&ctx, &mut session, "COMMIT").await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "{messages:?}"
+        );
+        assert_eq!(
+            read_kv_values(&ctx, "explicit_pipe").await,
+            vec![(Some("explicit_pipe".into()), Some("held".into()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_disconnect_discards_uncommitted_writes() {
+        let (_dir, ctx) = make_ctx().await;
+        let (mut stream, _client) = tokio::io::duplex(64 * 1024);
+        let mut session = Session::new(superuser());
+        pipeline_insert_frame(
+            &mut stream,
+            &ctx,
+            &mut session,
+            "disconnected_pipe",
+            "discard",
+        )
+        .await;
+        drop(session);
+        assert!(read_kv_values(&ctx, "disconnected_pipe").await.is_empty());
+        assert_eq!(
+            ctx.mvcc.active_snapshot_count(),
+            0,
+            "disconnect must release its snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_pipeline_sync_reports_a_commit_conflict_and_returns_idle() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        let (mut stream, mut client) = tokio::io::duplex(64 * 1024);
+        pipeline_insert_frame(&mut stream, &ctx, &mut session, "sync_conflict", "loser").await;
+        let mut other = Session::new(superuser());
+        let messages = execute_simple(
+            &ctx,
+            &mut other,
+            "INSERT INTO kv (k,v) VALUES ('sync_conflict','winner')",
+        )
+        .await;
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+            "{messages:?}"
+        );
+        handle_frontend(&mut stream, &ctx, &mut session, FrontendMessage::Sync)
+            .await
+            .unwrap();
+        drop(stream);
+        let mut bytes = Vec::new();
+        client.read_to_end(&mut bytes).await.unwrap();
+        assert!(
+            bytes.windows(7).any(|w| w == b"C40001\0"),
+            "Sync must report the refused commit, not acknowledge it"
+        );
+        assert!(
+            bytes.ends_with(b"Z\0\0\0\x05I"),
+            "failed implicit commit must return ReadyForQuery Idle"
+        );
+        assert_eq!(
+            read_kv_values(&ctx, "sync_conflict").await,
+            vec![(Some("sync_conflict".into()), Some("winner".into()))]
+        );
+        assert!(!session.in_txn());
     }
 
     /// INVARIANT (transactionality): a multi-row INSERT buffered inside an explicit
@@ -4394,6 +4713,446 @@ pub(crate) mod txn_atomicity_tests {
             row_count(&ctx, "a").await,
             1,
             "the row before the marker must land on COMMIT"
+        );
+    }
+    #[derive(Default)]
+    struct RecordedWire {
+        bytes: Vec<u8>,
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncRead for RecordedWire {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    impl tokio::io::AsyncWrite for RecordedWire {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_point_reply_is_batched_at_sync() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let mut frames = BytesMut::new();
+        frames.extend_from_slice(&pg_frame(
+            b'P',
+            b"\0SELECT v FROM kv WHERE k = 'good'\0\0\0",
+        ));
+        frames.extend_from_slice(&pg_frame(b'B', &[0; 8]));
+        frames.extend_from_slice(&pg_frame(b'D', b"P\0"));
+        frames.extend_from_slice(&pg_frame(b'E', &[0; 5]));
+        frames.extend_from_slice(&pg_frame(b'S', &[]));
+        frames.extend_from_slice(&pg_frame(b'X', &[]));
+        let mut wire = RecordedWire::default();
+        query_loop(&mut wire, &mut frames, &ctx, superuser(), &mut [0; 4096])
+            .await
+            .unwrap();
+        let mut tags = Vec::new();
+        let mut rest = wire.bytes.as_slice();
+        while !rest.is_empty() {
+            tags.push(rest[0]);
+            let len = i32::from_be_bytes(rest[1..5].try_into().unwrap()) as usize;
+            if rest[0] == b'D' {
+                assert_eq!(&rest[11..1 + len], b"expected");
+            }
+            rest = &rest[1 + len..];
+        }
+        assert_eq!(tags, b"12TDCZ");
+        assert_eq!(
+            wire.writes, 1,
+            "all replies for the bounded point read flush at Sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_flush_delivers_parse_and_pending_error_before_sync() {
+        let (_dir, ctx) = make_ctx().await;
+        for query in ["SELECT 1", "SELECT FROM"] {
+            let (mut client, mut server) = tokio::io::duplex(4096);
+            let mut frames = BytesMut::new();
+            let mut parse = vec![0];
+            parse.extend_from_slice(query.as_bytes());
+            parse.extend_from_slice(&[0, 0, 0]);
+            frames.extend_from_slice(&pg_frame(b'P', &parse));
+            frames.extend_from_slice(&pg_frame(b'H', &[]));
+            let serving = async {
+                query_loop(&mut server, &mut frames, &ctx, superuser(), &mut [0; 1024])
+                    .await
+                    .unwrap();
+            };
+            let receiving = async {
+                let mut response = [0; 5];
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.read_exact(&mut response),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(response[0], if query == "SELECT 1" { b'1' } else { b'E' });
+                client.write_all(&pg_frame(b'S', &[])).await.unwrap();
+                client.write_all(&pg_frame(b'X', &[])).await.unwrap();
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(serving, receiving);
+            })
+            .await
+            .expect("wire fixture completes");
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_sink_streams_bounded_rows_and_preserves_error_prefix() {
+        use ferrosa_sql::{ColumnType, Row, Value};
+        let mut wire = RecordedWire::default();
+        let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
+        let rows = (0..100).map(|_| Row(vec![Value::Text("x".repeat(1024))]));
+        let mut sink = SocketSink {
+            stream: &mut wire,
+            output: &mut output,
+        };
+        assert_eq!(
+            sink.send_rows(rows, &[ColumnType::Text], &[0])
+                .await
+                .unwrap(),
+            (100, None)
+        );
+        assert!(sink.stream.writes > 1);
+        assert!(sink.output.len() < RESPONSE_BUFFER_BYTES);
+        let prefix = sink.output.clone();
+        let (sent, error) = sink
+            .send_rows(
+                std::iter::once(Row(vec![
+                    Value::Text("partial".into()),
+                    Value::Int(i64::MAX),
+                ])),
+                &[ColumnType::Text, ColumnType::Int],
+                &[1],
+            )
+            .await
+            .unwrap();
+        assert_eq!(sent, 0);
+        assert!(error.is_some());
+        assert_eq!(sink.output.as_ref(), prefix.as_ref());
+        flush_output(sink.stream, sink.output).await.unwrap();
+        assert_eq!(
+            wire.bytes.iter().filter(|b| **b == b'x').count(),
+            100 * 1024
+        );
+    }
+
+    #[tokio::test]
+    async fn point_read_valid_mvcc_image_still_reports_corrupt_physical_payload() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"good".to_vec()));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![(0, ferrosa_common::CellValue::live(vec![0xff], i64::MAX - 1))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                i64::MAX - 1,
+            ),
+        };
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "kv"),
+                &key,
+                row,
+                i64::MAX - 1,
+            )
+            .unwrap();
+        let mut reader = Session::new(superuser());
+        let replies = execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'good'").await;
+        assert_eq!(error_sqlstate(&replies).as_deref(), Some("58000"));
+        assert!(!replies
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { .. })));
+    }
+
+    /// A keyed SELECT must not decode unrelated partitions. The deliberately
+    /// corrupt UTF-8 value is readable only through a scan, never through k=good.
+    async fn point_lookup_fixture() -> (tempfile::TempDir, QueryContext) {
+        let (dir, ctx) = make_ctx().await;
+        let mut writer = Session::new(superuser());
+        let result = execute_simple(
+            &ctx,
+            &mut writer,
+            "INSERT INTO kv (k, v) VALUES ('good', 'expected')",
+        )
+        .await;
+        assert_eq!(error_sqlstate(&result), None);
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"corrupt".to_vec(),
+        ));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![(0, ferrosa_common::CellValue::live(vec![0xff], 9000))],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(9000),
+        };
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "kv"),
+                &key,
+                row,
+                9000,
+            )
+            .unwrap();
+        (dir, ctx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_skips_unrelated_partition_decode() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let mut reader = Session::new(superuser());
+        let result = execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'good'").await;
+        assert_eq!(
+            error_sqlstate(&result),
+            None,
+            "point read touched unrelated corrupt row: {result:?}"
+        );
+        let rows: Vec<_> = result
+            .iter()
+            .filter_map(|m| match m {
+                BackendMessage::DataRow { columns: cells } => Some(cells),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, vec![&vec![Some(b"expected".to_vec())]]);
+        let missing =
+            execute_simple(&ctx, &mut reader, "SELECT v FROM kv WHERE k = 'missing'").await;
+        assert_eq!(
+            error_sqlstate(&missing),
+            None,
+            "missing point read scanned table: {missing:?}"
+        );
+        assert!(!missing
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { .. })));
+        let scan = execute_simple(&ctx, &mut reader, "SELECT v FROM kv").await;
+        assert_eq!(error_sqlstate(&scan).as_deref(), Some("58000"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_bound_parameter_skips_unrelated_partition_decode() {
+        let (_dir, ctx) = point_lookup_fixture().await;
+        let mut reader = Session::new(superuser());
+        reader.on_parse("point".into(), "SELECT v FROM kv WHERE k = $1", vec![25]);
+        reader.on_bind(
+            "point".into(),
+            "point".into(),
+            &[],
+            &[Some(b"good".to_vec())],
+            vec![],
+            &ctx.jsonb_limits,
+        );
+        let result = execute_portal(&ctx, &mut reader, "point").await;
+        assert_eq!(
+            error_sqlstate(&result),
+            None,
+            "bound point read touched unrelated row: {result:?}"
+        );
+        assert!(result
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { columns: cells }
+            if cells == &vec![Some(b"expected".to_vec())])));
+    }
+
+    /// The read adapter must request the exact key at the configured cluster
+    /// consistency. A full scan fails even if it would filter before decoding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_uses_cluster_key_operation_and_propagates_errors() {
+        use crate::cluster_read::{PartitionStream, RangeRead};
+        use ferrosa_cluster::{consistency::ConsistencyLevel, ring::strategy::ReplicationStrategy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct KeyRead {
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl RangeRead for KeyRead {
+            async fn stream_all(
+                &self,
+                _: &ferrosa_storage::TableId,
+                _: ConsistencyLevel,
+                _: &ReplicationStrategy,
+            ) -> Result<PartitionStream, String> {
+                Err("point SELECT opened a full scan".into())
+            }
+            async fn stream_key(
+                &self,
+                table: &ferrosa_storage::TableId,
+                key: &ferrosa_common::DecoratedKey,
+                cl: ConsistencyLevel,
+                strategy: &ReplicationStrategy,
+            ) -> Result<PartitionStream, String> {
+                assert_eq!(table, &ferrosa_storage::TableId::new("public", "kv"));
+                assert_eq!(key.key.as_bytes(), b"good");
+                assert_eq!(cl, crate::cluster_read::read_consistency().unwrap());
+                assert_eq!(strategy.replication_factor(), 1);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Err("required replica unavailable".into())
+            }
+        }
+        let (_dir, mut ctx) = make_ctx().await;
+        let adapter = Arc::new(KeyRead {
+            calls: AtomicUsize::new(0),
+        });
+        let reader = adapter.clone();
+        ctx.cluster_read = crate::ClusterRead::live(move || Some(reader.clone()));
+        let mut session = Session::new(superuser());
+        let result = execute_simple(&ctx, &mut session, "SELECT v FROM kv WHERE k='good'").await;
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            1,
+            "must request key, not scan"
+        );
+        assert_eq!(error_sqlstate(&result).as_deref(), Some("58000"));
+        assert!(format!("{result:?}").contains("required replica unavailable"));
+    }
+
+    /// A catalog opened before the first MVCC touch must restore a subsequently
+    /// deleted key without enumerating historical keys or reading current data.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_catalog_keeps_late_delete_before_image() {
+        use ferrosa_sql::Catalog;
+        let (_dir, ctx) = make_ctx().await;
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"good".to_vec()));
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "kv"),
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(0, ferrosa_common::CellValue::live(b"before".to_vec(), 9000))],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        9000,
+                    ),
+                },
+                9000,
+            )
+            .unwrap();
+        let snapshot = ctx.mvcc.snapshot();
+        let ferrosa_sql::Statement::Select(select) =
+            ferrosa_sql::parse_statement("SELECT * FROM kv WHERE k='good'").unwrap()
+        else {
+            panic!("select");
+        };
+        let (catalog, failure) = crate::query::load_catalog_with_mvcc(
+            &ctx.engine,
+            &ctx.schema,
+            &select,
+            "public",
+            Some(&ctx.mvcc),
+            Some(&snapshot),
+            None,
+            None,
+            Some((&[], &ctx.jsonb_limits)),
+        )
+        .await
+        .unwrap();
+        let mut writer = Session::new(superuser());
+        let deleted = execute_simple(&ctx, &mut writer, "DELETE FROM kv WHERE k='good'").await;
+        assert_eq!(error_sqlstate(&deleted), None, "{deleted:?}");
+        let table = catalog.resolve("public", "kv").unwrap();
+        let rows: Vec<_> = tokio::task::spawn_blocking(move || table.scan().collect::<Vec<_>>())
+            .await
+            .unwrap();
+        assert!(failure.take().is_none());
+        assert_eq!(
+            rows,
+            vec![ferrosa_sql::Row::new(vec![
+                ferrosa_sql::Value::Text("good".into()),
+                ferrosa_sql::Value::Text("before".into())
+            ])]
+        );
+        let mut own = Session::new(superuser());
+        execute_simple(&ctx, &mut own, "BEGIN").await;
+        execute_simple(&ctx, &mut own, "INSERT INTO kv (k,v) VALUES ('good','own')").await;
+        let visible = execute_simple(&ctx, &mut own, "SELECT v FROM kv WHERE k='good'").await;
+        assert_eq!(error_sqlstate(&visible), None);
+        assert!(visible
+            .iter()
+            .any(|m| matches!(m, BackendMessage::DataRow { columns }
+            if columns == &vec![Some(b"own".to_vec())])));
+    }
+    /// SQL equates signed zero but Cassandra floating partition keys preserve
+    /// its sign bit. Such keys must retain the scan path to avoid a false miss.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn point_lookup_float_signed_zero_keeps_sql_equality() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut meta = ctx
+            .schema
+            .snapshot()
+            .tables
+            .get(&("public".into(), "kv".into()))
+            .unwrap()
+            .clone();
+        meta.name = "float_keys".into();
+        meta.id = Uuid::new_v4();
+        meta.columns.get_mut("k").unwrap().column_type = "float".into();
+        ctx.schema.create_table(meta, &superuser()).unwrap();
+        let mut storage = kv_storage_schema();
+        storage.table = "float_keys".into();
+        storage.key_type = "org.apache.cassandra.db.marshal.FloatType".into();
+        ctx.engine.register_table(storage).unwrap();
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            (-0.0_f32).to_be_bytes().to_vec(),
+        ));
+        ctx.engine
+            .write(
+                &ferrosa_storage::TableId::new("public", "float_keys"),
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(
+                        0,
+                        ferrosa_common::CellValue::live(b"negative zero".to_vec(), 9000),
+                    )],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        9000,
+                    ),
+                },
+                9000,
+            )
+            .unwrap();
+        let mut reader = Session::new(superuser());
+        let result =
+            execute_simple(&ctx, &mut reader, "SELECT v FROM float_keys WHERE k=0.0").await;
+        assert_eq!(error_sqlstate(&result), None, "{result:?}");
+        assert!(
+            result
+                .iter()
+                .any(|m| matches!(m, BackendMessage::DataRow { columns }
+            if columns == &vec![Some(b"negative zero".to_vec())])),
+            "SQL signed-zero equality lost a key: {result:?}"
         );
     }
 }
