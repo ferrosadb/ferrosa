@@ -161,6 +161,30 @@ fn empty_aggregate_value(expr: &Expr) -> serde_json::Value {
     }
 }
 
+/// Classify the bound AST before any data-dependent evaluation. Exhaustiveness
+/// makes new statement variants require an explicit admission decision.
+fn statement_writes(statement: &Statement) -> bool {
+    match statement {
+        Statement::Create { .. }
+        | Statement::Set { .. }
+        | Statement::Remove { .. }
+        | Statement::Delete { .. }
+        | Statement::Merge { .. } => true,
+        Statement::Unwind { write, .. } => write.as_deref().is_some_and(statement_writes),
+        Statement::Union { arms, .. } => arms.iter().any(statement_writes),
+        Statement::Foreach { body, .. } => body.iter().any(statement_writes),
+        Statement::CallSubquery { outer, inner, .. } => {
+            statement_writes(outer) || statement_writes(inner)
+        }
+        Statement::Subscribe { inner, .. } => statement_writes(inner),
+        Statement::Match { .. }
+        | Statement::MatchWith { .. }
+        | Statement::MatchWithOptional { .. }
+        | Statement::Return { .. }
+        | Statement::Unsubscribe { .. } => false,
+    }
+}
+
 fn pattern_requires_adjacency(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Rel { .. } => true,
@@ -743,8 +767,42 @@ async fn heal_adjacency(
     Ok(())
 }
 
+/// Scheduling probe for deterministic integration tests of query execution.
+/// Only debug builds expose this seam; no probe is installed by normal callers.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[async_trait]
+pub trait QueryExecutionTestProbe: Send + Sync {
+    /// Called after an execution future is polled, including a pending lock wait.
+    fn after_poll(&self, ready: bool);
+
+    /// Called only after polling writer admission returns Pending.
+    fn writer_waiting(&self) {}
+
+    /// Called after SET has read/evaluated its RHS, before writing the property.
+    async fn before_property_write(&self) {}
+}
+
+#[cfg(debug_assertions)]
+tokio::task_local! {
+    static QUERY_EXECUTION_TEST_PROBE: Arc<dyn QueryExecutionTestProbe>;
+}
+
+#[cfg(debug_assertions)]
+pub(crate) async fn before_property_write_for_test() {
+    if let Ok(probe) = QUERY_EXECUTION_TEST_PROBE.try_with(Arc::clone) {
+        probe.before_property_write().await;
+    }
+}
+
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
+    publication: Arc<tokio::sync::RwLock<()>>,
+    // One FIFO writer domain for every keyspace/key through this engine. Always
+    // acquire BEFORE publication; a queued writer cannot delay its owner's COMMIT.
+    writer_admission: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(debug_assertions)]
+    query_test_probes: Mutex<HashMap<String, Arc<dyn QueryExecutionTestProbe>>>,
     schema: Arc<Schema>,
     /// Adjacency registration and observers, and the data dir that holds the
     /// heal record.
@@ -863,6 +921,10 @@ impl GraphEngine {
         // the lazy path; nothing here is so urgent that it can't wait
         // for the first query.
         Self {
+            publication: Arc::new(tokio::sync::RwLock::new(())),
+            writer_admission: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(debug_assertions)]
+            query_test_probes: Mutex::new(HashMap::new()),
             schema,
             storage,
             write_path,
@@ -1171,7 +1233,241 @@ impl GraphEngine {
         auth: &AuthContext,
         params: &HashMap<String, Value>,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        #[cfg(debug_assertions)]
+        {
+            let probe = self.query_test_probes.lock().unwrap().get(query).cloned();
+            if let Some(probe) = probe {
+                return QUERY_EXECUTION_TEST_PROBE
+                    .scope(probe.clone(), async {
+                        let mut execute = Box::pin(
+                            self.execute_stream_with_params_inner(query, keyspace, auth, params),
+                        );
+                        futures::future::poll_fn(|cx| {
+                            let result = std::future::Future::poll(execute.as_mut(), cx);
+                            probe.after_poll(result.is_ready());
+                            result
+                        })
+                        .await
+                    })
+                    .await;
+            }
+        }
+        self.execute_stream_with_params_inner(query, keyspace, auth, params)
+            .await
+    }
+
+    /// Install an instance-local probe for an exact query, without global state.
+    /// It covers execution setup (including the currently buffered SET operator),
+    /// not subsequent lazy row-stream polling by the transport.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_query_execution_probe_for_test(
+        &self,
+        query: &str,
+        probe: Arc<dyn QueryExecutionTestProbe>,
+    ) {
+        self.query_test_probes
+            .lock()
+            .unwrap()
+            .insert(query.to_string(), probe);
+    }
+
+    async fn acquire_writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let acquire = self.writer_admission.clone().lock_owned();
+        tokio::pin!(acquire);
+        futures::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(acquire.as_mut(), cx);
+            #[cfg(debug_assertions)]
+            if result.is_pending() {
+                let _ = QUERY_EXECUTION_TEST_PROBE.try_with(|probe| probe.writer_waiting());
+            }
+            result
+        })
+        .await
+    }
+
+    async fn execute_stream_with_params_inner(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        let transaction = crate::transaction::TRANSACTION_IO.try_with(Arc::clone).ok();
+        let query_deadline = tokio::time::Instant::now() + self.config.query_timeout;
+        let deadline = transaction.as_ref().map_or(query_deadline, |tx| {
+            query_deadline.min(tokio::time::Instant::from_std(tx.deadline))
+        });
         let statement = bind_statement_params(parse(query)?, params)?;
+        let subscription = matches!(statement, Statement::Subscribe { .. });
+        let writing = statement_writes(&statement);
+        if subscription && (transaction.is_some() || writing) {
+            return Err(GraphError::Validation(
+                "SUBSCRIBE requires a read-only query outside an explicit transaction".into(),
+            ));
+        }
+        let setup = async {
+            // BEGIN and read-only RUN do not acquire admission. Explicit ownership
+            // lives in the transaction; autocommit ownership lives in the stream.
+            let writer = if writing {
+                if let Some(tx) = &transaction {
+                    let mut owned = tx.writer_admission.lock().await;
+                    if owned.is_none() {
+                        *owned = Some(self.acquire_writer().await);
+                    }
+                    None
+                } else {
+                    Some(self.acquire_writer().await)
+                }
+            } else {
+                None
+            };
+            // A waiter owns no publication read guard. Nested executions call the
+            // private statement pipeline, inheriting this outer admission scope.
+            let publication = if subscription {
+                None
+            } else {
+                Some(self.publication.clone().read_owned().await)
+            };
+            // timeout_at polls a ready future before its timer; reject an
+            // already-expired admission before any data-dependent work too.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GraphError::Timeout);
+            }
+            let (columns, rows, stats) = self
+                .execute_stream_unlocked(statement, keyspace, auth)
+                .await?;
+            Ok::<_, GraphError>((columns, rows, stats, writer, publication))
+        };
+        let (columns, mut rows, stats, writer, publication) =
+            tokio::time::timeout_at(deadline, setup)
+                .await
+                .map_err(|_| GraphError::Timeout)??;
+        // Tuple fields drop in order even if the stream has never been polled.
+        // This makes publication-before-admission release independent of generator
+        // capture order, as well as normal completion/error paths.
+        let guards = (publication, writer);
+        let rows = Box::pin(async_stream::stream! {
+            let guards = guards;
+            let error = loop {
+                if !subscription && tokio::time::Instant::now() >= deadline {
+                    break Some(GraphError::Timeout);
+                }
+                let next = if subscription {
+                    Ok(futures::StreamExt::next(&mut rows).await)
+                } else {
+                    tokio::time::timeout_at(deadline, futures::StreamExt::next(&mut rows)).await
+                };
+                match next {
+                    Ok(Some(Ok(row))) => yield Ok(row),
+                    Ok(Some(Err(error))) => break Some(error),
+                    Err(_) => break Some(GraphError::Timeout),
+                    Ok(None) => break None,
+                }
+            };
+            // Drop the lazy executor too: it can retain transaction I/O. Release
+            // BEFORE yielding a terminal error, even if the consumer keeps us.
+            drop(rows);
+            drop(guards);
+            if let Some(error) = error { yield Err(error); }
+        });
+        Ok((columns, rows, stats))
+    }
+
+    pub(crate) async fn begin_transaction(
+        &self,
+        keyspace: String,
+        timeout: Duration,
+    ) -> Result<Arc<crate::transaction::LocalTransaction>> {
+        if !self.schema.snapshot().keyspaces.contains_key(&keyspace) {
+            return Err(GraphError::Validation(format!(
+                "database '{keyspace}' does not exist"
+            )));
+        }
+        let transaction = crate::transaction::LocalTransaction::new(
+            self.write_path.load_full(),
+            keyspace.clone(),
+            timeout,
+        )?;
+        // Complete committed adjacency setup before any pending edge exists.
+        self.ensure_adjacency_ready(&keyspace).await?;
+        Ok(Arc::new(transaction))
+    }
+
+    pub(crate) async fn execute_transaction(
+        &self,
+        transaction: Arc<crate::transaction::LocalTransaction>,
+        query: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<GraphResult> {
+        transaction.check_deadline()?;
+        let keyspace = transaction.keyspace.clone();
+        let remaining = transaction
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let execute = crate::transaction::TRANSACTION_IO.scope(transaction.clone(), async {
+            let (columns, mut stream, stats) = self
+                .execute_stream_with_params(query, &keyspace, auth, params)
+                .await?;
+            let mut rows = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(row) = futures::StreamExt::next(&mut stream).await {
+                let row = row?;
+                bytes = bytes
+                    .saturating_add(
+                        serde_json::to_vec(&row)
+                            .map_err(|e| GraphError::Internal(e.to_string()))?
+                            .len(),
+                    )
+                    .saturating_add(row.len().saturating_mul(64) + 64);
+                if bytes > crate::transaction::MAX_PENDING_BYTES {
+                    return Err(GraphError::Validation(
+                        "transaction result memory limit exceeded (8 MiB)".into(),
+                    ));
+                }
+                rows.push(row);
+            }
+            transaction.check_deadline()?;
+            Ok(GraphResult {
+                columns,
+                rows,
+                stats,
+            })
+        });
+        tokio::time::timeout(remaining, execute)
+            .await
+            .map_err(|_| GraphError::Validation("transaction timeout expired".into()))?
+    }
+
+    pub(crate) async fn commit_transaction(
+        &self,
+        transaction: &crate::transaction::LocalTransaction,
+    ) -> Result<()> {
+        let remaining = transaction
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let _guard = tokio::time::timeout(remaining, self.publication.write())
+            .await
+            .map_err(|_| {
+                GraphError::Validation("transaction timeout expired waiting to commit".into())
+            })?;
+        if !Arc::ptr_eq(&transaction.path, &self.write_path.load_full()) {
+            return Err(GraphError::Unavailable(
+                "write topology changed during the transaction; retry on the current coordinator"
+                    .into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    async fn execute_stream_unlocked(
+        &self,
+        statement: Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
         if let Statement::Foreach { var, list, body } = statement {
             let result = self
                 .execute_foreach(&var, &list, &body, keyspace, auth)
@@ -1248,6 +1544,10 @@ impl GraphEngine {
         .is_empty()
         {
             return Ok(());
+        }
+
+        if crate::transaction::TRANSACTION_IO.try_with(|_| ()).is_ok() {
+            return Err(GraphError::Validation("create graph labels before BEGIN; schema changes are not part of the row transaction".into()));
         }
 
         let _gate = self.implicit_schema_gate.lock().await;
@@ -1383,7 +1683,9 @@ impl GraphEngine {
     /// stream from outliving the handler that started it.
     fn owned_exec_ctx(&self, keyspace: &str) -> OwnedExecCtx {
         OwnedExecCtx {
-            write_path: self.write_path.load_full(),
+            write_path: crate::transaction::TRANSACTION_IO
+                .try_with(|tx| tx.clone() as Arc<dyn crate::executor::io::GraphWrite>)
+                .unwrap_or_else(|_| self.write_path.load_full()),
             keyspace: keyspace.to_string(),
             config: Arc::new(self.config.clone()),
             virtual_tables: Some(self.schema.virtual_tables_arc()),
@@ -1482,7 +1784,7 @@ impl GraphEngine {
         // Phase 2 — execute the pre-planned clauses in source order.
         let mut stats = QueryStats::default();
         for physical in planned.plans {
-            let wp = self.write_path.load();
+            let wp = self.owned_exec_ctx(keyspace).write_path;
             let result = execute(
                 physical,
                 &wp,
@@ -1736,7 +2038,7 @@ impl GraphEngine {
         };
 
         // Execute the initial snapshot.
-        let wp = self.write_path.load();
+        let wp = self.owned_exec_ctx(keyspace).write_path;
         let result = execute(
             physical,
             &wp,

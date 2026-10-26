@@ -463,3 +463,54 @@ immutable payloads. Commit-log and spill encodings retain their byte sequences.
 Published cell bytes are shared across row copies. Readers recover only unique
 scratch capacity; retained older payloads remain immutable. Memory estimates
 charge the full retained backing and a conservative shared-owner allowance.
+
+## Resident BatchTxn WAL framing
+
+`apply_batch` lowers BatchOps into mutations and wraps them in a versioned
+internal transaction record (`commitlog/transaction_record.rs`). Ordinary entry
+CRC framing covers the entire set. The reader validates and decodes every member
+before exposing one, assigning consecutive virtual offsets from the physical
+record's offset. Dirty-table tracking uses the same offsets. `BatchTxn` rejects
+a whole record exceeding segment capacity before append and forces fsync before
+applying rows and dispatching observers. The streamed `WriteSetSource` batch
+API remains separate. Callers requiring query-level atomic visibility must hold
+a publication barrier across reads and the commit, as the graph engine does.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+`PostgresMvccApplyObserver::acquire_postgres_apply` provides an owned lifecycle lease for the caller to retain through metadata preparation, atomic storage apply and publication. Production PostgreSQL observers validate every bound table UUID before returning a lease; all error paths release it by RAII. Storage continues to treat PostgreSQL metadata as opaque and adds no schema dependency. The default no-op hook preserves non-PostgreSQL/test observer compatibility; an observer protecting PostgreSQL incarnations must override it.
+
+
+### Storage-owned recovery admission (2026-10-26)
+
+The public `assert_table_recovery_complete(&TableId)` checks a registered,
+quiesced local table after its `open` handoff and deferred replay are drained.
+A monotone per-table `recovery-incomplete/` summary is atomically published using
+`schema_snapshot::persist_bounded_json` and directory fsync before a rejected row
+can be treated as retained. A live table latch is set first, so a failed summary
+write also prevents later flush checkpoints. The document is bounded to 256 bytes
+on read, stores only version/incomplete state, and survives table-directory
+lifecycle cleanup. It is never cleared by this implementation.
+
+Startup, explicit replay, lazy registration, and set-aside reingestion use strict
+application errors. Successful quarantine preserves valid-row salvage but blocks
+migration; quarantine or summary persistence failures propagate and retain the
+source frame. Explicit replay durably logs supplied mutations before application;
+failed and unattempted items remain queued. Admission also scans existing
+set-aside and quarantine artifacts and fails closed on unreadable status.
+This is local recovery status, not proof of unobservable historical completeness
+or distributed admission fencing. Callers must quiesce all Direct access.
+
+Reader rejection is also covered: CRC failures, undecodable payloads, malformed
+transaction envelopes and nonempty rejected tails persist unknown-source evidence
+before survivors are delivered or a source segment can retire. Such evidence
+blocks admission for every table and survives restart. Normal empty padding and
+torn creation headers do not create false rejection evidence. Persistence failure
+returns an error and keeps the source bytes. Replay/checkpoint locking prevents
+flush from crossing an unhandled replay frame.
+
+Existing WAL must be recovered via `StorageEngine::open`. Constructors using
+`new` detect pre-existing WAL artifacts and refuse admission for that engine,
+without decoding or reimplementing WAL recovery. Fresh `new` engines can admit
+clean tables.

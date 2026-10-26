@@ -211,3 +211,48 @@ moves spans and their original validation indices with cell identities. The publ
 metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
 and corrupt losing/dropped-value tests cover this path alongside fully decoding
 output verification.
+
+## Bounded transaction WAL (2026-10-26, t_a4712717)
+
+A legacy multi-entry batch could replay a valid prefix after a torn tail.
+`BatchTxn` now writes one CRC-covered envelope; the torn-log regression in
+`tests/batch_primitive.rs` truncates after enough bytes for a legacy mutation
+and requires zero recovered rows. Existing restart and periodic-sync tests
+exercise complete recovery and fsync-before-ack. Size/admission/table preflight
+rejections leave no durable writes.
+
+Residual boundaries: a post-append fsync error is an uncertain commit outcome;
+memtable application and schema retirement are not a storage-wide snapshot
+protocol. The graph caller supplies its publication barrier. The complete
+resident batch must fit one segment; durable CDC retains one decoded envelope
+while paging its members. Older binaries do not understand the new envelope.
+The existing streaming batch API still uses separate mutation records.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+`PostgresMvccApplyObserver::acquire_postgres_apply` provides an owned lifecycle lease for the caller to retain through metadata preparation, atomic storage apply and publication. Production PostgreSQL observers validate every bound table UUID before returning a lease; all error paths release it by RAII. Storage continues to treat PostgreSQL metadata as opaque and adds no schema dependency. The default no-op hook preserves non-PostgreSQL/test observer compatibility; an observer protecting PostgreSQL incarnations must override it.
+
+
+### Incomplete recovery admission (2026-10-26)
+
+| Failure mode | Implemented response / evidence |
+| --- | --- |
+| Malformed WAL row is successfully quarantined and absent from scans | Persist monotone per-table incomplete status before quarantine; salvage exact valid survivors but reject migration admission. |
+| Quarantine or status persistence fails | Return startup/replay/registration error; keep original/relogged WAL or original set-aside file and requeue unfinished deferred items. Live latch also prevents later valid writes from checkpointing across the failure. |
+| Restart or repeated replay would hide rejection | Bounded summary lives outside table-directory cleanup, is loaded during registration, and is never automatically cleared. |
+| Status is malformed, oversized, inaccessible, or a dangling symlink | Fail loud; never overwrite unreadable evidence. |
+| Legacy quarantine, unreadable set-aside, or caller-owned `open` pending vector exists | Public table admission rejects; registration alone does not imply recovered rows. |
+| Older binaries silently discarded data without observable artifacts | Not reconstructable by this contract; authoritative checkpoint/reimport remains necessary. |
+
+WAL retention for incomplete tables is intentionally conservative and may increase
+disk usage. There is no automatic repair or status-clearing API. Admission requires
+quiesced Direct usage and supplies no exclusion of old binaries or cluster nodes.
+
+Reader rejection is also covered: CRC failures, undecodable payloads, malformed
+transaction envelopes and nonempty rejected tails persist unknown-source evidence
+before survivors are delivered or a source segment can retire. Such evidence
+blocks admission for every table and survives restart. Normal empty padding and
+torn creation headers do not create false rejection evidence. Persistence failure
+returns an error and keeps the source bytes. Replay/checkpoint locking prevents
+flush from crossing an unhandled replay frame.

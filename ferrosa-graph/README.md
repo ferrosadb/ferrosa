@@ -456,3 +456,69 @@ No `#[ignore]`, no `TODO`/`FIXME` markers in source. Most test functions:
 Graph column extraction retains immutable `CellBytes` handles for regular
 cells. Adjacency repair carries those handles into new cells; visited traversal
 keys remain independently owned at the key boundary.
+
+## Explicit Bolt transactions (single node)
+
+`BEGIN` selects a database and opens a connection-owned mutation overlay.
+CREATE, MATCH, MERGE, SET, REMOVE and DELETE use the same executor with
+`GraphWrite` I/O; nested UNWIND/FOREACH/CALL execution inherits the overlay.
+Own reads reconcile pending rows and tombstones with committed storage.
+Committed secondary indexes are bypassed inside the transaction so predicates
+see pending changes. Edge and adjacency mutations commit in the same batch.
+`COMMIT` uses storage's durable `BatchTxn`; a graph publication barrier prevents
+finite HTTP/Bolt queries from seeing its intermediate row applications.
+ROLLBACK, RESET, query/protocol failure, EOF and timeout discard pending writes.
+After FAILURE, messages are IGNORED until RESET.
+
+Pending mutations and buffered RUN results each have an 8 MiB limit; staging
+accounts for encoded payload plus row/cell allocation overhead. Transactions
+default to 60 seconds; a positive Bolt `tx_timeout` overrides that deadline.
+Idle expiration releases the buffer and reports timeout on the next request.
+The entire encoded commit must fit one commit-log segment.
+
+Boundaries: labels must exist before BEGIN; transactional implicit DDL and
+SUBSCRIBE are not implemented. Isolation is read committed plus own writes.
+A FIFO writer gate shared by autocommit and explicit transactions prevents lost
+updates for property-dependent statements through the same GraphEngine. This is
+one gate for the entire engine, across unrelated keys and databases, **not row or
+partition locking**. The bound AST is classified exhaustively before MATCH,
+predicates, imported CALL bindings or mutation timestamp allocation. UNION,
+UNWIND, FOREACH and CALL writes participate in the same ownership scope.
+
+BEGIN and read-only RUNs do not acquire the gate. The first writing RUN retains
+it until COMMIT/abort; subsequent RUNs reuse it. Autocommit retains ownership
+through result exhaustion or stream drop, including buffered result draining. Bolt drops a replaced pending result before
+executing the replacement RUN, so it cannot wait on its own admission.
+Pure readers never take writer admission. Lock order is admission, publication
+read, execution; COMMIT retains admission and takes publication write. A queued
+writer holds no publication guard, so it cannot prevent the owner committing.
+Publication is released before admission. Query deadlines bound admission and
+finite stream polling; the earlier query/transaction deadline bounds explicit
+RUN. Idle explicit transactions expire on the existing Bolt timer. Terminal
+errors/drop release execution resources. An unpolled autocommit stream retains
+ownership until polled or dropped; waiters still have bounded deadlines.
+
+Benchmark implication: at most one writing transaction executes per engine,
+even for independent keys/databases. If average ownership lasts H seconds,
+admission throughput is at most roughly 1/H transactions/second. Client think
+time and slow result draining increase H. Async FIFO waiting does not provide
+parallel writes or Neo4j-equivalent locking granularity. Narrow ownership with
+update-read refresh/provenance is the prioritized follow-on optimization
+(`t_ddc70aac`).
+
+This does not retroactively protect a separate read-only RUN followed by a
+constant SET, or provide snapshot/serializable isolation. The gate and publication
+barrier cover this GraphEngine's cooperating queries, not CQL, raw WritePath
+callers, another engine instance or distributed coordinators. Graph mutation
+timestamps advance monotonically within the process after admission (including
+same-clock-tick updates); they are not a cross-protocol timestamp protocol.
+RESET/EOF release ownership when observed by Bolt, but the reader loop still
+awaits queued RUN: immediate RESET/EOF cancellation during that wait remains a
+separate transport requirement. The existing absolute transaction deadline and
+partial-frame read behavior are preserved. Schema DROP/recreate incarnation
+fencing also remains required before production rollout; the fresh-schema
+baseline must not run DDL concurrently with graph writes. Pair/cluster transaction execution
+still needs the Accord read/write-set integration; BEGIN does not substitute
+local writes for coordinator guarantees, and a topology change aborts COMMIT.
+Local fsync errors have an uncertain durable outcome and must not be retried as
+though rollback were proven. No Neo4j causal bookmark guarantee is added.

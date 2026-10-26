@@ -204,8 +204,13 @@ pub fn write_row(engine: &StorageEngine, i: usize) {
 /// A running server: its port, its engine (for writes behind the PG layer's
 /// back) and the data directory that must outlive it.
 pub struct TestServer {
+    /// Shared execution context for tests that instrument the wire transport.
+    pub context: Arc<QueryContext>,
     pub port: u16,
     pub engine: Arc<StorageEngine>,
+    /// Shared schema and DDL path for cross-protocol schema lifecycle tests.
+    pub schema: Arc<Schema>,
+    pub ddl_path: Arc<arc_swap::ArcSwap<ferrosa_cluster::ddl_path::DdlPath>>,
     /// The listener's suspended-portal accounting.
     pub portals: Arc<ferrosa_postgres::SuspendedPortals>,
     pub dir: tempfile::TempDir,
@@ -229,6 +234,20 @@ pub async fn start_server_with_accord(
     limits: ferrosa_postgres::PortalLimits,
     accord: AccordAccess,
 ) -> TestServer {
+    start_server_configured(rows, limits, accord, false).await
+}
+
+/// Enable the same DDL path used by SQL and CQL, without an external cluster.
+pub async fn start_server_with_ddl() -> TestServer {
+    start_server_configured(0, Default::default(), AccordAccess::disabled(), true).await
+}
+
+async fn start_server_configured(
+    rows: usize,
+    limits: ferrosa_postgres::PortalLimits,
+    accord: AccordAccess,
+    enable_ddl: bool,
+) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let engine = StorageEngine::new(engine_config(dir.path()), None).expect("engine");
     engine.register_table(storage_schema()).expect("register");
@@ -236,15 +255,25 @@ pub async fn start_server_with_accord(
         write_row(&engine, i);
     }
     let engine = Arc::new(engine);
+    let schema = Arc::new(schema_with_table());
+    let ddl_path = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrosa_cluster::ddl_path::DdlPath::Direct {
+            schema: Arc::clone(&schema),
+            engine: Arc::clone(&engine),
+        },
+    ));
     let portals = Arc::new(ferrosa_postgres::SuspendedPortals::new(limits));
     let ctx = Arc::new(QueryContext {
         cluster_read: Default::default(),
         engine: Arc::clone(&engine),
-        schema: Arc::new(schema_with_table()),
+        schema: Arc::clone(&schema),
         default_schema: "ks".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord,
-        ddl: None,
+        ddl: enable_ddl.then(|| {
+            Arc::new(ferrosa_postgres::ClusterDdl::new(Arc::clone(&ddl_path)))
+                as Arc<dyn ferrosa_postgres::DdlExecutor>
+        }),
         jsonb_limits: ferrosa_postgres::jsonb_wire::test_limits(),
         portals: Arc::clone(&portals),
     });
@@ -258,15 +287,27 @@ pub async fn start_server_with_accord(
     tokio::spawn(server::serve(
         listener,
         store,
-        ctx,
+        Arc::clone(&ctx),
         server::PgTls::plaintext(),
     ));
     TestServer {
+        context: ctx,
         port,
         engine,
+        schema,
+        ddl_path,
         portals,
         dir,
     }
+}
+
+/// The same authentication fixture for an instrumented connection driver.
+pub fn verifier_store() -> impl VerifierStore {
+    OneRole(ScramVerifier::from_password(
+        "devpass",
+        b"ferrosa-dev-salt",
+        4096,
+    ))
 }
 
 /// A SCRAM-authenticated `tokio-postgres` client.

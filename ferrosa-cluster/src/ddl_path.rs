@@ -329,6 +329,7 @@ pub(crate) async fn pause_ddl_compactions(
 }
 
 fn apply_direct(op: &DdlOperation, schema: &Schema, engine: &Arc<StorageEngine>) -> Result<()> {
+    let _lifecycle = schema.lifecycle_write();
     match op {
         DdlOperation::CreateKeyspace(ks) => {
             schema

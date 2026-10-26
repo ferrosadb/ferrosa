@@ -138,9 +138,15 @@ Other query gaps include `ON CONFLICT`, `UPDATE`/`DELETE … RETURNING`, and
   mutation batch. Row versions are staged before replica storage
   apply and made visible after the atomic batch succeeds. Conflicts return
   `40001`; rollback and failed transactions
-  discard uncommitted mutations. Only explicit `SERIALIZABLE` is supported;
-  explicit `READ COMMITTED` and `REPEATABLE READ` fail with `0A000`. Unqualified
-  `BEGIN` retains its legacy behavior and is not labeled strict serializable.
+  discard uncommitted mutations. Direct/single-node default `BEGIN`, explicit
+  `READ COMMITTED`, and implicit statements use statement-fresh committed views
+  plus their own buffered writes. Conflicting UPDATE/DELETE candidates acquire
+  local writer ownership and recheck the committed winner before evaluation.
+  Explicit `SERIALIZABLE` retains its BEGIN snapshot and conflict validation.
+  Cluster READ COMMITTED still requires distributed writer ownership and statement
+  snapshots: explicit requests currently return `0A000`, and cluster default
+  behavior is not PostgreSQL READ COMMITTED parity. `REPEATABLE READ` still returns
+  `0A000`. See the local ownership bounds below.
   Versions older than every live snapshot are reclaimed automatically — note this is
   an AGE bound only. The version history holds a full row per write in both the local
   and the distributed map and is never bounded by SIZE, so a very large single load
@@ -365,7 +371,7 @@ values log an error and the process uses the complete defaults:
 |---|---:|---|
 | `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | `8388608` | Resident buffer a transaction's write-set may hold before it SPILLS (a streaming buffer size, never a cap) |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
-| `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
+| `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Original transaction maximum age; actively releases idle ownership/wakes lock waits; expiry returns `40001` |
 | `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry interval |
 | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS_PER_CONNECTION` | `64` | Concurrent SUSPENDED portals one connection may hold — a concurrency bound, not a data cap (see the census) |
 | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS` | `2048` | Concurrent suspended portals per node — a concurrency bound, not a data cap (see the census) |
@@ -808,3 +814,120 @@ row materialization, while physical CQL decoding and the owned MVCC image copy
 remain. Tests pin zero-allocation payload validation, conversion-error parity, and
 a corrupt physical payload failing even when MVCC holds a valid replacement.
 The [experiment record](../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.
+
+## Transaction timestamp expressions (t_6b946676)
+
+`CURRENT_TIMESTAMP` and `now()` work in no-FROM SELECTs and DML scalar values,
+including stock pgbench history INSERTs and UPDATE assignments. The session
+captures a statement wall clock before execution; BEGIN pins that clock until
+COMMIT/ROLLBACK. An implicit extended-protocol pipeline keeps its clock until
+Sync. Autocommit statements capture a fresh clock. Parse/Describe do not freeze
+prepared values; Execute evaluates them using its transaction's clock.
+
+Clock SELECT results advertise `timestamptz` (OID 1184), with UTC text (`+00`) and
+PostgreSQL-epoch binary microseconds. Assignment to a `timestamp` column uses UTC
+and RETURNING retains OID 1114. The SQL column type distinguishes the two temporal
+types; both use the existing microsecond value representation. Persisted CQL
+`timestamp` cells still have millisecond precision. `timestamptz` table DDL,
+non-UTC session timezone conversion, precision arguments, and other clock
+functions remain unsupported. Unknown functions fail loudly.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+PostgreSQL MVCC uses `(qualified table name, TableMetadata.id)` for images, row conflicts, scan epochs and reservations. Statement-bound UUIDs accompany buffered writes and survive write-set spill. Local COMMIT validates the entire set before storage effects while holding a synchronous shared schema lifecycle lease; a retired incarnation aborts the transaction with SQLSTATE `40001`, including its unrelated writes. Reads bind the same UUID and refuse rebinding a retained snapshot to a replacement. Unrelated table histories remain intact.
+
+Accord partition metadata and row images carry the UUID in the canonical Cap'n Proto schema. The replica apply lease spans validation, storage apply and MVCC publication. Missing/invalid legacy UUID metadata is rejected, including replay; it is never assigned the current table ID. Upgrade requires draining/checkpointing legacy PostgreSQL Accord work and upgrading all participating readers/writers together. Additive fields alone do not make mixed old/new binaries safe: old readers ignore the UUID. This change does not rewrite historical metadata or introduce a storage-WAL migration.
+
+The existing distributed TRUNCATE all-serving fan-out bypasses Accord MVCC observers. Its raw marker protocol is unchanged; although buffered/local incarnation checks apply, this change does not fence that remote fan-out against concurrent remote DROP.
+
+
+### PostgreSQL index DDL readiness (t_9fba4678)
+
+On the single-node Direct path, `ClusterDdl::create_index` waits after schema
+apply until the engine declares the index and its build tracker is current.
+This covers stock pgbench's `ALTER TABLE ... ADD PRIMARY KEY` and the shared
+foreign-key index path. The wait checks the original table UUID and deployment
+path, propagates builder errors, and times out after 30 seconds if backfill is
+pending or deferred. Dropping the future cancels the wait; it does not undo
+schema changes or cancel durable background builds. SQL errors use `58000`;
+ALTER can already have recorded the key before its index fails. Storage still
+refuses incomplete postings. No storage or cluster dependencies changed.
+
+Pair/cluster index creation is explicitly refused: schema replication alone
+cannot establish readiness on every eligible replica read source. Replica build
+readiness integration remains required; no wait runs on Raft apply. SQL
+`CREATE INDEX` parsing and wire CancelRequest support remain outside this fix.
+The readiness integration test exercises real backfill and immediate indexed
+UPDATE. Its SELECT may use complete MVCC rows and is not evidence of an indexed
+SELECT plan or of distributed readiness. This readiness wait is independent of
+the transaction timestamp and table-incarnation MVCC changes documented above.
+
+Binding a replacement lazily reclaims only retired-incarnation MVCC heads and scan keys. Active snapshots retain their immutable historical roots until release/expiry; unrelated tables are not cleared.
+
+### Direct READ COMMITTED writer ownership (t_3c15a13f)
+
+`mvcc::writer_ownership` scopes async ownership by table UUID and partition-key
+hash. Each live table has 1,024 stripes; a transaction retains at most 1,024
+ownership entries per touched table regardless of spilled row count. Unrelated
+tables do not share locks. Uniformly distributed distinct partition keys collide
+with probability 1/1,024; a bulk writer or TRUNCATE can own every stripe of its
+table. There is no database-wide writer gate. Default lock timeout is disabled.
+A local FIFO manager tracks stable transaction identities and explicit predecessor
+dependencies. An acquisition that closes a real cycle fails its requester with
+`40P01`; an acyclic wait is not a deadlock.
+
+Admission is limited to 16,384 live writer transaction identities and 262,144
+combined held/pending resource references per manager. Exhaustion returns `53200`
+and transaction failure discards the staged writes and leases. Reentrant requests
+consume no extra references; empty resource and identity entries are reclaimed.
+Cycle checks are iterative and bounded by admitted identities. These are explicit
+resource limits, not exact byte accounting; stripe collisions still serialize.
+
+Candidate selection uses the same bounded MVCC scan channel as SELECT, with own
+buffered writes overlaid. Storage-key predicates use point reads. Declared-key
+index candidates are retained when the table has neither changed nor entered
+physical apply since the statement snapshot; a raced index uses the MVCC scan
+for complete candidate recovery. Initially nonmatching rows are not enrolled
+later. After ownership, the existing candidate is read again, its full predicate
+is rechecked, and column-dependent expressions use the winner's values. A deleted
+candidate is skipped. User transactions and previously emitted statements are
+never replayed.
+
+Ownership spans buffering, atomic storage apply, and MVCC publication. Commit,
+rollback, statement failure and task cancellation release it; an idle disconnect
+is also observed by the session reader. A failed
+explicit transaction remains aborted through extended-protocol Sync. Cancellation
+here means dropping the server execution future; this does not add PostgreSQL
+wire CancelRequest support or prompt EOF detection during a blocked statement.
+SERIALIZABLE joins ownership at commit and retains its
+original conflict checks. The original transaction lease and staged UUIDs continue
+fencing snapshot expiry and DROP/recreate; SQL transaction-clock values stay fixed.
+The existing maximum snapshot age (default 600 seconds) remains tied to the original
+BEGIN, including RC statement/commit refresh. Expiry wakes lock waiters and discards
+idle owners without client input; the next command on an expired idle transaction
+reports `40001`. Expiry never revokes a durable commit's ownership: once local apply
+starts, apply/publication finish coherently. Connection loss around commit can leave
+the client uncertain about the outcome.
+
+Positive `SET`/`RESET`/`SHOW lock_timeout` support is separate (`t_cc11529a`);
+SET/RESET remain explicitly unsupported. Native CancelRequest keys/routing and a
+bounded reader for EOF/Terminate during execution remain separate (`t_b254fd86`,
+FMEA PG-8). Future-drop tests do not establish wire cancellation.
+Synchronous bulk staging (COPY) acquires ownership at commit and retains conservative
+conflict validation if its table changed before ownership. Broader COPY contention
+compatibility and distributed READ COMMITTED remain implementation requirements,
+not guarantees supplied by this local hot-row cycle. Cross-protocol CQL writers
+are outside this PostgreSQL ownership domain.
+
+Evidence: `tests/pg_stock_contention.rs` covers stock TPC-B conservation, default
+and explicit RC, declared-key index RMW, own buffered inserts, initial predicate
+selection and winner rechecks, autocommit/disjoint progress, aborted extended
+transactions, rollback/disconnect, and bounded opposite key order. Server tests
+cover cancellation and ownership through physical apply/publication. Existing
+SERIALIZABLE snapshot, write-skew, phantom, expiry, spill and UUID tests remain gates.
+
+Writer-wait evidence (`t_87e93bce`): `pg_writer_wait` retains the >5-second
+owner, exact balance/deadlock victim and execution-drop audits. Ownership/session
+unit tests cover FIFO chains/cycles, injected small admission limits, queue/grant
+cancellation, original lifetime, idle expiry and pre/post-apply publication.

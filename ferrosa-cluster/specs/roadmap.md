@@ -374,3 +374,12 @@ reference/decision specs, and the dependency/usage review. Ordered by value.
   the front-end crates that call this one.
 - **Putting user data through Raft** — Raft is metadata-only by design (keeps the
   log small and protects heartbeats); the data path stays on the coordinator.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+PostgreSQL replica apply acquires each MVCC observer's lifecycle lease before preparing row images and retains the leases through the complete atomic storage batch and publication. Stale table UUIDs reject the whole batch before any storage effect; a fresh applier also rejects replay into a replacement incarnation. Schema/storage reconciliation uses synchronous lifecycle write fences with the lifecycle fence acquired before registry/storage locks; no guard spans an await. PostgreSQL metadata without incarnation UUIDs requires explicit upgrade handling and is refused by the new observer.
+
+Raft restore retires physical rows when authoritative incoming schema names a different UUID, then installs the replacement; storage/schema reconciliation errors propagate instead of reporting a successful snapshot. Direct DDL and pair catch-up retain one write fence across registry and storage transitions. The all-serving TRUNCATE fan-out is a separate raw-marker path and is not covered by the MVCC observer lease.
+
+Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.

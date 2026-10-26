@@ -19,7 +19,7 @@
 //! buffer. Exceeding it is an ERROR, never a truncation: a clipped result
 //! reported as complete is worse than a failure, because the caller cannot tell
 //! the difference. `LIMIT` is pushed INTO the scan whenever it is safe to do so
-//! — one triple pattern, no ORDER BY, DISTINCT, FILTER, or graph query form —
+//! — one triple pattern, no explicit Join, ORDER BY, DISTINCT, FILTER, or graph form —
 //! so a bounded query does bounded work rather than reading the whole table and
 //! throwing most of it away.
 
@@ -32,7 +32,7 @@ use ferrosa_sstable::types::{Partition, Row};
 use futures::StreamExt;
 
 use crate::error::SparqlError;
-use crate::planner::{QueryPlan, TripleOp, TripleScope};
+use crate::planner::{PlanStep, QueryPlan, TripleOp, TripleScope};
 use crate::results::{Binding, SparqlJsonResults};
 use crate::triple_store;
 
@@ -76,16 +76,7 @@ pub async fn execute(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<SparqlJsonResults, SparqlError> {
-    let mut binding_sets = evaluate_triple_patterns(plan, write_path, limits).await?;
-
-    // Apply FILTER expressions to binding sets.
-    if !plan.filters.is_empty() {
-        binding_sets.retain(|row| {
-            plan.filters
-                .iter()
-                .all(|expr| crate::filter::eval_filter(expr, row))
-        });
-    }
+    let mut binding_sets = evaluate_pattern(plan, write_path, limits).await?;
 
     // BUG-S13 / URS-QEC-S04: apply ORDER BY (evaluates expressions per solution;
     // fails loud on unsupported forms).
@@ -143,20 +134,10 @@ pub async fn execute_bindings(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut binding_sets = evaluate_triple_patterns(plan, write_path, limits).await?;
-
-    if !plan.filters.is_empty() {
-        binding_sets.retain(|row| {
-            plan.filters
-                .iter()
-                .all(|expr| crate::filter::eval_filter(expr, row))
-        });
-    }
-
-    Ok(binding_sets)
+    evaluate_pattern(plan, write_path, limits).await
 }
 
-/// Evaluate all triple patterns via nested-loop join, returning binding sets.
+/// Evaluate the WHERE algebra in order, returning full solution bindings.
 ///
 /// SCOPE NOTE (unchanged by the streaming work): the join itself is still a
 /// nested loop that rebuilds a materialized `binding_sets` per pattern, so for
@@ -164,39 +145,90 @@ pub async fn execute_bindings(
 /// sets, not by the scan. Those intermediates are now *bounded* — appending
 /// past [`ExecutionLimits::max_rows`] is a loud error — but they are not
 /// pipelined. Pipelining the join is a separate redesign.
-async fn evaluate_triple_patterns(
+async fn evaluate_pattern(
     plan: &QueryPlan,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
-    let mut binding_sets: Vec<HashMap<String, Binding>> = vec![HashMap::new()];
-    let budget = scan_budget(plan);
+    evaluate_steps(&plan.steps, plan, write_path, limits, scan_budget(plan)).await
+}
 
-    for (tp, op) in &plan.ops {
-        let new_bindings = match op {
-            TripleOp::PropertyPath {
-                scope,
-                subject,
-                path,
-                object,
-            } => {
-                evaluate_path_op(
-                    scope,
-                    subject,
-                    path,
-                    object,
-                    &binding_sets,
-                    write_path,
-                    limits,
-                )
-                .await?
+async fn evaluate_steps(
+    steps: &[PlanStep],
+    plan: &QueryPlan,
+    write_path: &Arc<WritePath>,
+    limits: &ExecutionLimits,
+    budget: Option<usize>,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let mut binding_sets = vec![HashMap::new()];
+    for step in steps {
+        match step {
+            PlanStep::Filter(index) => {
+                binding_sets.retain(|row| crate::filter::eval_filter(&plan.filters[*index], row));
             }
-            _ => evaluate_standard_op(tp, op, &binding_sets, write_path, limits, budget).await?,
-        };
-        binding_sets = new_bindings;
+            PlanStep::Extend {
+                variable,
+                expression,
+            } => {
+                for row in &mut binding_sets {
+                    if let Some(binding) = crate::bind::evaluate(expression, row)? {
+                        row.insert(variable.clone(), binding);
+                    }
+                }
+            }
+            PlanStep::Join { left, right } => {
+                // Neither operand may see the other's variables until the join.
+                let left = Box::pin(evaluate_steps(left, plan, write_path, limits, None)).await?;
+                let right = Box::pin(evaluate_steps(right, plan, write_path, limits, None)).await?;
+                binding_sets = join_solutions(&binding_sets, &left, limits)?;
+                binding_sets = join_solutions(&binding_sets, &right, limits)?;
+            }
+            PlanStep::Triple(index) => {
+                let (tp, op) = &plan.ops[*index];
+                binding_sets = match op {
+                    TripleOp::PropertyPath {
+                        scope,
+                        subject,
+                        path,
+                        object,
+                    } => {
+                        evaluate_path_op(
+                            scope,
+                            subject,
+                            path,
+                            object,
+                            &binding_sets,
+                            write_path,
+                            limits,
+                        )
+                        .await?
+                    }
+                    _ => {
+                        evaluate_standard_op(tp, op, &binding_sets, write_path, limits, budget)
+                            .await?
+                    }
+                };
+            }
+        }
     }
-
     Ok(binding_sets)
+}
+
+fn join_solutions(
+    left: &[HashMap<String, Binding>],
+    right: &[HashMap<String, Binding>],
+    limits: &ExecutionLimits,
+) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
+    let mut joined = Vec::new();
+    for left_row in left {
+        for right_row in right {
+            if let Some(row) = try_merge_bindings(left_row, right_row) {
+                joined.push(row);
+                check_solution_bound(joined.len(), limits)?;
+            }
+        }
+    }
+    Ok(joined)
 }
 
 /// How many solutions a single-pattern scan must produce before the executor
@@ -205,7 +237,8 @@ async fn evaluate_triple_patterns(
 /// `LIMIT` may only be pushed into the scan when every operator between the
 /// scan and the LIMIT preserves both the row count and the row order:
 ///
-/// - exactly one triple pattern — a join re-pairs solutions, so pattern *n*'s
+/// - exactly one triple pattern and no explicit Join — a join re-pairs
+///   solutions, so pattern *n*'s
 ///   rows are not the query's rows;
 /// - no `ORDER BY` and no `DISTINCT` — both are blocking, and the top *n* of a
 ///   sorted or deduplicated sequence is not the first *n* rows read;
@@ -217,7 +250,11 @@ async fn evaluate_triple_patterns(
 /// `None` means "read every matching row". That is still bounded by
 /// [`ExecutionLimits::max_rows`] — it is unbounded LIMIT, not unbounded work.
 fn scan_budget(plan: &QueryPlan) -> Option<usize> {
-    if plan.ops.len() != 1
+    if plan
+        .steps
+        .iter()
+        .any(|step| matches!(step, PlanStep::Join { .. }))
+        || plan.ops.len() != 1
         || !plan.order_by.is_empty()
         || plan.distinct
         || !plan.filters.is_empty()
@@ -426,21 +463,38 @@ fn bind_or_check_object(
         // An IRI constant matches only a stored IRI object with the same value
         // — never a literal that happens to spell the same characters.
         TermPattern::NamedNode(n) => obj_type == "uri" && n.as_str() == object,
-        // A literal constant is compared against the stored LEXICAL value.
+        // A literal constant compares lexical text AND datatype/language.
         // `Literal::to_string()` is the quoted N-Triples serialization and can
         // never equal a stored object (t_c3a2d3e4).
-        TermPattern::Literal(l) => obj_type == "literal" && l.value() == object,
+        TermPattern::Literal(l) => {
+            let expected = triple_store::canonical_term(
+                "literal",
+                l.value(),
+                Some(l.datatype().as_str()),
+                l.language(),
+            );
+            let actual = triple_store::canonical_term(
+                obj_type,
+                object,
+                datatype.as_deref(),
+                lang.as_deref(),
+            );
+            matches!((expected,actual),(Ok(a),Ok(b)) if a==b)
+        }
         _ => true,
     }
 }
 
 /// Insert a binding into a row, or check compatibility if already present.
 ///
-/// BUG-S4 fix: compares both `value` and `binding_type`.
+/// Compare the full RDF term: lexical value, term kind, datatype and language.
 /// Returns `false` if the existing binding is incompatible.
 fn try_insert_binding(row: &mut HashMap<String, Binding>, name: &str, binding: &Binding) -> bool {
     if let Some(existing) = row.get(name) {
-        existing.value == binding.value && existing.binding_type == binding.binding_type
+        existing.value == binding.value
+            && existing.binding_type == binding.binding_type
+            && existing.datatype == binding.datatype
+            && existing.lang == binding.lang
     } else {
         row.insert(name.to_string(), binding.clone());
         true
@@ -489,16 +543,8 @@ fn apply_order_by(
 fn apply_distinct(binding_sets: &mut Vec<HashMap<String, Binding>>, projection: &[String]) {
     let mut seen = std::collections::HashSet::new();
     binding_sets.retain(|row| {
-        let key: Vec<(&str, &str, &str)> = projection
-            .iter()
-            .map(|var| {
-                row.get(var)
-                    .map(|b| (var.as_str(), b.value.as_str(), b.binding_type.as_str()))
-                    .unwrap_or((var.as_str(), "", ""))
-            })
-            .collect();
-        let key_str = format!("{key:?}");
-        seen.insert(key_str)
+        let key: Vec<_> = projection.iter().map(|var| row.get(var).cloned()).collect();
+        seen.insert(key)
     });
 }
 
@@ -573,17 +619,14 @@ where
     /// and dropped before the next one is touched.
     fn feed(&mut self, partition: &Partition) -> Result<ControlFlow<()>, SparqlError> {
         // BUG-S3 fix: decode composite partition key (graph, subject) properly.
-        let key_bytes = partition.key.key.as_bytes();
-        // Graph isolation: a `GRAPH <iri>` scope (or the served default-graph
-        // scope) reads one graph's partitions only. Checking the graph here —
-        // before any row is counted or decoded — is what makes a named-graph
-        // scan exact without materializing the other graphs' rows.
-        if let Some(expected) = self.graph_filter.as_deref() {
-            if extract_composite_component(key_bytes, 0).as_deref() != Some(expected) {
-                return Ok(ControlFlow::Continue(()));
-            }
+        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
+        if self
+            .graph_filter
+            .as_deref()
+            .is_some_and(|expected| expected != graph)
+        {
+            return Ok(ControlFlow::Continue(()));
         }
-        let subject = extract_subject_from_partition_key(key_bytes);
         for row in &partition.rows {
             self.rows_read += 1;
             if self.rows_read > self.limits.max_rows {
@@ -596,7 +639,7 @@ where
                     describe_op(self.op),
                 )));
             }
-            let Some(triple) = decode_triple(row, &subject) else {
+            let Some(triple) = decode_triple(row, &subject)? else {
                 continue;
             };
             if !triple_matches_op(self.op, &triple) {
@@ -648,7 +691,7 @@ where
     match op {
         TripleOp::SubjectLookup { subject, .. } => {
             // Point read: bounded by one partition's row count by construction.
-            let key = triple_store::partition_key(&scope.graph, subject);
+            let key = triple_store::checked_partition_key(&scope.graph, subject)?;
             if let Some(partition) = write_path.read(&table_id, &key).await? {
                 // Exactly one partition: `Break` and `Continue` are equivalent
                 // here because there is nothing left to feed either way.
@@ -784,46 +827,19 @@ fn extract_composite_component(data: &[u8], position: usize) -> Option<String> {
 
 /// Decode one storage row into a triple, or `None` if it is not a live triple.
 ///
-/// Returns `None` for a row whose deletion marker is non-live: that row is a
-/// tombstone (or is masked by one in the merge) and MUST NOT surface as a
-/// triple. Without this, a SPARQL delete would remain visible to a subsequent
-/// SELECT (URS-QEC-D05).
-fn decode_triple(row: &Row, subject: &str) -> Option<FetchedTriple> {
-    if !row.deletion.is_live() {
-        return None;
-    }
-
-    let predicate = extract_clustering_string(&row.clustering, 0);
-    let object = extract_clustering_string(&row.clustering, 1);
-
-    // BUG-S18 fix: validate object type against known values.
-    let raw_obj_type =
-        cell_string(row, triple_store::COL_OBJECT_TYPE).unwrap_or_else(|| "literal".to_string());
-    let obj_type = match raw_obj_type.as_str() {
-        "uri" | "literal" | "bnode" => raw_obj_type,
-        other => {
-            tracing::warn!(value = other, "invalid object type, defaulting to literal");
-            "literal".into()
-        }
-    };
-
-    Some((
-        subject.to_string(),
-        predicate,
-        object,
-        obj_type,
-        cell_string(row, triple_store::COL_DATATYPE),
-        cell_string(row, triple_store::COL_LANGUAGE),
-    ))
-}
-
-/// Read a regular column's value out of a row as a UTF-8 string.
-fn cell_string(row: &Row, column: u16) -> Option<String> {
-    row.cells
-        .iter()
-        .find(|(idx, _)| *idx == column)
-        .and_then(|(_, cell)| cell.value.as_ref())
-        .map(|v| String::from_utf8_lossy(v).to_string())
+/// The v2 decoder validates identity and accounts for liveness newer than a
+/// retained tombstone. Deleted rows are omitted; malformed live rows fail loud.
+fn decode_triple(row: &Row, subject: &str) -> Result<Option<FetchedTriple>, SparqlError> {
+    Ok(triple_store::decode_v2_row(row)?.map(|(predicate, term)| {
+        (
+            subject.to_owned(),
+            predicate,
+            term.value,
+            term.binding_type,
+            term.datatype,
+            term.lang,
+        )
+    }))
 }
 
 /// Access-path filter: does this triple satisfy the constraint the op was
@@ -853,7 +869,7 @@ fn triple_matches_op(op: &TripleOp, triple: &FetchedTriple) -> bool {
 /// Extract a string component from a CQL clustering key at the given position.
 ///
 /// Clustering keys use the strict CQL composite encoding written by
-/// `update::encode_triple_clustering`: `[u16 len][bytes]` per component with NO
+/// `triple_store::encode_clustering`: `[u16 len][bytes]` per component with NO
 /// separator byte (this is what `ferrosa-common::schema` validates). A trailing
 /// separator must NOT be assumed — for short components the next component's
 /// length prefix high byte is `0x00`, and skipping it would corrupt the read.
@@ -1140,7 +1156,7 @@ mod tests {
     }
 
     /// Build a strict CQL clustering component: `[u16 len][bytes]` (no
-    /// separator), matching `update::encode_triple_clustering`.
+    /// separator), matching `triple_store::encode_clustering`.
     fn encode_clustering_component(s: &str) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(&(s.len() as u16).to_be_bytes());

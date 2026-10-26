@@ -98,9 +98,12 @@ fn eval_expr(expr: &Expression, bindings: &HashMap<String, Binding>) -> Value {
         Expression::Literal(lit) => literal_to_value(lit),
 
         Expression::SameTerm(left, right) => {
-            let l = eval_expr(left, bindings);
-            let r = eval_expr(right, bindings);
-            Value::Boolean(l == r)
+            let l = eval_term(left, bindings);
+            let r = eval_term(right, bindings);
+            match (l, r) {
+                (Some(l), Some(r)) => Value::Boolean(l == r),
+                _ => Value::Null,
+            }
         }
 
         Expression::If(cond, then_expr, else_expr) => {
@@ -185,6 +188,52 @@ fn eval_function(
             .map(|n| Value::Float(n.round()))
             .unwrap_or(Value::Null),
         _ => Value::Null,
+    }
+}
+
+/// Term identity must be checked before FILTER's value-space coercions.
+/// Derived expressions have fresh typed values; variables/constants keep their
+/// original lexical form, datatype and language (including ill-typed literals).
+fn eval_term(expr: &Expression, bindings: &HashMap<String, Binding>) -> Option<Binding> {
+    use crate::triple_store::canonical_term;
+    match expr {
+        Expression::Variable(v) => {
+            let b = bindings.get(v.as_str())?;
+            canonical_term(
+                &b.binding_type,
+                &b.value,
+                b.datatype.as_deref(),
+                b.lang.as_deref(),
+            )
+            .ok()
+        }
+        Expression::Literal(l) => canonical_term(
+            "literal",
+            l.value(),
+            Some(l.datatype().as_str()),
+            l.language(),
+        )
+        .ok(),
+        Expression::NamedNode(n) => canonical_term("uri", n.as_str(), None, None).ok(),
+        Expression::If(c, t, e) => {
+            eval_term(if eval_filter(c, bindings) { t } else { e }, bindings)
+        }
+        _ => {
+            let (value, datatype) = match eval_expr(expr, bindings) {
+                Value::Null => return None,
+                Value::String(s) => (s, "string"),
+                Value::Integer(n) => (n.to_string(), "integer"),
+                Value::Float(n) => (n.to_string(), "double"),
+                Value::Boolean(b) => (b.to_string(), "boolean"),
+            };
+            canonical_term(
+                "literal",
+                &value,
+                Some(&format!("http://www.w3.org/2001/XMLSchema#{datatype}")),
+                None,
+            )
+            .ok()
+        }
     }
 }
 

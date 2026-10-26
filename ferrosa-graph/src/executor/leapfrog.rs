@@ -8,12 +8,13 @@
 //! This avoids the intermediate blowup of nested-loop Expand on
 //! multi-way patterns, achieving worst-case optimal time complexity.
 
+use crate::executor::io::GraphWrite;
+
 use std::collections::HashMap;
 use std::time::Instant;
 
 use futures::StreamExt as _;
 
-use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
 use ferrosa_storage::TableId;
@@ -66,7 +67,7 @@ struct AdjacencyIterator {
 impl AdjacencyIterator {
     /// Create from a vertex's adjacency partition, filtering by optional label.
     async fn from_partition(
-        write_path: &WritePath,
+        write_path: &dyn GraphWrite,
         adj_table_id: &TableId,
         vertex_key: &DecoratedKey,
         edge_label: Option<&str>,
@@ -193,7 +194,7 @@ fn next_common_value(iterators: &mut [AdjacencyIterator]) -> Option<Vec<u8>> {
 /// 3. Collect matched bindings and project via return clause.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_wco_join(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     plan: &WcoJoinPlan,
     return_clause: &ReturnClause,
@@ -235,7 +236,7 @@ pub async fn execute_wco_join(
 /// exist first. `dedup_stream` and `take` do not.
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_wco_join_streaming<'a>(
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     plan: &WcoJoinPlan,
     return_clause: &ReturnClause,
@@ -358,7 +359,7 @@ pub async fn execute_wco_join_streaming<'a>(
 /// via leapfrog_join to find valid bindings.
 #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 async fn enumerate_bindings(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     adj_table_id: &TableId,
     plan: &WcoJoinPlan,
     variables: &[String],
@@ -517,7 +518,7 @@ async fn enumerate_bindings(
 /// already bound before the other was enumerated (e.g., the `(c)->(a)` edge
 /// in a triangle where `a` was the anchor and `c` was the last variable eliminated).
 async fn verify_all_relations(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     adj_table_id: &TableId,
     plan: &WcoJoinPlan,
     var_bindings: &HashMap<String, Vec<u8>>,
@@ -559,7 +560,7 @@ async fn verify_all_relations(
 
 /// Project variable bindings into a result row according to the return clause.
 async fn project_bindings(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     plan: &WcoJoinPlan,
     var_bindings: &HashMap<String, Vec<u8>>,
     return_clause: &ReturnClause,

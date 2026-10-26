@@ -56,6 +56,9 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// Mutable state tracked per connection.
 struct ConnectionState {
+    transaction: Option<Arc<crate::transaction::LocalTransaction>>,
+    failed: bool,
+    timed_out: bool,
     /// Whether the client has authenticated.
     authenticated: bool,
     /// Current keyspace / graph database.
@@ -74,6 +77,9 @@ struct ConnectionState {
 impl ConnectionState {
     fn new() -> Self {
         Self {
+            transaction: None,
+            failed: false,
+            timed_out: false,
             authenticated: false,
             keyspace: String::new(),
             pending_result: None,
@@ -304,8 +310,28 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
     // ── 3. Message loop ────────────────────────────────────────────────
     loop {
-        let msg_data = match read_message(&mut stream, &mut decoder, config.max_message_size).await
-        {
+        let read = read_message(&mut stream, &mut decoder, config.max_message_size);
+        let received = if let Some(transaction) = &state.transaction {
+            let remaining = transaction
+                .deadline
+                .saturating_duration_since(std::time::Instant::now());
+            tokio::pin!(read);
+            tokio::select! {
+                received = &mut read => received,
+                _ = tokio::time::sleep(remaining) => {
+                    // Free pending memory even when the client remains idle.
+                    // Keep polling the SAME frame read: read_exact can already
+                    // have consumed part of its header/body when the timer fires.
+                    state.transaction = None;
+                    state.pending_result = None;
+                    state.timed_out = true;
+                    read.await
+                }
+            }
+        } else {
+            read.await
+        };
+        let msg_data = match received {
             Ok(data) => data,
             Err(GraphError::Internal(msg)) if msg.contains("eof") || msg.contains("EOF") => {
                 // Client closed the connection.
@@ -318,6 +344,9 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
             Ok(m) => m,
             Err(e) => {
                 tracing::debug!(%e, "failed to decode Bolt message");
+                state.transaction = None;
+                state.pending_result = None;
+                state.failed = true;
                 let failure = BoltMessage::Failure {
                     metadata: vec![
                         (
@@ -361,57 +390,126 @@ async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Handle a Bolt explicit-transaction control message (`BEGIN` / `COMMIT` /
-/// `ROLLBACK`).
-///
-/// URS-QEC-B01 wires these message types into the dispatch path. The connection
-/// transaction state machine (URS-QEC-B02) — queueing statements, deferring
-/// execution to `COMMIT`, and backing it with the `StorageEngine` batch
-/// primitive — lands in the next increment. Until then these messages must
-/// **fail loud** (URS-QEC-X01): an explicit transaction we cannot actually open
-/// or durably commit must return a Bolt `FAILURE`, never a silent `SUCCESS` that
-/// would ack a transaction we never persisted.
-fn handle_tx_message(msg: &BoltMessage, _state: &mut ConnectionState) -> Vec<BoltMessage> {
-    let (code, message) = match msg {
-        BoltMessage::Begin { .. } => (
-            "Neo.ClientError.Transaction.TransactionStartFailed",
-            "explicit transactions (BEGIN) are not yet supported on this server",
-        ),
-        BoltMessage::Commit => (
-            "Neo.ClientError.Transaction.TransactionNotFound",
-            "COMMIT received with no open explicit transaction \
-             (explicit transactions are not yet supported)",
-        ),
-        BoltMessage::Rollback => (
-            "Neo.ClientError.Transaction.TransactionNotFound",
-            "ROLLBACK received with no open explicit transaction \
-             (explicit transactions are not yet supported)",
-        ),
-        // Not a transaction control message — caller guarantees this is unreachable.
-        _ => (
-            "Neo.DatabaseError.General.UnknownError",
-            "handle_tx_message called with a non-transaction message",
-        ),
-    };
-    vec![BoltMessage::Failure {
+fn failure(code: &str, message: impl Into<String>) -> BoltMessage {
+    BoltMessage::Failure {
         metadata: vec![
             ("code".into(), PackValue::String(code.into())),
             ("neo4j_code".into(), PackValue::String(code.into())),
             ("message".into(), PackValue::String(message.into())),
         ],
-    }]
+    }
+}
+
+/// Failure aborts all pending mutations; further messages are IGNORED until
+/// RESET, so a later RUN cannot accidentally escape into auto-commit mode.
+async fn process_message(
+    msg: BoltMessage,
+    engine: &Arc<GraphEngine>,
+    schema: &Arc<Schema>,
+    state: &mut ConnectionState,
+) -> Result<Vec<BoltMessage>, GraphError> {
+    if state.failed && !matches!(msg, BoltMessage::Reset | BoltMessage::Goodbye) {
+        return Ok(vec![BoltMessage::Ignored]);
+    }
+    let expired = state.timed_out
+        || state
+            .transaction
+            .as_ref()
+            .is_some_and(|tx| tx.check_deadline().is_err());
+    let result = if expired
+        && !matches!(
+            msg,
+            BoltMessage::Reset | BoltMessage::Rollback | BoltMessage::Goodbye
+        ) {
+        Ok(vec![failure(
+            "Neo.ClientError.Transaction.TransactionTimedOut",
+            "transaction timeout expired",
+        )])
+    } else {
+        process_message_inner(msg, engine, schema, state).await
+    };
+    let replies = match result {
+        Ok(replies) => replies,
+        Err(error) => {
+            let code = if error.to_string().contains("transaction timeout") {
+                "Neo.ClientError.Transaction.TransactionTimedOut"
+            } else {
+                error_code(&error)
+            };
+            vec![failure(code, error.to_string())]
+        }
+    };
+    if replies
+        .iter()
+        .any(|reply| matches!(reply, BoltMessage::Failure { .. }))
+    {
+        state.transaction = None;
+        state.pending_result = None;
+        state.timed_out = false;
+        state.failed = true;
+    }
+    Ok(replies)
 }
 
 /// Process a single message and produce response messages.
-async fn process_message(
+async fn process_message_inner(
     msg: BoltMessage,
     engine: &Arc<GraphEngine>,
     _schema: &Arc<Schema>,
     state: &mut ConnectionState,
 ) -> Result<Vec<BoltMessage>, GraphError> {
     match msg {
-        BoltMessage::Begin { .. } | BoltMessage::Commit | BoltMessage::Rollback => {
-            Ok(handle_tx_message(&msg, state))
+        BoltMessage::Begin { extra } => {
+            if !state.authenticated {
+                return Ok(vec![auth_failure_message()]);
+            }
+            if state.transaction.is_some() || state.pending_result.is_some() {
+                return Ok(vec![failure(
+                    "Neo.ClientError.Transaction.TransactionStartFailed",
+                    "BEGIN requires no open transaction or result",
+                )]);
+            }
+            let keyspace =
+                find_string_field(&extra, "db").unwrap_or_else(|| state.keyspace.clone());
+            let timeout = match extra
+                .iter()
+                .find(|(key, _)| key == "tx_timeout")
+                .map(|(_, value)| value)
+            {
+                None | Some(PackValue::Int(0)) => std::time::Duration::from_secs(60),
+                Some(PackValue::Int(ms)) if *ms > 0 => std::time::Duration::from_millis(*ms as u64),
+                _ => {
+                    return Ok(vec![failure(
+                        "Neo.ClientError.Request.Invalid",
+                        "tx_timeout must be a non-negative integer in milliseconds",
+                    )])
+                }
+            };
+            state.transaction = Some(engine.begin_transaction(keyspace.clone(), timeout).await?);
+            state.keyspace = keyspace;
+            Ok(vec![BoltMessage::Success { metadata: vec![] }])
+        }
+        BoltMessage::Commit => {
+            state.pending_result = None;
+            let Some(transaction) = state.transaction.take() else {
+                return Ok(vec![failure(
+                    "Neo.ClientError.Transaction.TransactionNotFound",
+                    "COMMIT received with no open transaction",
+                )]);
+            };
+            engine.commit_transaction(&transaction).await?;
+            Ok(vec![BoltMessage::Success { metadata: vec![] }])
+        }
+        BoltMessage::Rollback => {
+            state.pending_result = None;
+            if state.transaction.take().is_none() && !state.timed_out {
+                return Ok(vec![failure(
+                    "Neo.ClientError.Transaction.TransactionNotFound",
+                    "ROLLBACK received with no open transaction",
+                )]);
+            }
+            state.timed_out = false;
+            Ok(vec![BoltMessage::Success { metadata: vec![] }])
         }
 
         BoltMessage::Run {
@@ -419,6 +517,10 @@ async fn process_message(
             params,
             extra,
         } => {
+            // RUN replaces the previous result. Drop it before executing the
+            // replacement, since an undrained autocommit stream owns admission.
+            // Otherwise this connection waits on its own writer until timeout.
+            state.pending_result = None;
             let auth = state.auth_context.as_ref().cloned().unwrap_or(AuthContext {
                 role: "anonymous".to_string(),
                 is_superuser: false,
@@ -432,10 +534,29 @@ async fn process_message(
 
             let params = pack_params_to_json(params);
 
-            match engine
-                .execute_stream_with_params(&query, &keyspace, &auth, &params)
-                .await
-            {
+            let result = if let Some(transaction) = &state.transaction {
+                if keyspace != transaction.keyspace {
+                    return Ok(vec![failure(
+                        "Neo.ClientError.Request.Invalid",
+                        "RUN cannot change the database selected by BEGIN",
+                    )]);
+                }
+                engine
+                    .execute_transaction(transaction.clone(), &query, &auth, &params)
+                    .await
+                    .map(|result| {
+                        (
+                            result.columns,
+                            crate::executor::stream::stream_from_rows(result.rows),
+                            result.stats,
+                        )
+                    })
+            } else {
+                engine
+                    .execute_stream_with_params(&query, &keyspace, &auth, &params)
+                    .await
+            };
+            match result {
                 Ok((columns, rows, stats)) => {
                     let fields: Vec<PackValue> = columns
                         .iter()
@@ -455,17 +576,7 @@ async fn process_message(
                     });
                     Ok(vec![success])
                 }
-                Err(e) => {
-                    let code = error_code(&e);
-                    let failure = BoltMessage::Failure {
-                        metadata: vec![
-                            ("code".into(), PackValue::String(code.into())),
-                            ("neo4j_code".into(), PackValue::String(code.into())),
-                            ("message".into(), PackValue::String(e.to_string())),
-                        ],
-                    };
-                    Ok(vec![failure])
-                }
+                Err(e) => Err(e),
             }
         }
 
@@ -575,6 +686,9 @@ async fn process_message(
         }
 
         BoltMessage::Reset => {
+            state.transaction = None;
+            state.failed = false;
+            state.timed_out = false;
             state.pending_result = None;
             // Keep auth context — RESET doesn't log out.
             Ok(vec![BoltMessage::Success { metadata: vec![] }])
@@ -1140,83 +1254,21 @@ mod tests {
         assert_eq!(find_string_field(&map, "missing"), None);
     }
 
-    /// Extract the `code` field from a FAILURE message, if present.
-    fn failure_code(msg: &BoltMessage) -> Option<String> {
-        match msg {
-            BoltMessage::Failure { metadata } => find_string_field(metadata, "code"),
-            _ => None,
-        }
-    }
-
-    /// BEGIN must NOT silently SUCCEED while the transaction state machine is
-    /// unimplemented — it must fail loud (URS-QEC-X01).
     #[test]
-    fn begin_fails_loud_not_silent_success() {
-        let mut state = ConnectionState::new();
-        let replies = handle_tx_message(&BoltMessage::Begin { extra: vec![] }, &mut state);
-        assert_eq!(replies.len(), 1, "expected exactly one reply");
-        assert!(
-            matches!(replies[0], BoltMessage::Failure { .. }),
-            "BEGIN must return FAILURE, never SUCCESS, until the tx state machine exists; got {:?}",
-            replies[0]
+    fn transaction_failure_carries_driver_error_fields() {
+        let BoltMessage::Failure { metadata } = failure(
+            "Neo.ClientError.Transaction.TransactionNotFound",
+            "no open transaction",
+        ) else {
+            panic!("failure response")
+        };
+        assert_eq!(
+            find_string_field(&metadata, "code"),
+            find_string_field(&metadata, "neo4j_code")
         );
         assert_eq!(
-            failure_code(&replies[0]).as_deref(),
-            Some("Neo.ClientError.Transaction.TransactionStartFailed"),
+            find_string_field(&metadata, "message").as_deref(),
+            Some("no open transaction")
         );
-    }
-
-    /// COMMIT with no open transaction must fail loud — never a fake SUCCESS that
-    /// acks a transaction it never persisted.
-    #[test]
-    fn commit_without_tx_fails_loud() {
-        let mut state = ConnectionState::new();
-        let replies = handle_tx_message(&BoltMessage::Commit, &mut state);
-        assert_eq!(replies.len(), 1);
-        assert!(
-            matches!(replies[0], BoltMessage::Failure { .. }),
-            "COMMIT must return FAILURE, got {:?}",
-            replies[0]
-        );
-    }
-
-    /// ROLLBACK with no open transaction must fail loud, not silently succeed.
-    #[test]
-    fn rollback_without_tx_fails_loud() {
-        let mut state = ConnectionState::new();
-        let replies = handle_tx_message(&BoltMessage::Rollback, &mut state);
-        assert_eq!(replies.len(), 1);
-        assert!(
-            matches!(replies[0], BoltMessage::Failure { .. }),
-            "ROLLBACK must return FAILURE, got {:?}",
-            replies[0]
-        );
-    }
-
-    /// Every FAILURE we emit for tx messages carries both `code` and `message`
-    /// fields so drivers surface a real error rather than hanging.
-    #[test]
-    fn tx_failures_carry_code_and_message() {
-        for msg in [
-            BoltMessage::Begin { extra: vec![] },
-            BoltMessage::Commit,
-            BoltMessage::Rollback,
-        ] {
-            let mut state = ConnectionState::new();
-            let replies = handle_tx_message(&msg, &mut state);
-            match &replies[0] {
-                BoltMessage::Failure { metadata } => {
-                    assert!(
-                        find_string_field(metadata, "code").is_some(),
-                        "missing code for {msg:?}"
-                    );
-                    assert!(
-                        find_string_field(metadata, "message").is_some(),
-                        "missing message for {msg:?}"
-                    );
-                }
-                other => panic!("expected FAILURE for {msg:?}, got {other:?}"),
-            }
-        }
     }
 }

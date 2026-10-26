@@ -30,9 +30,10 @@
 use std::path::PathBuf;
 
 use ferrosa_common::{Error, Result};
-use ferrosa_storage::write_set_stage::{StagedWriteSet, WriteSetStage};
+use ferrosa_storage::write_set_stage::{StagedWriteSet, WriteSetSource, WriteSetStage};
 use ferrosa_storage::Mutation;
 
+use crate::mvcc::writer_ownership::{stripe, WriterLease, STRIPES};
 use crate::mvcc::PgWrite;
 
 /// The default staging root for a transaction write-set. Matches
@@ -45,6 +46,9 @@ fn default_stage_root() -> PathBuf {
 /// A transaction's buffered write-set, backed by a threshold-bounded, spilling
 /// [`WriteSetStage`] rather than a resident `Vec<PgWrite>`.
 pub struct TxnWriteSet {
+    pub(crate) read_committed: bool,
+    pub(crate) writers: WriterLease,
+    unowned_tables: std::collections::BTreeSet<(String, uuid::Uuid)>,
     stage: WriteSetStage,
     /// Number of writes staged. Tracked apart from the stage so `len` is O(1)
     /// and independent of residency.
@@ -55,6 +59,7 @@ pub struct TxnWriteSet {
     /// distributed commit so each written table contributes its WRITE WATERMARK,
     /// which a transaction that SCANNED the table reads (FMEA CL-72).
     tables: std::collections::BTreeSet<String>,
+    incarnations: std::collections::HashMap<(String, String), uuid::Uuid>,
 }
 
 impl std::fmt::Debug for TxnWriteSet {
@@ -78,9 +83,26 @@ impl TxnWriteSet {
     #[must_use]
     pub(crate) fn new(root: impl Into<PathBuf>) -> Self {
         Self {
+            read_committed: false,
+            writers: WriterLease::default(),
+            unowned_tables: Default::default(),
             stage: WriteSetStage::new(root),
             count: 0,
             tables: std::collections::BTreeSet::new(),
+            incarnations: std::collections::HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_threshold(root: impl Into<PathBuf>, bytes: u64) -> Self {
+        Self {
+            read_committed: false,
+            writers: WriterLease::default(),
+            unowned_tables: Default::default(),
+            stage: WriteSetStage::with_threshold(root, bytes),
+            count: 0,
+            tables: Default::default(),
+            incarnations: Default::default(),
         }
     }
 
@@ -94,6 +116,25 @@ impl TxnWriteSet {
     /// silently dropped a row would commit a transaction missing writes.
     pub(crate) fn push(&mut self, write: PgWrite) -> Result<()> {
         let mutation = write.0;
+        if self.read_committed
+            && !self
+                .writers
+                .owns(write.1, stripe(mutation.key.key.as_bytes()))
+        {
+            self.unowned_tables
+                .insert((format!("{}.{}", mutation.keyspace, mutation.table), write.1));
+        }
+        let name = (mutation.keyspace.clone(), mutation.table.clone());
+        if self
+            .incarnations
+            .get(&name)
+            .is_some_and(|id| *id != write.1)
+        {
+            return Err(Error::InvalidData(
+                "transaction spans different table incarnations".into(),
+            ));
+        }
+        self.incarnations.insert(name, write.1);
         self.tables
             .insert(format!("{}.{}", mutation.keyspace, mutation.table));
         let mut frame = vec![0u8; mutation.serialized_size()];
@@ -162,7 +203,8 @@ impl TxnWriteSet {
                     "txn write-set: staged entry is not a decodable mutation frame: {e}"
                 ))
             })?;
-            out.push(PgWrite(mutation));
+            let id = self.incarnations[&(mutation.keyspace.clone(), mutation.table.clone())];
+            out.push(PgWrite(mutation, id));
             Ok(())
         })?;
         Ok(out)
@@ -173,7 +215,164 @@ impl TxnWriteSet {
     /// # Errors
     ///
     /// A staging flush or map failure is surfaced.
-    pub(crate) fn into_staged(self) -> Result<StagedWriteSet> {
-        self.stage.finish()
+    pub(crate) fn into_staged(self) -> Result<PgStagedWriteSet> {
+        Ok(PgStagedWriteSet {
+            writers: self.writers,
+            unowned_tables: self.unowned_tables,
+            inner: self.stage.finish()?,
+            incarnations: self.incarnations,
+        })
+    }
+}
+
+/// A streamed write source retains relation identities independently of spilled rows.
+pub(crate) struct PgStagedWriteSet {
+    pub(crate) writers: WriterLease,
+    unowned_tables: std::collections::BTreeSet<(String, uuid::Uuid)>,
+    inner: StagedWriteSet,
+    incarnations: std::collections::HashMap<(String, String), uuid::Uuid>,
+}
+impl PgStagedWriteSet {
+    /// Visit spilled mutations without retaining per-row ownership metadata.
+    pub(crate) async fn acquire_writers(
+        &mut self,
+        mvcc: &crate::mvcc::MvccManager,
+        original: &crate::mvcc::MvccSnapshot,
+    ) -> std::result::Result<(), crate::messages::BackendMessage> {
+        let mut wanted = std::collections::BTreeMap::<uuid::Uuid, [bool; STRIPES]>::new();
+        self.inner
+            .for_each_mutation(&mut |mutation| {
+                let id = self.incarnations[&(mutation.keyspace.clone(), mutation.table.clone())];
+                let slots = wanted.entry(id).or_insert([false; STRIPES]);
+                if ferrosa_storage::table_tombstone::is_table_tombstone_key(&mutation.key) {
+                    slots.fill(true);
+                } else {
+                    let slot = stripe(mutation.key.key.as_bytes());
+                    slots[slot] = true;
+                }
+                Ok(())
+            })
+            .map_err(|e| crate::query::write_error_response(&e))?;
+        for (id, slots) in wanted {
+            for (slot, needed) in slots.into_iter().enumerate() {
+                if needed {
+                    self.writers.acquire(&mvcc.writers, id, slot).await?;
+                }
+            }
+        }
+        // Synchronous bulk staging can reach COMMIT without early ownership.
+        // It must retain conflict validation after the wait, rather than
+        // publishing an old-timestamp mutation over a newer committed row.
+        if self
+            .unowned_tables
+            .iter()
+            .any(|(table, id)| mvcc.relation_changed_since(original, table, *id))
+        {
+            return Err(crate::query::error_response(
+                "40001",
+                "concurrent change preceded buffered writer ownership",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+impl WriteSetSource for PgStagedWriteSet {
+    fn mutation_count(&self) -> usize {
+        self.inner.mutation_count()
+    }
+    fn for_each_mutation(&self, visit: &mut dyn FnMut(&Mutation) -> Result<()>) -> Result<()> {
+        self.inner.for_each_mutation(visit)
+    }
+    fn for_each_owned_mutation(&self, visit: &mut dyn FnMut(Mutation) -> Result<()>) -> Result<()> {
+        self.inner.for_each_owned_mutation(visit)
+    }
+}
+
+pub(crate) trait PgWriteSource: WriteSetSource {
+    /// Called with the schema lifecycle read lease held, before any batch effects.
+    fn validate_incarnations(
+        &self,
+        _schema: &ferrosa_schema::Schema,
+    ) -> std::result::Result<(), crate::mvcc::MvccCommitError> {
+        Ok(())
+    }
+}
+// Resident autocommit mutations are validated against the statement's bound UUID
+// before entering commit_mutations, under the same lifecycle lease.
+impl PgWriteSource for Vec<Mutation> {}
+#[cfg(test)]
+impl PgWriteSource for StagedWriteSet {}
+impl PgWriteSource for PgStagedWriteSet {
+    fn validate_incarnations(
+        &self,
+        schema: &ferrosa_schema::Schema,
+    ) -> std::result::Result<(), crate::mvcc::MvccCommitError> {
+        let snap = schema.snapshot();
+        if self
+            .incarnations
+            .iter()
+            .any(|(name, id)| snap.tables.get(name).is_none_or(|table| table.id != *id))
+        {
+            return Err(crate::mvcc::MvccCommitError::SerializationFailure);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::*;
+    use crate::mvcc::{MvccManager, RowChange};
+
+    #[tokio::test]
+    async fn late_staged_write_cannot_gain_freshness_from_later_stripe_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let mvcc = MvccManager::default();
+        let original = mvcc.snapshot();
+        let id = uuid::Uuid::new_v4();
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"key".to_vec()));
+        let mut writes = TxnWriteSet::new(dir.path());
+        writes.read_committed = true;
+        // COPY uses this synchronous staging seam, before acquiring writer ownership.
+        writes
+            .push(PgWrite(
+                Mutation::new("ks".into(), "t".into(), key.clone(), vec![], 1),
+                id,
+            ))
+            .unwrap();
+        mvcc.commit(
+            &mvcc.snapshot(),
+            &Default::default(),
+            vec![RowChange {
+                table: "ks.t".into(),
+                table_id: id,
+                key: vec![ferrosa_sql::Value::Text("key".into())],
+                partition_key: b"key".to_vec(),
+                before: None,
+                after: Some(ferrosa_sql::Row::new(vec![ferrosa_sql::Value::Int(2)])),
+            }],
+            || Ok(()),
+        )
+        .unwrap();
+        // A later DML can acquire the same stripe; that must not bless the earlier frame.
+        writes
+            .writers
+            .acquire(&mvcc.writers, id, stripe(key.key.as_bytes()))
+            .await
+            .unwrap();
+        let mut staged = writes.into_staged().unwrap();
+        let error = staged.acquire_writers(&mvcc, &original).await.unwrap_err();
+        assert!(
+            matches!(error, crate::messages::BackendMessage::ErrorResponse { fields }
+            if fields.iter().any(|(kind, value)| *kind == b'C' && value == "40001"))
+        );
     }
 }

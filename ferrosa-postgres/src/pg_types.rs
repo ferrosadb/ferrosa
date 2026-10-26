@@ -113,7 +113,7 @@ const fn entry(
 
 /// Every engine-backed Postgres type ferrosa advertises, one row per
 /// `ColumnType`. Kept in step with [`for_column_type`] by a unit test.
-pub const ALL_PG_TYPES: [PgType; 16] = [
+pub const ALL_PG_TYPES: [PgType; 17] = [
     entry(23, "int4", 4, ColumnType::Int, true),
     entry(20, "int8", 8, ColumnType::BigInt, true),
     entry(25, "text", -1, ColumnType::Text, true),
@@ -135,6 +135,7 @@ pub const ALL_PG_TYPES: [PgType; 16] = [
     entry(PG_OID_JSON, "json", -1, ColumnType::Json, false),
     entry(PG_OID_JSONPATH, "jsonpath", -1, ColumnType::JsonPath, false),
     entry(1009, "_text", -1, ColumnType::TextArray, false),
+    entry(1184, "timestamptz", 8, ColumnType::TimestampTz, true),
 ];
 
 /// The Postgres type for an engine relational column type.
@@ -156,6 +157,7 @@ pub fn for_column_type(ty: ColumnType) -> PgType {
         ColumnType::Json => 13,
         ColumnType::JsonPath => 14,
         ColumnType::TextArray => 15,
+        ColumnType::TimestampTz => 16,
     };
     ALL_PG_TYPES[idx]
 }

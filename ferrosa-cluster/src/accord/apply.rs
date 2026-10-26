@@ -1297,6 +1297,9 @@ impl EngineStorageApplier {
             return Ok(());
         }
 
+        // RAII leases cover validation, prepare, the complete atomic storage
+        // batch and publication. Errors release every acquired lease.
+        let mut postgres_lifecycle_leases = Vec::new();
         if !postgres_mvcc_metadata.is_empty() {
             let observers = self.postgres_mvcc_observers.read();
             if observers.is_empty() {
@@ -1310,6 +1313,13 @@ impl EngineStorageApplier {
                     txn_id,
                     reason: "PostgreSQL MVCC writeset contains multiple Accord timestamps".into(),
                 });
+            }
+            for observer in observers.iter() {
+                postgres_lifecycle_leases.push(
+                    observer
+                        .acquire_postgres_apply(&postgres_mvcc_metadata)
+                        .map_err(|reason| ApplyError { txn_id, reason })?,
+                );
             }
             for observer in observers.iter() {
                 observer

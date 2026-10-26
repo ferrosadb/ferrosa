@@ -88,12 +88,16 @@ pub struct Session {
     /// (`I`/`T`/`E`). Entering a `T` block starts PostgreSQL MVCC transaction
     /// state; Cassandra CQL transactions remain on Accord.
     txn: TransactionStatus,
+    /// Wall clock captured at statement dispatch, never at Parse/Describe.
+    statement_timestamp_micros: i64,
+    txn_timestamp_micros: Option<i64>,
     /// Extended protocol work commits or rolls back only at Sync.
     extended_implicit: bool,
     /// Explicit isolation mode for the current transaction. `None` means the
     /// session default.
     txn_isolation: Option<ferrosa_sql::IsolationLevel>,
     txn_snapshot: Option<MvccSnapshot>,
+    txn_expiry_cleaned: bool,
     txn_read_tables: HashSet<String>,
     /// The open transaction's ROW-level read set: the keyed reads, resolved to the ROW
     /// keys they visited, staged through the SAME threshold-bounded write-set spill as
@@ -161,9 +165,12 @@ impl Session {
             portals: HashMap::new(),
             error_pending: false,
             txn: TransactionStatus::default(),
+            statement_timestamp_micros: crate::query::wall_clock_micros(),
+            txn_timestamp_micros: None,
             extended_implicit: false,
             txn_isolation: None,
             txn_snapshot: None,
+            txn_expiry_cleaned: false,
             txn_read_tables: HashSet::new(),
             txn_read_rows: RowReadSet::default(),
             txn_writes: TxnWriteSet::default(),
@@ -343,20 +350,45 @@ impl Session {
 
     /// `BEGIN`: enter a transaction block and start a fresh empty write-set. A
     /// `BEGIN` while already in one keeps the session in-transaction (PG warns
-    /// but stays `T`) and clears any buffered writes.
+    /// but stays `T`) and preserves its identity, ownership and staged writes.
     pub(crate) fn begin_txn(
         &mut self,
         isolation: Option<ferrosa_sql::IsolationLevel>,
         snapshot: MvccSnapshot,
     ) {
+        if !matches!(self.txn, TransactionStatus::Idle) {
+            return;
+        }
         self.txn_writes = TxnWriteSet::default();
         self.txn_read_tables.clear();
         self.txn_read_rows = RowReadSet::default();
         if matches!(self.txn, TransactionStatus::Idle) {
+            self.txn_timestamp_micros = Some(self.statement_timestamp_micros);
             self.txn = TransactionStatus::InTransaction;
             self.txn_isolation = isolation;
             self.txn_snapshot = Some(snapshot);
+            self.txn_expiry_cleaned = false;
         }
+        self.txn_writes.writers.lifetime = self.txn_snapshot.as_ref().map(|s| s.lifetime.clone());
+    }
+
+    /// Idle cleanup preserves the expired snapshot so the next command reports
+    /// the established 40001 contract before the transaction enters failed state.
+    pub(crate) fn expire_idle_transaction(&mut self) {
+        self.txn_expiry_cleaned = true;
+        self.txn_writes = TxnWriteSet::default();
+        self.txn_read_tables.clear();
+        self.txn_read_rows = RowReadSet::default();
+        self.runs.clear();
+    }
+
+    pub(crate) fn idle_transaction_lifetime(
+        &self,
+    ) -> Option<std::sync::Arc<crate::mvcc::TransactionLifetime>> {
+        if !self.in_txn() || self.txn_expiry_cleaned {
+            return None;
+        }
+        self.txn_snapshot.as_ref().map(|s| s.lifetime.clone())
     }
 
     /// `COMMIT`/`ROLLBACK`: leave the transaction block, back to idle, and drop
@@ -367,14 +399,25 @@ impl Session {
         // PostgreSQL destroys a transaction's portals when it ends; their
         // queries and node slots go with them.
         self.runs.clear();
+        self.txn_timestamp_micros = None;
         self.txn = TransactionStatus::Idle;
         self.txn_isolation = None;
         self.txn_snapshot = None;
+        self.txn_expiry_cleaned = false;
         self.txn_read_tables.clear();
         self.txn_read_rows = RowReadSet::default();
         // Drop the whole staged write-set (resident prefix and spill) so a
         // committed or rolled-back transaction leaves nothing behind.
         self.txn_writes = TxnWriteSet::default();
+    }
+
+    pub(crate) fn start_statement(&mut self) {
+        self.statement_timestamp_micros = crate::query::wall_clock_micros();
+    }
+
+    pub(crate) fn timestamp_micros(&self) -> i64 {
+        self.txn_timestamp_micros
+            .unwrap_or(self.statement_timestamp_micros)
     }
 
     pub fn txn_isolation(&self) -> Option<ferrosa_sql::IsolationLevel> {
@@ -463,7 +506,7 @@ impl Session {
     /// which reads it as a STREAM rather than a resident `Vec<PgWrite>`.
     pub(crate) fn take_txn_stage(
         &mut self,
-    ) -> Result<ferrosa_storage::write_set_stage::StagedWriteSet, ferrosa_common::Error> {
+    ) -> Result<crate::txn_write_set::PgStagedWriteSet, ferrosa_common::Error> {
         let staged = std::mem::take(&mut self.txn_writes);
         staged.into_staged()
     }
@@ -482,6 +525,9 @@ impl Session {
     pub fn mark_txn_failed(&mut self) {
         if matches!(self.txn, TransactionStatus::InTransaction) {
             self.txn = TransactionStatus::Failed;
+            self.txn_writes = TxnWriteSet::default();
+            self.txn_read_tables.clear();
+            self.txn_read_rows = RowReadSet::default();
         }
     }
 
@@ -502,7 +548,7 @@ impl Session {
                 // yet. Fail loud rather than guess. The check walks a `||`
                 // concatenation, which can carry a `$N` below its top level.
                 if items.iter().any(|it| it.value.references_param()) {
-                    self.error_pending = true;
+                    self.mark_error();
                     return error_response(
                         "0A000",
                         "$N parameters in expression selects are not supported via the \
@@ -521,7 +567,7 @@ impl Session {
             Ok(Statement::Delete(del)) => PreparedKind::Delete(del),
             Ok(_) => {
                 // BEGIN/COMMIT/ROLLBACK/SET reach the backend via simple Query.
-                self.error_pending = true;
+                self.mark_error();
                 return error_response(
                     "0A000",
                     "only SELECT and INSERT/UPDATE/DELETE statements can be prepared via the \
@@ -529,7 +575,7 @@ impl Session {
                 );
             }
             Err(e) => {
-                self.error_pending = true;
+                self.mark_error();
                 // Same SQLSTATE as the simple-query path: a refused clause, key or
                 // CAST type is `0A000` (feature_not_supported), not the generic
                 // `42601` — a client must not read an unsupported feature as a typo.
@@ -562,7 +608,7 @@ impl Session {
         jsonb_limits: &ferrosa_jsonb::Limits,
     ) -> BackendMessage {
         let Some(stmt) = self.statements.get(&stmt_name) else {
-            self.error_pending = true;
+            self.mark_error();
             return error_response(
                 "26000",
                 &format!("prepared statement \"{stmt_name}\" does not exist"),
@@ -570,7 +616,7 @@ impl Session {
         };
 
         if param_formats.len() > 1 && param_formats.len() != param_values.len() {
-            self.error_pending = true;
+            self.mark_error();
             return error_response(
                 "08P01",
                 "Bind parameter format count must be zero, one, or match the parameter count",
@@ -579,7 +625,7 @@ impl Session {
         if param_formats.iter().any(|format| !matches!(format, 0 | 1))
             || result_formats.iter().any(|format| !matches!(format, 0 | 1))
         {
-            self.error_pending = true;
+            self.mark_error();
             return error_response("08P01", "Bind format code must be 0 (text) or 1 (binary)");
         }
 
@@ -596,7 +642,7 @@ impl Session {
         let params = match params {
             Ok(params) => params,
             Err(err) => {
-                self.error_pending = true;
+                self.mark_error();
                 return error_response(err.sqlstate, &err.message);
             }
         };
@@ -634,6 +680,7 @@ impl Session {
     /// Record that an error occurred mid-sequence (skip until `Sync`) and return
     /// the given `ErrorResponse`. Used by the async handlers in the server loop.
     pub fn fail(&mut self, err: BackendMessage) -> BackendMessage {
+        self.mark_txn_failed();
         self.error_pending = true;
         err
     }
@@ -642,6 +689,7 @@ impl Session {
     /// constructing a response — for when the error message was produced
     /// elsewhere (e.g. by the shared result renderer).
     pub fn mark_error(&mut self) {
+        self.mark_txn_failed();
         self.error_pending = true;
     }
 }
@@ -829,7 +877,8 @@ mod tests {
         assert_eq!(bind_error_code(114, 1, b"{"), "22P02");
         // An unmapped OID is refused at Bind, in both formats.
         assert_eq!(bind_error_code(4072, 0, b"$"), "42704");
-        assert_eq!(bind_error_code(1184, 1, b"{}"), "42704");
+        assert_eq!(bind_error_code(999_999, 1, b"{}"), "42704");
+        assert_eq!(bind_error_code(1184, 1, b"{}"), "22P03");
     }
 
     #[test]

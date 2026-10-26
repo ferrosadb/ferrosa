@@ -68,3 +68,8 @@ this roadmap is gap- and risk-driven rather than scraped from the code.
   authenticates, prioritises, and delivers their messages.
 - Cassandra internode wire compatibility — ferrosa intentionally runs its own
   internode protocol (CQL client compatibility is a separate concern).
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+The canonical PostgreSQL MVCC Cap'n Proto payload carries `TableMetadata.id` as 16 UUID bytes on each row image and on the partition root (including relation-only metadata without row images). PostgreSQL readers reject missing/invalid UUIDs rather than infer an incarnation from the name. Existing fields retain their ordinals. This additive wire change requires coordinated PostgreSQL participant upgrades: old binaries ignore the new identity fields, and uncheckpointed legacy Accord metadata is not safely replayable without explicit provenance-aware migration.

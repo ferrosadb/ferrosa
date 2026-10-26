@@ -248,3 +248,8 @@ end-to-end `integration.rs`, and `reconnect_backoff.rs`). No `#[ignore]`, no
 - [Data flow](specs/data-flow.md) — frame / handshake / lane sequence diagram
 - [FMEA / known issues](specs/fmea.md) — failure modes + gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+The canonical PostgreSQL MVCC Cap'n Proto payload carries `TableMetadata.id` as 16 UUID bytes on each row image and on the partition root (including relation-only metadata without row images). PostgreSQL readers reject missing/invalid UUIDs rather than infer an incarnation from the name. Existing fields retain their ordinals. This additive wire change requires coordinated PostgreSQL participant upgrades: old binaries ignore the new identity fields, and uncheckpointed legacy Accord metadata is not safely replayable without explicit provenance-aware migration.

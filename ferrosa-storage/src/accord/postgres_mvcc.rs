@@ -52,6 +52,12 @@ pub fn decode_mutation(data: &[u8]) -> Result<(&[u8], Option<&[u8]>), String> {
 /// Receives committed PostgreSQL row images after Accord applies the storage
 /// write set on a replica. Implementations must be idempotent by `(txn_id, t)`.
 pub trait PostgresMvccApplyObserver: Send + Sync + 'static {
+    /// Validate relation incarnations and retain their lifecycle through physical
+    /// apply and publication. The caller drops this guard on success or failure.
+    fn acquire_postgres_apply(&self, _metadata: &[Vec<u8>]) -> Result<Box<dyn Send>, String> {
+        Ok(Box::new(()))
+    }
+
     fn prepare_postgres_apply(
         &self,
         txn_id: TxnId,
