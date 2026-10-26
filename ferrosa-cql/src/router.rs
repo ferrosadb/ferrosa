@@ -1700,7 +1700,7 @@ struct ScanPageProgress {
 // The high byte forces it to reject this envelope, never interpret a raw key
 // as a row offset. The inner signed scan-position token retains its codec.
 const LIMITED_SCAN_CURSOR_MAGIC: &[u8; 3] = &[0xff, b'L', b'S'];
-const LIMITED_SCAN_CURSOR_VERSION: u8 = 1;
+const SCAN_CURSOR_LAYOUT_VERSION: u8 = 1;
 
 impl ScanPageProgress {
     fn decode(bytes: Option<&[u8]>, query_limit: Option<usize>) -> Result<Self, CqlError> {
@@ -1725,10 +1725,10 @@ impl ScanPageProgress {
                 "paging_state is not a limited scan cursor".into(),
             ));
         }
-        if payload[3] != LIMITED_SCAN_CURSOR_VERSION {
+        if payload[3] != SCAN_CURSOR_LAYOUT_VERSION {
             return Err(CqlError::Invalid(format!(
                 "unsupported limited scan cursor version {}; expected {}",
-                payload[3], LIMITED_SCAN_CURSOR_VERSION,
+                payload[3], SCAN_CURSOR_LAYOUT_VERSION,
             )));
         }
         let encoded_limit = u64::from_be_bytes(payload[4..12].try_into().unwrap());
@@ -1773,7 +1773,7 @@ impl ScanPageProgress {
                 // Include the outer SHA-256 tag so signing does not reallocate.
                 let mut payload = Vec::with_capacity(20 + bytes.len() + 32);
                 payload.extend_from_slice(LIMITED_SCAN_CURSOR_MAGIC);
-                payload.push(LIMITED_SCAN_CURSOR_VERSION);
+                payload.push(SCAN_CURSOR_LAYOUT_VERSION);
                 payload.extend_from_slice(&(limit as u64).to_be_bytes());
                 payload.extend_from_slice(&(returned as u64).to_be_bytes());
                 payload.extend_from_slice(&bytes);
