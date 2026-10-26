@@ -3,6 +3,11 @@
 Reverse placement on PostgreSQL's original VM, same client and binary:
 **21,104 Ferrosa versus 23,673 PostgreSQL INSERT rows/s (89.1%)**;
 **9,745 versus 10,798 warm point reads/s (90.3%)**.
+This supports rough end-to-end throughput parity for this warm 5k-row,
+eight-worker benchmark, with two observations per engine. Larger datasets,
+cold reads and sustained or multi-node workloads need separate measurements.
+The separate loopback point-read probe still measures 273 versus 117 microseconds
+p50; local lookup overhead remains under investigation.
 Both use the comparator root filesystem with a fresh Ferrosa data directory.
 The earlier 3.08× cross-product read ratio used unequal network paths; placing
 both on the original Ferrosa VM measured 3,142 versus 3,555 reads/s (88.4%).

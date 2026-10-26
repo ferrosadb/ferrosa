@@ -1,5 +1,33 @@
 # Measured pipeline changes
 
+## Current findings
+
+Ferrosa reaches **89.1% of PostgreSQL INSERT throughput and 90.3% of point-read
+throughput** in the reverse-placement control. This supports rough end-to-end
+throughput parity for the measured warm 5k-row, eight-worker workload, with two
+observations per engine. Broader equivalence across larger datasets, cold reads,
+sustained load and multi-node operation requires separate measurements.
+
+| Point-read comparison | Ferrosa ops/s | PostgreSQL ops/s | PostgreSQL / Ferrosa | Interpretation |
+| --- | ---: | ---: | ---: | --- |
+| Historical separate VMs | 3,313 | 10,212 | 3.08× | Unequal network paths; confounded |
+| Both on original Ferrosa VM | 3,142 | 3,555 | 1.13× | Shared slower path |
+| Both on original PostgreSQL VM | 9,745 | 10,798 | 1.11× | Shared faster path |
+
+The controls demonstrate the placement effect in both directions. The reverse
+control also changes storage placement and starts with fresh Ferrosa data, so
+the throughput change is not attributed solely to networking or to a code fix.
+Exact fixture, process, storage and repetition limits appear below.
+
+Local lookup overhead remains: a separate single-worker loopback probe measured
+**273 versus 117 microseconds p50** for full point reads and **220 versus 105
+microseconds** for missing keys. The difference on a miss means returned-payload
+copying alone cannot explain it. Loopback shares server CPUs with the client;
+these are separate probes, not direct server spans or additive request timings.
+Allocation volume, individual mutex waits and the exact host/network cause are
+not established by these measurements. No current matched Neo4j comparison is
+available.
+
 ## Reverse placement on PostgreSQL's original VM — 2026-10-26
 
 The reverse control moves the **same Ferrosa binary** onto the native PostgreSQL
@@ -129,7 +157,7 @@ wait times; RSS is not allocated bytes. No current matched Neo4j comparison is
 established. [Exact values and image identities](point-read-walk-results.json).
 
 The preceding 100k/follow-on-5k workload is retained below with its runtime. It
-has not been rerun on this latest runtime and is not a current 100k claim.
+has not been rerun on runtime `a948ed1df` and is not a current 100k claim.
 
 ## Previous matched workload — 2026-10-25
 
@@ -149,7 +177,7 @@ INSERT is within roughly 8% of PostgreSQL in these workloads. Point reads remain
 the main measured PostgreSQL gap. Older intermediate-revision measurements
 are retained below as history.
 
-The latest INSERT change improved the paired 100k rate from 17,138 to 24,275
+At that historical checkpoint, the INSERT change improved the paired 100k rate from 17,138 to 24,275
 rows/s (+41.6%). The 5k before/after ranges overlap, so its smaller mean change
 does not establish a speedup. Sampled peak RSS rose from 455 to 503 MiB despite
 fewer allocations. Two runs do not establish statistical significance. Both
@@ -160,7 +188,7 @@ Neo4j: **no current matched Ferrosa-versus-Neo4j result is established here**.
 The older Bolt numbers below are Ferrosa revision comparisons. Different older
 native Neo4j workloads cannot establish the current product gap.
 
-Source values/ranges: [latest INSERT and point-read results](mvcc-absence-results.json).
+Source values/ranges: [historical INSERT and point-read results](mvcc-absence-results.json).
 The sections below preserve the measured journey at their named revisions;
 their before/after rates are **historical**, not current comparison-product results.
 
@@ -271,7 +299,7 @@ and validated it after 30 seconds of reads. The candidate has 447 user CPU
 samples: allocator frames appear on 49 stacks (11.0% inclusive); libc leaves
 remain unattributed. No dominant CPU-spin hotspot was identified. Blocked
 mutex/request time is not measured by a CPU flame graph. Those profiles do
-not establish request/handoff/off-CPU timing; the latest read gap is above. Raw
+not establish request/handoff/off-CPU timing; the current placement-controlled results are above. Raw
 profiles and resource counters are retained in the private evidence.
 
 ## Payload-label correction (2026-10-25)
@@ -328,5 +356,5 @@ waits or request latency. Background I/O and network totals differ across the
 captures, so their whole-process deltas are diagnostic, not precise isolated
 attribution. Profiled throughput is excluded from the table.
 
-The remaining read gap is still open. This change targets INSERT metadata; it
+At that checkpoint, the read gap remained open. This change targets INSERT metadata; it
 does not establish bounded MVCC residency or eliminate query/protocol handoffs.
