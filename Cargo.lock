@@ -2525,6 +2525,7 @@ dependencies = [
  "chrono",
  "ferrosa-cluster",
  "ferrosa-common",
+ "ferrosa-index",
  "ferrosa-net",
  "ferrosa-schema",
  "ferrosa-sstable",

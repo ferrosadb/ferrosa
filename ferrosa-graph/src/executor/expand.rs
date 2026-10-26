@@ -1,16 +1,16 @@
 //! Expand executor: traverses graph patterns via the adjacency index.
 //!
 //! Executes a `PhysicalPlan::Expand` by:
-//! 1. Looking up the anchor vertex via `storage.read_range()` (or
-//!    `VirtualTable::read()` if the source is a virtual table)
+//! 1. Looking up anchor candidates via native/secondary keys, a range stream,
+//!    or a registered virtual table
 //! 2. For each hop, reading the adjacency index to find neighbors
 //! 3. Building a `GraphResult` with columns from the return clause
 //!
 //! Correctness: keyed anchors read only their adjacency partition, and hop
 //! frontiers stop at the configured fan-out bound without a duplicate neighbor
 //! vector.
-//! Last revised: 2026-10-06
-//! Last changed: Streamed adjacency neighbors and enforce frontier bounds per state.
+//! Last revised: 2026-10-26
+//! Last changed: Route eligible property equality through 2i and count vertex metadata.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -19,6 +19,7 @@ use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::write_path::{PartitionResultStream, WritePath};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
+use ferrosa_index::{IndexKey, IndexType};
 use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{Mutation, TableId};
@@ -2157,8 +2158,8 @@ async fn finish_expand_buffered(
 }
 
 /// Stream the anchor table's candidate partitions: a direct primary-key lookup
-/// when the anchor's properties pin the full key, else a lazy range scan of the
-/// table.
+/// when the anchor's properties pin the full key, a maintained secondary-index
+/// stream for exact scalar equality, else a lazy range scan of the table.
 ///
 /// Extracted from `execute_expand` so the anchor read strategy is one named
 /// decision the pull-based streaming `AnchorScan` (t_4ce82a3e,
@@ -2190,10 +2191,88 @@ async fn stream_anchor_partitions(
                 .await?;
             return Ok(Box::pin(futures::stream::iter(hit.into_iter().map(Ok))));
         }
+        if let Some(schema) = schema {
+            let snapshot = schema.snapshot();
+            let candidates =
+                anchor
+                    .props
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value))
+                    .chain(anchor.filters.iter().filter_map(|filter| {
+                        anchor_property_equality(filter, anchor.var.as_deref())
+                    }));
+            for (property, value) in candidates {
+                let Some(column) = meta.columns.get(property) else {
+                    continue;
+                };
+                let Some(key) = exact_graph_index_key(value, &column.column_type) else {
+                    continue;
+                };
+                for index in snapshot.indexes.values() {
+                    if index.keyspace == anchor.table.keyspace
+                        && index.table == anchor.table.table
+                        && index.target_columns.as_slice() == [property]
+                        && index.filter_predicate.is_none()
+                        && matches!(index.index_type, IndexType::BTree | IndexType::Hash)
+                        && write_path.declares_index_locally(&anchor_table_id, &index.name)
+                        && write_path.index_is_current(&anchor_table_id, &index.name)
+                    {
+                        // A current index miss is authoritative. The normal
+                        // property/WHERE checks still recheck every candidate;
+                        // errors or declaration races propagate to the caller.
+                        return Ok(write_path
+                            .index_read_stream(&anchor_table_id, &index.name, &key, None)
+                            .await?);
+                    }
+                }
+            }
+        }
     }
     Ok(write_path
         .range_read_stream_all(&anchor_table_id, 0)
         .await?)
+}
+
+fn anchor_property_equality<'a>(
+    filter: &'a Expr,
+    anchor_var: Option<&str>,
+) -> Option<(&'a str, &'a Expr)> {
+    let Expr::Comparison {
+        left,
+        op: CompareOp::Eq,
+        right,
+    } = filter
+    else {
+        return None;
+    };
+    match (left.as_ref(), right.as_ref()) {
+        (Expr::Property { var, name }, value) | (value, Expr::Property { var, name })
+            if Some(var.as_str()) == anchor_var =>
+        {
+            Some((name, value))
+        }
+        _ => None,
+    }
+}
+
+/// Only seek when byte equality covers every match of the existing evaluator.
+/// Integer comparisons are exact; mixed floating-point predicates retain the
+/// scan. Other decoded scalar formats can also be
+/// non-injective (for example noncanonical boolean bytes and text fallbacks).
+fn exact_graph_index_key(value: &Expr, column_type: &str) -> Option<IndexKey> {
+    let exact = match value {
+        Expr::Literal(Literal::Integer(_)) => {
+            matches!(column_type, "int" | "bigint")
+        }
+        Expr::Literal(Literal::String(_)) => column_type == "uuid",
+        _ => false,
+    };
+    if !exact {
+        return None;
+    }
+    encode_expr_for_column_type(value, column_type)
+        .ok()
+        .map(IndexKey)
 }
 
 /// Project one expand state's bindings into a result row per the RETURN items.
@@ -6275,6 +6354,76 @@ async fn execute_delete(
     })
 }
 
+/// Recognize unfiltered counts of physical vertices. Counts of properties,
+/// DISTINCT, traversal, WITH, virtual tables and filtered inputs keep the
+/// general evaluator, including its null and multiplicity semantics.
+fn metadata_node_count_anchor<'a>(
+    inner: &'a PhysicalPlan,
+    group_keys: &[usize],
+    projections: &[AggregateProjection],
+    result_clause: &ReturnClause,
+    virtual_tables: Option<&VirtualTableRegistry>,
+    schema: Option<&Schema>,
+) -> Option<&'a Anchor> {
+    if !group_keys.is_empty()
+        || projections.is_empty()
+        || result_clause.distinct
+        || result_clause.limit.is_some()
+        || !result_clause.order_by.is_empty()
+    {
+        return None;
+    }
+    let PhysicalPlan::Expand {
+        anchor,
+        hops,
+        optional_hops,
+        post_filters,
+        with_pipeline,
+        return_clause,
+    } = inner
+    else {
+        return None;
+    };
+    if !hops.is_empty()
+        || !optional_hops.is_empty()
+        || !post_filters.is_empty()
+        || with_pipeline.is_some()
+        || !anchor.props.is_empty()
+        || !anchor.filters.is_empty()
+        || return_clause.distinct
+        || return_clause.limit.is_some()
+        || !return_clause.order_by.is_empty()
+    {
+        return None;
+    }
+    if !projections.iter().all(|projection| match projection {
+        AggregateProjection::AggregateFunc {
+            name,
+            arg: Expr::Var(var),
+            distinct: false,
+        } => name == "count" && (var == "*" || anchor.var.as_deref() == Some(var.as_str())),
+        _ => false,
+    }) {
+        return None;
+    }
+    if virtual_tables.is_some_and(|vt| {
+        vt.get(&anchor.table.keyspace, &anchor.table.table)
+            .is_some()
+    }) {
+        return None;
+    }
+    let meta = table_metadata_for(schema, &anchor.table.keyspace, &anchor.table.table)?;
+    if meta.extensions.get("graph.type").map(String::as_str) != Some("vertex")
+        || meta
+            .columns
+            .values()
+            .any(|column| column.kind == ferrosa_schema::ColumnKind::Static)
+    {
+        return None;
+    }
+    Some(anchor)
+}
+
 /// Execute an Aggregate plan.
 ///
 /// 1. Executes the inner plan to get all rows.
@@ -6294,6 +6443,31 @@ async fn execute_aggregate(
     virtual_tables: Option<&VirtualTableRegistry>,
     schema: Option<&Schema>,
 ) -> Result<GraphResult> {
+    if config.max_groups > 0 {
+        if let Some(anchor) = metadata_node_count_anchor(
+            &inner,
+            group_keys,
+            projections,
+            return_clause,
+            virtual_tables,
+            schema,
+        ) {
+            let table = TableId::new(&anchor.table.keyspace, &anchor.table.table);
+            let strategy = graph_replication_strategy(schema, &anchor.table.keyspace)?;
+            let count = write_path
+                .count_range_with(&table, ConsistencyLevel::One, &strategy)
+                .await?;
+            check_timeout(start, config.query_timeout)?;
+            return Ok(GraphResult {
+                columns: build_columns(return_clause),
+                rows: vec![vec![serde_json::Value::from(count); projections.len()]],
+                stats: QueryStats {
+                    execution_ms: start.elapsed().as_millis() as u64,
+                    ..Default::default()
+                },
+            });
+        }
+    }
     // Step 1: stream the inner plan.
     //
     // This used to run the buffered `execute` and hold `inner_result.rows` for
@@ -6308,9 +6482,9 @@ async fn execute_aggregate(
     // needs is one row per group, for the GroupKey projections. So fold each
     // row as it arrives and keep the first row of each group, never the rest.
     //
-    // Memory is now proportional to the number of groups, which
-    // `config.max_groups` already bounds (FMEA F7) — a bound on STATE, not on
-    // results.
+    // Accumulator memory is proportional to the number of groups, bounded by
+    // `config.max_groups` (FMEA F7). The inner plan can still materialize an
+    // expansion frontier; the metadata-only count above bypasses that work.
     let (inner_columns, mut inner_rows, inner_stats) = Box::pin(execute_streaming(
         inner,
         write_path,

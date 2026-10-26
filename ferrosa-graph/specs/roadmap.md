@@ -16,14 +16,14 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Now (highest value)
 
-- **Route regular-property predicates through supported indexes.** The graph
-  anchor reader currently selects native-key lookup or range scan. Wire index
-  declaration/maintenance and reader selection while preserving duplicate
-  matches, filters and update/delete correctness. Native-primary-key schema
-  changes do not implement arbitrary-property indexes.
-- **Optimize count execution separately.** Preserve visibility and correctness
-  before adding metadata shortcuts. [Current results](../../deploy/fly-bench/pipeline/RESULTS.md)
-  and [experiment details](../../deploy/fly-bench/pipeline/HISTORY.md) record both gaps.
+- **Extend index eligibility and DDL.** Integer/UUID equality now consumes
+  CQL-declared BTree/Hash indexes and checks readiness before use. Extend this to
+  other scalar/predicate forms only with equivalent comparison semantics; add
+  Cypher index DDL separately.
+- **Extend count pushdown.** Unfiltered physical-vertex `count(n)`/`count(*)` now
+  count metadata. Filtered, grouped, DISTINCT and property counts keep the
+  evaluator; preserve null, multiplicity and visibility semantics before adding
+  further shortcuts. [Measurements](../../deploy/fly-bench/pipeline/RESULTS.md).
 
 - **Arm adjacency reconciliation in production (FMEA G-1).** The synchronous
   observer is the primary guarantee, but the background reconciler — the only

@@ -22,11 +22,13 @@ executive_summary: >
 
 ## Purpose & boundary
 
-Native-primary-key equality uses the keyed reader; other anchor properties use
-a range scan. Secondary property-index declaration/routing remains unimplemented
-in PR #613. The [current comparison](../../deploy/fly-bench/pipeline/RESULTS.md)
-separates those schemas and records the remaining count gap. See the
-[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) for plans and controls.
+Native-primary-key equality uses the keyed reader. Eligible integer/UUID equality
+uses a CQL-declared, current BTree/Hash secondary index; unsupported predicates or
+unready indexes use the range reader. All candidates retain predicate checks.
+Cypher index DDL remains unsupported. Simple unfiltered vertex counts use row
+metadata without materializing payloads; other aggregate shapes retain the
+general evaluator. See the [measurement status](../../deploy/fly-bench/pipeline/RESULTS.md)
+and [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md).
 
 `ferrosa-graph` turns a ferrosa keyspace into a queryable property graph without
 a dedicated graph store. There is no separate graph storage engine: vertices and
@@ -90,8 +92,10 @@ Bolt streams records the same way. Anchor partitions are **streamed** via
 table at once (t_bc5f0e6f); each hop reads `system_graph_<ks>.adjacency` to find
 neighbors. **Aggregation is incremental:** `execute_aggregate`
 (executor/expand.rs:6046) streams its inner plan and folds each row into per-group
-`Accumulator`s, so `count()` memory is proportional to the number of groups
-(bounded by `config.max_groups`), never to the input row count. `ORDER BY` (with
+`Accumulator`s, whose memory is proportional to groups (`config.max_groups`).
+An inner expansion can still materialize its frontier. Eligible unfiltered
+vertex counts bypass that expansion and call `WritePath::count_range_with` at
+CL ONE with the keyspace replication strategy. `ORDER BY` (with
 optional `LIMIT`) spills to disk through `executor::spill` when the sort would
 exceed the memory budget.
 

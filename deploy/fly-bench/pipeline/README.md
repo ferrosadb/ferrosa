@@ -1,9 +1,10 @@
 # Pipeline performance experiments
 
-[Current performance of PR #613](RESULTS.md): roughly **90% of PostgreSQL
-throughput** in the measured workload. Bolt native-key reads are fast;
-regular-property lookups and counts remain gaps. **Cypher secondary property-index
-support is not implemented in #613.**
+[Measurement status for PR #613](RESULTS.md): the candidate now routes eligible
+graph property equality through CQL-declared secondary indexes, counts physical
+vertices through metadata and compares integer keys exactly. Fresh timings for
+that code are pending; older tables are explicitly labelled as a baseline.
+Cypher index DDL remains unsupported.
 
 The current-results page contains comparator tables, the exact engine revision
 and workload limits. [Experiment details and earlier checkpoints](HISTORY.md)
@@ -22,6 +23,29 @@ only the standard library:
 ```sh
 python3 -m unittest discover -s deploy/fly-bench/pipeline -p 'test_*.py'
 python3 deploy/fly-bench/pipeline/workload.py --help
+```
+
+`validated_multimetric_bench.py` supplies the common insert/count/point-read/scan
+workload for all four front ends. CQL pins native protocol v4 with compression
+off. Bolt requires `--bolt-backend ferrosa|neo4j`: both fixtures declare indexes
+on `pk`, `bucket` and `payload`; Neo4j must report all three RANGE indexes ONLINE
+with the correct label/property definitions. Ferrosa declares indexes through
+CQL and uses UUID `id` as its native key, so regular `pk` reads exercise 2i.
+Use `--cql-port`, `--cql-user` and `--cql-password` when that setup needs them.
+
+SPARQL requires `--sparql-backend ferrosa|oxigraph`. Each logical record is three
+triples in the isolated graph `urn:ferrosa:benchmark`; payloads, keys and buckets
+match the other fixtures. One persistent HTTP connection per worker excludes
+per-query TCP setup. Count returns one scalar over the records, and reads/scans
+validate values. Oxigraph should use a persistent `--location`, as described in
+its [pinned CLI documentation](https://github.com/oxigraph/oxigraph/blob/v0.5.11/cli/README.md).
+Neither these small workloads nor equal request shapes establish durability,
+large-dataset, traversal or multi-node equivalence.
+
+```sh
+python3 deploy/fly-bench/pipeline/validated_multimetric_bench.py \
+  --engine sparql --sparql-backend ferrosa --host "$HOST" --port 8080 \
+  --stages 5000 --concurrency 8 --read-samples 100 --out /tmp/sparql.json
 ```
 
 Provide connection credentials in a private, mode-0600 JSON file, outside this

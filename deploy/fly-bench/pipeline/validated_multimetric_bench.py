@@ -3,14 +3,15 @@
 
 Correctness: every timed point read returns the expected key, bucket and payload;
 counts and bounded scans must be complete before timings are accepted.
-Last revised: 2026-10-24
-Last changed: Added value validation, deterministic reads and read-only probing.
+Last revised: 2026-10-26
+Last changed: Add persistent SPARQL sessions and require validated, indexed fixtures.
 
 Four legs, one shape of measurement, so the numbers are comparable:
 
     cql   -> ferrosa / Apache Cassandra     (cassandra-driver)
     pg    -> ferrosa pgwire / PostgreSQL     (psycopg3)
     bolt  -> ferrosa bolt / Neo4j            (neo4j driver)
+    sparql -> ferrosa / Oxigraph             (persistent HTTP sessions)
 
 Per size it reports the three metric families the benchmark is defined on:
 
@@ -35,6 +36,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import http.client
 import json
 import random
 import statistics
@@ -69,7 +72,11 @@ class CqlAdapter:
         self.args = args
         # One Cluster, one session per thread: sessions are expensive to build
         # and cheap to share.
-        auth = PlainTextAuthProvider(username=args.user, password=args.password) if args.user else None
+        auth = (
+            PlainTextAuthProvider(username=args.user, password=args.password)
+            if args.user
+            else None
+        )
         self.cluster = Cluster(
             contact_points=[args.host],
             port=args.port,
@@ -81,8 +88,10 @@ class CqlAdapter:
             compression=args.compression,
             connect_timeout=30,
             control_connection_timeout=30,
+            protocol_version=4,
         )
         self.session = self.cluster.connect()
+        self.protocol_version = self.cluster.protocol_version
         self._local = threading.local()
 
     def _session(self):
@@ -119,7 +128,9 @@ class CqlAdapter:
         wave = 32
         pending = []
         for pk in range(start, stop):
-            pending.append(session.execute_async(stmt, (pk, pk % 64, payloads[pk % len(payloads)])))
+            pending.append(
+                session.execute_async(stmt, (pk, pk % 64, payloads[pk % len(payloads)]))
+            )
             if len(pending) >= wave:
                 for fut in pending:
                     fut.result()
@@ -134,7 +145,9 @@ class CqlAdapter:
 
     def count_seconds(self):
         began = time.perf_counter()
-        self.session.execute(f"SELECT count(*) FROM {self.args.keyspace}.{self.args.table}").one()
+        self.session.execute(
+            f"SELECT count(*) FROM {self.args.keyspace}.{self.args.table}"
+        ).one()
         return time.perf_counter() - began
 
     def _read_stmt(self, session):
@@ -227,13 +240,16 @@ class PgAdapter:
     def point_read(self, pk):
         with self._conn().cursor() as cur:
             cur.execute(
-                f"SELECT pk, bucket, payload FROM {self.args.table} WHERE pk = %s", (pk,)
+                f"SELECT pk, bucket, payload FROM {self.args.table} WHERE pk = %s",
+                (pk,),
             )
             return cur.fetchone()
 
     def scan(self, limit):
         with self._conn().cursor() as cur:
-            cur.execute(f"SELECT pk, bucket, payload FROM {self.args.table} LIMIT {limit}")
+            cur.execute(
+                f"SELECT pk, bucket, payload FROM {self.args.table} LIMIT {limit}"
+            )
             return cur.fetchall()
 
     def close(self):
@@ -253,7 +269,11 @@ class BoltAdapter:
         self.args = args
         # An IPv6 literal must be bracketed in a URI, or the driver treats the
         # last colon-separated group as a service name and DNS-fails.
-        host = f"[{args.host}]" if ":" in args.host and not args.host.startswith("[") else args.host
+        host = (
+            f"[{args.host}]"
+            if ":" in args.host and not args.host.startswith("[")
+            else args.host
+        )
         self.driver = GraphDatabase.driver(
             f"bolt://{host}:{args.port}",
             auth=(args.user, args.password) if args.user else None,
@@ -262,6 +282,8 @@ class BoltAdapter:
         # arrive here as the driver's `database`, and Neo4j's default (unset) must
         # stay unset or it looks for a database named after the ferrosa keyspace.
         self.database = getattr(args, "bolt_database", None)
+        if getattr(args, "bolt_backend", None) == "ferrosa" and self.database is None:
+            self.database = args.keyspace
         self._local = threading.local()
 
     def _session(self):
@@ -270,38 +292,79 @@ class BoltAdapter:
         return self._local.session
 
     def ensure_schema(self):
-        # A lookup by pk needs an index to be comparable with a primary-key read
-        # on the other engines; without one this measures label scans. The DDL
-        # differs between Cypher implementations (Neo4j accepts IF NOT EXISTS,
-        # ferrosa's engine does not), so a refusal here must not abort the leg --
-        # it means we measure scans, which the read numbers will show.
+        if self.args.bolt_backend == "ferrosa":
+            self._ensure_ferrosa_schema()
+            return
+        with self.driver.session(database=self.database) as session:
+            session.run("MATCH (n:BenchRow) DETACH DELETE n").consume()
+            for prop in ("pk", "bucket", "payload"):
+                session.run(
+                    f"CREATE INDEX bench_{prop} IF NOT EXISTS FOR (n:BenchRow) ON (n.{prop})"
+                ).consume()
+            session.run("CALL db.awaitIndexes(120)").consume()
+            rows = list(
+                session.run(
+                    "SHOW INDEXES YIELD name, state, type, labelsOrTypes, properties "
+                    "WHERE name IN ["
+                    + ", ".join(repr(f"bench_{p}") for p in ("pk", "bucket", "payload"))
+                    + "] "
+                    "RETURN name, state, type, labelsOrTypes, properties"
+                )
+            )
+        by_name = {row["name"]: dict(row) for row in rows}
+        for prop in ("pk", "bucket", "payload"):
+            row = by_name.get(f"bench_{prop}")
+            if (
+                not row
+                or row["state"] != "ONLINE"
+                or row["type"] != "RANGE"
+                or row["labelsOrTypes"] != ["BenchRow"]
+                or row["properties"] != [prop]
+            ):
+                raise RuntimeError(
+                    f"required Bolt index bench_{prop} is missing, not ONLINE, or has the wrong definition: {row}"
+                )
+        self.index_configuration = by_name
+
+    def _ensure_ferrosa_schema(self):
+        cql_args = argparse.Namespace(**vars(self.args))
+        cql_args.port = self.args.cql_port
+        cql_args.user = self.args.cql_user
+        cql_args.password = self.args.cql_password
+        keyspace = self.args.bolt_database or self.args.keyspace
+        quoted = chr(34) + keyspace.replace(chr(34), chr(34) * 2) + chr(34)
+        cql = CqlAdapter(cql_args)
         try:
-            # Fresh graph per run: inheriting nodes would report no insert rate.
-            with self.driver.session(database=self.database) as s:
-                s.run("MATCH (n:BenchRow) DETACH DELETE n")
-            with self.driver.session(database=self.database) as s:
-                s.run("CREATE INDEX bench_pk IF NOT EXISTS FOR (n:BenchRow) ON (n.pk)")
-            # Wait for the index to come ONLINE, else the read leg measures a
-            # building index rather than a serving one.
-            deadline = time.time() + 120
-            while time.time() < deadline:
-                with self.driver.session(database=self.database) as s:
-                    rec = s.run(
-                        "SHOW INDEXES YIELD name, state WHERE name = 'bench_pk' RETURN state"
-                    ).single()
-                if rec and rec["state"] == "ONLINE":
-                    return
-                time.sleep(0.5)
-        except Exception as exc:  # noqa: BLE001 - index support is engine-specific
-            self.index_note = f"index not established: {type(exc).__name__}"
-            print(f"[bolt] {self.index_note}", file=sys.stderr, flush=True)
+            session = cql.session
+            session.execute(
+                f"CREATE KEYSPACE IF NOT EXISTS {quoted} "
+                "WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
+            )
+            session.execute(f"DROP TABLE IF EXISTS {quoted}.benchrow")
+            session.execute(
+                f"CREATE TABLE {quoted}.benchrow "
+                "(id uuid PRIMARY KEY, pk bigint, bucket bigint, payload text) "
+                "WITH extensions = {'graph.type': 'vertex', 'graph.label': 'BenchRow'}"
+            )
+            for prop in ("pk", "bucket", "payload"):
+                session.execute(
+                    f"CREATE INDEX bench_{prop} ON {quoted}.benchrow ({prop})"
+                )
+        finally:
+            cql.close()
+        self.index_configuration = {
+            f"bench_{prop}": {"property": prop, "declaration": "CQL"}
+            for prop in ("pk", "bucket", "payload")
+        }
 
     def load_range(self, start, stop, payloads):
         session = self._session()
         wave = 128
         batch = []
         for pk in range(start, stop):
-            batch.append({"pk": pk, "bucket": pk % 64, "payload": payloads[pk % len(payloads)]})
+            batch.append(
+                {"pk": pk, "bucket": pk % 64, "payload": payloads[pk % len(payloads)]}
+            )
             if len(batch) >= wave:
                 session.run(
                     "UNWIND $rows AS row CREATE (n:BenchRow {pk: row.pk, bucket: row.bucket, payload: row.payload})",
@@ -343,7 +406,122 @@ class BoltAdapter:
         self.driver.close()
 
 
-ADAPTERS = {"cql": CqlAdapter, "pg": PgAdapter, "bolt": BoltAdapter}
+class SparqlAdapter:
+    """Persistent HTTP sessions over one isolated RDF graph (three triples/row)."""
+
+    label = "sparql"
+    graph = "urn:ferrosa:benchmark"
+    prefix = "urn:ferrosa:benchmark:"
+
+    def __init__(self, args):
+        self.args = args
+        self.query_path, self.update_path = {
+            "ferrosa": ("/sparql", "/sparql/update"),
+            "oxigraph": ("/query", "/update"),
+        }[args.sparql_backend]
+        self._local = threading.local()
+        # Workers append once; close runs after the worker pool has joined.
+        self._connections = []
+
+    def _conn(self):
+        if not hasattr(self._local, "connection"):
+            connection = http.client.HTTPConnection(
+                self.args.host, self.args.port, timeout=30
+            )
+            self._local.connection = connection
+            self._connections.append(connection)
+        return self._local.connection
+
+    def _request(self, statement, *, update=False):
+        headers = {
+            "Content-Type": "application/sparql-update"
+            if update
+            else "application/sparql-query",
+            "Accept": "application/sparql-results+json",
+        }
+        if self.args.user:
+            credentials = f"{self.args.user}:{self.args.password or ''}".encode()
+            headers["Authorization"] = "Basic " + base64.b64encode(credentials).decode()
+        connection = self._conn()
+        connection.request(
+            "POST",
+            self.update_path if update else self.query_path,
+            body=statement.encode(),
+            headers=headers,
+        )
+        response = connection.getresponse()
+        data = response.read()
+        if not 200 <= response.status < 300:
+            raise RuntimeError(f"SPARQL HTTP {response.status}: {data[:512]!r}")
+        return None if update else json.loads(data)["results"]["bindings"]
+
+    def ensure_schema(self):
+        self._request(f"CLEAR SILENT GRAPH <{self.graph}>", update=True)
+
+    def load_range(self, start, stop, payloads):
+        datatype = "http://www.w3.org/2001/XMLSchema#integer"
+        for wave in range(start, stop, 128):
+            triples = []
+            for pk in range(wave, min(wave + 128, stop)):
+                triples.append(
+                    f'<{self.prefix}row:{pk}> <{self.prefix}pk> "{pk}"^^<{datatype}>; '
+                    f'<{self.prefix}bucket> "{pk % 64}"^^<{datatype}>; '
+                    f"<{self.prefix}payload> {json.dumps(payloads[pk % len(payloads)])} ."
+                )
+            self._request(
+                f"INSERT DATA {{ GRAPH <{self.graph}> {{ {' '.join(triples)} }} }}",
+                update=True,
+            )
+
+    def count(self):
+        rows = self._request(
+            f"SELECT (COUNT(*) AS ?c) WHERE {{ GRAPH <{self.graph}> {{ ?s <{self.prefix}pk> ?pk }} }}"
+        )
+        if len(rows) != 1:
+            raise ValueError("SPARQL count did not return one scalar")
+        count = int(rows[0]["c"]["value"])
+        if count < 0:
+            raise ValueError("SPARQL count was negative")
+        return count
+
+    def _select_records(self, subject, suffix=""):
+        return self._request(
+            f"SELECT ?pk ?bucket ?payload WHERE {{ GRAPH <{self.graph}> {{ "
+            f"{subject} <{self.prefix}pk> ?pk; <{self.prefix}bucket> ?bucket; "
+            f"<{self.prefix}payload> ?payload . }} }} {suffix}"
+        )
+
+    @staticmethod
+    def _decode_record(row):
+        return (
+            int(row["pk"]["value"]),
+            int(row["bucket"]["value"]),
+            row["payload"]["value"],
+        )
+
+    def point_read(self, pk):
+        rows = self._select_records(f"<{self.prefix}row:{int(pk)}>")
+        if len(rows) > 1:
+            raise ValueError("SPARQL point read returned a multivalued record")
+        return self._decode_record(rows[0]) if rows else None
+
+    def scan(self, limit):
+        return [
+            self._decode_record(row)
+            for row in self._select_records("?s", f"LIMIT {int(limit)}")
+        ]
+
+    def close(self):
+        for connection in self._connections:
+            connection.close()
+
+
+ADAPTERS = {
+    "cql": CqlAdapter,
+    "pg": PgAdapter,
+    "bolt": BoltAdapter,
+    "sparql": SparqlAdapter,
+}
 
 
 # ─────────────────────────────── measurement ─────────────────────────────
@@ -408,7 +586,9 @@ def measure(adapter, args, stage, actual, insert_rate):
         elapsed = time.perf_counter() - began
         expected = (pk, pk % 64, payloads[pk % len(payloads)])
         if received is None or tuple(received) != expected:
-            raise ValueError(f"point read returned missing or incorrect values for pk={pk}")
+            raise ValueError(
+                f"point read returned missing or incorrect values for pk={pk}"
+            )
         latencies.append(elapsed)
     latencies.sort()
     entry["read_samples"] = len(latencies)
@@ -423,9 +603,16 @@ def measure(adapter, args, stage, actual, insert_rate):
     scanned = len(scanned_rows)
     keys = [item[0] for item in scanned_rows]
     if scanned != scan_limit or len(set(keys)) != scanned:
-        raise ValueError(f"scan incomplete or duplicated: {scanned} rows, expected {scan_limit}")
+        raise ValueError(
+            f"scan incomplete or duplicated: {scanned} rows, expected {scan_limit}"
+        )
     if any(not isinstance(key, int) or not 0 <= key < stage for key in keys):
         raise ValueError("scan returned keys outside the loaded range")
+    if any(
+        tuple(row) != (row[0], row[0] % 64, payloads[row[0] % len(payloads)])
+        for row in scanned_rows
+    ):
+        raise ValueError("scan returned incorrect bucket or payload values")
     entry["scan_rows"] = scanned
     entry["scan_time_s"] = scan_elapsed
     entry["scan_rows_per_s"] = (scanned / scan_elapsed) if scan_elapsed else 0.0
@@ -439,6 +626,11 @@ def main() -> int:
     p.add_argument("--port", type=int, required=True)
     p.add_argument("--keyspace", default="bench")
     p.add_argument("--database", default="postgres")
+    p.add_argument("--bolt-backend", choices=("ferrosa", "neo4j"))
+    p.add_argument("--sparql-backend", choices=("ferrosa", "oxigraph"))
+    p.add_argument("--cql-port", type=int, default=9042)
+    p.add_argument("--cql-user")
+    p.add_argument("--cql-password")
     p.add_argument(
         "--bolt-database",
         default=None,
@@ -452,7 +644,9 @@ def main() -> int:
     p.add_argument("--repeats", type=int, default=3)
     p.add_argument("--read-samples", type=int, default=100)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--read-only", action="store_true", help="reuse rows; never run DDL or load")
+    p.add_argument(
+        "--read-only", action="store_true", help="reuse rows; never run DDL or load"
+    )
     p.add_argument("--image-digest", default="unknown")
     p.add_argument("--revision", default="unknown")
     p.add_argument(
@@ -462,13 +656,24 @@ def main() -> int:
     )
     p.add_argument("--out", required=True)
     args = p.parse_args()
+    if args.engine == "bolt" and args.bolt_backend is None:
+        print("--bolt-backend is required for --engine bolt", file=sys.stderr)
+        return 2
+    if args.engine == "sparql" and args.sparql_backend is None:
+        print("--sparql-backend is required for --engine sparql", file=sys.stderr)
+        return 2
 
     stages = [int(s) for s in args.stages.split(",") if s.strip()]
     if not stages or stages != sorted(set(stages)) or min(stages) <= 0:
-        print("--stages must contain positive, strictly ascending counts", file=sys.stderr)
+        print(
+            "--stages must contain positive, strictly ascending counts", file=sys.stderr
+        )
         return 2
     if min(args.concurrency, args.repeats, args.read_samples) <= 0:
-        print("--concurrency, --repeats and --read-samples must be positive", file=sys.stderr)
+        print(
+            "--concurrency, --repeats and --read-samples must be positive",
+            file=sys.stderr,
+        )
         return 2
 
     payloads = make_payloads(512)
@@ -485,12 +690,24 @@ def main() -> int:
             current = max(current, already)
             insert_rate = None
             if current < stage:
-                print(f"[{args.engine}] loading to {stage:,} ({stage - current:,} new, "
-                      f"concurrency={args.concurrency})", file=sys.stderr, flush=True)
+                print(
+                    f"[{args.engine}] loading to {stage:,} ({stage - current:,} new, "
+                    f"concurrency={args.concurrency})",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 insert_rate = load(adapter, current, stage, args.concurrency, payloads)
-                print(f"[{args.engine}]   {insert_rate:,.0f} rows/s", file=sys.stderr, flush=True)
+                print(
+                    f"[{args.engine}]   {insert_rate:,.0f} rows/s",
+                    file=sys.stderr,
+                    flush=True,
+                )
             actual = adapter.count()
-            print(f"[{args.engine}] measuring at {actual:,} rows", file=sys.stderr, flush=True)
+            print(
+                f"[{args.engine}] measuring at {actual:,} rows",
+                file=sys.stderr,
+                flush=True,
+            )
             results.append(measure(adapter, args, stage, actual, insert_rate))
 
         payload = {
@@ -503,7 +720,14 @@ def main() -> int:
             "read_only": args.read_only,
             "image_digest": args.image_digest,
             "revision": args.revision,
-            "index_note": getattr(adapter, "index_note", "not observed in read-only probe"),
+            "bolt_backend": args.bolt_backend,
+            "sparql_backend": args.sparql_backend,
+            "index_configuration": getattr(adapter, "index_configuration", None),
+            "cql_protocol_version": getattr(adapter, "protocol_version", None),
+            "rdf_triples_per_row": 3 if args.engine == "sparql" else None,
+            "index_note": getattr(
+                adapter, "index_note", "not observed in read-only probe"
+            ),
             "stages": results,
             "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }

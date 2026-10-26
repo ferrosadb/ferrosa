@@ -1,11 +1,11 @@
-# PR #613: current performance
+# PR #613: measurement status
 
-Measured on 2026-10-26 using engine revision `a948ed1df48fd955bc144956b3d50546512665e2`.
-That is the engine code in PR #613: subsequent commits change documentation and
-the Jepsen harness dependency, with the engine build dependency graph unchanged.
-
-Ferrosa is at roughly 90% of PostgreSQL throughput in this workload. Bolt native
-primary-key reads perform well; regular-property lookups and counts remain gaps.
+The local candidate adds graph secondary-index routing, metadata-only vertex
+counts and exact integer comparisons. **Fresh comparison timings are pending.**
+The tables below are the last validated **baseline**, measured on 2026-10-26
+using engine `a948ed1df48fd955bc144956b3d50546512665e2`; they do not measure
+the new graph code. Cassandra and SPARQL have no accepted current-code comparison
+in this record yet.
 
 ## Compared with PostgreSQL
 
@@ -28,8 +28,7 @@ Lower p50 is better. Neo4j uses an ONLINE index on `pk` in both fixtures.
 The fast Bolt case declares `pk` as Ferrosa's native primary key. The slow case
 uses UUID `id` as the primary key and filters regular property `pk`; Ferrosa scans
 while Neo4j uses an ONLINE index. These are separate schema controls. Declaring a
-primary key changes uniqueness semantics. **Cypher secondary property-index support is
-not implemented in PR #613**, so native-key speed does not establish general
+primary key changes uniqueness semantics. **This baseline predates the new graph secondary-index reader**, so native-key speed does not establish general
 graph parity.
 
 ## Measurement scope
@@ -46,7 +45,7 @@ graph parity.
 
 ## Remaining work
 
-Regular-property index declaration/routing and count optimization remain work.
+The new indexed-reader/count candidate still needs matched-placement timing and profiles.
 A separate PostgreSQL loopback probe also retains a local lookup gap: 273 versus
 117 microseconds p50. Neither CPU samples nor RSS establish exact allocation
 volume or individual mutex wait time.

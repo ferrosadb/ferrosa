@@ -8,11 +8,13 @@ last_updated: 2026-10-15
 
 ## Current performance limits
 
-Regular-property equality scans when it does not bind the native primary key;
-secondary property-index declaration/routing is unimplemented. Native-key lookup
-is fast in the measured workload, and count execution remains a separate gap.
-[Current results and scope](../../deploy/fly-bench/pipeline/RESULTS.md) and the
-[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) contain the evidence.
+Eligible integer/UUID equality uses declared, current scalar secondary indexes;
+unsupported predicates and absent/stale indexes retain complete range scans.
+Cypher index DDL remains unsupported. Unfiltered physical-vertex counts use
+metadata; other aggregate inputs can still materialize expansion frontiers.
+[Measurement status and scope](../../deploy/fly-bench/pipeline/RESULTS.md) and the
+[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) identify measured
+revisions; fresh comparison timings for these changes are pending.
 The dated code-verification pass below retains its original scope.
 
 > **Code-verification note (2026-10-15).** Rows below were re-checked against

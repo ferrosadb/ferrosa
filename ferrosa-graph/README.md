@@ -31,10 +31,19 @@ resolved port.
 
 ## Current performance
 
-In the measured PR #613 workload, native-primary-key reads perform well against
-Neo4j; regular-property lookups scan and count execution remains slower.
-Secondary property-index support is not implemented. The native-key control
-changes schema and uniqueness semantics.
+Native-key lookup remains the first anchor path. Equality on a regular `int`,
+`bigint` or `uuid` property can use a CQL-declared BTree/Hash secondary index,
+including property maps and simple WHERE equality in either operand order. The
+reader requires both a declaration and completed backfill, preserves duplicate
+matches, and rechecks predicates. Other shapes retain the range reader. Cypher
+index DDL remains unsupported. Integer comparisons preserve their full precision.
+
+Unfiltered `count(n)` and `count(*)` over physical vertex tables use the existing
+metadata count API, without building vertex maps or decoding payloads. Property
+counts, DISTINCT, filters, grouping, traversal, virtual tables and static columns
+retain the general evaluator. Aggregation folds incrementally, but an inner
+expansion can still materialize its frontier. New timing comparisons are pending;
+the results page identifies the exact last measured revision.
 See [current comparator results and scope](../deploy/fly-bench/pipeline/RESULTS.md)
 and the [detailed experiment record](../deploy/fly-bench/pipeline/HISTORY.md).
 
@@ -398,6 +407,7 @@ label, is what would attribute it.
   the materializing `range_read` is deliberately unused here), `DdlPath` +
   `DdlOperation` for replicated adjacency DDL, `ConsistencyLevel`,
   `ReplicationStrategy`, `ClusterError`.
+- **`ferrosa-index`** — typed `IndexKey` and supported scalar `IndexType` declarations.
 - **`ferrosa-common`** — `DecoratedKey`, `PartitionKey`, `CellValue`, `Error`.
 - **`ferrosa-net`** — `tls::optional_server_config` / `crypto_provider` build
   the graph HTTP and Bolt TLS configs (production path). The integration test
