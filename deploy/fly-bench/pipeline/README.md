@@ -1,10 +1,10 @@
 # Pipeline performance experiments
 
-[Measurement status for PR #613](RESULTS.md): the candidate now routes eligible
-graph property equality through CQL-declared secondary indexes, counts physical
-vertices through metadata and compares integer keys exactly. Fresh timings for
-that code are pending; older tables are explicitly labelled as a baseline.
-Cypher index DDL remains unsupported.
+[Measurement status](RESULTS.md): PR #613 is merged; the Bolt follow-up makes
+scalar-index setup automatic on first access and memoized across connections.
+Fresh final-code timings are pending. Historical tables retain their exact
+runtime identity and are not measurements of this follow-up. Explicit Cypher
+index DDL remains unsupported.
 
 The current-results page contains comparator tables, the exact engine revision
 and workload limits. [Experiment details and earlier checkpoints](HISTORY.md)
@@ -27,11 +27,15 @@ python3 deploy/fly-bench/pipeline/workload.py --help
 
 `validated_multimetric_bench.py` supplies the common insert/count/point-read/scan
 workload for all four front ends. CQL pins native protocol v4 with compression
-off. Bolt requires `--bolt-backend ferrosa|neo4j`: both fixtures declare indexes
-on `pk`, `bucket` and `payload`; Neo4j must report all three RANGE indexes ONLINE
-with the correct label/property definitions. Ferrosa declares indexes through
-CQL and uses UUID `id` as its native key, so regular `pk` reads exercise 2i.
-Use `--cql-port`, `--cql-user` and `--cql-password` when that setup needs them.
+off. Bolt requires `--bolt-backend ferrosa|neo4j`. Neo4j must report RANGE indexes
+on `pk`, `bucket` and `payload` ONLINE with their correct label/property definitions.
+Ferrosa creates only the keyspace through CQL, then sends ordinary Bolt CREATE
+and deletes its owned sentinel. Table and scalar-index setup must be automatic;
+the fixture must not predeclare them. A generated UUID `id` remains the native
+key, so regular `pk` reads exercise secondary indexes. Use a fresh benchmark
+keyspace/database; existing rows are not erased. `--cql-port`, `--cql-user` and
+`--cql-password` control keyspace bootstrap. Scans project and validate all three
+fields, just like point reads.
 
 SPARQL requires `--sparql-backend ferrosa|oxigraph`. Each logical record is three
 triples in the isolated graph `urn:ferrosa:benchmark`; payloads, keys and buckets

@@ -521,7 +521,11 @@ build; the codec's own cost is its delta against `none`.
   refuses the walk (truncated `Done` → `TruncatedReplica`) instead of
   contributing zero rows, so a tenant-wide read through a partition-key index
   either unions every node's slice or fails (t_50c8bc7d); callers with a scan
-  alternative check `WritePath::declares_index_locally` first.
+  alternative check `WritePath::declares_index_locally` first. The merge initializes
+  every source before yielding its first row. Bolt's cold index setup uses a
+  bounded first-result probe to observe initially stale remote indexes; this is
+  not a guarantee about later topology/readiness changes. `WritePath::clone`
+  shares its Arc-backed destinations for lazy scalar-alias streams.
   The consume path is **bounded memory**: `stream_consumer::PartitionSink` +
   `consume_range_stream_into` MOVE each decoded partition into a sink one at a
   time (resident set `O(chunk)`), and `coordinate_range_read_stream_limited_rows`

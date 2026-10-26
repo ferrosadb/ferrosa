@@ -20,6 +20,10 @@ use crate::bolt::message::BoltMessage;
 use crate::engine::GraphEngine;
 use crate::error::GraphError;
 
+#[cfg(test)]
+#[path = "auto_index_tests.rs"]
+mod auto_index_tests;
+
 /// Configuration for the Bolt server.
 #[derive(Debug, Clone)]
 pub struct BoltConfig {
@@ -433,7 +437,7 @@ async fn process_message(
             let params = pack_params_to_json(params);
 
             match engine
-                .execute_stream_with_params(&query, &keyspace, &auth, &params)
+                .execute_bolt_stream_with_params(&query, &keyspace, &auth, &params)
                 .await
             {
                 Ok((columns, rows, stats)) => {

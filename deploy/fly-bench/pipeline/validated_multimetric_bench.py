@@ -340,20 +340,19 @@ class BoltAdapter:
                 f"CREATE KEYSPACE IF NOT EXISTS {quoted} "
                 "WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"
             )
-            session.execute(f"DROP TABLE IF EXISTS {quoted}.benchrow")
-            session.execute(
-                f"CREATE TABLE {quoted}.benchrow "
-                "(id uuid PRIMARY KEY, pk bigint, bucket bigint, payload text) "
-                "WITH extensions = {'graph.type': 'vertex', 'graph.label': 'BenchRow'}"
-            )
-            for prop in ("pk", "bucket", "payload"):
-                session.execute(
-                    f"CREATE INDEX bench_{prop} ON {quoted}.benchrow ({prop})"
-                )
+
         finally:
             cql.close()
+        # Exercise the product's ordinary first-write path. No table or index
+        # DDL belongs in this fixture: it would conceal a default-path regression.
+        with self.driver.session(database=self.database) as session:
+            session.run(
+                "CREATE (n:BenchRow {pk: -1, bucket: -1, "
+                "payload: '__ferrosa_benchmark_bootstrap__'}) RETURN 1"
+            ).consume()
+            session.run("MATCH (n:BenchRow {pk: -1}) DETACH DELETE n").consume()
         self.index_configuration = {
-            f"bench_{prop}": {"property": prop, "declaration": "CQL"}
+            prop: {"property": prop, "setup": "automatic Bolt first access"}
             for prop in ("pk", "bucket", "payload")
         }
 
@@ -400,7 +399,7 @@ class BoltAdapter:
 
     def scan(self, limit):
         with self.driver.session(database=self.database) as s:
-            return list(s.run(f"MATCH (n:BenchRow) RETURN n.pk AS pk LIMIT {limit}"))
+            return list(s.run(f"MATCH (n:BenchRow) RETURN n.pk AS pk, n.bucket AS bucket, n.payload AS payload LIMIT {limit}"))
 
     def close(self):
         self.driver.close()

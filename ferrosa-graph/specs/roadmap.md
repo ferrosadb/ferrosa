@@ -16,10 +16,11 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Now (highest value)
 
-- **Extend index eligibility and DDL.** Integer/UUID equality now consumes
-  CQL-declared BTree/Hash indexes and checks readiness before use. Extend this to
-  other scalar/predicate forms only with equivalent comparison semantics; add
-  Cypher index DDL separately.
+- **Scalar-index follow-ups.** Bolt first-access setup is automatic and memoized;
+  integer/UUID, text, boolean and bounded float equality consume current scalar
+  indexes. Extend range/predicate support and explicit Cypher index DDL while
+  preserving evaluator semantics. Broad epsilon matches retain a range fallback;
+  boolean noncanonical aliases remain bounded but may require 255 probes.
 - **Extend count pushdown.** Unfiltered physical-vertex `count(n)`/`count(*)` now
   count metadata. Filtered, grouped, DISTINCT and property counts keep the
   evaluator; preserve null, multiplicity and visibility semantics before adding

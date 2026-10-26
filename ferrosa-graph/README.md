@@ -31,12 +31,25 @@ resolved port.
 
 ## Current performance
 
-Native-key lookup remains the first anchor path. Equality on a regular `int`,
-`bigint` or `uuid` property can use a CQL-declared BTree/Hash secondary index,
-including property maps and simple WHERE equality in either operand order. The
-reader requires both a declaration and completed backfill, preserves duplicate
-matches, and rechecks predicates. Other shapes retain the range reader. Cypher
-index DDL remains unsupported. Integer comparisons preserve their full precision.
+Bolt initializes scalar property indexes on first access to each permission-checked
+backing table. Ordinary `CREATE` uses schema-on-write and needs no client-side
+`CREATE TABLE` or `CREATE INDEX`. The engine shares setup across connections;
+cache hits compare immutable schema-snapshot and write-path identity without
+scanning DDL or taking the setup mutex. New labels, added columns, dropped indexes
+and path swaps invalidate setup. Existing BTree/Hash declarations are reused;
+missing indexes use the same replicated DDL and storage backfill path as CQL.
+Setup waits for current local indexes and probes participating cluster sources,
+within a bounded timeout, before executing the statement's data writes. Later
+index reads still check readiness; topology changes can make a later read fail.
+
+Native keys remain the first anchor path. Integer, UUID, text and boolean equality
+and bounded exact floating-point probes use current scalar indexes, preserve
+duplicate matches and recheck predicates. Text hex fallbacks, noncanonical boolean
+bytes and floating-point epsilon aliases retain their existing equality semantics.
+Boolean `true` may probe all 255 nonzero byte encodings, lazily; broad epsilon
+comparisons near zero retain the range path. Other unsupported shapes also retain
+that path. Explicit Cypher index DDL remains unsupported. HTTP/embedded callers
+can use declared indexes; automatic first-access setup is the Bolt entry point.
 
 Unfiltered `count(n)` and `count(*)` over physical vertex tables use the existing
 metadata count API, without building vertex maps or decoding payloads. Property
@@ -121,8 +134,9 @@ use those same stored endpoint keys.
   accurate number than the buffered path reported). A failure that surfaces
   after the first chunk **aborts the body**; the client sees a `200` with a
   truncated chunked transfer, never a `4xx`/`5xx`, because the status line is
-  already on the wire. Bolt (`bolt/server.rs`) still buffers — it holds results
-  in the connection struct across protocol messages and emits stats before rows.
+  already on the wire. Bolt (`bolt/server.rs`) retains an owned row stream across
+  protocol messages; PULL/DISCARD consume bounded batches. Operators that still
+  materialize inside the executor keep that behavior.
 - **`RETURN DISTINCT` ordering** — `DISTINCT` **without** an `ORDER BY` returns
   rows in **first-seen (expansion) order**, not sorted order. This changed
   deliberately when DISTINCT became a streaming dedup; earlier releases returned

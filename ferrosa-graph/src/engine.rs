@@ -390,6 +390,16 @@ pub trait GraphSchemaCoordinator: Send + Sync {
         &self,
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> Result<()>;
+
+    /// Create a derived scalar index through the same replicated DDL path.
+    async fn apply_create_index(
+        &self,
+        _index: ferrosa_schema::metadata::index::IndexMetadata,
+    ) -> Result<()> {
+        Err(GraphError::Validation(
+            "graph schema coordinator does not support index DDL".into(),
+        ))
+    }
 }
 
 /// Local-only coordinator. Single-node / unit-test default — applies
@@ -408,6 +418,14 @@ impl LocalGraphSchemaCoordinator {
 
 #[async_trait]
 impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
+    async fn apply_create_index(
+        &self,
+        index: ferrosa_schema::metadata::index::IndexMetadata,
+    ) -> Result<()> {
+        self.schema
+            .create_index_internal(index)
+            .map_err(|error| GraphError::Validation(format!("create_index_internal: {error}")))
+    }
     async fn apply_create_keyspace(
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
@@ -446,6 +464,16 @@ impl ClusterGraphSchemaCoordinator {
 
 #[async_trait]
 impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
+    async fn apply_create_index(
+        &self,
+        index: ferrosa_schema::metadata::index::IndexMetadata,
+    ) -> Result<()> {
+        self.ddl_path
+            .load()
+            .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateIndex(index))
+            .await
+            .map_err(|error| GraphError::Validation(format!("cluster DDL CreateIndex: {error}")))
+    }
     async fn apply_create_keyspace(
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
@@ -743,6 +771,15 @@ async fn heal_adjacency(
     Ok(())
 }
 
+mod bolt_indexes;
+
+#[derive(Clone, Copy)]
+struct QueryRequest<'a> {
+    keyspace: &'a str,
+    auth: &'a AuthContext,
+    bolt_indexes: bool,
+}
+
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
     schema: Arc<Schema>,
@@ -775,6 +812,7 @@ pub struct GraphEngine {
     /// table fails its apply. Held only around the creation, never around a
     /// write.
     implicit_schema_gate: tokio::sync::Mutex<()>,
+    bolt_indexes: bolt_indexes::BoltIndexSetup,
     /// Cached at construction so the lazy adjacency-registration path
     /// (`ensure_adjacency_storage_for_keyspace`) can spawn the
     /// reconciliation loop with the configured cadence on first use of
@@ -874,6 +912,7 @@ impl GraphEngine {
             adjacency_heals: ArcSwap::from_pointee(HashMap::new()),
             schema_coordinator,
             implicit_schema_gate: tokio::sync::Mutex::new(()),
+            bolt_indexes: bolt_indexes::BoltIndexSetup::new(),
             reconciliation_interval,
         }
     }
@@ -1172,10 +1211,84 @@ impl GraphEngine {
         params: &HashMap<String, Value>,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
         let statement = bind_statement_params(parse(query)?, params)?;
-        if let Statement::Foreach { var, list, body } = statement {
-            let result = self
-                .execute_foreach(&var, &list, &body, keyspace, auth)
+        self.execute_bound_stream(
+            statement,
+            QueryRequest {
+                keyspace,
+                auth,
+                bolt_indexes: false,
+            },
+        )
+        .await
+    }
+
+    /// Bolt's default path: share first-access scalar-index setup across connections.
+    pub async fn execute_bolt_stream_with_params(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        let statement = bind_statement_params(parse(query)?, params)?;
+        self.execute_bound_stream(
+            statement,
+            QueryRequest {
+                keyspace,
+                auth,
+                bolt_indexes: true,
+            },
+        )
+        .await
+    }
+
+    async fn ensure_bolt_indexes(
+        &self,
+        logical: &crate::planner::logical::LogicalPlan,
+    ) -> Result<()> {
+        // Validation already checked permissions on these bindings. Do not touch
+        // unrelated tables just because they share a keyspace.
+        for table in logical
+            .bindings
+            .values()
+            .chain(logical.arm_bindings.iter().flat_map(|arm| arm.values()))
+        {
+            self.bolt_indexes
+                .ensure(
+                    &table.keyspace,
+                    &table.table,
+                    bolt_indexes::Context {
+                        schema: &self.schema,
+                        storage: &self.storage,
+                        path: self.write_path.load_full(),
+                        coordinator: &*self.schema_coordinator,
+                        timeout: self.config.query_timeout,
+                    },
+                )
                 .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_bolt_index_setup_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.bolt_indexes.gate.lock().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bolt_index_initializations_for_test(&self) -> usize {
+        self.bolt_indexes
+            .initializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn execute_bound_stream(
+        &self,
+        statement: Statement,
+        request: QueryRequest<'_>,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        if let Statement::Foreach { var, list, body } = statement {
+            let result = self.execute_foreach(&var, &list, &body, request).await?;
             return Ok(buffered_as_stream(result));
         }
         if let Statement::CallSubquery {
@@ -1186,7 +1299,7 @@ impl GraphEngine {
         } = statement
         {
             let result = self
-                .execute_call_subquery(*outer, &imports, *inner, return_clause, keyspace, auth)
+                .execute_call_subquery(*outer, &imports, *inner, return_clause, request)
                 .await?;
             return Ok(buffered_as_stream(result));
         }
@@ -1197,13 +1310,10 @@ impl GraphEngine {
             ..
         } = &statement
         {
-            let result = self
-                .execute_unwind_write(expr, var, inner, keyspace, auth)
-                .await?;
+            let result = self.execute_unwind_write(expr, var, inner, request).await?;
             return Ok(buffered_as_stream(result));
         }
-        self.execute_statement_streaming(statement, keyspace, auth)
-            .await
+        self.execute_statement_streaming(statement, request).await
     }
 
     /// Validate, plan, and execute a single non-orchestrated statement (i.e. not
@@ -1214,12 +1324,9 @@ impl GraphEngine {
     async fn execute_statement(
         &self,
         statement: Statement,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
-        let (columns, rows, stats) = self
-            .execute_statement_streaming(statement, keyspace, auth)
-            .await?;
+        let (columns, rows, stats) = self.execute_statement_streaming(statement, request).await?;
         collect_to_graph_result(columns, rows, stats, usize::MAX).await
     }
 
@@ -1349,9 +1456,13 @@ impl GraphEngine {
     async fn execute_statement_streaming(
         &self,
         statement: Statement,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        let QueryRequest {
+            keyspace,
+            auth,
+            bolt_indexes,
+        } = request;
         // Create any table this write implies BEFORE the adjacency setup: that setup
         // only brings up a keyspace's adjacency index once the keyspace has an edge
         // table, so a first edge write has to exist first or it derives adjacency
@@ -1371,6 +1482,9 @@ impl GraphEngine {
             }
             Err(e) => return Err(e),
         };
+        if bolt_indexes {
+            self.ensure_bolt_indexes(&logical).await?;
+        }
         let physical = plan(logical)?;
         execute_streaming_owned(physical, self.owned_exec_ctx(keyspace)).await
     }
@@ -1411,8 +1525,7 @@ impl GraphEngine {
         expr: &Expr,
         var: &str,
         inner: &Statement,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
         let list_value = eval_expr(expr, &HashMap::new())
             .map_err(|e| GraphError::Validation(format!("UNWIND list expression: {e}")))?;
@@ -1432,7 +1545,7 @@ impl GraphEngine {
         for element in &elements {
             let replacement = value_to_expr(element)?;
             let bound = subst_var_statement(inner.clone(), var, &replacement);
-            let result = self.execute_statement(bound, keyspace, auth).await?;
+            let result = self.execute_statement(bound, request).await?;
             stats.vertices_written += result.stats.vertices_written;
             stats.vertices_read += result.stats.vertices_read;
             stats.edges_read += result.stats.edges_read;
@@ -1471,12 +1584,12 @@ impl GraphEngine {
         var: &str,
         list: &Expr,
         body: &[Statement],
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
+        let keyspace = request.keyspace;
         // Phase 1 — recursively plan the entire FOREACH tree. Any validation/plan
         // failure (at any depth) aborts here, before a single write.
-        let planned = self.plan_foreach(var, list, body, keyspace, auth).await?;
+        let planned = self.plan_foreach(var, list, body, request).await?;
         let element_count = planned.element_count;
 
         // Phase 2 — execute the pre-planned clauses in source order.
@@ -1515,9 +1628,13 @@ impl GraphEngine {
         var: &str,
         list: &Expr,
         body: &[Statement],
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<PlannedForeach> {
+        let QueryRequest {
+            keyspace,
+            auth,
+            bolt_indexes,
+        } = request;
         let list_value = eval_expr(list, &HashMap::new())
             .map_err(|e| GraphError::Validation(format!("FOREACH list expression: {e}")))?;
         let elements = match list_value {
@@ -1546,8 +1663,7 @@ impl GraphEngine {
                             &inner_var,
                             &inner_list,
                             &inner_body,
-                            keyspace,
-                            auth,
+                            request,
                         ))
                         .await?;
                         plans.extend(nested.plans);
@@ -1559,6 +1675,9 @@ impl GraphEngine {
                         }
                         let snap = self.schema.snapshot();
                         let logical = validate(&snap, auth, keyspace, leaf)?;
+                        if bolt_indexes {
+                            self.ensure_bolt_indexes(&logical).await?;
+                        }
                         plans.push(plan(logical)?);
                     }
                 }
@@ -1598,14 +1717,13 @@ impl GraphEngine {
         imports: &[String],
         inner: Statement,
         return_clause: Option<ReturnClause>,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
         // 1. Run the outer query, projecting each imported variable as a column so
         //    we can bind it per row. The outer is the MATCH built by the parser with
         //    an empty RETURN; we replace it with `RETURN <imports...>`.
         let outer = project_imports(outer, imports)?;
-        let outer_result = self.execute_statement(outer, keyspace, auth).await?;
+        let outer_result = self.execute_statement(outer, request).await?;
         let import_cols = outer_result.columns.clone();
 
         let inner_returns = statement_is_returning(&inner);
@@ -1638,7 +1756,7 @@ impl GraphEngine {
             }
             let bound_inner = fold_constants_statement(bound_inner)?;
 
-            let inner_result = self.execute_statement(bound_inner, keyspace, auth).await?;
+            let inner_result = self.execute_statement(bound_inner, request).await?;
             stats.vertices_written += inner_result.stats.vertices_written;
             stats.vertices_deleted += inner_result.stats.vertices_deleted;
             stats.vertices_read += inner_result.stats.vertices_read;

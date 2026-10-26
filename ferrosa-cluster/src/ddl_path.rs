@@ -29,7 +29,7 @@ use crate::system_table_writer::SystemTableWriter;
 /// Build an index this node learned about from somewhere other than a CQL
 /// session — a replicated `CREATE INDEX`, by any of the three DDL paths.
 ///
-/// Only [`route_create_index`] in `ferrosa-cql` wires an index into storage,
+/// Only `ferrosa_cql::router::route_create_index` in `ferrosa-cql` wires an index into storage,
 /// and it runs on the one node whose session received the statement. Every
 /// other replica recorded the index in `Schema` and in `system_schema.indexes`
 /// and built nothing, while `DropIndex` three arms down has always called
@@ -42,7 +42,7 @@ use crate::system_table_writer::SystemTableWriter;
 /// not registered yet cannot take an index, and that is reported by
 /// `register_index_in_engine` returning `Ok(false)` after logging why. A real
 /// failure is returned, not swallowed.
-pub(crate) fn build_replicated_index(
+pub fn build_replicated_index(
     engine: &Arc<StorageEngine>,
     idx: &ferrosa_schema::metadata::index::IndexMetadata,
     partition_key: &[String],

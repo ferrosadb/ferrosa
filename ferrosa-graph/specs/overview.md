@@ -22,13 +22,23 @@ executive_summary: >
 
 ## Purpose & boundary
 
-Native-primary-key equality uses the keyed reader. Eligible integer/UUID equality
-uses a CQL-declared, current BTree/Hash secondary index; unsupported predicates or
-unready indexes use the range reader. All candidates retain predicate checks.
-Cypher index DDL remains unsupported. Simple unfiltered vertex counts use row
-metadata without materializing payloads; other aggregate shapes retain the
-general evaluator. See the [measurement status](../../deploy/fly-bench/pipeline/RESULTS.md)
-and [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md).
+Native-primary-key equality uses the keyed reader. Bolt's first access to an
+authorized table automatically declares missing scalar BTree indexes through
+`GraphSchemaCoordinator` and waits for backfill. `engine::bolt_indexes` memoizes
+setup per table, using weak immutable snapshot/path identity; ordinary connections
+reuse the same cache. Setup is performed before leaf writes, including buffered
+UNWIND/FOREACH/CALL execution. Snapshot replacement invalidates it even when the
+schema UUID stays unchanged. Cold cluster probes observe each current source
+before publishing setup; subsequent reads retain fail-closed readiness checks.
+
+The scalar reader seeks the complete finite set of encodings matching the
+existing evaluator: integer/UUID, text/hex, boolean and bounded floating-point
+aliases. Dense epsilon matches, unsupported predicates or unready indexes retain
+the range reader. Candidates retain all predicate checks. Explicit Cypher index
+DDL remains unsupported. Simple unfiltered vertex counts use row metadata without
+materializing payloads; other aggregate shapes retain the general evaluator.
+See the [measurement status](../../deploy/fly-bench/pipeline/RESULTS.md) and
+[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md).
 
 `ferrosa-graph` turns a ferrosa keyspace into a queryable property graph without
 a dedicated graph store. There is no separate graph storage engine: vertices and

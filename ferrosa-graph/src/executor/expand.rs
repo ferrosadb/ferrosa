@@ -19,7 +19,7 @@ use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
 use ferrosa_cluster::write_path::{PartitionResultStream, WritePath};
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
-use ferrosa_index::{IndexKey, IndexType};
+use ferrosa_index::IndexType;
 use ferrosa_schema::{Schema, VirtualTableRegistry};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::{Mutation, TableId};
@@ -2205,7 +2205,7 @@ async fn stream_anchor_partitions(
                 let Some(column) = meta.columns.get(property) else {
                     continue;
                 };
-                let Some(key) = exact_graph_index_key(value, &column.column_type) else {
+                let Some(probe) = super::scalar_index::probe(value, &column.column_type) else {
                     continue;
                 };
                 for index in snapshot.indexes.values() {
@@ -2220,9 +2220,23 @@ async fn stream_anchor_partitions(
                         // A current index miss is authoritative. The normal
                         // property/WHERE checks still recheck every candidate;
                         // errors or declaration races propagate to the caller.
-                        return Ok(write_path
-                            .index_read_stream(&anchor_table_id, &index.name, &key, None)
-                            .await?);
+                        let first = write_path
+                            .index_read_stream(&anchor_table_id, &index.name, &probe.key, None)
+                            .await?;
+                        if probe.aliases.is_empty() {
+                            return Ok(first);
+                        }
+                        let path = write_path.clone();
+                        let index_name = index.name.clone();
+                        return Ok(Box::pin(async_stream::try_stream! {
+                            let mut hits = first;
+                            while let Some(partition) = hits.next().await { yield partition?; }
+                            for key in probe.aliases {
+                                let mut hits = path.index_read_stream(
+                                    &anchor_table_id, &index_name, &key, None).await?;
+                                while let Some(partition) = hits.next().await { yield partition?; }
+                            }
+                        }));
                     }
                 }
             }
@@ -2253,26 +2267,6 @@ fn anchor_property_equality<'a>(
         }
         _ => None,
     }
-}
-
-/// Only seek when byte equality covers every match of the existing evaluator.
-/// Integer comparisons are exact; mixed floating-point predicates retain the
-/// scan. Other decoded scalar formats can also be
-/// non-injective (for example noncanonical boolean bytes and text fallbacks).
-fn exact_graph_index_key(value: &Expr, column_type: &str) -> Option<IndexKey> {
-    let exact = match value {
-        Expr::Literal(Literal::Integer(_)) => {
-            matches!(column_type, "int" | "bigint")
-        }
-        Expr::Literal(Literal::String(_)) => column_type == "uuid",
-        _ => false,
-    };
-    if !exact {
-        return None;
-    }
-    encode_expr_for_column_type(value, column_type)
-        .ok()
-        .map(IndexKey)
 }
 
 /// Project one expand state's bindings into a result row per the RETURN items.

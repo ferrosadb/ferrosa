@@ -3261,6 +3261,69 @@ mod tests {
         );
     }
 
+    /// A readiness probe must observe every replica's initial status before
+    /// accepting even its first local hit.
+    #[tokio::test]
+    async fn index_readiness_probe_reports_remote_staleness_before_first_local_hit() {
+        let mut merged = merge_index_streams_in_row_order(vec![
+            replica(vec![index_hit(b"a", b"1")]),
+            replica(vec![Err(ClusterError::Internal(
+                "secondary index is not current; backfill pending".into(),
+            ))]),
+        ]);
+
+        let error = merged
+            .next()
+            .await
+            .expect("remote staleness must produce an item")
+            .expect_err("the first item must report the stale remote, before any local hit");
+        assert!(error.to_string().contains("not current"));
+    }
+
+    /// A remote that has not answered cannot be treated as an empty source.
+    #[tokio::test]
+    async fn index_readiness_probe_waits_for_remote_status_before_first_local_hit() {
+        let (status_tx, status_rx) = tokio::sync::oneshot::channel::<()>();
+        let remote: ClusterPartitionStream = Box::pin(futures::stream::once(async move {
+            status_rx
+                .await
+                .expect("the test must release the remote status");
+            Err(ClusterError::Internal(
+                "secondary index is not current; backfill pending".into(),
+            ))
+        }));
+        let mut merged =
+            merge_index_streams_in_row_order(vec![replica(vec![index_hit(b"a", b"1")]), remote]);
+        let mut first = Box::pin(merged.next());
+
+        assert!(
+            matches!(futures::poll!(first.as_mut()), std::task::Poll::Pending),
+            "a ready local head must wait for the remote's initial status"
+        );
+        status_tx
+            .send(())
+            .expect("the remote must still be waiting");
+        let error = first
+            .await
+            .expect("remote staleness must produce an item")
+            .expect_err("the delayed remote failure must precede the local hit");
+        assert!(error.to_string().contains("not current"));
+    }
+
+    #[tokio::test]
+    async fn index_readiness_probe_accepts_all_current_empty_sources() {
+        let mut merged = merge_index_streams_in_row_order(vec![
+            replica(Vec::new()),
+            replica(Vec::new()),
+            replica(Vec::new()),
+        ]);
+
+        assert!(
+            merged.next().await.is_none(),
+            "an empty-key miss on every current source must complete cleanly"
+        );
+    }
+
     /// Tripwire: the coordinator's index read may hold one head per node and
     /// the previous row, nothing that grows with the result.
     #[test]

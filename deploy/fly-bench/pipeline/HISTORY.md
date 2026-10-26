@@ -411,3 +411,32 @@ attribution. Profiled throughput is excluded from the table.
 
 At that checkpoint, the read gap remained open. This change targets INSERT metadata; it
 does not establish bounded MVCC residency or eliminate query/protocol handoffs.
+
+
+## Bolt default-index follow-up after #613 (2026-10-26)
+
+PR #613 merged at `48083a244`. Its graph timing evidence used explicitly declared
+indexes; that does not prove an ordinary Bolt client gets the indexed path.
+The follow-up starts from `9c9dbde02` and removes that benchmark dependency.
+
+TDD first reproduced an ordinary Bolt CREATE creating no scalar indexes. The
+new path creates them on first access, shares setup across connections, and
+refreshes after immutable schema snapshot or write-path replacement. Schema UUIDs
+alone were insufficient: internal table/index mutations can replace the snapshot
+without changing its UUID. Weak snapshot identity avoids retaining old schema maps.
+
+Separate REDs found text, boolean and floating-point equality still decoding all
+64 fixture vertices even with declared indexes. The new scalar probe stream covers
+the evaluator's finite byte aliases and decodes only matching vertices. It retains
+a range fallback for dense epsilon comparisons rather than returning incomplete
+results. Guards also cover concurrent first access, permission-checked table
+scope, backfill, timeout, pre-write failure and retry, index drops, added columns
+and engine recreation. A bounded cluster probe initializes all sources before
+accepting the first result; later topology/readiness changes remain checked by
+ordinary reads.
+
+The public Ferrosa fixture now uses only keyspace CQL DDL plus an ordinary Bolt
+CREATE and targeted sentinel deletion. It cannot conceal default-path regressions
+with manual table/index declarations. Neo4j still requires all three property
+indexes ONLINE. Fresh comparison results must identify the final follow-up runtime;
+none of the earlier timing tables measure this automatic setup path.

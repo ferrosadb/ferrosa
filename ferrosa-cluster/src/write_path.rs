@@ -459,6 +459,7 @@ fn local_fulltext_key_stream(
 ///
 /// Uses enum dispatch instead of trait objects so that `ArcSwap` works
 /// (trait objects are `!Sized` and `ArcSwap` requires `Sized`).
+#[derive(Clone)]
 pub enum WritePath {
     /// Standalone mode: writes directly to StorageEngine.
     Direct(Arc<StorageEngine>),

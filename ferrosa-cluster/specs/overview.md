@@ -96,8 +96,11 @@ threshold, and an unmet threshold returns `ReadTimeout`. Exposed as
 **Global index stream.** `coordinate_index_read_stream` reuses the bounded Bulk
 stream framing for high-cardinality secondary-index lookups. Each replica
 visits postings incrementally and the coordinator forwards bounded partitions;
-the coordinator retains `O(result)` row identities for cross-replica
-deduplication without a full `Vec<Partition>` response.
+the coordinator retains one head per node and deduplicates adjacent row
+identities in row order. It initializes every source before yielding its first
+row, allowing a bounded cold readiness probe to observe an initially stale peer.
+`ddl_path::build_replicated_index` is also callable by graph first-access setup,
+so automatic scalar indexes share the replicated-DDL storage wiring.
 
 **Full-text scatter-gather.** `coordinate_fulltext_search` fans an `fts_match`
 index lookup out to every node — its hits span all token ranges (there is no
