@@ -1,5 +1,36 @@
 # Measured pipeline changes
 
+## Reverse placement on PostgreSQL's original VM — 2026-10-26
+
+The reverse control moves the **same Ferrosa binary** onto the native PostgreSQL
+VM. The original Ferrosa VM is stopped during measurements. From the same runner,
+kernel SYN/SYNACK RTT before database startup is **0.297 ms**
+to Ferrosa and **0.315 ms** to PostgreSQL.
+This tests the faster network path in the reverse direction.
+
+| Reverse-control operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL |
+| --- | ---: | ---: | ---: |
+| INSERT, fresh 5k, paired mean rows/s | **21,104** | **23,673** | **89.1%** |
+| Warm point reads, paired mean ops/s | **9,745** | **10,798** | **90.3%** |
+| INSERT observed range, rows/s | 19,849–22,359 | 22,439–24,907 | Two observations |
+| Read observed range, ops/s | 9,667–9,823 | 10,565–11,030 | Two observations |
+
+The earlier roughly 22k number was INSERT rows/s, separate from point reads/s.
+Primary order is PostgreSQL → Ferrosa → Ferrosa → PostgreSQL. Each leg creates a
+fresh 5k table, inserts 96-byte payloads and performs 20k validated reads with
+eight warmed workers. All 80k primary reads, row values, counts and key sets pass.
+Both engines share the existing performance-2CPU/4096MiB/lax comparator VM and
+its root filesystem; one receives timed benchmark queries at a time. Processes
+are reused. Native PostgreSQL has fsync, synchronous_commit and full_page_writes
+enabled. Ferrosa has a fresh isolated data directory and the original benchmark
+configuration with adjusted addresses. CPU profiles run after primary timing.
+
+This changes placement and storage fixture, including a fresh Ferrosa data
+directory; the original Ferrosa VM used an attached volume and older fixture
+state. It is not a new source-code speedup or a crash-recovery test. The same
+client and workload are preserved. Two observations per engine are descriptive.
+[Exact observations, checksums and controls](point-read-reverse-results.json).
+
 ## Network attribution and same-VM read control — 2026-10-26
 
 The earlier **3.08× client-observed read ratio is network-confounded**. From the

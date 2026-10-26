@@ -554,5 +554,6 @@
         }
       ]
     }
-  }
+  },
+  "reverse_placement_followup": "point-read-reverse-results.json"
 }

@@ -1,11 +1,13 @@
 # Pipeline performance experiments
 
-Same-VM warm point-read control: **3,142 Ferrosa versus 3,555 PostgreSQL 18.6
-reads/s (88.4%; PostgreSQL / Ferrosa 1.13×)**. The earlier 3.08×
-client-observed ratio used unequal network paths and cannot establish an engine-only gap.
-The earlier separate-VM INSERT measurement remains 22,049 versus 23,578 rows/s
-(93.5%); this read control makes no new INSERT claim.
-The timing breakdown, four-change history, limits and exact values are in
+Reverse placement on PostgreSQL's original VM, same client and binary:
+**21,104 Ferrosa versus 23,673 PostgreSQL INSERT rows/s (89.1%)**;
+**9,745 versus 10,798 warm point reads/s (90.3%)**.
+Both use the comparator root filesystem with a fresh Ferrosa data directory.
+The earlier 3.08× cross-product read ratio used unequal network paths; placing
+both on the original Ferrosa VM measured 3,142 versus 3,555 reads/s (88.4%).
+These placement controls are not source-code speedups.
+The timing breakdown, four-change history, limits and exact observations are in
 [RESULTS.md](RESULTS.md). There is no current matched Neo4j comparison.
 
 This instrument validates exact row values, counts and key sets before accepting
