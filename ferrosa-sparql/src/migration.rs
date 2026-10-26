@@ -18,7 +18,7 @@ use std::{
 
 const MARKER: &str = "rdf-v2-cutover.json";
 const IDENTITY: &str = "rdf-migration-incarnation.json";
-const MAX_DOCUMENT: u64 = 4096;
+const CUTOVER_DOCUMENT_BYTES: u64 = 4096;
 
 /// Deployment mode supplied by the offline operator.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,10 +74,10 @@ fn load<T: serde::de::DeserializeOwned>(dir: &Path, name: &str) -> Result<Option
         Err(e) => return Err(invalid(e)),
     };
     let mut bytes = Vec::new();
-    file.take(MAX_DOCUMENT + 1)
+    file.take(CUTOVER_DOCUMENT_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(invalid)?;
-    if bytes.len() as u64 > MAX_DOCUMENT {
+    if bytes.len() as u64 > CUTOVER_DOCUMENT_BYTES {
         return Err(invalid("oversized cutover document"));
     }
     serde_json::from_slice(&bytes).map(Some).map_err(invalid)
@@ -150,6 +150,31 @@ pub(crate) fn admit(storage: &StorageEngine, keyspace: &str) -> Result<bool, Spa
     }
     Ok(true)
 }
+// One term has at most three metadata cells; this allocation is per row,
+// independent of the number of fragments in the migration stream.
+fn migrated_row(
+    predicate: &str,
+    term: &crate::results::Binding,
+    timestamp: i64,
+) -> Result<Row, SparqlError> {
+    let cells = [
+        (COL_DATATYPE, term.datatype.as_deref()),
+        (COL_LANGUAGE, term.lang.as_deref()),
+        (COL_OBJECT_TYPE, Some(term.binding_type.as_str())),
+    ]
+    .into_iter()
+    .filter_map(|(id, value)| {
+        value.map(|v| (id, CellValue::live(v.as_bytes().to_vec(), timestamp)))
+    })
+    .collect();
+    Ok(Row {
+        clustering: encode_clustering(predicate, term)?,
+        cells,
+        deletion: DeletionTime::LIVE,
+        primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
+    })
+}
+
 impl OfflineMigration {
     /// Recover local storage. Exclude old binaries, writers, readers and lifecycle
     /// operations before opening, and keep them excluded across interrupted runs.
@@ -351,25 +376,10 @@ impl OfflineMigration {
                     ));
                 }
                 let timestamp = row.primary_key_liveness.timestamp;
-                let mut cells = vec![(
-                    COL_OBJECT_TYPE,
-                    CellValue::live(term.binding_type.as_bytes().to_vec(), timestamp),
-                )];
-                for (id, value) in [(COL_DATATYPE, &term.datatype), (COL_LANGUAGE, &term.lang)] {
-                    if let Some(value) = value {
-                        cells.push((id, CellValue::live(value.as_bytes().to_vec(), timestamp)));
-                    }
-                }
-                cells.sort_by_key(|(id, _)| *id);
                 self.storage.write(
                     &target,
                     &fragment.key,
-                    Row {
-                        clustering: encode_clustering(&predicate, &term)?,
-                        cells,
-                        deletion: DeletionTime::LIVE,
-                        primary_key_liveness: LivenessInfo::with_timestamp(timestamp),
-                    },
+                    migrated_row(&predicate, &term, timestamp)?,
                     timestamp,
                 )?;
                 count += 1;

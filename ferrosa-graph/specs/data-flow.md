@@ -159,3 +159,7 @@ Ownership spans every key/database in this engine. Independent-key writes
 serialize (roughly 1/H throughput ceiling for ownership duration H), so baseline
 results must disclose this cost. No CQL/cross-engine/schema-incarnation guarantee
 follows from this local gate; narrower validated update-read ownership is next.
+
+Explicit transaction reads snapshot shared pending-mutation handles, then merge
+the consumed key with committed storage. The write-set byte budget remains in
+force; reading one key does not copy every unrelated staged partition.

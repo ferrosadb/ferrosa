@@ -229,3 +229,8 @@ never recopy v1, preventing resurrection after v2 deletes. Source and target
 incarnations bind the marker; legacy data remains retained. Pair/Cluster/degraded
 migration and downgrade require separate rollout work; this API does not fence
 other nodes. See [the cutover contract](specs/rdf-term-identity-cutover.md).
+
+CLEAR/DROP validates a streaming preflight before a streaming delete pass. It
+does not retain a table-sized vector of triples. This preserves refusal before
+mutation for preflight validation/row-budget failures, without claiming atomicity
+against concurrent writers or later storage failures.

@@ -522,3 +522,7 @@ still needs the Accord read/write-set integration; BEGIN does not substitute
 local writes for coordinator guarantees, and a topology change aborts COMMIT.
 Local fsync errors have an uncertain durable outcome and must not be retried as
 though rollback were proven. No Neo4j causal bookmark guarantee is added.
+
+Transaction read overlays retain immutable mutation handles and materialize only
+the consumed partition, avoiding a copy of unrelated pending rows. COMMIT requires
+all transaction read streams to be drained before consuming staged mutations.
