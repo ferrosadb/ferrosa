@@ -1,14 +1,49 @@
 # Measured pipeline changes
 
-## Current matched results — 2026-10-26
+## Network attribution and same-VM read control — 2026-10-26
 
-Latest measured runtime: `a948ed1df48fd955bc144956b3d50546512665e2`. Fresh process, 5,000 seeded rows,
+The earlier **3.08× client-observed read ratio is network-confounded**. From the
+same runner, kernel SYN/SYNACK RTT before PostgreSQL startup was **2.058 ms** to
+the Ferrosa VM and **0.347 ms** to the native PostgreSQL VM. These are established
+connection benchmarks: handshakes are not repeated for each read. The handshake
+probe exposes unequal network paths that every request/response must traverse.
+
+Moving the exact PostgreSQL 18.6 binary onto the Ferrosa VM makes both targets use
+one destination IP. Kernel handshake RTT then measures **2.050 ms** for Ferrosa
+and **2.006 ms** for PostgreSQL; protocol-only Sync p50 is **2.149 ms** and
+**2.146 ms**, respectively. The delay follows the VM/network path. Its exact
+provider-side cause is not established.
+
+| Same-VM warm point reads | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL |
+| --- | ---: | ---: | ---: |
+| Remote client, eight workers, paired mean ops/s | **3,142** | **3,555** | **88.4%** |
+| Remote client, observed ops/s range | 3,045–3,239 | 3,498–3,612 | PostgreSQL / Ferrosa **1.13×** |
+| Loopback `SELECT 1`, one worker, p50 | 0.088 ms | 0.104 ms | Separate diagnostic |
+| Loopback full point read, one worker, p50 | **0.273 ms** | **0.117 ms** | Separate diagnostic |
+
+Primary order is Ferrosa → PostgreSQL → PostgreSQL → Ferrosa, with a fresh 5k
+table and 20k validated reads per leg, eight warmed workers and 96-byte payloads.
+Both services share one performance-2CPU/4096MiB/lax VM; one receives benchmark
+queries at a time. Processes are reused between legs. The native binary matches
+the prior comparator SHA256. Its data directory is ephemeral, so INSERT and
+maximum-capacity claims are excluded. Primary timings precede CPU profiling.
+Two samples per engine are descriptive, not a statistical significance result.
+
+This is a measurement correction, not a new engine speedup. A smaller point-read
+overhead remains. Loopback removes the external route but shares server CPUs
+with the client. Separate probe medians cannot be summed into request spans;
+the remaining queue, decode, MVCC and protocol costs need direct span timing.
+[Numeric evidence, checksums and limits](point-read-network-results.json).
+
+## Historical separate-VM four-change walk — 2026-10-26
+
+Runtime of the historical walk: `a948ed1df48fd955bc144956b3d50546512665e2`. Fresh process, 5,000 seeded rows,
 20,000 fixed seeded point reads, eight warmed workers, 96-byte payloads. Values,
 keys and counts are validated. Means below use two unprofiled observations per
 checkpoint, in forward 0→1→2→3→4 then reverse 4→3→2→1→0 order, bracketed by
 two native PostgreSQL 18.6 controls. Separate CPU profiles are diagnostic only.
 
-| Current operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL | PostgreSQL / Ferrosa |
+| Historical separate-VM operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL | PostgreSQL / Ferrosa |
 | --- | ---: | ---: | ---: | ---: |
 | INSERT, fresh 5k, rows/s | **22,049** | 23,578 | **93.5%** | 1.07× |
 | Point reads, fresh 5k, ops/s | **3,313** | 10,212 | **32.4%** | **3.08×** |

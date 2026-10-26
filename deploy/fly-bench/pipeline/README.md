@@ -1,10 +1,12 @@
 # Pipeline performance experiments
 
-Current matched fresh-5k comparison: **22,049 versus PostgreSQL 18.6's
-23,578 INSERT rows/s (93.5%)**; **3,313 versus
-10,212 point reads/s (32.4%, a 3.08× remaining gap)**.
-The ordered four-change read walk, ranges, runtime identities and older workloads
-are in [RESULTS.md](RESULTS.md). There is no current matched Neo4j comparison.
+Same-VM warm point-read control: **3,142 Ferrosa versus 3,555 PostgreSQL 18.6
+reads/s (88.4%; PostgreSQL / Ferrosa 1.13×)**. The earlier 3.08×
+client-observed ratio used unequal network paths and cannot establish an engine-only gap.
+The earlier separate-VM INSERT measurement remains 22,049 versus 23,578 rows/s
+(93.5%); this read control makes no new INSERT claim.
+The timing breakdown, four-change history, limits and exact values are in
+[RESULTS.md](RESULTS.md). There is no current matched Neo4j comparison.
 
 This instrument validates exact row values, counts and key sets before accepting
 timings. It measures PostgreSQL inserts and point reads, and Bolt point updates

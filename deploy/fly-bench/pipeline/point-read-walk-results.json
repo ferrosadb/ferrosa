@@ -328,5 +328,10 @@
       "cargo_deny_all_categories": "passed"
     },
     "measured_engine_revision_remains": "a948ed1df48fd955bc144956b3d50546512665e2"
+  },
+  "transport_followup": {
+    "status": "cross-product ratio is network-confounded",
+    "evidence": "point-read-network-results.json",
+    "note": "Preserve observed historical values; no engine-only 3.08x gap claim."
   }
 }
