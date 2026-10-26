@@ -140,6 +140,13 @@ newest `semver-v<version>` tag (a merge contributes its PR title), and prints
 
 `semver-v*` tags never trigger `release.yml`, which only builds `v*` tags.
 
+The release bot refreshes and commits the root, JSONB conformance, and SSTable
+fuzz lockfiles after changing the workspace version. Each records versions of
+workspace crates. When adding another independent Cargo workspace with path
+dependencies on those crates, add its lockfile to `.semver-bump.toml`'s
+`post_apply` and `also_commit`, and fetch it in `semver.yml` before the offline
+refresh. Security CI checks every tracked lockfile with `--locked`.
+
 #### One-time setup
 
 The release job fails with an `::error::` until all of these exist:
