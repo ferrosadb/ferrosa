@@ -26,6 +26,9 @@ default_install_hook_types:
 # time against the commit message.
 default_stages: [pre-commit, pre-push, manual]
 
+# Dependency failures must stop before the expensive workspace checks below.
+fail_fast: true
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -88,6 +91,14 @@ repos:
       # Tests run via cargo-nextest when installed (parallel by
       # binary AND by test). Falls back to `cargo test` otherwise —
       # install via `cargo install cargo-nextest --locked`.
+      - id: cargo-deny-prepush
+        name: cargo deny (fresh index, all lockfiles, same gate as Security CI)
+        stages: [pre-push]
+        entry: python3 scripts/check-dependencies.py
+        language: system
+        always_run: true
+        pass_filenames: false
+
       - id: cargo-test-workspace
         name: cargo test/nextest --workspace (pre-push, mirrors CI)
         stages: [pre-push]

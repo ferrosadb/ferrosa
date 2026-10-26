@@ -88,9 +88,14 @@ contract lives at `src/wit/ferrosa-udf.wit` (worlds `udf` and `uda`).
 - **`ferrosa-common`** — `CqlValue`, `CqlType` (the type model it converts to/from
   the WIT ABI).
 
-External: `wasmtime` (component-model), `slotmap`, `num-bigint`, `uuid`, `bumpalo`,
+External: `wasmtime` (component-model; Wasmtime 48 default features except its
+unused on-disk compilation cache), `slotmap`, `num-bigint`, `uuid`, `bumpalo`,
 `thiserror`, `tracing`. Under `asc-udf`: `rquickjs`, `tokio`, `wit-component`,
 `wit-parser`.
+
+The explicit Wasmtime feature list excludes the cache's vulnerable `zstd` 0.13
+dependency. `UdfExecutor` continues to cache components and instances in its
+own in-memory registry and pool.
 
 **Called by** (crates that depend on this):
 

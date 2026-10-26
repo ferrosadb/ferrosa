@@ -285,7 +285,8 @@ External: `crc32fast`, `crossbeam-channel` (the `depth >= 1` write pump's
 `full`/`free`/error channels and stall-watchdog `select!`, T-033 — D7), `libc`
 (O_DIRECT/`F_NOCACHE`/`posix_fadvise`/`pwritev` for `direct::DirectWriter` and
 `pump::FileSink`), `lru`, `lz4_flex`, `memmap2`, `rayon`, `tracing` (loud
-fallback logging), `zstd`. **No async runtime** — positional I/O is
+fallback logging), `zstd` (>= 0.14.3, resets reused stream contexts so an
+abandoned compression cannot leak into the next chunk). **No async runtime** — positional I/O is
 synchronous; S3 wrappers live in `ferrosa-storage`.
 
 **Called by** (crates that depend on this):

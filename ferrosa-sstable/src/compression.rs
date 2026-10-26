@@ -540,6 +540,36 @@ pub(crate) fn write_compression_info_header(
 mod tests {
     use super::*;
 
+    #[test]
+    fn zstd_compress_into_discards_abandoned_stream() {
+        let level = 3;
+        ZSTD_CCTX.with(|cell| {
+            let mut context = zstd::zstd_safe::CCtx::create();
+            context
+                .set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level))
+                .unwrap();
+            {
+                let mut encoder = zstd::stream::raw::Encoder::with_context(&mut context);
+                let mut input = InBuffer::around(b"previous request's private data");
+                let mut buffer = [0; 1024];
+                let mut output = OutBuffer::around(&mut buffer[..]);
+                encoder.run(&mut input, &mut output).unwrap();
+                assert_eq!(input.pos, input.src.len());
+                // Drop without finish, as on an interrupted compression operation.
+            }
+            *cell.borrow_mut() = Some((level, context));
+        });
+
+        let compression = Compression::Zstd { level };
+        let data = b"next request";
+        let mut compressed = vec![0; compression.compress_bound(data.len())];
+        let written = compression.compress_into(data, &mut compressed).unwrap();
+        let decoded = compression
+            .decompress(&compressed[..written], data.len())
+            .unwrap();
+        assert_eq!(decoded, data);
+    }
+
     // --- Compression round-trip ---
 
     #[test]

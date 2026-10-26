@@ -54,6 +54,25 @@ that's by design. The codebase does not silently skip tests.
 CI runs all of the above on every pull request. If you can run them locally first,
 you'll save a CI round-trip.
 
+### Dependency checks before pushing
+
+Run `python3 scripts/check-dependencies.py` before the build and test gates.
+Install the same tool version CI uses with:
+
+```bash
+cargo install cargo-deny --version "$(python3 scripts/check-dependencies.py --tool-version)" --locked
+pre-commit install --hook-type pre-push
+python3 scripts/check-dependencies.py
+```
+
+The pre-push hook and Security workflow call this same script. It discovers
+every tracked `Cargo.lock`, refreshes the advisory database and registry index,
+and checks advisories, bans, licenses, and sources with all features and the
+root `deny.toml`. `--locked` prevents the scan from silently fixing the lockfile
+instead of checking the versions being pushed. Network or scan failures stop
+the hook before expensive workspace tests. Refreshing the index also catches
+newly yanked releases that a warm local cache might otherwise miss.
+
 ## Development Workflow
 
 ### Branching
