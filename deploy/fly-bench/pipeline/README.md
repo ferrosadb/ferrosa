@@ -1,26 +1,13 @@
 # Pipeline performance experiments
 
-Reverse placement on PostgreSQL's original VM, same client and binary:
-**21,104 Ferrosa versus 23,673 PostgreSQL INSERT rows/s (89.1%)**;
-**9,745 versus 10,798 warm point reads/s (90.3%)**.
-This supports rough end-to-end throughput parity for this warm 5k-row,
-eight-worker benchmark, with two observations per engine. Larger datasets,
-cold reads and sustained or multi-node workloads need separate measurements.
-The separate loopback point-read probe still measures 273 versus 117 microseconds
-p50; local lookup overhead remains under investigation.
-Both use the comparator root filesystem with a fresh Ferrosa data directory.
-The earlier 3.08× cross-product read ratio used unequal network paths; placing
-both on the original Ferrosa VM measured 3,142 versus 3,555 reads/s (88.4%).
-These placement controls are not source-code speedups.
-The timing breakdown, four-change history, limits and exact observations are in
-[RESULTS.md](RESULTS.md).
+[Current performance of PR #613](RESULTS.md): roughly **90% of PostgreSQL
+throughput** in the measured workload. Bolt native-key reads are fast;
+regular-property lookups and counts remain gaps. **Cypher secondary property-index
+support is not implemented in #613.**
 
-Matched-placement Neo4j node-query controls show the schema distinction:
-Ferrosa's native-primary-key point read is **0.761 versus 1.866 ms p50**;
-a regular-property lookup over its UUID-primary table is **91.63 versus 2.50 ms**.
-The latter scans while Neo4j uses a range index. Declaring a primary key changes
-schema and uniqueness semantics; arbitrary-property indexing and count execution
-remain gaps. These measurements do not establish general graph parity.
+The current-results page contains comparator tables, the exact engine revision
+and workload limits. [Experiment details and earlier checkpoints](HISTORY.md)
+retain the measurement journey. The instructions below describe the harness.
 
 This instrument validates exact row values, counts and key sets before accepting
 timings. It measures PostgreSQL inserts and point reads, and Bolt point updates

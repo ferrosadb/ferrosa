@@ -202,25 +202,17 @@ and replication strategy; failures propagate without a local fallback. Joins,
 compound/clustering keys, floating/decimal keys and other unproved key families
 retain scans. Floating signed zero cannot use byte-key equality because SQL
 equates both signs. Selective-decode, recording-reader and snapshot tests cover
-this path. Current runtime `a948ed1df` measures 21,104 versus PostgreSQL 18.6's
-23,673 INSERT rows/s (89.1%) and 9,745 versus 10,798 point reads/s (90.3%) in the
-reverse-placement control. Both engines share PostgreSQL's original benchmark
-VM and root filesystem, with fresh Ferrosa data. These are two-run unprofiled
-means for a warm 5k-row, eight-worker workload with full value validation.
-This supports rough end-to-end throughput parity within that scope. Earlier
-separate-VM ratios were network-confounded; controls in both directions and
-storage/fixture differences are documented in the report. Local loopback point
-reads still measure 273 versus 117 microseconds p50, leaving lookup overhead to
-investigate. Larger, cold, sustained and multi-node workloads need separate
-measurements. Historical measurements and the completed four-change walk remain
-in [current results, ranges and scope](../../deploy/fly-bench/pipeline/RESULTS.md).
+this path. [Current PR #613 results](../../deploy/fly-bench/pipeline/RESULTS.md)
+measure roughly 90% of PostgreSQL throughput in the small warm workload and
+retain the local lookup gap. The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md)
+contains earlier revisions, staged measurements and placement controls.
 
 Decoded storage rows consume their owned text/blob/numeric/JSON payloads during SQL conversion; identity/capacity and value/error parity tests prevent a clone from reappearing there. Physical decoding before MVCC row replacement and per-query execution/response overhead remain separate measured follow-ups.
 
 Cursor opening and first fetch now share a blocking job with separate early metadata publication; opening cancellation owns the existing stream drop guard before awaiting columns. Explicit gated regressions preserve liveness and prevent first-fetch queue interposition.
 
 
-### Point-read walk, step 3 (2026-10-25)
+### Response buffering and encoding
 
 The connection reuses one response buffer, flushing at Sync, simple-query completion,
 explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
@@ -229,11 +221,10 @@ encode directly into that buffer; specialized codecs retain their checked fallba
 A failed row rolls back its partial bytes while preserving earlier rows. Collecting
 ReplySink callers keep the existing message interface. Ownership/allocation tests,
 wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
-change. The completed staged Fly walk, paired controls and observed ranges are
-reported in [the benchmark results](../../deploy/fly-bench/pipeline/RESULTS.md).
+change. Current measurements and limits are in [the benchmark results](../../deploy/fly-bench/pipeline/RESULTS.md).
 
 
-### Point-read walk, step 4 (2026-10-25)
+### Row validation and MVCC replacement
 
 Storage reads retain their configured consistency path and complete shared CQL
 decoding. A borrowed validation pass preserves SQL representability errors before
@@ -242,5 +233,4 @@ materialized when no MVCC or staged image replaces it. This removes throwaway SQ
 row materialization, while physical CQL decoding and the owned MVCC image copy
 remain. Tests pin zero-allocation payload validation, conversion-error parity, and
 a corrupt physical payload failing even when MVCC holds a valid replacement.
-The completed staged Fly walk reports observed throughput and ranges separately
-from the later placement controls; see [the benchmark results](../../deploy/fly-bench/pipeline/RESULTS.md).
+The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.

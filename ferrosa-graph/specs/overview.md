@@ -22,15 +22,11 @@ executive_summary: >
 
 ## Purpose & boundary
 
-Measured node-query controls (2026-10-26, runtime `a948ed1df`) distinguish native
-key lookup from regular-property lookup. At matched placement and 20k nodes,
-`pk bigint PRIMARY KEY` yields 0.761 versus Neo4j 5.26.32's 1.866 ms point p50;
-regular `pk` under UUID-primary `id` yields 91.63 versus 2.50 ms. The graph anchor
-reader uses a direct key read only when all native key components are bound;
-otherwise it scans. Native key declarations change schema/uniqueness semantics.
-Both tested Cypher index DDL syntaxes fail, and secondary-property index routing
-remains a gap. These are two-run node-query measurements, not a traversal or
-graph-write comparison. [Exact evidence and scope](../../deploy/fly-bench/pipeline/RESULTS.md).
+Native-primary-key equality uses the keyed reader; other anchor properties use
+a range scan. Secondary property-index declaration/routing remains unimplemented
+in PR #613. The [current comparison](../../deploy/fly-bench/pipeline/RESULTS.md)
+separates those schemas and records the remaining count gap. See the
+[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) for plans and controls.
 
 `ferrosa-graph` turns a ferrosa keyspace into a queryable property graph without
 a dedicated graph store. There is no separate graph storage engine: vertices and
