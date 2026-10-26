@@ -845,7 +845,7 @@ impl IndexCatalog {
     }
 
     /// This catalog with every column ordinal remapped from `old_schema`'s
-    /// regular-column layout onto `new_schema`'s.
+    /// flat static-plus-regular column layout onto `new_schema`'s.
     ///
     /// Regular columns are ordered by Cassandra's column-name comparator, so
     /// `ALTER TABLE ADD` of a column that sorts before an indexed column
@@ -858,7 +858,10 @@ impl IndexCatalog {
     fn remapped_onto(&self, old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
         let mut catalog = self.clone();
         let remap = |index_name: &str, pos: &mut usize| {
-            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
+            let Some(old_col) = u16::try_from(*pos)
+                .ok()
+                .and_then(|ordinal| old_schema.column_at_ordinal(ordinal))
+            else {
                 tracing::error!(
                     index = index_name,
                     position = *pos,
@@ -867,11 +870,7 @@ impl IndexCatalog {
                 );
                 return;
             };
-            match new_schema
-                .regular_columns
-                .iter()
-                .position(|c| c.name == old_col.name)
-            {
+            match new_schema.column_index(&old_col.name).map(usize::from) {
                 Some(new_pos) => {
                     if new_pos != *pos {
                         tracing::info!(
@@ -981,6 +980,37 @@ impl IndexCatalog {
             self.index_type_for(index_name),
             self.index_filter_predicates.get(index_name),
         ))
+    }
+
+    /// Interpret target index definitions against a frozen row layout.
+    /// A column absent from that layout has no cells: its sentinel ordinal
+    /// cannot equal any u16 cell tag, so extraction produces no postings.
+    /// This catalog is local to sidecar building, never published to writers.
+    fn for_source_schema(&self, target: &TableSchema, source: &TableSchema) -> Self {
+        let mut catalog = self.clone();
+        let remap = |position: &mut usize| {
+            *position = u16::try_from(*position)
+                .ok()
+                .and_then(|ordinal| target.column_at_ordinal(ordinal))
+                .and_then(|column| source.column_index(&column.name))
+                .map(usize::from)
+                .unwrap_or(usize::MAX);
+        };
+        for (_, position) in &mut catalog.indexed_columns {
+            remap(position);
+        }
+        for (_, position) in &mut catalog.fulltext_indexes {
+            remap(position);
+        }
+        for config in &mut catalog.vector_index_configs {
+            remap(&mut config.column_position);
+        }
+        for predicate in catalog.index_filter_predicates.values_mut() {
+            for clause in &mut predicate.clauses {
+                remap(&mut clause.column_position);
+            }
+        }
+        catalog
     }
 
     /// Whether this catalog declares an index named `index_name`, of any kind.
@@ -5447,7 +5477,7 @@ impl<F: FlushTarget> TableStore<F> {
         // reloads the view.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let phase_start = Instant::now();
-        let target_catalog = {
+        let (target_catalog, target_schema) = {
             let old_view = self.view.load_full();
             let flush_schema = Arc::clone(&old_view.indexes.schema);
             let flush_catalog = Arc::clone(&old_view.indexes.catalog);
@@ -5458,7 +5488,8 @@ impl<F: FlushTarget> TableStore<F> {
             if !Arc::ptr_eq(&target_schema, &flush_schema) {
                 self.schema.store(Arc::clone(&target_schema));
             }
-            let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
+            let fresh_indexes =
+                new_indexes(Arc::clone(&target_catalog), Arc::clone(&target_schema));
             let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
             let frozen_active = Arc::clone(&old_view.active);
             let old_indexes = Arc::clone(&old_view.indexes);
@@ -5506,7 +5537,7 @@ impl<F: FlushTarget> TableStore<F> {
             // Writers that load the view from here on write to the new
             // memtable; seal the old one and wait out the writes inside it.
             old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
-            target_catalog
+            (target_catalog, target_schema)
         };
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SwapMemtable,
@@ -5531,7 +5562,8 @@ impl<F: FlushTarget> TableStore<F> {
         }
         let mut outcome = FlushOutcome::NothingToFlush;
         for memtable in &sealed {
-            if self.flush_sealed(memtable, &target_catalog, total_start)? == FlushOutcome::Published
+            if self.flush_sealed(memtable, &target_catalog, &target_schema, total_start)?
+                == FlushOutcome::Published
             {
                 outcome = FlushOutcome::Published;
             }
@@ -5546,6 +5578,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         sealed: &Arc<SealedMemtable>,
         target_catalog: &Arc<IndexCatalog>,
+        target_schema: &Arc<TableSchema>,
         total_start: Instant,
     ) -> Result<FlushOutcome> {
         let old_active = Arc::clone(&sealed.memtable);
@@ -5665,12 +5698,17 @@ impl<F: FlushTarget> TableStore<F> {
             );
         }
 
-        // Step 5a': the memtable speaks flat ordinals (statics first, static
-        // cells inside clustered rows); an SSTable numbers statics and regulars
-        // separately and holds statics in the static row. Convert here, in
-        // place, before any header is built (t_65661473).
-        for p in partitions.iter_mut() {
-            crate::ordinal_space::flat_into_sstable_space(p, schema.static_columns.len())?;
+        // Sidecars consume memtable FLAT cell ordinals. Indexed flushes
+        // convert in place only after extraction; early unindexed branches
+        // already need SSTable ordinal space for their writers.
+        let indexed_flush = flush_catalog.declares_any() || target_catalog.declares_any();
+        if !indexed_flush {
+            for partition in &mut partitions {
+                crate::ordinal_space::flat_into_sstable_space(
+                    partition,
+                    schema.static_columns.len(),
+                )?;
+            }
         }
 
         if partitions.is_empty() {
@@ -5712,7 +5750,7 @@ impl<F: FlushTarget> TableStore<F> {
                 )));
             }
             Some(Ok(config)) => {
-                if flush_catalog.declares_any() || target_catalog.declares_any() {
+                if indexed_flush {
                     return Err(ferrosa_common::Error::InvalidData(format!(
                         "{}.{} sets {} so a flush writes one generation per window, but the \
                          table declares a secondary, vector or full-text index: a memtable's \
@@ -5745,7 +5783,7 @@ impl<F: FlushTarget> TableStore<F> {
         // fulltext/vector steps stay exactly as-is.
         // Sidecars are written for the target catalog (see Step 5b), so a
         // flush whose rotation added an index must take the indexed path.
-        let can_shard = !flush_catalog.declares_any() && !target_catalog.declares_any();
+        let can_shard = !indexed_flush;
         let num_shards = flush::desired_flush_shards(
             partitions.len(),
             can_shard,
@@ -5774,7 +5812,16 @@ impl<F: FlushTarget> TableStore<F> {
         // memtable to get here: an index it dropped gets no sidecar, and an
         // index it added is posted now from the frozen rows, which no write
         // can reach any more.
-        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
+        // Catalog edits use the target layout; frozen rows keep their original
+        // ordinals. Normalize definitions once, without remapping/copying rows.
+        // Ordinary flushes borrow the catalog and allocate nothing here.
+        let source_catalog = if Arc::ptr_eq(&flush_schema, target_schema) {
+            std::borrow::Cow::Borrowed(target_catalog.as_ref())
+        } else {
+            std::borrow::Cow::Owned(target_catalog.for_source_schema(target_schema, &flush_schema))
+        };
+        let sidecar_indexes =
+            self.flush_sidecar_indexes(&old_indexes, &source_catalog, &partitions);
         // Serve exactly these postings for the flushing memtable until the
         // sidecar is installed: an index the rotating DDL added now reads the
         // frozen rows too, and one it dropped no longer answers from them.
@@ -5784,7 +5831,7 @@ impl<F: FlushTarget> TableStore<F> {
         // its own index, or one built from the rows for an index the rotating
         // DDL added. The same map feeds the vector sidecars below.
         let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
-            target_catalog
+            source_catalog
                 .vector_index_configs
                 .iter()
                 .map(|cfg| {
@@ -5803,12 +5850,7 @@ impl<F: FlushTarget> TableStore<F> {
         // when it declares the index). Built before encoding, from the rows as
         // the memtable holds them; written once the generation is known.
         let mut fti_sidecars: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
-        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
-            let col_pos = flush_catalog
-                .fulltext_indexes
-                .iter()
-                .find(|(name, _)| name == index_name)
-                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
+        for (index_name, col_pos) in &source_catalog.fulltext_indexes {
             let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
             for partition in &partitions {
                 let pk_bytes = partition.key.key.as_bytes();
@@ -5841,6 +5883,15 @@ impl<F: FlushTarget> TableStore<F> {
                 index_name.clone(),
                 fti_builder.finish().map_err(|e| e.to_string()),
             ));
+        }
+
+        if indexed_flush {
+            for partition in &mut partitions {
+                crate::ordinal_space::flat_into_sstable_space(
+                    partition,
+                    schema.static_columns.len(),
+                )?;
+            }
         }
 
         let header = flush::header_for_flush(&schema, &partitions);
@@ -19793,6 +19844,147 @@ mod tests {
         assert!(
             missing.is_empty(),
             "partitions dropped by the pauses: {missing:?}"
+        );
+    }
+    #[test]
+    fn a_schema_and_index_rotation_keeps_old_postings_and_does_not_invent_new_cells() {
+        let old_schema = two_column_schema("pk", "zulu");
+        let store = TableStore::new_with_indexes(
+            old_schema.clone(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..Default::default()
+            },
+            vec![("pk_idx".into(), 0)],
+        );
+        store
+            .write(
+                &make_key("old"),
+                make_two_column_row(b"match", b"kept", 1000),
+            )
+            .unwrap();
+        let mut new_schema = old_schema;
+        new_schema.regular_columns.insert(
+            0,
+            ColumnDefinition {
+                name: "alpha".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            },
+        );
+        let _rotation: FlushOutcome = store
+            .flush_rotating(
+                |catalog, schema| {
+                    let mut target = catalog.remapped_onto(schema, &new_schema);
+                    target.indexed_columns.push(("alpha_idx".into(), 0));
+                    target
+                        .index_types
+                        .insert("alpha_idx".into(), IndexType::BTree);
+                    (Arc::new(target), Arc::new(new_schema))
+                },
+                || {},
+            )
+            .unwrap();
+        let key = IndexKey(b"match".to_vec());
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &key).unwrap().len(),
+            1,
+            "an ordinal shift must reuse semantically unchanged postings"
+        );
+        assert!(
+            collect_index_results(&store, "alpha_idx", &key)
+                .unwrap()
+                .is_empty(),
+            "a column absent from frozen rows must not inherit another column's values"
+        );
+    }
+    #[test]
+    fn schema_and_index_rotation_with_static_columns_keeps_flat_ordinals() {
+        let mut old_schema = two_column_schema("pk", "zulu");
+        old_schema.static_columns.push(ColumnDefinition {
+            name: "s".into(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        });
+        let store = TableStore::new_with_indexes(
+            old_schema.clone(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..Default::default()
+            },
+            vec![("pk_idx".into(), 1)],
+        );
+        let mut row = make_two_column_row(b"match", b"kept", 1000);
+        for (position, _) in &mut row.cells {
+            *position += 1;
+        }
+        store.write(&make_key("old"), row).unwrap();
+        let mut new_schema = old_schema;
+        new_schema.regular_columns.insert(
+            1,
+            ColumnDefinition {
+                name: "score".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            },
+        );
+        let _rotation: FlushOutcome = store
+            .flush_rotating(
+                |catalog, schema| {
+                    let mut target = catalog.remapped_onto(schema, &new_schema);
+                    target.indexed_columns.push(("score_idx".into(), 2));
+                    target
+                        .index_types
+                        .insert("score_idx".into(), IndexType::BTree);
+                    target.indexed_columns.push(("zulu_idx".into(), 3));
+                    target
+                        .index_types
+                        .insert("zulu_idx".into(), IndexType::BTree);
+                    (Arc::new(target), Arc::new(new_schema))
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &IndexKey(b"match".to_vec()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            collect_index_results(&store, "score_idx", &IndexKey(b"match".to_vec()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            collect_index_results(&store, "zulu_idx", &IndexKey(b"kept".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "new index extraction must use the frozen flat row layout before SSTable conversion"
+        );
+        let row = Row {
+            clustering: 1_i32.to_be_bytes().to_vec(),
+            cells: vec![
+                (1, CellValue::live(b"fresh".to_vec(), 2000)),
+                (2, CellValue::live(b"new score".to_vec(), 2000)),
+                (3, CellValue::live(b"more".to_vec(), 2000)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2000),
+        };
+        store.write(&make_key("new"), row).unwrap();
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &IndexKey(b"fresh".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "static columns occupy the prefix of the shared cell-ordinal space"
+        );
+        assert_eq!(
+            collect_index_results(&store, "score_idx", &IndexKey(b"new score".to_vec()))
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

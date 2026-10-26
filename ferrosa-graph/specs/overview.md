@@ -198,3 +198,14 @@ full graph.
 Graph column extraction retains immutable `CellBytes` handles for regular
 cells. Adjacency repair carries those handles into new cells; visited traversal
 keys remain independently owned at the key boundary.
+
+
+### First-write scalar columns over Bolt
+
+Before planning a Bolt data write, the engine derives missing columns from bound
+scalar properties, checks ALTER permission, rechecks under the shared schema gate,
+and applies them through the schema coordinator. Standalone and replicated paths
+update storage's column layout through the existing ALTER path. Warm writes issue
+no column DDL and take no schema-setup mutex. Signed numeric literals are normalized
+by the parser, so inference, byte encoding and indexed equality share literal
+semantics. Null, collection and computed first values require declared columns.

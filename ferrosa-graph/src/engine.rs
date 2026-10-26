@@ -391,6 +391,19 @@ pub trait GraphSchemaCoordinator: Send + Sync {
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> Result<()>;
 
+    /// Add first-write scalar columns and update this node's storage schema.
+    async fn apply_add_columns(
+        &self,
+        _keyspace: &str,
+        _table: &str,
+        _columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        _storage: &Arc<StorageEngine>,
+    ) -> Result<()> {
+        Err(GraphError::Validation(
+            "graph schema coordinator does not support column DDL".into(),
+        ))
+    }
+
     /// Create a derived scalar index through the same replicated DDL path.
     async fn apply_create_index(
         &self,
@@ -418,6 +431,33 @@ impl LocalGraphSchemaCoordinator {
 
 #[async_trait]
 impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
+    async fn apply_add_columns(
+        &self,
+        keyspace: &str,
+        table: &str,
+        columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        storage: &Arc<StorageEngine>,
+    ) -> Result<()> {
+        self.schema
+            .alter_table_internal(keyspace, table, column_additions(columns))
+            .map_err(|error| GraphError::Validation(format!("add scalar columns: {error}")))?;
+        let snapshot = self.schema.snapshot();
+        let metadata = snapshot
+            .tables
+            .get(&(keyspace.into(), table.into()))
+            .ok_or_else(|| {
+                GraphError::Validation(format!(
+                    "table {keyspace}.{table} disappeared during column setup"
+                ))
+            })?;
+        storage
+            .update_table_schema(
+                &ferrosa_storage::TableId::new(keyspace, table),
+                metadata.to_storage_schema(),
+            )
+            .map_err(GraphError::Storage)
+    }
+
     async fn apply_create_index(
         &self,
         index: ferrosa_schema::metadata::index::IndexMetadata,
@@ -445,6 +485,17 @@ impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
     }
 }
 
+fn column_additions(
+    columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+) -> ferrosa_schema::metadata::table::TableUpdates {
+    ferrosa_schema::metadata::table::TableUpdates {
+        params: None,
+        add_columns: columns,
+        drop_columns: vec![],
+        extensions: None,
+    }
+}
+
 /// Cluster-aware coordinator. Routes adjacency DDL through the same
 /// `DdlPath` regular CQL `CREATE TABLE` uses, so every replica's state
 /// machine applies the DDL — registering the adjacency table in its
@@ -464,6 +515,26 @@ impl ClusterGraphSchemaCoordinator {
 
 #[async_trait]
 impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
+    async fn apply_add_columns(
+        &self,
+        keyspace: &str,
+        table: &str,
+        columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        _storage: &Arc<StorageEngine>,
+    ) -> Result<()> {
+        self.ddl_path
+            .load()
+            .execute(ferrosa_cluster::pair::ddl::DdlOperation::AlterTable {
+                keyspace: keyspace.into(),
+                table: table.into(),
+                updates: Box::new(column_additions(columns)),
+            })
+            .await
+            .map_err(|error| {
+                GraphError::Validation(format!("cluster DDL add scalar columns: {error}"))
+            })
+    }
+
     async fn apply_create_index(
         &self,
         index: ferrosa_schema::metadata::index::IndexMetadata,
@@ -1452,6 +1523,49 @@ impl GraphEngine {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_bolt_schema_setup_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.implicit_schema_gate.lock().await
+    }
+
+    async fn ensure_bolt_columns(
+        &self,
+        statement: &Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<()> {
+        use crate::planner::implicit::columns_needing_declarations;
+        if columns_needing_declarations(&self.schema.snapshot(), keyspace, statement)?.is_empty() {
+            return Ok(());
+        }
+        tokio::time::timeout(self.config.query_timeout, async {
+        let _gate = self.implicit_schema_gate.lock().await;
+        let snapshot = self.schema.snapshot();
+        let additions = columns_needing_declarations(&snapshot, keyspace, statement)?;
+        // Check all schema permissions before applying any changes.
+        for table in additions.keys() {
+            check_permission(
+                &snapshot,
+                auth,
+                Permission::Alter,
+                &Resource::Table(keyspace.into(), table.clone()),
+            )
+            .map_err(|error| {
+                GraphError::PermissionDenied(format!(
+                    "first-write columns require ALTER on {keyspace}.{table}: {error}"
+                ))
+            })?;
+        }
+        for (table, columns) in additions {
+            self.schema_coordinator
+                .apply_add_columns(keyspace, &table, columns, &self.storage)
+                .await?;
+        }
+        Ok(())
+        }).await.map_err(|_|GraphError::Validation(format!(
+            "first-write scalar columns for keyspace '{keyspace}' are not ready after {:?}; retry",self.config.query_timeout)))?
+    }
+
     /// The streaming half of [`GraphEngine::execute_statement`].
     async fn execute_statement_streaming(
         &self,
@@ -1468,6 +1582,9 @@ impl GraphEngine {
         // table, so a first edge write has to exist first or it derives adjacency
         // rows into a table that was never registered.
         self.ensure_write_tables(&statement, keyspace, auth).await?;
+        if bolt_indexes {
+            self.ensure_bolt_columns(&statement, keyspace, auth).await?;
+        }
         if statement_requires_adjacency(&statement) {
             self.ensure_adjacency_ready(keyspace).await?;
         }
@@ -1670,6 +1787,9 @@ impl GraphEngine {
                     }
                     leaf => {
                         self.ensure_write_tables(&leaf, keyspace, auth).await?;
+                        if bolt_indexes {
+                            self.ensure_bolt_columns(&leaf, keyspace, auth).await?;
+                        }
                         if statement_requires_adjacency(&leaf) {
                             self.ensure_adjacency_ready(keyspace).await?;
                         }

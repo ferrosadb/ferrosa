@@ -42,11 +42,14 @@ Setup waits for current local indexes and probes participating cluster sources,
 within a bounded timeout, before executing the statement's data writes. Later
 index reads still check readiness; topology changes can make a later read fail.
 
-Schema-on-write creates missing labels from their initial properties. It does not
-automatically add columns to an existing label: declare additional columns before
-writing them. The existing encoder ignores undeclared properties; this known
-schema-evolution issue is tracked separately. Newly declared scalar columns receive
-indexes on their next Bolt access.
+Schema-on-write creates missing labels and adds missing scalar columns on their
+first Bolt write, before storing the row. `CREATE`, `MERGE`, `SET` and bound batch
+writes infer column types from non-null scalar literals or parameters, including
+signed numbers. Adding columns requires `ALTER` on the backing table. Known
+columns take the path without column DDL or its setup mutex. Null, collection and
+computed first values need an explicitly declared column; inference fails clearly
+instead of discarding those properties. New columns invalidate the shared index
+setup and receive their indexes before data writes.
 
 Native keys remain the first anchor path. Integer, UUID, text and boolean equality
 and bounded exact floating-point probes use current scalar indexes, preserve
@@ -56,6 +59,7 @@ Boolean `true` may probe all 255 nonzero byte encodings, lazily; broad epsilon
 comparisons near zero retain the range path. Other unsupported shapes also retain
 that path. Explicit Cypher index DDL remains unsupported. HTTP/embedded callers
 can use declared indexes; automatic first-access setup is the Bolt entry point.
+HTTP/embedded writes require declared columns and can still omit undeclared fields.
 
 Unfiltered `count(n)` and `count(*)` over physical vertex tables use the existing
 metadata count API, without building vertex maps or decoding payloads. Property

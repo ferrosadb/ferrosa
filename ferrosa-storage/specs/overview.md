@@ -463,3 +463,14 @@ immutable payloads. Commit-log and spill encodings retain their byte sequences.
 Published cell bytes are shared across row copies. Readers recover only unique
 scratch capacity; retained older payloads remain immutable. Memory estimates
 charge the full retained backing and a conservative shared-owner allowance.
+
+
+### Index sidecars across column-layout changes
+
+A rotation captures the target schema with its target index catalog. Frozen rows
+and postings retain their original schema. Before extracting sidecars, the target
+catalog is mapped by column name into that frozen layout, including predicates,
+full-text positions and vector positions. Missing source columns use an ordinal
+outside the u16 cell-tag space and contribute no postings. Unchanged scalar index
+definitions reuse their frozen postings. Ordinary flushes borrow the catalog; a
+schema change clones only index metadata, without remapping or copying rows.

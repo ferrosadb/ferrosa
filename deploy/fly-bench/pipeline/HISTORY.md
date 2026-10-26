@@ -440,3 +440,18 @@ CREATE and targeted sentinel deletion. It cannot conceal default-path regression
 with manual table/index declarations. Neo4j still requires all three property
 indexes ONLINE. Fresh comparison results must identify the final follow-up runtime;
 none of the earlier timing tables measure this automatic setup path.
+
+
+## First-write Bolt schema follow-up
+
+The first ordinary-write Fly preflight rejected a negative bootstrap value,
+exposing that signed numeric constants were represented as arithmetic instead of
+literals. A regression now covers that path through Bolt. Existing-label writes
+also discarded undeclared properties; first-write scalar column creation now uses
+coordinated ALTER before index initialization and data writes.
+
+The expanded tests exposed an older storage rotation error: sidecar extraction
+used new column ordinals against old frozen rows after adding an earlier-sorting
+column. Target definitions now map into the frozen schema by name, reusing valid
+postings and producing no entries for absent columns. No new performance results
+are claimed until the final binary completes matched-placement validation.

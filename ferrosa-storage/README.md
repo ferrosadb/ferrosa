@@ -1616,3 +1616,10 @@ immutable payloads. Commit-log and spill encodings retain their byte sequences.
 Published cell bytes are shared across row copies. Readers recover only unique
 scratch capacity; retained older payloads remain immutable. Memory estimates
 charge the full retained backing and a conservative shared-owner allowance.
+
+
+Schema rotations build index sidecars in the frozen rows' column layout. Target
+index definitions are mapped by column name once per schema change; unchanged
+postings are reused, and columns absent from old rows produce no entries. Ordinary
+flushes borrow the existing catalog. This preserves indexed reads when ALTER adds
+a column that sorts before an indexed property, without copying the row batch.

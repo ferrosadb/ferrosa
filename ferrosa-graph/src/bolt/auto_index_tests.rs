@@ -15,6 +15,8 @@ struct ObservedCoordinator {
     local: LocalGraphSchemaCoordinator,
     indexes: AtomicUsize,
     fail_indexes: AtomicBool,
+    columns: AtomicUsize,
+    fail_columns: AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -27,6 +29,21 @@ impl GraphSchemaCoordinator for ObservedCoordinator {
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> crate::error::Result<()> {
         self.local.apply_create_table(table).await
+    }
+    async fn apply_add_columns(
+        &self,
+        keyspace: &str,
+        table: &str,
+        columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        storage: &Arc<StorageEngine>,
+    ) -> crate::error::Result<()> {
+        self.columns.fetch_add(1, Ordering::Relaxed);
+        if self.fail_columns.load(Ordering::Relaxed) {
+            return Err(GraphError::Validation("injected column DDL failure".into()));
+        }
+        self.local
+            .apply_add_columns(keyspace, table, columns, storage)
+            .await
     }
     async fn apply_create_index(
         &self,
@@ -91,6 +108,8 @@ impl Fixture {
             local: LocalGraphSchemaCoordinator::new(Arc::clone(&schema)),
             indexes: AtomicUsize::new(0),
             fail_indexes: AtomicBool::new(false),
+            columns: AtomicUsize::new(0),
+            fail_columns: AtomicBool::new(false),
         });
         let engine = Arc::new(GraphEngine::new_with_coordinator(
             Arc::clone(&schema),
@@ -787,5 +806,310 @@ async fn bolt_scalar_indexes_preserve_noncanonical_byte_and_float_equality() {
         ages,
         vec![72, 73],
         "a broad epsilon comparison must keep its complete range fallback"
+    );
+}
+
+#[tokio::test]
+async fn bolt_first_write_adds_a_new_scalar_column_and_index_on_an_existing_label() {
+    let f = Fixture::new();
+    f.query(&mut f.connection(), "CREATE (n:Evolving {pk: 1})")
+        .await;
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Evolving {pk: 2, score: 42})",
+    )
+    .await;
+    let rows = f
+        .query(
+            &mut f.connection(),
+            "MATCH (n:Evolving) WHERE n.score = 42 RETURN n.pk, n.score",
+        )
+        .await;
+    assert_eq!(
+        rows,
+        vec![vec![PackValue::Int(2), PackValue::Int(42)]],
+        "a new scalar property must be stored on its first write"
+    );
+    let snapshot = f.schema.snapshot();
+    let table = &snapshot.tables[&("bolt_auto".into(), "evolving_v".into())];
+    assert!(table.columns.contains_key("score"));
+    assert!(snapshot
+        .indexes
+        .values()
+        .any(|index| index.table == "evolving_v" && index.target_columns == ["score"]));
+}
+
+#[tokio::test]
+async fn bolt_initial_write_infers_negative_scalar_literals() {
+    let f = Fixture::new();
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Negative {pk: -1, score: -1.5})",
+    )
+    .await;
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Negative) WHERE n.pk = -1 RETURN n.pk, n.score"
+        )
+        .await,
+        vec![vec![PackValue::Int(-1), PackValue::Float(-1.5)]]
+    );
+}
+
+#[tokio::test]
+async fn bolt_set_and_unwind_add_scalar_columns_once_and_preserve_existing_rows() {
+    let f = Fixture::new();
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Evolving {pk: 1, zulu: 'kept'})",
+    )
+    .await;
+    f.query(
+        &mut f.connection(),
+        "MATCH (n:Evolving {pk: 1}) SET n.alpha = 42",
+    )
+    .await;
+
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {alpha: 42}) RETURN n.pk, n.zulu"
+        )
+        .await,
+        vec![vec![PackValue::Int(1), PackValue::String("kept".into())]]
+    );
+    f.query(&mut f.connection(),
+        "UNWIND [{pk: 2, active: true}, {pk: 3, active: false}] AS row CREATE (n:Evolving {pk: row.pk, active: row.active})").await;
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {active: true}) RETURN n.pk"
+        )
+        .await,
+        vec![vec![PackValue::Int(2)]]
+    );
+    assert_eq!(f.coordinator.columns.load(Ordering::Relaxed), 2);
+    for pk in 4..8 {
+        f.query(
+            &mut f.connection(),
+            &format!("CREATE (n:Evolving {{pk: {pk}, active: true}})"),
+        )
+        .await;
+    }
+    assert_eq!(
+        f.coordinator.columns.load(Ordering::Relaxed),
+        2,
+        "new connections and known properties must not repeat column DDL"
+    );
+    let hot_guard = f.engine.hold_bolt_schema_setup_for_test().await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        f.query(
+            &mut f.connection(),
+            "CREATE (n:Evolving {pk: 9, active: true})",
+        ),
+    )
+    .await
+    .expect("known columns on a fresh connection must bypass the schema-setup mutex");
+    drop(hot_guard);
+    let result = f
+        .engine
+        .execute(
+            "MATCH (n:Evolving {alpha: 42}) RETURN n.zulu",
+            "bolt_auto",
+            &Fixture::auth(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.stats.vertices_read, 1);
+}
+
+#[tokio::test]
+async fn bolt_failed_column_setup_writes_nothing_and_is_retryable() {
+    let f = Fixture::new();
+    f.query(&mut f.connection(), "CREATE (n:Evolving {pk: 1})")
+        .await;
+    f.coordinator.fail_columns.store(true, Ordering::Relaxed);
+    let query = "CREATE (n:Evolving {pk: 2, score: 42})";
+    let result = f
+        .engine
+        .execute_bolt_stream_with_params(query, "bolt_auto", &Fixture::auth(), &HashMap::new())
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        f.query(&mut f.connection(), "MATCH (n:Evolving) RETURN n.pk")
+            .await,
+        vec![vec![PackValue::Int(1)]]
+    );
+    f.coordinator.fail_columns.store(false, Ordering::Relaxed);
+    f.query(&mut f.connection(), query).await;
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {score: 42}) RETURN n.pk"
+        )
+        .await,
+        vec![vec![PackValue::Int(2)]]
+    );
+    assert_eq!(f.coordinator.columns.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn bolt_schema_evolution_uses_the_production_ddl_coordinator() {
+    let mut f = Fixture::new();
+    f.storage.register_system_tables().unwrap();
+    let ddl = Arc::new(arc_swap::ArcSwap::from_pointee(
+        ferrosa_cluster::ddl_path::DdlPath::Direct {
+            schema: Arc::clone(&f.schema),
+            engine: Arc::clone(&f.storage),
+        },
+    ));
+    f.engine = Arc::new(GraphEngine::new_with_coordinator(
+        Arc::clone(&f.schema),
+        Arc::clone(&f.storage),
+        Arc::clone(&f.path),
+        Default::default(),
+        std::time::Duration::ZERO,
+        Arc::new(crate::engine::ClusterGraphSchemaCoordinator::new(ddl)),
+    ));
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Evolving {pk: -1, zulu: 'before'})",
+    )
+    .await;
+    f.query(
+        &mut f.connection(),
+        "MATCH (n:Evolving {pk: -1}) SET n.alpha = 42",
+    )
+    .await;
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {alpha: 42}) RETURN n.pk, n.zulu"
+        )
+        .await,
+        vec![vec![PackValue::Int(-1), PackValue::String("before".into())]]
+    );
+}
+
+#[tokio::test]
+async fn bolt_foreach_keeps_values_when_a_later_clause_adds_a_column() {
+    let f = Fixture::new();
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Evolving {pk: 0, zulu: 'seed'})",
+    )
+    .await;
+    f.query(&mut f.connection(),
+        "FOREACH (x IN [1] | CREATE (n:Evolving {pk: 1, zulu: 'first'}) CREATE (m:Evolving {pk: 2, alpha: 42}))").await;
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {pk: 1}) RETURN n.pk, n.zulu"
+        )
+        .await,
+        vec![vec![PackValue::Int(1), PackValue::String("first".into())]]
+    );
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {alpha: 42}) RETURN n.pk"
+        )
+        .await,
+        vec![vec![PackValue::Int(2)]]
+    );
+}
+
+#[tokio::test]
+async fn bolt_waiting_for_first_write_column_setup_respects_the_query_timeout() {
+    let f = Fixture::with_config(crate::executor::expand::GraphEngineConfig {
+        query_timeout: std::time::Duration::from_millis(50),
+        ..Default::default()
+    });
+    f.query(&mut f.connection(), "CREATE (n:Evolving {pk: 1})")
+        .await;
+    let _blocked = f.engine.hold_bolt_schema_setup_for_test().await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        f.engine.execute_bolt_stream_with_params(
+            "CREATE (n:Evolving {pk: 2, score: 42})",
+            "bolt_auto",
+            &Fixture::auth(),
+            &HashMap::new(),
+        ),
+    )
+    .await
+    .expect("the setup timeout must include waiting for column DDL");
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn bolt_new_scalar_columns_require_alter_permission() {
+    use ferrosa_schema::auth::permission::{GrantEntry, Permission, Resource};
+    use ferrosa_schema::auth::role::RoleMetadata;
+    let f = Fixture::new();
+    f.query(&mut f.connection(), "CREATE (n:Evolving {pk: 1})")
+        .await;
+    f.schema
+        .create_role_internal(RoleMetadata {
+            name: "writer".into(),
+            is_superuser: false,
+            can_login: true,
+            salted_hash: None,
+            member_of: Default::default(),
+            scram: None,
+        })
+        .unwrap();
+    f.schema
+        .grant_internal(GrantEntry {
+            role: "writer".into(),
+            resource: Resource::Table("bolt_auto".into(), "evolving_v".into()),
+            permissions: std::collections::HashSet::from([Permission::Modify, Permission::Select]),
+        })
+        .unwrap();
+    let auth = AuthContext {
+        role: "writer".into(),
+        is_superuser: false,
+        must_change_password: false,
+    };
+    let result = f
+        .engine
+        .execute_bolt_stream_with_params(
+            "CREATE (n:Evolving {pk: 2, score: 42})",
+            "bolt_auto",
+            &auth,
+            &HashMap::new(),
+        )
+        .await;
+    assert!(matches!(result, Err(GraphError::PermissionDenied(_))));
+    assert!(
+        !f.schema.snapshot().tables[&("bolt_auto".into(), "evolving_v".into())]
+            .columns
+            .contains_key("score")
+    );
+    assert_eq!(f.coordinator.columns.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn bolt_existing_index_finds_old_rows_after_a_new_column_sorts_before_it() {
+    let f = Fixture::new();
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Evolving {pk: 1, zulu: 'kept'})",
+    )
+    .await;
+    f.query(
+        &mut f.connection(),
+        "CREATE (n:Evolving {pk: 2, alpha: 42})",
+    )
+    .await;
+    assert_eq!(
+        f.query(
+            &mut f.connection(),
+            "MATCH (n:Evolving {pk: 1}) RETURN n.pk, n.zulu"
+        )
+        .await,
+        vec![vec![PackValue::Int(1), PackValue::String("kept".into())]]
     );
 }
