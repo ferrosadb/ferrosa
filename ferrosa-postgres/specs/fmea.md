@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 doc: fmea
-last_updated: 2026-10-11
+last_updated: 2026-10-26
 ---
 
 # ferrosa-postgres — FMEA / Known Issues

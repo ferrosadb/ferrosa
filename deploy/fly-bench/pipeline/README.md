@@ -1,10 +1,10 @@
 # Pipeline performance experiments
 
-Current measured position versus PostgreSQL 18.6: **24,275 versus 26,392 INSERT
-rows/s at 100k rows (92.0%)**; **22,842 versus 24,900 at 5k (91.7%)**; point
-reads **2,814 versus 9,855 ops/s (28.6%, a 3.50× remaining gap)**. There is no
-current matched Neo4j comparison in this report. See [current results, scope and
-historical journey](RESULTS.md).
+Current matched fresh-5k comparison: **22,049 versus PostgreSQL 18.6's
+23,578 INSERT rows/s (93.5%)**; **3,313 versus
+10,212 point reads/s (32.4%, a 3.08× remaining gap)**.
+The ordered four-change read walk, ranges, runtime identities and older workloads
+are in [RESULTS.md](RESULTS.md). There is no current matched Neo4j comparison.
 
 This instrument validates exact row values, counts and key sets before accepting
 timings. It measures PostgreSQL inserts and point reads, and Bolt point updates

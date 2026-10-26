@@ -1,14 +1,79 @@
 # Measured pipeline changes
 
-## Current results — 2026-10-25
+## Current matched results — 2026-10-26
 
-Latest measured Ferrosa runtime: `15d9e7f0e6991301d304fbf0034877b9cd514d76`.
+Latest measured runtime: `a948ed1df48fd955bc144956b3d50546512665e2`. Fresh process, 5,000 seeded rows,
+20,000 fixed seeded point reads, eight warmed workers, 96-byte payloads. Values,
+keys and counts are validated. Means below use two unprofiled observations per
+checkpoint, in forward 0→1→2→3→4 then reverse 4→3→2→1→0 order, bracketed by
+two native PostgreSQL 18.6 controls. Separate CPU profiles are diagnostic only.
+
+| Current operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL | PostgreSQL / Ferrosa |
+| --- | ---: | ---: | ---: | ---: |
+| INSERT, fresh 5k, rows/s | **22,049** | 23,578 | **93.5%** | 1.07× |
+| Point reads, fresh 5k, ops/s | **3,313** | 10,212 | **32.4%** | **3.08×** |
+
+### Ordered point-read walk
+
+| Cumulative checkpoint | Runtime | Reads/s, paired mean (range) | Change from previous | / PostgreSQL |
+| --- | --- | ---: | ---: | ---: |
+| Baseline | `15d9e7f0e` | **3,048** (3,005–3,091) | — | 29.9% |
+| 1. Move decoded values | `840152137` | **2,987** (2,954–3,020) | -2.0% | 29.2% |
+| 2. Fuse open / first fetch | `bdd095abf` | **2,979** (2,930–3,029) | -0.2% | 29.2% |
+| 3. Direct encoding / response buffer | `de0806312` | **3,239** (3,218–3,259) | +8.7% | 31.7% |
+| 4. Skip replaced SQL materialization | `a948ed1df` | **3,313** (3,308–3,319) | +2.3% | 32.4% |
+
+Total read change: **+8.7%**.
+These are cumulative changes, so each row compares with the preceding checkpoint.
+Two repetitions are descriptive; the ranges matter and do not establish statistical
+significance. The final PostgreSQL read controls are 9,837
+and 10,586 ops/s.
+
+The native read controls drifted **+7.6%**.
+To check the bundle without the cold-build gaps, an additional 0→4→4→0 run
+measured baseline **2,947** versus final
+**3,285** reads/s
+(**+11.5%**). That confirmation is kept
+separate from the intermediate walk; both comparisons remain descriptive.
+
+INSERT paired mean changes from 23,591 to
+22,049 rows/s (-6.5%).
+The baseline range is 22,055–25,127;
+the final range is 19,882–24,215.
+Those ranges overlap; this walk does not establish an INSERT improvement.
+
+Step 1 pins allocation identity/capacity when moving CQL values. Step 2 pins one
+blocking job for opening and the first fetch. Step 3 proves zero allocations in
+the preallocated common scalar encoder and batches a bounded point response at
+Sync; specialized codecs retain their checked fallback. Step 4 removes throwaway
+SQL row materialization while preserving physical CQL decoding and error checks.
+The physical CQL payload decode and owned MVCC image copy remain; this is not a
+claim that the whole read path is zero-copy or allocation-free.
+
+A separate 400-read Fly syscall trace confirms five successful socket writes per
+warmed point read became one. Including eight prepare cycles, sends change from
+2,016 to 408, with the same 89,937 total response bytes and all returned values
+validated. Traced timings are not included in the throughput comparison.
+
+Both engines use the same Fly performance-2CPU/4096MiB/lax class and client.
+Ferrosa uses an attached volume and PostgreSQL its root filesystem. Read CPU
+profiles, process/RSS, disk/network and scheduler data were gathered separately
+and retained privately. CPU samples and runqueue sums are not individual mutex
+wait times; RSS is not allocated bytes. No current matched Neo4j comparison is
+established. [Exact values and image identities](point-read-walk-results.json).
+
+The preceding 100k/follow-on-5k workload is retained below with its runtime. It
+has not been rerun on this latest runtime and is not a current 100k claim.
+
+## Previous matched workload — 2026-10-25
+
+Ferrosa runtime for this preceding workload: `15d9e7f0e6991301d304fbf0034877b9cd514d76`.
 Native comparison: PostgreSQL 18.6. These are means of two unprofiled runs per
 system, with full key/value/count validation. Eight workers, 96-byte payloads
 and 400 seeded point reads; the 5k fixture follows a 100k workload in the same
 process.
 
-| Current operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL | Remaining gap |
+| Previous workload operation | Ferrosa | PostgreSQL 18.6 | Ferrosa / PostgreSQL | Remaining gap |
 | --- | ---: | ---: | ---: | --- |
 | INSERT, 100k rows, rows/s | **24,275** | 26,392 | **92.0%** | PostgreSQL 1.09× faster |
 | INSERT, 5k follow-on, rows/s | **22,842** | 24,900 | **91.7%** | PostgreSQL 1.09× faster |

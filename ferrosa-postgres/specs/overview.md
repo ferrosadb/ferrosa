@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 status: developer-preview
-last_updated: 2026-10-09
+last_updated: 2026-10-26
 executive_summary: >
   The PostgreSQL v3 wire-protocol front-end for ferrosa. Implements the
   frontend/backend protocol (startup, SCRAM-SHA-256, simple + extended query),

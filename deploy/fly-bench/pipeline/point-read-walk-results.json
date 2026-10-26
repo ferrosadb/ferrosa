@@ -1,0 +1,313 @@
+{
+  "experiment": "sequential point-read fixes1\u20134",
+  "workload": {
+    "rows": 5000,
+    "reads": 20000,
+    "concurrency": 8,
+    "payload_bytes": 96,
+    "fixture": "fresh process5000rows, no100kpreload",
+    "repetitions": "forward0,1,2,3,4 then reverse4,3,2,1,0",
+    "profiles": "separate30sread CPUcapture onforwardlegs"
+  },
+  "stages": [
+    {
+      "step": 0,
+      "name": "current baseline",
+      "revision": "15d9e7f0e6991301d304fbf0034877b9cd514d76",
+      "image": "registry.fly.io/ferrosa-bench-main@sha256:f32e70b76e4fea80231b24e2327a231e8b75e5fe830d22e4cbed6cf9f37bbb37",
+      "legs": {
+        "forward": {
+          "read_operations_per_s": 3005.1547059555287,
+          "read_or_operation_p50_ms": 2.552593000000769,
+          "read_or_operation_p99_ms": 4.713877000000366,
+          "insert_rows_per_s": 22055.06862154512,
+          "started_at": "2026-10-25T22:54:47Z",
+          "finished_at": "2026-10-25T22:54:54Z",
+          "validated": true
+        },
+        "reverse": {
+          "read_operations_per_s": 3091.354684365836,
+          "read_or_operation_p50_ms": 2.494213500000342,
+          "read_or_operation_p99_ms": 4.326447999993377,
+          "insert_rows_per_s": 25127.47254769588,
+          "started_at": "2026-10-26T00:18:10Z",
+          "finished_at": "2026-10-26T00:18:17Z",
+          "validated": true
+        }
+      },
+      "paired_mean_read_ops_s": 3048.2546951606823,
+      "paired_mean_insert_rows_s": 23591.2705846205,
+      "ratio_to_previous": null,
+      "fraction_postgres": 0.2985008160392553,
+      "insert_fraction_postgres": 1.0005682455583156
+    },
+    {
+      "step": 1,
+      "name": "move decoded values",
+      "revision": "8401521378ea949c664dc5ee737cc7aa39f0a311",
+      "image": "registry.fly.io/ferrosa-bench-main@sha256:32c94e01b08adb7d9c65b0c021d0a494654d4369b2199ed4be42b270187bd7ad",
+      "legs": {
+        "forward": {
+          "read_operations_per_s": 2953.509861724313,
+          "read_or_operation_p50_ms": 2.582293000003233,
+          "read_or_operation_p99_ms": 4.920445999999856,
+          "insert_rows_per_s": 22245.42934619593,
+          "started_at": "2026-10-25T23:45:03Z",
+          "finished_at": "2026-10-25T23:45:10Z",
+          "validated": true
+        },
+        "reverse": {
+          "read_operations_per_s": 3020.252721114281,
+          "read_or_operation_p50_ms": 2.5447179999993352,
+          "read_or_operation_p99_ms": 4.73309699999902,
+          "insert_rows_per_s": 23210.708745119377,
+          "started_at": "2026-10-26T00:16:42Z",
+          "finished_at": "2026-10-26T00:16:49Z",
+          "validated": true
+        }
+      },
+      "paired_mean_read_ops_s": 2986.8812914192968,
+      "paired_mean_insert_rows_s": 22728.069045657656,
+      "ratio_to_previous": 0.9798660512722838,
+      "fraction_postgres": 0.2924908159139395,
+      "insert_fraction_postgres": 0.9639575828852188
+    },
+    {
+      "step": 2,
+      "name": "fuse cursor open and first fetch",
+      "revision": "bdd095abf264b43695848bb5a612f5fb69274194",
+      "image": "registry.fly.io/ferrosa-bench-main@sha256:8d13f1a08c61d55f233aed7523f85d936293ce53124b4f46bd1c43aa8b1992e8",
+      "legs": {
+        "forward": {
+          "read_operations_per_s": 2929.6258013367756,
+          "read_or_operation_p50_ms": 2.58463800000186,
+          "read_or_operation_p99_ms": 4.998825999997791,
+          "insert_rows_per_s": 21066.54463463363,
+          "started_at": "2026-10-25T23:52:28Z",
+          "finished_at": "2026-10-25T23:52:35Z",
+          "validated": true
+        },
+        "reverse": {
+          "read_operations_per_s": 3029.2351432174937,
+          "read_or_operation_p50_ms": 2.5273829999967745,
+          "read_or_operation_p99_ms": 4.646626999999626,
+          "insert_rows_per_s": 23871.458422073032,
+          "started_at": "2026-10-26T00:15:20Z",
+          "finished_at": "2026-10-26T00:15:28Z",
+          "validated": true
+        }
+      },
+      "paired_mean_read_ops_s": 2979.430472277135,
+      "paired_mean_insert_rows_s": 22469.00152835333,
+      "ratio_to_previous": 0.9975054853490273,
+      "fraction_postgres": 0.2917611932883672,
+      "insert_fraction_postgres": 0.952969843571198
+    },
+    {
+      "step": 3,
+      "name": "single encoding and reused buffered responses",
+      "revision": "de080631261992f5c4176afeee77411a0ade98ef",
+      "image": "registry.fly.io/ferrosa-bench-main@sha256:7f4390a6ca7fe311abc51bd5ed9614e27bad61bc694816fd2492a5e1599df4bd",
+      "legs": {
+        "forward": {
+          "read_operations_per_s": 3258.657431818334,
+          "read_or_operation_p50_ms": 2.351407999999111,
+          "read_or_operation_p99_ms": 4.376307999997664,
+          "insert_rows_per_s": 21008.81771172394,
+          "started_at": "2026-10-26T00:02:36Z",
+          "finished_at": "2026-10-26T00:02:43Z",
+          "validated": true
+        },
+        "reverse": {
+          "read_operations_per_s": 3218.4924974924306,
+          "read_or_operation_p50_ms": 2.367248500000585,
+          "read_or_operation_p99_ms": 4.441327000002104,
+          "insert_rows_per_s": 23731.51808356857,
+          "started_at": "2026-10-26T00:13:57Z",
+          "finished_at": "2026-10-26T00:14:04Z",
+          "validated": true
+        }
+      },
+      "paired_mean_read_ops_s": 3238.5749646553822,
+      "paired_mean_insert_rows_s": 22370.167897646257,
+      "ratio_to_previous": 1.0869778619737978,
+      "fraction_postgres": 0.31713795808751327,
+      "insert_fraction_postgres": 0.9487780476217589
+    },
+    {
+      "step": 4,
+      "name": "avoid redundant SQL materialization for MVCC replacements",
+      "revision": "a948ed1df48fd955bc144956b3d50546512665e2",
+      "image": "registry.fly.io/ferrosa-bench-main@sha256:1ed2555fb9f17d604273c3ef00e4736b803faa5135d6394b1c7b275b40deab32",
+      "legs": {
+        "forward": {
+          "read_operations_per_s": 3307.841696082754,
+          "read_or_operation_p50_ms": 2.329293000002508,
+          "read_or_operation_p99_ms": 4.026628999994841,
+          "insert_rows_per_s": 24215.29817735117,
+          "started_at": "2026-10-26T00:10:09Z",
+          "finished_at": "2026-10-26T00:10:15Z",
+          "validated": true
+        },
+        "reverse": {
+          "read_operations_per_s": 3319.0399469911617,
+          "read_or_operation_p50_ms": 2.319809000002948,
+          "read_or_operation_p99_ms": 4.203797999998926,
+          "insert_rows_per_s": 19881.907908760186,
+          "started_at": "2026-10-26T00:12:39Z",
+          "finished_at": "2026-10-26T00:12:45Z",
+          "validated": true
+        }
+      },
+      "paired_mean_read_ops_s": 3313.4408215369576,
+      "paired_mean_insert_rows_s": 22048.60304305568,
+      "ratio_to_previous": 1.0231169133642524,
+      "fraction_postgres": 0.3244692087891382,
+      "insert_fraction_postgres": 0.9351396307659638
+    }
+  ],
+  "native_controls": [
+    {
+      "read_operations_per_s": 9837.47892598049,
+      "insert_rows_per_s": 22209.7530745863,
+      "started_at": "2026-10-25T22:51:16Z"
+    },
+    {
+      "read_operations_per_s": 10586.282292547046,
+      "insert_rows_per_s": 24945.992051937486,
+      "started_at": "2026-10-26T00:19:08Z"
+    }
+  ],
+  "native_mean_read_ops_s": 10211.880609263768,
+  "native_mean_insert_rows_s": 23577.872563261895,
+  "limits": [
+    "Fresh 5,000 rows and 20,000 reads; separate from the older 400-read / 5k-after-100k workload.",
+    "Paired means require completed forward and reverse observations.",
+    "CPU profiles are separate from primary timings.",
+    "Two repetitions are descriptive; no statistical significance is claimed.",
+    "Native PostgreSQL uses its root filesystem; Ferrosa uses an attached volume."
+  ],
+  "bundle_confirmation": {
+    "order": [
+      0,
+      4,
+      4,
+      0
+    ],
+    "reason": "Native control drift and long cold-build gaps in the original sweep.",
+    "legs": [
+      {
+        "index": 0,
+        "step": 0,
+        "revision": "15d9e7f0e6991301d304fbf0034877b9cd514d76",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:f32e70b76e4fea80231b24e2327a231e8b75e5fe830d22e4cbed6cf9f37bbb37",
+        "read_operations_per_s": 2957.758907105387,
+        "insert_rows_per_s": 23315.821177556492,
+        "started_at": "2026-10-26T00:22:59Z",
+        "finished_at": "2026-10-26T00:23:06Z",
+        "validated": true
+      },
+      {
+        "index": 1,
+        "step": 4,
+        "revision": "a948ed1df48fd955bc144956b3d50546512665e2",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:1ed2555fb9f17d604273c3ef00e4736b803faa5135d6394b1c7b275b40deab32",
+        "read_operations_per_s": 3232.3300819898263,
+        "insert_rows_per_s": 20627.82484653175,
+        "started_at": "2026-10-26T00:24:25Z",
+        "finished_at": "2026-10-26T00:24:32Z",
+        "validated": true
+      },
+      {
+        "index": 2,
+        "step": 4,
+        "revision": "a948ed1df48fd955bc144956b3d50546512665e2",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:1ed2555fb9f17d604273c3ef00e4736b803faa5135d6394b1c7b275b40deab32",
+        "read_operations_per_s": 3337.553967924335,
+        "insert_rows_per_s": 23662.10338428234,
+        "started_at": "2026-10-26T00:25:42Z",
+        "finished_at": "2026-10-26T00:25:49Z",
+        "validated": true
+      },
+      {
+        "index": 3,
+        "step": 0,
+        "revision": "15d9e7f0e6991301d304fbf0034877b9cd514d76",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:f32e70b76e4fea80231b24e2327a231e8b75e5fe830d22e4cbed6cf9f37bbb37",
+        "read_operations_per_s": 2936.572372072414,
+        "insert_rows_per_s": 23931.925809345186,
+        "started_at": "2026-10-26T00:27:00Z",
+        "finished_at": "2026-10-26T00:27:07Z",
+        "validated": true
+      }
+    ],
+    "groups": {
+      "0": {
+        "mean_reads_s": 2947.1656395889004,
+        "min": 2936.572372072414,
+        "max": 2957.758907105387
+      },
+      "4": {
+        "mean_reads_s": 3284.942024957081,
+        "min": 3232.3300819898263,
+        "max": 3337.553967924335
+      }
+    },
+    "read_change_fraction": 0.11461058748475939,
+    "native_control_read_change_fraction": 0.07611740489618635,
+    "limits": [
+      "Two observations per image; descriptive, not statistical significance.",
+      "Does not isolate the four intermediate changes individually."
+    ]
+  },
+  "socket_syscall_diagnostic": {
+    "stages": [
+      {
+        "stage": "baseline",
+        "successful_pg_calls": {
+          "recvfrom": 408,
+          "sendto": 2016
+        },
+        "total_send_bytes": 89937,
+        "positive_send_sizes": {
+          "5": 408,
+          "6": 408,
+          "14": 400,
+          "79": 400,
+          "118": 1,
+          "119": 16,
+          "120": 116,
+          "121": 267
+        },
+        "positive_receive_cycles_by_writes": {
+          "2": 8,
+          "5": 400
+        },
+        "scope": "400 validated reads plus eight prepared-statement setup cycles; diagnostic only."
+      },
+      {
+        "stage": "step4",
+        "successful_pg_calls": {
+          "recvfrom": 408,
+          "sendto": 408
+        },
+        "total_send_bytes": 89937,
+        "positive_send_sizes": {
+          "11": 8,
+          "222": 1,
+          "223": 16,
+          "224": 116,
+          "225": 267
+        },
+        "positive_receive_cycles_by_writes": {
+          "1": 408
+        },
+        "scope": "400 validated reads plus eight prepared-statement setup cycles; diagnostic only."
+      }
+    ],
+    "limits": [
+      "Syscall counts are not unprofiled timings.",
+      "Futex calls mix condition variables and other waits; no mutex attribution is inferred."
+    ]
+  }
+}
