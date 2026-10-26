@@ -12,12 +12,16 @@
 //! Last revised: 2026-10-26
 //! Last changed: Route eligible property equality through 2i and count vertex metadata.
 
+use crate::executor::io::GraphWrite;
+
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use ferrosa_cluster::consistency::ConsistencyLevel;
 use ferrosa_cluster::ring::strategy::ReplicationStrategy;
-use ferrosa_cluster::write_path::{PartitionResultStream, WritePath};
+use ferrosa_cluster::write_path::PartitionResultStream;
+#[cfg(test)]
+use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_index::IndexType;
 use ferrosa_schema::{Schema, VirtualTableRegistry};
@@ -155,7 +159,7 @@ type StreamingPlanResult<'a> = Result<(Vec<String>, RowStream<'a>, QueryStats)>;
 /// this entry point adds only the materialization.
 pub async fn execute(
     plan: PhysicalPlan,
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     config: &GraphEngineConfig,
     virtual_tables: Option<&VirtualTableRegistry>,
@@ -213,7 +217,7 @@ pub async fn execute(
 /// fallback variant is fully executed before this function returns.
 pub async fn execute_streaming<'a>(
     plan: PhysicalPlan,
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     config: &'a GraphEngineConfig,
     virtual_tables: Option<&'a VirtualTableRegistry>,
@@ -242,7 +246,7 @@ pub async fn execute_streaming<'a>(
 /// straight through to [`execute_streaming`]. There is one dispatch.
 pub struct OwnedExecCtx {
     /// From `ArcSwap::load_full()`, not `load()` — an owned `Arc`, not a `Guard`.
-    pub write_path: std::sync::Arc<WritePath>,
+    pub write_path: std::sync::Arc<dyn GraphWrite>,
     /// Owned copy of the caller's `&str`.
     pub keyspace: String,
     /// Owned config; `GraphEngineConfig` is small and `Clone`.
@@ -377,7 +381,7 @@ fn owned_stream_items(
 /// `Subscribe` and `Union` recurse into it, so the future has to be type-erased.
 fn execute_streaming_inner<'a>(
     plan: PhysicalPlan,
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     config: &'a GraphEngineConfig,
     virtual_tables: Option<&'a VirtualTableRegistry>,
@@ -584,7 +588,7 @@ fn return_only_stream<'a>(
 /// still measures from the same instant the buffered `execute` used to.
 async fn execute_buffered<'a>(
     plan: PhysicalPlan,
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     config: &'a GraphEngineConfig,
     virtual_tables: Option<&'a VirtualTableRegistry>,
@@ -827,7 +831,7 @@ async fn execute_buffered<'a>(
 
 fn graph_filter_passes<'a>(
     expr: &'a Expr,
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     schema: Option<&'a Schema>,
     bindings: &'a HashMap<String, serde_json::Value>,
@@ -911,7 +915,7 @@ fn graph_filter_passes<'a>(
 
 #[allow(clippy::too_many_arguments)]
 async fn pattern_predicate_exists(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     schema: Option<&Schema>,
     bindings: &HashMap<String, serde_json::Value>,
@@ -1142,7 +1146,7 @@ fn expr_has_pattern_comprehension(expr: &Expr) -> bool {
 #[allow(clippy::too_many_arguments)]
 fn graph_eval_expr<'a>(
     expr: &'a Expr,
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     schema: Option<&'a Schema>,
     bindings: &'a HashMap<String, serde_json::Value>,
@@ -1187,7 +1191,7 @@ fn graph_eval_expr<'a>(
 /// returning a partial/wrong list.
 #[allow(clippy::too_many_arguments)]
 async fn eval_pattern_comprehension(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     schema: Option<&Schema>,
     bindings: &HashMap<String, serde_json::Value>,
@@ -1257,7 +1261,7 @@ async fn eval_pattern_comprehension(
 /// Collect outgoing neighbor vertex ids for a source vertex over an optional
 /// relationship type, using the adjacency index with an edge-table fallback.
 async fn outgoing_neighbor_ids(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     schema: Option<&Schema>,
     source_key: &DecoratedKey,
@@ -1322,7 +1326,7 @@ async fn outgoing_neighbor_ids(
 /// inline property filter. Returns `None` when the label is missing or the
 /// inline filter does not match.
 async fn resolve_target_node_json(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     schema: Option<&Schema>,
     neighbor_id: &[u8],
@@ -1462,7 +1466,7 @@ struct ExpandPlan<'p> {
 /// The shared execution context an Expand runs against.
 #[derive(Clone, Copy)]
 struct ExpandCtx<'a> {
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     config: &'a GraphEngineConfig,
     virtual_tables: Option<&'a VirtualTableRegistry>,
@@ -2175,7 +2179,7 @@ async fn finish_expand_buffered(
 /// This bounds MEMORY, not the answer: the scan still visits every partition
 /// and the caller still keeps every state that passes its filters.
 async fn stream_anchor_partitions(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     anchor: &Anchor,
     anchor_meta: Option<&ferrosa_schema::metadata::table::TableMetadata>,
     schema: Option<&Schema>,
@@ -2226,17 +2230,15 @@ async fn stream_anchor_partitions(
                         if probe.aliases.is_empty() {
                             return Ok(first);
                         }
-                        let path = write_path.clone();
-                        let index_name = index.name.clone();
-                        return Ok(Box::pin(async_stream::try_stream! {
-                            let mut hits = first;
-                            while let Some(partition) = hits.next().await { yield partition?; }
-                            for key in probe.aliases {
-                                let mut hits = path.index_read_stream(
-                                    &anchor_table_id, &index_name, &key, None).await?;
-                                while let Some(partition) = hits.next().await { yield partition?; }
-                            }
-                        }));
+                        let mut streams = vec![first];
+                        for key in probe.aliases {
+                            streams.push(
+                                write_path
+                                    .index_read_stream(&anchor_table_id, &index.name, &key, None)
+                                    .await?,
+                            );
+                        }
+                        return Ok(Box::pin(futures::stream::iter(streams).flatten()));
                     }
                 }
             }
@@ -2280,7 +2282,7 @@ fn anchor_property_equality<'a>(
 async fn project_state(
     return_clause: &ReturnClause,
     needs_graph_projection: bool,
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     schema: Option<&Schema>,
     anchor_var: &str,
@@ -2315,7 +2317,7 @@ struct ExpandProjection<'a> {
     return_clause: ReturnClause,
     anchor_var: String,
     needs_graph_projection: bool,
-    write_path: &'a WritePath,
+    write_path: &'a dyn GraphWrite,
     keyspace: &'a str,
     schema: Option<&'a Schema>,
 }
@@ -2525,7 +2527,7 @@ fn apply_with_pipeline(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_optional_hops(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     states: Vec<ExpandState>,
     optional_hops: &[Hop],
@@ -2714,7 +2716,7 @@ fn push_state_with_fan_out_limit(
 
 #[allow(clippy::too_many_arguments)]
 async fn try_edge_anchored_initial_states(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     anchor: &Anchor,
     hops: &[Hop],
     optional_hops: &[Hop],
@@ -3239,7 +3241,7 @@ pub(super) fn extract_column_bytes_from_row(
 
 #[allow(clippy::too_many_arguments)]
 async fn find_edge_match(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     table_id: &TableId,
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     bindings: &HashMap<String, serde_json::Value>,
@@ -3311,7 +3313,7 @@ async fn find_edge_match(
 
 #[allow(clippy::too_many_arguments)]
 async fn find_vertex_match(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     table_id: &TableId,
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     bindings: &HashMap<String, serde_json::Value>,
@@ -3465,7 +3467,7 @@ fn resolve_lookup_component(
 }
 
 async fn find_table_row_by_props(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     table_id: &TableId,
     meta: &ferrosa_schema::metadata::table::TableMetadata,
     props: &[(String, Expr)],
@@ -3668,7 +3670,7 @@ fn resolve_opposite_vertex(
 /// concurrently within a hop (t_0cc8d63e).
 #[allow(clippy::too_many_arguments)]
 async fn hydrate_hop_neighbor(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     schema: Option<&Schema>,
     hop: &Hop,
     state: &ExpandState,
@@ -3989,16 +3991,49 @@ fn encode_components(components: &[Vec<u8>]) -> Vec<u8> {
 
 /// Generate a current timestamp in microseconds since epoch.
 fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as i64
+    mutation_timestamp_at(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as i64,
+    )
+}
+
+fn mutation_timestamp_at(wall_micros: i64) -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    // Allocate only during admitted execution, never while queued. Keep local
+    // mutations ordered even when the clock repeats/regresses. Reserve +1 for
+    // DELETE's adjacency repair. This is not a cross-process/CQL clock protocol.
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let next = |last: i64| wall_micros.max(last.checked_add(2).expect("graph timestamp overflow"));
+    let previous = LAST
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |last| {
+            Some(next(last))
+        })
+        .expect("timestamp update always supplies a value");
+    next(previous)
+}
+
+#[test]
+fn bolt_rmw_mutation_timestamps_advance_when_wall_clock_stalls_or_recedes() {
+    let first = mutation_timestamp_at(100);
+    let second = mutation_timestamp_at(100);
+    let third = mutation_timestamp_at(99);
+    // DELETE adjacency repair reserves timestamp + 1 as well.
+    assert!(
+        second > first + 1,
+        "successor must outrank predecessor and repair"
+    );
+    assert!(
+        third > second + 1,
+        "wall clock regression cannot reorder admitted writes"
+    );
 }
 
 /// Execute a CREATE plan: for each CreateOp, build a Row with cells from the
 /// properties and write it to storage.
 async fn execute_create(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     creates: &[CreateOp],
     return_clause: Option<&crate::parser::ReturnClause>,
     _config: &GraphEngineConfig,
@@ -4156,7 +4191,7 @@ fn fallback_merge_key_type(
 ///
 /// After all merges, apply any trailing SET assignments.
 async fn execute_merge(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     merges: &[MergeOp],
     set_clause: &[(String, String, Expr)],
     _return_clause: Option<&crate::parser::ReturnClause>,
@@ -4486,7 +4521,7 @@ async fn execute_merge(
 }
 
 async fn write_explicit_adjacency_entries(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     table_id: &TableId,
     key: &DecoratedKey,
     row: &Row,
@@ -4536,7 +4571,7 @@ async fn write_explicit_adjacency_entries(
 /// tombstone and the one the observer derived. (A sibling in ANOTHER partition
 /// is not seen here; the background reconcile restores that entry.)
 async fn restore_entries_shared_with_live_edges(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     table_id: &TableId,
     key: &DecoratedKey,
     deleted: &Row,
@@ -4625,7 +4660,7 @@ async fn restore_entries_shared_with_live_edges(
 /// is content-addressed and idempotent (LWW with monotonic timestamps), so
 /// duplicate forwards to replicas that already applied are safe.
 async fn adjacency_write_with_retry(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     adj_table_id: &TableId,
     key: &DecoratedKey,
     row: Row,
@@ -4932,7 +4967,7 @@ fn build_schema_aware_merge_shape(
 }
 
 async fn infer_schema_aware_merge_shape(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     op: &MergeOp,
     set_props: &[(String, Expr)],
     schema: &Schema,
@@ -5441,7 +5476,7 @@ fn projection_reads_storage(plan: &PhysicalPlan) -> bool {
 /// `updated N vertices` status row.
 #[allow(clippy::too_many_arguments)]
 async fn execute_set(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     expand: PhysicalPlan,
     keyspace: &str,
     assignments: &[(String, String, Expr)],
@@ -5626,6 +5661,11 @@ async fn execute_set(
                     primary_key_liveness: LivenessInfo::NONE,
                 };
 
+                // Integration-test scheduling only: suspend after evaluating the
+                // dependent read, without replacing any storage operation.
+                #[cfg(debug_assertions)]
+                crate::engine::before_property_write_for_test().await;
+
                 write_path
                     .write(
                         &table_id,
@@ -5707,7 +5747,7 @@ async fn execute_set(
 /// than silently no-op (URS-QEC-X01).
 #[allow(clippy::too_many_arguments)]
 async fn execute_remove(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     expand: PhysicalPlan,
     keyspace: &str,
     items: &[RemoveItem],
@@ -5972,7 +6012,7 @@ fn tombstone_mutation(
 ///
 /// Returns the number of incident edges tombstoned.
 async fn delete_with_adjacency(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     vertex_key: &DecoratedKey,
     vertex_table: &TableId,
@@ -6087,7 +6127,7 @@ async fn delete_with_adjacency(
 /// relationship in either direction. Read-only: performs no writes, so a plain
 /// `DELETE n` can fail loud before tombstoning anything.
 async fn vertex_has_incident_edges(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     vertex_key: &DecoratedKey,
 ) -> Result<bool> {
@@ -6109,7 +6149,7 @@ async fn vertex_has_incident_edges(
 /// has surviving relationships, return a Neo4j-style constraint error so the
 /// whole `DELETE` deletes nothing. Read-only.
 async fn check_plain_delete_constraint(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     expand_result: &GraphResult,
     keyspace: &str,
     variables: &[String],
@@ -6162,7 +6202,7 @@ async fn check_plain_delete_constraint(
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_delete(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     expand: PhysicalPlan,
     keyspace: &str,
     variables: &[String],
@@ -6426,7 +6466,7 @@ fn metadata_node_count_anchor<'a>(
 /// 4. Enforces max group count (FMEA F7).
 #[allow(clippy::too_many_arguments)]
 async fn execute_aggregate(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     inner: PhysicalPlan,
     group_keys: &[usize],
@@ -9959,7 +9999,7 @@ mod tests {
     }
 
     fn projection_ctx<'a>(
-        write_path: &'a WritePath,
+        write_path: &'a dyn GraphWrite,
         return_clause: crate::parser::ReturnClause,
         needs_graph_projection: bool,
     ) -> ExpandProjection<'a> {

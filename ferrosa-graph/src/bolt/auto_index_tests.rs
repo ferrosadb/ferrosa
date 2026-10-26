@@ -1,4 +1,6 @@
 //! Exercise the real Bolt RUN/PULL dispatch against storage, without network races.
+#[path = "transaction_auto_schema_tests.rs"]
+mod transaction_auto_schema_tests;
 use super::*;
 use crate::engine::{GraphSchemaCoordinator, LocalGraphSchemaCoordinator};
 use ferrosa_cluster::write_path::WritePath;
@@ -670,6 +672,13 @@ async fn bolt_index_setup_failure_happens_before_unwind_writes_and_can_retry() {
             .unwrap(),
         0,
         "index DDL failure must precede the first data write"
+    );
+    let reset = process_message(BoltMessage::Reset, &f.engine, &f.schema, &mut state)
+        .await
+        .unwrap();
+    assert!(
+        matches!(reset.as_slice(), [BoltMessage::Success { .. }]),
+        "RESET after setup failure must allow retry: {reset:?}"
     );
     f.coordinator.fail_indexes.store(false, Ordering::Relaxed);
     f.query(&mut state, query).await;

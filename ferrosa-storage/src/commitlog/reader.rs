@@ -44,6 +44,9 @@ use super::segment::{ENTRY_OVERHEAD, SYNC_MARKER_SIZE};
 /// 3. Read and deserialize one entry payload at a time.
 /// 4. On CRC failure, skip to the next sync marker if available; otherwise stop.
 pub struct SegmentReader {
+    /// Monotone, bounded evidence of nonempty bytes rejected by this reader.
+    rejected_records: bool,
+    transaction_entries: std::collections::VecDeque<(CommitLogPosition, Mutation)>,
     file: File,
     file_len: u64,
     /// Parsed header descriptor.
@@ -78,6 +81,8 @@ impl SegmentReader {
         let descriptor = SegmentDescriptor::read_from(&header)?;
 
         Ok(Self {
+            rejected_records: false,
+            transaction_entries: Default::default(),
             file,
             file_len,
             descriptor,
@@ -125,6 +130,31 @@ impl SegmentReader {
         self.descriptor.segment_id
     }
 
+    /// Whether any nonempty record/section was rejected. Recovery must retain
+    /// this source and durably record incomplete admission before retiring it.
+    /// This does not change the bounded CDC entry interface or allocate payloads.
+    pub(crate) fn rejected_records(&self) -> bool {
+        self.rejected_records
+    }
+
+    /// Distinguish unwritten zero padding from rejected nonempty bytes, with
+    /// fixed scratch space even for a large preallocated tail.
+    fn reject_nonempty_range(&mut self, start: u64, end: u64) -> ferrosa_common::Result<()> {
+        self.file.seek(SeekFrom::Start(start))?;
+        let mut remaining = end.saturating_sub(start);
+        let mut scratch = [0u8; 4096];
+        while remaining != 0 {
+            let size = remaining.min(scratch.len() as u64) as usize;
+            self.file.read_exact(&mut scratch[..size])?;
+            if scratch[..size].iter().any(|byte| *byte != 0) {
+                self.rejected_records = true;
+                break;
+            }
+            remaining -= size as u64;
+        }
+        Ok(())
+    }
+
     /// Returns the segment descriptor (header info).
     pub fn descriptor(&self) -> &SegmentDescriptor {
         &self.descriptor
@@ -154,6 +184,16 @@ impl SegmentReader {
         maximum_payload_bytes: usize,
     ) -> ferrosa_common::Result<Option<SegmentEntryRead>> {
         loop {
+            if let Some((position, mutation)) = self.transaction_entries.front() {
+                if mutation.serialized_size() > maximum_payload_bytes {
+                    return Ok(Some(SegmentEntryRead::PayloadTooLarge {
+                        position: *position,
+                        bytes: mutation.serialized_size(),
+                    }));
+                }
+                let (position, mutation) = self.transaction_entries.pop_front().unwrap();
+                return Ok(Some(SegmentEntryRead::Mutation(position, mutation)));
+            }
             if self.finished {
                 return Ok(None);
             }
@@ -165,6 +205,7 @@ impl SegmentReader {
             }
 
             if self.entry_offset.saturating_add(ENTRY_OVERHEAD as u64) > self.section_end {
+                self.reject_nonempty_range(self.entry_offset, self.section_end)?;
                 self.advance_section();
                 continue;
             }
@@ -177,6 +218,7 @@ impl SegmentReader {
             let stored_size_crc =
                 u32::from_be_bytes(entry_header[4..8].try_into().expect("fixed slice"));
             if stored_size_crc != crc32fast::hash(&entry_size_bytes) {
+                self.reject_nonempty_range(self.entry_offset, self.section_end)?;
                 // A torn tail is expected after a crash; the rest of this
                 // section is unreadable, so skip to the next sync marker.
                 tracing::warn!(
@@ -192,6 +234,7 @@ impl SegmentReader {
             let payload_end = payload_start.saturating_add(entry_size);
             let entry_end = payload_end.saturating_add(4);
             if entry_end > self.section_end || entry_end > self.file_len {
+                self.rejected_records = true;
                 self.advance_section();
                 continue;
             }
@@ -217,6 +260,7 @@ impl SegmentReader {
             self.entry_offset = entry_end;
 
             if u32::from_be_bytes(payload_crc) != crc32fast::hash(&payload) {
+                self.rejected_records = true;
                 tracing::warn!(
                     segment_id = self.descriptor.segment_id,
                     offset = payload_start - 8,
@@ -242,6 +286,7 @@ impl SegmentReader {
                     mutation
                 }
                 Err(e) => {
+                    self.rejected_records = true;
                     // The CRC matched, so these are the bytes that were written:
                     // a decode failure is a format problem, not torn I/O. The
                     // entry is skipped like a corrupt one, but never silently.
@@ -256,18 +301,40 @@ impl SegmentReader {
                     continue;
                 }
             };
-            return Ok(Some(SegmentEntryRead::Mutation(
-                CommitLogPosition {
-                    segment_id: self.descriptor.segment_id,
-                    offset: payload_start - 8,
-                },
-                mutation,
-            )));
+            let position = CommitLogPosition {
+                segment_id: self.descriptor.segment_id,
+                offset: payload_start - 8,
+            };
+            // Decode every member before yielding any: malformed/torn envelopes
+            // cannot expose a successfully decoded prefix.
+            let mutations = match super::transaction_record::decode(mutation) {
+                Ok(mutations) => mutations,
+                Err(error) => {
+                    self.rejected_records = true;
+                    tracing::error!(%error, segment_id = self.descriptor.segment_id,
+                        offset = position.offset, "rejecting malformed transaction WAL envelope");
+                    continue;
+                }
+            };
+            self.transaction_entries
+                .extend(mutations.into_iter().enumerate().map(|(index, mutation)| {
+                    (
+                        CommitLogPosition {
+                            offset: position.offset + index as u64,
+                            ..position
+                        },
+                        mutation,
+                    )
+                }));
         }
     }
 
     fn open_next_section(&mut self) -> ferrosa_common::Result<()> {
         if self.marker_offset.saturating_add(SYNC_MARKER_SIZE as u64) > self.file_len {
+            self.reject_nonempty_range(
+                self.marker_offset.saturating_add(SYNC_MARKER_SIZE as u64),
+                self.file_len,
+            )?;
             self.finished = true;
             return Ok(());
         }
@@ -280,6 +347,10 @@ impl SegmentReader {
         crc_input[..8].copy_from_slice(&self.descriptor.segment_id.to_be_bytes());
         crc_input[8..].copy_from_slice(&next.to_be_bytes());
         if stored_crc != crc32fast::hash(&crc_input) {
+            self.reject_nonempty_range(
+                self.marker_offset.saturating_add(SYNC_MARKER_SIZE as u64),
+                self.file_len,
+            )?;
             self.finished = true;
             return Ok(());
         }
@@ -291,6 +362,7 @@ impl SegmentReader {
             u64::from(next).min(self.file_len)
         };
         if section_end < section_start || (next != 0 && u64::from(next) <= self.marker_offset) {
+            self.reject_nonempty_range(section_start, self.file_len)?;
             self.finished = true;
             return Ok(());
         }

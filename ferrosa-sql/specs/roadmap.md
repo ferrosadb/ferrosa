@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 doc: roadmap
-last_updated: 2026-10-11
+last_updated: 2026-10-26
 ---
 
 # ferrosa-sql — Roadmap
@@ -156,3 +156,5 @@ toward the Postgres queries real clients send.
   those belong to `ferrosa-postgres` and the storage layer, not here.
 - Embedding DataFusion / Arrow (decision **D3**) — the bespoke value model and
   semantics stay owned in this crate.
+
+- Implemented (t_6b946676): no-FROM bare CURRENT_TIMESTAMP mixed with now(), and distinct TimestampTz column typing. Clock evaluation remains in ferrosa-postgres.

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sparql
 doc: fmea
-last_updated: 2026-07-25
+last_updated: 2026-10-26
 ---
 
 # ferrosa-sparql — FMEA / Known Issues
@@ -67,3 +67,45 @@ overflow). **SP-4** downgraded from unbounded to bounded.
   the build if the `Vec`-returning `WritePath::range_read` is reintroduced.
 - **No** test today covers OPTIONAL semantics, true UNION semantics, or auth —
   the SP-1/2/3 blind spots.
+
+## BIND compatibility resolution (t_c5b544d4, 2026-10-26)
+
+- **Resolved:** Extend planning rejection, including `BIND(1 AS ?x)` over an
+  empty BGP. The empty solution identity survives and BIND adds a typed integer.
+- **Prevented:** flattening all bindings/filters after all triple operations,
+  which would expose later variables or discard valid dependent bindings.
+  Ordered steps retain filter placement and independent Join operand scopes.
+- **Prevented:** integer rounding through f64 and loss of RDF term metadata.
+  Integer arithmetic is checked; aliases clone the complete term; join
+  compatibility includes datatype and language as well as lexical form/kind.
+- **Residual limits:** integer arithmetic is bounded to i64; overflow leaves the
+  target unbound. Integer division truncates decimal results at 18 fractional
+  digits. Decimal/float/double arithmetic operands fail explicitly, as do
+  unsupported BIND expression forms (during planning). Existing FILTER and
+  ORDER BY semantics, OPTIONAL, UNION and subquery limitations remain.
+
+Detection: the `baseline_bind` executor regressions cover all resolved failure
+modes and assert that errors preserve the solution without binding a placeholder.
+
+## RDF identity core and cutover risks (t_16b96d45)
+
+Fresh v2 keys prevent lexical siblings of different kinds/datatypes/languages
+from overwriting one another. Queries and deletes retain full terms, with exact
+postfiltering of lexical index candidates. The codec rejects overlong fields,
+unsupported versions, malformed UTF-8/lengths and key/cell disagreement. Numeric
+lexical forms and ill-typed values remain terms. New schema ordinals follow
+storage conventions; the historical v1 decoder uses historical ordinals.
+
+Offline Direct migration refuses incomplete recovery, malformed or hybrid legacy
+metadata, unexplained targets, stale incarnation markers, and incomplete copies.
+Reader-level rejected WAL frames persist an unknown-source recovery barrier;
+quarantine or barrier persistence failure aborts replay while retaining source
+bytes. Publication follows survivor/index validation and durable target flush.
+See [the cutover contract](rdf-term-identity-cutover.md).
+
+Already overwritten variants cannot be recovered from surviving v1 rows. The
+operator must exclude old binaries and concurrent readers/writers/lifecycle
+changes across all passes; local markers do not fence other nodes. V1 remains
+retained and is never unioned with v2. After v2 writes, downgrade is lossy and
+requires an authoritative checkpoint or export/reimport. Distributed migration
+and historical data silently lost by older binaries remain separate work.

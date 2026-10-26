@@ -1,13 +1,13 @@
 ---
 crate: ferrosa-sparql
 status: implemented
-last_updated: 2026-07-25
+last_updated: 2026-10-26
 executive_summary: >
   The SPARQL 1.1 Query + Update endpoint for ferrosa. Parses SPARQL with
   spargebra/oxrdf, plans algebra into TripleOps over a single CQL-backed
-  rdf_triples table per keyspace, executes via the cluster write path with a
+  rdf_triples_v2 table per keyspace, executes via the cluster write path with a
   nested-loop join, and serializes results as SPARQL JSON/XML/N-Triples/Turtle
-  over an axum HTTP surface. The model is one RDF graph per keyspace; cross-graph
+  over an axum HTTP surface. Default and named graphs have separate partitions; cross-graph
   operations fail loud rather than silently retarget. Significant gaps remain:
   no authentication, no OPTIONAL/MINUS, UNION is concat-only, and property paths
   load the full predicate adjacency into memory.
@@ -26,14 +26,16 @@ delegates reads to `ferrosa-cluster`'s `WritePath` and writes to
 The RDF data model is mapped onto exactly one CQL table per keyspace:
 
 ```
-rdf_triples : ((graph, subject), predicate, object)
-              regular cols: object_type, datatype, language
+rdf_triples_v2 : ((graph, subject), predicate, object, object_identity)
+                 regular cols: datatype=0, language=1, object_type=2
+rdf_triples    : historical v1 only; never served by this core
 ```
 
-The partition key is the composite `(graph, subject)` where `graph` is the
-keyspace name — so there is **one logical RDF graph per keyspace**. This is the
-crate's defining boundary: anything that addresses a distinct named graph is
-rejected, never silently mapped onto the default graph.
+The partition key is `(graph, subject)`; the keyspace chooses the table. Named
+graphs and the default graph are isolated. The lexical object component supports
+candidate indexing; the third component carries versioned kind/datatype/language
+identity. V1 has a separate schema and historical metadata ordinals and requires
+explicit migration before serving.
 
 ## Module map
 
@@ -44,10 +46,11 @@ rejected, never silently mapped onto the default graph.
 | `executor` (`src/executor.rs`, ~1150 LoC) | Streaming triple-pattern scans + `ExecutionLimits` row bound, LIMIT pushdown, nested-loop join, constant-term enforcement, FILTER/ORDER BY/DISTINCT/LIMIT, composite-key decode, tombstone skipping, ObjectScan index |
 | `update` (`src/update.rs`, ~730 LoC) | INSERT/DELETE DATA, DELETE WHERE, DELETE/INSERT WHERE, CLEAR, DROP, CREATE; up-front atomicity validation; one shared tombstone primitive |
 | `property_path` (`src/property_path.rs`, ~440 LoC) | `+ * ? ^` evaluation via BFS with cycle detection over a streamed, bounded adjacency read |
+| `bind` (`src/bind.rs`) | RDF-term-preserving Extend expressions, checked integer arithmetic and bounded decimal division |
 | `filter` (`src/filter.rs`, ~490 LoC) | `Expression` evaluation: comparisons, boolean ops, arithmetic, a function subset; `unsupported_expr` gate for ORDER BY fail-loud |
 | `results` (`src/results.rs`, ~415 LoC) | `Binding`, `SparqlJsonResults`, `ResultFormat`; JSON / W3C XML / N-Triples serializers |
 | `http` (`src/http.rs`, ~234 LoC) | axum router, content negotiation, 1 MiB body limit, error→status mapping |
-| `triple_store` (`src/triple_store.rs`) | `rdf_triples` schema, composite partition-key encoding, `ObjectType` |
+| `triple_store` (`src/triple_store.rs`) | v2 schema/strict identity codec, v1 schema/decoder, checked keys and legacy fence |
 | `rdf_star` (`src/rdf_star.rs`) | RDF\* annotation evaluation stub — fail-loud, not implemented |
 | `namespace` (`src/namespace.rs`) | Standard prefix table (rdf, rdfs, owl, xsd, foaf, …) |
 
@@ -57,10 +60,10 @@ rejected, never silently mapped onto the default graph.
 flowchart TD
     HTTP["axum handlers<br/>POST/GET /sparql, /sparql/update"] --> ENG["SparqlEngine::execute / execute_update"]
     ENG --> PARSE["spargebra parse<br/>query / update"]
-    PARSE --> PLAN["planner::plan_query<br/>algebra to Vec&lt;TripleOp&gt;"]
-    PLAN --> EXEC["executor::execute<br/>nested-loop join"]
+    PARSE --> PLAN["planner::plan_query<br/>algebra to storage ops + ordered PlanSteps"]
+    PLAN --> EXEC["executor::execute<br/>ordered join / FILTER / BIND"]
     EXEC --> WP["ferrosa-cluster WritePath<br/>read / range_read_stream_all / index_read"]
-    WP --> POST["FILTER to ORDER BY to DISTINCT to LIMIT/OFFSET"]
+    WP --> POST["ORDER BY to DISTINCT to LIMIT/OFFSET"]
     POST --> SHAPE{"query form?"}
     SHAPE -->|SELECT| SER["results.rs serialize"]
     SHAPE -->|ASK| BOOL["boolean from non-empty bindings"]
@@ -77,40 +80,33 @@ partition key); a bound predicate to `PredicateScan` (streaming range scan +
 filter); a bound object to `ObjectScan` (secondary index
 `rdf_triples_object_idx` when this node declares it — checked up front with
 `WritePath::declares_index_locally`, because an undeclared index read is now
-refused rather than answered empty — otherwise a streaming range scan; nothing
-creates that index today, so the scan is the live path); nothing bound
+refused rather than answered empty — otherwise a streaming range scan; registration
+declares the index and non-current backfills also use the scan); nothing bound
 to `FullScan`. Range scans pull one partition at a time from
 `WritePath::range_read_stream_all` and bind each row as it arrives — no
 intermediate `Vec` of fetched triples exists. The executor folds each
 `TripleOp`'s rows into the running binding set with a compatibility check on both
-value and `binding_type`, and enforces every constant term in the pattern (the
+kind, lexical value, datatype and language, and enforces every constant term in the pattern (the
 access path is a pushdown, not the whole match).
 
-**Write path.** UPDATE first validates **every** operation (atomicity), then
-applies them sequentially. Inserts write a live row; every delete form funnels
+**Write path.** UPDATE first validates operation shapes and constant keys, then
+applies operations sequentially. Resolved DELETE/INSERT template keys are checked
+before that operation mutates; storage failures are not rolled back. Inserts
+write a live row; every delete form funnels
 through one `tombstone_triple` primitive that writes a deletion-marker row with
 `LivenessInfo::NONE` and clustering identical to the live row it must shadow.
 
 ## Key invariants
 
-1. **One graph per keyspace.** Operations addressing a different named graph
-   fail loud, never retarget (`check_quad_graph_pattern`,
-   `check_pattern_graph_reads`).
-
-   > **This invariant is VIOLATED today (FMEA SP-11 / t_af4eb9f0).** The read
-   > side sets the `graph` partition-key component from the KEYSPACE, but
-   > `update.rs` writes it as the literal string `"default"`. The two agree only
-   > when the keyspace *is* `default` — and the HTTP endpoint defaults the
-   > keyspace to `rdf`. On any other keyspace a point read computes a key
-   > nothing was written under, so `SubjectLookup` misses data a `FullScan`
-   > finds and `DELETE` reports success while tombstoning empty keys. Resolving
-   > it requires deciding which side is authoritative; see the roadmap.
+1. **Graph and keyspace are separate.** Default and named graph scans/paths and
+   deletes isolate the selected graph. CLEAR/DROP DEFAULT, NAMED and ALL retain
+   each scanned row's actual graph when constructing tombstones.
 2. **UPDATE atomicity by up-front rejection.** Because execution has no rollback,
    `validate_update` rejects the whole request before any mutation if any op is
    unaddressable — preventing a desugared `Drop` from wiping data before a later
    op fails.
 3. **Tombstone clustering must shadow the live row exactly.** Inserts and deletes
-   share `encode_triple_clustering` (strict `[u16 len][bytes]`, no separator), so
+   share `triple_store::encode_clustering` (strict `[u16 len][bytes]`, no separator), so
    a tombstone matches the row it deletes; `LivenessInfo::NONE` prevents
    resurrection.
 4. **Fail loud over silent wrong answers.** RDF\* annotation, `LOAD`,
@@ -126,7 +122,7 @@ through one `tombstone_triple` primitive that writes a deletion-marker row with
    property-path BFS) may buffer but not exceed it.
 7. **A constant is a match constraint in every position.** The access method is
    chosen from ONE bound term, but `try_bind_triple` re-checks subject,
-   predicate, and object — including term kind, so an IRI constant never matches
+   predicate, and object — including kind, datatype and language, so an IRI constant never matches
    a literal spelling the same characters. A blank node in a pattern is a
    non-selectable variable and constrains nothing.
 8. **LIMIT pushdown only where it is provably safe.** The scan stops after
@@ -142,3 +138,44 @@ Front-end leaf: depends on `ferrosa-cluster`, `ferrosa-storage`,
 `ferrosa-common`, `ferrosa-sstable`, `ferrosa-index`, `ferrosa-schema`; depended
 on only by the `ferrosa` binary. See the
 [root crate index](../../specs/crates.md) for the full graph.
+
+## Extend / BIND execution (t_c5b544d4)
+
+`QueryPlan::steps` retains triple-operation and filter indices plus Extend and
+scoped Join steps. The storage access inventory remains in `ops`; it does not
+control expression ordering. Each Join operand starts with the empty solution
+mapping and its own expression scope. BGP joins still stream the storage side;
+explicit Join operands and their compatible combinations obey `max_rows`.
+LIMIT pushdown is disabled for explicit Join steps and for any FILTER.
+
+The shared executor evaluates Extend per solution, retaining the row when the
+expression has an unbound operand, invalid type/value, overflow or zero divisor.
+The BIND evaluator preserves complete RDF terms for constants/aliases and uses
+checked i64 arithmetic without float conversion. Integer division emits decimal
+lexical values with at most 18 fractional digits (truncation toward zero).
+Unsupported expression forms fail planning; arithmetic on decimal/float/double
+operands fails explicitly. These restrictions do not affect constant/alias
+bindings of those RDF terms. See README for the supported subset.
+
+Regression evidence: `tests/sparql_executor_invariants.rs::baseline_bind`, through
+the real planner and both public executor entry points. Covers empty identity,
+dependent binds, expression errors, BGP/BIND/FILTER order, nested scopes, RDF
+term metadata, integer precision, overflow and division.
+
+## RDF identity format boundary
+
+Fresh data serves v2 exclusively. Canonical metadata column order is used for
+new SSTables; the v1 decoder retains historical ordinals. All new mutations use
+checked keys; the total partition key and every clustering/identity component
+must fit u16 lengths. Partition keys have separator bytes, clustering keys do not.
+
+The public engine refuses legacy evidence before v2 registration and each
+read/update unless a durable completed migration matches both table incarnations.
+`migration::OfflineMigration` owns recovered local storage and performs explicit,
+quiesced Direct-mode copy through bounded fragments. It checks source/target
+recovery admission, validates all source identities through the lexical index,
+counts the target independently, flushes, and durably publishes completion.
+Interrupted targets remain fenced. A completed rerun validates provenance without
+recopying retired v1. Empty registry snapshots retain the flat storage catalog
+fallback so neither source nor target disappears on restart. See
+[RDF term identity cutover](rdf-term-identity-cutover.md).

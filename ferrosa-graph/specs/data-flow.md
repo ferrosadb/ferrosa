@@ -141,3 +141,21 @@ is idempotent and observable (`ReconcileMetrics`), but a safety net — never th
 source of truth. Caveat (FMEA): it is disarmed by the default config and repairs
 at hardcoded RF=1, so the fallback is currently weaker than the invariant it
 guards.
+
+
+## Same-engine write ownership
+
+Bound AST -> recursive write classification -> FIFO GraphEngine writer admission
+-> publication read guard -> MATCH/predicates/RHS/nested execution -> row stream.
+BEGIN/read-only RUN skips admission. Explicit writes retain admission in the
+transaction overlay across RUNs; COMMIT takes publication write under admission
+and publishes through the unchanged BatchTxn. Autocommit retains admission in the
+outer stream until exhaustion/error/drop. Publication releases before admission.
+Waiters hold no publication guard; readers bypass writer admission. Deadlines
+bound setup/admission and finite stream polling. RESET/EOF cannot be observed
+while Bolt is awaiting RUN; prompt cancellation there remains separate work.
+
+Ownership spans every key/database in this engine. Independent-key writes
+serialize (roughly 1/H throughput ceiling for ownership duration H), so baseline
+results must disclose this cost. No CQL/cross-engine/schema-incarnation guarantee
+follows from this local gate; narrower validated update-read ownership is next.

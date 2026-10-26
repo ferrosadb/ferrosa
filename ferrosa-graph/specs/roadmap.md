@@ -126,3 +126,40 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
   / `ferrosa-cluster`. This crate delegates all reads/writes to `WritePath`.
 - CQL value-codec ownership — handled upstream; the graph engine consumes
   `Partition`/`Row`/`CellValue` as given.
+
+## Bolt explicit transaction checkpoint (2026-10-26)
+
+The bounded single-node implementation stages real mutations, reads its own
+writes and commits through `BatchTxn`; cleanup and isolation are covered by
+the Bolt TCP integration cases on t_a4712717. Remaining boundaries for later
+work are Accord-backed distributed execution, transactional label DDL, conflict
+detection/snapshot isolation, cross-protocol publication, and causal bookmarks.
+These are integration gaps, not intentional Neo4j compatibility exclusions.
+
+
+## Approved Option A writer admission (2026-10-26)
+
+Now: one same-GraphEngine FIFO writer gate shared by explicit/autocommit writes,
+classified from the bound AST before data-dependent evaluation. Retain through
+COMMIT/abort or autocommit stream exhaustion/drop; readers bypass admission.
+Publication follows admission, and mutation timestamps advance after admission.
+This is an explicit correctness/performance tradeoff: unrelated keys/databases
+serialize, with approximate admission throughput bounded by 1/H ownership time.
+The comparison must disclose this granularity and client/drain-time sensitivity.
+
+Next, prioritized optimization (`t_ddc70aac`): narrow partition/key ownership with update-read
+refresh and dependency provenance, consistent lock identities across operators,
+bounded ownership memory and deadlock handling. Do not lock only the final SET
+or reuse stale predicates/RHS/imported bindings. Do not claim equivalent locking
+granularity to Neo4j before implementing and measuring this follow-on.
+
+Next, separate transport requirement (`t_2d545c04`): observe RESET/EOF while RUN awaits admission,
+using bounded reader/cancellation coordination and preserving partial-frame reads,
+reply ordering and uncertain durable commit outcomes. Current release is on
+observation or deadline; immediate queued-RUN cancellation is not implemented.
+Root decides whether benchmark paths need this before measurement (the current
+path commits/rolls back after completed RUN and sends no RESET during a queued RUN).
+
+Separate correctness prerequisite before production (`t_6775b186`): schema-incarnation fencing
+for DROP/recreate. The fresh-schema baseline excludes concurrent DDL. Broader
+CQL/cross-engine/distributed isolation remains outside this local ownership domain.

@@ -247,9 +247,10 @@ an owned, `Send` iterator, and `RowStream`/`TryRowStream` are `Send`.
 
 ## Dependencies
 
-**Calls** (ferrosa crates this depends on): `ferrosa-storage` only, for the
+**Calls** (ferrosa crates this depends on): `ferrosa-storage`, for the
 bounded external merge sort and the cancellable temp-table reservation the
-blocking operators spill through. Nothing else from it is used, and the engine
+blocking operators spill through, and `ferrosa-jsonb`, for validated JSON values.
+Nothing else from storage is used, and the engine
 still carries its own `Value`/`Row`/`RelSchema` model — it does not adopt
 `CqlValue`.
 
@@ -299,3 +300,13 @@ under nextest (one process per test) and never shares the budget.
 - [Architecture overview](specs/overview.md) — module map, invariants, data flow
 - [FMEA / known issues](specs/fmea.md) — supported surface vs gaps, ranked by RPN
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+## Transaction clock syntax and types (t_6b946676)
+
+The no-FROM scalar grammar recognizes bare `CURRENT_TIMESTAMP` alongside zero-arg
+`now()`, including mixed lists and aliases. It preserves function AST nodes:
+parsing never reads a clock. The PostgreSQL frontend owns transaction/statement
+clock evaluation. `ColumnType::TimestampTz` distinguishes timestamp-with-time-zone
+results from `ColumnType::Timestamp`; both carry `Value::Timestamp` microseconds,
+with the column type supplying temporal interpretation and wire typing. This
+adds no new dependency. Table projections and precision arguments are unchanged.

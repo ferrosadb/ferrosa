@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -69,6 +70,9 @@ pub trait DdlExecutor: Send + Sync {
 
 /// [`DdlExecutor`] over the shared, atomically swappable [`DdlPath`] that the
 /// CQL router also holds, so Postgres DDL is replicated exactly as CQL DDL is.
+/// Index creation additionally requires completed backfill before success.
+/// Currently only Direct can establish that readiness; pair/cluster index
+/// creation is refused until their replica readiness protocol is available.
 pub struct ClusterDdl {
     path: Arc<ArcSwap<DdlPath>>,
 }
@@ -122,11 +126,83 @@ impl DdlExecutor for ClusterDdl {
         columns: &[String],
     ) -> Result<(), String> {
         let path = self.path.load_full();
+        // Schema agreement is not replica build readiness. Until the pair /
+        // cluster protocol supplies that evidence, refuse rather than vouch
+        // for remote read sources using just this node's tracker.
+        let DdlPath::Direct { schema, engine } = path.as_ref() else {
+            return Err(format!(
+                "PostgreSQL index DDL on {} requires replica index readiness; \
+                 schema apply acknowledgement alone is insufficient",
+                path.kind()
+            ));
+        };
+        let table_key = (keyspace.to_string(), table.to_string());
+        let table_uuid = schema
+            .snapshot()
+            .tables
+            .get(&table_key)
+            .ok_or_else(|| format!("index table {keyspace}.{table} does not exist"))?
+            .id;
         let index = ferrosa_cluster::pair::ddl::secondary_index(keyspace, table, name, columns);
         path.execute(DdlOperation::CreateIndex(index))
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+
+        // Run only after apply has released its lifecycle/compaction guards.
+        // No spawned waiter: dropping this future cancels the wait, while
+        // already-applied DDL and background build jobs remain durable.
+        let table_id = ferrosa_storage::TableId::new(keyspace, table);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if !Arc::ptr_eq(&path, &self.path.load_full()) {
+                    return Err(format!(
+                        "DDL path changed while awaiting index {keyspace}.{table}.{name}"
+                    ));
+                }
+                if index_ready(schema, engine, &table_id, table_uuid, name)? {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            format!(
+                "timed out after 30s waiting for index {keyspace}.{table}.{name}; \
+                 backfill is still pending or deferred (schema was applied)"
+            )
+        })?
     }
+}
+
+/// Observe current coverage, including compaction replacements, without
+/// retaining any schema lease across an await or modifying the build tracker.
+fn index_ready(
+    schema: &Schema,
+    engine: &ferrosa_storage::StorageEngine,
+    table: &ferrosa_storage::TableId,
+    table_uuid: uuid::Uuid,
+    name: &str,
+) -> Result<bool, String> {
+    let _lease = schema.lifecycle_read();
+    let key = (table.keyspace().to_string(), table.table().to_string());
+    let target = format!("{}.{}.{name}", table.keyspace(), table.table());
+    if schema.snapshot().tables.get(&key).map(|meta| meta.id) != Some(table_uuid) {
+        return Err(format!(
+            "table generation retired while awaiting index {target}"
+        ));
+    }
+    if !engine.declares_index(table, name) {
+        return Err(format!("index {target} is not registered in storage"));
+    }
+    let state = engine
+        .index_tracker()
+        .get_state(table.keyspace(), table.table(), name)
+        .ok_or_else(|| format!("index {target} is not registered in the build tracker"))?;
+    if let ferrosa_storage::index::IndexStatus::Failed { error, .. } = state.status {
+        return Err(format!("index {target} build failed: {error}"));
+    }
+    Ok(engine.index_is_current(table, name))
 }
 
 /// What a `CREATE TABLE` runs against: the schema registry it checks for

@@ -35,6 +35,7 @@ pub(crate) mod reader;
 pub mod replay_progress;
 pub(crate) mod segment;
 pub(crate) mod sync;
+pub(crate) mod transaction_record;
 
 pub use config::{
     ArchiveConfig, CommitLogBatchConfig, CommitLogConfig, CommitLogPosition, CommitLogSyncMode,
@@ -466,7 +467,21 @@ fn is_zeroed_segment_header(path: &std::path::Path) -> ferrosa_common::Result<bo
     let mut file = fs::File::open(path)?;
     let mut header = [0u8; descriptor::HEADER_SIZE];
     file.read_exact(&mut header)?;
-    Ok(header.iter().all(|byte| *byte == 0))
+    if header.iter().any(|byte| *byte != 0) {
+        return Ok(false);
+    }
+    // Only an entirely zero file is an unwritten preallocation. A destroyed
+    // header in front of nonempty records must fail opening, retaining bytes.
+    let mut scratch = [0u8; 4096];
+    loop {
+        let size = file.read(&mut scratch)?;
+        if size == 0 {
+            return Ok(true);
+        }
+        if scratch[..size].iter().any(|byte| *byte != 0) {
+            return Ok(false);
+        }
+    }
 }
 
 /// The commit log: write-ahead log for mutation durability.
@@ -621,6 +636,19 @@ impl CommitLog {
     /// No-op (and no allocation) when no bus is attached or no subscriber is
     /// listening — the row clone happens only when an event will be delivered,
     /// so this stays off the cost path for the common no-CDC case.
+    /// Publish individual members after the transaction's durable apply. Never
+    /// publish the internal WAL envelope as a user mutation.
+    pub(crate) fn publish_transaction_mutation(&self, mutation: &Mutation) {
+        self.emit_written_on_node(
+            &mutation.keyspace,
+            &mutation.table,
+            &mutation.key,
+            &mutation.rows,
+            mutation.timestamp,
+            mutation.mutation_id,
+        );
+    }
+
     fn emit_written_on_node(
         &self,
         keyspace: &str,
@@ -729,6 +757,29 @@ impl CommitLog {
         F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
         B: FnMut() -> ferrosa_common::Result<()>,
     {
+        Self::open_and_replay_streaming_with_rejections(
+            config,
+            on_mutation,
+            segment_done,
+            || Ok(()),
+            progress,
+        )
+    }
+
+    /// Storage recovery admission hook. Rejected source files are retained even
+    /// after this callback succeeds; a callback error stops replay before unlink.
+    pub(crate) fn open_and_replay_streaming_with_rejections<F, B, R>(
+        config: Config,
+        on_mutation: F,
+        segment_done: B,
+        on_rejected: R,
+        progress: Option<&mut dyn ReplayProgress>,
+    ) -> ferrosa_common::Result<Self>
+    where
+        F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
+        B: FnMut() -> ferrosa_common::Result<()>,
+        R: FnMut() -> ferrosa_common::Result<()>,
+    {
         let checkpoint = CommitLogCheckpoint::load(&config.checkpoint_dir)?;
         let segment_files = Self::scan_segment_files(&config.log_dir)?;
         // The new generation starts above every id on disk or in the
@@ -750,6 +801,7 @@ impl CommitLog {
                 &checkpoint,
                 on_mutation,
                 segment_done,
+                on_rejected,
                 tally,
             )
         });
@@ -784,17 +836,19 @@ impl CommitLog {
     /// Streams the previous generation's `segment_files` to `on_mutation`,
     /// handing each one to the retire thread only after the mutations its
     /// consumer re-logged into `self` are fsynced.
-    fn replay_segments<F, B>(
+    fn replay_segments<F, B, R>(
         &self,
         segment_files: &[(u64, PathBuf)],
         checkpoint: &HashMap<TableId, CommitLogPosition>,
         mut on_mutation: F,
         mut segment_done: B,
+        mut on_rejected: R,
         mut tally: ReplayTally<'_>,
     ) -> ferrosa_common::Result<()>
     where
         F: FnMut(Mutation, &ReplayRelog<'_>) -> ferrosa_common::Result<()>,
         B: FnMut() -> ferrosa_common::Result<()>,
+        R: FnMut() -> ferrosa_common::Result<()>,
     {
         let relog = ReplayRelog { log: self };
         // Unlinking is the retire thread's job: on a large log the unlinks
@@ -813,9 +867,17 @@ impl CommitLog {
                 tally.segment_done(index);
                 continue;
             }
+            let rejected;
             {
                 let mut reader = SegmentReader::open(path)?;
                 let entries = reader.read_all()?;
+                rejected = reader.rejected_records();
+                if rejected {
+                    // Keep the original bytes, and publish durable admission
+                    // evidence BEFORE any source retirement can be considered.
+                    fs::File::open(path)?.sync_all()?;
+                    on_rejected()?;
+                }
 
                 for (pos, mutation) in entries {
                     let table_id = TableId::new(&mutation.keyspace, &mutation.table);
@@ -841,7 +903,9 @@ impl CommitLog {
             replay_progress::test_trace::record(replay_progress::test_trace::Event::Synced {
                 path: path.clone(),
             });
-            retirer.retire(path.clone())?;
+            if !rejected {
+                retirer.retire(path.clone())?;
+            }
             tally.segment_done(index);
         }
         retirer.finish()?;
@@ -915,6 +979,23 @@ impl CommitLog {
         mutation: &Mutation,
         ack: AckPolicy,
     ) -> ferrosa_common::Result<CommitLogPosition> {
+        self.append_record(mutation, ack, None)
+    }
+
+    pub(crate) fn append_transaction_record(
+        &self,
+        record: &Mutation,
+        tables: &[TableId],
+    ) -> ferrosa_common::Result<CommitLogPosition> {
+        self.append_record(record, AckPolicy::CallerSyncs, Some(tables))
+    }
+
+    fn append_record(
+        &self,
+        mutation: &Mutation,
+        ack: AckPolicy,
+        batch_tables: Option<&[TableId]>,
+    ) -> ferrosa_common::Result<CommitLogPosition> {
         // DEBUG-level span so it costs nothing at the default INFO filter.
         let _span = tracing::debug_span!(
             "commitlog.write",
@@ -985,7 +1066,21 @@ impl CommitLog {
         // state — no global commit-log-level mutex on the hot path.
         let table_id = TableId::new(&mutation.keyspace, &mutation.table);
         let mark_dirty_start = Instant::now();
-        segment.mark_table_dirty(&table_id, position);
+        if let Some(tables) = batch_tables {
+            for (index, table) in tables.iter().enumerate() {
+                // Reader assigns stable ordered positions within the envelope,
+                // so CDC pagination and per-table flush checkpoints retain all members.
+                segment.mark_table_dirty(
+                    table,
+                    CommitLogPosition {
+                        offset: position.offset + index as u64,
+                        ..position
+                    },
+                );
+            }
+        } else {
+            segment.mark_table_dirty(&table_id, position);
+        }
         observe_duration(
             &COMMITLOG_APPEND_MARK_DIRTY_MICROS_TOTAL,
             &COMMITLOG_APPEND_MARK_DIRTY_MICROS_MAX,
@@ -1007,14 +1102,16 @@ impl CommitLog {
 
         // CDC: publish the local change-data-capture event after the write is
         // durable in the segment buffer (WrittenOnNode stream).
-        self.emit_written_on_node(
-            &mutation.keyspace,
-            &mutation.table,
-            &mutation.key,
-            &mutation.rows,
-            mutation.timestamp,
-            mutation.mutation_id,
-        );
+        if batch_tables.is_none() {
+            self.emit_written_on_node(
+                &mutation.keyspace,
+                &mutation.table,
+                &mutation.key,
+                &mutation.rows,
+                mutation.timestamp,
+                mutation.mutation_id,
+            );
+        }
 
         Ok(position)
     }

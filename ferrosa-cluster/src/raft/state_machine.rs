@@ -742,6 +742,10 @@ impl FerrosStateMachine {
         meta: SnapshotMeta<u64, BasicNode>,
         bytes: Vec<u8>,
     ) -> Result<(), StorageIOError<u64>> {
+        let lifecycle_schema = self.schema.clone();
+        let _lifecycle = lifecycle_schema
+            .as_ref()
+            .map(|schema| schema.lifecycle_write());
         let data: SnapshotData = decode_snapshot(&bytes)
             .map_err(|e| StorageIOError::read_state_machine(to_any_error(e)))?;
 
@@ -752,9 +756,12 @@ impl FerrosStateMachine {
         self.state = data.state;
         self.last_applied = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
+        self.sync_schema_and_engine_from_state("Raft snapshot")
+            .map_err(|e| {
+                StorageIOError::read_state_machine(to_any_error(std::io::Error::other(e)))
+            })?;
         self.publish_snapshot(meta, bytes);
         self.sync_ring();
-        self.sync_schema_and_engine_from_state("Raft snapshot");
         self.unregister_tables_dropped_by_snapshot(&dropped);
         Ok(())
     }
@@ -839,7 +846,48 @@ impl FerrosStateMachine {
         }
     }
 
-    fn sync_schema_and_engine_from_state(&self, context: &'static str) {
+    fn sync_schema_and_engine_from_state(&self, context: &'static str) -> Result<(), String> {
+        let _lifecycle = self.schema.as_ref().map(|schema| schema.lifecycle_write());
+        // A same-name table with a different UUID owns none of the local old
+        // incarnation's rows. Retire physical state before publishing its identity.
+        if let (Some(schema), Some(engine)) = (&self.schema, &self.engine) {
+            let local = schema.snapshot();
+            let mut retired = Vec::new();
+            for (name, incoming) in &self.state.tables {
+                if ferrosa_schema::is_system_keyspace(&name.0) {
+                    continue;
+                }
+                let tid = TableId::new(&name.0, &name.1);
+                let physical = engine.table_schema(&tid);
+                let physical_id = physical
+                    .as_ref()
+                    .and_then(|table| table.extensions.get(ferrosa_schema::TABLE_ID_EXTENSION))
+                    .map(|value| {
+                        Uuid::parse_str(value).map_err(|e| {
+                            format!("{context}: invalid stored table incarnation for {tid}: {e}")
+                        })
+                    })
+                    .transpose()?;
+                let known_id = physical_id.or_else(|| local.tables.get(name).map(|table| table.id));
+                match known_id {
+                    Some(id) if id != incoming.id => retired.push(tid),
+                    None if engine.memtable_size(&tid) > 0
+                        || table_has_local_artifacts(engine, &tid).map_err(|e| {
+                            format!("{context}: inspect unbound table {tid}: {e}")
+                        })? =>
+                    {
+                        return Err(format!("{context}: table {tid} has data but no authoritative local incarnation; restore schema provenance before retrying"));
+                    }
+                    _ => {}
+                }
+            }
+            // Validate every table before retiring any data.
+            for tid in retired {
+                engine
+                    .unregister_table(&tid)
+                    .map_err(|e| format!("{context}: retire superseded table {tid}: {e}"))?;
+            }
+        }
         // Propagate full state to local Schema if present.
         if let Some(schema) = &self.schema {
             let snap = ferrosa_schema::SchemaSnapshot {
@@ -893,9 +941,9 @@ impl FerrosStateMachine {
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect(),
             };
-            if let Err(e) = schema.apply_snapshot(snap) {
-                tracing::error!(%e, %context, "apply_snapshot to schema failed");
-            }
+            schema
+                .apply_snapshot(snap)
+                .map_err(|e| format!("{context}: apply schema snapshot: {e}"))?;
         }
 
         // Land every table's schema on the engine if present.
@@ -916,14 +964,17 @@ impl FerrosStateMachine {
                 let schema = table.to_storage_schema();
                 let table_id = TableId::new(&schema.keyspace, &schema.table);
                 if engine.table_schema(&table_id).is_some() {
-                    if let Err(e) = engine.update_table_schema(&table_id, schema) {
-                        tracing::error!(%e, %context, %table_id, "update_table_schema failed — node may serve a schema its Raft state contradicts");
-                    }
-                } else if let Err(e) = engine.register_table(schema) {
-                    tracing::error!(%e, %context, "register_table failed");
+                    engine
+                        .update_table_schema(&table_id, schema)
+                        .map_err(|e| format!("{context}: update table {table_id}: {e}"))?;
+                } else {
+                    engine
+                        .register_table(schema)
+                        .map_err(|e| format!("{context}: register table {table_id}: {e}"))?;
                 }
             }
         }
+        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
@@ -1157,6 +1208,10 @@ impl FerrosStateMachine {
                 }
             }
             RaftOp::DropKeyspace(name) => {
+                let lifecycle_schema = self.schema.clone();
+                let _lifecycle = lifecycle_schema
+                    .as_ref()
+                    .map(|schema| schema.lifecycle_write());
                 self.state.keyspaces.remove(&name);
                 // Collect tables to drop for engine unregistration.
                 let dropped_tables: Vec<(String, String)> = self
@@ -1230,6 +1285,10 @@ impl FerrosStateMachine {
 
             // ---- DDL: Tables -------------------------------------------
             RaftOp::CreateTable(table) => {
+                let lifecycle_schema = self.schema.clone();
+                let _lifecycle = lifecycle_schema
+                    .as_ref()
+                    .map(|schema| schema.lifecycle_write());
                 let key = (table.keyspace.clone(), table.name.clone());
                 let inserted = if let std::collections::btree_map::Entry::Vacant(entry) =
                     self.state.tables.entry(key)
@@ -1279,6 +1338,10 @@ impl FerrosStateMachine {
                 }
             }
             RaftOp::DropTable { keyspace, table } => {
+                let lifecycle_schema = self.schema.clone();
+                let _lifecycle = lifecycle_schema
+                    .as_ref()
+                    .map(|schema| schema.lifecycle_write());
                 self.state.tables.remove(&(keyspace.clone(), table.clone()));
                 // Also drop indexes on this table.
                 self.state
@@ -3482,6 +3545,127 @@ mod tests {
     /// value provided 3072` (3072 = vector<float,768>, the column that actually
     /// sits at index 3 in the stale ordering). It survived restarts, a snapshot
     /// install and a full raft reset.
+    #[test]
+    fn snapshot_preserves_rows_with_stored_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let engine = test_engine(dir.path());
+        let incoming = simple_table("incarnation_ks", "known");
+        engine.register_table(incoming.to_storage_schema()).unwrap();
+        let tid = TableId::new(&incoming.keyspace, &incoming.name);
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"known".to_vec()));
+        engine
+            .write(
+                &tid,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        let mut sm = FerrosStateMachine::with_side_effects(schema.clone(), engine.clone());
+        sm.state.tables.insert(
+            (incoming.keyspace.clone(), incoming.name.clone()),
+            incoming.clone(),
+        );
+        sm.sync_schema_and_engine_from_state("known incarnation regression")
+            .unwrap();
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        assert_eq!(
+            schema.snapshot().tables[&(incoming.keyspace, incoming.name)].id,
+            incoming.id
+        );
+    }
+
+    #[test]
+    fn snapshot_refuses_data_without_authoritative_local_incarnation() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let engine = test_engine(dir.path());
+        let incoming = simple_table("incarnation_ks", "unbound");
+        let mut legacy = incoming.to_storage_schema();
+        legacy.extensions.remove(ferrosa_schema::TABLE_ID_EXTENSION);
+        engine.register_table(legacy).unwrap();
+        let tid = TableId::new(&incoming.keyspace, &incoming.name);
+        let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+            b"unknown".to_vec(),
+        ));
+        engine
+            .write(
+                &tid,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+                },
+                1,
+            )
+            .unwrap();
+        let mut sm = FerrosStateMachine::with_side_effects(schema.clone(), engine.clone());
+        sm.state.tables.insert(
+            (incoming.keyspace.clone(), incoming.name.clone()),
+            incoming.clone(),
+        );
+        assert!(
+            sm.sync_schema_and_engine_from_state("unbound incarnation regression")
+                .is_err(),
+            "data without an authoritative local UUID must not be assigned an incoming UUID"
+        );
+        assert!(
+            engine.read(&tid, &key).unwrap().is_some(),
+            "ambiguous data must remain recoverable"
+        );
+        assert!(!schema
+            .snapshot()
+            .tables
+            .contains_key(&(incoming.keyspace, incoming.name)));
+    }
+
+    #[test]
+    fn snapshot_recreated_table_retires_old_physical_rows() {
+        use ferrosa_common::{DecoratedKey, PartitionKey};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(test_schema_instance());
+        let engine = test_engine(dir.path());
+        let old = simple_table("incarnation_ks", "t");
+        schema.create_table_internal(old.clone()).unwrap();
+        engine.register_table(old.to_storage_schema()).unwrap();
+        let tid = TableId::new(&old.keyspace, &old.name);
+        let key = DecoratedKey::new(PartitionKey::new(b"old".to_vec()));
+        let row = ferrosa_sstable::types::Row {
+            clustering: vec![],
+            cells: vec![],
+            deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+            primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(1),
+        };
+        engine.write(&tid, &key, row, 1).unwrap();
+        assert!(engine.read(&tid, &key).unwrap().is_some());
+        let mut replacement = old.clone();
+        replacement.id = Uuid::new_v4();
+        let mut sm = FerrosStateMachine::with_side_effects(schema.clone(), engine.clone());
+        sm.state.tables.insert(
+            (old.keyspace.clone(), old.name.clone()),
+            replacement.clone(),
+        );
+        sm.sync_schema_and_engine_from_state("incarnation regression")
+            .unwrap();
+        assert!(
+            engine.read(&tid, &key).unwrap().is_none(),
+            "restore reused storage from the previous table UUID"
+        );
+        assert_eq!(
+            schema.snapshot().tables[&(old.keyspace, old.name)].id,
+            replacement.id
+        );
+    }
+
     #[tokio::test]
     async fn recovering_a_snapshot_corrects_an_already_registered_stale_schema() {
         let dir = tempfile::tempdir().unwrap();

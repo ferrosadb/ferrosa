@@ -215,7 +215,11 @@ pub enum ColumnType {
     Float,
     Uuid,
     Bytea,
+    /// Timestamp without time zone, carried as `Value::Timestamp`.
     Timestamp,
+    /// UTC instant (PostgreSQL timestamptz), also carried as `Value::Timestamp`.
+    /// The column type preserves its timezone semantics independently of the payload.
+    TimestampTz,
     Date,
     Time,
     Inet,
@@ -536,5 +540,22 @@ mod tests {
         assert_ne!(ColumnType::Date, ColumnType::Time);
         assert_ne!(ColumnType::Inet, ColumnType::Numeric);
         assert_eq!(ColumnType::Numeric, ColumnType::Numeric);
+    }
+}
+
+#[cfg(test)]
+mod timestamp_regression {
+    use super::*;
+
+    #[test]
+    fn timestamp_timezone_is_part_of_the_column_type() {
+        assert_ne!(ColumnType::Timestamp, ColumnType::TimestampTz);
+        let column = Column::new("now", ColumnType::TimestampTz);
+        assert_eq!(column.ty, ColumnType::TimestampTz);
+        // Both temporal types carry microseconds; the column carries zone semantics.
+        assert_eq!(
+            Value::Timestamp(123).sql_cmp(&Value::Timestamp(123)),
+            Some(std::cmp::Ordering::Equal)
+        );
     }
 }

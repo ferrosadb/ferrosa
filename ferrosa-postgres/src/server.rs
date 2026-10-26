@@ -395,19 +395,30 @@ where
                 // Need more bytes for a complete frame. A client that sends
                 // nothing must not keep its suspended portals forever, so the
                 // wait ends early when the longest-idle one expires.
-                let n = match session.next_expiry(idle_timeout) {
-                    None => stream.read(read_buf).await?,
-                    Some(deadline) => tokio::select! {
-                        // `read` is cancel-safe: no bytes are lost if the
-                        // deadline wins.
-                        read = stream.read(read_buf) => read?,
-                        () = tokio::time::sleep_until(deadline.into()) => {
-                            let closed =
-                                session.expire_idle(std::time::Instant::now(), idle_timeout);
-                            ctx.portals.record_expiries(closed);
-                            continue;
+                let portal_deadline = session.next_expiry(idle_timeout);
+                let lifetime = session.idle_transaction_lifetime();
+                let n = tokio::select! {
+                    biased;
+                    () = async {
+                        match lifetime {
+                            Some(lifetime) => lifetime.until_expired().await,
+                            None => std::future::pending().await,
                         }
-                    },
+                    } => {
+                        session.expire_idle_transaction();
+                        continue;
+                    }
+                    () = async {
+                        match portal_deadline {
+                            Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let closed = session.expire_idle(std::time::Instant::now(), idle_timeout);
+                        ctx.portals.record_expiries(closed);
+                        continue;
+                    }
+                    read = stream.read(read_buf) => read?,
                 };
                 if n == 0 {
                     return Ok(()); // EOF: client closed
@@ -499,7 +510,8 @@ where
         FrontendMessage::Execute { portal, max_rows } => {
             // A pipeline is one implicit transaction until Sync, including on
             // a standalone node. Do not commit each Execute independently.
-            if !session.in_txn() {
+            session.start_statement();
+            if !session.in_txn() && !session.in_failed_txn() {
                 if let Err(error) = begin_implicit_transaction(ctx, session).await {
                     session.fail(error).encode(out);
                     return Ok(false);
@@ -586,9 +598,10 @@ async fn begin_implicit_transaction(
     // path) since the listener was built.
     let Some(committer) = ctx.accord.committer() else {
         session.begin_txn(
-            Some(ferrosa_sql::IsolationLevel::Serializable),
+            Some(ferrosa_sql::IsolationLevel::ReadCommitted),
             ctx.mvcc.snapshot(),
         );
+        session.txn_writes_mut().read_committed = true;
         return Ok(());
     };
     let cluster_ts = committer
@@ -660,8 +673,42 @@ impl<St: AsyncWrite + Unpin> ReplySink for SocketSink<'_, St> {
     }
 }
 
-/// Treat standalone PostgreSQL data statements as implicit transactions in
-/// cluster mode, so autocommit has the same Accord ordering as explicit BEGIN.
+/// Drop-safe statement execution: a cancelled future cannot leave buffered
+/// effects or writer ownership in a reusable session.
+struct StatementScope<'a> {
+    session: &'a mut Session,
+    explicit: bool,
+    extended: bool,
+    finished: bool,
+}
+impl<'a> StatementScope<'a> {
+    fn new(session: &'a mut Session, extended: bool) -> Self {
+        let explicit = session.in_txn() && !session.is_extended_implicit();
+        Self {
+            session,
+            explicit,
+            extended,
+            finished: false,
+        }
+    }
+}
+impl Drop for StatementScope<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            if self.explicit {
+                self.session.mark_txn_failed();
+            } else {
+                self.session.end_txn();
+            }
+            if self.extended {
+                self.session.mark_error();
+            }
+        }
+    }
+}
+
+/// Treat standalone data statements as implicit transactions: local writer
+/// ownership on Direct nodes, and Accord ordering in cluster mode.
 ///
 /// A `SELECT`'s rows are written to `out` as they are produced; the returned
 /// messages are the tail still to send (its `CommandComplete`, or the
@@ -677,6 +724,19 @@ pub(crate) async fn execute_simple_to<O: ReplySink>(
     sql: &str,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
+    let mut scope = StatementScope::new(session, false);
+    let result = execute_simple_scoped(ctx, scope.session, sql, out).await;
+    scope.finished = result.is_ok();
+    result
+}
+
+async fn execute_simple_scoped<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    sql: &str,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    session.start_statement();
     let is_data_statement = matches!(
         ferrosa_sql::parse_statement(sql),
         Ok(ferrosa_sql::Statement::Select(_)
@@ -690,7 +750,7 @@ pub(crate) async fn execute_simple_to<O: ReplySink>(
             // the cluster commit (and, there, to every serving node at CL=ALL).
             | ferrosa_sql::Statement::Truncate(_))
     );
-    if session.in_txn() || ctx.accord.committer().is_none() || !is_data_statement {
+    if session.in_txn() || session.in_failed_txn() || !is_data_statement {
         return execute_simple_inner(ctx, session, sql, out).await;
     }
     if let Err(error) = begin_implicit_transaction(ctx, session).await {
@@ -790,10 +850,17 @@ async fn begin_block(
     session: &mut Session,
     isolation: Option<ferrosa_sql::IsolationLevel>,
 ) -> Vec<BackendMessage> {
-    if isolation.is_some_and(|level| level != ferrosa_sql::IsolationLevel::Serializable) {
+    if isolation.is_some_and(|level| {
+        !matches!(
+            level,
+            ferrosa_sql::IsolationLevel::Serializable | ferrosa_sql::IsolationLevel::ReadCommitted
+        )
+    }) || (ctx.accord.committer().is_some()
+        && isolation == Some(ferrosa_sql::IsolationLevel::ReadCommitted))
+    {
         return vec![query::error_response(
             "0A000",
-            "only SERIALIZABLE isolation is supported for explicit PostgreSQL transactions",
+            "requested isolation requires a PostgreSQL implementation for this execution mode",
         )];
     }
     let snapshot = if let Some(committer) = ctx.accord.committer() {
@@ -810,6 +877,10 @@ async fn begin_block(
         ctx.mvcc.snapshot()
     };
     session.begin_txn(isolation, snapshot);
+    if ctx.accord.committer().is_none() {
+        session.txn_writes_mut().read_committed =
+            session.txn_isolation() != Some(ferrosa_sql::IsolationLevel::Serializable);
+    }
     vec![BackendMessage::CommandComplete {
         tag: "BEGIN".to_string(),
     }]
@@ -835,6 +906,11 @@ fn track_select_reads(
     }
     if let Some(row) = point_read_row_key(ctx, select) {
         if let Some(snapshot) = session.txn_snapshot() {
+            ctx.mvcc
+                .bind_relation(snapshot, &row.table, row.table_id)
+                .map_err(|_| {
+                    query::error_response("40001", "table incarnation changed during transaction")
+                })?;
             ctx.mvcc.record_point_read(snapshot, row);
         }
         // HYBRID read granularity: this read RESOLVED to a key, so the DISTRIBUTED commit
@@ -945,6 +1021,7 @@ fn point_read_row_key(
     }
     Some(crate::mvcc::RowKey {
         table: format!("{keyspace}.{}", select.from.table),
+        table_id: table.id,
         key: vec![column_value.clone()],
     })
 }
@@ -955,6 +1032,7 @@ fn read_env<'a>(
     snapshot: &'a crate::mvcc::MvccSnapshot,
 ) -> query::ReadEnv<'a> {
     query::ReadEnv {
+        timestamp_micros: query::wall_clock_micros(),
         engine: &ctx.engine,
         schema: &ctx.schema,
         default_schema: &ctx.default_schema,
@@ -972,6 +1050,7 @@ pub(crate) fn dml_context<'a>(
     txn: Option<&'a mut crate::TxnWriteSet>,
 ) -> query::DmlContext<'a> {
     query::DmlContext {
+        timestamp_micros: query::wall_clock_micros(),
         engine: &ctx.engine,
         mvcc: Some(&ctx.mvcc),
         schema: &ctx.schema,
@@ -1027,8 +1106,10 @@ async fn run_data_statement<O: ReplySink>(
     }
     let snapshot = read_snapshot(ctx, session);
     let in_txn = session.in_txn();
+    let mut env = read_env(ctx, &snapshot);
+    env.timestamp_micros = session.timestamp_micros();
     let msgs = query::execute_query_streaming(
-        read_env(ctx, &snapshot),
+        env,
         sql,
         if in_txn {
             Some(session.txn_writes_mut())
@@ -1089,7 +1170,8 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
     // write even when the writer never read the table itself (FMEA CL-72). Read
     // BEFORE the staging is consumed; it is one entry per TABLE, never per row.
     let written_tables = session.txn_writes_mut().written_tables();
-    let staged = match session.take_txn_stage() {
+    let read_committed = session.txn_writes_mut().read_committed;
+    let mut staged = match session.take_txn_stage() {
         Ok(staged) => staged,
         Err(error) => {
             session.end_txn();
@@ -1116,6 +1198,48 @@ async fn commit_txn(ctx: &QueryContext, session: &mut Session) -> Vec<BackendMes
         .txn_snapshot()
         .cloned()
         .unwrap_or_else(|| ctx.mvcc.snapshot());
+
+    let incarnation_validation = {
+        let _lifecycle = ctx.schema.lifecycle_read();
+        crate::txn_write_set::PgWriteSource::validate_incarnations(&staged, &ctx.schema)
+            .and_then(|()| ctx.mvcc.validate_relations(&ctx.schema, &snapshot))
+    };
+    if incarnation_validation.is_err() {
+        session.end_txn();
+        return vec![query::error_response(
+            "40001",
+            "table incarnation changed during transaction",
+        )];
+    }
+
+    if ctx.accord.committer().is_none() && !staged.is_empty() {
+        if let Err(error) = staged.acquire_writers(&ctx.mvcc, &snapshot).await {
+            session.end_txn();
+            return vec![error];
+        }
+    }
+    // Physical apply consumes the staged source. Keep ownership in this outer
+    // scope until MVCC has published and the entire commit has returned.
+    let _writers = std::mem::take(&mut staged.writers);
+    // The original lease still fences expiry and table incarnation. RC writers
+    // own their partitions from evaluation through publication; only their commit
+    // validation view advances. Serializable transactions retain their BEGIN view.
+    if !ctx.mvcc.snapshot_is_active(&snapshot) {
+        session.end_txn();
+        return vec![query::error_response(
+            "40001",
+            "PostgreSQL transaction snapshot expired",
+        )];
+    }
+    let snapshot = if read_committed {
+        let mut refreshed = ctx.mvcc.snapshot();
+        // Only visibility advances. Even synchronous preparation before the
+        // apply reservation must still validate the original BEGIN lifetime.
+        refreshed.lifetime = snapshot.lifetime.clone();
+        refreshed
+    } else {
+        snapshot
+    };
 
     // An empty write-set (`BEGIN; COMMIT;` with no DML, or only reads) is a
     // no-op that commits cleanly — there is nothing to apply, so no atomicity to
@@ -1469,7 +1593,8 @@ async fn describe(
                         Ok(pending) => pending,
                         Err(err) => return vec![session.fail(err)],
                     };
-                    let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+                    let mut scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+                    scalar_ctx.timestamp_micros = session.timestamp_micros();
                     match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => vec![
                             extended::parameter_description(&[]),
@@ -1580,7 +1705,8 @@ async fn describe(
                         Ok(pending) => pending,
                         Err(err) => return vec![session.fail(err)],
                     };
-                    let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+                    let mut scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+                    scalar_ctx.timestamp_micros = session.timestamp_micros();
                     match query::execute_scalar_select(&items, scalar_ctx).await {
                         Ok(result) => {
                             vec![extended::describe_portal_rows(
@@ -1682,6 +1808,26 @@ async fn execute_portal_to<O: ReplySink>(
     max_rows: i32,
     out: &mut O,
 ) -> std::io::Result<Vec<BackendMessage>> {
+    let mut scope = StatementScope::new(session, true);
+    let result = execute_portal_scoped(ctx, scope.session, portal_name, max_rows, out).await;
+    scope.finished = result.is_ok();
+    result
+}
+
+async fn execute_portal_scoped<O: ReplySink>(
+    ctx: &QueryContext,
+    session: &mut Session,
+    portal_name: &str,
+    max_rows: i32,
+    out: &mut O,
+) -> std::io::Result<Vec<BackendMessage>> {
+    session.start_statement();
+    if session.in_failed_txn() {
+        return Ok(vec![session.fail(query::error_response(
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        ))]);
+    }
     let is_data_statement = session
         .portal(portal_name)
         .and_then(|portal| session.statement(&portal.stmt_name))
@@ -1938,6 +2084,7 @@ async fn execute_portal_inner(
         return vec![session.fail(error)];
     }
 
+    let timestamp_micros = session.timestamp_micros();
     match parsed {
         // Routed to `execute_select_portal` before this point.
         PreparedKind::Select(_) => vec![session.fail(query::error_response(
@@ -1951,7 +2098,8 @@ async fn execute_portal_inner(
                 Ok(pending) => pending,
                 Err(err) => return vec![session.fail(err)],
             };
-            let scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+            let mut scalar_ctx = scalar_read_ctx(ctx, &snapshot, &pending);
+            scalar_ctx.timestamp_micros = session.timestamp_micros();
             match query::execute_scalar_select(&items, scalar_ctx).await {
                 Ok(result) => {
                     let msgs = query::render_execute_result(Ok(result), &result_formats);
@@ -1984,7 +2132,10 @@ async fn execute_portal_inner(
                 None
             };
             let msgs = query::execute_insert(
-                dml_context(ctx, transaction_writes),
+                query::DmlContext {
+                    timestamp_micros,
+                    ..dml_context(ctx, transaction_writes)
+                },
                 &ins,
                 &params,
                 returning_opts,
@@ -1998,7 +2149,15 @@ async fn execute_portal_inner(
             } else {
                 None
             };
-            let msgs = query::execute_update(dml_context(ctx, txn), &upd, &params).await;
+            let msgs = query::execute_update(
+                query::DmlContext {
+                    timestamp_micros,
+                    ..dml_context(ctx, txn)
+                },
+                &upd,
+                &params,
+            )
+            .await;
             execute_dml(session, msgs)
         }
         PreparedKind::Delete(del) => {
@@ -2007,7 +2166,15 @@ async fn execute_portal_inner(
             } else {
                 None
             };
-            let msgs = query::execute_delete(dml_context(ctx, txn), &del, &params).await;
+            let msgs = query::execute_delete(
+                query::DmlContext {
+                    timestamp_micros,
+                    ..dml_context(ctx, txn)
+                },
+                &del,
+                &params,
+            )
+            .await;
             execute_dml(session, msgs)
         }
     }
@@ -2052,6 +2219,7 @@ where
         "PostgreSQL listener TLS posture"
     );
     let tls = Arc::new(tls);
+    ctx.mvcc.attach_schema(ctx.schema.clone());
     let _snapshot_reaper = crate::mvcc::MvccManager::spawn_snapshot_reaper(ctx.mvcc.clone());
     // Install the MVCC observer before any connection can run, and via the
     // node's Accord-state slot rather than a committer: at this point the node
@@ -2662,10 +2830,15 @@ pub(crate) mod txn_atomicity_tests {
     }
 
     #[tokio::test]
-    async fn extended_pipeline_sync_reports_a_commit_conflict_and_returns_idle() {
+    async fn serializable_pipeline_sync_reports_a_commit_conflict_and_returns_idle() {
         let (_dir, ctx) = make_ctx().await;
         let mut session = Session::new(superuser());
         let (mut stream, mut client) = tokio::io::duplex(64 * 1024);
+        session.begin_txn(
+            Some(ferrosa_sql::IsolationLevel::Serializable),
+            ctx.mvcc.snapshot(),
+        );
+        session.mark_extended_implicit();
         pipeline_insert_frame(&mut stream, &ctx, &mut session, "sync_conflict", "loser").await;
         let mut other = Session::new(superuser());
         let messages = execute_simple(
@@ -3910,6 +4083,511 @@ pub(crate) mod txn_atomicity_tests {
         assert!(!session.in_txn() && !session.in_failed_txn());
         assert_eq!(row_count(&ctx, "z").await, 0);
 
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_rc_statement_releases_ownership_and_aborts_transaction() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut first = Session::new(superuser());
+        let mut second = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut first,
+            "INSERT INTO kv (k, v) VALUES ('one', '0'), ('two', '0')",
+        )
+        .await;
+        execute_simple(&ctx, &mut first, "BEGIN").await;
+        execute_simple(&ctx, &mut second, "BEGIN").await;
+        execute_simple(&ctx, &mut first, "UPDATE kv SET v = '1' WHERE k = 'one'").await;
+        execute_simple(&ctx, &mut second, "UPDATE kv SET v = '2' WHERE k = 'two'").await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(50),
+            execute_simple(&ctx, &mut first, "UPDATE kv SET v = '1' WHERE k = 'two'"),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the test must cancel a pending ownership wait"
+        );
+        assert!(
+            first.in_failed_txn(),
+            "a cancelled statement must poison its transaction"
+        );
+        let changed =
+            execute_simple(&ctx, &mut second, "UPDATE kv SET v = '2' WHERE k = 'one'").await;
+        assert_eq!(command_tag(&changed).as_deref(), Some("UPDATE 1"));
+        assert_eq!(
+            command_tag(&execute_simple(&ctx, &mut first, "COMMIT").await).as_deref(),
+            Some("ROLLBACK")
+        );
+        execute_simple(&ctx, &mut second, "ROLLBACK").await;
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn rc_writer_ownership_survives_physical_apply_until_publication() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('owned', 'before')",
+        )
+        .await;
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "UPDATE kv SET v = 'after' WHERE k = 'owned'",
+        )
+        .await;
+        let id = ctx.schema.snapshot().tables[&(ctx.default_schema.clone(), "kv".into())].id;
+        let key = ferrosa_row_bridge::build_decorated_key(
+            &[ferrosa_common::CqlValue::Text("owned".into())],
+            &[],
+        )
+        .unwrap();
+        let slot = crate::mvcc::writer_ownership::stripe(key.key.as_bytes());
+        let locks = ctx.mvcc.writers.clone();
+        crate::mvcc::AFTER_APPLY.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                assert!(
+                    locks.is_owned_for_test(id, slot),
+                    "ownership ended before MVCC publication"
+                );
+            }))
+        });
+        assert_eq!(
+            command_tag(&execute_simple(&ctx, &mut session, "COMMIT").await),
+            Some("COMMIT".into())
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_identity_and_staged_writes_survive_repeated_begin() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('same', 'before')",
+        )
+        .await;
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "UPDATE kv SET v = 'after' WHERE k = 'same'",
+        )
+        .await;
+        let original = ctx.mvcc.deadline_for_test(session.txn_snapshot().unwrap());
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        assert_eq!(
+            session.txn_write_count(),
+            1,
+            "BEGIN within a transaction must not release its staged writes/ownership"
+        );
+        assert_eq!(
+            ctx.mvcc.deadline_for_test(session.txn_snapshot().unwrap()),
+            original
+        );
+        assert_eq!(
+            command_tag(&execute_simple(&ctx, &mut session, "COMMIT").await).as_deref(),
+            Some("COMMIT")
+        );
+        let rows = execute_simple(&ctx, &mut session, "SELECT v FROM kv WHERE k = 'same'").await;
+        assert!(rows.iter().any(|m| matches!(m, BackendMessage::DataRow { columns } if columns == &vec![Some(b"after".to_vec())])));
+        ctx.engine.shutdown().unwrap();
+    }
+
+    async fn writer_commit_expiry_boundary(after_apply: bool) {
+        let (_dir, ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('boundary', 'before')",
+        )
+        .await;
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut session,
+            "UPDATE kv SET v = 'after' WHERE k = 'boundary'",
+        )
+        .await;
+        if after_apply {
+            let manager = ctx.mvcc.clone();
+            let id = ctx.schema.snapshot().tables[&(ctx.default_schema.clone(), "kv".into())].id;
+            let key = ferrosa_row_bridge::build_decorated_key(
+                &[ferrosa_common::CqlValue::Text("boundary".into())],
+                &[],
+            )
+            .unwrap();
+            let slot = crate::mvcc::writer_ownership::stripe(key.key.as_bytes());
+            crate::mvcc::AFTER_APPLY.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    assert!(manager.expire_all_snapshots_for_test() > 0);
+                    assert!(
+                        manager.writers.is_owned_for_test(id, slot),
+                        "expiry must not steal durable commit ownership"
+                    );
+                }))
+            });
+        } else {
+            crate::mvcc::MvccManager::expire_after_liveness_for_test(ctx.mvcc.clone());
+        }
+        let result = execute_simple(&ctx, &mut session, "COMMIT").await;
+        if after_apply {
+            assert_eq!(command_tag(&result).as_deref(), Some("COMMIT"));
+        } else {
+            assert!(
+                is_error(&result, "40001"),
+                "RC refresh must not reset original lifetime: {result:?}"
+            );
+        }
+        let rows =
+            execute_simple(&ctx, &mut session, "SELECT v FROM kv WHERE k = 'boundary'").await;
+        let expected = if after_apply {
+            b"after".to_vec()
+        } else {
+            b"before".to_vec()
+        };
+        assert_eq!(
+            rows.iter()
+                .filter_map(|m| match m {
+                    BackendMessage::DataRow { columns } => Some(columns.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![vec![Some(expected)]]
+        );
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_lifetime_expiring_before_apply_rolls_back() {
+        writer_commit_expiry_boundary(false).await;
+    }
+
+    #[tokio::test]
+    async fn writer_lifetime_expiring_after_apply_finishes_coherent_publication() {
+        writer_commit_expiry_boundary(true).await;
+    }
+
+    #[tokio::test]
+    async fn writer_resource_exhaustion_rolls_back_prior_staged_writes() {
+        let (_dir, mut ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('one', 'before'), ('two', 'before')",
+        )
+        .await;
+        Arc::get_mut(&mut ctx.mvcc).unwrap().writers =
+            crate::mvcc::writer_ownership::WriterLocks::with_limits_for_test(2, 1);
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        assert_eq!(
+            command_tag(
+                &execute_simple(
+                    &ctx,
+                    &mut session,
+                    "UPDATE kv SET v = 'after' WHERE k = 'one'"
+                )
+                .await
+            )
+            .as_deref(),
+            Some("UPDATE 1")
+        );
+        let failure = execute_simple(
+            &ctx,
+            &mut session,
+            "UPDATE kv SET v = 'after' WHERE k = 'two'",
+        )
+        .await;
+        assert!(is_error(&failure, "53200"));
+        assert!(session.in_failed_txn());
+        assert_eq!(session.txn_write_count(), 0);
+        assert_eq!(
+            command_tag(&execute_simple(&ctx, &mut session, "COMMIT").await).as_deref(),
+            Some("ROLLBACK")
+        );
+        for key in ["one", "two"] {
+            let rows = execute_simple(
+                &ctx,
+                &mut session,
+                &format!("SELECT v FROM kv WHERE k = '{key}'"),
+            )
+            .await;
+            assert_eq!(
+                rows.iter()
+                    .filter_map(|m| match m {
+                        BackendMessage::DataRow { columns } => Some(columns.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![vec![Some(b"before".to_vec())]]
+            );
+            execute_simple(&ctx, &mut session, "BEGIN").await;
+            assert_eq!(
+                command_tag(
+                    &execute_simple(
+                        &ctx,
+                        &mut session,
+                        &format!("UPDATE kv SET v = 'probe' WHERE k = '{key}'")
+                    )
+                    .await
+                )
+                .as_deref(),
+                Some("UPDATE 1")
+            );
+            execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        }
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_commit_resource_exhaustion_releases_partial_acquisition() {
+        let (_dir, mut ctx) = make_ctx().await;
+        let mut session = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut session,
+            "INSERT INTO kv (k, v) VALUES ('one', 'before'), ('two', 'before')",
+        )
+        .await;
+        Arc::get_mut(&mut ctx.mvcc).unwrap().writers =
+            crate::mvcc::writer_ownership::WriterLocks::with_limits_for_test(2, 1);
+        execute_simple(&ctx, &mut session, "BEGIN ISOLATION LEVEL SERIALIZABLE").await;
+        for key in ["one", "two"] {
+            assert_eq!(
+                command_tag(
+                    &execute_simple(
+                        &ctx,
+                        &mut session,
+                        &format!("UPDATE kv SET v = 'after' WHERE k = '{key}'")
+                    )
+                    .await
+                )
+                .as_deref(),
+                Some("UPDATE 1")
+            );
+        }
+        assert!(is_error(
+            &execute_simple(&ctx, &mut session, "COMMIT").await,
+            "53200"
+        ));
+        for key in ["one", "two"] {
+            let rows = execute_simple(
+                &ctx,
+                &mut session,
+                &format!("SELECT v FROM kv WHERE k = '{key}'"),
+            )
+            .await;
+            assert_eq!(
+                rows.iter()
+                    .filter_map(|m| match m {
+                        BackendMessage::DataRow { columns } => Some(columns.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+                vec![vec![Some(b"before".to_vec())]]
+            );
+            execute_simple(&ctx, &mut session, "BEGIN").await;
+            assert_eq!(
+                command_tag(
+                    &execute_simple(
+                        &ctx,
+                        &mut session,
+                        &format!("UPDATE kv SET v = 'probe' WHERE k = '{key}'")
+                    )
+                    .await
+                )
+                .as_deref(),
+                Some("UPDATE 1")
+            );
+            execute_simple(&ctx, &mut session, "ROLLBACK").await;
+        }
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_lifetime_is_original_begin_across_rc_refresh() {
+        let (_dir, mut ctx) = make_ctx().await;
+        ctx.mvcc = Arc::new(crate::mvcc::MvccManager::with_max_age_for_test(
+            Duration::from_secs(1),
+        ));
+        let mut session = Session::new(superuser());
+        execute_simple(&ctx, &mut session, "BEGIN").await;
+        let original = ctx.mvcc.deadline_for_test(session.txn_snapshot().unwrap());
+        for _ in 0..3 {
+            let refreshed = read_snapshot(&ctx, &session);
+            assert!(ctx.mvcc.deadline_for_test(&refreshed) >= original);
+            assert_eq!(
+                ctx.mvcc.deadline_for_test(session.txn_snapshot().unwrap()),
+                original
+            );
+            assert!(!is_error(
+                &execute_simple(&ctx, &mut session, "SELECT 1").await,
+                "40001"
+            ));
+        }
+        tokio::time::sleep_until(original.into()).await;
+        assert!(
+            is_error(
+                &execute_simple(&ctx, &mut session, "SELECT 1").await,
+                "40001"
+            ),
+            "original BEGIN age expires without waiting for a periodic reaper"
+        );
+        assert!(session.in_failed_txn());
+        ctx.engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_lifetime_expiry_wakes_waiter_and_releases_preowned_rows() {
+        use std::future::Future;
+        let (_dir, ctx) = make_ctx().await;
+        let mut owner = Session::new(superuser());
+        let mut waiter = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut owner,
+            "INSERT INTO kv (k, v) VALUES ('one', '0'), ('two', '0')",
+        )
+        .await;
+        execute_simple(&ctx, &mut owner, "BEGIN").await;
+        execute_simple(&ctx, &mut waiter, "BEGIN").await;
+        execute_simple(
+            &ctx,
+            &mut owner,
+            "UPDATE kv SET v = 'owner' WHERE k = 'one'",
+        )
+        .await;
+        execute_simple(
+            &ctx,
+            &mut waiter,
+            "UPDATE kv SET v = 'waiter' WHERE k = 'two'",
+        )
+        .await;
+        let mut waiting = Box::pin(execute_simple(
+            &ctx,
+            &mut waiter,
+            "UPDATE kv SET v = 'waiter' WHERE k = 'one'",
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            if ctx.mvcc.writers.has_waiters_for_test() {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        assert!(ctx.mvcc.expire_all_snapshots_for_test() >= 2);
+        let messages = tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("expired waiter must wake while owner still holds its lease");
+        assert!(is_error(&messages, "40001"));
+        assert!(waiter.in_failed_txn());
+        assert_eq!(waiter.txn_write_count(), 0);
+        drop(owner);
+        let mut fresh = Session::new(superuser());
+        let messages = execute_simple(
+            &ctx,
+            &mut fresh,
+            "UPDATE kv SET v = 'clean' WHERE k = 'two'",
+        )
+        .await;
+        assert_eq!(command_tag(&messages).as_deref(), Some("UPDATE 1"));
+        ctx.engine.shutdown().unwrap();
+    }
+
+    async fn read_ready_for_writer_test(client: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        let mut result = Vec::new();
+        loop {
+            let mut header = [0; 5];
+            client.read_exact(&mut header).await.unwrap();
+            let len = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+            let mut body = vec![0; len - 4];
+            client.read_exact(&mut body).await.unwrap();
+            result.extend_from_slice(&header);
+            result.extend_from_slice(&body);
+            if header[0] == b'Z' {
+                return result;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn writer_lifetime_expiry_releases_idle_owner_without_client_input() {
+        let (_dir, ctx) = make_ctx().await;
+        let mut seed = Session::new(superuser());
+        execute_simple(
+            &ctx,
+            &mut seed,
+            "INSERT INTO kv (k, v) VALUES ('idle', 'before')",
+        )
+        .await;
+        let id = ctx.schema.snapshot().tables[&(ctx.default_schema.clone(), "kv".into())].id;
+        let key = ferrosa_row_bridge::build_decorated_key(
+            &[ferrosa_common::CqlValue::Text("idle".into())],
+            &[],
+        )
+        .unwrap();
+        let slot = crate::mvcc::writer_ownership::stripe(key.key.as_bytes());
+        let (mut client, mut socket) = tokio::io::duplex(4096);
+        let mut frames = BytesMut::new();
+        frames.extend_from_slice(&pg_query("BEGIN"));
+        frames.extend_from_slice(&pg_query(
+            "UPDATE kv SET v = 'uncommitted' WHERE k = 'idle'",
+        ));
+        let serving = async {
+            query_loop(&mut socket, &mut frames, &ctx, superuser(), &mut [0; 1024])
+                .await
+                .unwrap();
+        };
+        let driving = async {
+            read_ready_for_writer_test(&mut client).await;
+            let updated = read_ready_for_writer_test(&mut client).await;
+            assert!(String::from_utf8_lossy(&updated).contains("UPDATE 1"));
+            assert!(ctx.mvcc.writers.is_owned_for_test(id, slot));
+            assert_eq!(ctx.mvcc.expire_all_snapshots_for_test(), 1);
+            let mut probe = crate::mvcc::writer_ownership::WriterLease::default();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                probe.acquire(&ctx.mvcc.writers, id, slot),
+            )
+            .await
+            .expect("idle expired owner must release without another frame")
+            .unwrap();
+            drop(probe);
+            client.write_all(&pg_query("SELECT 1")).await.unwrap();
+            let expired = read_ready_for_writer_test(&mut client).await;
+            assert!(String::from_utf8_lossy(&expired).contains("40001"));
+            client.write_all(&pg_query("COMMIT")).await.unwrap();
+            let rollback = read_ready_for_writer_test(&mut client).await;
+            assert!(String::from_utf8_lossy(&rollback).contains("ROLLBACK"));
+            client.write_all(&pg_frame(b'X', &[])).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(serving, driving);
+        })
+        .await
+        .unwrap();
+        let rows = execute_simple(&ctx, &mut seed, "SELECT v FROM kv WHERE k = 'idle'").await;
+        assert_eq!(
+            rows.iter()
+                .filter_map(|m| match m {
+                    BackendMessage::DataRow { columns } => Some(columns.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![vec![Some(b"before".to_vec())]]
+        );
         ctx.engine.shutdown().unwrap();
     }
 

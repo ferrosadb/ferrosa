@@ -1623,3 +1623,69 @@ index definitions are mapped by column name once per schema change; unchanged
 postings are reused, and columns absent from old rows produce no entries. Ordinary
 flushes borrow the existing catalog. This preserves indexed reads when ALTER adds
 a column that sorts before an indexed property, without copying the row batch.
+
+## Bounded local transaction records
+
+`apply_batch` / `BatchTxn::commit` now encode the complete resident mutation set
+in one CRC-protected commit-log envelope and force fsync before memtable apply.
+A torn envelope replays no prefix. The whole record must fit a fresh segment;
+preflight rejection applies and logs nothing. Existing ordinary records remain
+readable. This format uses a reserved internal keyspace marker and requires the
+new reader; older binaries cannot recover these transaction records.
+
+Replay expands a validated envelope into ordinary mutations with distinct,
+ordered virtual positions inside its physical record. Per-table dirty positions
+and CDC cursors use those positions, preserving checkpoints within a batch.
+Live CDC emits each real mutation after durable apply, never the envelope.
+Durable CDC retains the decoded envelope while paging its individual members. The separate
+streaming `write_atomic_batch` path retains its existing per-mutation WAL format.
+The storage primitive does not itself provide a cross-table read snapshot; the
+Bolt caller supplies a graph query publication barrier. Fsync failure after
+append has an uncertain durable outcome even though no memtable apply occurred.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+`PostgresMvccApplyObserver::acquire_postgres_apply` provides an owned lifecycle lease for the caller to retain through metadata preparation, atomic storage apply and publication. Production PostgreSQL observers validate every bound table UUID before returning a lease; all error paths release it by RAII. Storage continues to treat PostgreSQL metadata as opaque and adds no schema dependency. The default no-op hook preserves non-PostgreSQL/test observer compatibility; an observer protecting PostgreSQL incarnations must override it.
+
+
+### Offline recovery admission (2026-10-26)
+
+`StorageEngine::assert_table_recovery_complete(&TableId) -> ferrosa_common::Result<()>`
+is the storage-owned admission check for offline migration of a registered,
+quiesced local Direct table. Submit all pending mutations returned by `open` and
+finish deferred registration/replay before checking. It rejects any observed
+replay rejection, pending handoff/deferred/set-aside data, unreadable recovery
+status, and detectable table or stale-WAL quarantine artifacts. It is not a
+cluster fence: deployment must exclude old readers/writers and other nodes.
+
+Rejected replay records one bounded atomic JSON summary per table under
+`recovery-incomplete/`, outside lifecycle-managed SSTable directories. The summary
+contains no row payload or event history; forensic rows remain in the existing
+quarantine files. Recording precedes quarantine/checkpoint eligibility. Failed
+recording or quarantine returns an error and preserves the original/relogged
+frame; successful salvage can start the engine but cannot admit migration.
+Explicit/deferred failures keep the failed item and unattempted suffix queued.
+Incomplete tables do not advance WAL flush checkpoints, even after later valid
+writes. Repeated replay/restart never clears the summary. No automatic clearing,
+repair, or deletion is provided; this conservative retention can grow WAL disk
+usage until an operator chooses an authoritative recovery procedure.
+
+This contract covers recovery under this implementation plus observable older
+pending/quarantine artifacts. It cannot certify data silently discarded by older
+binaries with no remaining evidence; those datasets need an authoritative
+checkpoint or reimport. Dependencies and dependents are unchanged; SPARQL can
+use this public API without parsing storage files.
+
+Reader rejection is also covered: CRC failures, undecodable payloads, malformed
+transaction envelopes and nonempty rejected tails persist unknown-source evidence
+before survivors are delivered or a source segment can retire. Such evidence
+blocks admission for every table and survives restart. Normal empty padding and
+torn creation headers do not create false rejection evidence. Persistence failure
+returns an error and keeps the source bytes. Replay/checkpoint locking prevents
+flush from crossing an unhandled replay frame.
+
+Existing WAL must be recovered via `StorageEngine::open`. Constructors using
+`new` detect pre-existing WAL artifacts and refuse admission for that engine,
+without decoding or reimplementing WAL recovery. Fresh `new` engines can admit
+clean tables.

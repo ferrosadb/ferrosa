@@ -2,7 +2,7 @@
 //!
 //! Implements the ground-data ops (`INSERT DATA`, `DELETE DATA`) and the
 //! pattern-based ops (`DELETE WHERE`, `DELETE/INSERT … WHERE`, `CLEAR`, `DROP`)
-//! over the `rdf_triples` store (URS-QEC-D04). Pattern ops plan their WHERE
+//! over the `rdf_triples_v2` store (URS-QEC-D04). Pattern ops plan their WHERE
 //! clause through the SELECT executor to bind solutions, then tombstone each
 //! resulting ground triple via the same low-level [`StorageEngine`] path as
 //! `DELETE DATA`. Genuinely unimplemented ops fail loud (URS-QEC-X01).
@@ -45,6 +45,7 @@ pub async fn execute_update(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<UpdateResult, SparqlError> {
+    triple_store::refuse_legacy(storage, keyspace)?;
     // The parser recurses per nesting level without a limit.
     crate::nesting::check_nesting(update_str)?;
     let update = spargebra::SparqlParser::new()
@@ -134,12 +135,33 @@ pub async fn execute_update(
 fn validate_update(update: &spargebra::Update) -> Result<(), SparqlError> {
     for op in &update.operations {
         match op {
-            spargebra::GraphUpdateOperation::InsertData { .. }
-            | spargebra::GraphUpdateOperation::DeleteData { .. } => {
-                // `INSERT DATA` / `DELETE DATA` name their target graph on each
-                // quad and the writer keys rows by that graph component, so a
-                // named graph is addressable: nothing to reject. (The default
-                // graph's storage component is set by the writer.)
+            spargebra::GraphUpdateOperation::InsertData { data } => {
+                for quad in data {
+                    let (value, kind, dt, lang) = term_to_rdf(&quad.object)?;
+                    let term = triple_store::canonical_term(
+                        &kind,
+                        &value,
+                        dt.as_deref(),
+                        lang.as_deref(),
+                    )?;
+                    validate_key(
+                        &graph_name_str(&quad.graph_name),
+                        &named_node_or_var_str(&quad.subject)?,
+                        quad.predicate.as_str(),
+                        &term,
+                    )?;
+                }
+            }
+            spargebra::GraphUpdateOperation::DeleteData { data } => {
+                for quad in data {
+                    let triple = ground_quad_triple(quad)?;
+                    validate_key(
+                        &graph_name_str(&quad.graph_name),
+                        &triple.subject,
+                        &triple.predicate,
+                        &triple.object,
+                    )?;
+                }
             }
             spargebra::GraphUpdateOperation::DeleteInsert {
                 delete,
@@ -152,7 +174,38 @@ fn validate_update(update: &spargebra::Update) -> Result<(), SparqlError> {
                 // is the COPY/MOVE/ADD desugaring, which this engine does not
                 // honor — reject it up front, before any (possibly destructive)
                 // op runs, so the request is atomic.
-                resolve_delete_insert_graph(insert, delete, pattern)?;
+                let target = resolve_delete_insert_graph(insert, delete, pattern)?;
+                // Validate constants even in templates whose variables are unbound.
+                let empty = HashMap::new();
+                for tmpl in insert {
+                    let (kind, dt, lang) = object_metadata(&tmpl.object, &empty);
+                    let term = triple_store::canonical_term(
+                        &kind,
+                        &resolve_term(&tmpl.object, &empty).unwrap_or_default(),
+                        dt.as_deref(),
+                        lang.as_deref(),
+                    )?;
+                    validate_key(
+                        target.storage_graph(),
+                        &resolve_term(&tmpl.subject, &empty).unwrap_or_default(),
+                        &resolve_predicate(&tmpl.predicate, &empty).unwrap_or_default(),
+                        &term,
+                    )?;
+                }
+                for tmpl in delete {
+                    let term = resolve_ground_object(&tmpl.object, &empty).unwrap_or(Binding {
+                        binding_type: "uri".into(),
+                        value: String::new(),
+                        datatype: None,
+                        lang: None,
+                    });
+                    validate_key(
+                        target.storage_graph(),
+                        &resolve_ground_term(&tmpl.subject, &empty).unwrap_or_default(),
+                        &resolve_predicate(&tmpl.predicate, &empty).unwrap_or_default(),
+                        &term,
+                    )?;
+                }
             }
             spargebra::GraphUpdateOperation::Clear { graph, silent }
             | spargebra::GraphUpdateOperation::Drop { graph, silent } => {
@@ -356,34 +409,51 @@ async fn exec_delete_insert(
     let plan = crate::planner::plan_where(pattern, &scope)?;
     let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
-    let mut deleted = 0usize;
-    let mut inserted = 0usize;
-
-    for sol in &solutions {
-        for tmpl in delete {
-            if let Some(triple) = instantiate_ground_delete(tmpl, sol) {
-                delete_ground_triple(keyspace, target_graph, &triple, storage)?;
-                deleted += 1;
-            }
-        }
+    let deletes: Vec<_> = solutions
+        .iter()
+        .flat_map(|sol| {
+            delete
+                .iter()
+                .filter_map(move |tmpl| instantiate_ground_delete(tmpl, sol))
+        })
+        .collect();
+    let inserts: Vec<_> = solutions
+        .iter()
+        .flat_map(|sol| {
+            insert
+                .iter()
+                .filter_map(move |tmpl| instantiate_insert(tmpl, sol))
+        })
+        .collect();
+    for t in &deletes {
+        validate_key(target_graph, &t.subject, &t.predicate, &t.object)?;
     }
-    for sol in &solutions {
-        for tmpl in insert {
-            if let Some(triple) = instantiate_insert(tmpl, sol) {
-                write_triple(
-                    keyspace,
-                    target_graph,
-                    &triple.subject,
-                    &triple.predicate,
-                    &triple.object,
-                    &triple.obj_type,
-                    &triple.datatype,
-                    &triple.language,
-                    storage,
-                )?;
-                inserted += 1;
-            }
-        }
+    for t in &inserts {
+        let term = triple_store::canonical_term(
+            &t.obj_type,
+            &t.object,
+            t.datatype.as_deref(),
+            t.language.as_deref(),
+        )?;
+        validate_key(target_graph, &t.subject, &t.predicate, &term)?;
+    }
+    let deleted = deletes.len();
+    let inserted = inserts.len();
+    for triple in &deletes {
+        delete_ground_triple(keyspace, target_graph, triple, storage)?;
+    }
+    for triple in &inserts {
+        write_triple(
+            keyspace,
+            target_graph,
+            &triple.subject,
+            &triple.predicate,
+            &triple.object,
+            &triple.obj_type,
+            &triple.datatype,
+            &triple.language,
+            storage,
+        )?;
     }
 
     Ok((deleted, inserted))
@@ -399,41 +469,48 @@ async fn exec_clear(
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
 ) -> Result<usize, SparqlError> {
-    // The triple store is single-graph-per-keyspace; the partition-key graph
-    // component is the keyspace. DEFAULT / NAMED / ALL therefore all resolve to
-    // "every triple this engine can see for `keyspace`". A specific NamedNode
-    // target must match the keyspace's graph, else there is nothing to clear.
-    if let GraphTarget::NamedNode(n) = target {
-        if n.as_str() != keyspace {
-            return Ok(0);
+    use futures::StreamExt;
+    let table = triple_store::triples_table_id(keyspace);
+    let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
+    let mut triples = Vec::new();
+    let mut rows_read = 0usize;
+    while let Some(partition) = partitions.next().await {
+        let partition = partition?;
+        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
+        let selected = match target {
+            GraphTarget::NamedNode(n) => graph == n.as_str(),
+            GraphTarget::DefaultGraph => graph == "default",
+            GraphTarget::NamedGraphs => graph != "default",
+            GraphTarget::AllGraphs => true,
+        };
+        if !selected {
+            continue;
+        }
+        for row in &partition.rows {
+            rows_read += 1;
+            if rows_read > limits.max_rows {
+                return Err(SparqlError::Execution(format!(
+                    "SPARQL scan read more than {} storage rows during CLEAR/DROP",
+                    limits.max_rows
+                )));
+            }
+            if let Some((predicate, object)) = triple_store::decode_v2_row(row)? {
+                validate_key(&graph, &subject, &predicate, &object)?;
+                triples.push((
+                    graph.clone(),
+                    GroundTriple {
+                        subject: subject.clone(),
+                        predicate,
+                        object,
+                    },
+                ));
+            }
         }
     }
-
-    // Full scan: SELECT ?s ?p ?o WHERE { ?s ?p ?o } over the keyspace graph.
-    let scan = spargebra::SparqlParser::new()
-        .parse_query("SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
-        .map_err(|e| SparqlError::Parse(format!("{e}")))?;
-    let scope = crate::planner::TripleScope::new(keyspace, "default");
-    let plan = crate::planner::plan_query(&scan, &scope)?;
-    let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
-
-    let mut deleted = 0usize;
-    for sol in &solutions {
-        let s = sol.get("s");
-        let p = sol.get("p");
-        let o = sol.get("o");
-        if let (Some(s), Some(p), Some(o)) = (s, p, o) {
-            let triple = GroundTriple {
-                subject: s.value.clone(),
-                predicate: p.value.clone(),
-                object: o.value.clone(),
-            };
-            delete_ground_triple(keyspace, keyspace, &triple, storage)?;
-            deleted += 1;
-        }
+    for (graph, triple) in &triples {
+        delete_ground_triple(keyspace, graph, triple, storage)?;
     }
-
-    Ok(deleted)
+    Ok(triples.len())
 }
 
 /// A ground triple to tombstone. The graph it lives in is supplied by the
@@ -441,7 +518,7 @@ async fn exec_clear(
 struct GroundTriple {
     subject: String,
     predicate: String,
-    object: String,
+    object: Binding,
 }
 
 /// A ground triple to insert, carrying object typing metadata.
@@ -476,6 +553,29 @@ fn resolve_ground_term(term: &GroundTermPattern, sol: &HashMap<String, Binding>)
     }
 }
 
+/// Preserve the complete term when substituting a DELETE object variable.
+fn resolve_ground_object(
+    term: &GroundTermPattern,
+    sol: &HashMap<String, Binding>,
+) -> Option<Binding> {
+    match term {
+        GroundTermPattern::NamedNode(n) => Some(Binding {
+            binding_type: "uri".into(),
+            value: n.as_str().into(),
+            datatype: None,
+            lang: None,
+        }),
+        GroundTermPattern::Literal(l) => Some(Binding {
+            binding_type: "literal".into(),
+            value: l.value().into(),
+            datatype: Some(l.datatype().as_str().into()),
+            lang: l.language().map(str::to_owned),
+        }),
+        GroundTermPattern::Variable(v) => sol.get(v.as_str()).cloned(),
+        GroundTermPattern::Triple(_) => None,
+    }
+}
+
 /// Resolve a predicate pattern (named node or variable) against a solution.
 fn resolve_predicate(pred: &NamedNodePattern, sol: &HashMap<String, Binding>) -> Option<String> {
     match pred {
@@ -492,7 +592,7 @@ fn instantiate_ground_delete(
 ) -> Option<GroundTriple> {
     let subject = resolve_ground_term(&tmpl.subject, sol)?;
     let predicate = resolve_predicate(&tmpl.predicate, sol)?;
-    let object = resolve_ground_term(&tmpl.object, sol)?;
+    let object = resolve_ground_object(&tmpl.object, sol)?;
     Some(GroundTriple {
         subject,
         predicate,
@@ -579,23 +679,52 @@ fn delete_ground_quad(
     keyspace: &str,
     storage: &Arc<StorageEngine>,
 ) -> Result<(), SparqlError> {
-    let graph = match &quad.graph_name {
-        spargebra::term::GraphName::NamedNode(n) => n.as_str().to_string(),
-        spargebra::term::GraphName::DefaultGraph => "default".to_string(),
-    };
-    let subject = quad.subject.as_str().to_string();
-    let predicate = quad.predicate.as_str().to_string();
-    let object = match &quad.object {
-        spargebra::term::GroundTerm::NamedNode(n) => n.as_str().to_string(),
-        spargebra::term::GroundTerm::Literal(l) => l.value().to_string(),
-        spargebra::term::GroundTerm::Triple(t) => format!("<<{t}>>"),
-    };
+    let triple = ground_quad_triple(quad)?;
+    delete_ground_triple(
+        keyspace,
+        &graph_name_str(&quad.graph_name),
+        &triple,
+        storage,
+    )
+}
 
-    tombstone_triple(keyspace, &graph, &subject, &predicate, &object, storage)
+fn ground_quad_triple(quad: &GroundQuad) -> Result<GroundTriple, SparqlError> {
+    let object = match &quad.object {
+        spargebra::term::GroundTerm::NamedNode(n) => {
+            triple_store::canonical_term("uri", n.as_str(), None, None)?
+        }
+        spargebra::term::GroundTerm::Literal(l) => triple_store::canonical_term(
+            "literal",
+            l.value(),
+            Some(l.datatype().as_str()),
+            l.language(),
+        )?,
+        spargebra::term::GroundTerm::Triple(_) => {
+            return Err(SparqlError::Plan(
+                "quoted triple identity is not supported".into(),
+            ));
+        }
+    };
+    Ok(GroundTriple {
+        subject: quad.subject.as_str().into(),
+        predicate: quad.predicate.as_str().into(),
+        object,
+    })
+}
+
+fn validate_key(
+    graph: &str,
+    subject: &str,
+    predicate: &str,
+    term: &Binding,
+) -> Result<(), SparqlError> {
+    triple_store::checked_partition_key(graph, subject)?;
+    triple_store::encode_clustering(predicate, term)?;
+    Ok(())
 }
 
 /// Shared low-level tombstone primitive: write a deletion-marker row for the
-/// triple `(graph, subject, predicate, object)` in `keyspace.rdf_triples`.
+/// triple `(graph, subject, predicate, object)` in `keyspace.rdf_triples_v2`.
 ///
 /// This is the ONE path every SPARQL delete (`DELETE DATA`, `DELETE WHERE`,
 /// `DELETE/INSERT … WHERE`, `CLEAR`, `DROP`) funnels through, so the tombstone
@@ -605,18 +734,18 @@ fn tombstone_triple(
     graph: &str,
     subject: &str,
     predicate: &str,
-    object: &str,
+    object: &Binding,
     storage: &Arc<StorageEngine>,
 ) -> Result<(), SparqlError> {
     let table_id = triple_store::triples_table_id(keyspace);
-    let key = triple_store::partition_key(graph, subject);
+    let key = triple_store::checked_partition_key(graph, subject)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let timestamp = now.as_micros() as i64;
 
     // Build clustering key matching the triple to delete.
-    let clustering = encode_triple_clustering(predicate, object);
+    let clustering = triple_store::encode_clustering(predicate, object)?;
 
     // Write a pure row tombstone (deletion marker). The primary-key liveness
     // MUST be NONE — a LIVE liveness would resurrect the row as an empty live
@@ -635,21 +764,6 @@ fn tombstone_triple(
     Ok(())
 }
 
-/// Encode the `(predicate, object)` clustering key for an `rdf_triples` row.
-///
-/// Strict CQL composite-clustering encoding: `[u16 len][bytes]` per column with
-/// NO separator byte (validated by `ferrosa-common::schema`). Shared by inserts
-/// and tombstones so a tombstone's clustering exactly matches the live row it
-/// must shadow (URS-QEC-D07/X02).
-fn encode_triple_clustering(predicate: &str, object: &str) -> Vec<u8> {
-    let mut clustering = Vec::new();
-    clustering.extend_from_slice(&(predicate.len() as u16).to_be_bytes());
-    clustering.extend_from_slice(predicate.as_bytes());
-    clustering.extend_from_slice(&(object.len() as u16).to_be_bytes());
-    clustering.extend_from_slice(object.as_bytes());
-    clustering
-}
-
 #[allow(clippy::too_many_arguments)]
 fn write_triple(
     keyspace: &str,
@@ -662,14 +776,18 @@ fn write_triple(
     language: &Option<String>,
     storage: &Arc<StorageEngine>,
 ) -> Result<(), SparqlError> {
+    let term =
+        triple_store::canonical_term(obj_type, object, datatype.as_deref(), language.as_deref())?;
+    let datatype = &term.datatype;
+    let language = &term.lang;
     let table_id = triple_store::triples_table_id(keyspace);
-    let key = triple_store::partition_key(graph, subject);
+    let key = triple_store::checked_partition_key(graph, subject)?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_micros() as i64;
 
-    let clustering = encode_triple_clustering(predicate, object);
+    let clustering = triple_store::encode_clustering(predicate, &term)?;
 
     let mut cells = Vec::new();
     cells.push((
@@ -689,6 +807,7 @@ fn write_triple(
         ));
     }
 
+    cells.sort_by_key(|(ordinal, _)| *ordinal);
     let row = Row {
         clustering,
         cells,

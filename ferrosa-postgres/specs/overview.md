@@ -14,8 +14,11 @@ executive_summary: >
   and conflict validation. In standalone mode, validation uses local table
   epochs. In cluster mode, a global PostgreSQL marker conservatively rejects a
   snapshot if any PostgreSQL data transaction committed after it; the supplied
-  table set is not yet used for per-table Accord validation. Explicit isolation
-  modes other than SERIALIZABLE fail with `0A000`. Accord applies PostgreSQL
+  table set is not yet used for per-table Accord validation. Direct/default and
+  explicit READ COMMITTED use statement snapshots and bounded local writer
+  ownership; cluster READ COMMITTED remains a separate implementation requirement.
+  REPEATABLE READ and explicit cluster READ COMMITTED currently fail with `0A000`.
+  Accord applies PostgreSQL
   row-version metadata to every replica. CQL/Cassandra transactions remain on
   Accord's existing path. The native-driver Jepsen workload records transfer,
   register, predicate/phantom, and write-skew histories, including a single
@@ -384,3 +387,105 @@ row materialization, while physical CQL decoding and the owned MVCC image copy
 remain. Tests pin zero-allocation payload validation, conversion-error parity, and
 a corrupt physical payload failing even when MVCC holds a valid replacement.
 The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.
+
+## Transaction timestamp expressions (t_6b946676)
+
+`CURRENT_TIMESTAMP` and `now()` work in no-FROM SELECTs and DML scalar values,
+including stock pgbench history INSERTs and UPDATE assignments. The session
+captures a statement wall clock before execution; BEGIN pins that clock until
+COMMIT/ROLLBACK. An implicit extended-protocol pipeline keeps its clock until
+Sync. Autocommit statements capture a fresh clock. Parse/Describe do not freeze
+prepared values; Execute evaluates them using its transaction's clock.
+
+Clock SELECT results advertise `timestamptz` (OID 1184), with UTC text (`+00`) and
+PostgreSQL-epoch binary microseconds. Assignment to a `timestamp` column uses UTC
+and RETURNING retains OID 1114. The SQL column type distinguishes the two temporal
+types; both use the existing microsecond value representation. Persisted CQL
+`timestamp` cells still have millisecond precision. `timestamptz` table DDL,
+non-UTC session timezone conversion, precision arguments, and other clock
+functions remain unsupported. Unknown functions fail loudly.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+PostgreSQL MVCC uses `(qualified table name, TableMetadata.id)` for images, row conflicts, scan epochs and reservations. Statement-bound UUIDs accompany buffered writes and survive write-set spill. Local COMMIT validates the entire set before storage effects while holding a synchronous shared schema lifecycle lease; a retired incarnation aborts the transaction with SQLSTATE `40001`, including its unrelated writes. Reads bind the same UUID and refuse rebinding a retained snapshot to a replacement. Unrelated table histories remain intact.
+
+Accord partition metadata and row images carry the UUID in the canonical Cap'n Proto schema. The replica apply lease spans validation, storage apply and MVCC publication. Missing/invalid legacy UUID metadata is rejected, including replay; it is never assigned the current table ID. Upgrade requires draining/checkpointing legacy PostgreSQL Accord work and upgrading all participating readers/writers together. Additive fields alone do not make mixed old/new binaries safe: old readers ignore the UUID. This change does not rewrite historical metadata or introduce a storage-WAL migration.
+
+The existing distributed TRUNCATE all-serving fan-out bypasses Accord MVCC observers. Its raw marker protocol is unchanged; although buffered/local incarnation checks apply, this change does not fence that remote fan-out against concurrent remote DROP.
+
+
+### PostgreSQL index DDL readiness boundary (t_9fba4678)
+
+`ClusterDdl::create_index` applies schema DDL through `DdlPath`, then on Direct
+awaits engine declaration and complete tracker readiness, with a 30-second
+post-apply deadline. It checks the pre-apply table UUID under a short synchronous
+schema lifecycle read lease on each observation; no lease spans an await. A
+retired table, missing registration, build failure, or changed deployment path
+returns an error. SSTable retirement follows the tracker's replacement coverage;
+the wait does not cache the original pending generation list or mark anything
+current. Future cancellation drops only the wait; schema/backfill remain durable.
+
+Pair/cluster index DDL is refused before index creation because DdlPath schema
+acknowledgements have no all-serving-replica build readiness guarantee. Completing
+that protocol needs incarnation-aware replica evidence and membership fencing
+outside Raft apply. The SQL CREATE INDEX parser and wire CancelRequest remain
+unfinished. No query, MVCC, timestamp, storage guard or shared apply code changes
+are part of this boundary.
+
+Binding a replacement lazily reclaims only retired-incarnation MVCC heads and scan keys. Active snapshots retain their immutable historical roots until release/expiry; unrelated tables are not cleared.
+
+## Local READ COMMITTED (t_3c15a13f)
+
+Default and explicit RC transactions on Direct/single-node execution use a fresh
+committed view for each statement, including UPDATE/DELETE candidate selection,
+with staged own writes overlaid. A row must match initially before it can wait
+for ownership. After waiting, the row and full predicate are re-evaluated before
+computing the mutation. The existing streaming provider supplies bounded row
+channels and MVCC recovery of deleted rows; stable declared-key index lookups keep
+the normal keyed path. A raced index uses the statement's MVCC scan.
+
+`writer_ownership.rs` is a focused child module of `mvcc`: table-UUID-scoped,
+1,024 partition hash stripes per live table, owned by the staged transaction and
+moved to the commit scope until after MVCC publication. Stable transaction identities
+and explicit FIFO predecessor edges detect cycles; the closing requester receives
+`40P01`. Default lock timeout is disabled. A short metadata mutex protects atomic
+admission/handoff/removal, never evaluation, await or storage I/O. Pending RAII guards
+cover grant-before-wakeup cancellation as well as queued cancellation. Payload
+staging still spills. Hash collisions can serialize disjoint partitions within a
+table (1/1,024 for uniform keys); unrelated tables never share ownership.
+
+Direct RC validates the original lease/incarnations, obtains all remaining writer
+scopes, then uses a fresh commit view. SERIALIZABLE uses its original snapshot.
+Late synchronous bulk writers keep conservative conflict validation to avoid
+acknowledging stale timestamps; full COPY contention semantics remain required.
+Execution-future cancellation aborts an explicit transaction and releases its
+writers. Error handling preserves `25P02` through Sync until COMMIT/ROLLBACK;
+COMMIT of an aborted transaction reports ROLLBACK. SQL transaction timestamps are
+unchanged. No schema/cluster/storage internals or dependencies changed.
+
+The local ownership domain does not coordinate remote Accord or CQL writers.
+Distributed READ COMMITTED needs distributed ownership and statement-snapshot
+ordering; this cycle does not claim cluster parity or add wire CancelRequest.
+
+### Writer admission and original lifetime (t_87e93bce)
+
+Each local manager admits at most 16,384 live writer identities and 262,144 held
+plus pending resource references, returning `53200` on exhaustion. Empty entries
+are reclaimed. Cycle checks are iterative and bounded by admitted identities;
+these budgets are resource limits, not a byte-accurate memory claim. No row payload
+enters the graph, and existing 1,024-stripe collision behavior is unchanged.
+
+The original snapshot owns an absolute lifetime and expiry notification, shared
+with its writer lease. RC visibility refresh never resets that lifetime. The reaper
+publishes expiry notifications only after successful CAS; acquisition and the idle
+session perform cleanup. Idle expiry discards writes/read state/portals and retains
+the expired snapshot for the next command's `40001`. Waiting expiry also returns
+`40001`. Repeated BEGIN preserves staged writes, identity and lifetime. Commit
+refresh carries the original lifetime through pre-apply validation; post-apply
+expiry cannot revoke ownership or interrupt publication. No statement is retried.
+
+SET/RESET/SHOW positive lock_timeout remains t_cc11529a. Native CancelRequest and
+prompt blocked-execution EOF/Terminate remain t_b254fd86. This cycle tests execution
+future/drop cancellation only, not wire cancellation. Distributed RC and early
+COPY ownership remain t_b6306006 and t_4c825e03.

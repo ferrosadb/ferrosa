@@ -2,24 +2,24 @@
 
 > SPARQL 1.1 Query + Update endpoint for ferrosa, built on `spargebra`/`oxrdf`,
 > translating algebra trees into reads and writes against a single CQL-backed
-> `rdf_triples` table.
+> `rdf_triples_v2` table.
 
 ## What this crate is
 
 `ferrosa-sparql` is the W3C SPARQL front-end. It parses SPARQL with `spargebra`,
-plans the algebra into storage operations against ferrosa's `rdf_triples` table
-(`((graph, subject), predicate, object)`), executes them via the cluster write
+plans the algebra into storage operations against ferrosa's `rdf_triples_v2` table
+(`((graph, subject), predicate, object, object_identity)`), executes them via the cluster write
 path, and serializes results with hand-written JSON / XML / N-Triples / Turtle
 encoders. The HTTP surface implements the SPARQL 1.1 Protocol over `axum`, and
 serves HTTPS only when `SparqlHttpConfig` carries a certificate (`[sparql]
 tls_cert/tls_key`); `require_tls` without one refuses to start (t_d5d122ba). The
 rustls config comes from `ferrosa_net::tls`, the process's single crypto provider.
 
-Its model is **one RDF graph per keyspace**: the `graph` partition-key component
-is the keyspace name, and there is exactly one `rdf_triples` table per keyspace.
-Operations that would address a *different* named graph (the `ADD`/`MOVE`/`COPY`
-desugaring, `GRAPH <g> { … }` reads, named-graph insert/delete targets) are
-**rejected fail-loud** rather than silently retargeted to the default graph.
+Each keyspace has one active v2 table. Its `(graph, subject)` partition key
+separates the default graph (`default`) and named graphs. Named `GRAPH <g>` reads
+and same-graph inserts/deletes are supported; variable graph names and cross-graph
+`ADD`/`MOVE`/`COPY` requests remain unsupported. Existing v1 datasets are refused
+until explicit offline migration completes, including empty registered v1 schemas.
 
 ## What's implemented
 
@@ -27,7 +27,7 @@ desugaring, `GRAPH <g> { … }` reads, named-graph insert/delete targets) are
   `DESCRIBE <iri>` and `DESCRIBE ?var WHERE { … }`).
 - **Graph-pattern coverage** — BGPs, `PROJECT`, `DISTINCT`/`REDUCED`,
   `SLICE` (LIMIT/OFFSET), `ORDER BY` (over arbitrary supported expressions),
-  `FILTER`, `UNION` (concatenated), property paths. Multi-pattern joins run as a
+  `FILTER`, `BIND`/`Extend`, explicit `Join`, `UNION` (concatenated), property paths. Multi-pattern joins run as a
   nested-loop join with binding-compatibility checks.
 - **Property paths** — `+` (OneOrMore), `*` (ZeroOrMore), `?` (ZeroOrOne),
   reverse (`^`) over a single predicate, evaluated by in-memory BFS with cycle
@@ -37,8 +37,9 @@ desugaring, `GRAPH <g> { … }` reads, named-graph insert/delete targets) are
   `ABS`, `CEIL`, `FLOOR`, `ROUND`. Unsupported FILTER sub-forms evaluate to Null.
 - **Update** — `INSERT DATA`, `DELETE DATA`, `DELETE WHERE`,
   `DELETE/INSERT … WHERE`, `CLEAR`, `DROP`, `CREATE` (no-op). All deletes funnel
-  through one tombstone primitive. `LOAD` and named-graph ops fail loud; the
-  whole request is validated up-front for atomicity (no partial mutation).
+  through one tombstone primitive. `LOAD` and unsupported cross-graph ops fail loud. Constant key lengths are
+  prevalidated across the request; instantiated pattern keys are validated before
+  applying that operation. Storage failures are not transactionally rolled back.
 - **RDF\* (SPARQL-star)** — quoted triples `<< s p o >>` **parse** (via the
   `sparql-12` feature) but annotation evaluation is **not implemented**: the
   planner rejects quoted triples in subject/object position fail-loud.
@@ -51,8 +52,8 @@ desugaring, `GRAPH <g> { … }` reads, named-graph insert/delete targets) are
 ## How it works
 
 Five-stage pipeline: **parse** (`spargebra`) → **plan**
-(`planner::plan_query` → `QueryPlan` of `TripleOp`s) → **execute**
-(`executor::execute`, nested-loop join, then FILTER → ORDER BY → DISTINCT →
+(`planner::plan_query` → `QueryPlan` of storage operations and ordered `PlanStep`s) → **execute**
+(`executor::execute`, algebra-ordered joins/FILTER/BIND, then ORDER BY → DISTINCT →
 LIMIT/OFFSET) → **shape** (ASK boolean / CONSTRUCT+DESCRIBE graph assembly in
 `engine.rs`) → **serialize** (`results.rs`).
 
@@ -70,6 +71,29 @@ the object is bound, or `PropertyPath` (BFS) for closure operators. The access
 path is only a *pushdown*: every constant in the triple pattern is enforced
 again when a row is bound, so choosing a path on one constant never discards
 another.
+
+### BIND / Extend semantics
+
+An empty BGP produces one empty solution. Each `BIND` evaluates against its
+inner solutions; dependent bindings run in algebra order. FILTERs stay at their
+algebra position, and explicit JOIN operands evaluate independently before
+compatibility matching. This prevents an earlier BIND or a nested FILTER from
+reading variables introduced later or outside its scope. SELECT and
+`execute_bindings` (the UPDATE binding path) share this evaluation.
+
+Constants and variable aliases retain their RDF term kind, lexical form,
+datatype and language. Arithmetic currently supports signed 64-bit integer
+operands: `+`, `-`, `*`, unary signs, and `/`. Integer results never pass through
+floating point. Integer division produces `xsd:decimal` using integer long
+division, truncated toward zero after at most 18 fractional digits. Unbound
+operands, type errors, integer overflow and division by zero leave only the
+BIND target unbound; the solution and its other bindings survive.
+
+This is a bounded expression subset: other BIND expression forms fail during
+planning, and decimal/float/double arithmetic operands fail explicitly during
+execution. Literal constants and aliases of those datatypes still work. Existing
+FILTER/ORDER BY expression limitations and OPTIONAL/UNION gaps remain; this does
+not claim full SPARQL expression conformance.
 
 ### Scans stream, and the bound is real
 
@@ -118,10 +142,10 @@ case the scan runs to completion under the bound instead. `ASK` is planned with
 |------|-------|
 | Engine | `SparqlEngine::{new, execute, execute_update}`, `SparqlConfig`, `SparqlResult`, `ConstructedTriple` |
 | HTTP | `start_sparql_http`, `build_router` (internal), `SparqlHttpConfig`, `AppState` |
-| Planner | `plan_query`, `plan_where`, `QueryPlan`, `TripleOp`, `GraphQueryMode`, `OrderCondition` |
+| Planner | `plan_query`, `plan_where`, `QueryPlan`, `PlanStep`, `TripleOp`, `GraphQueryMode`, `OrderCondition` |
 | Executor | `execute`, `execute_bindings`, `ExecutionLimits`, `DEFAULT_MAX_ROWS`, `extract_subject_from_key`, `clustering_component` |
 | Update | `execute_update`, `UpdateResult` |
-| Triple store | `rdf_triples_schema`, `triples_table_id`, `partition_key`, `RdfTriple`, `ObjectType` |
+| Triple store | `rdf_triples_schema`, `triples_table_id`, `canonical_term`, `checked_partition_key`, `encode_clustering`, `decode_v2_row`; migration input: `rdf_triples_v1_schema`, `decode_v1_row` |
 | Results | `SparqlJsonResults`, `Binding`, `SparqlAskResult`, `ResultFormat` |
 | Errors | `SparqlError` |
 
@@ -155,7 +179,8 @@ External: `spargebra`, `oxrdf` (both with `sparql-12`/`rdf-12`),
 
 ## Tests
 
-83 in-crate unit tests plus 5 integration suites.
+Unit tests and storage-backed integration suites exercise full-term identity,
+legacy survivor preservation, interrupted migration, recovery refusal and restart.
 
 **Invariant suites** — these drive `executor::execute` END TO END (a real
 `QueryPlan` from the real planner, a real `WritePath` over a temp
@@ -165,8 +190,7 @@ true of a SPARQL engine, rather than describing what the code currently does:
 - `tests/sparql_executor_invariants.rs` — constant-term enforcement in every
   position, read-path agreement between a point lookup and a full scan, delete
   honesty, LIMIT/OFFSET totality over any `usize`, DISTINCT exactness.
-  **4 of these currently FAIL** against t_af4eb9f0; see
-  [specs/fmea.md](specs/fmea.md) SP-11.
+  See [specs/fmea.md](specs/fmea.md) for historical failure context.
 - `tests/sparql_scan_bound_invariants.rs` (10) — completeness (complete result
   or an error, never a silent truncation) and boundedness (`LIMIT n` does not
   read the whole table), asserted without timing by setting `max_rows` below the
@@ -183,3 +207,25 @@ Coverage gaps — OPTIONAL, real UNION semantics, auth, join cost — are tracke
 - [Architecture overview](specs/overview.md) — module map, data flow, invariants
 - [FMEA / known issues](specs/fmea.md) — failure modes + real gaps
 - [Roadmap](specs/roadmap.md) — Now / Next / Later
+
+## RDF term identity and offline migration (t_16b96d45)
+
+Fresh datasets use v2. Object identity includes kind, original lexical form,
+datatype IRI and normalized language. Plain literals equal xsd:string; numeric
+lexical forms, unknown datatypes and ill-typed values are preserved. Keys use a
+versioned, tagged, length-checked codec. Strict reads reject malformed identities
+and key/cell disagreement. Lexical object-index hits are candidates and undergo
+full-term matching. Full identities survive bindings, DISTINCT, property paths,
+INSERT and all DELETE/CLEAR/DROP variants.
+
+V1 schema/directory/set-aside evidence refuses serving and writes until an
+explicit `migration::OfflineMigration` completes. The local Direct API requires
+operator exclusion of all old/new readers, writers, migrators and lifecycle
+operations throughout every pass. It recovers storage, checks durable recovery
+admission, streams surviving terms into v2, validates index coverage and exact
+survivor counts, and atomically publishes a bounded cutover marker. Interrupted
+copies remain unservable and can resume without resetting data. Completed reruns
+never recopy v1, preventing resurrection after v2 deletes. Source and target
+incarnations bind the marker; legacy data remains retained. Pair/Cluster/degraded
+migration and downgrade require separate rollout work; this API does not fence
+other nodes. See [the cutover contract](specs/rdf-term-identity-cutover.md).

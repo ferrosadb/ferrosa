@@ -283,6 +283,7 @@ fn storage_to_table_indices(meta: &TableMetadata) -> Vec<usize> {
 /// defect" rule applied to the read path: remove the repeated allocation rather
 /// than shrink the schema.
 pub(crate) struct TableCodec {
+    pub(crate) table_id: uuid::Uuid,
     /// Declared column names, in declared order.
     names: Vec<String>,
     /// Parsed CQL type per declared column, in declared order.
@@ -318,6 +319,7 @@ impl TableCodec {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         Ok(Self {
+            table_id: meta.id,
             names,
             types,
             pk: pk_indices(meta),
@@ -869,6 +871,21 @@ pub struct StreamingTable {
 }
 
 impl StreamingTable {
+    /// Async DML consumers share the SELECT producer and its bounded row channel.
+    pub(crate) fn rows(&self) -> mpsc::Receiver<Row> {
+        let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
+        self.handle.spawn(guard_scan_producer(
+            produce_scan(
+                self.ctx.clone(),
+                tx,
+                self.failure.clone(),
+                self.mvcc_view.clone(),
+            ),
+            self.failure.clone(),
+        ));
+        rx
+    }
+
     pub(crate) fn with_point_lookup(mut self, point: Option<PointLookup>) -> Self {
         // Providers are uniquely owned until installed in the catalog.
         Arc::get_mut(&mut self.ctx)
@@ -897,17 +914,7 @@ impl TableProvider for StreamingTable {
     }
 
     fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
-        let (tx, rx) = mpsc::channel(self.scan_buffer_rows);
-        self.handle.spawn(guard_scan_producer(
-            produce_scan(
-                self.ctx.clone(),
-                tx,
-                self.failure.clone(),
-                self.mvcc_view.clone(),
-            ),
-            self.failure.clone(),
-        ));
-        Box::new(ScanIter { rx })
+        Box::new(ScanIter { rx: self.rows() })
     }
 }
 
@@ -1068,6 +1075,11 @@ pub(crate) fn staged_overlay(
     let storage_error =
         |message: String| MvccCommitError::Storage(ferrosa_common::Error::InvalidData(message));
     let codec = TableCodec::build(keyspace, table, schema).map_err(storage_error)?;
+    if writes.iter().any(|write| {
+        write.0.keyspace == keyspace && write.0.table == table && write.1 != codec.table_id
+    }) {
+        return Err(MvccCommitError::SerializationFailure);
+    }
     // Resolve only the keys the transaction actually staged. Building a whole
     // snapshot overlay here made even one own write clone unrelated payloads.
     if let Some(view) = view {
@@ -1994,6 +2006,7 @@ mod tests {
                 &HashSet::new(),
                 vec![crate::mvcc::RowChange {
                     table: "ks.t".into(),
+                    table_id: schema.snapshot().tables[&("ks".into(), "t".into())].id,
                     key: vec![Value::Text("alpha".into()), Value::Int(1)],
                     partition_key: b"alpha".to_vec(),
                     before: Some(before.clone()),
@@ -2019,6 +2032,7 @@ mod tests {
                 &HashSet::new(),
                 vec![crate::mvcc::RowChange {
                     table: "ks.t".into(),
+                    table_id: schema.snapshot().tables[&("ks".into(), "t".into())].id,
                     key: vec![Value::Text("alpha".into()), Value::Int(1)],
                     partition_key: b"alpha".to_vec(),
                     before: Some(Row::new(vec![
@@ -2039,13 +2053,16 @@ mod tests {
                 .unwrap();
             assert_eq!(rows, vec![before.clone()]);
         }
-        let staged = vec![crate::mvcc::PgWrite(ferrosa_storage::Mutation::new(
-            "ks".into(),
-            "t".into(),
-            key.clone(),
-            vec![storage_row(1, "own", 40, 4000)],
-            4000,
-        ))];
+        let staged = vec![crate::mvcc::PgWrite(
+            ferrosa_storage::Mutation::new(
+                "ks".into(),
+                "t".into(),
+                key.clone(),
+                vec![storage_row(1, "own", 40, 4000)],
+                4000,
+            ),
+            schema.snapshot().tables[&("ks".into(), "t".into())].id,
+        )];
         let (own_catalog, own_failure) = crate::query::load_catalog_with_mvcc(
             &engine,
             &schema,
@@ -2158,7 +2175,11 @@ mod tests {
                 load_table(&engine, &schema, "ks", "t", failure.clone())
                     .await
                     .unwrap()
-                    .with_mvcc_view(manager.table_view(&snapshot, "ks.t")),
+                    .with_mvcc_view(manager.table_view(
+                        &snapshot,
+                        "ks.t",
+                        schema.snapshot().tables[&("ks".into(), "t".into())].id,
+                    )),
             );
             let rows = scan_rows(table.clone()).await;
             assert_eq!(rows, baseline_rows);
@@ -2230,6 +2251,7 @@ mod tests {
             let changes = (0..size)
                 .map(|i| RowChange {
                     table: "ks.t".into(),
+                    table_id: schema.snapshot().tables[&("ks".into(), "t".into())].id,
                     key: vec![Value::Text("alpha".into()), Value::Int(i)],
                     partition_key: b"alpha".to_vec(),
                     before: None,
@@ -2245,13 +2267,16 @@ mod tests {
                 .commit(&manager.snapshot(), &HashSet::new(), changes, || Ok(()))
                 .unwrap();
             let snapshot = manager.snapshot();
-            let staged = vec![PgWrite(ferrosa_storage::Mutation::new(
-                "ks".into(),
-                "t".into(),
-                DecoratedKey::new(PartitionKey::new(b"alpha".to_vec())),
-                vec![storage_row(1, "own", 40, 4000)],
-                4000,
-            ))];
+            let staged = vec![PgWrite(
+                ferrosa_storage::Mutation::new(
+                    "ks".into(),
+                    "t".into(),
+                    DecoratedKey::new(PartitionKey::new(b"alpha".to_vec())),
+                    vec![storage_row(1, "own", 40, 4000)],
+                    4000,
+                ),
+                schema.snapshot().tables[&("ks".into(), "t".into())].id,
+            )];
             let mut counts = Vec::new();
             for writes in [None, Some(staged.as_slice())] {
                 let count = MvccManager::count_allocations_for_test(|| {

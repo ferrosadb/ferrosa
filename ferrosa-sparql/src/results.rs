@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 
 /// A single variable binding in a SPARQL result row.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Binding {
     #[serde(rename = "type")]
     pub binding_type: String, // "uri", "literal", "bnode"

@@ -302,3 +302,36 @@ values are skipped without ownership, while equal-timestamp comparisons fetch
 bytes through reusable buffers. Source spans remain aligned through schema
 ordinal remapping. Measured
 acceptance evidence is kept with `deploy/fly-compaction-probe`.
+
+## Bounded transaction WAL checkpoint (2026-10-26)
+
+`BatchTxn` now uses one CRC-protected WAL envelope, with all-member decode before
+replay and ordered per-member CDC/checkpoint positions. Remaining shared storage
+work includes transaction framing for arbitrarily large streamed write sets,
+cross-protocol atomic publication, and a decision/recovery protocol that exposes
+uncertain post-append I/O outcomes separately from clean preflight aborts.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+`PostgresMvccApplyObserver::acquire_postgres_apply` provides an owned lifecycle lease for the caller to retain through metadata preparation, atomic storage apply and publication. Production PostgreSQL observers validate every bound table UUID before returning a lease; all error paths release it by RAII. Storage continues to treat PostgreSQL metadata as opaque and adds no schema dependency. The default no-op hook preserves non-PostgreSQL/test observer compatibility; an observer protecting PostgreSQL incarnations must override it.
+
+
+### Recovery admission prerequisite (2026-10-26)
+
+Implemented in this bounded cycle: public table recovery admission; durable
+bounded incomplete summaries; strict startup/explicit/deferred/set-aside errors;
+unfinished-item retention; checkpoint protection; legacy-artifact rejection.
+Focused tests cover clean recovery, exact survivor salvage, I/O failure,
+repeated replay, restart, and pending ownership. No RDF migration or cluster
+fencing is implemented here. Operator-authorized recovery from authoritative
+history remains necessary for previously discarded data; no guessed repair or
+automatic clearing/deletion is provided.
+
+Reader rejection is also covered: CRC failures, undecodable payloads, malformed
+transaction envelopes and nonempty rejected tails persist unknown-source evidence
+before survivors are delivered or a source segment can retire. Such evidence
+blocks admission for every table and survives restart. Normal empty padding and
+torn creation headers do not create false rejection evidence. Persistence failure
+returns an error and keeps the source bytes. Replay/checkpoint locking prevents
+flush from crossing an unhandled replay frame.

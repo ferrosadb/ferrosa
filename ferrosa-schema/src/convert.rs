@@ -109,6 +109,10 @@ fn split_map_types(s: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// Storage-schema extension carrying the authoritative table incarnation UUID.
+/// Written by `to_storage_schema`; caller-provided values are overwritten.
+pub const TABLE_ID_EXTENSION: &str = "ferrosa.table_id";
+
 impl TableMetadata {
     /// Convert this table metadata to a `TableSchema` suitable for the storage layer.
     ///
@@ -238,6 +242,7 @@ impl TableMetadata {
         // Merge table options into extensions so the storage layer can
         // configure components without depending on schema metadata types.
         let mut extensions = self.extensions.clone();
+        extensions.insert(TABLE_ID_EXTENSION.to_owned(), self.id.to_string());
         for (k, v) in &self.params.compaction {
             extensions.insert(format!("compaction.{k}"), v.clone());
         }
@@ -606,6 +611,19 @@ mod tests {
             extensions: HashMap::new(),
             is_system: false,
         }
+    }
+
+    #[test]
+    fn storage_schema_carries_authoritative_table_incarnation() {
+        let mut table = table_with_gc_grace(60);
+        table
+            .extensions
+            .insert("ferrosa.table_id".into(), uuid::Uuid::new_v4().to_string());
+        assert_eq!(
+            table.to_storage_schema().extensions.get("ferrosa.table_id"),
+            Some(&table.id.to_string()),
+            "storage provenance must use the authoritative UUID, not a caller-supplied extension"
+        );
     }
 
     #[test]

@@ -210,7 +210,7 @@ pub struct SparqlEngine {
 impl SparqlEngine {
     /// Create a new SPARQL engine.
     ///
-    /// Registers the `rdf_triples` table schema for the default graph
+    /// Admits fresh/v2 datasets and registers the `rdf_triples_v2` schema for the default graph
     /// keyspace so that INSERT/DELETE/SELECT queries can execute without
     /// requiring external DDL.
     pub fn new(
@@ -218,11 +218,6 @@ impl SparqlEngine {
         write_path: Arc<WritePath>,
         config: SparqlConfig,
     ) -> Self {
-        // Register the RDF triples table for the default keyspace.
-        let schema = crate::triple_store::rdf_triples_schema(&config.default_graph);
-        if let Err(e) = storage.register_table(schema) {
-            tracing::warn!(%e, "failed to register rdf_triples table for default graph");
-        }
         let limits = ExecutionLimits {
             max_rows: config.max_rows,
         };
@@ -232,30 +227,45 @@ impl SparqlEngine {
             config,
             limits,
         };
-        engine.ensure_object_index(&engine.config.default_graph);
+        if let Err(error) = engine.ensure_table_registered(&engine.config.default_graph) {
+            tracing::warn!(%error,"SPARQL dataset admission refused; requests will fail");
+        }
         engine
     }
 
     /// Ensure the rdf_triples table is registered for a given keyspace.
     ///
     /// Called lazily when a query targets a keyspace other than the default.
-    fn ensure_table_registered(&self, keyspace: &str) {
+    fn ensure_table_registered(&self, keyspace: &str) -> Result<(), SparqlError> {
+        crate::triple_store::refuse_legacy(&self.storage, keyspace)?;
         let schema = crate::triple_store::rdf_triples_schema(keyspace);
-        if let Err(e) = self.storage.register_table(schema) {
-            // register_table returns Ok(()) if already registered.
-            tracing::debug!(%e, keyspace, "rdf_triples table registration");
+        if let Some(actual) = self
+            .storage
+            .table_schema(&crate::triple_store::triples_table_id(keyspace))
+        {
+            if actual.key_type != schema.key_type
+                || actual.clustering_columns != schema.clustering_columns
+                || actual.regular_columns != schema.regular_columns
+                || actual.static_columns != schema.static_columns
+            {
+                return Err(SparqlError::Execution(
+                    "RDF v2 schema mismatch; refusing serving and writes".into(),
+                ));
+            }
         }
+        self.storage.register_table(schema)?;
         // A keyspace registered here rather than in `new` needs the index just
         // as much: an object-bound pattern against it would otherwise scan.
         self.ensure_object_index(keyspace);
+        Ok(())
     }
 
-    /// Declare the object index for `keyspace`'s `rdf_triples` table.
+    /// Declare the object index for `keyspace`'s `rdf_triples_v2` table.
     ///
     /// [`TripleOp::ObjectScan`](crate::planner::TripleOp::ObjectScan) reads
     /// through `rdf_triples_object_idx` and streams a full table scan when this
     /// node does not declare it — and nothing else creates that index for
-    /// `rdf_triples`, so every `?s ?p <o>` pattern read the whole table. The
+    /// `rdf_triples_v2`, so every `?s ?p <o>` pattern read the whole table. The
     /// declaration goes through the same engine-level path a `CREATE INDEX` and
     /// a post-restart reload use ([`StorageEngine::register_index_in_engine`]),
     /// which also builds sidecars for any SSTable that predates the index and
@@ -339,7 +349,7 @@ impl SparqlEngine {
                 "invalid keyspace name: {ks}"
             )));
         }
-        self.ensure_table_registered(ks);
+        self.ensure_table_registered(ks)?;
         crate::update::execute_update(
             update_str,
             ks,
@@ -382,7 +392,7 @@ impl SparqlEngine {
         }
 
         // Ensure rdf_triples table exists for this keyspace.
-        self.ensure_table_registered(graph);
+        self.ensure_table_registered(graph)?;
 
         // The keyspace names the TABLE; the default graph names the PARTITION.
         // These were one value until this fix, and that conflation meant a
@@ -530,6 +540,7 @@ async fn build_graph_result(
                 };
                 let lookup_plan = planner::QueryPlan {
                     ops: vec![(dummy_tp, op)],
+                    steps: vec![planner::PlanStep::Triple(0)],
                     projection: vec!["__p".into(), "__o".into()],
                     limit: None,
                     offset: None,
@@ -601,6 +612,7 @@ async fn build_graph_result(
                 };
                 let dummy_plan = planner::QueryPlan {
                     ops: vec![(dummy_tp, op)],
+                    steps: vec![planner::PlanStep::Triple(0)],
                     projection: vec!["__p".into(), "__o".into()],
                     limit: None,
                     offset: None,

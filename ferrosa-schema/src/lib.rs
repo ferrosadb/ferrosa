@@ -9,6 +9,7 @@ pub mod auth;
 pub mod convert;
 pub mod error;
 pub mod jsonb_rules;
+mod lifecycle;
 pub mod metadata;
 pub mod registry;
 pub mod secrets;
@@ -27,8 +28,9 @@ pub use auth::{
     check_permission, AuthContext, AuthRateLimiter, GrantEntry, PasswordHasher, PasswordPolicy,
     Permission, RateLimitConfig, Resource, RoleMetadata, RoleUpdates, ScramCredential,
 };
-pub use convert::cql_to_marshal_type;
+pub use convert::{cql_to_marshal_type, TABLE_ID_EXTENSION};
 pub use error::{Result, SchemaError};
+pub use lifecycle::{SchemaReadLease, SchemaWriteLease};
 pub use metadata::{
     CachingParams, ClusteringOrder, ColumnKind, ColumnMask, ColumnMetadata, IndexMetadata,
     KeyspaceMetadata, KeyspaceUpdates, ReplicationParams, TableFlag, TableMetadata, TableParams,

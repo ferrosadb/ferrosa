@@ -343,7 +343,7 @@ Sourced from in-code fail-loud `0A000`/preview gaps, the FMEA
 
 - **DDL follow-ups to T-132a** — `DROP`/`ALTER TABLE` (T-132b); DDL through the
   extended protocol (`Parse` refuses it); `NoticeResponse` so `IF NOT EXISTS`
-  can emit the PG NOTICE; `timestamptz` (no `pg_types` entry, refused `42704`);
+  can emit the PG NOTICE; `timestamptz` table DDL (refused `42704`; clock results have OID 1184);
   enforcing `varchar(n)` / `numeric(p,s)`; cluster-mode jsonb DDL gate
   (T-300).
 
@@ -417,3 +417,49 @@ row materialization, while physical CQL decoding and the owned MVCC image copy
 remain. Tests pin zero-allocation payload validation, conversion-error parity, and
 a corrupt physical payload failing even when MVCC holds a valid replacement.
 The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.
+
+- Implemented (t_6b946676): transaction-stable CURRENT_TIMESTAMP/now(), prepared execution timing, and typed clock results. Non-UTC timezone conversion and microsecond storage remain outside this slice.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+PostgreSQL MVCC uses `(qualified table name, TableMetadata.id)` for images, row conflicts, scan epochs and reservations. Statement-bound UUIDs accompany buffered writes and survive write-set spill. Local COMMIT validates the entire set before storage effects while holding a synchronous shared schema lifecycle lease; a retired incarnation aborts the transaction with SQLSTATE `40001`, including its unrelated writes. Reads bind the same UUID and refuse rebinding a retained snapshot to a replacement. Unrelated table histories remain intact.
+
+Accord partition metadata and row images carry the UUID in the canonical Cap'n Proto schema. The replica apply lease spans validation, storage apply and MVCC publication. Missing/invalid legacy UUID metadata is rejected, including replay; it is never assigned the current table ID. Upgrade requires draining/checkpointing legacy PostgreSQL Accord work and upgrading all participating readers/writers together. Additive fields alone do not make mixed old/new binaries safe: old readers ignore the UUID. This change does not rewrite historical metadata or introduce a storage-WAL migration.
+
+The existing distributed TRUNCATE all-serving fan-out bypasses Accord MVCC observers. Its raw marker protocol is unchanged; although buffered/local incarnation checks apply, this change does not fence that remote fan-out against concurrent remote DROP.
+
+
+### Index DDL readiness (t_9fba4678)
+
+- Implemented in this bounded slice: Direct index DDL waits for complete backfill,
+  propagates builder failures, bounds deferred work at 30 seconds, and rejects
+  retired table generations or changed deployment paths. Cancelling its future
+  leaves the fail-loud storage guard and durable builds intact.
+- Required integration: Pair/cluster readiness must cover eligible replica read
+  sources and table incarnation/membership changes outside Raft apply. Those
+  PostgreSQL index operations are explicitly refused pending that work.
+- Separate unfinished surfaces: SQL CREATE INDEX parsing and PostgreSQL wire
+  CancelRequest. The current stock pgbench entry is ADD PRIMARY KEY; the workload
+  is unchanged. Immediate SELECT in the regression may use complete MVCC rows;
+  indexed UPDATE and actual tracker completion establish this slice's evidence.
+
+Binding a replacement lazily reclaims only retired-incarnation MVCC heads and scan keys. Active snapshots retain their immutable historical roots until release/expiry; unrelated tables are not cleared.
+
+## Direct READ COMMITTED compatibility cycle — t_3c15a13f
+
+- Implemented for root independent verification: default/explicit Direct RC
+  statement snapshots and own writes, bounded per-table partition ownership,
+  hot-row wait/re-evaluation, full predicate rechecks, atomic commit, cancellation
+  cleanup and aborted-session behavior. Stock TPC-B workload and audit unchanged.
+- Required next: t_b6306006 — distributed writer ownership and statement-snapshot ordering
+  before claiming cluster RC parity; t_4c825e03 — complete COPY contention semantics beyond
+  conservative late-ownership conflict validation; t_b254fd86 for wire cancellation/EOF.
+- Concurrency bound: 1,024 stripes/table; disjoint hash collisions serialize,
+  unrelated tables do not. t_87e93bce adds default disabled lock timeout, explicit
+  FIFO cycle detection (`40P01`), 16,384-identity / 262,144-reference admission
+  limits (`53200`), cancellation-safe handoff and active original lifetime expiry
+  (`40001`). No global writer gate or benchmark-only feature switch.
+- t_cc11529a: implement positive lock_timeout with SET/RESET/SHOW and per-acquisition
+  timing tests. t_b254fd86: implement native CancelRequest and bounded transport
+  observation of EOF/Terminate while executing. Neither is claimed by drop tests.

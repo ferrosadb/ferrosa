@@ -127,6 +127,19 @@ impl QuarantineWriter {
         })
     }
 
+    /// Make the forensic payload and both newly created directory entries
+    /// durable before replay can retire its source frame.
+    pub fn sync(&self) -> Result<()> {
+        self.file
+            .lock()
+            .map_err(|e| Error::InvalidData(format!("quarantine lock: {e}")))?
+            .sync_all()?;
+        let dir = self.path.parent().expect("quarantine path has a parent");
+        File::open(dir)?.sync_all()?;
+        File::open(dir.parent().expect("quarantine directory has a parent"))?.sync_all()?;
+        Ok(())
+    }
+
     /// Path of the JSONL file this writer appends to.
     pub fn path(&self) -> &Path {
         &self.path

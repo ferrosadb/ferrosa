@@ -10,7 +10,9 @@
 //! Last revised: 2026-10-24
 //! Last changed: Persistent snapshot roots with per-scope apply reservations.
 
-#[cfg(test)]
+#[path = "writer_ownership.rs"]
+pub(crate) mod writer_ownership;
+
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::env;
@@ -232,17 +234,19 @@ fn parse_positive_duration(
 /// A PostgreSQL transaction's buffered storage mutation. It is applied only
 /// by the PostgreSQL MVCC commit path; Cassandra's Accord buffers are separate.
 #[derive(Clone, Debug)]
-pub struct PgWrite(pub(crate) Mutation);
+pub struct PgWrite(pub(crate) Mutation, pub(crate) uuid::Uuid);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RowKey {
     pub(crate) table: String,
+    pub(crate) table_id: uuid::Uuid,
     pub(crate) key: Vec<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RowChange {
     pub table: String,
+    pub table_id: uuid::Uuid,
     pub key: Vec<Value>,
     pub partition_key: Vec<u8>,
     pub before: Option<Row>,
@@ -252,7 +256,8 @@ pub(crate) struct RowChange {
 // Immutable HAMT paths and row payloads are structurally shared. A snapshot
 // owns its root through the registry; expiry drops ownership without a sweep.
 type SharedRow = Arc<Option<Row>>;
-type TableRows<V> = PersistentMap<String, PersistentMap<Arc<Vec<Value>>, V>>;
+type RelationId = (String, uuid::Uuid);
+type TableRows<V> = PersistentMap<RelationId, PersistentMap<Arc<Vec<Value>>, V>>;
 type LocalRows = TableRows<LocalVersion>;
 type ClusterRows = TableRows<OrdMap<Timestamp, SharedRow>>;
 
@@ -265,19 +270,53 @@ struct LocalVersion {
     /// later head updates instead of inserting None into every older root.
     baseline_absent: bool,
 }
+/// Original snapshot lifetime, shared with local ownership and the idle session.
+/// Expiry requests cleanup only in cancellable phases; it never revokes a lease
+/// from an applying commit. Notifications occur after a successful metadata CAS.
+pub(crate) struct TransactionLifetime {
+    deadline: Instant,
+    expired: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+impl TransactionLifetime {
+    pub(crate) fn is_expired(&self) -> bool {
+        self.expired.load(Ordering::Acquire) || Instant::now() >= self.deadline
+    }
+
+    fn expire(&self) {
+        self.expired.store(true, Ordering::Release);
+        self.wake.notify_waiters();
+    }
+
+    pub(crate) async fn until_expired(&self) {
+        let notified = self.wake.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_expired() {
+            return;
+        }
+        tokio::select! {
+            () = &mut notified => {},
+            () = tokio::time::sleep_until(self.deadline.into()) => {},
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ActiveSnapshot {
     cluster_ts: Option<Timestamp>,
     started_at: Instant,
+    lifetime: Arc<TransactionLifetime>,
     local: LocalRows,
     cluster: ClusterRows,
     reads: PersistentSet<RowKey>,
+    relations: PersistentMap<String, uuid::Uuid>,
 }
 #[derive(Clone)]
 struct Reservation {
     writes: PersistentSet<RowKey>,
     reads: PersistentSet<RowKey>,
-    tables: HashSet<String>,
+    tables: HashSet<RelationId>,
 }
 #[derive(Clone, Default)]
 struct State {
@@ -290,7 +329,7 @@ struct State {
     keys: TableRows<()>,
     reservations: PersistentMap<u64, Reservation>,
     applied_accord_txns: PersistentSet<(TxnId, Timestamp)>,
-    table_epochs: PersistentMap<String, u64>,
+    table_epochs: PersistentMap<RelationId, u64>,
     /// Allocated once with the manager, so implicit absence reads never allocate.
     absent: SharedRow,
 }
@@ -298,14 +337,17 @@ struct State {
 /// Atomic persistent metadata publication. Physical storage/WAL work remains
 /// external, with no metadata mutex or global pending owner held across it.
 pub struct MvccManager {
+    pub(crate) writers: writer_ownership::WriterLocks,
     state: Arc<ArcSwap<State>>,
     next_reservation: AtomicU64,
     config: MvccConfig,
     profile: Arc<MvccProfile>,
+    schema: std::sync::OnceLock<Arc<ferrosa_schema::Schema>>,
 }
 
 #[cfg(test)]
 thread_local! {
+    pub(crate) static AFTER_APPLY: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static BEFORE_CAS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static AFTER_LIVENESS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
     static CAS_RETRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -360,6 +402,7 @@ pub(crate) struct MvccSnapshot {
     read_ts: u64,
     cluster_ts: Option<Timestamp>,
     _lease: Arc<SnapshotLease>,
+    pub(crate) lifetime: Arc<TransactionLifetime>,
 }
 
 impl MvccSnapshot {
@@ -392,11 +435,101 @@ impl MvccManager {
 
     fn with_config(config: MvccConfig) -> Self {
         Self {
+            writers: Default::default(),
             state: Arc::new(ArcSwap::from_pointee(State::default())),
             next_reservation: AtomicU64::new(1),
             config,
             profile: Arc::new(MvccProfile::from_env()),
+            schema: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Attach the shared schema before registering the replica apply observer.
+    pub fn attach_schema(&self, schema: Arc<ferrosa_schema::Schema>) {
+        let existing = self.schema.get_or_init(|| schema.clone());
+        assert!(
+            Arc::ptr_eq(existing, &schema),
+            "MVCC manager attached to another schema"
+        );
+    }
+
+    pub(crate) fn bind_relation(
+        &self,
+        snapshot: &MvccSnapshot,
+        table: &str,
+        id: uuid::Uuid,
+    ) -> Result<(), MvccCommitError> {
+        // A stale statement must never retire the replacement's heads. Resolve
+        // against the authority while fencing schema mutation through this CAS.
+        let _lifecycle = self.schema.get().map(|schema| schema.lifecycle_read());
+        if let Some(schema) = self.schema.get() {
+            if !schema
+                .snapshot()
+                .tables
+                .values()
+                .any(|meta| meta.id == id && format!("{}.{}", meta.keyspace, meta.name) == table)
+            {
+                return Err(MvccCommitError::SerializationFailure);
+            }
+        }
+        {
+            let state = self.state.load();
+            let active = state
+                .active_snapshots
+                .get(&snapshot.id)
+                .ok_or(MvccCommitError::SnapshotExpired)?;
+            if active.relations.get(table) == Some(&id) {
+                return Ok(());
+            }
+        }
+        update(&self.state, |state| {
+            let active = state
+                .active_snapshots
+                .get_mut(&snapshot.id)
+                .ok_or(MvccCommitError::SnapshotExpired)?;
+            if active.relations.get(table).is_some_and(|old| *old != id) {
+                return Err(MvccCommitError::SerializationFailure);
+            }
+            active.relations.insert(table.to_owned(), id);
+            // Drop only retired heads. Retained snapshots continue owning their
+            // immutable roots until expiry/release; unrelated histories stay put.
+            let retired: Vec<_> = state
+                .keys
+                .keys()
+                .filter(|(name, old_id)| name == table && *old_id != id)
+                .cloned()
+                .collect();
+            for relation in retired {
+                state.keys.remove(&relation);
+                state.local.remove(&relation);
+                state.cluster.remove(&relation);
+                state.cluster_applied.remove(&relation);
+                state.table_epochs.remove(&relation);
+            }
+            Ok(())
+        })
+    }
+
+    /// Caller holds a schema lifecycle lease through physical apply.
+    pub(crate) fn validate_relations(
+        &self,
+        schema: &ferrosa_schema::Schema,
+        snapshot: &MvccSnapshot,
+    ) -> Result<(), MvccCommitError> {
+        let state = self.state.load();
+        let active = state
+            .active_snapshots
+            .get(&snapshot.id)
+            .ok_or(MvccCommitError::SnapshotExpired)?;
+        let schema = schema.snapshot();
+        for (name, id) in &active.relations {
+            if !schema.tables.values().any(|table| {
+                table.id == *id && format!("{}.{}", table.keyspace, table.name) == *name
+            }) {
+                return Err(MvccCommitError::SerializationFailure);
+            }
+        }
+        Ok(())
     }
 
     /// Resident-history accounting: entry counts and an estimated byte cost for
@@ -465,7 +598,7 @@ impl MvccManager {
     }
 
     fn expire_snapshots_before(&self, now: Instant) -> usize {
-        update(&self.state, |state| {
+        let expired = update(&self.state, |state| {
             let expired: Vec<_> = state
                 .active_snapshots
                 .iter()
@@ -473,13 +606,31 @@ impl MvccManager {
                     now.saturating_duration_since(snapshot.started_at)
                         >= self.config.max_snapshot_age
                 })
-                .map(|(id, _)| *id)
+                .map(|(id, snapshot)| (*id, snapshot.lifetime.clone()))
                 .collect();
-            for id in &expired {
+            for (id, _) in &expired {
                 state.active_snapshots.remove(id);
             }
-            expired.len()
+            expired
+        });
+        // CAS retries must never send speculative cancellation notifications.
+        for (_, lifetime) in &expired {
+            lifetime.expire();
+        }
+        expired.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_max_age_for_test(age: Duration) -> Self {
+        Self::with_config(MvccConfig {
+            max_snapshot_age: age,
+            ..MvccConfig::default()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deadline_for_test(&self, snapshot: &MvccSnapshot) -> Instant {
+        self.state.load().active_snapshots[&snapshot.id].started_at + self.config.max_snapshot_age
     }
 
     #[cfg(test)]
@@ -498,6 +649,12 @@ impl MvccManager {
     }
 
     fn snapshot_at(&self, cluster_ts: Option<Timestamp>) -> MvccSnapshot {
+        let started_at = Instant::now();
+        let lifetime = Arc::new(TransactionLifetime {
+            deadline: started_at + self.config.max_snapshot_age,
+            expired: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        });
         let (id, read_ts) = update(&self.state, |state| {
             state.next_snapshot_id = state.next_snapshot_id.wrapping_add(1).max(1);
             let id = state.next_snapshot_id;
@@ -505,15 +662,18 @@ impl MvccManager {
                 id,
                 ActiveSnapshot {
                     cluster_ts,
-                    started_at: Instant::now(),
+                    started_at,
+                    lifetime: lifetime.clone(),
                     local: state.local.clone(),
                     cluster: state.cluster.clone(),
                     reads: PersistentSet::new(),
+                    relations: PersistentMap::new(),
                 },
             );
             (id, state.commit_seq)
         });
         MvccSnapshot {
+            lifetime,
             id,
             read_ts,
             cluster_ts,
@@ -537,13 +697,46 @@ impl MvccManager {
         validate_snapshot(&state, snapshot, read_tables)
     }
 
+    /// An index over physical storage can narrow a statement snapshot only if
+    /// this relation has neither changed nor entered physical apply since it.
+    pub(crate) fn relation_stable(
+        &self,
+        snapshot: &MvccSnapshot,
+        table: &str,
+        id: uuid::Uuid,
+    ) -> bool {
+        let state = self.state.load();
+        !state
+            .table_epochs
+            .get(&(table.to_owned(), id))
+            .is_some_and(|seq| *seq > snapshot.read_ts)
+            && !state
+                .reservations
+                .values()
+                .any(|reservation| reservation.writes.iter().any(|key| key.table_id == id))
+    }
+
+    pub(crate) fn relation_changed_since(
+        &self,
+        snapshot: &MvccSnapshot,
+        table: &str,
+        id: uuid::Uuid,
+    ) -> bool {
+        self.state
+            .load()
+            .table_epochs
+            .get(&(table.to_owned(), id))
+            .is_some_and(|seq| *seq > snapshot.read_ts)
+    }
+
     /// Whether `snapshot` is still live in this manager. The pre-statement
     /// liveness probe uses this, NOT [`Self::validate_commit`]: a read-set
     /// conflict is a COMMIT-time decision, and must not abort a later read on a
     /// still-valid snapshot (which must keep reading from its BEGIN snapshot).
     pub(crate) fn snapshot_is_active(&self, snapshot: &MvccSnapshot) -> bool {
         let state = self.state.load();
-        let active = state.active_snapshots.contains_key(&snapshot.id);
+        let active =
+            !snapshot.lifetime.is_expired() && state.active_snapshots.contains_key(&snapshot.id);
         #[cfg(test)]
         {
             let hook = AFTER_LIVENESS.with(|slot| slot.borrow_mut().take());
@@ -576,11 +769,27 @@ impl MvccManager {
         });
     }
 
-    pub(crate) fn table_view(&self, snapshot: &MvccSnapshot, table: &str) -> MvccTableView {
+    pub(crate) fn table_view(
+        &self,
+        snapshot: &MvccSnapshot,
+        table: &str,
+        table_id: uuid::Uuid,
+    ) -> MvccTableView {
         MvccTableView {
             state: self.state.clone(),
             snapshot: snapshot.clone(),
-            table: table.to_owned(),
+            table: (table.to_owned(), table_id),
+            schema: self.schema.get().cloned(),
+            schema_key: self.schema.get().and_then(|schema| {
+                schema
+                    .snapshot()
+                    .tables
+                    .iter()
+                    .find(|(_, meta)| {
+                        meta.id == table_id && format!("{}.{}", meta.keyspace, meta.name) == table
+                    })
+                    .map(|(key, _)| key.clone())
+            }),
         }
     }
 
@@ -591,7 +800,7 @@ impl MvccManager {
         snapshot: &MvccSnapshot,
         table: &str,
     ) -> Result<HashMap<Vec<Value>, Option<Row>>, MvccCommitError> {
-        self.table_view(snapshot, table)
+        self.table_view(snapshot, table, uuid::Uuid::nil())
             .rows()?
             .map(|image| {
                 let (key, row) = image?;
@@ -615,6 +824,7 @@ impl MvccManager {
                 (
                     RowKey {
                         table: change.table.clone(),
+                        table_id: change.table_id,
                         key: change.key.clone(),
                     },
                     Arc::new(change.key),
@@ -628,7 +838,19 @@ impl MvccManager {
             let request = Reservation {
                 writes: prepared.iter().map(|(key, ..)| key.clone()).collect(),
                 reads: state.active_snapshots[&snapshot.id].reads.clone(),
-                tables: read_tables.clone(),
+                tables: read_tables
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            state.active_snapshots[&snapshot.id]
+                                .relations
+                                .get(name)
+                                .copied()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect(),
             };
             for (key, ..) in &prepared {
                 if row_changed(state, snapshot, key) {
@@ -648,28 +870,32 @@ impl MvccManager {
                 // would copy shared paths even when or_insert changed nothing.
                 if state
                     .local
-                    .get(&key.table)
+                    .get(&(key.table.clone(), key.table_id))
                     .is_some_and(|table| table.contains_key(owned_key))
                 {
                     continue;
                 }
                 state
                     .keys
-                    .entry(key.table.clone())
+                    .entry((key.table.clone(), key.table_id))
                     .or_default()
                     .insert(owned_key.clone(), ());
                 // A first-touch baseline has never been committed by MVCC.
                 // Inheriting an unrelated global epoch would manufacture a
                 // conflict even when physical apply later fails.
                 let seq = 0;
-                state.local.entry(key.table.clone()).or_default().insert(
-                    owned_key.clone(),
-                    LocalVersion {
-                        seq,
-                        row: before.clone(),
-                        baseline_absent: before.is_none(),
-                    },
-                );
+                state
+                    .local
+                    .entry((key.table.clone(), key.table_id))
+                    .or_default()
+                    .insert(
+                        owned_key.clone(),
+                        LocalVersion {
+                            seq,
+                            row: before.clone(),
+                            baseline_absent: before.is_none(),
+                        },
+                    );
                 if before.is_none() {
                     // Missing older roots can resolve the same known absence
                     // through this head. Do not build readers × inserted-keys
@@ -680,7 +906,7 @@ impl MvccManager {
                 for (_, active) in state.active_snapshots.iter_mut() {
                     active
                         .local
-                        .entry(key.table.clone())
+                        .entry((key.table.clone(), key.table_id))
                         .or_default()
                         .entry(owned_key.clone())
                         .or_insert_with(|| LocalVersion {
@@ -699,20 +925,26 @@ impl MvccManager {
             armed: true,
         };
         apply().map_err(MvccCommitError::Storage)?;
+        #[cfg(test)]
+        AFTER_APPLY.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
         let seq = update(&self.state, |state| {
             if !prepared.is_empty() {
                 state.commit_seq = state.commit_seq.saturating_add(1);
                 for (key, owned_key, _, after) in &prepared {
                     let version = state
                         .local
-                        .get_mut(&key.table)
+                        .get_mut(&(key.table.clone(), key.table_id))
                         .and_then(|table| table.get_mut(owned_key))
                         .expect("reservation published the local baseline");
                     version.seq = state.commit_seq;
                     version.row = after.clone();
                     state
                         .table_epochs
-                        .insert(key.table.clone(), state.commit_seq);
+                        .insert((key.table.clone(), key.table_id), state.commit_seq);
                 }
             }
             state.reservations.remove(&id);
@@ -784,10 +1016,23 @@ impl MvccManager {
 pub(crate) struct MvccTableView {
     state: Arc<ArcSwap<State>>,
     snapshot: MvccSnapshot,
-    table: String,
+    table: RelationId,
+    schema: Option<Arc<ferrosa_schema::Schema>>,
+    schema_key: Option<(String, String)>,
 }
 impl MvccTableView {
     pub(crate) fn ensure_active(&self) -> Result<(), MvccCommitError> {
+        if let Some(schema) = &self.schema {
+            let snapshot = schema.snapshot();
+            if self
+                .schema_key
+                .as_ref()
+                .and_then(|key| snapshot.tables.get(key))
+                .is_none_or(|table| table.id != self.table.1)
+            {
+                return Err(MvccCommitError::SerializationFailure);
+            }
+        }
         if self
             .state
             .load()
@@ -801,6 +1046,7 @@ impl MvccTableView {
     }
 
     pub(crate) fn row(&self, key: &Vec<Value>) -> Result<Option<SharedRow>, MvccCommitError> {
+        self.ensure_active()?;
         let state = self.state.load();
         let active = state
             .active_snapshots
@@ -864,13 +1110,13 @@ impl MvccTableView {
 type SnapshotRows =
     Box<dyn Iterator<Item = Result<(Arc<Vec<Value>>, SharedRow), MvccCommitError>> + Send>;
 
-type ClusterImage = (String, Arc<Vec<Value>>, SharedRow, SharedRow);
+type ClusterImage = (RelationId, Arc<Vec<Value>>, SharedRow, SharedRow);
 fn cluster_images(changes: Vec<RowChange>) -> Vec<ClusterImage> {
     changes
         .into_iter()
         .map(|c| {
             (
-                c.table,
+                (c.table, c.table_id),
                 Arc::new(c.key),
                 Arc::new(c.before),
                 Arc::new(c.after),
@@ -908,15 +1154,40 @@ fn publish_cluster_images(state: &mut State, timestamp: Timestamp, images: &[Clu
     }
 }
 fn reservations_conflict(a: &Reservation, b: &Reservation) -> bool {
-    a.writes
+    a.writes.iter().any(|key| {
+        b.writes.contains(key)
+            || b.reads.contains(key)
+            || b.tables.contains(&(key.table.clone(), key.table_id))
+    }) || b
+        .writes
         .iter()
-        .any(|key| b.writes.contains(key) || b.reads.contains(key) || b.tables.contains(&key.table))
-        || b.writes
-            .iter()
-            .any(|key| a.reads.contains(key) || a.tables.contains(&key.table))
+        .any(|key| a.reads.contains(key) || a.tables.contains(&(key.table.clone(), key.table_id)))
 }
 
 impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
+    fn acquire_postgres_apply(&self, metadata: &[Vec<u8>]) -> Result<Box<dyn Send>, String> {
+        let schema = self
+            .schema
+            .get()
+            .ok_or("PostgreSQL MVCC observer has no shared schema")?;
+        let lease = schema.lifecycle_read();
+        let snapshot = schema.snapshot();
+        let current: HashMap<_, _> = snapshot
+            .tables
+            .values()
+            .map(|table| (format!("{}.{}", table.keyspace, table.name), table.id))
+            .collect();
+        for payload in metadata {
+            let (name, id) = crate::row_change_codec::decode_table_identity(payload)?;
+            if current.get(&name) != Some(&id) {
+                return Err(format!(
+                    "PostgreSQL table incarnation changed: {name} ({id})"
+                ));
+            }
+        }
+        Ok(Box::new(lease))
+    }
+
     fn prepare_postgres_apply(
         &self,
         txn_id: TxnId,
@@ -925,6 +1196,9 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
     ) -> Result<(), String> {
         let started = self.profile.is_enabled().then(Instant::now);
         let changes = decode_row_changes(metadata)?;
+        if let Some(schema) = self.schema.get() {
+            validate_replica_relations(schema, &changes)?;
+        }
         let decoded = changes.len();
         let images = cluster_images(changes);
         update(&self.state, |state| {
@@ -960,6 +1234,9 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
     ) -> Result<(), String> {
         let started = self.profile.is_enabled().then(Instant::now);
         let changes = decode_row_changes(metadata)?;
+        if let Some(schema) = self.schema.get() {
+            validate_replica_relations(schema, &changes)?;
+        }
         let decoded = changes.len();
         self.record_applied_accord_commit(txn_id, timestamp, changes);
         if let Some(started) = started {
@@ -983,6 +1260,27 @@ impl ferrosa_storage::accord::PostgresMvccApplyObserver for MvccManager {
     }
 }
 
+fn validate_replica_relations(
+    schema: &ferrosa_schema::Schema,
+    changes: &[RowChange],
+) -> Result<(), String> {
+    let snapshot = schema.snapshot();
+    let current: HashMap<_, _> = snapshot
+        .tables
+        .values()
+        .map(|table| (format!("{}.{}", table.keyspace, table.name), table.id))
+        .collect();
+    for change in changes {
+        if current.get(&change.table) != Some(&change.table_id) {
+            return Err(format!(
+                "PostgreSQL table incarnation changed: {} ({})",
+                change.table, change.table_id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn decode_row_changes(metadata: &[Vec<u8>]) -> Result<Vec<RowChange>, String> {
     let mut changes = Vec::new();
     for payload in metadata {
@@ -996,13 +1294,13 @@ fn decode_row_changes(metadata: &[Vec<u8>]) -> Result<Vec<RowChange>, String> {
 fn row_changed(state: &State, snapshot: &MvccSnapshot, row: &RowKey) -> bool {
     state
         .local
-        .get(&row.table)
+        .get(&(row.table.clone(), row.table_id))
         .and_then(|table| table.get(&row.key))
         .is_some_and(|v| v.seq > snapshot.read_ts)
         || snapshot.cluster_ts.is_some_and(|ts| {
             state
                 .cluster
-                .get(&row.table)
+                .get(&(row.table.clone(), row.table_id))
                 .and_then(|table| table.get(&row.key))
                 .and_then(|v| v.get_max())
                 .is_some_and(|(latest, _)| *latest > ts)
@@ -1013,6 +1311,9 @@ fn validate_snapshot(
     snapshot: &MvccSnapshot,
     tables: &HashSet<String>,
 ) -> Result<(), MvccCommitError> {
+    if snapshot.lifetime.is_expired() {
+        return Err(MvccCommitError::SnapshotExpired);
+    }
     let active = state
         .active_snapshots
         .get(&snapshot.id)
@@ -1024,14 +1325,23 @@ fn validate_snapshot(
         || tables.iter().any(|table| {
             state
                 .table_epochs
-                .get(table)
+                .get(&(
+                    table.clone(),
+                    active.relations.get(table).copied().unwrap_or_default(),
+                ))
                 .is_some_and(|epoch| *epoch > snapshot.read_ts)
         })
         || state.reservations.values().any(|other| {
-            other
-                .writes
-                .iter()
-                .any(|row| active.reads.contains(row) || tables.contains(&row.table))
+            other.writes.iter().any(|row| {
+                active.reads.contains(row)
+                    || (tables.contains(&row.table)
+                        && active
+                            .relations
+                            .get(&row.table)
+                            .copied()
+                            .unwrap_or_default()
+                            == row.table_id)
+            })
         })
     {
         return Err(MvccCommitError::SerializationFailure);
@@ -1195,6 +1505,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn binding_replacement_reclaims_only_retired_heads_and_keeps_snapshot_roots() {
+        let manager = MvccManager::default();
+        let old_id = uuid::Uuid::new_v4();
+        let new_id = uuid::Uuid::new_v4();
+        let mut old = change(None, Some(row("retired")));
+        old.table_id = old_id;
+        let mut keep = change(None, Some(row("kept")));
+        keep.table = "public.keep".into();
+        manager
+            .commit(
+                &manager.snapshot(),
+                &HashSet::new(),
+                vec![old, keep],
+                || Ok(()),
+            )
+            .unwrap();
+        let retained = manager.snapshot();
+        let fresh = manager.snapshot();
+        manager
+            .bind_relation(&fresh, "public.items", new_id)
+            .unwrap();
+        assert_eq!(
+            manager.history_stats().local_keys,
+            1,
+            "retired heads must be reclaimed independently of unrelated tables"
+        );
+        assert_eq!(
+            manager
+                .table_overlay(&retained, "public.keep")
+                .unwrap()
+                .get(&vec![Value::Int(1)]),
+            Some(&Some(row("kept")))
+        );
+        assert!(
+            manager.history_stats().local_versions >= 2,
+            "retained snapshots still own their roots"
+        );
+    }
+
     fn row(value: &str) -> Row {
         Row::new(vec![Value::Text(value.to_string())])
     }
@@ -1213,6 +1563,7 @@ mod tests {
     fn change(before: Option<Row>, after: Option<Row>) -> RowChange {
         RowChange {
             table: "public.items".to_string(),
+            table_id: uuid::Uuid::nil(),
             key: vec![Value::Int(1)],
             partition_key: vec![1],
             before,
@@ -1409,7 +1760,7 @@ mod tests {
         });
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let during = manager.snapshot();
-        let view = manager.table_view(&during, "public.items");
+        let view = manager.table_view(&during, "public.items", uuid::Uuid::nil());
         assert_eq!(
             view.row(&vec![Value::Int(1)]).unwrap().unwrap().as_ref(),
             &Some(row("before"))
@@ -1425,6 +1776,7 @@ mod tests {
                     &snapshot,
                     RowKey {
                         table: "public.items".into(),
+                        table_id: uuid::Uuid::nil(),
                         key: vec![Value::Int(1)],
                     },
                 ),
@@ -1498,6 +1850,7 @@ mod tests {
                             &concurrent,
                             RowKey {
                                 table: "other".into(),
+                                table_id: uuid::Uuid::nil(),
                                 key: vec![Value::Int(5)],
                             },
                         );
@@ -1574,6 +1927,7 @@ mod tests {
             &old,
             RowKey {
                 table: "public.items".into(),
+                table_id: uuid::Uuid::nil(),
                 key: vec![Value::Int(1)],
             },
         );
@@ -1678,7 +2032,7 @@ mod tests {
         let old = manager.snapshot();
         let cloned = old.clone();
         let shared = manager
-            .table_view(&old, "public.items")
+            .table_view(&old, "public.items", uuid::Uuid::nil())
             .row(&vec![Value::Int(1)])
             .unwrap()
             .unwrap();
@@ -1724,7 +2078,7 @@ mod tests {
                 || Ok(()),
             )
             .unwrap();
-        let view = manager.table_view(&expired, "public.items");
+        let view = manager.table_view(&expired, "public.items", uuid::Uuid::nil());
         let shared = view.row(&vec![Value::Int(1)]).unwrap().unwrap();
         let weak = Arc::downgrade(&shared);
         drop(shared);
@@ -1828,7 +2182,7 @@ mod tests {
             .on_postgres_apply(TxnId::new(1, ts), ts, &[metadata])
             .unwrap();
         let stale = manager.snapshot_with_cluster_ts(Timestamp::synthetic(25));
-        let view = manager.table_view(&stale, "public.items");
+        let view = manager.table_view(&stale, "public.items", uuid::Uuid::nil());
         assert!(
             matches!(
                 view.row(&vec![Value::Int(1)]),
@@ -1854,6 +2208,7 @@ mod tests {
             let changes = (0..rows)
                 .map(|key| RowChange {
                     table: "public.items".into(),
+                    table_id: uuid::Uuid::nil(),
                     key: vec![Value::Int(key as i64)],
                     partition_key: (key as u64).to_be_bytes().to_vec(),
                     before: None,
@@ -1869,14 +2224,14 @@ mod tests {
             // absence is known, rather than an unknown physical-row fallback.
             for snapshot in &held {
                 for key in [0, rows - 1] {
-                    let view = manager.table_view(snapshot, "public.items");
+                    let view = manager.table_view(snapshot, "public.items", uuid::Uuid::nil());
                     let visible = view.row(&vec![Value::Int(key as i64)]).unwrap();
                     assert_eq!(visible.as_deref(), Some(&None));
                 }
             }
             let new = manager.snapshot();
             let visible = manager
-                .table_view(&new, "public.items")
+                .table_view(&new, "public.items", uuid::Uuid::nil())
                 .row(&vec![Value::Int((rows - 1) as i64)])
                 .unwrap();
             assert_eq!(visible.as_deref(), Some(&Some(row("inserted"))));
@@ -1915,7 +2270,7 @@ mod tests {
         let existing_key = vec![Value::Int(1)];
         assert!(
             manager
-                .table_view(&old, "public.items")
+                .table_view(&old, "public.items", uuid::Uuid::nil())
                 .row(&fresh_key)
                 .unwrap()
                 .is_none(),
@@ -1954,7 +2309,8 @@ mod tests {
             let observations: Vec<_> = [&reader_old, &during]
                 .into_iter()
                 .map(|snapshot| {
-                    let view = reader_manager.table_view(snapshot, "public.items");
+                    let view =
+                        reader_manager.table_view(snapshot, "public.items", uuid::Uuid::nil());
                     (
                         view.row(&vec![Value::Int(2)])
                             .map(|row| row.map(|shared| (*shared).clone())),
@@ -1985,7 +2341,7 @@ mod tests {
             );
         }
         for snapshot in [&old, &during] {
-            let view = manager.table_view(snapshot, "public.items");
+            let view = manager.table_view(snapshot, "public.items", uuid::Uuid::nil());
             assert_eq!(view.row(&fresh_key).unwrap().as_deref(), Some(&None));
             assert_eq!(
                 view.row(&existing_key).unwrap().as_deref(),
@@ -1993,7 +2349,7 @@ mod tests {
             );
         }
         let new = manager.snapshot();
-        let view = manager.table_view(&new, "public.items");
+        let view = manager.table_view(&new, "public.items", uuid::Uuid::nil());
         assert_eq!(
             view.row(&fresh_key).unwrap().as_deref(),
             Some(&Some(row("inserted")))
@@ -2168,6 +2524,7 @@ mod tests {
         let before = vec![
             RowChange {
                 table: "public.items".to_string(),
+                table_id: uuid::Uuid::nil(),
                 key: vec![Value::Int(1)],
                 partition_key: vec![1],
                 before: Some(row("left-before")),
@@ -2175,6 +2532,7 @@ mod tests {
             },
             RowChange {
                 table: "public.items".to_string(),
+                table_id: uuid::Uuid::nil(),
                 key: vec![Value::Int(2)],
                 partition_key: vec![2],
                 before: Some(row("right-before")),

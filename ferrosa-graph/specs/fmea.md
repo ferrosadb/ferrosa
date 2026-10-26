@@ -91,3 +91,58 @@ network listeners, so consistency and DoS modes dominate.
   the exported series are `_entries_{repaired,removed,rewritten}_total`,
   `_reconcile_errors_total`, `_reconcile_passes_total`,
   `_heals_completed_total`, `_heals_failed_total` (`adjacency/reconcile.rs:104-134`).
+
+## Explicit transaction boundaries (2026-10-26, t_a4712717)
+
+- Pending writes leaking on error/disconnect: connection owns only memory; all
+  FAILURE paths clear it and enter failed state until RESET. Idle timeout clears
+  memory without sending an unsolicited protocol reply.
+- Own reads missing pending keys/index updates: transaction reads reconcile the
+  overlay and use scan fallback rather than committed index postings.
+- Partial graph visibility at COMMIT: finite graph query streams share a
+  publication barrier. Slow/unconsumed streams can delay a commit until its
+  deadline. This does not protect independent CQL readers or another GraphEngine.
+- Lost property-dependent updates through one GraphEngine: a shared FIFO writer
+  gate admits writing bound ASTs before MATCH/predicates/RHS/imported bindings.
+  Explicit ownership lasts through COMMIT/abort, autocommit through stream
+  exhaustion/drop. Process-local monotonic mutation timestamps prevent same-tick
+  or regressing-clock reconciliation from discarding successors. A separate read
+  RUN followed by a constant SET still needs a read-set/conflict protocol.
+- Admission/publication deadlock: acquire admission before publication read;
+  queued writers hold no publication guard. COMMIT retains admission then takes
+  publication write, releasing publication first. Query/transaction deadlines
+  bound waits. Pending guards drop on errors/cancellation and observed terminals.
+- Coarse admission limits performance: all keys/databases in one engine serialize.
+  Think time and slow consumers extend ownership; approximate ceiling is 1/H.
+  An unpolled autocommit result holds until polling/drop. This is a deliberate
+  baseline tradeoff, not equivalent row-level concurrency; prioritize narrower
+  ownership with safe update-read refresh.
+- Transport cancellation: RESET/EOF releases on observation, but Bolt cannot
+  observe either while awaiting queued RUN. Prompt observation is still pending;
+  bounded execution deadlines and partial-frame behavior are preserved.
+- Schema/topology changes: new labels are refused inside BEGIN; changed routing
+  aborts COMMIT. DROP/recreate incarnation fencing remains a separate required
+  correctness boundary before production; the fresh-schema baseline excludes
+  concurrent DDL. Pair/cluster execution still needs Accord integration. CQL,
+  raw WritePath calls and other GraphEngines do not share writer admission.
+- Durability: preflight rejection writes nothing; a complete WAL envelope is
+  replayed all-or-none after a torn record. An I/O/fsync error after append is
+  an uncertain outcome, not proof of a successful rollback.
+
+Regression coverage: `graph_http_integration::single_node_explicit_transaction_*`
+exercises commit/rollback, CREATE/MATCH, SET/DELETE own reads, external isolation,
+error, RESET, disconnect, timeout, memory rejection and adjacency publication.
+
+`bolt_rmw_regressions::bolt_rmw_*` adds conserved increments, both mixed-mode
+orders, owner/waiter/reader overlap, observed terminal release, bounded waiter
+expiration, cancelled reservations, stream exhaustion/drop, nested write
+classification and intentional independent-key blocking. Gate probes acknowledge
+actual Pending admission rather than relying on sleeps or generic scan polling.
+
+### Automatic scalar columns during an explicit transaction
+
+A first-property SET must not perform immediate column DDL while row mutations
+are staged for rollback. `ensure_bolt_columns` rejects missing columns inside
+`TRANSACTION_IO` before acquiring the schema gate or rotating storage. The Bolt
+transaction regression covers staged-row discard, unchanged columns, RESET and
+writer release; warm existing-column writes keep automatic index preparation.
