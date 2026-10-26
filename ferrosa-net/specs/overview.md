@@ -107,6 +107,9 @@ and rejects frames whose version does not match. `length` is bounded by
 
 ## Position in the dependency graph
 
+Zstd region compression requires `zstd` >= 0.14.3 with patched native bindings.
+The negotiated codec and region framing are unchanged.
+
 Near-leaf. **Calls:** `ferrosa-common` (only). **Called by:** `ferrosa`,
 `ferrosa-cluster`, `ferrosa-cql`, `ferrosa-graph`, `ferrosa-session`. See the
 [root crate index](../../specs/crates.md) for the full graph.

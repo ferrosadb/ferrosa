@@ -114,6 +114,11 @@ the pool only on success.
 
 ## Position in the dependency graph
 
+Wasmtime 48 uses an explicit feature list matching its defaults except `cache`.
+The executor never enables Wasmtime's on-disk compilation cache; excluding it
+removes its `zstd` 0.13 dependency. The compiled-component registry and instance
+pool described above are independent of that optional feature.
+
 Leaf-adjacent: depends only on `ferrosa-common` (plus external Wasmtime/QuickJS
 toolchain crates). Depended on by `ferrosa`, `ferrosa-cql`, `ferrosa-ctl`, and
 `ferrosa-session`. See the [root crate index](../../specs/crates.md) for the full

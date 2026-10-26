@@ -8,7 +8,35 @@ description = "WASM-sandboxed User-Defined Function execution for Ferrosa"
 
 [dependencies]
 ferrosa-common = { path = "../ferrosa-common" }
-wasmtime = { version = "48.0.7", features = ["component-model"] }
+# Preserve Wasmtime 48 defaults except the unused on-disk compilation cache.
+# That feature pulls zstd 0.13; UdfExecutor uses its own in-memory registry/pool.
+wasmtime = { version = "48.0.7", default-features = false, features = [
+    "anyhow",
+    "async",
+    "backtrace",
+    "gc",
+    "gc-copying",
+    "gc-drc",
+    "gc-null",
+    "wat",
+    "profiling",
+    "parallel-compilation",
+    "cranelift",
+    "pooling-allocator",
+    "demangle",
+    "addr2line",
+    "coredump",
+    "debug-builtins",
+    "runtime",
+    "component-model",
+    "component-model-async",
+    "threads",
+    "stack-switching",
+    "std",
+    "debug",
+    "compile-time-builtins",
+    "wit-parser",
+] }
 slotmap = "1"
 num-bigint = "0.4"
 thiserror = "2"

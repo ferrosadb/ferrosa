@@ -219,6 +219,12 @@ regression (the count growing) still fails the test.
 
 ## Position in the dependency graph
 
+Zstd compression requires `zstd` >= 0.14.3 with patched native bindings.
+Reborrowing the thread-local compression context resets its session, discarding
+input buffered by an abandoned stream. The regression test
+`zstd_compress_into_discards_abandoned_stream` exercises this isolation through
+`Compression::compress_into`.
+
 A near-leaf crate: it calls only `ferrosa-common`. It is one of the most
 widely-depended-on crates in the workspace — `ferrosa-cdc`, `ferrosa-cluster`,
 `ferrosa-cql`, `ferrosa-ctl`, `ferrosa-graph`, `ferrosa-index-builder`,
