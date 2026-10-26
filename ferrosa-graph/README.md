@@ -42,6 +42,12 @@ Setup waits for current local indexes and probes participating cluster sources,
 within a bounded timeout, before executing the statement's data writes. Later
 index reads still check readiness; topology changes can make a later read fail.
 
+Schema-on-write creates missing labels from their initial properties. It does not
+automatically add columns to an existing label: declare additional columns before
+writing them. The existing encoder ignores undeclared properties; this known
+schema-evolution issue is tracked separately. Newly declared scalar columns receive
+indexes on their next Bolt access.
+
 Native keys remain the first anchor path. Integer, UUID, text and boolean equality
 and bounded exact floating-point probes use current scalar indexes, preserve
 duplicate matches and recheck predicates. Text hex fallbacks, noncanonical boolean
