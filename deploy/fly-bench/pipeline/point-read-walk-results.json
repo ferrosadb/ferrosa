@@ -309,5 +309,24 @@
       "Syscall counts are not unprofiled timings.",
       "Futex calls mix condition variables and other waits; no mutex attribution is inferred."
     ]
+  },
+  "ci_dependency_followup": {
+    "crate": "crypto-bigint",
+    "previous": "0.7.6",
+    "replacement": "0.7.9",
+    "reason": "Registry yanked version rejected by the existing dependency-advisory gate.",
+    "workspace_consumers": [
+      "ferrosa-jepsen"
+    ],
+    "engine_normal_build_dependency_graph_unchanged": true,
+    "engine_package_count": 657,
+    "engine_dependency_graph_sha256": "12b018717d7730f935b3ab58ac6a3cc981cea3a7b3c6b3b737f78fec06187403",
+    "validation": {
+      "jepsen_lib_passed": 244,
+      "jepsen_lib_failed": 0,
+      "strict_jepsen_all_target_all_feature_clippy": "passed",
+      "cargo_deny_all_categories": "passed"
+    },
+    "measured_engine_revision_remains": "a948ed1df48fd955bc144956b3d50546512665e2"
   }
 }
