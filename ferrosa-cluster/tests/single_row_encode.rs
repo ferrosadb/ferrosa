@@ -6,7 +6,8 @@
 //! encoder's, the row survives the round trip, and the encode allocates the
 //! wire buffer and nothing else.
 //!
-//! One test owns the process allocator window, so this file holds exactly one.
+//! Allocation windows measure only the calling thread: the encoder is
+//! synchronous, and test-runner/background threads are outside its budget.
 
 use ferrosa_cluster::pair::coordinator::{
     decode_mutation, encode_mutation, encode_single_row_mutation,
@@ -15,26 +16,33 @@ use ferrosa_common::{CellValue, DecoratedKey, PartitionKey};
 use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
 use ferrosa_storage::Mutation;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::cell::Cell;
 
 struct Counter;
-static EVENTS: AtomicUsize = AtomicUsize::new(0);
-static BYTES: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Const initialization never allocates, including from the allocator itself.
+    static COUNTS: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+}
+
+fn record_allocation(size: usize) {
+    // Allocations during TLS teardown are outside any measurement window.
+    let _ = COUNTS.try_with(|counts| {
+        let (events, bytes) = counts.get();
+        counts.set((events + 1, bytes + size));
+    });
+}
 
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(l.size(), Ordering::Relaxed);
+        record_allocation(l.size());
         unsafe { System.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(l.size(), Ordering::Relaxed);
+        record_allocation(l.size());
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
-        BYTES.fetch_add(n, Ordering::Relaxed);
+        record_allocation(n);
         unsafe { System.realloc(p, l, n) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
@@ -46,11 +54,11 @@ unsafe impl GlobalAlloc for Counter {
 static ALLOCATOR: Counter = Counter;
 
 fn events() -> usize {
-    EVENTS.load(Ordering::Relaxed)
+    COUNTS.with(|counts| counts.get().0)
 }
 
 fn bytes() -> usize {
-    BYTES.load(Ordering::Relaxed)
+    COUNTS.with(|counts| counts.get().1)
 }
 
 fn row() -> Row {
@@ -71,6 +79,43 @@ fn row() -> Row {
 
 fn key() -> DecoratedKey {
     DecoratedKey::new(PartitionKey::new(b"partition-key".to_vec()))
+}
+
+#[test]
+fn allocation_counter_excludes_other_threads() {
+    use std::hint::black_box;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // The handshake allocates nothing on this thread inside the window. Keep
+    // the worker alive until after the snapshot to exclude its teardown.
+    let phase = Arc::new(AtomicUsize::new(0));
+    let worker_phase = Arc::clone(&phase);
+    let worker = std::thread::spawn(move || {
+        while worker_phase.load(Ordering::Acquire) == 0 {
+            std::hint::spin_loop();
+        }
+        let buffer = black_box(vec![0u8; 4096]);
+        worker_phase.store(2, Ordering::Release);
+        while worker_phase.load(Ordering::Acquire) == 2 {
+            std::hint::spin_loop();
+        }
+        black_box(buffer);
+    });
+
+    let before = (events(), bytes());
+    phase.store(1, Ordering::Release);
+    while phase.load(Ordering::Acquire) != 2 {
+        std::hint::spin_loop();
+    }
+    let delta = (events() - before.0, bytes() - before.1);
+    phase.store(3, Ordering::Release);
+    worker.join().unwrap();
+    assert_eq!(
+        delta,
+        (0, 0),
+        "another thread contaminated the encoder budget"
+    );
 }
 
 #[test]
