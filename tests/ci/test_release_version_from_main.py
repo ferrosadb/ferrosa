@@ -9,6 +9,7 @@ Run: python3 -m unittest -q tests/ci/test_release_version_from_main.py
 import os
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -206,6 +207,75 @@ class SemverWorkflowContractTest(unittest.TestCase):
         hooks = (ROOT / ".pre-commit-config.yaml").read_text(encoding="utf-8")
         self.assertNotIn("semver-bump --check --base", hooks)
         self.assertIn("semver-bump --check-message", hooks)
+
+    def test_release_fetches_every_graph_before_offline_lock_refresh(self):
+        cfg = tomllib.loads((ROOT / ".semver-bump.toml").read_text())
+        for command in cfg["post_apply"]:
+            if command[:2] != ["cargo", "update"]:
+                continue
+            fetch = "cargo fetch --locked"
+            if "--manifest-path" in command:
+                fetch += " --manifest-path " + command[command.index("--manifest-path") + 1]
+            self.assertIn(fetch, self.wf)
+
+
+class ReleaseLockfilesTest(unittest.TestCase):
+    def test_real_release_refreshes_and_commits_every_dependent_lockfile(self):
+        """Exercise the real release configuration with small, offline Cargo graphs."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def run(*command):
+                result = subprocess.run(command, cwd=root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return result.stdout
+
+            run("git", "init", "-q", "-b", "main")
+            run("git", "config", "user.name", "test")
+            run("git", "config", "user.email", "test@example.com")
+            (root / ".semver-bump.toml").write_text((ROOT / ".semver-bump.toml").read_text())
+            (root / "Cargo.toml").write_text(
+                '[workspace]\nmembers = ["shared"]\nresolver = "2"\n'
+                'exclude = ["ferrosa-jsonb-conformance", "ferrosa-sstable/fuzz"]\n'
+                '[workspace.package]\nversion = "0.1.0"\n'
+            )
+            shared = root / "shared"
+            shared.mkdir()
+            (shared / "Cargo.toml").write_text(
+                '[package]\nname = "release-shared"\nversion.workspace = true\n'
+                'edition = "2021"\n[lib]\npath = "lib.rs"\n'
+            )
+            (shared / "lib.rs").write_text("")
+            manifests = ["Cargo.toml"]
+            for name, directory in (("conformance", "ferrosa-jsonb-conformance"),
+                                    ("fuzz", "ferrosa-sstable/fuzz")):
+                project = root / directory
+                project.mkdir(parents=True)
+                (project / "Cargo.toml").write_text(
+                    f'[package]\nname = "release-{name}"\nversion = "0.0.0"\n'
+                    'edition = "2021"\n[workspace]\n[lib]\npath = "lib.rs"\n'
+                    f'[dependencies]\nrelease-shared = {{ path = "{os.path.relpath(shared, project)}" }}\n'
+                )
+                (project / "lib.rs").write_text("")
+                manifests.append(f"{directory}/Cargo.toml")
+            for manifest in manifests:
+                run("cargo", "generate-lockfile", "--offline", "--manifest-path", manifest)
+            run("git", "add", ".")
+            run("git", "commit", "-qm", "chore: baseline")
+            run("git", "tag", "semver-v0.1.0")
+            run("git", "commit", "--allow-empty", "-qm", "fix: require a patch release")
+
+            run("python3", str(ROOT / "scripts" / "semver-bump"), "--release")
+
+            for manifest in manifests:
+                # --locked is the same invariant enforced by the dependency gate.
+                run("cargo", "metadata", "--offline", "--locked", "--format-version", "1",
+                    "--manifest-path", manifest)
+                lock = Path(manifest).with_name("Cargo.lock")
+                packages = tomllib.loads(run("git", "show", f"HEAD:{lock}"))["package"]
+                self.assertEqual(next(p["version"] for p in packages
+                                      if p["name"] == "release-shared"), "0.1.1")
+            self.assertEqual(run("git", "status", "--porcelain"), "")
 
 
 if __name__ == "__main__":

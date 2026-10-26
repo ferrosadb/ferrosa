@@ -10,13 +10,14 @@ tag_prefix = "semver-v"
 
 # Every crate inherits `version.workspace = true`, so Cargo.lock records the
 # version of each member; refresh it so `--locked` builds pass after a bump.
-# ferrosa-jsonb-conformance is its own workspace with path deps on our crates,
-# so its lockfile records their version too, and ci.yml builds it --locked.
+# The conformance and fuzz workspaces have path deps on our crates, so their
+# lockfiles record those versions too. Security checks every lockfile --locked.
 post_apply = [
   ["cargo", "update", "--workspace", "--offline"],
   ["cargo", "update", "--workspace", "--offline", "--manifest-path", "ferrosa-jsonb-conformance/Cargo.toml"],
+  ["cargo", "update", "--workspace", "--offline", "--manifest-path", "ferrosa-sstable/fuzz/Cargo.toml"],
 ]
-also_commit = ["Cargo.lock", "ferrosa-jsonb-conformance/Cargo.lock"]
+also_commit = ["Cargo.lock", "ferrosa-jsonb-conformance/Cargo.lock", "ferrosa-sstable/fuzz/Cargo.lock"]
 
 [[file]]
 path = "Cargo.toml"
