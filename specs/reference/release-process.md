@@ -143,6 +143,12 @@ choose glibc: it is 15-20% faster than musl, so it is the default image.
   against that base at build time.
 - **musl, `docker-image`:** `alpine:3.20` + `ca-certificates` + `tzdata`,
   COPYing the static musl binary.
+- **In-image HTTP client:** the glibc image ships `curl` for readiness probing,
+  not for the engine. Roll and provisioning tooling probes `/readyz` from
+  inside the container over HTTPS on loopback, because that is the only view
+  that proves the node serves traffic; a runtime image with no HTTP client
+  cannot run that gate at all. The musl image needs nothing extra — Alpine's
+  base already provides busybox `wget`.
 - Neither compiles in Docker or uses QEMU.
 - **Features:** both are built with `--features ferrosa/full` (otel + flight +
   asc-udf), identical to the `.deb`/tarball binaries.
