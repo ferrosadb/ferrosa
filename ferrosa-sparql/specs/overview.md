@@ -179,3 +179,7 @@ Interrupted targets remain fenced. A completed rerun validates provenance withou
 recopying retired v1. Empty registry snapshots retain the flat storage catalog
 fallback so neither source nor target disappears on restart. See
 [RDF term identity cutover](rdf-term-identity-cutover.md).
+
+CLEAR/DROP uses two streaming passes: validation followed by deletion. Each pass
+holds storage fragments, rather than buffering every selected triple. A preflight
+error leaves the data unchanged; this is not a transaction over concurrent writers.

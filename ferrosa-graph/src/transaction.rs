@@ -31,7 +31,7 @@ tokio::task_local! {
 
 #[derive(Default)]
 struct Pending {
-    mutations: Vec<Mutation>,
+    mutations: Vec<Arc<Mutation>>,
     bytes: usize,
 }
 
@@ -98,14 +98,16 @@ impl LocalTransaction {
             return Err(invalid("transaction pending memory limit exceeded (8 MiB)"));
         }
         pending.bytes += bytes;
-        pending.mutations.extend(mutations);
+        pending
+            .mutations
+            .extend(mutations.into_iter().map(Arc::new));
         Ok(())
     }
 
     fn overlay(
         &self,
         table: &TableId,
-    ) -> ferrosa_common::Result<BTreeMap<DecoratedKey, Vec<Partition>>> {
+    ) -> ferrosa_common::Result<BTreeMap<DecoratedKey, Vec<Arc<Mutation>>>> {
         self.check_deadline()?;
         let pending = self.pending.lock().unwrap();
         let mut partitions: BTreeMap<_, Vec<_>> = BTreeMap::new();
@@ -114,12 +116,7 @@ impl LocalTransaction {
                 partitions
                     .entry(m.key.clone())
                     .or_default()
-                    .push(Partition {
-                        key: m.key.clone(),
-                        deletion: DeletionTime::LIVE,
-                        static_row: None,
-                        rows: m.rows.clone(),
-                    });
+                    .push(Arc::clone(m));
             }
         }
         Ok(partitions)
@@ -132,6 +129,9 @@ impl LocalTransaction {
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
         let mut batch = self.storage.begin_batch();
         for m in pending.mutations {
+            // RUN streams are drained before COMMIT; never copy an outstanding
+            // read snapshot into a second committed write set.
+            let m = Arc::try_unwrap(m).map_err(|_| invalid("transaction read is still active"))?;
             for row in m.rows {
                 batch.stage(BatchOp::Write {
                     keyspace: m.keyspace.clone(),
@@ -146,7 +146,19 @@ impl LocalTransaction {
     }
 }
 
-fn merged(parts: Vec<Partition>, limit: usize) -> Partition {
+fn merged(base: Option<Partition>, mutations: Vec<Arc<Mutation>>, limit: usize) -> Partition {
+    let mut parts: Vec<_> = base.into_iter().collect();
+    // The overlay retains shared handles only. Materialize the consumed key,
+    // never unrelated pending partitions. Payload staging remains byte-bounded.
+    for mutation in mutations {
+        let mutation = Arc::unwrap_or_clone(mutation);
+        parts.push(Partition {
+            key: mutation.key,
+            deletion: DeletionTime::LIVE,
+            static_row: None,
+            rows: mutation.rows,
+        });
+    }
     let mut partition = ferrosa_storage::merge_partitions(parts);
     partition
         .rows
@@ -164,14 +176,12 @@ impl GraphWrite for LocalTransaction {
         table_id: &TableId,
         key: &DecoratedKey,
     ) -> ferrosa_common::Result<Option<Partition>> {
-        let mut parts = self.overlay(table_id)?.remove(key).unwrap_or_default();
-        if let Some(base) = self.storage.read(table_id, key)? {
-            parts.insert(0, base);
-        }
-        if parts.is_empty() {
+        let parts = self.overlay(table_id)?.remove(key).unwrap_or_default();
+        let base = self.storage.read(table_id, key)?;
+        if parts.is_empty() && base.is_none() {
             return Ok(None);
         }
-        let partition = merged(parts, 0);
+        let partition = merged(base, parts, 0);
         Ok((!partition.rows.is_empty() || partition.static_row.is_some()).then_some(partition))
     }
 
@@ -199,13 +209,12 @@ impl GraphWrite for LocalTransaction {
             while let Some(partition) = base.next().await {
                 if Instant::now() >= deadline { Err(ClusterError::Storage(invalid("transaction timeout expired")))?; }
                 let partition = partition?;
-                let mut parts = overlay.remove(&partition.key).unwrap_or_default();
-                parts.insert(0, partition);
-                let partition = merged(parts, row_limit);
+                let parts = overlay.remove(&partition.key).unwrap_or_default();
+                let partition = merged(Some(partition), parts, row_limit);
                 if !partition.rows.is_empty() || partition.static_row.is_some() { yield partition; }
             }
             for parts in overlay.into_values() {
-                let partition = merged(parts, row_limit);
+                let partition = merged(None, parts, row_limit);
                 if !partition.rows.is_empty() || partition.static_row.is_some() { yield partition; }
             }
         }))

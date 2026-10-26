@@ -555,3 +555,7 @@ change is refused before DDL or storage rotation, and failure/RESET discards
 staged rows and releases writer ownership. Existing scalar columns retain the
 shared automatic-index setup; index readiness never bypasses the transaction's
 read-your-writes overlay.
+
+Transaction read overlays retain immutable mutation handles and materialize only
+the consumed partition, avoiding a copy of unrelated pending rows. COMMIT requires
+all transaction read streams to be drained before consuming staged mutations.

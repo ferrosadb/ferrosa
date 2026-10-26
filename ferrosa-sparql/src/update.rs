@@ -471,46 +471,53 @@ async fn exec_clear(
 ) -> Result<usize, SparqlError> {
     use futures::StreamExt;
     let table = triple_store::triples_table_id(keyspace);
-    let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
-    let mut triples = Vec::new();
-    let mut rows_read = 0usize;
-    while let Some(partition) = partitions.next().await {
-        let partition = partition?;
-        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
-        let selected = match target {
-            GraphTarget::NamedNode(n) => graph == n.as_str(),
-            GraphTarget::DefaultGraph => graph == "default",
-            GraphTarget::NamedGraphs => graph != "default",
-            GraphTarget::AllGraphs => true,
-        };
-        if !selected {
-            continue;
-        }
-        for row in &partition.rows {
-            rows_read += 1;
-            if rows_read > limits.max_rows {
-                return Err(SparqlError::Execution(format!(
-                    "SPARQL scan read more than {} storage rows during CLEAR/DROP",
-                    limits.max_rows
-                )));
+    // Validate a complete first pass before issuing deletes, retaining no table
+    // of triples. Like the existing update path, this is not a multi-statement
+    // transaction: concurrent writers and storage failures require coordination.
+    let mut deleted = 0usize;
+    for apply in [false, true] {
+        let mut partitions = write_path.range_read_stream_all(&table, 0).await?;
+        let mut rows_read = 0usize;
+        while let Some(partition) = partitions.next().await {
+            let partition = partition?;
+            let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
+            let selected = match target {
+                GraphTarget::NamedNode(n) => graph == n.as_str(),
+                GraphTarget::DefaultGraph => graph == "default",
+                GraphTarget::NamedGraphs => graph != "default",
+                GraphTarget::AllGraphs => true,
+            };
+            if !selected {
+                continue;
             }
-            if let Some((predicate, object)) = triple_store::decode_v2_row(row)? {
-                validate_key(&graph, &subject, &predicate, &object)?;
-                triples.push((
-                    graph.clone(),
-                    GroundTriple {
-                        subject: subject.clone(),
-                        predicate,
-                        object,
-                    },
-                ));
+            for row in &partition.rows {
+                rows_read += 1;
+                if rows_read > limits.max_rows {
+                    return Err(SparqlError::Execution(format!(
+                        "SPARQL scan read more than {} storage rows during CLEAR/DROP",
+                        limits.max_rows
+                    )));
+                }
+                if let Some((predicate, object)) = triple_store::decode_v2_row(row)? {
+                    validate_key(&graph, &subject, &predicate, &object)?;
+                    if apply {
+                        delete_ground_triple(
+                            keyspace,
+                            &graph,
+                            &GroundTriple {
+                                subject: subject.clone(),
+                                predicate,
+                                object,
+                            },
+                            storage,
+                        )?;
+                        deleted += 1;
+                    }
+                }
             }
         }
     }
-    for (graph, triple) in &triples {
-        delete_ground_triple(keyspace, graph, triple, storage)?;
-    }
-    Ok(triples.len())
+    Ok(deleted)
 }
 
 /// A ground triple to tombstone. The graph it lives in is supplied by the

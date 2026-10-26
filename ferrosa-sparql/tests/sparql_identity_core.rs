@@ -686,3 +686,37 @@ async fn ask_and_construct_use_full_term_matching() {
         vec![literal("1", INTEGER, None), literal("1", STRING, None)]
     );
 }
+
+#[tokio::test]
+async fn clear_wide_graph_preflights_limits_then_deletes_every_fragment() {
+    let f = Fixture::new();
+    for i in 0..600 {
+        f.insert(G, &format!("\"term-{i}\"")).await;
+    }
+    f.storage.flush(&triples_table_id(KS)).unwrap();
+    let bounded = SparqlEngine::new(
+        f.storage.clone(),
+        Arc::new(WritePath::direct(f.storage.clone())),
+        SparqlConfig {
+            max_rows: 599,
+            ..Default::default()
+        },
+    );
+    assert!(bounded
+        .execute_update(&format!("CLEAR GRAPH <{G}>"), KS)
+        .await
+        .is_err());
+    assert_eq!(
+        f.objects(G).await.len(),
+        600,
+        "failed preflight must not delete a prefix"
+    );
+    f.engine
+        .execute_update(&format!("CLEAR GRAPH <{G}>"), KS)
+        .await
+        .unwrap();
+    assert!(
+        f.objects(G).await.is_empty(),
+        "all fragments must be deleted"
+    );
+}
