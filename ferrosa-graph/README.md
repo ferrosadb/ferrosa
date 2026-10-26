@@ -29,6 +29,24 @@ matching environment variables, then supplies these config objects to the HTTP
 and Bolt servers. Bolt uses the resolved Graph HTTP host with its separately
 resolved port.
 
+## Measured node-query performance (2026-10-26)
+
+Matched-placement Bolt tests at runtime `a948ed1df`, with 20k nodes and equal
+network RTT, distinguish two schemas. With `pk bigint PRIMARY KEY`, Ferrosa's
+single-worker point-read p50 is **0.761 ms versus Neo4j 5.26.32's 1.866 ms**;
+eight-worker throughput is **2,336 versus 1,436 reads/s**. With UUID `id` as the
+primary key and regular property `pk`, the same property equality scans the
+Ferrosa table: **91.63 versus 2.50 ms p50**, while Neo4j uses `NodeIndexSeek`.
+Both tested Cypher property-index DDL syntaxes are rejected by Ferrosa.
+
+The anchor reader uses `pk_read` when properties bind the complete native key;
+otherwise it uses `range_read_stream_all`. Declaring a native key changes the
+schema and uniqueness semantics and is not an arbitrary-property index fix.
+Count execution also remains slower in this fixture (133.39 versus 1.50 ms).
+Two observations per engine/schema are descriptive; these node-query shapes do
+not establish general traversal or graph-write parity. See [schemas, plans,
+placement controls and exact measurements](../deploy/fly-bench/pipeline/RESULTS.md).
+
 ## What's implemented
 
 MERGE resolves both endpoint nodes before writing their relationship, so explicit

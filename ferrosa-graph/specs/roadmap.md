@@ -16,6 +16,20 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Now (highest value)
 
+- **Route regular-property predicates through supported indexes.** The
+  2026-10-26 matched-placement 20k-node control measures 91.63 versus Neo4j's
+  2.50 ms point p50 when Ferrosa's UUID-primary table filters regular `pk`.
+  Native `pk` primary-key lookup measures 0.761 versus 1.866 ms, showing the
+  access-path distinction. Both tested Cypher index DDL syntaxes fail, and
+  `stream_anchor_partitions` selects only native-key lookup or range scan.
+  Connect property-index declaration/maintenance and graph reader selection;
+  preserve duplicate matches, filtering and index-update correctness. Changing
+  the native primary key is a schema control, not this implementation.
+- **Investigate count execution separately from point reads.** The keyed
+  20k-node fixture measures 133.39 versus 1.50 ms median count latency. Keep
+  count visibility/correctness requirements explicit before adding metadata
+  shortcuts. [Measurements, plans and limits](../../deploy/fly-bench/pipeline/RESULTS.md).
+
 - **Arm adjacency reconciliation in production (FMEA G-1).** The synchronous
   observer is the primary guarantee, but the background reconciler — the only
   thing that catches dropped mutations and crash-recovery drift — is still

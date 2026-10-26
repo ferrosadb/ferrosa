@@ -1,6 +1,6 @@
 # Measured pipeline changes
 
-## Current findings
+## Current PostgreSQL findings
 
 Ferrosa reaches **89.1% of PostgreSQL INSERT throughput and 90.3% of point-read
 throughput** in the reverse-placement control. This supports rough end-to-end
@@ -25,8 +25,57 @@ microseconds** for missing keys. The difference on a miss means returned-payload
 copying alone cannot explain it. Loopback shares server CPUs with the client;
 these are separate probes, not direct server spans or additive request timings.
 Allocation volume, individual mutex waits and the exact host/network cause are
-not established by these measurements. No current matched Neo4j comparison is
-available.
+not established by these measurements. Matched Neo4j node-query controls are
+reported in the next section.
+
+## Neo4j comparison: network and lookup-schema controls — 2026-10-26
+
+The original Ferrosa endpoint measured **2.093 ms kernel SYN/SYNACK RTT** versus
+**0.310 ms** to Neo4j. Moving the same Ferrosa ELF and its runtime libraries beside
+Neo4j makes RTT **0.315 versus 0.310 ms**. The native-key follow-up measures
+**0.344 versus 0.329 ms**. The original Ferrosa VM is stopped during query timing.
+
+| Matched-placement node-query shape | Ferrosa | Neo4j 5.26.32 |
+| --- | ---: | ---: |
+| Regular-property point read, one worker, paired p50 | **91.63 ms** | **2.50 ms** |
+| Native-key point read, one worker, paired p50 | **0.761 ms** | **1.866 ms** |
+| Native-key point reads, eight workers, paired ops/s | **2,336** | **1,436** |
+| Count over native-key fixture, paired median | 133.39 ms | 1.50 ms |
+| Bounded scan over native-key fixture, paired rows/s | 37,580 | 52,933 |
+
+Both fixtures contain 20k nodes, 96-byte payloads and 512 variants. In each,
+Neo4j uses an ONLINE range index on `pk` and reports `NodeIndexSeek`. Ferrosa's
+regular-property fixture is a CQL vertex table with `id uuid PRIMARY KEY` and
+regular `pk bigint`, matching the schema-on-write layout. It rejects both tested
+Cypher index DDL syntaxes. The graph anchor reader selects `pk_read` only when
+the full native primary key is bound; otherwise it calls `range_read_stream_all`.
+The regular-property predicate therefore scans this table.
+
+The size probe supports that arm attribution: Ferrosa point p50 rises from
+**2.98 → 10.90 → 43.98 → 120.17 ms** at 500 → 2k → 8k → 20k nodes. Declaring
+`pk bigint PRIMARY KEY` in the second Ferrosa fixture makes the same property
+equality query use the native keyed path; its size-probe p50 stays around
+**0.73–0.80 ms**. The keyed primary cases record 50 SST probes for 50 reads and
+400 for 400 reads, with no scan releases. Query labels differ between fixtures;
+both engines use the same query shape within each fixture.
+
+**Finding:** removing bad network placement leaves a real regular-property
+lookup gap. Native keyed graph reads perform well in this measured workload;
+arbitrary-property index declaration/routing and count execution remain gaps.
+The native-key control changes schema and uniqueness semantics. It is not a
+property-index implementation or a general graph-parity result.
+
+Primary order is Neo4j → Ferrosa → Ferrosa → Neo4j for each schema, with 50
+single-worker and 400 eight-worker point reads per leg, five count samples and
+a 10k-row bounded scan. All **3,600 timed point reads** and both 20k-node
+value/key censuses validate. Both services share one performance-2CPU/4096MiB/lax
+VM and root filesystem, with one timed workload active. Processes are reused;
+two observations per engine are descriptive. P50 entries are means of per-leg
+p50s. CPU profiles follow primary timing; raw profiles/resources remain private.
+JVM JFR recording could not write its output file, so no JVM allocation or
+monitor-wait conclusions are claimed. Relationship traversals, graph writes,
+durability and multi-node operation are outside this comparison.
+[Exact observations, schema DDL, plans, counters and checksums](graph-placement-results.json).
 
 ## Reverse placement on PostgreSQL's original VM — 2026-10-26
 
@@ -153,8 +202,8 @@ Both engines use the same Fly performance-2CPU/4096MiB/lax class and client.
 Ferrosa uses an attached volume and PostgreSQL its root filesystem. Read CPU
 profiles, process/RSS, disk/network and scheduler data were gathered separately
 and retained privately. CPU samples and runqueue sums are not individual mutex
-wait times; RSS is not allocated bytes. No current matched Neo4j comparison is
-established. [Exact values and image identities](point-read-walk-results.json).
+wait times; RSS is not allocated bytes. Matched Neo4j node-query controls are
+reported above. [Exact values and image identities](point-read-walk-results.json).
 
 The preceding 100k/follow-on-5k workload is retained below with its runtime. It
 has not been rerun on runtime `a948ed1df` and is not a current 100k claim.
@@ -184,9 +233,9 @@ fewer allocations. Two runs do not establish statistical significance. Both
 servers use the same 2-performance-CPU/4-GiB class and region; Ferrosa uses an
 attached volume and PostgreSQL its root filesystem, so storage is not identical.
 
-Neo4j: **no current matched Ferrosa-versus-Neo4j result is established here**.
-The older Bolt numbers below are Ferrosa revision comparisons. Different older
-native Neo4j workloads cannot establish the current product gap.
+The older Bolt numbers below are Ferrosa revision comparisons. The matched
+Neo4j node-query and lookup-schema controls are reported above; older native
+Neo4j workloads remain historical.
 
 Source values/ranges: [historical INSERT and point-read results](mvcc-absence-results.json).
 The sections below preserve the measured journey at their named revisions;

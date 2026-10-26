@@ -13,7 +13,14 @@ The earlier 3.08× cross-product read ratio used unequal network paths; placing
 both on the original Ferrosa VM measured 3,142 versus 3,555 reads/s (88.4%).
 These placement controls are not source-code speedups.
 The timing breakdown, four-change history, limits and exact observations are in
-[RESULTS.md](RESULTS.md). There is no current matched Neo4j comparison.
+[RESULTS.md](RESULTS.md).
+
+Matched-placement Neo4j node-query controls show the schema distinction:
+Ferrosa's native-primary-key point read is **0.761 versus 1.866 ms p50**;
+a regular-property lookup over its UUID-primary table is **91.63 versus 2.50 ms**.
+The latter scans while Neo4j uses a range index. Declaring a primary key changes
+schema and uniqueness semantics; arbitrary-property indexing and count execution
+remain gaps. These measurements do not establish general graph parity.
 
 This instrument validates exact row values, counts and key sets before accepting
 timings. It measures PostgreSQL inserts and point reads, and Bolt point updates

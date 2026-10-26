@@ -1,0 +1,811 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-10-26",
+  "ferrosa_revision": "a948ed1df48fd955bc144956b3d50546512665e2",
+  "ferrosa_image": "registry.fly.io/ferrosa-bench-main@sha256:1ed2555fb9f17d604273c3ef00e4736b803faa5135d6394b1c7b275b40deab32",
+  "ferrosa_binary_sha256": "3f3ad18ee2aefb462d4e4847eb006829000827bad1ab5cfc8d7690921d338638",
+  "neo4j_version": "5.26.32 community",
+  "neo4j_image": "docker-hub-mirror.fly.io/library/neo4j:5.26-community@sha256:57ecb62bbb0c41c98fb69e08ee014c959926f3bd16ee8ef466c4a1e298f6157c",
+  "original_ferrosa_kernel_syn_rtt_us_p50": 2092.5,
+  "server_class": "performance-2CPU/4096MiB/lax; both engines share one VM, one query workload active",
+  "experiments": {
+    "regular_property": {
+      "label": "BenchRow",
+      "ferrosa_key": "id uuid PRIMARY KEY; pk bigint regular property",
+      "seeds_and_plans": {
+        "ferrosa": {
+          "rows": 20000,
+          "size_probes": [
+            {
+              "rows": 500,
+              "operations": 10,
+              "mean_ms": 3.005720700001291,
+              "p50_ms": 2.9774614999951154,
+              "p99_ms": 3.4290199999986726
+            },
+            {
+              "rows": 2000,
+              "operations": 10,
+              "mean_ms": 11.204841199996451,
+              "p50_ms": 10.895819999994671,
+              "p99_ms": 13.130114000006188
+            },
+            {
+              "rows": 8000,
+              "operations": 10,
+              "mean_ms": 44.100235800000576,
+              "p50_ms": 43.97575949999322,
+              "p99_ms": 48.65712600000904
+            },
+            {
+              "rows": 20000,
+              "operations": 10,
+              "mean_ms": 120.35584929999885,
+              "p50_ms": 120.17404450000413,
+              "p99_ms": 134.47457099999838
+            }
+          ],
+          "index_attempts": [
+            {
+              "ddl": "CREATE INDEX bench_pk IF NOT EXISTS FOR (n:BenchRow) ON (n.pk)",
+              "accepted": false,
+              "error_type": "CypherSyntaxError",
+              "message": "{neo4j_code: Neo.ClientError.Statement.SyntaxError} {message: An unknown error occurred} {gql_status: 50N42} {gql_status_description: error: general processing exception - unexpected error}"
+            },
+            {
+              "ddl": "CREATE INDEX ON :BenchRow(pk)",
+              "accepted": false,
+              "error_type": "CypherSyntaxError",
+              "message": "{neo4j_code: Neo.ClientError.Statement.SyntaxError} {message: An unknown error occurred} {gql_status: 50N42} {gql_status_description: error: general processing exception - unexpected error}"
+            }
+          ],
+          "plan": {
+            "plan": "Expand {\n  anchor: bench.benchrow (var: Some(\"n\"))\n  return: 3 item(s)\n}"
+          },
+          "schema_bootstrap": [
+            "CREATE KEYSPACE IF NOT EXISTS bench WITH replication = {'class':'SimpleStrategy','replication_factor':1}",
+            "CREATE TABLE bench.benchrow (id uuid PRIMARY KEY,pk bigint,bucket bigint,payload text) WITH extensions = {'graph.type':'vertex','graph.label':'BenchRow'}"
+          ],
+          "source_sha256": "33c3fb717e1299b81539ea0698ba1afe7d24a34938b78c467f234cca7665ea8c"
+        },
+        "neo4j": {
+          "rows": 20000,
+          "size_probes": [
+            {
+              "rows": 500,
+              "operations": 10,
+              "mean_ms": 8.296377099998153,
+              "p50_ms": 7.248660000001905,
+              "p99_ms": 21.521561000000133
+            },
+            {
+              "rows": 2000,
+              "operations": 10,
+              "mean_ms": 3.971845100002725,
+              "p50_ms": 3.6754699999974605,
+              "p99_ms": 6.087093000004984
+            },
+            {
+              "rows": 8000,
+              "operations": 10,
+              "mean_ms": 3.697752800000842,
+              "p50_ms": 3.6493049999961613,
+              "p99_ms": 6.241983000009554
+            },
+            {
+              "rows": 20000,
+              "operations": 10,
+              "mean_ms": 2.7179425999975138,
+              "p50_ms": 2.6111230000012142,
+              "p99_ms": 4.766806999995765
+            }
+          ],
+          "index_attempts": [
+            {
+              "ddl": "CREATE INDEX bench_pk IF NOT EXISTS FOR (n:BenchRow) ON (n.pk)",
+              "accepted": true
+            }
+          ],
+          "indexes": [
+            {
+              "name": "bench_pk",
+              "state": "ONLINE",
+              "type": "RANGE",
+              "labelsOrTypes": [
+                "BenchRow"
+              ],
+              "properties": [
+                "pk"
+              ]
+            }
+          ],
+          "plan": {
+            "args": {
+              "planner-impl": "IDP",
+              "Details": "pk, bucket, payload",
+              "planner-version": "5.26.32",
+              "string-representation": "Cypher 5\n\nPlanner COST\n\nRuntime SLOTTED\n\nRuntime version 5.26.32\n\n+------------------+----+---------------------------------------------------------------------------+----------------+\n| Operator         | Id | Details                                                                   | Estimated Rows |\n+------------------+----+---------------------------------------------------------------------------+----------------+\n| +ProduceResults  |  0 | pk, bucket, payload                                                       |              1 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +Projection      |  1 | cache[n.pk] AS pk, cache[n.bucket] AS bucket, cache[n.payload] AS payload |              1 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +CacheProperties |  2 | cache[n.bucket], cache[n.payload]                                         |              1 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +NodeIndexSeek   |  3 | RANGE INDEX n:BenchRow(pk) WHERE pk = $pk, cache[n.pk]                    |              1 |\n+------------------+----+---------------------------------------------------------------------------+----------------+\n\nTotal database accesses: ?\n",
+              "runtime-version": "5.26.32",
+              "runtime": "SLOTTED",
+              "Id": 0,
+              "runtime-impl": "SLOTTED",
+              "EstimatedRows": 1.0,
+              "planner": "COST",
+              "version": "5"
+            },
+            "children": [
+              {
+                "args": {
+                  "Details": "cache[n.pk] AS pk, cache[n.bucket] AS bucket, cache[n.payload] AS payload",
+                  "Id": 1,
+                  "EstimatedRows": 1.0
+                },
+                "children": [
+                  {
+                    "args": {
+                      "Details": "cache[n.bucket], cache[n.payload]",
+                      "Id": 2,
+                      "EstimatedRows": 1.0
+                    },
+                    "children": [
+                      {
+                        "args": {
+                          "Details": "RANGE INDEX n:BenchRow(pk) WHERE pk = $pk, cache[n.pk]",
+                          "Id": 3,
+                          "EstimatedRows": 1.0
+                        },
+                        "identifiers": [
+                          "n"
+                        ],
+                        "operatorType": "NodeIndexSeek@neo4j"
+                      }
+                    ],
+                    "identifiers": [
+                      "n"
+                    ],
+                    "operatorType": "CacheProperties@neo4j"
+                  }
+                ],
+                "identifiers": [
+                  "n",
+                  "pk",
+                  "bucket",
+                  "payload"
+                ],
+                "operatorType": "Projection@neo4j"
+              }
+            ],
+            "identifiers": [
+              "n",
+              "pk",
+              "bucket",
+              "payload"
+            ],
+            "operatorType": "ProduceResults@neo4j"
+          },
+          "version": [
+            {
+              "name": "Neo4j Kernel",
+              "versions": [
+                "5.26.32"
+              ],
+              "edition": "community"
+            }
+          ],
+          "source_sha256": "6ccf52c0fcf582b5512667637f7af4e8d4281829bb1a258ed517951dd34229b7"
+        }
+      },
+      "transport": {
+        "ferrosa": {
+          "kernel_syn_rtt_us_p50": 314.5,
+          "source_sha256": "49224e2686544bd4231ebb2880c8d0a61b3f7acb3baf2e026921f6a1d7d9da3e"
+        },
+        "neo4j": {
+          "kernel_syn_rtt_us_p50": 310.0,
+          "source_sha256": "290929dd69888c4b92337f0cc663ccbc37bdf2277dbb45ed3bf3747ce94c7367"
+        }
+      },
+      "observations": [
+        {
+          "target": "neo4j",
+          "leg": 1,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 2.4845159800008787,
+              "p50_ms": 2.218738500005202,
+              "p99_ms": 4.798587000010457,
+              "elapsed_s": 0.12451794800000471,
+              "ops_s": 401.5485382075049,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 5.721363594999644,
+              "p50_ms": 5.443559999989134,
+              "p99_ms": 13.05603400001587,
+              "elapsed_s": 0.29696331400000986,
+              "ops_s": 1346.967726794653,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 1.6868213999941872,
+            "p50_ms": 1.5459459999931369,
+            "p99_ms": 2.181074000020544
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.24441668800000116,
+            "rows_s": 40913.73662669037
+          },
+          "source_sha256": "f3a31d349820f7f478d01b2304ec12492c47d575ebd665ec686fd1c14f44594b",
+          "validated": true
+        },
+        {
+          "target": "ferrosa",
+          "leg": 2,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 93.1317878800013,
+              "p50_ms": 90.28371700000548,
+              "p99_ms": 170.77266000001146,
+              "elapsed_s": 4.657126972999976,
+              "ops_s": 10.73623293714742,
+              "scan_release_delta": 129854.0,
+              "sst_probe_delta": 0.0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 631.3758385825,
+              "p50_ms": 588.0924644999936,
+              "p99_ms": 1380.708386000009,
+              "elapsed_s": 32.526279663,
+              "ops_s": 12.297748286749705,
+              "scan_release_delta": 1049458.0,
+              "sst_probe_delta": 0.0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 138.48137759999872,
+            "p50_ms": 139.36613699999612,
+            "p99_ms": 141.49944099997924
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.312150881000008,
+            "rows_s": 32035.789769242216
+          },
+          "source_sha256": "a48795bf030ae5ddf74db2820ff6178b0e29f155250bf7ce45b2b1ee4df186cf",
+          "validated": true
+        },
+        {
+          "target": "ferrosa",
+          "leg": 3,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 96.88985377999813,
+              "p50_ms": 92.9797894999922,
+              "p99_ms": 172.7621850000105,
+              "elapsed_s": 4.845016356999992,
+              "ops_s": 10.319882600140433,
+              "scan_release_delta": 133743.0,
+              "sst_probe_delta": 0.0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 649.4859584825001,
+              "p50_ms": 588.0806589999992,
+              "p99_ms": 1386.458570000002,
+              "elapsed_s": 33.210752622,
+              "ops_s": 12.044291936191339,
+              "scan_release_delta": 1034874.0,
+              "sst_probe_delta": 0.0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 145.56182200000762,
+            "p50_ms": 137.20762299999478,
+            "p99_ms": 173.29437400002234
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.26984508900000037,
+            "rows_s": 37058.29903022614
+          },
+          "source_sha256": "0249726e3cf932fba8fc515b5a37debeccd603ca2b2395a6020ae3a70a4faf5f",
+          "validated": true
+        },
+        {
+          "target": "neo4j",
+          "leg": 4,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 2.89646742000059,
+              "p50_ms": 2.780372499998407,
+              "p99_ms": 4.953606000015043,
+              "elapsed_s": 0.14505160099997738,
+              "ops_s": 344.70491642493346,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 4.810664895000514,
+              "p50_ms": 4.211458000000334,
+              "p99_ms": 12.084087000005184,
+              "elapsed_s": 0.25647212500001615,
+              "ops_s": 1559.6236823006586,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 2.950689800007922,
+            "p50_ms": 2.102104000016425,
+            "p99_ms": 5.50983499999802
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.1853405410000164,
+            "rows_s": 53954.7362171513
+          },
+          "source_sha256": "61ab8e9eddd40c62dd6a1ddee8769e268c703659648a4ea4c358985ca005db11",
+          "validated": true
+        }
+      ],
+      "paired_means": {
+        "ferrosa": {
+          "point": {
+            "1": {
+              "p50_ms": 91.63175324999884,
+              "ops_s": 10.528057768643926
+            },
+            "8": {
+              "p50_ms": 588.0865617499965,
+              "ops_s": 12.171020111470522
+            }
+          },
+          "count_p50_ms": 138.28687999999545,
+          "scan_rows_s": 34547.04439973418
+        },
+        "neo4j": {
+          "point": {
+            "1": {
+              "p50_ms": 2.4995555000018044,
+              "ops_s": 373.1267273162192
+            },
+            "8": {
+              "p50_ms": 4.827508999994734,
+              "ops_s": 1453.2957045476558
+            }
+          },
+          "count_p50_ms": 1.8240250000047808,
+          "scan_rows_s": 47434.23642192084
+        }
+      }
+    },
+    "native_primary_key": {
+      "label": "BenchKeyed",
+      "ferrosa_key": "pk bigint PRIMARY KEY",
+      "seeds_and_plans": {
+        "ferrosa": {
+          "rows": 20000,
+          "size_probes": [
+            {
+              "rows": 500,
+              "operations": 10,
+              "mean_ms": 1.162299799999289,
+              "p50_ms": 0.7357829999961041,
+              "p99_ms": 3.959029000000669
+            },
+            {
+              "rows": 2000,
+              "operations": 10,
+              "mean_ms": 0.8751496000016346,
+              "p50_ms": 0.8026830000034124,
+              "p99_ms": 1.412825999992151
+            },
+            {
+              "rows": 8000,
+              "operations": 10,
+              "mean_ms": 0.7354099999986374,
+              "p50_ms": 0.7261379999903284,
+              "p99_ms": 0.8464080000010199
+            },
+            {
+              "rows": 20000,
+              "operations": 10,
+              "mean_ms": 0.7934567999981823,
+              "p50_ms": 0.7938979999977391,
+              "p99_ms": 0.8926779999995915
+            }
+          ],
+          "index_attempts": [
+            {
+              "ddl": "CREATE INDEX bench_pk IF NOT EXISTS FOR (n:BenchKeyed) ON (n.pk)",
+              "accepted": false,
+              "error_type": "CypherSyntaxError",
+              "message": "{neo4j_code: Neo.ClientError.Statement.SyntaxError} {message: An unknown error occurred} {gql_status: 50N42} {gql_status_description: error: general processing exception - unexpected error}"
+            },
+            {
+              "ddl": "CREATE INDEX ON :BenchKeyed(pk)",
+              "accepted": false,
+              "error_type": "CypherSyntaxError",
+              "message": "{neo4j_code: Neo.ClientError.Statement.SyntaxError} {message: An unknown error occurred} {gql_status: 50N42} {gql_status_description: error: general processing exception - unexpected error}"
+            }
+          ],
+          "plan": {
+            "plan": "Expand {\n  anchor: bench.benchkeyed (var: Some(\"n\"))\n  return: 3 item(s)\n}"
+          },
+          "schema_bootstrap": [
+            "CREATE KEYSPACE IF NOT EXISTS bench WITH replication = {'class':'SimpleStrategy','replication_factor':1}",
+            "CREATE TABLE bench.benchkeyed (pk bigint PRIMARY KEY,bucket bigint,payload text) WITH extensions = {'graph.type':'vertex','graph.label':'BenchKeyed'}"
+          ],
+          "source_sha256": "68a5c8f16e04ccaf8f233a62b127d3e872bb4413b365aa048abc968379635124"
+        },
+        "neo4j": {
+          "rows": 20000,
+          "size_probes": [
+            {
+              "rows": 500,
+              "operations": 10,
+              "mean_ms": 6.406894399998464,
+              "p50_ms": 5.557809999999108,
+              "p99_ms": 10.266240999996512
+            },
+            {
+              "rows": 2000,
+              "operations": 10,
+              "mean_ms": 3.5052892999971164,
+              "p50_ms": 3.1639209999951845,
+              "p99_ms": 5.675854000003255
+            },
+            {
+              "rows": 8000,
+              "operations": 10,
+              "mean_ms": 6.871685199998012,
+              "p50_ms": 7.3377849999971545,
+              "p99_ms": 8.68938700000399
+            },
+            {
+              "rows": 20000,
+              "operations": 10,
+              "mean_ms": 3.224347200001887,
+              "p50_ms": 3.188756000000126,
+              "p99_ms": 4.0549489999932575
+            }
+          ],
+          "index_attempts": [
+            {
+              "ddl": "CREATE INDEX bench_pk IF NOT EXISTS FOR (n:BenchKeyed) ON (n.pk)",
+              "accepted": true
+            }
+          ],
+          "indexes": [
+            {
+              "name": "bench_pk",
+              "state": "ONLINE",
+              "type": "RANGE",
+              "labelsOrTypes": [
+                "BenchKeyed"
+              ],
+              "properties": [
+                "pk"
+              ]
+            }
+          ],
+          "plan": {
+            "args": {
+              "planner-impl": "IDP",
+              "Details": "pk, bucket, payload",
+              "planner-version": "5.26.32",
+              "string-representation": "Cypher 5\n\nPlanner COST\n\nRuntime SLOTTED\n\nRuntime version 5.26.32\n\n+------------------+----+---------------------------------------------------------------------------+----------------+\n| Operator         | Id | Details                                                                   | Estimated Rows |\n+------------------+----+---------------------------------------------------------------------------+----------------+\n| +ProduceResults  |  0 | pk, bucket, payload                                                       |              1 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +Projection      |  1 | cache[n.pk] AS pk, cache[n.bucket] AS bucket, cache[n.payload] AS payload |              1 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +CacheProperties |  2 | cache[n.bucket], cache[n.payload]                                         |              1 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +NodeIndexSeek   |  3 | RANGE INDEX n:BenchKeyed(pk) WHERE pk = $pk, cache[n.pk]                  |              1 |\n+------------------+----+---------------------------------------------------------------------------+----------------+\n\nTotal database accesses: ?\n",
+              "runtime-version": "5.26.32",
+              "runtime": "SLOTTED",
+              "Id": 0,
+              "runtime-impl": "SLOTTED",
+              "EstimatedRows": 1.0,
+              "planner": "COST",
+              "version": "5"
+            },
+            "children": [
+              {
+                "args": {
+                  "Details": "cache[n.pk] AS pk, cache[n.bucket] AS bucket, cache[n.payload] AS payload",
+                  "Id": 1,
+                  "EstimatedRows": 1.0
+                },
+                "children": [
+                  {
+                    "args": {
+                      "Details": "cache[n.bucket], cache[n.payload]",
+                      "Id": 2,
+                      "EstimatedRows": 1.0
+                    },
+                    "children": [
+                      {
+                        "args": {
+                          "Details": "RANGE INDEX n:BenchKeyed(pk) WHERE pk = $pk, cache[n.pk]",
+                          "Id": 3,
+                          "EstimatedRows": 1.0
+                        },
+                        "identifiers": [
+                          "n"
+                        ],
+                        "operatorType": "NodeIndexSeek@neo4j"
+                      }
+                    ],
+                    "identifiers": [
+                      "n"
+                    ],
+                    "operatorType": "CacheProperties@neo4j"
+                  }
+                ],
+                "identifiers": [
+                  "n",
+                  "pk",
+                  "bucket",
+                  "payload"
+                ],
+                "operatorType": "Projection@neo4j"
+              }
+            ],
+            "identifiers": [
+              "n",
+              "pk",
+              "bucket",
+              "payload"
+            ],
+            "operatorType": "ProduceResults@neo4j"
+          },
+          "version": [
+            {
+              "name": "Neo4j Kernel",
+              "versions": [
+                "5.26.32"
+              ],
+              "edition": "community"
+            }
+          ],
+          "source_sha256": "195addb2e4ca8cedebc0749848c0a77c39b1e05d056986cba46bf758d53c95f4"
+        }
+      },
+      "transport": {
+        "ferrosa": {
+          "kernel_syn_rtt_us_p50": 344.0,
+          "source_sha256": "54c7d5b21a9e9a246fb9eb34a2f80ddec05750e57a25600ab1e5732295ed1095"
+        },
+        "neo4j": {
+          "kernel_syn_rtt_us_p50": 328.5,
+          "source_sha256": "104bdf68d36e47cb08056b122a0277869aad97749428b93c1310824054a1592d"
+        }
+      },
+      "observations": [
+        {
+          "target": "neo4j",
+          "leg": 1,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 2.0196220599996195,
+              "p50_ms": 1.845700000004058,
+              "p99_ms": 5.3984959999979765,
+              "elapsed_s": 0.10121097200000406,
+              "ops_s": 494.0175853661201,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 5.752462990000495,
+              "p50_ms": 5.184710500003575,
+              "p99_ms": 18.594739000008076,
+              "elapsed_s": 0.30017251499999986,
+              "ops_s": 1332.5670406566044,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 2.227045799995153,
+            "p50_ms": 1.6026449999912984,
+            "p99_ms": 4.806745999999862
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.2171944830000001,
+            "rows_s": 46041.6851380152
+          },
+          "source_sha256": "735d0fdbd69132a0b4c279ff60ee1cb377807dc453fe5a68ce2df027b3cc54ba",
+          "validated": true
+        },
+        {
+          "target": "ferrosa",
+          "leg": 2,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 0.8694884400006231,
+              "p50_ms": 0.7859430000038969,
+              "p99_ms": 2.0488939999978584,
+              "elapsed_s": 0.04377149999999119,
+              "ops_s": 1142.295786071075,
+              "scan_release_delta": 0.0,
+              "sst_probe_delta": 50.0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 3.247790079999966,
+              "p50_ms": 3.0512064999967947,
+              "p99_ms": 6.822051000000329,
+              "elapsed_s": 0.17276376499999913,
+              "ops_s": 2315.300317748933,
+              "scan_release_delta": 0.0,
+              "sst_probe_delta": 400.0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 136.38867319999974,
+            "p50_ms": 131.63120800000172,
+            "p99_ms": 176.984762999993
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.26536835099999223,
+            "rows_s": 37683.46889264233
+          },
+          "source_sha256": "d8f421dc5e6e73fed99566a8f58db96d06d155521f32fdec741ac9db7f3df91d",
+          "validated": true
+        },
+        {
+          "target": "ferrosa",
+          "leg": 3,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 0.8126928000001499,
+              "p50_ms": 0.7359080000028939,
+              "p99_ms": 1.8157150000064348,
+              "elapsed_s": 0.04085187799999801,
+              "ops_s": 1223.9339400749811,
+              "scan_release_delta": 0.0,
+              "sst_probe_delta": 50.0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 3.1487236674998798,
+              "p50_ms": 2.9098219999994512,
+              "p99_ms": 7.381828999996287,
+              "elapsed_s": 0.1696915029999957,
+              "ops_s": 2357.21879368356,
+              "scan_release_delta": 0.0,
+              "sst_probe_delta": 400.0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 130.38086999999905,
+            "p50_ms": 135.15768899999614,
+            "p99_ms": 138.82049900000482
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.2668385970000031,
+            "rows_s": 37475.83787513275
+          },
+          "source_sha256": "a563bb8923d60bfe6457c4838245f4c314a643f2e2bba70b4412e2c681eaa44e",
+          "validated": true
+        },
+        {
+          "target": "neo4j",
+          "leg": 4,
+          "cases": [
+            {
+              "concurrency": 1,
+              "operations": 50,
+              "mean_ms": 2.674733040001911,
+              "p50_ms": 1.8872594999947978,
+              "p99_ms": 12.589715000018487,
+              "elapsed_s": 0.13395481200001313,
+              "ops_s": 373.260200611495,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            },
+            {
+              "concurrency": 8,
+              "operations": 400,
+              "mean_ms": 4.902417072500214,
+              "p50_ms": 4.575047999992421,
+              "p99_ms": 14.349310999989484,
+              "elapsed_s": 0.25989312499999073,
+              "ops_s": 1539.0941949696216,
+              "scan_release_delta": 0,
+              "sst_probe_delta": 0
+            }
+          ],
+          "count": {
+            "operations": 5,
+            "mean_ms": 2.247499799995012,
+            "p50_ms": 1.3947559999962778,
+            "p99_ms": 5.259344999984705
+          },
+          "scan": {
+            "rows": 10000,
+            "seconds": 0.16715445100001602,
+            "rows_s": 59824.910076723245
+          },
+          "source_sha256": "ae2e185b0627dc8c7bf7b3a360bc986339ac5384517cb5f62d16ea4a844a8607",
+          "validated": true
+        }
+      ],
+      "paired_means": {
+        "ferrosa": {
+          "point": {
+            "1": {
+              "p50_ms": 0.7609255000033954,
+              "ops_s": 1183.1148630730281
+            },
+            "8": {
+              "p50_ms": 2.980514249998123,
+              "ops_s": 2336.2595557162467
+            }
+          },
+          "count_p50_ms": 133.39444849999893,
+          "scan_rows_s": 37579.65338388754
+        },
+        "neo4j": {
+          "point": {
+            "1": {
+              "p50_ms": 1.866479749999428,
+              "ops_s": 433.6388929888076
+            },
+            "8": {
+              "p50_ms": 4.879879249997998,
+              "ops_s": 1435.830617813113
+            }
+          },
+          "count_p50_ms": 1.498700499993788,
+          "scan_rows_s": 52933.297607369226
+        }
+      }
+    }
+  },
+  "limits": [
+    "20k nodes,96B payloads,512 variants; single-label node property equality, count and bounded node scan only.",
+    "N/F/F/N order, two primary observations per engine and schema;50 C1 and400 C8 point reads per leg.",
+    "Full20k value/key census outside timing; every point value and10k bounded scan checked.",
+    "Means of per-leg p50s are descriptive, not a pooled percentile or significance claim.",
+    "Both use comparator root filesystem and fresh data. Source ELF and its loader/libc are unchanged.",
+    "Native-primary-key control changes schema and uniqueness semantics; it does not fix arbitrary property indexes.",
+    "Neo4j property index is ONLINE. Both tested Cypher index DDL syntaxes fail on Ferrosa.",
+    "No engine code changed; no relationship-traversal, graph-write, crash-recovery or multi-node comparison.",
+    "CPU profiles collected separately. JVM JFR start returned zero but failed to create its file: no JFR allocation/monitor-wait results.",
+    "CPU samples, RSS and summed scheduler thread times do not measure exact request allocations or individual mutex waits."
+  ]
+}

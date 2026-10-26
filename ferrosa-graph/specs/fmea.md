@@ -6,6 +6,19 @@ last_updated: 2026-10-15
 
 # ferrosa-graph — FMEA / Known Issues
 
+## Measured node-query performance limits (2026-10-26)
+
+Regular-property equality under a different native primary key scans the anchor
+table. A matched-network 20k-node fixture with UUID-primary `id` and regular `pk`
+measures 91.63 versus Neo4j 5.26.32's 2.50 ms point p50. Both tested Cypher index
+DDL syntaxes fail. A separate `pk bigint PRIMARY KEY` control measures 0.761
+versus 1.866 ms, with one SST probe per point read and no scan releases in its
+timed windows. This changes schema and uniqueness semantics; it does not provide
+an arbitrary-property index. Counts remain slower (133.39 versus 1.50 ms in that
+fixture). CPU/RSS samples do not establish request-level allocation or mutex
+wait costs. These two-run node-query observations are separate from the dated
+code-verification pass below. [Evidence, plans and scope](../../deploy/fly-bench/pipeline/RESULTS.md).
+
 > **Code-verification note (2026-10-15).** Rows below were re-checked against
 > the crate at v0.22.3 (`origin/main`, `9e32e82a`). Limits cited in this pass:
 > query timeout 30 s, `max_fan_out_per_hop` 10 000, `max_groups` 100 000,
