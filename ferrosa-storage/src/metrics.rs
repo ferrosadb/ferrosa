@@ -325,6 +325,17 @@ static FLUSH_LAST_BYTES: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_ROWS: AtomicU64 = AtomicU64::new(0);
 static FLUSH_LAST_PARTITIONS: AtomicU64 = AtomicU64::new(0);
 static WRITE_ADMISSION_DELAYED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Times the write path derived an async observer's entries inline because that
+/// observer's bounded queue was full. A non-zero, rising value means the queue
+/// capacity is undersized for the write rate: nothing was lost, but index
+/// maintenance is landing on the write path. See
+/// `ObserverConfig::queue_capacity` / `FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY`.
+static OBSERVER_BACKPRESSURE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Mutations currently staged in async-observer queues (summed over observers),
+/// and the total bound in force. Published from the write path and the drain
+/// loop, so `depth / capacity` is the saturation ratio.
+static OBSERVER_QUEUE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static OBSERVER_QUEUE_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static WRITE_ADMISSION_DELAY_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WRITE_ADMISSION_DELAY_COUNT: AtomicU64 = AtomicU64::new(0);
 static WRITE_ADMISSION_DELAY_BUCKETS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -374,6 +385,21 @@ pub fn observe_eviction_audit_offload(uploaded: bool, failed: bool) {
 
 pub fn inc_write_admission_delayed() {
     WRITE_ADMISSION_DELAYED_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// One async-observer hand-off was derived inline on the write path because the
+/// observer's queue was full. Counted, not lost: the entry was still produced.
+pub fn inc_observer_backpressure() {
+    OBSERVER_BACKPRESSURE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Publish how full the async-observer queues are (`depth`, staged mutations)
+/// and the bound that is in force (`capacity`). Called from the write path and
+/// the drain loop, so the value tracks the queue instead of freezing at the last
+/// write.
+pub fn set_observer_queue(depth: u64, capacity: u64) {
+    OBSERVER_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
+    OBSERVER_QUEUE_CAPACITY.store(capacity, Ordering::Relaxed);
 }
 
 pub fn observe_write_admission_delay(duration: Duration) {
@@ -1355,6 +1381,34 @@ pub fn render_prometheus() -> String {
     out.push_str(&format!(
         "ferrosa_storage_memtable_backpressure_bytes {}\n",
         MEMTABLE_BACKPRESSURE_BYTES.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_observer_backpressure_total Async-observer entries derived \
+inline on the write path because the observer's queue was full; the entry was produced, \
+the writer paid for it.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_observer_backpressure_total counter\n");
+    out.push_str(
+        "# HELP ferrosa_storage_observer_queue_depth Mutations staged in async-observer queues \
+now; snapshot, read alongside the capacity below.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_observer_queue_depth gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_observer_queue_depth {}\n",
+        OBSERVER_QUEUE_DEPTH.load(Ordering::Relaxed)
+    ));
+    out.push_str(
+        "# HELP ferrosa_storage_observer_queue_capacity Total bound of the async-observer \
+queues (sum over registered observers); depth / capacity is the saturation ratio.\n",
+    );
+    out.push_str("# TYPE ferrosa_storage_observer_queue_capacity gauge\n");
+    out.push_str(&format!(
+        "ferrosa_storage_observer_queue_capacity {}\n",
+        OBSERVER_QUEUE_CAPACITY.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "ferrosa_storage_observer_backpressure_total {}\n",
+        OBSERVER_BACKPRESSURE_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_write_admission_delayed_total CQL writes delayed in the soft-pressure zone.\n");
     out.push_str("# TYPE ferrosa_storage_write_admission_delayed_total counter\n");

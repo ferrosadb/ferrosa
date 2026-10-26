@@ -299,7 +299,7 @@ impl BigEvicted {
 fn partition_values(partitions: &[Partition]) -> std::collections::BTreeSet<Vec<u8>> {
     partitions
         .iter()
-        .map(|p| p.rows[0].cells[0].1.value.clone().expect("live cell"))
+        .map(|p| p.rows[0].cells[0].1.value.as_ref().expect("live cell").to_vec())
         .collect()
 }
 

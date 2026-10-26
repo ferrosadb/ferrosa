@@ -1,5 +1,10 @@
 # ferrosa-cql
 
+Blob-to-JSON conversion writes lowercase hex into one pre-sized output string,
+including the quotes and `0x` prefix. It preserves output bytes without allocating
+a temporary string per input byte. The bridge tests cover empty values, padding,
+mixed bytes and a larger payload.
+
 > The CQL native-protocol (v4/v5) server — the client-facing front-end to the
 > Ferrosa database. The largest, most central crate in the workspace (~54k LoC).
 
@@ -433,3 +438,9 @@ pair or Raft path sees the statement.
 create or add a jsonb column or field (top level, nested, or through a UDT) are
 InvalidRequest (0x2200) on a node that is not standalone. The message names the
 mode and says the capability ledger (D15a) is required; there is no bypass.
+
+### Cell payload boundary
+
+Storage cells expose immutable `CellBytes` slices. Typed result decoding
+borrows these bytes; legacy blob result values still explicitly own vectors at
+the `CqlValue::Blob` boundary.

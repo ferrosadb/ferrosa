@@ -15,6 +15,10 @@ executive_summary: >
 
 ## Purpose & boundary
 
+The JSON bridge renders blobs directly into one pre-sized output string. Its
+table-driven lowercase hex encoder preserves the quoted `0x` representation;
+this allocation change does not alter CQL frame or row encoding.
+
 `ferrosa-cql` is the **client-facing front-end** of Ferrosa. Its boundary spans
 from the raw TCP socket to the storage engine: it decodes CQL binary frames,
 authenticates, parses CQL text into an AST, routes statements through the schema
@@ -245,3 +249,9 @@ A hub, not a leaf. Depends on eleven sibling crates (`ferrosa-cdc`,
 ## jsonb (T-150)
 
 jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal into a jsonb target with a "not yet supported (T-170/T-171)" error, and `CONTAINS` over `list<jsonb>` errors instead of matching nothing. Results follow D6a: the wire type is varchar and the cell is the JSON text; `toJson` prints the document. LWT `IF` orders jsonb by D18 (T-150).
+
+### Cell payload boundary
+
+Storage cells expose immutable `CellBytes` slices. Typed result decoding
+borrows these bytes; legacy blob result values still explicitly own vectors at
+the `CqlValue::Blob` boundary.

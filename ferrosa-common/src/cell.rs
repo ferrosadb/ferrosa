@@ -10,6 +10,11 @@
 //! - **Tombstone**: no value, marks deletion at a specific timestamp
 //!
 //! Sentinel constants: [`NO_TIMESTAMP`], [`NO_TTL`], [`NO_DELETION_TIME`].
+//! Correctness: payload bytes and reconciliation metadata retain their encoding.
+//! Last revised: 2026-10-24
+//! Last changed: Route payload ownership through the immutable CellBytes boundary.
+
+use crate::CellBytes;
 
 /// Timestamp for a cell value (microseconds since epoch).
 /// Matches Cassandra's `Cell.timestamp()`.
@@ -38,7 +43,7 @@ pub const NO_DELETION_TIME: i32 = i32::MAX;
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CellValue {
     /// The cell's bytes. `None` for tombstones.
-    pub value: Option<Vec<u8>>,
+    pub value: Option<CellBytes>,
     /// Microseconds since epoch. Used for last-write-wins conflict resolution.
     pub timestamp: Timestamp,
     /// Time-to-live in seconds. 0 means no expiration.
@@ -67,6 +72,11 @@ impl CellValue {
     /// assert!(!cell.is_tombstone());
     /// ```
     pub fn live(value: Vec<u8>, timestamp: Timestamp) -> Self {
+        Self::live_bytes(value.into(), timestamp)
+    }
+
+    /// A live cell from an existing immutable payload handle.
+    pub fn live_bytes(value: CellBytes, timestamp: Timestamp) -> Self {
         Self {
             value: Some(value),
             timestamp,
@@ -79,6 +89,16 @@ impl CellValue {
     /// A cell with a TTL that will expire.
     pub fn expiring(
         value: Vec<u8>,
+        timestamp: Timestamp,
+        ttl: i32,
+        local_deletion_time: i32,
+    ) -> Self {
+        Self::expiring_bytes(value.into(), timestamp, ttl, local_deletion_time)
+    }
+
+    /// An expiring cell from an existing immutable payload handle.
+    pub fn expiring_bytes(
+        value: CellBytes,
         timestamp: Timestamp,
         ttl: i32,
         local_deletion_time: i32,

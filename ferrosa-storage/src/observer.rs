@@ -1,4 +1,7 @@
 //! WriteObserver trait for reactive storage hooks.
+//! Correctness: bounded hand-off preserves mutation values under saturation.
+//! Last revised: 2026-10-24
+//! Last changed: Document shared queue payloads and inline backpressure.
 //!
 //! Observers receive mutations after they are committed to the write-ahead log
 //! and memtable. They can produce derived mutations (e.g., adjacency index
@@ -13,6 +16,15 @@
 //!
 //! `on_write` must be **non-blocking**. Do not perform async I/O, disk reads, or
 //! network calls inside `on_write`.
+//!
+//! # Concurrency contract
+//!
+//! An `Async` observer's derivation normally runs on its drain task, but when
+//! that observer's queue is full the write path derives inline instead
+//! (`StorageEngine::dispatch_async_observers`) so no entry is ever discarded.
+//! Implementations must therefore tolerate `derive_into`/`on_write` being called
+//! concurrently from a writer thread and the drain task, and must not assume
+//! derivation order between the two.
 
 use crate::commitlog::config::TableId;
 use crate::commitlog::mutation::Mutation;
@@ -50,12 +62,56 @@ pub trait WriteObserver: Send + Sync {
     /// Returns zero or more derived mutations to be applied (e.g., index entries).
     /// Must be non-blocking — no async I/O, disk reads, or network calls.
     fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation>;
+
+    /// Allocation-free form of [`WriteObserver::on_write`]: append the derived
+    /// mutations to a buffer the CALLER owns and reuses across writes.
+    ///
+    /// `on_write` must mint a fresh `Vec` per mutation and hand ownership over,
+    /// so a write path that observes every row allocates once per derived entry
+    /// no matter how the callee is written. An observer that can derive in place
+    /// overrides this; the default keeps every other implementor unchanged.
+    /// Callers should clear and reuse one buffer per statement rather than
+    /// allocating per mutation — the same shape the CQL session uses for its
+    /// write staging buffers.
+    fn derive_into(&self, table: &TableId, mutation: &Mutation, out: &mut Vec<Mutation>) {
+        out.extend(self.on_write(table, mutation));
+    }
 }
+
+/// The capacity a bounded channel falls back to when the deployment does not
+/// name one. See [`ObserverConfig::queue_capacity`] for what it assumes.
+pub const DEFAULT_OBSERVER_QUEUE_CAPACITY: usize = 10_000;
+
+/// Environment variable that overrides
+/// [`ObserverConfig::queue_capacity`]. A value below 1 is refused (tokio's
+/// `mpsc::channel(0)` panics) and the default is used, with a WARN.
+pub const OBSERVER_QUEUE_CAPACITY_ENV: &str = "FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY";
 
 /// Configuration for async observer dispatch.
 #[derive(Debug, Clone)]
 pub struct ObserverConfig {
-    /// Bounded channel capacity for async observers (default 10,000).
+    /// Bounded queue capacity per async observer, in mutations.
+    ///
+    /// When this queue is full, the writer derives and applies that observer's
+    /// entries inline through the same path as the drain task. It absorbs the
+    /// cost as backpressure; saturation does not discard entries or defer them
+    /// to a later repair pass.
+    ///
+    /// The default ([`DEFAULT_OBSERVER_QUEUE_CAPACITY`], 10,000) encodes three
+    /// assumptions:
+    /// - **Burst, not steady state.** The queue absorbs a burst the drain task
+    ///   has not caught up with yet. It cannot absorb a drain that stays behind
+    ///   forever; no finite queue can, which is why a full queue shifts work
+    ///   back to the writer.
+    /// - **Memory.** Queues hold `(TableId, Arc<Mutation>)`. The payload is
+    ///   shared across observers and retained until its last consumer finishes.
+    ///   Capacity bounds messages, not payload bytes: a single mutation can
+    ///   contain many rows and cells, so no fixed bytes-per-message is assumed.
+    /// - **Writer cost.** A smaller queue moves derivation onto the writer
+    ///   sooner. Queue depth, configured capacity and the backpressure counter
+    ///   expose this trade on the existing metrics surface.
+    ///
+    /// Override with [`OBSERVER_QUEUE_CAPACITY_ENV`].
     pub queue_capacity: usize,
     /// Batch drain interval in milliseconds (default 10).
     pub batch_interval_ms: u64,
@@ -64,8 +120,47 @@ pub struct ObserverConfig {
 impl Default for ObserverConfig {
     fn default() -> Self {
         Self {
-            queue_capacity: 10_000,
+            queue_capacity: DEFAULT_OBSERVER_QUEUE_CAPACITY,
             batch_interval_ms: 10,
+        }
+    }
+}
+
+impl ObserverConfig {
+    /// [`ObserverConfig::default`] with deployment overrides applied. Every
+    /// engine constructor uses this, so a deployment tunes the drop threshold
+    /// without a rebuild.
+    pub fn from_env() -> Self {
+        Self {
+            queue_capacity: queue_capacity_from_env(),
+            ..Self::default()
+        }
+    }
+}
+
+/// [`OBSERVER_QUEUE_CAPACITY_ENV`], or the default when unset or unusable.
+pub fn queue_capacity_from_env() -> usize {
+    queue_capacity_from(std::env::var(OBSERVER_QUEUE_CAPACITY_ENV).ok().as_deref())
+}
+
+/// Parse an operator-supplied capacity. A missing, unparsable or zero value is
+/// the default: the queue is what stands between a full observer and a dropped
+/// derived entry, and `mpsc::channel(0)` panics, so a bad override must not
+/// become a startup failure or an always-full queue.
+fn queue_capacity_from(raw: Option<&str>) -> usize {
+    let Some(raw) = raw else {
+        return DEFAULT_OBSERVER_QUEUE_CAPACITY;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(capacity) if capacity >= 1 => capacity,
+        _ => {
+            tracing::warn!(
+                value = %raw,
+                variable = OBSERVER_QUEUE_CAPACITY_ENV,
+                default = DEFAULT_OBSERVER_QUEUE_CAPACITY,
+                "observer: unusable async observer queue capacity; using the default"
+            );
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
         }
     }
 }
@@ -75,6 +170,27 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn queue_capacity_override_is_external_and_validated() {
+        assert_eq!(queue_capacity_from(None), DEFAULT_OBSERVER_QUEUE_CAPACITY);
+        // An operator's value is honoured exactly: it sets the drop threshold.
+        assert_eq!(queue_capacity_from(Some("64")), 64);
+        assert_eq!(queue_capacity_from(Some(" 512 ")), 512);
+        // Unusable values must not become an always-full queue or a panic.
+        assert_eq!(
+            queue_capacity_from(Some("0")),
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            queue_capacity_from(Some("not-a-number")),
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+        assert_eq!(
+            queue_capacity_from(Some("-1")),
+            DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+    }
 
     #[test]
     fn observer_mode_values() {
@@ -145,6 +261,73 @@ mod tests {
 
         observer.on_write(&table, &mutation);
         assert_eq!(observer.count(), 2);
+    }
+
+    /// An observer that implements ONLY `on_write` must keep working now that the
+    /// drain loop calls `derive_into`: the trait's default forwards to `on_write`.
+    /// Without this, wiring the allocation-free path would silently stop every
+    /// observer that had not been taught the new method.
+    #[test]
+    fn derive_into_defaults_to_on_write() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+
+        let table = TableId::new("ks", "tbl");
+        let observer = CountingObserver::new(ObserverMode::Sync, vec![table.clone()]);
+        let mutation = Mutation {
+            mutation_id: [0x21u8; 16],
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+            rows: vec![],
+            timestamp: 1000,
+        };
+
+        let mut out = Vec::new();
+        observer.derive_into(&table, &mutation, &mut out);
+
+        assert_eq!(
+            observer.count(),
+            1,
+            "the default must reach the observer's on_write exactly once"
+        );
+        assert!(
+            out.is_empty(),
+            "and append whatever it derived (here: nothing)"
+        );
+    }
+
+    /// The same buffer is reused across writes, so a second write must not have to
+    /// grow it. This is the reuse contract the write path relies on; it is asserted
+    /// on capacity, not on an allocation counter.
+    #[test]
+    fn derive_into_reuses_a_callers_buffer() {
+        use ferrosa_common::key::{DecoratedKey, PartitionKey};
+
+        let table = TableId::new("ks", "tbl");
+        let observer = CountingObserver::new(ObserverMode::Sync, vec![table.clone()]);
+        let mutation = Mutation {
+            mutation_id: [0x22u8; 16],
+            keyspace: "ks".to_string(),
+            table: "tbl".to_string(),
+            key: DecoratedKey::new(PartitionKey::new(b"pk".to_vec())),
+            rows: vec![],
+            timestamp: 1000,
+        };
+
+        let mut out = Vec::new();
+        observer.derive_into(&table, &mutation, &mut out);
+        let capacity_after_first = out.capacity();
+
+        // What a drain loop does between messages.
+        out.clear();
+        observer.derive_into(&table, &mutation, &mut out);
+
+        assert!(
+            out.capacity() <= capacity_after_first,
+            "a repeated write must not grow the caller's buffer: \
+             {capacity_after_first} -> {}",
+            out.capacity()
+        );
     }
 
     #[test]

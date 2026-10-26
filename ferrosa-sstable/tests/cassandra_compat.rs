@@ -475,7 +475,7 @@ fn read_real_cassandra_udt() {
         "field 0 = street 'main'"
     );
     assert_eq!(
-        field([0, 1]).map(|v| i32::from_be_bytes(v.try_into().unwrap())),
+        field([0, 1]).map(|v| i32::from_be_bytes(v.as_slice().try_into().unwrap())),
         Some(12345),
         "field 1 = zip 12345"
     );

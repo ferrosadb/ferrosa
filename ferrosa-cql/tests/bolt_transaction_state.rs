@@ -121,7 +121,7 @@ fn read_cell(
     row.cells
         .iter()
         .find(|(idx, _)| *idx == 0)
-        .and_then(|(_, c)| c.value.clone())
+        .and_then(|(_, c)| c.value.as_ref().map(|value| value.to_vec()))
 }
 
 fn engine_with_table(dir: &Path, table: &str) -> Arc<StorageEngine> {

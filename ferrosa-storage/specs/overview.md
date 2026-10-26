@@ -74,6 +74,16 @@ without changing the process environment. Digest verification is unconditional.
 
 ## Data flow
 
+After a successful write, synchronous observers borrow its mutation. All
+asynchronous observers of that write receive handles to one immutable
+`Arc<Mutation>` through bounded channels. Owned write payloads move into the
+shared allocation; borrowed batch inputs clone once only when an async observer
+watches the table. Queue saturation or closure runs derivation inline through
+the drain's application path, with a counted backpressure event. It does not
+change commit-log encoding or mutation replay IDs. The queue limit bounds
+messages, not bytes in one mutation. Derived-write errors and observer panics
+remain separate failure modes; sharing does not repair those paths.
+
 **Write path** (front-end → durable): build a `Mutation` → `commit_log.append`
 (CAS allocation into the active segment, durability governed by the sync
 strategy) → `ArcSwap::load` the `StoreView` → `active.put` into one memtable
@@ -443,3 +453,13 @@ with the existing `merge_partitions` oracle's supplied-source order. Adjacent
 duplicate rows cannot change which source supplies equal-timestamp row TTLs,
 delete-time metadata or otherwise equal cells; earlier duplicates from the same
 source retain priority. The timestamp/value/expiry LWW comparator is unchanged.
+
+### Cell payload boundary
+
+Cell payloads use `CellBytes`; merge metadata stays independently owned.
+Compaction and SSTable reads use caller-owned mutable scratch before publishing
+immutable payloads. Commit-log and spill encodings retain their byte sequences.
+
+Published cell bytes are shared across row copies. Readers recover only unique
+scratch capacity; retained older payloads remain immutable. Memory estimates
+charge the full retained backing and a conservative shared-owner allowance.

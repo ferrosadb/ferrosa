@@ -1,7 +1,7 @@
 //! Cursor guards complement the public-executor allocation red; these API tests
 //! were added after the incremental API and assert parity, pull rate and failure safety.
-//! Last revised: 2026-10-23
-//! Last changed: Cover reusable buffers, BTI lookup and incomplete staged output.
+//! Last revised: 2026-10-24
+//! Last changed: Attribute reusable-decoder allocations to its own thread.
 use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Result};
 use ferrosa_sstable::{
     compression::Compression,
@@ -12,29 +12,80 @@ use ferrosa_sstable::{
     writer::{SSTableOutput, SSTableWriter, WriteOptions},
 };
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
 struct Counter;
 static EVENTS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    static LOCAL_EVENTS: Cell<usize> = const { Cell::new(0) };
+}
+fn record_allocation() {
+    EVENTS.fetch_add(1, Ordering::Relaxed);
+    let _ = LOCAL_EVENTS.try_with(|events| events.set(events.get() + 1));
+}
 unsafe impl GlobalAlloc for Counter {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         unsafe { System.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        EVENTS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         unsafe { System.realloc(p, l, n) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         unsafe { System.dealloc(p, l) }
     }
 }
+// The guard measures the reusable decoder, not unrelated harness threads.
+fn decoder_events() -> usize {
+    LOCAL_EVENTS.with(Cell::get)
+}
+
+#[test]
+fn allocation_guard_scopes_to_the_decoder_thread() {
+    let before = decoder_events();
+    std::hint::black_box(vec![7u8; 123]);
+    assert!(
+        decoder_events() > before,
+        "own-thread allocations must be counted"
+    );
+    // Atomic handshakes do not allocate on the measured thread. A blocking
+    // Barrier would lazily allocate the thread's park token inside the window.
+    let stage = Arc::new(AtomicUsize::new(0));
+    let other = stage.clone();
+    let worker = std::thread::spawn(move || {
+        while other.load(Ordering::Acquire) == 0 {
+            std::hint::spin_loop();
+        }
+        std::hint::black_box(vec![9u8; 321]);
+        other.store(2, Ordering::Release);
+    });
+    let process_before = EVENTS.load(Ordering::Relaxed);
+    let before = decoder_events();
+    stage.store(1, Ordering::Release);
+    while stage.load(Ordering::Acquire) != 2 {
+        std::hint::spin_loop();
+    }
+    let events = decoder_events() - before;
+    let process_events = EVENTS.load(Ordering::Relaxed) - process_before;
+    worker.join().unwrap();
+    assert!(
+        process_events >= 1,
+        "foreign allocation must be observable globally"
+    );
+    assert_eq!(
+        events, 0,
+        "unrelated-thread allocation contaminated decoder guard"
+    );
+}
+
 #[global_allocator]
 static ALLOCATOR: Counter = Counter;
 struct Traced {
@@ -156,12 +207,15 @@ fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
                 assert!(it.next_clustered_row_into(&mut decoded).unwrap());
                 assert_eq!(&decoded, e);
             }
-            let before = EVENTS.load(Ordering::Relaxed);
+            let process_before = EVENTS.load(Ordering::Relaxed);
+            let before = decoder_events();
             for e in &expected.rows[128..] {
                 assert!(it.next_clustered_row_into(&mut decoded).unwrap());
                 assert_eq!(&decoded, e);
             }
-            let events = EVENTS.load(Ordering::Relaxed) - before;
+            let events = decoder_events() - before;
+            let process_events = EVENTS.load(Ordering::Relaxed) - process_before;
+            eprintln!("SCAN_ALLOCATION_SCOPE local={events} process={process_events} compression={compression:?} complex={complex}");
             assert!(events<=4,"reusable scan allocated {events} times for 896 rows ({compression:?},complex={complex})");
             assert!(!it.next_clustered_row_into(&mut decoded).unwrap());
             assert!(it.next_partition_header_only().unwrap().is_none());
@@ -234,7 +288,7 @@ fn scan_cursor_parity_allocation_pull_and_failure_contracts() {
     );
     let key = DecoratedKey::new(PartitionKey::from(b"p".as_slice()));
     let mut large = row(0, false);
-    large.cells[0].1.value = Some(vec![7; 128 * 1024]);
+    large.cells[0].1.value = Some(vec![7; 128 * 1024].into());
     w.begin_partition(&key, DeletionTime::LIVE, None).unwrap();
     w.write_partition_row(&large).unwrap();
     w.end_partition().unwrap();

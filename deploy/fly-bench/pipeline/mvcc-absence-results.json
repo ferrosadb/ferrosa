@@ -1,0 +1,331 @@
+{
+  "experiment": "Implicit fresh INSERT absence across MVCC snapshots",
+  "date": "2026-10-25",
+  "before_revision": "e8772cf29ec756d63278cf25d6db4836cdf1ee88",
+  "after_revision": "15d9e7f0e6991301d304fbf0034877b9cd514d76",
+  "after_image_digest": "sha256:f32e70b76e4fea80231b24e2327a231e8b75e5fe830d22e4cbed6cf9f37bbb37",
+  "native_postgres_version": "18.6",
+  "workload": {
+    "payload_bytes": 96,
+    "payload_variants": 512,
+    "concurrency": 8,
+    "per_ferrosa_process_rows_order": [
+      100000,
+      5000
+    ],
+    "native_5k_process_sequence": "100k then 5k in separate followup controls"
+  },
+  "order": [
+    "D41",
+    "E41",
+    "P41",
+    "P42",
+    "E42",
+    "D42"
+  ],
+  "insert_summary": {
+    "100000": {
+      "D": {
+        "runs": [
+          17266.32559038751,
+          17010.039963122523
+        ],
+        "mean": 17138.182776755017,
+        "min": 17010.039963122523,
+        "max": 17266.32559038751
+      },
+      "E": {
+        "runs": [
+          23847.652247893533,
+          24701.647047479855
+        ],
+        "mean": 24274.649647686696,
+        "min": 23847.652247893533,
+        "max": 24701.647047479855
+      },
+      "P": {
+        "runs": [
+          26533.168785021535,
+          26250.56130525218
+        ],
+        "mean": 26391.86504513686,
+        "min": 26250.56130525218,
+        "max": 26533.168785021535
+      },
+      "after_vs_before_ratio": 1.4164074431865123,
+      "before_fraction_postgres": 0.6493736894851625,
+      "after_fraction_postgres": 0.9197777271962712
+    },
+    "5000": {
+      "D": {
+        "runs": [
+          24353.360322442324,
+          19721.862338773517
+        ],
+        "mean": 22037.61133060792,
+        "min": 19721.862338773517,
+        "max": 24353.360322442324
+      },
+      "E": {
+        "runs": [
+          21639.003472822133,
+          24044.584931290818
+        ],
+        "mean": 22841.794202056473,
+        "min": 21639.003472822133,
+        "max": 24044.584931290818
+      },
+      "after_vs_before_ratio": 1.036491381002424,
+      "P": {
+        "method": "100k validated workload followed by5k fixture in same native PG process; primaryINSERT timings no CPU sampler",
+        "legs": [
+          {
+            "round": 143,
+            "insert_rows_per_s": 24303.99979576886,
+            "read_operations_per_s": 9708.865823159349,
+            "validated": true
+          },
+          {
+            "round": 144,
+            "insert_rows_per_s": 25495.562214395894,
+            "read_operations_per_s": 10001.507727288712,
+            "validated": true
+          }
+        ],
+        "mean": 24899.781005082375,
+        "min": 24303.99979576886,
+        "max": 25495.562214395894
+      },
+      "after_fraction_postgres": 0.9173492006774743
+    }
+  },
+  "local_allocation_regression": {
+    "rows": [
+      128,
+      256
+    ],
+    "reader_counts": [
+      1,
+      16
+    ],
+    "before": [
+      [
+        1865,
+        4265
+      ],
+      [
+        3543,
+        7913
+      ]
+    ],
+    "after": [
+      [
+        1411,
+        1410
+      ],
+      [
+        2704,
+        2704
+      ]
+    ],
+    "controls": "Restoring only None fanout fails allocation bound; disabling only known-absence fallback fails paused-apply visibility."
+  },
+  "profiles": {
+    "fixed_rows": 200000,
+    "diagnostic_only": true,
+    "limits": [
+      "separate49Hz software userCPU captures",
+      "inclusive stack categories overlap",
+      "sampled process/resource window includes SSH collector gates beyond load interval",
+      "runqueue is summed thread time, not request or mutex latency",
+      "RSS is sampled not allocator requested bytes; no heap allocation count inferred"
+    ],
+    "arms": {
+      "D": {
+        "user_cpu_samples": 972,
+        "inclusive_samples": {
+          "imbl": 534,
+          "arc_swap": 108,
+          "prepare_row_changes": 139,
+          "record_point_read": 26,
+          "commitlog": 144
+        },
+        "process_cpu": {
+          "available": true,
+          "cpu_ticks": 2626,
+          "clock_ticks_per_second": 100,
+          "cpu_seconds": 26.26,
+          "cpu_percent_of_one_core": 90.55042363088985,
+          "note": "Seconds require a captured guest CLK_TCK; absent is not assumed."
+        },
+        "stable_thread_cpu_seconds": 24.495361204,
+        "sampled_span_s": 29.000416505,
+        "peak_sampled_rss_kib": 466040,
+        "summed_thread_runqueue_s": 21.400209122,
+        "vdc": {
+          "read_bytes": 60661760,
+          "write_bytes": 114085888,
+          "io_ms": 432,
+          "weighted_io_ms": 744,
+          "mean_read_ms": 0.1169284467713787,
+          "mean_write_ms": 0.14662629757785467
+        },
+        "eth0": {
+          "rx_bytes": 42874202,
+          "tx_bytes": 32972777,
+          "rx_errors": 0,
+          "tx_errors": 0,
+          "rx_drops": 0,
+          "tx_drops": 0
+        },
+        "cpu_top_leaves": [
+          [
+            "core::ptr::drop_glue::<imbl::nodes::hamt::Entry<",
+            150
+          ],
+          [
+            "<imbl_sized_chunks::sparse_chunk::SparseChunk<imbl::nodes::hamt::Entry<",
+            118
+          ],
+          [
+            "<imbl_sized_chunks::sparse_chunk::SparseChunk<",
+            99
+          ],
+          [
+            "[libc.so.6]",
+            60
+          ],
+          [
+            "<crossbeam_skiplist::base::SkipList<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>>::search_bound::<ferrosa_common::key::DecoratedKey>",
+            51
+          ],
+          [
+            "<ferrosa_postgres::mvcc::MvccManager>::commit::<ferrosa_postgres::query::commit_mutations<ferrosa_storage::write_set_stage::StagedWriteSet>::{closure#0}>",
+            34
+          ],
+          [
+            "<imbl::nodes::hamt::HamtNode<",
+            22
+          ],
+          [
+            "malloc",
+            19
+          ]
+        ]
+      },
+      "E": {
+        "user_cpu_samples": 647,
+        "inclusive_samples": {
+          "imbl": 225,
+          "arc_swap": 39,
+          "prepare_row_changes": 146,
+          "record_point_read": 31,
+          "commitlog": 165
+        },
+        "process_cpu": {
+          "available": true,
+          "cpu_ticks": 1793,
+          "clock_ticks_per_second": 100,
+          "cpu_seconds": 17.93,
+          "cpu_percent_of_one_core": 71.71904739031866,
+          "note": "Seconds require a captured guest CLK_TCK; absent is not assumed."
+        },
+        "stable_thread_cpu_seconds": 16.370489845,
+        "sampled_span_s": 25.000332063,
+        "peak_sampled_rss_kib": 515420,
+        "summed_thread_runqueue_s": 17.374593975,
+        "vdc": {
+          "read_bytes": 38653952,
+          "write_bytes": 112599040,
+          "io_ms": 456,
+          "weighted_io_ms": 751,
+          "mean_read_ms": 0.1349862258953168,
+          "mean_write_ms": 0.14844576020300274
+        },
+        "eth0": {
+          "rx_bytes": 42367107,
+          "tx_bytes": 9460064,
+          "rx_errors": 0,
+          "tx_errors": 0,
+          "rx_drops": 0,
+          "tx_drops": 0
+        },
+        "cpu_top_leaves": [
+          [
+            "<crossbeam_skiplist::base::SkipList<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>>::search_bound::<ferrosa_common::key::DecoratedKey>",
+            62
+          ],
+          [
+            "core::ptr::drop_glue::<imbl::nodes::hamt::Entry<",
+            49
+          ],
+          [
+            "[libc.so.6]",
+            38
+          ],
+          [
+            "<imbl_sized_chunks::sparse_chunk::SparseChunk<",
+            37
+          ],
+          [
+            "<imbl::nodes::hamt::Entry<",
+            35
+          ],
+          [
+            "<imbl_sized_chunks::sparse_chunk::SparseChunk<imbl::nodes::hamt::Entry<",
+            27
+          ],
+          [
+            "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write",
+            19
+          ],
+          [
+            "malloc",
+            14
+          ]
+        ]
+      }
+    }
+  },
+  "environment": {
+    "cpu_kind": "performance",
+    "cpus": 2,
+    "memory_mib": 4096,
+    "region": "LAX",
+    "storage": "Ferrosa attached volume; native PostgreSQL root filesystem",
+    "durability": "Native fsync, synchronous_commit and full_page_writes on"
+  },
+  "limits": [
+    "n=2 descriptive means and observed ranges",
+    "same 2performanceCPU/4096MiB LAX class; PostgreSQL rootfs vs Ferrosa volume",
+    "100k starts in fresh process; 5k follows validated100k workload in same process",
+    "same client bytes for all legs, every row/key/value validated outside primary INSERT timing",
+    "5k observed ranges overlap; no confident small-load speedup",
+    "native5k controls ran later with matching 100k-to-5k sequence",
+    "profile RSS increased despite fewer allocations; no heap allocation totals inferred from RSS",
+    "raw profiles and machine evidence retained privately"
+  ],
+  "read_summary_5000": {
+    "ferrosa_ops_per_s": {
+      "runs": [
+        2874.411334930652,
+        2753.8475880710953
+      ],
+      "mean": 2814.1294615008737,
+      "min": 2753.8475880710953,
+      "max": 2874.411334930652
+    },
+    "postgres_ops_per_s": {
+      "runs": [
+        9708.865823159349,
+        10001.507727288712
+      ],
+      "mean": 9855.18677522403,
+      "min": 9708.865823159349,
+      "max": 10001.507727288712
+    },
+    "ferrosa_fraction_postgres": 0.28554805968524144,
+    "postgres_over_ferrosa": 3.502037454228532,
+    "scope": "400 seeded point reads with 8 warmed workers after a 100k fixture then a 5k fixture; 2 unprofiled repetitions per system; all values validated"
+  }
+}

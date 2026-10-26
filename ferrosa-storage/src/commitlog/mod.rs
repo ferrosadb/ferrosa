@@ -134,9 +134,21 @@ pub fn empty_segment_skipped_total() -> u64 {
 
 /// Renders commit-log counters in Prometheus exposition format.
 pub fn render_prometheus() -> String {
+    let mut out = String::new();
+    write_prometheus(&mut out);
+    out
+}
+
+/// Appends the Prometheus rendering for the commit-log counters to `out`.
+///
+/// Writes into the caller's buffer rather than building a `String` per line, so
+/// a scrape costs no per-line allocation and a caller that reuses its buffer
+/// pays none beyond the first growth.
+fn write_prometheus(out: &mut String) {
+    use std::fmt::Write as _;
+
     let flush = segment::flush_metrics();
     let sync_batch = sync::sync_batch_metrics();
-    let mut out = String::new();
     out.push_str("# HELP ferrosa_commitlog_syncs_by_mode_total Commit-log file and directory syncs by the system call issued (full = F_FULLFSYNC, barrier = F_BARRIERFSYNC, fsync = fsync(2)); only full survives power loss on macOS.\n");
     out.push_str("# TYPE ferrosa_commitlog_syncs_by_mode_total counter\n");
     for mode in [
@@ -144,268 +156,310 @@ pub fn render_prometheus() -> String {
         config::CommitLogSyncMode::Barrier,
         config::CommitLogSyncMode::Fsync,
     ] {
-        out.push_str(&format!(
-            "ferrosa_commitlog_syncs_by_mode_total{{mode=\"{}\"}} {}\n",
+        let _ = writeln!(
+            out,
+            "ferrosa_commitlog_syncs_by_mode_total{{mode=\"{}\"}} {}",
             mode.name(),
             segment::syncs_issued(mode)
-        ));
+        );
     }
     out.push_str("# HELP ferrosa_commitlog_appends_total Total commit-log appends.\n");
     out.push_str("# TYPE ferrosa_commitlog_appends_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_appends_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_appends_total {}",
         COMMITLOG_APPENDS_TOTAL.load(Ordering::Relaxed)
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_replay_set_aside_mutations_total Mutations set aside on disk at startup because no schema was available to replay them.\n");
     out.push_str("# TYPE ferrosa_commitlog_replay_set_aside_mutations_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_replay_set_aside_mutations_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_replay_set_aside_mutations_total {}",
         crate::replay_set_aside::replay_set_aside_mutations_total()
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_replay_set_aside_pending_mutations Set-aside mutations not yet re-ingested; non-zero means rows are on disk but invisible to reads.\n");
     out.push_str("# TYPE ferrosa_commitlog_replay_set_aside_pending_mutations gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_replay_set_aside_pending_mutations {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_replay_set_aside_pending_mutations {}",
         crate::replay_set_aside::replay_set_aside_pending_mutations()
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_bytes_total Total bytes reserved for commit-log entries.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_bytes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_bytes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_bytes_total {}",
         COMMITLOG_APPEND_BYTES_TOTAL.load(Ordering::Relaxed)
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_alloc_seconds_total Total wall time spent allocating commit-log entry space.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_alloc_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_alloc_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_alloc_seconds_total {:.9}",
         COMMITLOG_APPEND_ALLOC_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_alloc_seconds_max Maximum wall time spent allocating commit-log entry space.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_alloc_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_alloc_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_alloc_seconds_max {:.9}",
         COMMITLOG_APPEND_ALLOC_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_rotations_total Commit-log appends that had to rotate the active segment inline.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_rotations_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_rotations_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_rotations_total {}",
         COMMITLOG_APPEND_ROTATIONS_TOTAL.load(Ordering::Relaxed)
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_rotate_seconds_total Total wall time appends spent rotating the active segment inline.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_rotate_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_rotate_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_rotate_seconds_total {:.9}",
         COMMITLOG_APPEND_ROTATE_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_rotate_seconds_max Maximum wall time an append spent rotating the active segment inline.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_rotate_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_rotate_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_rotate_seconds_max {:.9}",
         COMMITLOG_APPEND_ROTATE_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_write_entry_seconds_total Total wall time spent serializing commit-log entries into memory.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_write_entry_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_write_entry_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_write_entry_seconds_total {:.9}",
         COMMITLOG_APPEND_WRITE_ENTRY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_write_entry_seconds_max Maximum wall time spent serializing one commit-log entry into memory.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_write_entry_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_write_entry_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_write_entry_seconds_max {:.9}",
         COMMITLOG_APPEND_WRITE_ENTRY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_mark_dirty_seconds_total Total wall time spent updating commit-log dirty-table tracking.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_mark_dirty_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_mark_dirty_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_mark_dirty_seconds_total {:.9}",
         COMMITLOG_APPEND_MARK_DIRTY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_mark_dirty_seconds_max Maximum wall time spent updating commit-log dirty-table tracking.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_mark_dirty_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_mark_dirty_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_mark_dirty_seconds_max {:.9}",
         COMMITLOG_APPEND_MARK_DIRTY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_sync_notify_seconds_total Total wall time append callers spent in the configured sync strategy notification.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_sync_notify_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_sync_notify_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_sync_notify_seconds_total {:.9}",
         COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_TOTAL.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_append_sync_notify_seconds_max Maximum wall time an append caller spent in sync strategy notification.\n");
     out.push_str("# TYPE ferrosa_commitlog_append_sync_notify_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_append_sync_notify_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_append_sync_notify_seconds_max {:.9}",
         COMMITLOG_APPEND_SYNC_NOTIFY_MICROS_MAX.load(Ordering::Relaxed) as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_flushes_total Incremental commit-log flushes.\n");
     out.push_str("# TYPE ferrosa_commitlog_flushes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_flushes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_flushes_total {}",
         flush.incremental_flushes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_flush_bytes_total Bytes written by incremental commit-log flushes.\n");
     out.push_str("# TYPE ferrosa_commitlog_flush_bytes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_flush_bytes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_flush_bytes_total {}",
         flush.incremental_bytes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_full_flushes_total Full segment rewrite flushes.\n");
     out.push_str("# TYPE ferrosa_commitlog_full_flushes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_full_flushes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_full_flushes_total {}",
         flush.full_flushes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_full_flush_bytes_total Bytes written by full segment rewrite flushes.\n");
     out.push_str("# TYPE ferrosa_commitlog_full_flush_bytes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_full_flush_bytes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_full_flush_bytes_total {}",
         flush.full_bytes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_syncs_total Successful commit-log fsync calls.\n");
     out.push_str("# TYPE ferrosa_commitlog_syncs_total counter\n");
-    out.push_str(&format!("ferrosa_commitlog_syncs_total {}\n", flush.syncs));
+    let _ = writeln!(out, "ferrosa_commitlog_syncs_total {}", flush.syncs);
     out.push_str("# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk/force_full_flush calls that performed fsync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_seconds_total {:.9}",
         flush.sync_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_seconds_max Maximum observed wall time for a commit-log fsync call.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_seconds_max {:.9}",
         flush.sync_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_wait_writers_seconds_total Total wall time commit-log sync spent waiting for in-flight writers to finish entries.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_wait_writers_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_wait_writers_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_wait_writers_seconds_total {:.9}",
         flush.sync_wait_writers_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_wait_writers_seconds_max Maximum observed wait-for-writers time before commit-log sync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_wait_writers_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_wait_writers_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_wait_writers_seconds_max {:.9}",
         flush.sync_wait_writers_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_file_lock_wait_seconds_total Total wall time commit-log sync spent waiting for the segment file mutex.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_file_lock_wait_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_file_lock_wait_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_file_lock_wait_seconds_total {:.9}",
         flush.sync_file_lock_wait_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_file_lock_wait_seconds_max Maximum wait for the segment file mutex during commit-log sync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_file_lock_wait_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_file_lock_wait_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_file_lock_wait_seconds_max {:.9}",
         flush.sync_file_lock_wait_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_write_seconds_total Total wall time spent writing commit-log bytes to the file before sync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_write_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_write_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_write_seconds_total {:.9}",
         flush.sync_write_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_write_seconds_max Maximum wall time spent writing commit-log bytes to the file before sync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_write_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_write_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_write_seconds_max {:.9}",
         flush.sync_write_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_data_seconds_total Total wall time spent in commit-log file sync_data/fsync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_data_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_data_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_data_seconds_total {:.9}",
         flush.sync_data_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_data_seconds_max Maximum wall time spent in commit-log file sync_data/fsync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_data_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_data_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_data_seconds_max {:.9}",
         flush.sync_data_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_parent_dir_seconds_total Total wall time spent syncing parent directories for newly-created commit-log files.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_parent_dir_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_parent_dir_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_parent_dir_seconds_total {:.9}",
         flush.sync_parent_dir_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_parent_dir_seconds_max Maximum wall time spent syncing a commit-log parent directory.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_parent_dir_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_parent_dir_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_parent_dir_seconds_max {:.9}",
         flush.sync_parent_dir_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_periodic_idle_flushes_skipped_total Periodic commit-log timer ticks skipped because no writes were pending.\n");
     out.push_str("# TYPE ferrosa_commitlog_periodic_idle_flushes_skipped_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_periodic_idle_flushes_skipped_total {}",
         sync::periodic_idle_flush_skipped_total()
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_archive_notify_dropped_total Closed commit-log segments never handed to the PITR archiver (queue full or archiver stopped).\n");
     out.push_str("# TYPE ferrosa_commitlog_archive_notify_dropped_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_archive_notify_dropped_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_archive_notify_dropped_total {}",
         ARCHIVE_NOTIFY_DROPPED_TOTAL.load(Ordering::Relaxed)
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_not_durable_refusals_total Writes refused because the commit log could not make them durable (sync thread dead, fsync failing, or past the stall deadline).\n");
     out.push_str("# TYPE ferrosa_commitlog_not_durable_refusals_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_not_durable_refusals_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_not_durable_refusals_total {}",
         sync::refused_writes_total()
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_batches_total Commit-log sync batches flushed.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batches_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_batches_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_batches_total {}",
         sync_batch.batches
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_batch_writes_total Commit-log writes included in sync batches.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batch_writes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_batch_writes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_batch_writes_total {}",
         sync_batch.writes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_batch_bytes_total Commit-log bytes included in sync batches.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batch_bytes_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_batch_bytes_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_batch_bytes_total {}",
         sync_batch.bytes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_batch_wait_seconds_total Total time sync batches stayed open before flush.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batch_wait_seconds_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_batch_wait_seconds_total {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_batch_wait_seconds_total {:.9}",
         sync_batch.wait_micros_total as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_batch_wait_seconds_max Maximum time a sync batch stayed open before flush.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_batch_wait_seconds_max gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_batch_wait_seconds_max {:.9}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_batch_wait_seconds_max {:.9}",
         sync_batch.wait_micros_max as f64 / 1_000_000.0
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_pending_writes Commit-log writes currently waiting for sync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_pending_writes gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_pending_writes {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_pending_writes {}",
         sync_batch.pending_writes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_sync_pending_bytes Commit-log bytes currently waiting for sync.\n");
     out.push_str("# TYPE ferrosa_commitlog_sync_pending_bytes gauge\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_sync_pending_bytes {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_sync_pending_bytes {}",
         sync_batch.pending_bytes
-    ));
+    );
     out.push_str("# HELP ferrosa_commitlog_empty_segments_skipped_total Empty or torn commit-log segments skipped during replay.\n");
     out.push_str("# TYPE ferrosa_commitlog_empty_segments_skipped_total counter\n");
-    out.push_str(&format!(
-        "ferrosa_commitlog_empty_segments_skipped_total {}\n",
+    let _ = writeln!(
+        out,
+        "ferrosa_commitlog_empty_segments_skipped_total {}",
         empty_segment_skipped_total()
-    ));
-    out
+    );
 }
 
 fn is_zeroed_segment_header(path: &std::path::Path) -> ferrosa_common::Result<bool> {
@@ -1558,6 +1612,223 @@ mod tests {
         log.shutdown().unwrap();
     }
 
+    /// Every non-value byte the renderer emits, in order: comment lines
+    /// verbatim and sample lines without their numeric value. Prometheus
+    /// scrapers parse these names, labels and HELP strings, so the T6 rewrite
+    /// (`push_str(&format!(..))` -> `writeln!(out, ..)`) must not move one.
+    ///
+    /// Values are excluded because they come from process-global atomics that
+    /// other tests mutate; their format is asserted separately below.
+    const PROMETHEUS_STATIC_LINES: &[&str] = &[
+        "# HELP ferrosa_commitlog_syncs_by_mode_total Commit-log file and directory syncs by the system call issued (full = F_FULLFSYNC, barrier = F_BARRIERFSYNC, fsync = fsync(2)); only full survives power loss on macOS.",
+        "# TYPE ferrosa_commitlog_syncs_by_mode_total counter",
+        "ferrosa_commitlog_syncs_by_mode_total{mode=\"full\"}",
+        "ferrosa_commitlog_syncs_by_mode_total{mode=\"barrier\"}",
+        "ferrosa_commitlog_syncs_by_mode_total{mode=\"fsync\"}",
+        "# HELP ferrosa_commitlog_appends_total Total commit-log appends.",
+        "# TYPE ferrosa_commitlog_appends_total counter",
+        "ferrosa_commitlog_appends_total",
+        "# HELP ferrosa_commitlog_replay_set_aside_mutations_total Mutations set aside on disk at startup because no schema was available to replay them.",
+        "# TYPE ferrosa_commitlog_replay_set_aside_mutations_total counter",
+        "ferrosa_commitlog_replay_set_aside_mutations_total",
+        "# HELP ferrosa_commitlog_replay_set_aside_pending_mutations Set-aside mutations not yet re-ingested; non-zero means rows are on disk but invisible to reads.",
+        "# TYPE ferrosa_commitlog_replay_set_aside_pending_mutations gauge",
+        "ferrosa_commitlog_replay_set_aside_pending_mutations",
+        "# HELP ferrosa_commitlog_append_bytes_total Total bytes reserved for commit-log entries.",
+        "# TYPE ferrosa_commitlog_append_bytes_total counter",
+        "ferrosa_commitlog_append_bytes_total",
+        "# HELP ferrosa_commitlog_append_alloc_seconds_total Total wall time spent allocating commit-log entry space.",
+        "# TYPE ferrosa_commitlog_append_alloc_seconds_total counter",
+        "ferrosa_commitlog_append_alloc_seconds_total",
+        "# HELP ferrosa_commitlog_append_alloc_seconds_max Maximum wall time spent allocating commit-log entry space.",
+        "# TYPE ferrosa_commitlog_append_alloc_seconds_max gauge",
+        "ferrosa_commitlog_append_alloc_seconds_max",
+        "# HELP ferrosa_commitlog_append_rotations_total Commit-log appends that had to rotate the active segment inline.",
+        "# TYPE ferrosa_commitlog_append_rotations_total counter",
+        "ferrosa_commitlog_append_rotations_total",
+        "# HELP ferrosa_commitlog_append_rotate_seconds_total Total wall time appends spent rotating the active segment inline.",
+        "# TYPE ferrosa_commitlog_append_rotate_seconds_total counter",
+        "ferrosa_commitlog_append_rotate_seconds_total",
+        "# HELP ferrosa_commitlog_append_rotate_seconds_max Maximum wall time an append spent rotating the active segment inline.",
+        "# TYPE ferrosa_commitlog_append_rotate_seconds_max gauge",
+        "ferrosa_commitlog_append_rotate_seconds_max",
+        "# HELP ferrosa_commitlog_append_write_entry_seconds_total Total wall time spent serializing commit-log entries into memory.",
+        "# TYPE ferrosa_commitlog_append_write_entry_seconds_total counter",
+        "ferrosa_commitlog_append_write_entry_seconds_total",
+        "# HELP ferrosa_commitlog_append_write_entry_seconds_max Maximum wall time spent serializing one commit-log entry into memory.",
+        "# TYPE ferrosa_commitlog_append_write_entry_seconds_max gauge",
+        "ferrosa_commitlog_append_write_entry_seconds_max",
+        "# HELP ferrosa_commitlog_append_mark_dirty_seconds_total Total wall time spent updating commit-log dirty-table tracking.",
+        "# TYPE ferrosa_commitlog_append_mark_dirty_seconds_total counter",
+        "ferrosa_commitlog_append_mark_dirty_seconds_total",
+        "# HELP ferrosa_commitlog_append_mark_dirty_seconds_max Maximum wall time spent updating commit-log dirty-table tracking.",
+        "# TYPE ferrosa_commitlog_append_mark_dirty_seconds_max gauge",
+        "ferrosa_commitlog_append_mark_dirty_seconds_max",
+        "# HELP ferrosa_commitlog_append_sync_notify_seconds_total Total wall time append callers spent in the configured sync strategy notification.",
+        "# TYPE ferrosa_commitlog_append_sync_notify_seconds_total counter",
+        "ferrosa_commitlog_append_sync_notify_seconds_total",
+        "# HELP ferrosa_commitlog_append_sync_notify_seconds_max Maximum wall time an append caller spent in sync strategy notification.",
+        "# TYPE ferrosa_commitlog_append_sync_notify_seconds_max gauge",
+        "ferrosa_commitlog_append_sync_notify_seconds_max",
+        "# HELP ferrosa_commitlog_flushes_total Incremental commit-log flushes.",
+        "# TYPE ferrosa_commitlog_flushes_total counter",
+        "ferrosa_commitlog_flushes_total",
+        "# HELP ferrosa_commitlog_flush_bytes_total Bytes written by incremental commit-log flushes.",
+        "# TYPE ferrosa_commitlog_flush_bytes_total counter",
+        "ferrosa_commitlog_flush_bytes_total",
+        "# HELP ferrosa_commitlog_full_flushes_total Full segment rewrite flushes.",
+        "# TYPE ferrosa_commitlog_full_flushes_total counter",
+        "ferrosa_commitlog_full_flushes_total",
+        "# HELP ferrosa_commitlog_full_flush_bytes_total Bytes written by full segment rewrite flushes.",
+        "# TYPE ferrosa_commitlog_full_flush_bytes_total counter",
+        "ferrosa_commitlog_full_flush_bytes_total",
+        "# HELP ferrosa_commitlog_syncs_total Successful commit-log fsync calls.",
+        "# TYPE ferrosa_commitlog_syncs_total counter",
+        "ferrosa_commitlog_syncs_total",
+        "# HELP ferrosa_commitlog_sync_seconds_total Total wall time spent in commit-log flush_to_disk/force_full_flush calls that performed fsync.",
+        "# TYPE ferrosa_commitlog_sync_seconds_total counter",
+        "ferrosa_commitlog_sync_seconds_total",
+        "# HELP ferrosa_commitlog_sync_seconds_max Maximum observed wall time for a commit-log fsync call.",
+        "# TYPE ferrosa_commitlog_sync_seconds_max gauge",
+        "ferrosa_commitlog_sync_seconds_max",
+        "# HELP ferrosa_commitlog_sync_wait_writers_seconds_total Total wall time commit-log sync spent waiting for in-flight writers to finish entries.",
+        "# TYPE ferrosa_commitlog_sync_wait_writers_seconds_total counter",
+        "ferrosa_commitlog_sync_wait_writers_seconds_total",
+        "# HELP ferrosa_commitlog_sync_wait_writers_seconds_max Maximum observed wait-for-writers time before commit-log sync.",
+        "# TYPE ferrosa_commitlog_sync_wait_writers_seconds_max gauge",
+        "ferrosa_commitlog_sync_wait_writers_seconds_max",
+        "# HELP ferrosa_commitlog_sync_file_lock_wait_seconds_total Total wall time commit-log sync spent waiting for the segment file mutex.",
+        "# TYPE ferrosa_commitlog_sync_file_lock_wait_seconds_total counter",
+        "ferrosa_commitlog_sync_file_lock_wait_seconds_total",
+        "# HELP ferrosa_commitlog_sync_file_lock_wait_seconds_max Maximum wait for the segment file mutex during commit-log sync.",
+        "# TYPE ferrosa_commitlog_sync_file_lock_wait_seconds_max gauge",
+        "ferrosa_commitlog_sync_file_lock_wait_seconds_max",
+        "# HELP ferrosa_commitlog_sync_write_seconds_total Total wall time spent writing commit-log bytes to the file before sync.",
+        "# TYPE ferrosa_commitlog_sync_write_seconds_total counter",
+        "ferrosa_commitlog_sync_write_seconds_total",
+        "# HELP ferrosa_commitlog_sync_write_seconds_max Maximum wall time spent writing commit-log bytes to the file before sync.",
+        "# TYPE ferrosa_commitlog_sync_write_seconds_max gauge",
+        "ferrosa_commitlog_sync_write_seconds_max",
+        "# HELP ferrosa_commitlog_sync_data_seconds_total Total wall time spent in commit-log file sync_data/fsync.",
+        "# TYPE ferrosa_commitlog_sync_data_seconds_total counter",
+        "ferrosa_commitlog_sync_data_seconds_total",
+        "# HELP ferrosa_commitlog_sync_data_seconds_max Maximum wall time spent in commit-log file sync_data/fsync.",
+        "# TYPE ferrosa_commitlog_sync_data_seconds_max gauge",
+        "ferrosa_commitlog_sync_data_seconds_max",
+        "# HELP ferrosa_commitlog_sync_parent_dir_seconds_total Total wall time spent syncing parent directories for newly-created commit-log files.",
+        "# TYPE ferrosa_commitlog_sync_parent_dir_seconds_total counter",
+        "ferrosa_commitlog_sync_parent_dir_seconds_total",
+        "# HELP ferrosa_commitlog_sync_parent_dir_seconds_max Maximum wall time spent syncing a commit-log parent directory.",
+        "# TYPE ferrosa_commitlog_sync_parent_dir_seconds_max gauge",
+        "ferrosa_commitlog_sync_parent_dir_seconds_max",
+        "# HELP ferrosa_commitlog_periodic_idle_flushes_skipped_total Periodic commit-log timer ticks skipped because no writes were pending.",
+        "# TYPE ferrosa_commitlog_periodic_idle_flushes_skipped_total counter",
+        "ferrosa_commitlog_periodic_idle_flushes_skipped_total",
+        "# HELP ferrosa_commitlog_archive_notify_dropped_total Closed commit-log segments never handed to the PITR archiver (queue full or archiver stopped).",
+        "# TYPE ferrosa_commitlog_archive_notify_dropped_total counter",
+        "ferrosa_commitlog_archive_notify_dropped_total",
+        "# HELP ferrosa_commitlog_not_durable_refusals_total Writes refused because the commit log could not make them durable (sync thread dead, fsync failing, or past the stall deadline).",
+        "# TYPE ferrosa_commitlog_not_durable_refusals_total counter",
+        "ferrosa_commitlog_not_durable_refusals_total",
+        "# HELP ferrosa_commitlog_sync_batches_total Commit-log sync batches flushed.",
+        "# TYPE ferrosa_commitlog_sync_batches_total counter",
+        "ferrosa_commitlog_sync_batches_total",
+        "# HELP ferrosa_commitlog_sync_batch_writes_total Commit-log writes included in sync batches.",
+        "# TYPE ferrosa_commitlog_sync_batch_writes_total counter",
+        "ferrosa_commitlog_sync_batch_writes_total",
+        "# HELP ferrosa_commitlog_sync_batch_bytes_total Commit-log bytes included in sync batches.",
+        "# TYPE ferrosa_commitlog_sync_batch_bytes_total counter",
+        "ferrosa_commitlog_sync_batch_bytes_total",
+        "# HELP ferrosa_commitlog_sync_batch_wait_seconds_total Total time sync batches stayed open before flush.",
+        "# TYPE ferrosa_commitlog_sync_batch_wait_seconds_total counter",
+        "ferrosa_commitlog_sync_batch_wait_seconds_total",
+        "# HELP ferrosa_commitlog_sync_batch_wait_seconds_max Maximum time a sync batch stayed open before flush.",
+        "# TYPE ferrosa_commitlog_sync_batch_wait_seconds_max gauge",
+        "ferrosa_commitlog_sync_batch_wait_seconds_max",
+        "# HELP ferrosa_commitlog_sync_pending_writes Commit-log writes currently waiting for sync.",
+        "# TYPE ferrosa_commitlog_sync_pending_writes gauge",
+        "ferrosa_commitlog_sync_pending_writes",
+        "# HELP ferrosa_commitlog_sync_pending_bytes Commit-log bytes currently waiting for sync.",
+        "# TYPE ferrosa_commitlog_sync_pending_bytes gauge",
+        "ferrosa_commitlog_sync_pending_bytes",
+        "# HELP ferrosa_commitlog_empty_segments_skipped_total Empty or torn commit-log segments skipped during replay.",
+        "# TYPE ferrosa_commitlog_empty_segments_skipped_total counter",
+        "ferrosa_commitlog_empty_segments_skipped_total",
+    ];
+
+    #[test]
+    fn prometheus_render_text_is_unchanged() {
+        let text = render_prometheus();
+        assert!(text.ends_with('\n'), "exposition must end with a newline");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            PROMETHEUS_STATIC_LINES.len(),
+            "renderer line count changed"
+        );
+        for (line, expected) in lines.iter().zip(PROMETHEUS_STATIC_LINES) {
+            if expected.starts_with('#') {
+                assert_eq!(line, expected, "comment line changed");
+                continue;
+            }
+            let (name, value) = line
+                .rsplit_once(' ')
+                .unwrap_or_else(|| panic!("sample line has no value: {line}"));
+            assert_eq!(name, *expected, "metric line changed");
+            // `{:.9}` seconds, or an integer counter/gauge.
+            if name.ends_with("_seconds_total") || name.ends_with("_seconds_max") {
+                let (whole, frac) = value
+                    .split_once('.')
+                    .unwrap_or_else(|| panic!("seconds value lost its decimal point: {line}"));
+                assert!(
+                    !whole.is_empty() && whole.chars().all(|c| c.is_ascii_digit()),
+                    "seconds integer part changed: {line}"
+                );
+                assert_eq!(frac.len(), 9, "seconds precision changed: {line}");
+                assert!(frac.chars().all(|c| c.is_ascii_digit()), "{line}");
+            } else {
+                assert!(
+                    !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
+                    "value is not a plain integer: {line}"
+                );
+            }
+        }
+    }
+
+    /// The renderer appends to one caller-owned buffer: no temporary `String`
+    /// per line, and no reallocation once the destination is big enough.
+    #[test]
+    fn prometheus_render_does_not_reallocate_its_buffer() {
+        let mut out = String::with_capacity(64 * 1024);
+        write_prometheus(&mut out);
+        assert_eq!(
+            out.capacity(),
+            64 * 1024,
+            "render outgrew a 64 KiB buffer, so it is allocating while rendering"
+        );
+        assert_eq!(out.lines().count(), PROMETHEUS_STATIC_LINES.len());
+    }
+
+    /// I3: the renderer's per-line sites write into `out`; a `format!` there
+    /// would allocate one `String` per line per scrape.
+    #[test]
+    fn prometheus_renderer_does_not_format_per_line() {
+        let src = include_str!("mod.rs");
+        let production = src.split("#[cfg(test)]").next().expect("production part");
+        let start = production
+            .find("fn write_prometheus(")
+            .expect("renderer present");
+        let rest = &production[start..];
+        let renderer = match rest.find("\nfn is_zeroed_segment_header") {
+            Some(end) => &rest[..end],
+            None => rest,
+        };
+        assert!(
+            !renderer.contains("format!("),
+            "renderer must write into `out`, not build a String per line"
+        );
+        assert!(renderer.contains("writeln!(out,"));
+    }
     #[test]
     fn prometheus_exports_syncs_issued_per_mode() {
         let text = render_prometheus();

@@ -147,3 +147,8 @@ return 413. HTTP 202 returns `status: cancellation_requested`, `node_id`, echoed
 `keyspace`/`table`, `matched_tasks` and `already_cancelled_tasks`. This is a request
 acknowledgement: committed replacements continue, and future scheduling remains
 active. `ferrosa-ctl compaction stop` calls this endpoint.
+
+PostgreSQL is registered as starting before the web readiness endpoint is
+exposed. It becomes up only after its background TCP bind succeeds; pending or
+failed binds keep readiness false. This closes the startup window where an
+empty listener-status map could briefly make an occupied-port node look ready.

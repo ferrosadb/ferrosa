@@ -1,0 +1,559 @@
+{
+  "schema_version": 1,
+  "measured_at_utc": "2026-10-26",
+  "ferrosa_revision": "a948ed1df48fd955bc144956b3d50546512665e2",
+  "ferrosa_image": "registry.fly.io/ferrosa-bench-main@sha256:1ed2555fb9f17d604273c3ef00e4736b803faa5135d6394b1c7b275b40deab32",
+  "postgres_version": "18.6 (Debian 18.6-1.pgdg13+2)",
+  "postgres_binary_sha256": "4944085dba4adcf0f65b8fb4e698c5ac353ecff890fdc89afe8007c2547b1469",
+  "scope": "Network attribution; warm point reads. Same runner to one destination VM on two ports.",
+  "limitations": [
+    "Both servers share performance-2CPU/4096MiB/lax VM; one measured at a time.",
+    "Fresh tables, reused server processes. Two samples per engine are descriptive.",
+    "PostgreSQL data is on ephemeral root filesystem; no INSERT or capacity comparison.",
+    "No engine code changed. Same-VM CPU profiles run after all primary timings.",
+    "Loopback client shares server CPUs; report separately from remote client results.",
+    "Probe medians are separate experiments, not additive per-request spans.",
+    "Exact provider host/routing cause is not established."
+  ],
+  "previous_separate_vm_controls": {
+    "ferrosa": {
+      "source_sha256": "e49ef8790ebcda675ceeb2841c3377050832415a2d8151cac1b35375a07bbab2",
+      "connect_samples": 32,
+      "kernel_syn_rtt_us_min": 1976,
+      "kernel_syn_rtt_us_p50": 2058.0,
+      "kernel_syn_rtt_us_max": 3046,
+      "cases": [
+        {
+          "mode": "sync",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 2.162444,
+          "p99_ms": 2.977192,
+          "validated": true
+        },
+        {
+          "mode": "sync",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 2.124155,
+          "p99_ms": 3.221741,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 2.202984,
+          "p99_ms": 3.49647,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 2.244783,
+          "p99_ms": 3.6616,
+          "validated": true
+        }
+      ]
+    },
+    "postgres": {
+      "source_sha256": "96ea48607a9f6d75d17a76d840541abea2945aebea00650357f5911eacdc7f5f",
+      "connect_samples": 32,
+      "kernel_syn_rtt_us_min": 252,
+      "kernel_syn_rtt_us_p50": 347.0,
+      "kernel_syn_rtt_us_max": 2558,
+      "cases": [
+        {
+          "mode": "sync",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 0.375039,
+          "p99_ms": 1.372217,
+          "validated": true
+        },
+        {
+          "mode": "sync",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 0.495448,
+          "p99_ms": 1.928345,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 0.449139,
+          "p99_ms": 1.635746,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 0.834307,
+          "p99_ms": 2.707113,
+          "validated": true
+        }
+      ]
+    }
+  },
+  "same_vm_controls": {
+    "ferrosa": {
+      "source_sha256": "8f4a8825895ee183e061c2973002eef9ba4195b783043cfd90a534cca85373b1",
+      "connect_samples": 32,
+      "kernel_syn_rtt_us_min": 1972,
+      "kernel_syn_rtt_us_p50": 2050.0,
+      "kernel_syn_rtt_us_max": 4001,
+      "cases": [
+        {
+          "mode": "sync",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 2.148994,
+          "p99_ms": 2.835812,
+          "validated": true
+        },
+        {
+          "mode": "sync",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 2.135504,
+          "p99_ms": 2.956812,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 2.177484,
+          "p99_ms": 3.394581,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 2.229464,
+          "p99_ms": 4.113999,
+          "validated": true
+        }
+      ]
+    },
+    "postgres": {
+      "source_sha256": "2743ab8851a50294cbac66a73f58e793e0e54a0a8df57b82bcfca37f7cda43d1",
+      "connect_samples": 32,
+      "kernel_syn_rtt_us_min": 1952,
+      "kernel_syn_rtt_us_p50": 2005.5,
+      "kernel_syn_rtt_us_max": 2631,
+      "cases": [
+        {
+          "mode": "sync",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 2.145514,
+          "p99_ms": 3.48371,
+          "validated": true
+        },
+        {
+          "mode": "sync",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 2.131285,
+          "p99_ms": 4.431447,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 1,
+          "operations": 256,
+          "p50_ms": 2.248514,
+          "p99_ms": 4.233618,
+          "validated": true
+        },
+        {
+          "mode": "simple_constant",
+          "concurrency": 8,
+          "operations": 2048,
+          "p50_ms": 2.239834,
+          "p99_ms": 3.996259,
+          "validated": true
+        }
+      ]
+    }
+  },
+  "same_vm_primary_order": [
+    {
+      "target": "ferrosa",
+      "round": 106,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "read_elapsed_s": 6.174252963000001,
+      "read_operations_per_s": 3239.2582746208413,
+      "read_or_operation_p50_ms": 2.3535434999928384,
+      "read_or_operation_p99_ms": 4.210829000001581,
+      "rows_after": 5000,
+      "query_plan": {
+        "unsupported_or_failed": "SyntaxError",
+        "message": "expected a statement, found `EXPLAIN`"
+      },
+      "validated": true,
+      "source_sha256": "e7068d2d403b8fbdb5176fa9e17077500d0e63f572c0f329959429030b20e59a"
+    },
+    {
+      "target": "postgres",
+      "round": 107,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "read_elapsed_s": 5.5372943950000035,
+      "read_operations_per_s": 3611.872256251961,
+      "read_or_operation_p50_ms": 2.1478689999980816,
+      "read_or_operation_p99_ms": 3.453870999990727,
+      "rows_after": 5000,
+      "query_plan": [
+        [
+          "Index Scan using pipeline_pipelinee107pg_pkey on pipeline_pipelinee107pg  (cost=0.29..8.30 rows=1 width=40)"
+        ],
+        [
+          "  Index Cond: (pk = 42)"
+        ]
+      ],
+      "validated": true,
+      "source_sha256": "9627fdd9f9cea85079a5a492769cc23f5d263f094be729088d6c75acd7eae4c4"
+    },
+    {
+      "target": "postgres",
+      "round": 108,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "read_elapsed_s": 5.717359930000001,
+      "read_operations_per_s": 3498.1180553381737,
+      "read_or_operation_p50_ms": 2.1909839999949554,
+      "read_or_operation_p99_ms": 3.852740000013455,
+      "rows_after": 5000,
+      "query_plan": [
+        [
+          "Index Scan using pipeline_pipelinee108pg_pkey on pipeline_pipelinee108pg  (cost=0.29..8.30 rows=1 width=40)"
+        ],
+        [
+          "  Index Cond: (pk = 42)"
+        ]
+      ],
+      "validated": true,
+      "source_sha256": "6d1233b12a8141db8c95e7e94d53954167c98bc926ef7e1f0ab30fed7999bdfb"
+    },
+    {
+      "target": "ferrosa",
+      "round": 109,
+      "rows": 5000,
+      "reads": 20000,
+      "concurrency": 8,
+      "payload_bytes": 96,
+      "payload_variants": 512,
+      "read_elapsed_s": 6.567947840999992,
+      "read_operations_per_s": 3045.0911737074534,
+      "read_or_operation_p50_ms": 2.4062390000025857,
+      "read_or_operation_p99_ms": 4.620387000002779,
+      "rows_after": 5000,
+      "query_plan": {
+        "unsupported_or_failed": "SyntaxError",
+        "message": "expected a statement, found `EXPLAIN`"
+      },
+      "validated": true,
+      "source_sha256": "db6ccf423ac8ecc3ce993c51bb9873c39ea3c41725b2325e417725b6dd7aa231"
+    }
+  ],
+  "same_vm_read_ops_s_mean": {
+    "ferrosa": 3142.1747241641474,
+    "postgres": 3554.995155795067
+  },
+  "same_vm_ferrosa_over_postgres": 0.8838759510099548,
+  "same_vm_postgres_over_ferrosa": 1.1313804825862237,
+  "loopback_ladder": {
+    "ferrosa": {
+      "source_sha256": "4c7dac4f6bcecf04364e0fc933ac8c82864db22e3ca06a4eb2692eda0f404c02",
+      "cases": [
+        {
+          "case": "constant",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.097736584,
+          "p50_ms": 0.08792,
+          "p95_ms": 0.1387,
+          "p99_ms": 0.17505,
+          "validated": true
+        },
+        {
+          "case": "miss",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.2453308305,
+          "p50_ms": 0.22036,
+          "p95_ms": 0.31458,
+          "p99_ms": 0.61387,
+          "validated": true
+        },
+        {
+          "case": "key_only",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.24626477549999998,
+          "p50_ms": 0.23144,
+          "p95_ms": 0.327,
+          "p99_ms": 0.42987,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.2982199275,
+          "p50_ms": 0.27301,
+          "p95_ms": 0.39167,
+          "p99_ms": 0.90444,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": true,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.2492116655,
+          "p50_ms": 0.23707,
+          "p95_ms": 0.3273,
+          "p99_ms": 0.36402,
+          "validated": true
+        },
+        {
+          "case": "constant",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.1712055075,
+          "p50_ms": 1.10281,
+          "p95_ms": 2.28319,
+          "p99_ms": 2.94979,
+          "validated": true
+        },
+        {
+          "case": "miss",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.6303134979999998,
+          "p50_ms": 1.51993,
+          "p95_ms": 3.01845,
+          "p99_ms": 4.03073,
+          "validated": true
+        },
+        {
+          "case": "key_only",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.4685597479999999,
+          "p50_ms": 1.34889,
+          "p95_ms": 2.75203,
+          "p99_ms": 3.526059,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.9861183905,
+          "p50_ms": 1.82625,
+          "p95_ms": 3.755879,
+          "p99_ms": 5.019379,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": true,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.8841579165,
+          "p50_ms": 1.78159,
+          "p95_ms": 3.28858,
+          "p99_ms": 4.14307,
+          "validated": true
+        }
+      ]
+    },
+    "postgres": {
+      "source_sha256": "f03a520bdda21380063025dfe2568ab891db4723299257ce933b367c04fec46e",
+      "cases": [
+        {
+          "case": "constant",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.1163916685,
+          "p50_ms": 0.10423,
+          "p95_ms": 0.17247,
+          "p99_ms": 0.23326,
+          "validated": true
+        },
+        {
+          "case": "miss",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.1150442285,
+          "p50_ms": 0.10492,
+          "p95_ms": 0.16682,
+          "p99_ms": 0.20059,
+          "validated": true
+        },
+        {
+          "case": "key_only",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.112991733,
+          "p50_ms": 0.10314,
+          "p95_ms": 0.16873,
+          "p99_ms": 0.20112,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.1264752975,
+          "p50_ms": 0.11742,
+          "p95_ms": 0.17267,
+          "p99_ms": 0.19931,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": true,
+          "native_serializable_autocommit": false,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.13773625150000002,
+          "p50_ms": 0.13001,
+          "p95_ms": 0.19906,
+          "p99_ms": 0.28943,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": true,
+          "concurrency": 1,
+          "operations": 2000,
+          "mean_ms": 0.1298009125,
+          "p50_ms": 0.11991,
+          "p95_ms": 0.17491,
+          "p99_ms": 0.21445,
+          "validated": true
+        },
+        {
+          "case": "constant",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.216225053,
+          "p50_ms": 1.12929,
+          "p95_ms": 2.248239,
+          "p99_ms": 2.87561,
+          "validated": true
+        },
+        {
+          "case": "miss",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.427803028,
+          "p50_ms": 1.370919,
+          "p95_ms": 2.63726,
+          "p99_ms": 3.23284,
+          "validated": true
+        },
+        {
+          "case": "key_only",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.2887107175,
+          "p50_ms": 1.04445,
+          "p95_ms": 3.17393,
+          "p99_ms": 4.64542,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.7730965300000001,
+          "p50_ms": 1.70173,
+          "p95_ms": 3.283099,
+          "p99_ms": 4.03408,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": true,
+          "native_serializable_autocommit": false,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.7069989585,
+          "p50_ms": 1.57668,
+          "p95_ms": 3.442569,
+          "p99_ms": 4.64061,
+          "validated": true
+        },
+        {
+          "case": "full",
+          "explicit_transaction": false,
+          "native_serializable_autocommit": true,
+          "concurrency": 8,
+          "operations": 2000,
+          "mean_ms": 1.5572671064999999,
+          "p50_ms": 1.40313,
+          "p95_ms": 3.21927,
+          "p99_ms": 4.34234,
+          "validated": true
+        }
+      ]
+    }
+  },
+  "reverse_placement_followup": "point-read-reverse-results.json"
+}

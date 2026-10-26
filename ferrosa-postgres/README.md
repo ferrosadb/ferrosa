@@ -366,7 +366,7 @@ values log an error and the process uses the complete defaults:
 | `FERROSA_WRITE_SET_SPILL_THRESHOLD_BYTES` | `8388608` | Resident buffer a transaction's write-set may hold before it SPILLS (a streaming buffer size, never a cap) |
 | `FERROSA_POSTGRES_SCAN_BUFFER_ROWS` | `64` | In-flight rows between storage and the SQL executor |
 | `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` | `600000` | Maximum active snapshot age; later use returns `40001` |
-| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry and history-pruning interval |
+| `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` | `1000` | Background snapshot expiry interval |
 | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS_PER_CONNECTION` | `64` | Concurrent SUSPENDED portals one connection may hold — a concurrency bound, not a data cap (see the census) |
 | `FERROSA_POSTGRES_MAX_SUSPENDED_PORTALS` | `2048` | Concurrent suspended portals per node — a concurrency bound, not a data cap (see the census) |
 | `FERROSA_POSTGRES_SUSPENDED_PORTAL_IDLE_TIMEOUT_MS` | `600000` | Idle timeout after which a suspended portal is closed (`57014`) |
@@ -375,6 +375,54 @@ values log an error and the process uses the complete defaults:
 spills) and its constant, config field and accessor were removed. Neither it nor
 the consensus-side `FERROSA_ACCORD_CONFLICT_INDEX_CAPACITY` is read anywhere any
 more — the conflict index grows rather than refusing (see `ferrosa-cluster` CL-49).
+
+MVCC publishes persistent `imbl` HAMT roots through `arc-swap`. Active snapshots
+own structurally shared roots and immutable `Arc` row payloads. Dropping the last
+lease or expiring a snapshot removes its registry root; neither path sweeps
+unrelated row histories. Local commits reserve changed keys and their point/scan
+read scopes before storage apply, publish before-images before any physical
+change, and invoke storage exactly once outside metadata CAS retries. Disjoint
+writers and snapshot reads can progress while another storage apply pauses.
+Overlapping reservations or stale reads fail with `40001` before storage effects.
+
+
+
+Cursor resolution and the first bounded row fetch run in one blocking job.
+A one-shot column publication preserves early metadata without requeueing the
+cursor. The stream owns cancellation before awaiting that publication, so a
+dropped opening future stops its producer. Queue-order and cancellation
+regressions exercise the production opening path with one blocking worker.
+
+Owned decoded storage rows move text, ASCII, blob, numeric and validated JSON
+payloads into SQL values. The borrowed conversion API remains available for
+callers retaining their input. Production-path identity/capacity tests require
+text/blob allocations to survive the conversion unchanged; scalar/error results
+match the borrowed conversion. This removes one intermediate payload copy and
+does not change cluster reads, snapshot selection or wire encoding.
+
+Fresh local inserts represent their pre-insert absence once in the current head.
+An older snapshot missing that key resolves this shared absence without copying
+an entry into every reader root. First-touch rows that already exist physically
+still publish their before-image to active roots before storage apply; later
+updates preserve the original absence fact and each snapshot's existing image.
+The allocation regression compares 128/256-key commits with 1 versus 16 held
+readers, and a paused-apply test checks both absent and pre-existing rows.
+Storage/WAL work itself may block. Cluster prepare publishes timestamped images;
+apply retains each key's latest applied image and future prepares, while active
+roots retain their historical images. Applied-transaction replay is idempotent. A new cluster snapshot requesting
+history older than a retained head fails with `40001` instead of falling through
+to current physical storage.
+
+Streaming providers resolve the live snapshot root after each physical read,
+restore deleted rows once, and keep staged own writes ahead of snapshot images.
+Restoration enumerates shared key-only roots and resolves each payload through
+the live registry, so a held iterator cannot pin an expired historical table.
+They retain an emitted-key set of O(scanned keys) for late-delete reconciliation,
+in addition to the bounded row channel; they do not retain the scanned rows.
+Cancellation drops the producer's keys and lease. Expiry is checked during the
+scan and returns `40001`. Current heads, active roots, outstanding prepares and
+the applied-transaction identity set remain resident; this is no total MVCC
+memory cap or durable version store.
 
 ### Cap census (no-hard-bounds rule)
 
@@ -602,6 +650,9 @@ See [specs/data-flow.md](specs/data-flow.md) for the sequence diagrams.
 
 ## Dependencies
 
+Persistent MVCC metadata uses `imbl = 7.0.2` (MPL-2.0) for structurally shared
+HAMTs/ordered maps and `arc-swap` for atomic root publication.
+
 **Calls** (ferrosa crates this depends on):
 
 - **`ferrosa-common`** — `CqlValue`, `CqlType`, `DecoratedKey`, `PartitionKey`,
@@ -716,3 +767,44 @@ differences, both fixed: a `\u0000` escape was accepted (Postgres: `22P05`), and
 a bad binary version byte answered `22P03` (Postgres: `XX000`; `08P01` for an
 empty value). There are no named divergences: `NAMED_DIVERGENCES` in the oracle is
 empty and fails if an entry stops differing.
+
+### Extended-protocol transaction boundary
+
+Extended-protocol pipelines stage DML until `Sync` and commit the group as one atomic batch. An error rolls back preceding writes in that group, disconnect discards staging, and an explicit `BEGIN` remains open across `Sync`. Commit failures are reported before `ReadyForQuery`. Tests: `server::txn_atomicity_tests::extended_pipeline_*`.
+
+
+Scalar primary-key SELECTs now request exactly one physical partition for
+literal and bound-parameter equality, using the canonical write-side key codec.
+The snapshot tail resolves only that row, including a late delete and own staged
+insert. Cluster reads use `WritePath::pk_read` with the configured consistency
+and replication strategy; failures propagate without a local fallback. Joins,
+compound/clustering keys, floating/decimal keys and other unproved key families
+retain scans. Floating signed zero cannot use byte-key equality because SQL
+equates both signs. Selective-decode, recording-reader and snapshot tests cover
+this path. The [current PR #613 comparison](../deploy/fly-bench/pipeline/RESULTS.md)
+measures roughly 90% of PostgreSQL throughput in the small warm workload, with
+remaining local lookup overhead recorded there. See the [experiment record](../deploy/fly-bench/pipeline/HISTORY.md)
+for earlier revisions, the four-change walk and placement controls.
+
+### Response buffering and encoding
+
+The connection reuses one response buffer, flushing at Sync, simple-query completion,
+explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
+COPY flushes pending replies before its input handshake. Common scalar DataRows
+encode directly into that buffer; specialized codecs retain their checked fallback.
+A failed row rolls back its partial bytes while preserving earlier rows. Collecting
+ReplySink callers keep the existing message interface. Ownership/allocation tests,
+wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
+change. Current measurements and limits are in [the benchmark results](../deploy/fly-bench/pipeline/RESULTS.md).
+
+
+### Row validation and MVCC replacement
+
+Storage reads retain their configured consistency path and complete shared CQL
+decoding. A borrowed validation pass preserves SQL representability errors before
+MVCC lookup. Only key fields become SQL values before lookup; a full SQL row is
+materialized when no MVCC or staged image replaces it. This removes throwaway SQL
+row materialization, while physical CQL decoding and the owned MVCC image copy
+remain. Tests pin zero-allocation payload validation, conversion-error parity, and
+a corrupt physical payload failing even when MVCC holds a valid replacement.
+The [experiment record](../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.

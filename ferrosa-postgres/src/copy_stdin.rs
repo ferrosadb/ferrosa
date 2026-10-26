@@ -485,7 +485,6 @@ async fn flush(ctx: &QueryContext, buffer: &mut TxnWriteSet) -> Result<(), Backe
     let staged = std::mem::take(buffer)
         .into_staged()
         .map_err(|error| query::write_error_response(&error))?;
-    let _commit_guard = ctx.mvcc.commit_guard().await;
     match query::commit_mutations(
         &ctx.engine,
         &ctx.schema,

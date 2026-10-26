@@ -17307,7 +17307,7 @@ mod tests {
                     .value
                     .clone()
                     .expect("row cell must have a value");
-                (p.key.key.as_bytes().to_vec(), v)
+                (p.key.key.as_bytes().to_vec(), v.into_vec())
             })
             .collect();
         assert_eq!(

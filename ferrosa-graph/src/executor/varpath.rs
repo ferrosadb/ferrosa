@@ -303,9 +303,9 @@ pub async fn execute_var_length(
                                     target_col,
                                 );
                                 let current = vertex_key.key.as_bytes();
-                                let mut admit = |id: Vec<u8>| -> Result<()> {
+                                let mut admit = |id: ferrosa_common::CellBytes| -> Result<()> {
                                     admit_neighbor(
-                                        id,
+                                        id.into_vec(),
                                         &mut visited,
                                         &mut next_frontier,
                                         config.max_var_path_visited,

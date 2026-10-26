@@ -21,6 +21,12 @@ resolution beyond the serialization header, or cluster routing.
 
 ## What's implemented
 
+- **Payload ownership boundary** — cell decoding uses caller-owned
+  `CellBytesMut` scratch and publishes immutable `CellBytes`. Deferred-value
+  readers accept `CellReadBuffer`, retaining the same corrupt-length checks for
+  both scratch and legacy vectors. Unique scratch can be recovered and reused
+  between cells without exposing mutation through published payloads.
+
 - **BTI write** — `SSTableWriter` accepts partitions in token order and emits
   all components (Data.db, Partitions.db, Rows.db, Filter.db,
   CompressionInfo.db / CRC.db, Statistics.db, Digest.crc32, TOC.txt) either as
@@ -614,3 +620,11 @@ existing two-buffer contract; sparse reads reuse the caller's chunk buffer.
 `tests/scan_cursor_io.rs` bounds physical bytes on the public pending-value
 API with synchronous and background-prefetched inputs, in addition to exact
 payload checks. This prevents metadata seeks from multiplying full-window I/O.
+
+Published cell bytes are shared across row copies. Readers recover only unique
+scratch capacity; retained older payloads remain immutable. Memory estimates
+charge the full retained backing and a conservative shared-owner allowance.
+
+Reusable cursor allocation guards count only the decoder thread. A controlled
+foreign-thread allocation verifies attribution; the existing allocation bound
+and byte/corruption assertions are retained.

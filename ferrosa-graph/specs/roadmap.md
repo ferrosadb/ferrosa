@@ -16,6 +16,15 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Now (highest value)
 
+- **Extend index eligibility and DDL.** Integer/UUID equality now consumes
+  CQL-declared BTree/Hash indexes and checks readiness before use. Extend this to
+  other scalar/predicate forms only with equivalent comparison semantics; add
+  Cypher index DDL separately.
+- **Extend count pushdown.** Unfiltered physical-vertex `count(n)`/`count(*)` now
+  count metadata. Filtered, grouped, DISTINCT and property counts keep the
+  evaluator; preserve null, multiplicity and visibility semantics before adding
+  further shortcuts. [Measurements](../../deploy/fly-bench/pipeline/RESULTS.md).
+
 - **Arm adjacency reconciliation in production (FMEA G-1).** The synchronous
   observer is the primary guarantee, but the background reconciler — the only
   thing that catches dropped mutations and crash-recovery drift — is still
@@ -74,6 +83,12 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
     instead of refusing them.
 
 ## Implemented since the last revision
+
+- **MERGE endpoint identity (2026-10-24).** Schema-on-write UUID fallback keys
+  use 16 bytes, and each relationship is scheduled after both endpoint nodes
+  bind. Tests cover new relationships, explicit UUID destinations, existing
+  opaque keys, traversal, idempotency and deletion. Existing raw keys are not
+  rewritten.
 
 - **G-14 — a completed deploy heal is not repeated (2026-10-19).** The heal
   writes `<data_dir>/graph-adjacency-heals.json` once it completes with zero

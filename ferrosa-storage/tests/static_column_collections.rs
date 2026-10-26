@@ -132,7 +132,7 @@ fn simple_value(row: &Row, ordinal: u16) -> Option<Vec<u8>> {
         1,
         "column {ordinal} must hold exactly one cell"
     );
-    cells[0].value.clone()
+    cells[0].value.as_ref().map(|value| value.to_vec())
 }
 
 fn list_at(row: &Row, ordinal: u16) -> Option<CqlValue> {

@@ -88,6 +88,8 @@ pub struct Session {
     /// (`I`/`T`/`E`). Entering a `T` block starts PostgreSQL MVCC transaction
     /// state; Cassandra CQL transactions remain on Accord.
     txn: TransactionStatus,
+    /// Extended protocol work commits or rolls back only at Sync.
+    extended_implicit: bool,
     /// Explicit isolation mode for the current transaction. `None` means the
     /// session default.
     txn_isolation: Option<ferrosa_sql::IsolationLevel>,
@@ -159,6 +161,7 @@ impl Session {
             portals: HashMap::new(),
             error_pending: false,
             txn: TransactionStatus::default(),
+            extended_implicit: false,
             txn_isolation: None,
             txn_snapshot: None,
             txn_read_tables: HashSet::new(),
@@ -197,6 +200,14 @@ impl Session {
         if let Some(stmt) = self.statements.get_mut(name) {
             stmt.param_oids = oids;
         }
+    }
+
+    pub(crate) fn mark_extended_implicit(&mut self) {
+        self.extended_implicit = true;
+    }
+
+    pub(crate) fn is_extended_implicit(&self) -> bool {
+        self.extended_implicit
     }
 
     /// Handle `Sync`: clear the error-skip flag. The caller then emits
@@ -352,6 +363,7 @@ impl Session {
     /// the buffered write-set. After `end_txn` no buffered write survives, so a
     /// rolled-back (or committed) transaction never re-applies on the next one.
     pub fn end_txn(&mut self) {
+        self.extended_implicit = false;
         // PostgreSQL destroys a transaction's portals when it ends; their
         // queries and node slots go with them.
         self.runs.clear();

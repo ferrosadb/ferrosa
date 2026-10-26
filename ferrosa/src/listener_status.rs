@@ -2,22 +2,31 @@
 //! Correctness: Correct when a listener that failed to bind (or stopped) is
 //!   reported as failed until it is marked up again, the report is deterministic
 //!   (sorted by name), and marking is idempotent and never panics.
-//! Last revised: 2026-09-26
-//! Last changed: New module — Postgres, SPARQL, graph HTTP and Bolt each log a bind
-//!   failure and let the node carry on, so `/readyz` answered 200 with a client
-//!   listener missing. The failure is now recorded here, exported as
-//!   `ferrosa_listener_up`, and gates `/readyz`.
+//! Last revised: 2026-10-26
+//! Last changed: Register expected listeners as starting before background binds
+//!   run, so readiness cannot pass through an empty status map during startup.
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-/// Which background listeners have failed, and why.
+/// Which background listeners are starting, serving, or failed.
 #[derive(Default)]
 pub struct ListenerStatus {
     listeners: Mutex<BTreeMap<&'static str, Option<String>>>,
 }
 
 impl ListenerStatus {
+    /// Register required listeners before asynchronous startup begins.
+    pub fn expecting(names: &[&'static str]) -> Self {
+        Self {
+            listeners: Mutex::new(
+                names
+                    .iter()
+                    .map(|name| (*name, Some("starting".to_string())))
+                    .collect(),
+            ),
+        }
+    }
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<&'static str, Option<String>>> {
         // A panic while holding this lock only interrupted a map insert; the map is
         // still valid, and health reporting must keep working.
@@ -36,7 +45,7 @@ impl ListenerStatus {
         self.lock().insert(name, Some(reason.to_string()));
     }
 
-    /// The listeners currently failed, as `(name, reason)`, sorted by name.
+    /// Listeners not serving yet (starting or failed), sorted by name.
     pub fn failed(&self) -> Vec<(&'static str, String)> {
         self.lock()
             .iter()
@@ -45,11 +54,11 @@ impl ListenerStatus {
     }
 
     /// Prometheus text: `ferrosa_listener_up{listener="..."}` is 1 or 0 for every
-    /// listener that has been marked.
+    /// listener that has been registered or marked.
     pub fn render_prometheus(&self, out: &mut String) {
         use std::fmt::Write;
         out.push_str(
-            "# HELP ferrosa_listener_up 1 when a background client listener is serving, 0 when it failed to bind or exited.\n\
+            "# HELP ferrosa_listener_up 1 when a background client listener is serving, 0 when starting, failed to bind, or exited.\n\
              # TYPE ferrosa_listener_up gauge\n",
         );
         for (name, failure) in self.lock().iter() {
@@ -66,6 +75,24 @@ impl ListenerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expected_listener_blocks_readiness_until_it_has_bound() {
+        let status = ListenerStatus::expecting(&["postgres"]);
+        assert_eq!(status.failed(), vec![("postgres", "starting".to_string())]);
+        let mut metrics = String::new();
+        status.render_prometheus(&mut metrics);
+        assert!(metrics.contains("ferrosa_listener_up{listener=\"postgres\"} 0\n"));
+        status.mark_up("postgres");
+        assert!(status.failed().is_empty());
+    }
+
+    #[test]
+    fn another_listener_coming_up_cannot_hide_a_pending_listener() {
+        let status = ListenerStatus::expecting(&["postgres"]);
+        status.mark_up("graph_http");
+        assert_eq!(status.failed(), vec![("postgres", "starting".to_string())]);
+    }
 
     #[test]
     fn a_fresh_status_reports_no_failures() {

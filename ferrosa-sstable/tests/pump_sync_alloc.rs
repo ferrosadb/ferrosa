@@ -101,3 +101,42 @@ fn pump_sync_alloc_streaming_64mib_after_warmup_is_alloc_free() {
     let logical = writer.finish().expect("finish");
     assert_eq!(logical, (TOTAL_CHUNKS * CHUNK) as u64);
 }
+
+/// The count must belong to the measuring thread alone. libtest's main thread
+/// allocates its first blocking `recv()` context after it spawns the test
+/// thread, and on a busy CPU that lands inside the measured loop above (CI run
+/// 40051576713 counted 4). Here another thread allocates while the window is
+/// open; the threads hand off through atomics only, so nothing else on this
+/// thread allocates inside the window.
+#[test]
+fn pump_sync_alloc_counter_ignores_other_threads() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static STEP: AtomicU8 = AtomicU8::new(0);
+
+    let other = std::thread::spawn(|| {
+        while STEP.load(Ordering::Acquire) != 1 {
+            std::hint::spin_loop();
+        }
+        std::hint::black_box(Vec::<u8>::with_capacity(64));
+        STEP.store(2, Ordering::Release);
+    });
+
+    let before = alloc_events();
+    STEP.store(1, Ordering::Release);
+    while STEP.load(Ordering::Acquire) != 2 {
+        std::hint::spin_loop();
+    }
+    let delta = alloc_events() - before;
+    other.join().expect("allocating thread");
+
+    assert_eq!(delta, 0, "another thread's allocation was counted");
+}
+
+/// The control: an allocation on the measuring thread is counted, so a zero
+/// above cannot come from a counter that counts nothing.
+#[test]
+fn pump_sync_alloc_counter_sees_the_measuring_thread() {
+    let before = alloc_events();
+    std::hint::black_box(Vec::<u8>::with_capacity(64));
+    assert_eq!(alloc_events() - before, 1);
+}

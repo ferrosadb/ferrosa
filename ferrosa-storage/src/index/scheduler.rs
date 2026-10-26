@@ -551,12 +551,13 @@ impl LocalBackend {
                 // its component out of the composite clustering-key bytes
                 // (t_430c4188); a regular/static index reads the cell at the
                 // declared column position.
-                let value_owned: Option<Vec<u8>> =
+                let value_owned: Option<ferrosa_common::CellBytes> =
                     match (job.clustering_source, job.partition_key_source) {
                         (Some(src), _) => {
                             ferrosa_row_bridge::decode_clustering(&row.clustering, src.total)
                                 .into_iter()
                                 .nth(src.component)
+                                .map(Into::into)
                         }
                         // A partition-key index: every row in this partition shares
                         // the same value, decoded once from the key.
@@ -564,6 +565,7 @@ impl LocalBackend {
                             ferrosa_row_bridge::decode_pk(&partition.key, src.total)
                                 .into_iter()
                                 .nth(src.component)
+                                .map(Into::into)
                         }
                         (None, None) => row
                             .cells

@@ -12,6 +12,7 @@ ferrosa-schema = { path = "../ferrosa-schema" }
 ferrosa-sstable = { path = "../ferrosa-sstable" }
 ferrosa-cluster = { path = "../ferrosa-cluster" }
 ferrosa-storage = { path = "../ferrosa-storage" }
+ferrosa-index = { path = "../ferrosa-index" }
 arc-swap = "1.7"
 async-stream = "0.3"
 hex = "0.4"

@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-postgres
 status: developer-preview
-last_updated: 2026-10-09
+last_updated: 2026-10-26
 executive_summary: >
   The PostgreSQL v3 wire-protocol front-end for ferrosa. Implements the
   frontend/backend protocol (startup, SCRAM-SHA-256, simple + extended query),
@@ -218,11 +218,59 @@ transaction's write-set may hold before it SPILLS to a staging file (default
 sets the storage-to-executor row channel capacity (64), and
 `FERROSA_POSTGRES_MVCC_MAX_SNAPSHOT_AGE_MS` expires older active snapshots
 (600,000 ms). `FERROSA_POSTGRES_MVCC_SNAPSHOT_REAPER_INTERVAL_MS` controls the
-expiry/pruning sweep cadence (1,000 ms). Invalid values log an error and select
+snapshot-registry expiry cadence (1,000 ms). Invalid values log an error and select
 the complete default set without stopping startup. Expired transactions fail
 on subsequent snapshot validation with SQLSTATE `40001`. Tuning guidance and
 query-materialization caveats are in the public
 [`PROFILE.md`](../../PROFILE.md).
+
+MVCC publishes persistent `imbl` HAMT roots through `arc-swap`. Active snapshots
+own structurally shared roots and immutable `Arc` row payloads. Dropping the last
+lease or expiring a snapshot removes its registry root; neither path sweeps
+unrelated row histories. Local commits reserve changed keys and their point/scan
+read scopes before storage apply, publish before-images before any physical
+change, and invoke storage exactly once outside metadata CAS retries. Disjoint
+writers and snapshot reads can progress while another storage apply pauses.
+Overlapping reservations or stale reads fail with `40001` before storage effects.
+
+
+
+Cursor resolution and the first bounded row fetch run in one blocking job.
+A one-shot column publication preserves early metadata without requeueing the
+cursor. The stream owns cancellation before awaiting that publication, so a
+dropped opening future stops its producer. Queue-order and cancellation
+regressions exercise the production opening path with one blocking worker.
+
+Owned decoded storage rows move text, ASCII, blob, numeric and validated JSON
+payloads into SQL values. The borrowed conversion API remains available for
+callers retaining their input. Production-path identity/capacity tests require
+text/blob allocations to survive the conversion unchanged; scalar/error results
+match the borrowed conversion. This removes one intermediate payload copy and
+does not change cluster reads, snapshot selection or wire encoding.
+
+Fresh local inserts represent their pre-insert absence once in the current head.
+An older snapshot missing that key resolves this shared absence without copying
+an entry into every reader root. First-touch rows that already exist physically
+still publish their before-image to active roots before storage apply; later
+updates preserve the original absence fact and each snapshot's existing image.
+The allocation regression compares 128/256-key commits with 1 versus 16 held
+readers, and a paused-apply test checks both absent and pre-existing rows.
+Storage/WAL work itself may block. Cluster prepare publishes timestamped images;
+apply retains each key's latest applied image and future prepares, while active
+roots retain their historical images. Applied-transaction replay is idempotent. A new cluster snapshot requesting
+history older than a retained head fails with `40001` instead of falling through
+to current physical storage.
+
+Streaming providers resolve the live snapshot root after each physical read,
+restore deleted rows once, and keep staged own writes ahead of snapshot images.
+Restoration enumerates shared key-only roots and resolves each payload through
+the live registry, so a held iterator cannot pin an expired historical table.
+They retain an emitted-key set of O(scanned keys) for late-delete reconciliation,
+in addition to the bounded row channel; they do not retain the scanned rows.
+Cancellation drops the producer's keys and lease. Expiry is checked during the
+scan and returns `40001`. Current heads, active roots, outstanding prepares and
+the applied-transaction identity set remain resident; this is no total MVCC
+memory cap or durable version store.
 
 ### Coherence with the consensus write path
 
@@ -294,3 +342,45 @@ graph.
 `CqlType::Jsonb` maps to the engine `ColumnType::Jsonb` (OID 3802, typlen -1, `binary: true`; `json` 114, `jsonpath` 4072 and `text[]` 1009 have `ALL_PG_TYPES` entries, all `binary: false`). `storage_provider::cql_to_value` and `query::value_to_cql` move the validated cell across unchanged as `Value::Jsonb` (T-160). The wire codec is `jsonb_wire` (T-161a): text format is the PostgreSQL 16 jsonb text (`TextStyle::PgText`, D26; `{"aa":2,"b":1}` prints `{"b": 1, "aa": 2}`, scale kept); binary format is `0x01` then that text (`jsonb_send`). `render_value` never returns NULL for a jsonb value: a corrupt cell is `XX001`, an over-budget print `54000`, and jsonpath/`text[]` are `0A000` (T-161b). Input is parsed with `ferrosa_jsonb::parse_text_observed` under `QueryContext::jsonb_limits` (resolved from `[jsonb]` in `ferrosa/src/main.rs`, no default): a parameter declared 3802 or 114 (or bound to a jsonb column after `Describe`) is parsed in `decode_param_checked`; an untyped string literal or a text-declared parameter bound to a jsonb column is parsed in `value_to_cql`. SQLSTATEs: `22P02` invalid JSON (byte offset, input never echoed), `22P03` bad or missing binary version byte, `22030` duplicate key under the strict policy, `54000` over a limit, `XX001` corrupt stored cell. Duplicate keys resolve last-wins and are logged as a `jsonb_duplicate_keys_dropped` edge line (D6b). DDL: `jsonb` and `json` create a CQL `jsonb` column (`json` is stored as jsonb, D11) on every deployment mode — there is no capability gate (the former off-standalone refusal, T-300/D24/D32, was REMOVED, not disabled; jsonb is a first-class data type). The one surviving jsonb DDL constraint is placement (T-154a, D3): jsonb is still refused in a key column. An unspecified-OID binary-format parameter is decoded as text: clients get 3802 from `Describe`, and a raw Bind without one fails 22P02 rather than writing.
 
 T-301 acceptance: `tests/jsonb_slice.rs` (no infrastructure) and the `differential_oracle_jsonb_*` tests compare ferrosa with postgres:16 byte for byte over jsonb DDL, INSERT (literal, text `$1`, binary `$1`) and SELECT (text, binary). See the README section "Slice acceptance evidence (T-301)".
+
+### Extended-protocol transaction boundary
+
+Extended protocol: each implicit pipeline owns one snapshot and staged write-set until `Sync`. `handle_frontend` commits or rolls it back at that boundary; each `Execute` does not independently publish its write. Explicit transactions retain their existing COMMIT/ROLLBACK boundary.
+
+
+Scalar primary-key SELECTs now request exactly one physical partition for
+literal and bound-parameter equality, using the canonical write-side key codec.
+The snapshot tail resolves only that row, including a late delete and own staged
+insert. Cluster reads use `WritePath::pk_read` with the configured consistency
+and replication strategy; failures propagate without a local fallback. Joins,
+compound/clustering keys, floating/decimal keys and other unproved key families
+retain scans. Floating signed zero cannot use byte-key equality because SQL
+equates both signs. Selective-decode, recording-reader and snapshot tests cover
+this path. [Current PR #613 results](../../deploy/fly-bench/pipeline/RESULTS.md)
+measure roughly 90% of PostgreSQL throughput in the small warm workload and
+retain the local lookup gap. The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md)
+contains earlier revisions, staged measurements and placement controls.
+
+
+### Response buffering and encoding
+
+The connection reuses one response buffer, flushing at Sync, simple-query completion,
+explicit Flush (including error-pending state), and an 8 KiB streaming threshold.
+COPY flushes pending replies before its input handshake. Common scalar DataRows
+encode directly into that buffer; specialized codecs retain their checked fallback.
+A failed row rolls back its partial bytes while preserving earlier rows. Collecting
+ReplySink callers keep the existing message interface. Ownership/allocation tests,
+wire parity, bounded streaming, Sync batching and explicit Flush tests cover this
+change. Current measurements and limits are in [the benchmark results](../../deploy/fly-bench/pipeline/RESULTS.md).
+
+
+### Row validation and MVCC replacement
+
+Storage reads retain their configured consistency path and complete shared CQL
+decoding. A borrowed validation pass preserves SQL representability errors before
+MVCC lookup. Only key fields become SQL values before lookup; a full SQL row is
+materialized when no MVCC or staged image replaces it. This removes throwaway SQL
+row materialization, while physical CQL decoding and the owned MVCC image copy
+remain. Tests pin zero-allocation payload validation, conversion-error parity, and
+a corrupt physical payload failing even when MVCC holds a valid replacement.
+The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.

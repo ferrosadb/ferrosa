@@ -13,7 +13,7 @@ use crate::{
     IndexBuilder, IndexCapabilities, IndexConfig, IndexError, IndexFactory, IndexFileMeta,
     IndexFiles, IndexKey, IndexReader, IndexResult, IndexType, RowPosition,
 };
-use ferrosa_common::CellValue;
+use ferrosa_common::{CellBytes, CellValue};
 use std::collections::HashMap;
 use std::ops::{Bound, ControlFlow};
 use std::path::PathBuf;
@@ -52,7 +52,7 @@ impl IndexFactory for HashIndexFactory {
 /// Raw entry before building the hash map.
 #[derive(Debug, Clone)]
 struct RawEntry {
-    key: Vec<u8>,
+    key: CellBytes,
     position: RowPosition,
 }
 

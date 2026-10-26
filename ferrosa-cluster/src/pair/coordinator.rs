@@ -5,9 +5,11 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use uuid::Uuid;
 
+use ferrosa_common::key::DecoratedKey;
 use ferrosa_net::codec::Lane;
 use ferrosa_net::message::Message;
 use ferrosa_net::peer::PeerManager;
+use ferrosa_sstable::types::Row;
 use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::{Mutation, TableId};
 
@@ -209,6 +211,31 @@ pub fn encode_mutation(mutation: &Mutation) -> Bytes {
     let mut buf = vec![0u8; size];
     mutation.serialize_into(&mut buf);
     Bytes::from(buf)
+}
+
+/// Encode a single-row mutation for the wire without owning a [`Mutation`].
+///
+/// Byte-identical to `encode_mutation(&Mutation::new(..))` for the same fields
+/// (both go through the same row encoder), and it exists so a coordinator can
+/// encode the row it is about to write locally instead of cloning it into a
+/// throwaway `Mutation` first.
+pub fn encode_single_row_mutation(
+    keyspace: &str,
+    table: &str,
+    key: &DecoratedKey,
+    row: &Row,
+    timestamp: i64,
+) -> Bytes {
+    let encoded = Mutation::serialize_borrowed_rows(
+        Uuid::new_v4().into_bytes(),
+        keyspace,
+        table,
+        key,
+        timestamp,
+        &[row],
+    )
+    .expect("a single-row mutation is always within the u16 row-count limit");
+    Bytes::from(encoded)
 }
 
 /// Decode a Mutation from wire bytes.

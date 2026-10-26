@@ -17,6 +17,12 @@ executive_summary: >
 
 ## Purpose & boundary
 
+Single-row replica writes encode borrowed inputs with
+`pair::coordinator::encode_single_row_mutation`; local application still consumes
+the original row. The helper uses the storage mutation encoder and retains its
+wire format and per-mutation replay ID. This changes allocation ownership, not
+consistency levels or acknowledgment semantics.
+
 `ferrosa-cluster` is the **distribution boundary**. Below it sits
 `ferrosa-storage` (a single-node engine); above it sit the query front-ends
 (`ferrosa-cql`, `ferrosa-graph`, `ferrosa-sparql`, `ferrosa-flight`,
@@ -225,3 +231,9 @@ than a total wait budget (CL-63). See
 It is a hub crate: a wide fan-in of front-ends depend on its coordinator/consensus
 API, so its public surface (CL semantics, `ModeController`, `MembershipChanger`,
 repair) changes ripple broadly. See the [root crate index](../../specs/crates.md).
+
+### Cell payload boundary
+
+Raft cell DTOs carry `CellBytes` and serialize the same byte sequence as
+the former owned vector. Frozen legacy-format tests cover this boundary; replay
+identities and digest ordering are unchanged.

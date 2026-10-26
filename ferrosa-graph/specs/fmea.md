@@ -6,6 +6,17 @@ last_updated: 2026-10-15
 
 # ferrosa-graph — FMEA / Known Issues
 
+## Current performance limits
+
+Eligible integer/UUID equality uses declared, current scalar secondary indexes;
+unsupported predicates and absent/stale indexes retain complete range scans.
+Cypher index DDL remains unsupported. Unfiltered physical-vertex counts use
+metadata; other aggregate inputs can still materialize expansion frontiers.
+[Measurement status and scope](../../deploy/fly-bench/pipeline/RESULTS.md) and the
+[experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) identify measured
+revisions; fresh comparison timings for these changes are pending.
+The dated code-verification pass below retains its original scope.
+
 > **Code-verification note (2026-10-15).** Rows below were re-checked against
 > the crate at v0.22.3 (`origin/main`, `9e32e82a`). Limits cited in this pass:
 > query timeout 30 s, `max_fan_out_per_hop` 10 000, `max_groups` 100 000,
@@ -56,6 +67,12 @@ network listeners, so consistency and DoS modes dominate.
    scans the whole edge table per neighbour (24 s per vertex at 21k edges).
 
 ## Detection assets
+
+- MERGE endpoint identity: `schema_on_write` covers unknown relationship DDL;
+  `graph_http_integration` checks explicit UUID and existing raw destinations,
+  repeated MERGE, traversal, and edge/deletion storage identity. Relationships
+  bind after both endpoints, and UUID fallback generation respects key width.
+  This does not migrate previously malformed stored keys.
 
 - `adjacency/reconcile.rs` tests: repair-missing, idempotency, orphan-removal,
   partial-direction repair, yield policy (`tests` module).

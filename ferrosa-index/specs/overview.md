@@ -64,6 +64,10 @@ bincode tag order is asserted stable (`lib.rs::bincode_index_type_variant_tag_st
 
 ## Data flow
 
+B-tree entries and raw hash-builder entries retain `CellBytes` keys. Key
+comparison, hashing and file serialization use their byte slices; the in-memory
+payload abstraction does not change index-file encoding.
+
 ```mermaid
 flowchart TD
     subgraph build [Build path]

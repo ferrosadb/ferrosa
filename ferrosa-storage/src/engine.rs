@@ -1,8 +1,8 @@
 //! Module: Compose commit log, memtable, flush, compaction, object storage, and cache.
 //! Correctness: Correct when admitted writes are durable before visibility and reads,
 //! replay, flush, and maintenance preserve table and cursor invariants.
-//! Last revised: 2026-09-27
-//! Last changed: Retry output digest failures with backoff and latch table pauses for operator resume.
+//! Last revised: 2026-10-24
+//! Last changed: Share immutable observer payloads across bounded lossless queues.
 //!
 //! [`StorageEngine`] is the entry point for all storage operations. It owns:
 //! - A [`CommitLog`] for write-ahead durability.
@@ -1603,7 +1603,8 @@ pub struct StorageEngine {
     time_series_consolidators: RwLock<HashMap<TableId, TimeSeriesConsolidatorHandle>>,
     time_series_runtime_settings: Arc<TimeSeriesRuntimeSettings>,
     time_series_wasm_aggregates: RwLock<Option<Arc<dyn TimeSeriesWasmAggregateExecutor>>>,
-    /// Default channel capacity for async observers.
+    /// Bounded queue capacity per async observer, from
+    /// [`crate::observer::ObserverConfig::from_env`] (deployment-tunable).
     async_observer_capacity: usize,
     /// Index build scheduler — rebuilds secondary indexes after compaction.
     index_scheduler: Option<crate::index::IndexBuildScheduler>,
@@ -2672,11 +2673,34 @@ const DEFAULT_TIME_SERIES_MATERIALIZATION_POLL_INTERVAL: std::time::Duration =
 const DEFAULT_TIME_SERIES_MATERIALIZATION_BATCH_LIMIT: usize = 128;
 
 /// State for a single async observer: the observer, its sender half, and a
-/// drop counter for backpressure metrics.
+/// count of how often the write path had to derive inline because this
+/// observer's queue was full.
 struct AsyncObserverState {
     observer: Arc<dyn crate::observer::WriteObserver>,
-    sender: tokio::sync::mpsc::Sender<(TableId, Mutation)>,
-    drop_count: Arc<AtomicU64>,
+    sender: tokio::sync::mpsc::Sender<(TableId, Arc<Mutation>)>,
+    backpressure_count: Arc<AtomicU64>,
+}
+
+/// Async-observer queue gauges: `(staged mutations, bound in force)`.
+///
+/// `Sender::capacity()` is the REMAINING permits and `Sender::max_capacity()` the
+/// bound, so in-flight depth is the difference. This is a snapshot: a concurrent
+/// send or drain can make it read one message stale, which is why it is a gauge
+/// and nothing in the write path depends on it. With no observer registered the
+/// bound reported is the CONFIGURED capacity, so the tunable is visible before a
+/// first observer exists.
+fn observer_queue_gauges(states: &[AsyncObserverState], configured_capacity: usize) -> (u64, u64) {
+    if states.is_empty() {
+        return (0, configured_capacity as u64);
+    }
+    let mut depth = 0u64;
+    let mut capacity = 0u64;
+    for state in states {
+        let bound = state.sender.max_capacity() as u64;
+        capacity += bound;
+        depth += bound.saturating_sub(state.sender.capacity() as u64);
+    }
+    (depth, capacity)
 }
 
 struct TimeSeriesConsolidatorHandle {
@@ -3135,7 +3159,18 @@ impl StorageEngine {
     fn cleanup_stale_compaction_staging(
         config: &StorageEngineConfig,
     ) -> ferrosa_common::Result<()> {
-        let output_dir = &config.compaction.output_dir;
+        Self::cleanup_staging_dir(&config.compaction.output_dir, |dir| {
+            std::fs::remove_dir_all(dir)
+        })
+    }
+
+    /// [`Self::cleanup_stale_compaction_staging`] with the removal injectable,
+    /// so a test can make the directory vanish between the scan and the
+    /// removal.
+    fn cleanup_staging_dir(
+        output_dir: &Path,
+        remove_dir_all: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> ferrosa_common::Result<()> {
         if !output_dir.exists() {
             std::fs::create_dir_all(output_dir).map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
@@ -3147,12 +3182,23 @@ impl StorageEngine {
         }
 
         let removed_files = Self::count_regular_files(output_dir)?;
-        std::fs::remove_dir_all(output_dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to remove stale compaction staging dir {}: {e}",
-                output_dir.display()
-            ))
-        })?;
+        match remove_dir_all(output_dir) {
+            Ok(()) => {}
+            // Already gone (t_a3395843): nothing to clean is not a failure.
+            // Exiting here killed a node at boot on 2026-10-25.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::info!(
+                    path = %output_dir.display(),
+                    "storage startup: compaction staging dir was already gone; nothing to clean"
+                );
+            }
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to remove stale compaction staging dir {}: {e}",
+                    output_dir.display()
+                )))
+            }
+        }
         std::fs::create_dir_all(output_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!(
                 "failed to recreate compaction staging dir {}: {e}",
@@ -3171,14 +3217,21 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Regular files under `dir`, for the cleanup log line. A directory that is
+    /// gone holds none (t_a3395843); every other error names the path.
     fn count_regular_files(dir: &Path) -> ferrosa_common::Result<usize> {
         let mut count = 0usize;
-        for entry in std::fs::read_dir(dir).map_err(|e| {
-            ferrosa_common::Error::InvalidFormat(format!(
-                "failed to read compaction staging dir {}: {e}",
-                dir.display()
-            ))
-        })? {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to read compaction staging dir {}: {e}",
+                    dir.display()
+                )))
+            }
+        };
+        for entry in entries {
             let entry = entry.map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
                     "failed to read compaction staging entry in {}: {e}",
@@ -3586,7 +3639,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -3848,7 +3901,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -4141,7 +4194,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -8536,7 +8589,7 @@ impl StorageEngine {
                 let state = AsyncObserverState {
                     observer,
                     sender: tx,
-                    drop_count: Arc::new(AtomicU64::new(0)),
+                    backpressure_count: Arc::new(AtomicU64::new(0)),
                 };
                 self.async_observers.write().push(state);
             }
@@ -8544,17 +8597,19 @@ impl StorageEngine {
     }
 
     /// Registers an async observer and returns the receiver end of the bounded
-    /// channel. The caller is responsible for draining the receiver.
+    /// channel. The caller is responsible for draining the receiver. All async
+    /// observers of one write share its immutable mutation payload; the queue
+    /// carries an `Arc` handle rather than a deep copy of the rows and cells.
     pub fn register_async_observer(
         &self,
         observer: Arc<dyn crate::observer::WriteObserver>,
         capacity: usize,
-    ) -> tokio::sync::mpsc::Receiver<(TableId, Mutation)> {
+    ) -> tokio::sync::mpsc::Receiver<(TableId, Arc<Mutation>)> {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         let state = AsyncObserverState {
             observer,
             sender: tx,
-            drop_count: Arc::new(AtomicU64::new(0)),
+            backpressure_count: Arc::new(AtomicU64::new(0)),
         };
         self.async_observers.write().push(state);
         rx
@@ -8890,7 +8945,7 @@ impl StorageEngine {
         let target_table_id = TableId::new(&mutation.keyspace, &mutation.table);
         self.apply_derived_mutation(&mutation);
         self.dispatch_sync_observers(&target_table_id, &mutation);
-        self.dispatch_async_observers(&target_table_id, &mutation);
+        self.dispatch_async_observers(&target_table_id, || mutation);
         Ok(true)
     }
 
@@ -9190,15 +9245,22 @@ impl StorageEngine {
         let mut rx = self.register_async_observer(observer.clone(), capacity);
 
         TaskPool::current("storage-observer-drain").spawn(async move {
+            // One buffer for the drain's whole lifetime, cleared per message.
+            // `derive_into` fills it in place, so observing a write adds no
+            // per-write allocation; observers that only implement `on_write`
+            // still work through the trait's default.
+            let mut derived: Vec<Mutation> = Vec::new();
             while let Some((table_id, mutation)) = rx.recv().await {
-                // observer.on_write is synchronous and non-blocking.
+                // observer.derive_into is synchronous and non-blocking.
                 // Wrap in catch_unwind so a panicking observer does not kill the drain loop.
+                derived.clear();
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    observer.on_write(&table_id, &mutation)
+                    observer.derive_into(&table_id, &mutation, &mut derived)
                 }));
                 match result {
-                    Ok(derived) => {
-                        for dm in derived {
+                    Ok(()) => {
+                        // Move each derived mutation out; the buffer keeps its capacity.
+                        for dm in derived.drain(..) {
                             engine.apply_derived_mutation(&dm);
                         }
                     }
@@ -9218,6 +9280,9 @@ impl StorageEngine {
                         );
                     }
                 }
+                // The queue just lost a message: refresh the depth gauge so an
+                // operator sees the observer keeping up (and a stalled one not).
+                engine.publish_observer_queue_gauges();
             }
         });
     }
@@ -9320,29 +9385,120 @@ impl StorageEngine {
 
     /// Dispatches a mutation to all async observers watching the given table.
     ///
-    /// Uses `try_send` — never blocks the write path. If the channel is full,
-    /// the mutation is dropped and the drop counter is incremented.
-    fn dispatch_async_observers(&self, table_id: &TableId, mutation: &Mutation) {
+    /// The hand-off is `try_send`: never blocks, never awaits. That is required,
+    /// not incidental — this runs on the synchronous write path, and every
+    /// caller of it (`write`, `write_batch`, `write_mixed_batch`, the
+    /// timeseries materializer) may be executing on a tokio worker thread, where
+    /// `blocking_send` panics. An unbounded channel is equally unacceptable: a
+    /// stalled observer would grow the queue until the node OOMs.
+    ///
+    /// So when the queue is full (`TrySendError::Full`), or its drain task is
+    /// gone (`TrySendError::Closed`, e.g. an `Async` observer registered through
+    /// `register_observer`, which drops the receiver), the write path takes the
+    /// observer's work inline: `derive_into` + `apply_derived_mutation` — the
+    /// exact pair the drain task runs. No derived entry is ever discarded; the
+    /// writer pays the derivation instead, which is what backpressure means for
+    /// a synchronous producer. The cost per write stays bounded by one
+    /// derivation (it never waits for the consumer), and memory stays bounded by
+    /// the channel capacity.
+    ///
+    /// Each inline fallback is counted as a backpressure event
+    /// ([`StorageEngine::observer_backpressure_count`]): a rising count means the
+    /// queue is undersized for the write rate, and the write path is absorbing
+    /// index maintenance it was meant to keep off the durability path.
+    ///
+    /// Observers must therefore tolerate `derive_into` running on a writer
+    /// thread concurrently with the drain task. They are already `Send + Sync`;
+    /// they must not assume single-threaded or ordered derivation.
+    fn dispatch_async_observers(
+        &self,
+        table_id: &TableId,
+        make_mutation: impl FnOnce() -> Mutation,
+    ) {
         let async_obs = self.async_observers.read();
-        for state in async_obs.iter() {
-            if state.observer.watches_table(table_id)
-                && state
+        let mut interested = async_obs
+            .iter()
+            .filter(|state| state.observer.watches_table(table_id));
+        if let Some(first) = interested.next() {
+            // Move an owned payload; a borrowed batch materializes once, not
+            // once per observer. With no watcher, do neither. Every queue then
+            // shares the same rows, cells, key and replay identity.
+            let mutation = Arc::new(make_mutation());
+            for state in std::iter::once(first).chain(interested) {
+                let Err(unsent) = state
                     .sender
-                    .try_send((table_id.clone(), mutation.clone()))
-                    .is_err()
-            {
-                state.drop_count.fetch_add(1, Ordering::Relaxed);
+                    .try_send((table_id.clone(), Arc::clone(&mutation)))
+                else {
+                    continue;
+                };
+                crate::metrics::inc_observer_backpressure();
+                if state.backpressure_count.fetch_add(1, Ordering::Relaxed) == 0 {
+                    match &unsent {
+                        tokio::sync::mpsc::error::TrySendError::Full(_) => tracing::warn!(
+                            table = %table_id,
+                            capacity = state.sender.max_capacity(),
+                            "observer: async observer queue is full; deriving this write's entries \
+                             inline on the write path until the observer catches up"
+                        ),
+                        tokio::sync::mpsc::error::TrySendError::Closed(_) => tracing::warn!(
+                            table = %table_id,
+                            "observer: async observer has no drain task (receiver dropped); \
+                             deriving its entries inline on the write path"
+                        ),
+                    }
+                }
+                self.derive_inline_on_write_path(state.observer.as_ref(), table_id, &mutation);
             }
+        }
+        let (depth, capacity) = observer_queue_gauges(&async_obs, self.async_observer_capacity);
+        crate::metrics::set_observer_queue(depth, capacity);
+    }
+
+    /// Publish the async-observer queue gauges from a caller that does NOT
+    /// already hold the observer lock (the drain loop, after applying a batch).
+    fn publish_observer_queue_gauges(&self) {
+        let async_obs = self.async_observers.read();
+        let (depth, capacity) = observer_queue_gauges(&async_obs, self.async_observer_capacity);
+        crate::metrics::set_observer_queue(depth, capacity);
+    }
+
+    /// The drain task's work, run on the calling thread: derive this write's
+    /// entries and apply them through the same durable path the drain task uses
+    /// (`apply_derived_mutation`), so a full queue costs latency instead of an
+    /// entry.
+    ///
+    /// `apply_derived_mutation` writes straight to the commit log and the target
+    /// memtable rather than calling `write`, so this cannot re-enter observer
+    /// dispatch. The caller holds `async_observers` read-locked across it, so an
+    /// observer that registers another observer from `derive_into` would
+    /// self-deadlock (the sync path has the same rule over `observers`).
+    fn derive_inline_on_write_path(
+        &self,
+        observer: &dyn crate::observer::WriteObserver,
+        table_id: &TableId,
+        mutation: &Mutation,
+    ) {
+        let mut derived: Vec<Mutation> = Vec::new();
+        observer.derive_into(table_id, mutation, &mut derived);
+        for dm in &derived {
+            self.apply_derived_mutation(dm);
         }
     }
 
-    /// Returns the total number of mutations dropped by async observers due to
-    /// backpressure (channel full).
-    pub fn observer_drop_count(&self) -> u64 {
+    /// Total number of times the write path derived an async observer's entries
+    /// inline because that observer's queue was full (or had no drain task),
+    /// across all observers.
+    ///
+    /// Not an error counter and not a data-loss counter: no entry was lost. It
+    /// is the signal that the queue capacity is undersized for the write rate
+    /// (see `ObserverConfig::queue_capacity` and
+    /// `FERROSA_ASYNC_OBSERVER_QUEUE_CAPACITY`), so index maintenance is landing
+    /// on the write path.
+    pub fn observer_backpressure_count(&self) -> u64 {
         let async_obs = self.async_observers.read();
         async_obs
             .iter()
-            .map(|s| s.drop_count.load(Ordering::Relaxed))
+            .map(|s| s.backpressure_count.load(Ordering::Relaxed))
             .sum()
     }
 
@@ -9706,6 +9862,8 @@ impl StorageEngine {
             phase_start.elapsed(),
         );
         let observer_mutation = if self.has_observers_for_table(table_id) {
+            // Clone row metadata for the observer lifetime. CellBytes shares
+            // immutable payloads with the row moved into the memtable.
             Some(Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
@@ -9779,9 +9937,9 @@ impl StorageEngine {
 
         // 3. Notify observers after successful commit log + memtable write.
         let phase_start = Instant::now();
-        if let Some(mutation) = observer_mutation.as_ref() {
-            self.dispatch_sync_observers(table_id, mutation);
-            self.dispatch_async_observers(table_id, mutation);
+        if let Some(mutation) = observer_mutation {
+            self.dispatch_sync_observers(table_id, &mutation);
+            self.dispatch_async_observers(table_id, || mutation);
         }
         crate::metrics::observe_write_phase(
             crate::metrics::WritePhase::Observers,
@@ -9823,10 +9981,15 @@ impl StorageEngine {
                 self.check_memtable_write_admission(table_id, state)?;
             }
 
+            // The key is moved in: the memtable write below borrows `mutation.key`,
+            // so nothing needs the local `key` afterwards. The row cannot be moved
+            // the same way — the memtable takes ownership of it below and the
+            // observers still need it after that, so the two owners are concurrent.
+            // CellBytes shares the immutable bytes across these row metadata copies.
             let mutation = Mutation::new(
                 table_id.keyspace.clone(),
                 table_id.table.clone(),
-                key.clone(),
+                key,
                 vec![row.clone()],
                 timestamp,
             );
@@ -9842,7 +10005,7 @@ impl StorageEngine {
                         "table not registered: {table_id}"
                     ))
                 })?;
-                state.store.write(&key, row)?;
+                state.store.write(&mutation.key, row)?;
                 state.last_commit_log_position.store(Arc::new(Some(cl_pos)));
                 if state
                     .first_unflushed_write_at_nanos
@@ -9862,7 +10025,7 @@ impl StorageEngine {
 
             // Notify observers after successful commit log + memtable write.
             self.dispatch_sync_observers(table_id, &mutation);
-            self.dispatch_async_observers(table_id, &mutation);
+            self.dispatch_async_observers(table_id, || mutation);
         }
 
         Ok(())
@@ -9998,7 +10161,7 @@ impl StorageEngine {
         source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
             self.dispatch_sync_observers(&table_id, m);
-            self.dispatch_async_observers(&table_id, m);
+            self.dispatch_async_observers(&table_id, || m.clone());
             Ok(())
         })?;
 
@@ -16622,7 +16785,7 @@ impl StorageEngine {
                 &ConsolidationConfig::default(),
             )),
             time_series_wasm_aggregates: RwLock::new(None),
-            async_observer_capacity: crate::observer::ObserverConfig::default().queue_capacity,
+            async_observer_capacity: crate::observer::ObserverConfig::from_env().queue_capacity,
             index_scheduler,
             index_tracker,
             batchlog: Some(crate::batchlog::BatchlogManager::new(
@@ -18477,6 +18640,60 @@ mod tests {
         assert!(
             live_data.exists(),
             "startup cleanup must not remove normal SSTable files"
+        );
+    }
+
+    /// t_a3395843: on 2026-10-25 a node died at boot with "failed to remove
+    /// stale compaction staging dir ...: No such file or directory". The dir
+    /// was gone by the time it was removed. Nothing left to clean is not a
+    /// failure: startup goes on and leaves an empty staging dir.
+    #[test]
+    fn staging_dir_that_vanishes_before_removal_is_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("compaction");
+        std::fs::create_dir_all(staging.join("ks.t")).unwrap();
+        std::fs::write(staging.join("ks.t").join("7-Data.db"), b"debris").unwrap();
+
+        StorageEngine::cleanup_staging_dir(&staging, |path| {
+            // Someone else (crash residue being cleaned, an operator) removes
+            // it first; the real removal then sees ENOENT.
+            std::fs::remove_dir_all(path).unwrap();
+            std::fs::remove_dir_all(path)
+        })
+        .expect("a staging dir that is already gone has nothing to clean");
+
+        assert!(staging.is_dir(), "the staging dir is recreated");
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+    }
+
+    /// The count that precedes the removal has the same race: a dir gone
+    /// between the existence check and the scan holds no files.
+    #[test]
+    fn counting_a_staging_dir_that_is_gone_finds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("compaction");
+        assert_eq!(StorageEngine::count_regular_files(&gone).unwrap(), 0);
+    }
+
+    /// Every error other than NotFound stays fatal and names the path.
+    #[test]
+    fn staging_dir_removal_failure_other_than_not_found_is_fatal_and_names_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("compaction");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let err = StorageEngine::cleanup_staging_dir(&staging, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .expect_err("a permission error must stop startup");
+        let message = err.to_string();
+        assert!(
+            message.contains(&staging.display().to_string()),
+            "the error names the staging dir: {message}"
+        );
+        assert!(
+            message.contains("failed to remove stale compaction staging dir"),
+            "{message}"
         );
     }
 
@@ -21113,6 +21330,138 @@ mod tests {
         engine.batch_write(&table_id(), mutations).unwrap();
     }
 
+    /// I3: the bytes read back are the bytes written, at 1 / 100 / 10 000 rows.
+    ///
+    /// `batch_write` takes `Vec<(DecoratedKey, Row, i64)>` by value, so the
+    /// caller's rows are consumed by the call itself; the write path is handed
+    /// the rows, not a copy it could outlive.
+    #[test]
+    fn batch_write_round_trips_row_bytes_at_1_100_and_10000_rows() {
+        for count in [1usize, 100, 10_000] {
+            let dir = tempfile::tempdir().unwrap();
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(test_schema()).unwrap();
+            let tid = table_id();
+
+            let payloads: Vec<Vec<u8>> = (0..count)
+                .map(|i| format!("value-{i:06}-padding-to-make-the-cell-non-trivial").into_bytes())
+                .collect();
+            let mutations: Vec<(DecoratedKey, Row, i64)> = payloads
+                .iter()
+                .enumerate()
+                .map(|(i, payload)| {
+                    let ts = 1_000 + i as i64;
+                    (make_key(&partition_key(i)), make_row(payload, ts), ts)
+                })
+                .collect();
+
+            engine.batch_write(&tid, mutations).unwrap();
+
+            for (i, payload) in payloads.iter().enumerate() {
+                let partition = engine
+                    .read(&tid, &make_key(&partition_key(i)))
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("row {i} of {count} missing after batch_write"));
+                let cell = partition
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter())
+                    .find(|(index, _)| *index == 0)
+                    .map(|(_, cell)| cell)
+                    .unwrap_or_else(|| panic!("row {i} of {count} lost its value cell"));
+                assert_eq!(
+                    cell.value.as_deref(),
+                    Some(payload.as_slice()),
+                    "row {i} of {count}: bytes read back differ from bytes written"
+                );
+            }
+        }
+    }
+
+    /// The `DecoratedKey` the observers see is the caller's key: its cached
+    /// token is carried through the write path, never recomputed.
+    ///
+    /// The sentinel token is deliberately *not* the Murmur3 token of the key
+    /// bytes, so any recompute on the path shows up as a mismatch.
+    #[test]
+    fn batch_write_carries_the_cached_token_into_the_mutation() {
+        use crate::observer::{ObserverMode, WriteObserver};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct TokenSpy {
+            seen: Mutex<Vec<(i64, Option<Vec<u8>>)>>,
+        }
+        impl WriteObserver for TokenSpy {
+            fn mode(&self) -> ObserverMode {
+                ObserverMode::Sync
+            }
+            fn tables(&self) -> Vec<TableId> {
+                vec![table_id()]
+            }
+            fn on_write(&self, _: &TableId, mutation: &Mutation) -> Vec<Mutation> {
+                let value = mutation
+                    .rows
+                    .first()
+                    .and_then(|row| row.cells.iter().find(|(index, _)| *index == 0))
+                    .and_then(|(_, cell)| cell.value.as_ref().map(|value| value.to_vec()));
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((mutation.key.token.0, value));
+                Vec::new()
+            }
+        }
+
+        fn sentinel_key() -> DecoratedKey {
+            let mut key = make_key("sentinel");
+            key.token = ferrosa_common::Token(-424_242);
+            key
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        let tid = table_id();
+
+        let spy = Arc::new(TokenSpy::default());
+        engine.register_observer(spy.clone());
+
+        let sentinel = sentinel_key();
+        assert_ne!(
+            sentinel.token,
+            ferrosa_common::Token::from_key(sentinel.key.as_bytes()),
+            "the sentinel token must differ from the computed one for this test to prove anything"
+        );
+
+        let payload = b"token-preserved".to_vec();
+        engine
+            .batch_write(&tid, vec![(sentinel_key(), make_row(&payload, 7000), 7000)])
+            .unwrap();
+
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            1,
+            "one write must produce one observed mutation"
+        );
+        assert_eq!(
+            seen[0].0, -424_242,
+            "the cached token was recomputed instead of carried through the write path"
+        );
+        assert_eq!(
+            seen[0].1.as_deref(),
+            Some(payload.as_slice()),
+            "the row bytes reaching the observer differ from the bytes written"
+        );
+    }
+
+    fn partition_key(i: usize) -> String {
+        format!("k{i:06}")
+    }
+
     #[test]
     fn engine_read_range() {
         let dir = tempfile::tempdir().unwrap();
@@ -22333,33 +22682,268 @@ mod tests {
         assert_eq!(recv_mutation.keyspace, "test_ks");
     }
 
+    /// The smallest capacity `tokio::sync::mpsc::channel` accepts. ONE slot
+    /// guarantees the second write of a burst meets a FULL queue (the first is
+    /// still queued, nothing consumes it), so the inline backpressure path runs
+    /// after exactly one queued mutation — the minimum setup that exercises it
+    /// without depending on scheduling.
+    const STALLED_QUEUE_CAPACITY: usize = 1;
+
+    /// Three writes that each derive one row inline cost microseconds. Five
+    /// seconds is orders of magnitude above any legitimate inline derivation and
+    /// far below "waiting for a stalled consumer", so this bound fails on a
+    /// blocking regression rather than on a slow machine.
+    const STALLED_QUEUE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// An async observer over `test_ks.test_table` that derives one entry per
+    /// write into `test_ks.derived_table`, keyed by the source key — the shape of
+    /// the adjacency index, whose entries the old drop path discarded.
+    struct DerivingAsyncObserver {
+        watched: TableId,
+        derived_table: TableId,
+    }
+
+    impl DerivingAsyncObserver {
+        fn new(watched: TableId, derived_table: TableId) -> Self {
+            Self {
+                watched,
+                derived_table,
+            }
+        }
+    }
+
+    impl crate::observer::WriteObserver for DerivingAsyncObserver {
+        fn mode(&self) -> crate::observer::ObserverMode {
+            crate::observer::ObserverMode::Async
+        }
+
+        fn tables(&self) -> Vec<TableId> {
+            vec![self.watched.clone()]
+        }
+
+        fn on_write(&self, table: &TableId, mutation: &Mutation) -> Vec<Mutation> {
+            let mut out = Vec::new();
+            self.derive_into(table, mutation, &mut out);
+            out
+        }
+
+        fn derive_into(&self, table: &TableId, mutation: &Mutation, out: &mut Vec<Mutation>) {
+            if table != &self.watched {
+                return;
+            }
+            out.push(Mutation {
+                mutation_id: [0x5a; 16],
+                keyspace: self.derived_table.keyspace.clone(),
+                table: self.derived_table.table.clone(),
+                key: mutation.key.clone(),
+                rows: mutation.rows.clone(),
+                timestamp: mutation.timestamp,
+            });
+        }
+    }
+
+    /// `test_schema` under another table name, for the derived entries to land in.
+    fn derived_schema() -> TableSchema {
+        TableSchema {
+            table: "derived_table".to_string(),
+            ..test_schema()
+        }
+    }
+
+    fn derived_table_id() -> TableId {
+        TableId::new("test_ks", "derived_table")
+    }
+
+    /// I1 — a committed write's derived entry is never lost. With a full queue
+    /// and a stalled drain, the write path derives inline, so every write of the
+    /// burst is accounted for: N-1 entries are already durable and the Nth is
+    /// pending in the queue, exactly as an unfull queue would leave it.
+    ///
+    /// Red on the base: the queue held one mutation, the other N-1 were
+    /// discarded, and reading the derived table found only the queued one, at
+    /// best (the drain never ran, so nothing at all).
     #[test]
-    fn async_observer_backpressure_drops() {
+    fn full_queue_never_loses_a_derived_entry() {
+        const BURST: usize = 3;
         let dir = tempfile::tempdir().unwrap();
         let config = StorageEngineConfig::test_config(dir.path());
         let engine = StorageEngine::new(config, None).unwrap();
         engine.register_table(test_schema()).unwrap();
+        engine.register_table(derived_schema()).unwrap();
 
         let tid = table_id();
-        let observer = Arc::new(AsyncCountingObserver::new(vec![tid.clone()]));
-        // Tiny channel capacity of 2 to test backpressure.
-        let _rx = engine.register_async_observer(observer, 2);
+        let derived_tid = derived_table_id();
+        let observer = Arc::new(DerivingAsyncObserver::new(tid.clone(), derived_tid.clone()));
+        let mut rx = engine.register_async_observer(observer, STALLED_QUEUE_CAPACITY);
 
-        assert_eq!(engine.observer_drop_count(), 0);
-
-        // Write 5 mutations — channel holds 2, so at least 3 should be dropped.
-        for i in 0..5 {
+        for i in 0..BURST {
             let key = make_key(&format!("k{i}"));
-            engine
-                .write(&tid, &key, make_row(b"val", 1000 + i), 1000 + i)
-                .unwrap();
+            let ts = 1000 + i as i64;
+            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
         }
 
-        // Drop count should be >= 3 (channel capacity 2, 5 writes).
+        // Nothing drained the queue: k0 is still in it, and that is the only
+        // write whose entry may legitimately be outstanding.
+        let queued = rx.try_recv().expect("the first write must be queued");
+        assert!(rx.try_recv().is_err(), "capacity is one slot");
+        let queued_entry_derived = engine.read(&derived_tid, &queued.1.key).unwrap().is_none();
+
+        let mut derived_inline = 0;
+        for i in 0..BURST {
+            let key = make_key(&format!("k{i}"));
+            if engine.read(&derived_tid, &key).unwrap().is_some() {
+                derived_inline += 1;
+            }
+        }
+
         assert!(
-            engine.observer_drop_count() >= 3,
-            "expected >= 3 drops, got {}",
-            engine.observer_drop_count()
+            queued_entry_derived,
+            "the queued write must not also have been derived inline (that would double-apply)"
+        );
+        assert_eq!(
+            derived_inline,
+            BURST - 1,
+            "{} of {BURST} committed writes left NO derived entry behind while the drain was \
+             stalled; a committed write whose entry is missing is data the index cannot reach",
+            BURST - derived_inline - 1
+        );
+    }
+
+    /// I2 + I4 — durability and progress are unchanged: writes return while the
+    /// observer is stalled, and the inline fallback never waits for it, so a full
+    /// queue cannot hang the writer.
+    #[test]
+    fn full_queue_does_not_block_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(derived_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(DerivingAsyncObserver::new(tid.clone(), derived_table_id()));
+        // Held, never polled: the observer is stalled for the whole test.
+        let _rx = engine.register_async_observer(observer, STALLED_QUEUE_CAPACITY);
+
+        let started = std::time::Instant::now();
+        for i in 0..3 {
+            let key = make_key(&format!("k{i}"));
+            let ts = 1000 + i as i64;
+            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+        }
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < STALLED_QUEUE_WRITE_BOUND,
+            "three writes against a stalled observer took {elapsed:?}; the write path must \
+             never wait for the consumer"
+        );
+    }
+
+    /// Metrics are process-wide. Other engine tests legitimately publish their
+    /// own queue state, so an exact scrape must run alone in a child process.
+    /// Keep the real renderer and every value assertion; serialize the fixture,
+    /// not the production code or the entire storage suite.
+    fn isolated_observer_metrics_test(name: &str, test: impl FnOnce()) {
+        const CHILD_ENV: &str = "FERROSA_OBSERVER_METRICS_TEST_CHILD";
+        if std::env::var(CHILD_ENV).as_deref() == Ok(name) {
+            test();
+        } else {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(CHILD_ENV, name)
+                .output()
+                .expect("run isolated observer metrics test");
+            assert!(
+                output.status.success(),
+                "isolated {name} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    /// I3 — the event is observable in production: the inline fallback increments
+    /// a counter published on the Prometheus surface, so an undersized queue is
+    /// visible instead of being inferred from index entries that do not exist.
+    #[test]
+    fn queue_full_is_observable_backpressure_not_loss() {
+        isolated_observer_metrics_test(
+            "engine::tests::queue_full_is_observable_backpressure_not_loss",
+            queue_full_metrics_case,
+        );
+    }
+
+    fn queue_full_metrics_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let engine = StorageEngine::new(config, None).unwrap();
+        engine.register_table(test_schema()).unwrap();
+        engine.register_table(derived_schema()).unwrap();
+
+        let tid = table_id();
+        let observer = Arc::new(DerivingAsyncObserver::new(tid.clone(), derived_table_id()));
+        let _rx = engine.register_async_observer(observer, STALLED_QUEUE_CAPACITY);
+
+        let before = engine.observer_backpressure_count();
+        for i in 0..3 {
+            let key = make_key(&format!("k{i}"));
+            let ts = 1000 + i as i64;
+            engine.write(&tid, &key, make_row(b"val", ts), ts).unwrap();
+        }
+        let events = engine.observer_backpressure_count() - before;
+
+        assert_eq!(
+            events, 2,
+            "expected 2 of 3 writes to fall back inline (one fits in the queue), got {events}"
+        );
+        let rendered = crate::metrics::render_prometheus();
+        assert!(
+            rendered.contains("ferrosa_storage_observer_backpressure_total"),
+            "the backpressure counter must be scrapeable in production, not test-only"
+        );
+        // Usage and limit, so `depth / capacity` is derivable by an operator:
+        // one observer, one slot, one message parked in it (nothing drains).
+        assert!(
+            rendered.contains("ferrosa_storage_observer_queue_depth 1\n"),
+            "the queue depth gauge must report the one staged mutation; got:\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!(
+                "ferrosa_storage_observer_queue_capacity {STALLED_QUEUE_CAPACITY}\n"
+            )),
+            "the configured capacity must be on the same surface as the depth"
+        );
+    }
+
+    /// The capacity gauge reports the CONFIGURED bound even before any observer
+    /// registers, so an operator can see the tunable that decides when the write
+    /// path starts absorbing index maintenance.
+    #[test]
+    fn queue_capacity_gauge_is_visible_with_no_observer() {
+        isolated_observer_metrics_test(
+            "engine::tests::queue_capacity_gauge_is_visible_with_no_observer",
+            queue_capacity_metrics_case,
+        );
+    }
+
+    fn queue_capacity_metrics_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.publish_observer_queue_gauges();
+        let expected = format!(
+            "ferrosa_storage_observer_queue_capacity {}\n",
+            crate::observer::DEFAULT_OBSERVER_QUEUE_CAPACITY
+        );
+        let rendered = crate::metrics::render_prometheus();
+        assert!(
+            rendered.contains(&expected),
+            "expected {expected:?} in:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("ferrosa_storage_observer_queue_depth 0\n"),
+            "no observer means nothing staged"
         );
     }
 
