@@ -1,10 +1,12 @@
-# PR #613: measurement status
+# PR #625: measurement status
 
-The local candidate adds graph secondary-index routing, metadata-only vertex
-counts and exact integer comparisons. **Fresh comparison timings are pending.**
-The tables below are the last validated **baseline**, measured on 2026-10-26
-using engine `a948ed1df48fd955bc144956b3d50546512665e2`; they do not measure
-the new graph code. Cassandra and SPARQL have no accepted current-code comparison
+PR #625 combines PostgreSQL/Bolt/SPARQL correctness fixes, automatic scalar
+columns and indexes for Bolt, and CQL scan pagination that preserves the total
+LIMIT. **Fresh performance comparisons on the combined code are pending.**
+
+The tables below are historical baselines measured on 2026-10-26 using engine
+`a948ed1df48fd955bc144956b3d50546512665e2`. They do not measure the combined
+implementation. Cassandra and SPARQL have no accepted current-code comparison
 in this record yet.
 
 ## Compared with PostgreSQL
@@ -45,7 +47,8 @@ graph parity.
 
 ## Remaining work
 
-The new indexed-reader/count candidate still needs matched-placement timing and profiles.
+The combined candidate still needs matched-placement timing and profiles, with
+independent writable fixtures for each binary because WAL/RDF formats differ.
 A separate PostgreSQL loopback probe also retains a local lookup gap: 273 versus
 117 microseconds p50. Neither CPU samples nor RSS establish exact allocation
 volume or individual mutex wait time.

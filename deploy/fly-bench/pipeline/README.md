@@ -1,10 +1,13 @@
 # Pipeline performance experiments
 
-[Measurement status](RESULTS.md): PR #613 is merged; the Bolt follow-up makes
-scalar-index setup automatic on first access and memoized across connections.
-Fresh final-code timings are pending. Historical tables retain their exact
-runtime identity and are not measurements of this follow-up. Explicit Cypher
-index DDL remains unsupported.
+[Measurement status](RESULTS.md): PR #625 combines automatic Bolt scalar schema
+and index setup, streaming CQL LIMIT pages, and protocol transaction/RDF fixes.
+Fresh combined-code timings are pending; historical tables retain their measured
+runtime identity. Explicit Cypher index DDL remains unsupported.
+
+Old and new binaries must use independent writable data and object-store
+fixtures. The new transaction WAL envelope and RDF v2 cutover are not safe
+cross-version fixture interchange formats.
 
 The current-results page contains comparator tables, the exact engine revision
 and workload limits. [Experiment details and earlier checkpoints](HISTORY.md)

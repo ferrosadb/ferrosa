@@ -1,8 +1,31 @@
 # Experiment record and performance history
 
 Detailed measurements, placement controls and earlier checkpoints.
-Use [current PR #613 results](RESULTS.md) for the final engine comparison.
+Use [current measurement status](RESULTS.md) for the final engine comparison.
 Each experiment below retains its recorded revision and workload.
+
+## Combined protocol and default-write work — PR #625
+
+The follow-up combines automatic scalar-column/index preparation for ordinary
+Bolt writes with the protocol foundation in #625. Explicit transactions retain
+staged read-your-writes, durable commit and rollback; structural label/column
+creation is rejected before metadata can escape the row transaction. A merge
+regression caught a new-column SET succeeding inside BEGIN; the guard now
+rejects it and preserves RESET, rollback and writer release.
+
+A separate live CQL census inserted and counted 20,000 rows but returned only
+5,000 through the driver's normal iteration. The limited scan capped its input
+at the fetch size, then omitted continuation. Scan-order paging now retains raw
+key position plus cumulative LIMIT progress. Fourteen local pagination guards
+cover page boundaries, wide partitions, v4 wire parameters, filtering, changing
+fetch size and authenticated token validation. A signed outer format makes older
+coordinators reject the token instead of treating its key as an offset.
+
+The combined source passes 33 focused Bolt server tests and those 14 pagination
+guards. These are correctness results, not new performance measurements. The
+matched rerun must use independently seeded writable fixtures: #625 adds a
+transaction WAL envelope and RDF v2 identity format that older binaries cannot
+be assumed to replay. Earlier timing tables below remain historical.
 
 ## PostgreSQL findings at the recorded runtime
 
