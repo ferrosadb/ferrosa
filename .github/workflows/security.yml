@@ -55,48 +55,15 @@ jobs:
             sh.rustup.rs:443
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-04-25
+      - name: Read cargo-deny version
+        id: deny-version
+        run: echo "version=$(python3 scripts/check-dependencies.py --tool-version)" >> "$GITHUB_OUTPUT"
       - name: Install cargo-deny
         uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.62.35
         with:
-          tool: cargo-deny@0.20.2
-      # advisories: known CVEs. bans: duplicate/banned crates.
-      # licenses: nothing copyleft sneaking into a shipped binary.
-      # sources: crates only from registries we name.
-      - name: Root workspace
-        run: cargo deny --all-features check advisories bans licenses sources
-      # Workspaces with their own Cargo.lock are separate dependency graphs; a
-      # vulnerable crate in one of them is invisible to the root check. Each
-      # is checked against the same root deny.toml (cargo-deny reads
-      # <cwd>/deny.toml). A new nested Cargo.lock must be added here.
-      - name: Separately locked workspaces
-        run: |
-          set -euo pipefail
-          for manifest in \
-            ferrosa-jsonb-conformance/Cargo.toml \
-            ferrosa-sstable/fuzz/Cargo.toml \
-            examples/timeseries-rrd/wasm-rust/rms/Cargo.toml \
-            examples/timeseries-rrd/wasm-rust/stddev/Cargo.toml
-          do
-            echo "::group::$manifest"
-            cargo deny --manifest-path "$manifest" --all-features check advisories bans licenses sources
-            echo "::endgroup::"
-          done
-      - name: Every Cargo.lock is covered
-        # Fails when a Cargo.lock exists that neither step above checks, so a
-        # new nested workspace cannot go unaudited.
-        run: |
-          set -euo pipefail
-          expected="Cargo.lock
-          examples/timeseries-rrd/wasm-rust/rms/Cargo.lock
-          examples/timeseries-rrd/wasm-rust/stddev/Cargo.lock
-          ferrosa-jsonb-conformance/Cargo.lock
-          ferrosa-sstable/fuzz/Cargo.lock"
-          actual="$(git ls-files -- '*Cargo.lock' | sort)"
-          if [ "$actual" != "$(printf '%s\n' "$expected" | sed 's/^ *//' | sort)" ]; then
-            echo "::error::tracked Cargo.lock files differ from the list this job checks:"
-            printf '%s\n' "$actual"
-            exit 1
-          fi
+          tool: cargo-deny@${{ steps.deny-version.outputs.version }}
+      - name: Check every tracked Rust lockfile
+        run: python3 scripts/check-dependencies.py
 
   python-advisories:
     name: Python Advisories
