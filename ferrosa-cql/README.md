@@ -226,6 +226,14 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
   `mixed_wide_and_narrow_partitions_page_exactly`,
   `wide_partition_multi_text_clustering_pages_exactly_after_flush`,
   `many_small_partitions_pk_projection_pages_without_stalling`.
+  Scan-order full scans, including `ALLOW FILTERING`, carry the original `LIMIT`
+  and cumulative rows returned in a versioned scan cursor. Each page resumes at
+  the raw partition/clustering position and returns at most the smaller of the
+  client fetch size and remaining query limit. Reaching `LIMIT` completes the
+  result without an extra page; a fetch size of 5,000 never caps the whole query.
+  Regression coverage: `router::tests::limited_scan_paging` (narrow and wide
+  partitions, v4 wire continuation, exact boundaries, filtering, and bounded
+  upstream consumption).
   **Wire ingress (`connection.rs`, `decode_query_params`)** — the QUERY/EXECUTE
   `<query_parameters>` section (§4.1.4) is decoded IN ORDER — flags → values →
   `page_size` (flag 0x04) → `paging_state` (flag 0x08) — into `PagingParams`,

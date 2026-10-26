@@ -11,8 +11,8 @@
 //! Correctness: compound clustering restrictions validate declared key order,
 //! and bounded single-column clustering resumes stop before materializing a
 //! wide partition tail.
-//! Last revised: 2026-09-27
-//! Last changed: Coordinate table DDL with compaction cancellation and completion.
+//! Last revised: 2026-10-26
+//! Last changed: Preserve global LIMIT across native streaming scan pages.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1687,6 +1687,91 @@ impl StreamResumeCursor {
     }
 }
 
+/// Progress of a scan-order query across pages. The wire cursor carries raw
+/// storage position plus a cumulative row count, so LIMIT never resets per page.
+/// Plain scans need neither a result spool nor an offset-based prefix rescan.
+struct ScanPageProgress {
+    resume: Option<StreamResumeCursor>,
+    query_limit: Option<usize>,
+    returned: usize,
+}
+
+const LIMITED_SCAN_CURSOR_MAGIC: &[u8; 4] = b"LSC1";
+
+impl ScanPageProgress {
+    fn decode(bytes: Option<&[u8]>, query_limit: Option<usize>) -> Result<Self, CqlError> {
+        let Some(limit) = query_limit else {
+            return Ok(Self {
+                resume: StreamResumeCursor::from_paging_state(bytes)?,
+                query_limit,
+                returned: 0,
+            });
+        };
+        let Some(bytes) = bytes else {
+            return Ok(Self {
+                resume: None,
+                query_limit,
+                returned: 0,
+            });
+        };
+        // PagingState authenticates the payload before any position is trusted.
+        let state = crate::paging::PagingState::decode(bytes)?;
+        let payload = state.clustering_key;
+        if state.remaining_in_partition
+            || payload.len() < 20
+            || &payload[..4] != LIMITED_SCAN_CURSOR_MAGIC
+        {
+            return Err(CqlError::Protocol(
+                "paging_state is not a limited scan cursor".into(),
+            ));
+        }
+        let encoded_limit = u64::from_be_bytes(payload[4..12].try_into().unwrap());
+        let returned = usize::try_from(u64::from_be_bytes(payload[12..20].try_into().unwrap()))
+            .map_err(|_| CqlError::Protocol("paging_state row count is out of range".into()))?;
+        if encoded_limit != limit as u64 || returned == 0 || returned >= limit {
+            return Err(CqlError::Protocol(
+                "paging_state has an invalid scan LIMIT or row count".into(),
+            ));
+        }
+        Ok(Self {
+            resume: Some(StreamResumeCursor {
+                partition_key: state.partition_key,
+                // Narrow partitions legitimately have an empty clustering key.
+                clustering_key: payload[20..].to_vec(),
+            }),
+            query_limit,
+            returned,
+        })
+    }
+
+    fn remaining_limit(&self) -> Option<usize> {
+        self.query_limit.map(|limit| limit - self.returned)
+    }
+
+    fn finish(self, mut page: StreamedPage) -> Result<StreamedPage, CqlError> {
+        if let Some(limit) = self.query_limit {
+            let returned = self
+                .returned
+                .checked_add(page.rows.len())
+                .filter(|&returned| returned <= limit)
+                .ok_or_else(|| CqlError::ServerError("streamed scan exceeded its LIMIT".into()))?;
+            if returned == limit {
+                page.next_paging_state = None;
+            } else if let Some(bytes) = page.next_paging_state.take() {
+                let mut state = crate::paging::PagingState::decode(&bytes)?;
+                let mut payload = Vec::with_capacity(20 + state.clustering_key.len());
+                payload.extend_from_slice(LIMITED_SCAN_CURSOR_MAGIC);
+                payload.extend_from_slice(&(limit as u64).to_be_bytes());
+                payload.extend_from_slice(&(returned as u64).to_be_bytes());
+                payload.extend_from_slice(&state.clustering_key);
+                state.clustering_key = payload;
+                page.next_paging_state = Some(state.encode());
+            }
+        }
+        Ok(page)
+    }
+}
+
 /// An index read that cannot be served a page at a time.
 enum UnpagedIndexRead {
     /// A builtin aggregate, folded as rows streamed: the one result row.
@@ -2256,10 +2341,20 @@ async fn collect_page_from_partition_stream(
     bound: crate::paging::ScanBound,
     resume: Option<StreamResumeCursor>,
     row_context: PartitionRowContext<'_>,
+    remaining_limit: Option<usize>,
 ) -> Result<StreamedPage, CqlError> {
-    // `None` means read to the end: the client sent no page size, so it expects
-    // every row and the protocol forbids handing it a continuation.
-    let row_cap = bound.row_cap();
+    // A page bounds the response; LIMIT bounds the whole query. With neither,
+    // the client expects every row and may not receive a continuation.
+    let row_cap = match (bound.row_cap(), remaining_limit) {
+        (Some(page_size), Some(limit)) => Some(page_size.min(limit)),
+        (page_size, limit) => page_size.or(limit),
+    };
+    if remaining_limit == Some(0) {
+        return Ok(StreamedPage {
+            rows: Vec::new(),
+            next_paging_state: None,
+        });
+    }
     debug_assert!(
         row_cap != Some(0),
         "a zero row cap would answer a legitimate query with an empty result"
@@ -2298,14 +2393,18 @@ async fn collect_page_from_partition_stream(
                 if Some(rows.len()) == row_cap {
                     // We already have a full page and just found another row — a
                     // continuation is required. Stop without consuming further.
-                    // Unreachable when unpaged (`row_cap` is `None`), which is
-                    // how an unpaged scan reads to the end.
+                    // An unpaged LIMIT stops immediately when accepted below;
+                    // without either bound, this branch is unreachable.
                     more_rows_remain = true;
                     return ControlFlow::Break(());
                 }
 
                 rows.push(output_row);
                 last_ck = clustering;
+                // The global LIMIT completes the query, even if more rows exist.
+                if Some(rows.len()) == remaining_limit {
+                    return ControlFlow::Break(());
+                }
                 if Some(rows.len()) == row_cap {
                     cursor_from_current_partition = true;
                 }
@@ -2315,7 +2414,7 @@ async fn collect_page_from_partition_stream(
         if cursor_from_current_partition {
             last_pk = partition_key;
         }
-        if more_rows_remain {
+        if more_rows_remain || Some(rows.len()) == remaining_limit {
             break 'outer;
         }
 
@@ -7505,11 +7604,10 @@ async fn route_select_user_table_inner(
                         && s.limit.is_none()
                         && ctx.paging.page_size.is_some_and(|size| size > 0)
                         && distinct_full_partition_key_projection(s, table_meta);
-                    let unbounded_scan_shape = s.where_clauses.is_empty()
+                    let scan_order_page_shape = s.where_clauses.is_empty()
                         && s.order_by.is_empty()
                         && s.ann_of.is_none()
                         && !s.distinct
-                        && s.limit.is_none()
                         && !count_only_select
                         && !has_function_projection;
                     if distinct_partition_page_shape {
@@ -7556,12 +7654,19 @@ async fn route_select_user_table_inner(
                         .await?;
                         streamed_paging_state = Some(page.next_paging_state);
                         page.rows
-                    } else if unbounded_scan_shape {
+                    } else if scan_order_page_shape {
                         let request_bound = request_scan_bound(ctx);
 
-                        let resume = StreamResumeCursor::from_paging_state(
+                        let query_limit = s
+                            .limit
+                            .as_ref()
+                            .and_then(|l| l.as_literal())
+                            .map(|n| n.max(0) as usize);
+                        let mut progress = ScanPageProgress::decode(
                             ctx.paging.paging_state.as_deref(),
+                            query_limit,
                         )?;
+                        let resume = progress.resume.take();
                         // Resume the scan at the last partition key (inclusive) AND
                         // the last delivered clustering position within it, so every
                         // producer (local iterator and remote replicas) skips the
@@ -7622,8 +7727,10 @@ async fn route_select_user_table_inner(
                                 ck_indices: &ck_indices,
                                 storage_to_table: &storage_to_table,
                             },
+                            progress.remaining_limit(),
                         )
                         .await?;
+                        let page = progress.finish(page)?;
 
                         streamed_paging_state = Some(page.next_paging_state);
                         page.rows
@@ -7658,9 +7765,11 @@ async fn route_select_user_table_inner(
                                 .as_ref()
                                 .and_then(|l| l.as_literal())
                                 .map(|n| n.max(0) as usize);
-                            let resume = StreamResumeCursor::from_paging_state(
+                            let mut progress = ScanPageProgress::decode(
                                 ctx.paging.paging_state.as_deref(),
+                                limit_size,
                             )?;
+                            let resume = progress.resume.take();
                             let start_key = resume.as_ref().map(|cur| {
                                 ferrosa_cluster::write_path::ScanResume {
                                     key: ferrosa_common::key::DecoratedKey::new(
@@ -7698,9 +7807,10 @@ async fn route_select_user_table_inner(
                                     keyspace: ks,
                                     state,
                                 },
-                                limit_size,
+                                progress.remaining_limit(),
                             )
                             .await?;
+                            let page = progress.finish(page)?;
                             streamed_paging_state = Some(page.next_paging_state);
                             page.rows
                         } else if !count_only_select && builtin_scalar_aggregate_stream_shape(s) {
@@ -16913,6 +17023,9 @@ mod tests {
 
     /// Result cursors: ORDER BY / DISTINCT / function-projection paging.
     mod streaming_results;
+
+    /// Unordered LIMIT scans preserve continuation and the total query limit.
+    mod limited_scan_paging;
 
     /// Rows written with legacy nanosecond Accord stamps (t_cf637b6e).
     mod legacy_ns;

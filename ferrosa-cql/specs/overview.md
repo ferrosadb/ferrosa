@@ -105,6 +105,17 @@ decomposes partitions to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+Scan-order full scans use raw partition/clustering continuation, including when
+`LIMIT` or `ALLOW FILTERING` is present. The limited cursor records the original
+limit and cumulative returned rows; the collector receives only the remaining
+limit. A paged response retains one page and uses one-row lookahead only when
+more rows could be returned. Reaching the global limit needs no lookahead or cursor.
+This avoids both a fetch-size result cap and restarting the scan for each page.
+The configurable 5,000 default is an internal cursor/FTS batch size, not a total
+ordinary-scan limit. Unpaged queries return their complete requested result in
+one protocol response, so their output buffer scales with that result; they
+never advertise a paging state.
+
 Global scalar secondary-index plans use `WritePath::index_read_stream`.
 COUNT folds directly over the bounded-per-hop stream, and a plain `LIMIT` stops
 the consumer at the requested row count. Multi-index AND plans retain only
