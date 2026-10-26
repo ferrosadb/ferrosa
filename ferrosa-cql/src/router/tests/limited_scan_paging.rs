@@ -7,6 +7,88 @@
 use super::*;
 
 #[tokio::test]
+async fn limited_scan_cursor_cannot_be_misread_as_a_legacy_offset() {
+    let (state, _dir, auth, ks) = setup_wide_scan_table(31).await;
+    let query = "SELECT v, id FROM pageks.t LIMIT 20";
+    let Statement::Select(select) = crate::parser::parse(query).unwrap() else {
+        panic!("expected SELECT");
+    };
+    let (expected, _) = collect_all_pages(&state, &auth, &ks, query, None).await;
+    let ctx = paging_ctx(&auth, &ks, Some(7), None);
+    let first = route_select_raw(&state, &ctx, &select).await.unwrap();
+    let cursor = first.paging_state.expect("LIMIT 20 needs another page");
+
+    let legacy_pk_len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
+    assert!(
+        legacy_pk_len > cursor.len(),
+        "even an older decoder without new-token checks must reject the key length"
+    );
+    assert!(
+        crate::paging::PagingState::decode(&cursor).is_err(),
+        "a limited cursor must not decode as legacy pk/ck/offset state"
+    );
+    assert!(
+        crate::paging::apply_pagination(20, Some(7), Some(&cursor)).is_err(),
+        "a legacy paginator must reject this cursor rather than restart or skip rows"
+    );
+
+    let ctx = paging_ctx(&auth, &ks, Some(7), Some(cursor));
+    let second = route_select_raw(&state, &ctx, &select).await.unwrap();
+    assert_eq!(first.rows, expected[..7]);
+    assert_eq!(second.rows, expected[7..14]);
+    assert!(second.paging_state.is_some());
+}
+
+#[tokio::test]
+async fn limited_bigint_scan_cursor_cannot_be_misread_as_a_legacy_offset() {
+    let (state, _dir, auth, ks) = setup_wide_scan_table(0).await;
+    let ctx = paging_ctx(&auth, &ks, None, None);
+    run_ddl(
+        &state,
+        &ctx,
+        "CREATE TABLE pageks.big (id bigint PRIMARY KEY, v int)",
+    )
+    .await;
+    for id in 0..31 {
+        run_ddl(
+            &state,
+            &ctx,
+            &format!("INSERT INTO pageks.big (id, v) VALUES ({id}, {})", id * 10),
+        )
+        .await;
+    }
+    let query = "SELECT v, id FROM pageks.big LIMIT 20";
+    let Statement::Select(select) = crate::parser::parse(query).unwrap() else {
+        panic!("expected SELECT");
+    };
+    let (expected, _) = collect_all_pages(&state, &auth, &ks, query, None).await;
+    let ctx = paging_ctx(&auth, &ks, Some(7), None);
+    let first = route_select_raw(&state, &ctx, &select).await.unwrap();
+    let cursor = first.paging_state.expect("LIMIT 20 needs another page");
+
+    // A bigint partition key has the same width as the legacy offset field.
+    let legacy_pk_len = u32::from_be_bytes(cursor[..4].try_into().unwrap()) as usize;
+    assert!(
+        legacy_pk_len > cursor.len(),
+        "even an older decoder must reject the token before reading its bigint key"
+    );
+    assert!(
+        crate::paging::PagingState::decode(&cursor).is_err(),
+        "a limited bigint cursor must not decode as legacy paging state"
+    );
+    assert!(
+        crate::paging::apply_pagination(20, Some(7), Some(&cursor)).is_err(),
+        "a legacy paginator must not treat a bigint partition key as a row offset"
+    );
+
+    let ctx = paging_ctx(&auth, &ks, Some(7), Some(cursor));
+    let second = route_select_raw(&state, &ctx, &select).await.unwrap();
+    assert_eq!(first.rows, expected[..7]);
+    assert_eq!(second.rows, expected[7..14]);
+    assert!(second.paging_state.is_some());
+}
+
+#[tokio::test]
 async fn limited_scan_preserves_progress_when_fetch_size_changes() {
     let (state, _dir, auth, ks) = setup_wide_scan_table(31).await;
     let query = "SELECT v, id FROM pageks.t LIMIT 20";
@@ -67,11 +149,18 @@ async fn limited_scan_rejects_an_authenticated_but_truncated_cursor_payload() {
     let ctx = paging_ctx(&auth, &ks, Some(7), None);
     let first = route_select_raw(&state, &ctx, &select).await.unwrap();
     let cursor = first.paging_state.expect("LIMIT 20 has more than one page");
-    let mut state_token = crate::paging::PagingState::decode(&cursor).unwrap();
-    assert!(state_token.clustering_key.pop().is_some());
-    // Re-sign through the outer codec so this exercises semantic validation,
-    // rather than merely failing its authentication check.
-    let ctx = paging_ctx(&auth, &ks, Some(7), Some(state_token.encode()));
+    let mut payload = crate::paging::verify_paging_payload(&cursor)
+        .unwrap()
+        .to_vec();
+    assert!(payload.pop().is_some());
+    // Authenticate the shortened outer payload so the nested continuation,
+    // rather than only the outer signature, must be validated.
+    let ctx = paging_ctx(
+        &auth,
+        &ks,
+        Some(7),
+        Some(crate::paging::sign_paging_payload(payload)),
+    );
     assert!(
         route_select_raw(&state, &ctx, &select).await.is_err(),
         "an authenticated but incomplete continuation must be rejected"
@@ -342,4 +431,54 @@ async fn scan_page_collector_does_not_drain_the_upstream_result() {
         8,
         "one page may consume its rows and one lookahead, not the whole result"
     );
+}
+
+#[tokio::test]
+async fn limited_scan_rejects_a_future_authenticated_cursor_version() {
+    let (state, _dir, auth, ks) = setup_wide_scan_table(31).await;
+    let Statement::Select(select) =
+        crate::parser::parse("SELECT v, id FROM pageks.t LIMIT 20").unwrap()
+    else {
+        panic!("expected SELECT");
+    };
+    let first = route_select_raw(&state, &paging_ctx(&auth, &ks, Some(7), None), &select)
+        .await
+        .unwrap();
+    let cursor = first.paging_state.unwrap();
+    let mut payload = crate::paging::verify_paging_payload(&cursor)
+        .unwrap()
+        .to_vec();
+    payload[3] = u8::MAX;
+    let ctx = paging_ctx(
+        &auth,
+        &ks,
+        Some(7),
+        Some(crate::paging::sign_paging_payload(payload)),
+    );
+    let error = route_select_raw(&state, &ctx, &select)
+        .await
+        .err()
+        .expect("invalid cursor must be refused");
+    assert!(error.to_string().contains("version"), "{error}");
+}
+
+#[tokio::test]
+async fn limited_scan_authenticates_its_outer_limit_and_count() {
+    let (state, _dir, auth, ks) = setup_wide_scan_table(31).await;
+    let Statement::Select(select) =
+        crate::parser::parse("SELECT v, id FROM pageks.t LIMIT 20").unwrap()
+    else {
+        panic!("expected SELECT");
+    };
+    let first = route_select_raw(&state, &paging_ctx(&auth, &ks, Some(7), None), &select)
+        .await
+        .unwrap();
+    let mut cursor = first.paging_state.unwrap();
+    cursor[10] ^= 1;
+    let ctx = paging_ctx(&auth, &ks, Some(7), Some(cursor));
+    let error = route_select_raw(&state, &ctx, &select)
+        .await
+        .err()
+        .expect("invalid cursor must be refused");
+    assert!(error.to_string().contains("signature"), "{error}");
 }

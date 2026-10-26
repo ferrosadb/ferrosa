@@ -1696,7 +1696,11 @@ struct ScanPageProgress {
     returned: usize,
 }
 
-const LIMITED_SCAN_CURSOR_MAGIC: &[u8; 4] = b"LSC1";
+// An old decoder treats the first four bytes as a partition-key length.
+// The high byte forces it to reject this envelope, never interpret a raw key
+// as a row offset. The inner signed scan-position token retains its codec.
+const LIMITED_SCAN_CURSOR_MAGIC: &[u8; 3] = &[0xff, b'L', b'S'];
+const LIMITED_SCAN_CURSOR_VERSION: u8 = 1;
 
 impl ScanPageProgress {
     fn decode(bytes: Option<&[u8]>, query_limit: Option<usize>) -> Result<Self, CqlError> {
@@ -1714,16 +1718,18 @@ impl ScanPageProgress {
                 returned: 0,
             });
         };
-        // PagingState authenticates the payload before any position is trusted.
-        let state = crate::paging::PagingState::decode(bytes)?;
-        let payload = state.clustering_key;
-        if state.remaining_in_partition
-            || payload.len() < 20
-            || &payload[..4] != LIMITED_SCAN_CURSOR_MAGIC
-        {
+        // Authenticate every outer field before trusting the version or count.
+        let payload = crate::paging::verify_paging_payload(bytes)?;
+        if payload.len() < 20 || !payload.starts_with(LIMITED_SCAN_CURSOR_MAGIC) {
             return Err(CqlError::Protocol(
                 "paging_state is not a limited scan cursor".into(),
             ));
+        }
+        if payload[3] != LIMITED_SCAN_CURSOR_VERSION {
+            return Err(CqlError::Invalid(format!(
+                "unsupported limited scan cursor version {}; expected {}",
+                payload[3], LIMITED_SCAN_CURSOR_VERSION,
+            )));
         }
         let encoded_limit = u64::from_be_bytes(payload[4..12].try_into().unwrap());
         let returned = usize::try_from(u64::from_be_bytes(payload[12..20].try_into().unwrap()))
@@ -1733,11 +1739,17 @@ impl ScanPageProgress {
                 "paging_state has an invalid scan LIMIT or row count".into(),
             ));
         }
+        let state = crate::paging::PagingState::decode(&payload[20..])?;
+        if state.remaining_in_partition {
+            return Err(CqlError::Protocol(
+                "paging_state is not a scan-order position".into(),
+            ));
+        }
         Ok(Self {
             resume: Some(StreamResumeCursor {
                 partition_key: state.partition_key,
                 // Narrow partitions legitimately have an empty clustering key.
-                clustering_key: payload[20..].to_vec(),
+                clustering_key: state.clustering_key,
             }),
             query_limit,
             returned,
@@ -1758,14 +1770,14 @@ impl ScanPageProgress {
             if returned == limit {
                 page.next_paging_state = None;
             } else if let Some(bytes) = page.next_paging_state.take() {
-                let mut state = crate::paging::PagingState::decode(&bytes)?;
-                let mut payload = Vec::with_capacity(20 + state.clustering_key.len());
+                // Include the outer SHA-256 tag so signing does not reallocate.
+                let mut payload = Vec::with_capacity(20 + bytes.len() + 32);
                 payload.extend_from_slice(LIMITED_SCAN_CURSOR_MAGIC);
+                payload.push(LIMITED_SCAN_CURSOR_VERSION);
                 payload.extend_from_slice(&(limit as u64).to_be_bytes());
                 payload.extend_from_slice(&(returned as u64).to_be_bytes());
-                payload.extend_from_slice(&state.clustering_key);
-                state.clustering_key = payload;
-                page.next_paging_state = Some(state.encode());
+                payload.extend_from_slice(&bytes);
+                page.next_paging_state = Some(crate::paging::sign_paging_payload(payload));
             }
         }
         Ok(page)

@@ -266,3 +266,9 @@ jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal 
 Storage cells expose immutable `CellBytes` slices. Typed result decoding
 borrows these bytes; legacy blob result values still explicitly own vectors at
 the `CqlValue::Blob` boundary.
+
+Limited scan continuations use a signed, versioned outer envelope (`FF 4C 53`,
+version 1) around the raw scan position and cumulative LIMIT progress. Older
+coordinators reject this envelope instead of interpreting its key as an offset.
+Resume an in-flight limited query from its first page if a coordinator rejects
+its token after an upgrade; unlimited scan tokens retain their existing format.
