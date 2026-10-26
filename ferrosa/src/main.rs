@@ -3286,7 +3286,12 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     // SPARQL, Postgres). A bind failure used to be one ERROR line while `/readyz`
     // kept answering 200; each listener now records itself here, and `/readyz` and
     // `/metrics` report it.
-    let listener_status = std::sync::Arc::new(crate::listener_status::ListenerStatus::default());
+    // PostgreSQL binds in a background task. Register it before exposing the
+    // readiness endpoint; absence from the map must not mean it has bound.
+    let listener_status =
+        std::sync::Arc::new(crate::listener_status::ListenerStatus::expecting(&[
+            "postgres",
+        ]));
 
     // Health of the supervised background tasks (the flusher and the maintenance
     // loop). A dead or hung flusher used to be one ERROR line while the node kept
