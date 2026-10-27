@@ -319,3 +319,7 @@ clock evaluation. `ColumnType::TimestampTz` distinguishes timestamp-with-time-zo
 results from `ColumnType::Timestamp`; both carry `Value::Timestamp` microseconds,
 with the column type supplying temporal interpretation and wire typing. This
 adds no new dependency. Table projections and precision arguments are unchanged.
+
+## Single-row COUNT pushdown
+
+Eligible unfiltered, single-table `COUNT(*)` calls the optional `TableProvider::count_all` capability before opening a row cursor. Aliases, BIGINT overflow checking, LIMIT and OFFSET retain normal semantics. WHERE, joins, grouping, HAVING, DISTINCT, ORDER BY and COUNT(expression) use the ordinary executor. Unsupported capabilities return `None`; a source error fails the statement rather than falling back to a potentially different answer.

@@ -931,3 +931,7 @@ Writer-wait evidence (`t_87e93bce`): `pg_writer_wait` retains the >5-second
 owner, exact balance/deadlock victim and execution-drop audits. Ownership/session
 unit tests cover FIFO chains/cycles, injected small admission limits, queue/grant
 cancellation, original lifetime, idle expiry and pre/post-apply publication.
+
+## Single-row COUNT pushdown
+
+Unfiltered `COUNT(*)` on tables with one partition-key column and no clustering/static columns uses a key/liveness count capability. It avoids SQL payload decoding and the per-row producer channel. The physical key pass reconciles sparse own-write and live MVCC before-images, records visited keys, includes historical rows absent from storage, and refuses expired snapshots. Cluster counts retain the requested consistency and replication strategy; an unsupported count capability may use the existing cluster scan, while a count error fails the query. This is a linear scan, not a cached table cardinality. Other table/query shapes retain the normal scan.

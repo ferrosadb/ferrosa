@@ -537,3 +537,7 @@ longer clones the unrelated Row/Cell metadata vector; table-deletion shadowing
 still uses an owned filtered partition. Allocation guards vary column width and
 payload size independently. Counts remain O(N); TTL, tombstone and overlap
 semantics retain their existing read/merge rules.
+
+## Single-row COUNT pushdown
+
+`count_live_single_row_range_matching` is a separate exact liveness counter for partitions containing at most one non-clustered row and no static row. Stable primary-key liveness uses SSTable row metadata and shared resident partitions. TTL, row/partition deletions and table tombstones trigger full reads of all overlapping pinned source partitions before LWW reconciliation; this preserves value-based ties and source column mappings. Source refill happens after these reads. The callback runs after the pinned physical image is obtained. Exceptional rows can read payload bytes; this API does not promise zero payload I/O for TTL/deletion cases. Existing `count_range_matching` remains unchanged in its liveness contract.

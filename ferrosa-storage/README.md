@@ -1709,3 +1709,7 @@ clean tables.
 Set-aside replay retains the exclusive recovery checkpoint gate through its
 durability flush. It uses the guarded flush body directly, avoiding recursive
 read-lock acquisition while retaining the SSTable and WAL durability ordering.
+
+## Single-row COUNT pushdown
+
+`count_live_single_row_range_matching` is a separate exact liveness counter for partitions containing at most one non-clustered row and no static row. Stable primary-key liveness uses SSTable row metadata and shared resident partitions. TTL, row/partition deletions and table tombstones trigger full reads of all overlapping pinned source partitions before LWW reconciliation; this preserves value-based ties and source column mappings. Source refill happens after these reads. The callback runs after the pinned physical image is obtained. Exceptional rows can read payload bytes; this API does not promise zero payload I/O for TTL/deletion cases. Existing `count_range_matching` remains unchanged in its liveness contract.

@@ -1234,3 +1234,7 @@ PostgreSQL replica apply acquires each MVCC observer's lifecycle lease before pr
 Raft restore retires physical rows when authoritative incoming schema names a different UUID, then installs the replacement; storage/schema reconciliation errors propagate instead of reporting a successful snapshot. Direct DDL and pair catch-up retain one write fence across registry and storage transitions. The all-serving TRUNCATE fan-out is a separate raw-marker path and is not covered by the MVCC observer lease.
 
 Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.
+
+## Single-row COUNT pushdown
+
+The single-row liveness-count route follows the same consistency/replication selection as range reads. When the selected read needs no remote replica it invokes the exact local metadata counter; otherwise it counts the existing consistency-merged partition stream and applies row visibility. Remote errors propagate; they never become a local-only or zero count. Remote reconciliation can still decode payloads: the metadata-only optimization applies to the local route.

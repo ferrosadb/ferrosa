@@ -119,3 +119,7 @@ lookup. Grouped aggregation continues to spill under its memory budget.
 Projection transfers owned values into their final output occurrence. Repeated
 columns fork only additional occurrences; identity-prefix projections reuse the
 input row vector. This removes payload copies on ordinary bounded SQL scans.
+
+## Single-row COUNT pushdown
+
+Eligible unfiltered, single-table `COUNT(*)` calls the optional `TableProvider::count_all` capability before opening a row cursor. Aliases, BIGINT overflow checking, LIMIT and OFFSET retain normal semantics. WHERE, joins, grouping, HAVING, DISTINCT, ORDER BY and COUNT(expression) use the ordinary executor. Unsupported capabilities return `None`; a source error fails the statement rather than falling back to a potentially different answer.

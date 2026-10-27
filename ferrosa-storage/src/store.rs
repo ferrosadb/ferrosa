@@ -6841,6 +6841,26 @@ impl<F: FlushTarget> TableStore<F> {
         end: Option<&DecoratedKey>,
         matches: &dyn Fn(&DecoratedKey) -> bool,
     ) -> Result<u64> {
+        self.count_range_matching_impl(start, end, matches, false)
+    }
+
+    /// Exact single-row liveness count; TTL/deletion cases retain full cell LWW.
+    pub fn count_live_single_row_range_matching(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> Result<u64> {
+        self.count_range_matching_impl(start, end, matches, true)
+    }
+
+    fn count_range_matching_impl(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+        live_single_row: bool,
+    ) -> Result<u64> {
         let view = self.view.load_full();
         let start_owned = start.cloned();
         let end_owned = end.cloned();
@@ -6865,14 +6885,6 @@ impl<F: FlushTarget> TableStore<F> {
         )?;
         let sstables_slice = &sst_readers[..];
 
-        let mut merger = crate::range_merger::merger_for_metadata_sources(
-            active_iter,
-            flushing_iters,
-            sstables_slice,
-            start_owned,
-            end_owned,
-        )?;
-
         let mut total: u64 = 0;
         // Each row in the merged partition contributes 1 to the
         // count unless its tombstone marker covers it.
@@ -6894,8 +6906,33 @@ impl<F: FlushTarget> TableStore<F> {
                 c.max_token,
             ));
         }
+        let schema = self.schema.load_full();
+        let mut merger = if live_single_row {
+            crate::range_merger::merger_for_live_single_row_count(
+                active_iter,
+                flushing_iters,
+                sstables_slice,
+                start_owned,
+                end_owned,
+                &schema,
+                !table_delete.is_live(),
+            )?
+        } else {
+            crate::range_merger::merger_for_metadata_sources(
+                active_iter,
+                flushing_iters,
+                sstables_slice,
+                start_owned,
+                end_owned,
+            )?
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .min(i32::MAX as u64) as i32;
         while let Some(p) = merger.next_merged_partition()? {
-            if !matches(&p.key) || crate::table_tombstone::is_table_tombstone_key(&p.key) {
+            if crate::table_tombstone::is_table_tombstone_key(&p.key) {
                 continue;
             }
             let p = if !table_delete.is_live()
@@ -6909,7 +6946,17 @@ impl<F: FlushTarget> TableStore<F> {
                 // copy of every resident cell. Keep the merger's shared view.
                 std::borrow::Cow::Borrowed(p.as_ref())
             };
-            total = total.saturating_add(p.rows.len() as u64);
+            // Resolve snapshot predicates only after this pinned physical image
+            // (including any exceptional cell reads) has been obtained.
+            if !matches(&p.key) {
+                continue;
+            }
+            let rows = if live_single_row {
+                p.rows.iter().filter(|r| r.is_visible_at(now_secs)).count()
+            } else {
+                p.rows.len()
+            };
+            total = total.saturating_add(rows as u64);
             if p.static_row.is_some() {
                 total = total.saturating_add(1);
             }

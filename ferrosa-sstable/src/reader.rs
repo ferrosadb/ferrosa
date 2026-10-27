@@ -1925,6 +1925,22 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         self.pos = reader.position();
         Ok(result)
     }
+
+    /// Bookmark within this pinned immutable source for an exceptional full read.
+    pub fn partition_position(&self) -> u64 {
+        self.pos
+    }
+
+    /// Schema of this pinned source for exceptional liveness reads.
+    pub fn source_header(&self) -> &SerializationHeader {
+        self.sst.header()
+    }
+
+    /// Read a bookmarked partition without advancing this iterator. This keeps
+    /// a count's exceptional TTL/deletion reads on its original source view.
+    pub fn read_partition_at(&self, position: u64) -> Result<Option<crate::types::Partition>> {
+        DataReader::new(&self.source, &self.sst.stored, position).read_partition()
+    }
 }
 
 #[cfg(test)]

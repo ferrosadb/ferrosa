@@ -843,6 +843,7 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         // with a short result the client could not distinguish from a complete
         // one (forge t_50d99192).
         ExecError::Spill(_) => ("58030", err.to_string()),
+        ExecError::Source(_) => ("58000", err.to_string()),
         // An exact aggregate total that does not fit its PostgreSQL result type
         // (sum(int2|int4) is int8). numeric_value_out_of_range, matching
         // PostgreSQL's `bigint out of range`.
@@ -6971,6 +6972,158 @@ mod txn_buffer_tests {
         engine.register_table(kv_storage_schema()).unwrap();
         let schema = schema_with_kv();
         (dir, engine, schema)
+    }
+
+    /// COUNT needs row liveness, not the representation of an unselected cell.
+    /// The same bad cell must still fail when it is actually selected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_count_star_does_not_decode_unselected_payload() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+        let table = ferrosa_storage::TableId::new("public", "kv");
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"key".to_vec()));
+        engine
+            .write(
+                &table,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(0, ferrosa_common::cell::CellValue::live(vec![0xff], 1000))],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1000,
+                    ),
+                },
+                1000,
+            )
+            .unwrap();
+        for flushed in [false, true] {
+            if flushed {
+                engine.flush_all().unwrap();
+            }
+            let messages = execute_query(
+                &engine,
+                &schema,
+                "SELECT COUNT(*) AS n FROM kv",
+                "public",
+                &crate::jsonb_wire::test_limits(),
+                None,
+            )
+            .await;
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "COUNT decoded payload (flushed={flushed}): {messages:?}"
+            );
+            assert!(messages.iter().any(|m| matches!(m, BackendMessage::DataRow { columns } if columns == &vec![Some(b"1".to_vec())])), "COUNT must return one: {messages:?}");
+            let selected = execute_query(
+                &engine,
+                &schema,
+                "SELECT v FROM kv",
+                "public",
+                &crate::jsonb_wire::test_limits(),
+                None,
+            )
+            .await;
+            assert!(
+                selected
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "selected corrupt cell must fail"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_count_matches_ttl_delete_and_resurrection_visibility() {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row as StoredRow};
+        let cases = [
+            (
+                LivenessInfo::with_ttl(1000, 1, 1),
+                CellValue::expiring(b"v".to_vec(), 1000, 1, 1),
+                DeletionTime::LIVE,
+                0,
+            ),
+            (
+                LivenessInfo::with_ttl(1000, 1, 1),
+                CellValue::live(b"v".to_vec(), 2000),
+                DeletionTime::LIVE,
+                1,
+            ),
+            (
+                LivenessInfo::with_timestamp(1000),
+                CellValue::live(b"v".to_vec(), 1000),
+                DeletionTime::new(3000, 3),
+                0,
+            ),
+            (
+                LivenessInfo::with_timestamp(4000),
+                CellValue::live(b"v".to_vec(), 4000),
+                DeletionTime::new(3000, 3),
+                1,
+            ),
+        ];
+        for (liveness, cell, deletion, expected) in cases {
+            let (_dir, engine, schema) = new_engine_and_schema().await;
+            let table = ferrosa_storage::TableId::new("public", "kv");
+            let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                b"key".to_vec(),
+            ));
+            engine
+                .write(
+                    &table,
+                    &key,
+                    StoredRow {
+                        clustering: vec![],
+                        cells: vec![(0, cell)],
+                        deletion,
+                        primary_key_liveness: liveness,
+                    },
+                    4000,
+                )
+                .unwrap();
+            for flushed in [false, true] {
+                if flushed {
+                    engine.flush_all().unwrap();
+                }
+                let selected = execute_query(
+                    &engine,
+                    &schema,
+                    "SELECT k FROM kv",
+                    "public",
+                    &crate::jsonb_wire::test_limits(),
+                    None,
+                )
+                .await;
+                assert!(!selected
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })));
+                assert_eq!(
+                    selected
+                        .iter()
+                        .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+                        .count(),
+                    expected,
+                    "SELECT liveness oracle"
+                );
+                let counted = execute_query(
+                    &engine,
+                    &schema,
+                    "SELECT COUNT(*) FROM kv",
+                    "public",
+                    &crate::jsonb_wire::test_limits(),
+                    None,
+                )
+                .await;
+                let value = expected.to_string().into_bytes();
+                assert!(counted.iter().any(|m| matches!(m, BackendMessage::DataRow { columns } if columns == &vec![Some(value.clone())])), "visibility mismatch, flushed={flushed}, expected={expected}: {counted:?}");
+                assert!(!counted
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })));
+            }
+        }
     }
 
     /// The Cassandra marshal name a PostgreSQL `numeric`/`decimal` column stores.

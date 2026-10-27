@@ -10740,6 +10740,27 @@ impl StorageEngine {
         }
     }
 
+    /// Exact visibility count for tables with one row per partition and no static
+    /// columns. Stable PK liveness skips payloads; TTL/deletion exceptions read
+    /// original pinned source records to retain full LWW value-tie semantics.
+    pub fn count_live_single_row_range_matching(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> ferrosa_common::Result<u64> {
+        match self.table_state(table_id) {
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .count_live_single_row_range_matching(start, end, matches)
+            }
+            None => Ok(0),
+        }
+    }
+
     /// Projection-aware variant of `range_iter`. Only the cells whose
     /// ordinals are in `wanted` are decoded; SSTable cells outside
     /// the projection are byte-skipped via

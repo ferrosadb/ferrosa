@@ -344,6 +344,30 @@ impl ClusterCoordinator {
         strategy: &crate::ring::strategy::ReplicationStrategy,
         matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
     ) -> crate::error::Result<u64> {
+        self.coordinate_count_matching_impl(table_id, cl, strategy, matches, false)
+            .await
+    }
+
+    /// Visibility-correct single-row count over the same selected replicas as a scan.
+    pub async fn coordinate_live_single_row_count_matching(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+    ) -> crate::error::Result<u64> {
+        self.coordinate_count_matching_impl(table_id, cl, strategy, matches, true)
+            .await
+    }
+
+    async fn coordinate_count_matching_impl(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+        live_single_row: bool,
+    ) -> crate::error::Result<u64> {
         // Correctness over speed (forge t_8c4e44e8): the local replica only
         // holds the partitions whose tokens fall in ITS owned ranges. When the
         // TABLE's keyspace RF does not span the whole ring (`RF < node_count`,
@@ -367,10 +391,14 @@ impl ClusterCoordinator {
         // never the local subset.
         let rf = strategy.replication_factor();
         if self.range_read_remotes(cl, rf).needed == 0 {
-            return self
-                .storage
-                .count_range_matching(table_id, None, None, matches)
-                .map_err(ClusterError::Storage);
+            return if live_single_row {
+                self.storage
+                    .count_live_single_row_range_matching(table_id, None, None, matches)
+            } else {
+                self.storage
+                    .count_range_matching(table_id, None, None, matches)
+            }
+            .map_err(ClusterError::Storage);
         }
 
         // Fan out the unbounded streaming range read (local + CL-selected
@@ -383,13 +411,35 @@ impl ClusterCoordinator {
         let mut stream = self
             .coordinate_range_read_stream_all_with(table_id, 0, cl, rf)
             .await?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .min(i32::MAX as u64) as i32;
         let mut total: u64 = 0;
         while let Some(item) = stream.next().await {
             let partition = item?;
             if !matches(&partition.key) {
                 continue;
             }
-            total = total.saturating_add(partition.rows.len() as u64);
+            if live_single_row
+                && (partition.static_row.is_some()
+                    || partition.rows.iter().any(|r| !r.clustering.is_empty()))
+            {
+                return Err(ClusterError::Storage(ferrosa_common::Error::InvalidFormat(
+                    "single-row count received clustered/static rows".into(),
+                )));
+            }
+            let rows = if live_single_row {
+                partition
+                    .rows
+                    .iter()
+                    .filter(|r| r.is_visible_at(now_secs))
+                    .count()
+            } else {
+                partition.rows.len()
+            };
+            total = total.saturating_add(rows as u64);
             if partition.static_row.is_some() {
                 total = total.saturating_add(1);
             }

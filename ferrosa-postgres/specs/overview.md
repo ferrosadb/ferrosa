@@ -489,3 +489,7 @@ SET/RESET/SHOW positive lock_timeout remains t_cc11529a. Native CancelRequest an
 prompt blocked-execution EOF/Terminate remain t_b254fd86. This cycle tests execution
 future/drop cancellation only, not wire cancellation. Distributed RC and early
 COPY ownership remain t_b6306006 and t_4c825e03.
+
+## Single-row COUNT pushdown
+
+Unfiltered `COUNT(*)` on tables with one partition-key column and no clustering/static columns uses a key/liveness count capability. It avoids SQL payload decoding and the per-row producer channel. The physical key pass reconciles sparse own-write and live MVCC before-images, records visited keys, includes historical rows absent from storage, and refuses expired snapshots. Cluster counts retain the requested consistency and replication strategy; an unsupported count capability may use the existing cluster scan, while a count error fails the query. This is a linear scan, not a cached table cardinality. Other table/query shapes retain the normal scan.

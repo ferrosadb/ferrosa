@@ -234,32 +234,7 @@ fn read_now_secs() -> i32 {
 }
 
 fn row_is_visible(row: &Row, now_secs: i32) -> bool {
-    // TTL expiry: a row whose primary-key liveness was written with a TTL and
-    // has expired is gone — unless some cell is still live (a later non-TTL
-    // UPDATE can resurrect it). Mirrors Cassandra semantics.
-    let pkl = &row.primary_key_liveness;
-    let liveness_expired = pkl.has_ttl() && ldt_is_expired(pkl.local_deletion_time, now_secs);
-    if liveness_expired {
-        let any_live_cell = row.cells.iter().any(|(_, c)| cell_is_live(c, now_secs));
-        if !any_live_cell {
-            return false;
-        }
-    }
-
-    // Skip tombstone rows — but only if no newer mutation supersedes the
-    // tombstone. In Cassandra semantics, an UPDATE or INSERT after a DELETE
-    // resurrects the row: the primary_key_liveness timestamp or cell timestamps
-    // may be newer than the row-level deletion.
-    if !row.deletion.is_live() {
-        let del_ts = row.deletion.marked_for_delete_at;
-        let liveness_supersedes = row.primary_key_liveness.timestamp > del_ts;
-        let any_cell_supersedes = row.cells.iter().any(|(_, cell)| cell.timestamp > del_ts);
-        if !liveness_supersedes && !any_cell_supersedes {
-            return false;
-        }
-    }
-
-    true
+    row.is_visible_at(now_secs)
 }
 
 struct RowDecodeContext<'a> {

@@ -1080,6 +1080,32 @@ impl WritePath {
         }
     }
 
+    /// Visibility-correct count for non-clustered single-row tables. Remote
+    /// responses are merged at the requested consistency before reconciliation.
+    pub async fn count_live_single_row_matching_with(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+    ) -> crate::error::Result<u64> {
+        match self {
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_live_single_row_count_matching(table_id, cl, strategy, matches)
+                    .await
+            }
+            Self::Direct(engine) => engine
+                .count_live_single_row_range_matching(table_id, None, None, matches)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
+                .local_storage()
+                .count_live_single_row_range_matching(table_id, None, None, matches)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Unavailable => self.count_range(table_id).await,
+        }
+    }
+
     /// Projection-aware streaming range read for query shapes that only need a
     /// subset of regular cells to evaluate predicates. This keeps COUNT(*) with
     /// ALLOW FILTERING on wide tables out of the Vec-returning materialization

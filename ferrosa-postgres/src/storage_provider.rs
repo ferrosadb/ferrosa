@@ -115,6 +115,9 @@ use tokio::sync::mpsc;
 
 use crate::cluster_read::{read_consistency, PartitionStream, RangeRead};
 
+mod count;
+use count::metadata_count;
+
 /// Convert a ferrosa [`CqlValue`] to [`ferrosa_sql::Value`]. Unsupported values
 /// return an error so callers cannot turn real data into fabricated SQL NULLs.
 pub fn cql_to_value(v: &CqlValue) -> Result<Value, String> {
@@ -500,6 +503,8 @@ struct ScanContext {
     /// Complete key for a single-row table. The relational executor still
     /// evaluates the predicate; this only narrows physical I/O and MVCC tails.
     point: Option<PointLookup>,
+    /// One logical row per partition permits key-only MVCC reconciliation.
+    metadata_countable: bool,
 }
 
 pub(crate) struct PointLookup {
@@ -913,6 +918,19 @@ impl TableProvider for StreamingTable {
         &self.schema
     }
 
+    fn count_all(&self) -> Option<Result<u64, String>> {
+        if !self.ctx.metadata_countable {
+            return None;
+        }
+        self.handle
+            .block_on(metadata_count(
+                &self.ctx,
+                self.mvcc_view.as_ref(),
+                &self.failure,
+            ))
+            .transpose()
+    }
+
     fn scan(&self) -> Box<dyn Iterator<Item = Row> + Send> {
         Box::new(ScanIter { rx: self.rows() })
     }
@@ -1019,6 +1037,12 @@ pub(crate) async fn load_table_with_overlay(
     Ok(StreamingTable {
         schema: rel_schema,
         ctx: Arc::new(ScanContext {
+            metadata_countable: pk_idx.len() == 1
+                && ck_idx.is_empty()
+                && meta
+                    .columns
+                    .values()
+                    .all(|column| column.kind != ColumnKind::Static),
             engine: engine.clone(),
             table_id: TableId::new(keyspace, table),
             col_names,
