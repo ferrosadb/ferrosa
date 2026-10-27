@@ -697,6 +697,7 @@ fn owned_projection(cols: Vec<usize>) -> impl Fn(Row) -> Row + Send {
     let identity = cols.iter().copied().eq(0..cols.len());
     move |mut row| {
         if identity {
+            assert!(cols.len() <= row.0.len(), "projection exceeds input row width");
             row.0.truncate(cols.len());
             return row;
         }

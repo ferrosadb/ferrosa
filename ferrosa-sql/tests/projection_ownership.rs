@@ -36,3 +36,12 @@ fn repeated_projection_moves_one_copy_and_preserves_both_values() {
     assert_ne!(text_pointer(&output, 0), text_pointer(&output, 1));
     assert_eq!(text_pointer(&output, 1), pointer);
 }
+
+#[test]
+#[should_panic]
+fn identity_projection_rejects_a_short_input_row() {
+    let input = Row(vec![Value::Int(1)]);
+    let _ = try_project(Box::new(std::iter::once(Ok(input))), vec![0, 1])
+        .next()
+        .unwrap();
+}
