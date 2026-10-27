@@ -1989,7 +1989,9 @@ mod tests {
             )
             .await;
             assert!(messages.iter().any(|message| matches!(message,
-                BackendMessage::ErrorResponse { code, message, .. } if code == "58000" && message.contains("ks.t") && message.contains("name")
+                BackendMessage::ErrorResponse { fields }
+                    if fields.iter().any(|(kind, value)| *kind == b'C' && value == "58000")
+                        && fields.iter().any(|(kind, value)| *kind == b'M' && value.contains("ks.t") && value.contains("name"))
             )), "missing contextual statement failure (flushed={flushed}): {messages:?}");
             assert!(
                 !messages
