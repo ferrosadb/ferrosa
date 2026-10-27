@@ -63,8 +63,10 @@ until explicit offline migration completes, including empty registered v1 schema
   labelled as SPARQL Results JSON. RDF/XML and JSON-LD graph output are unavailable.
 - **HTTP** — `POST /sparql`, `GET /sparql?query=…`, `POST /sparql/update`,
   `GET /sparql/health`, with a 1 MiB request-body limit. Query/update and version
-  parameters have checked cardinality. Supported operation-version announcements
-  are 1.1/1.2; other versions fail with 400. The service URI is the fallback base,
+  parameters have checked cardinality. Accepted transport operation-version
+  parameters are 1.1/1.2; other parameter values fail with 400. The parser uses
+  its SPARQL 1.2 grammar; strict version-specific language validation is not
+  implemented. The service URI is the fallback base,
   with explicit BASE taking precedence. Protocol dataset overrides
   (`default-graph-uri`, `named-graph-uri`, `using-graph-uri`,
   `using-named-graph-uri`) are currently refused with 400 before updates; they are
@@ -74,6 +76,11 @@ The protocol/JSON contracts are pinned to the W3C Working Drafts of
 [23 July 2026](https://www.w3.org/TR/2026/WD-sparql12-protocol-20260723/) and
 [13 August 2026](https://www.w3.org/TR/2026/WD-sparql12-results-json-20260813/).
 These focused tests do not establish full W3C conformance.
+
+The Rust `Binding` API is a typed enum. Use its constructors and `kind()`,
+`scalar_value()`, `datatype()` and `lang()` accessors. Triple terms have no scalar
+string value. This replaces direct access to the former scalar struct fields;
+it does not change the persisted scalar RDF v2 identity encoding.
 
 ## How it works
 

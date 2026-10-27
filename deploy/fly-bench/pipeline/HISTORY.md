@@ -478,3 +478,35 @@ used new column ordinals against old frozen rows after adding an earlier-sorting
 column. Target definitions now map into the frozen schema by name, reusing valid
 postings and producing no entries for absent columns. No new performance results
 are claimed until the final binary completes matched-placement validation.
+
+
+## 2026-10-27: combined code, COUNT and JSON 1.2
+
+Current code is `c24cad554`; see [the current comparison](RESULTS.md) and
+[all observations](current-results.json). The previous combined-code record is
+[5b8356172](baseline-5b835-results.json); older checkpoints below retain their
+original revision and workload limits. They are not current product numbers.
+
+- Matched eight-writer PostgreSQL loading failed with SQLSTATE 40P01. That failure
+  is retained; current load comparisons are explicitly matched one-writer runs.
+- Resident count copied Row/Cell metadata although payloads were already shared.
+  The 32-row one/256-column fixture changed from 5,467/462,427 requested bytes to
+  1,083/1,083; predicate count changed from 3,275/231,755 to 1,083/1,083. The old
+  payload-size controls already passed. This isolates an allocation fix; it is
+  not a causal claim about wall-clock count improvements in different epochs.
+- SPARQL COUNT previously failed on unsupported Group algebra. It now produces
+  real server aggregates; current 2,000-record COUNT is 11.536 ms versus
+  Oxigraph 1.333 ms. No client scan is substituted for COUNT timing.
+- Recursive triple/directional SPARQL Results JSON, version-aware negotiation,
+  strict operation cardinality, explicit dataset refusal and service base IRI
+  handling have real HTTP/engine regressions. Persisted RDF 1.2 and full W3C
+  conformance remain outside this increment.
+- Local checks pass 10,242 selected tests with 95 existing configured skips and
+  14 isolated cluster tests; 31 focused cases are included. Independent verification
+  repeated 29 earlier cases and 13 final COUNT/allocation cases, with source review
+  closing two additional findings. Coverage is 96.8% for COUNT, 95.3% negotiation,
+  92.9% protocol and 92.1% serialization; the COUNT streaming helper is 100%.
+- Short point-read rates are close in the current driver. Counts/scans remain
+  real gaps. The lower 30-second profiled PostgreSQL read rate is explicitly
+  separated from short unprofiled results; an instrumentation/duration control
+  is pending. CPU stacks and raw scheduling/RSS/disk/network evidence are retained.

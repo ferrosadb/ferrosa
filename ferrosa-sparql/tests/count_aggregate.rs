@@ -210,3 +210,33 @@ async fn count_fails_loud_on_unimplemented_input_algebra() {
         );
     }
 }
+
+#[tokio::test]
+async fn streamed_count_obeys_bind_filter_and_constant_constraints() {
+    let (engine, _dir) = fixture(64);
+    seed(&engine).await;
+    engine
+        .execute_update("INSERT DATA { <urn:a> <urn:q> 2 }", KS)
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT (COUNT(?x) AS ?c) WHERE { ?s <urn:p> ?o BIND(?o + 1 AS ?x) FILTER(?x > 2) }"
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &engine,
+            "SELECT (COUNT(?x) AS ?c) WHERE { ?s <urn:p> ?o BIND(?missing + 1 AS ?x) }"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(&engine, "SELECT (COUNT(*) AS ?c) WHERE { <urn:a> ?p 1 }").await,
+        1
+    );
+}

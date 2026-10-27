@@ -2,8 +2,8 @@
 
 [Measurement status](RESULTS.md): PR #625 combines automatic Bolt scalar schema
 and index setup, streaming CQL LIMIT pages, and protocol transaction/RDF fixes.
-Fresh combined-code timings are pending; historical tables retain their measured
-runtime identity. Explicit Cypher index DDL remains unsupported.
+Current matched-VM comparisons are recorded in RESULTS.md and current-results.json;
+historical tables retain their measured runtime identity. Explicit Cypher index DDL remains unsupported.
 
 Old and new binaries must use independent writable data and object-store
 fixtures. The new transaction WAL envelope and RDF v2 cutover are not safe
@@ -103,3 +103,29 @@ Software sampling caused 11–28% overhead in the recorded rig; sampled timings
 are diagnostic only. Hardware PMU tracing distorted this VM much more and is
 excluded from the accepted comparisons. See [RESULTS.md](RESULTS.md) for the
 measured scope and limitations.
+
+
+The current comparison uses the portable probes below (install `psycopg[binary]`,
+`neo4j` and `cassandra-driver` in the same client environment for both products).
+`protocol_probe.py` config entries name targets such as `ferrosa_pg`/`postgres`,
+`ferrosa_cql`/`cassandra`, or `ferrosa_sparql`/`oxigraph`. A fresh `--scope` owns
+its benchmark table; SPARQL owns and clears only its benchmark graph. These
+commands write fixture data and belong on a dedicated benchmark database.
+
+```sh
+python3 deploy/fly-bench/pipeline/protocol_probe.py \
+  --config /run/private/protocols.json --target ferrosa_pg --protocol pg \
+  --scope bench_repro --rows 5000 --reads 20000 --write-concurrency 1 \
+  --out /tmp/ferrosa-pg.json
+python3 deploy/fly-bench/pipeline/bolt_probe.py \
+  --runtime-config /run/private/benchmark.json --target ferrosa \
+  --action measure --reads 20000 --serial-reads 500 --out /tmp/ferrosa-bolt.json
+```
+
+For CQL use 20,000 rows/eight writers; for SPARQL use 2,000 records/eight writers.
+Bolt first needs `--action seed` for each of `--label BenchRow` and
+`--label BenchWrite`, and `--action access` records index/count access proof.
+Run native/Ferrosa/Ferrosa/native twice, with no concurrent benchmark work.
+`resources_low_overhead.sh` is the one-process 1 Hz OS collector used by this run;
+CPU stack profiling is a separate phase. `--profile` in the protocol probe
+selects a 30-second duration loop; CPU profiler attachment belongs to the controller.

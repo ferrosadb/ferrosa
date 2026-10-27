@@ -1,0 +1,811 @@
+{
+  "measured_date": "2026-10-27",
+  "runtime": {
+    "revision": "c24cad554dd61a0fb76bf385bdf0669f6638998f",
+    "image": "registry.fly.io/ferrosa-bench-main@sha256:e04e84633e6b6ea77fccd21bda7b00932f79be6e17482bb574aff749e8ddc526",
+    "binary_sha256": "9ce311e078f9210a981b15e401f703e24cefd0aa0468ff7d2d0823a2b438ed0f"
+  },
+  "scope": "Warm single-node end-to-end microbenchmarks; no durability or scale equivalence claim",
+  "vm": {
+    "cpu_kind": "performance",
+    "cpus": 2,
+    "memory_mib": 4096,
+    "placement": "Each engine pair shares its physical VM, root filesystem and network destination; one timed workload at a time"
+  },
+  "payload_bytes": 96,
+  "payload_variants": 512,
+  "protocols": {
+    "pg": {
+      "native": "postgres",
+      "rows": 5000,
+      "read_concurrency": 8,
+      "write_concurrency": 1,
+      "point_operations_per_leg": 20000,
+      "engines": {
+        "postgres": {
+          "insert_rows_s": {
+            "mean": 27901.320486528017,
+            "minimum": 18166.0590265247,
+            "maximum": 55745.68923600942,
+            "observations": [
+              18830.914320356726,
+              18862.61936322122,
+              55745.68923600942,
+              18166.0590265247
+            ]
+          },
+          "point_ops_s": {
+            "mean": 9951.084397621713,
+            "minimum": 9490.748141107666,
+            "maximum": 10204.555655088941,
+            "observations": [
+              9490.748141107666,
+              10204.555655088941,
+              9938.379759662701,
+              10170.654034627541
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 0.6407756249959817,
+            "minimum": 0.6266084999921873,
+            "maximum": 0.6713530000013179,
+            "observations": [
+              0.6713530000013179,
+              0.6266084999921873,
+              0.6383580000033362,
+              0.6267829999870855
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 0.7632555000078867,
+            "minimum": 0.6799080000234881,
+            "maximum": 0.9023180000014008,
+            "observations": [
+              0.9023180000014008,
+              0.6799080000234881,
+              0.738568000002715,
+              0.7322280000039427
+            ]
+          },
+          "count_status": "measured",
+          "scan_rows_s": {
+            "mean": 443091.9566437017,
+            "minimum": 412686.75003956247,
+            "maximum": 481990.3812067394,
+            "observations": [
+              431913.27734230476,
+              412686.75003956247,
+              481990.3812067394,
+              445777.41798620013
+            ]
+          },
+          "kernel_syn_rtt_us_p50": [
+            361.0,
+            316.0,
+            306.5,
+            315.5
+          ],
+          "point_plans": [
+            [
+              [
+                "Index Scan using pipeline135_pg_1_pkey on pipeline135_pg_1  (cost=0.29..8.30 rows=1 width=40)"
+              ],
+              [
+                "  Index Cond: (pk = 42)"
+              ]
+            ],
+            [
+              [
+                "Index Scan using pipeline135_pg_4_pkey on pipeline135_pg_4  (cost=0.29..8.30 rows=1 width=40)"
+              ],
+              [
+                "  Index Cond: (pk = 42)"
+              ]
+            ],
+            [
+              [
+                "Index Scan using pipeline135_pg_5_pkey on pipeline135_pg_5  (cost=0.29..8.30 rows=1 width=40)"
+              ],
+              [
+                "  Index Cond: (pk = 42)"
+              ]
+            ],
+            [
+              [
+                "Index Scan using pipeline135_pg_8_pkey on pipeline135_pg_8  (cost=0.29..8.30 rows=1 width=40)"
+              ],
+              [
+                "  Index Cond: (pk = 42)"
+              ]
+            ]
+          ]
+        },
+        "ferrosa_pg": {
+          "insert_rows_s": {
+            "mean": 14641.273703787532,
+            "minimum": 13871.457475978772,
+            "maximum": 15187.108902520706,
+            "observations": [
+              15187.108902520706,
+              14439.755618341742,
+              15066.772818308908,
+              13871.457475978772
+            ]
+          },
+          "point_ops_s": {
+            "mean": 9502.169339462727,
+            "minimum": 9017.587065882986,
+            "maximum": 9846.454104228329,
+            "observations": [
+              9017.587065882986,
+              9628.333599227022,
+              9516.302588512573,
+              9846.454104228329
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 0.7381667499917199,
+            "minimum": 0.7271029999884604,
+            "maximum": 0.7603779999953986,
+            "observations": [
+              0.7603779999953986,
+              0.7352379999971959,
+              0.7299479999858249,
+              0.7271029999884604
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 46.20995799999861,
+            "minimum": 40.279029999993554,
+            "maximum": 49.90005199999814,
+            "observations": [
+              40.279029999993554,
+              44.862077000004774,
+              49.90005199999814,
+              49.79867299999796
+            ]
+          },
+          "count_status": "measured",
+          "scan_rows_s": {
+            "mean": 99404.43502954242,
+            "minimum": 93910.12909580399,
+            "maximum": 103746.84425438868,
+            "observations": [
+              97236.2369350714,
+              102724.52983290562,
+              103746.84425438868,
+              93910.12909580399
+            ]
+          },
+          "kernel_syn_rtt_us_p50": [
+            325.0,
+            307.0,
+            344.0,
+            322.0
+          ],
+          "point_plans": [
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ],
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ],
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ],
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ]
+          ]
+        }
+      },
+      "write_wave_per_worker": 256,
+      "eight_writer_status": "FAILED: DeadlockDetected during5000-row insert; preserved inrun131",
+      "auth": "authenticated connections; creation included in load, excluded from warm reads"
+    },
+    "cql": {
+      "native": "cassandra",
+      "rows": 20000,
+      "read_concurrency": 8,
+      "write_concurrency": 8,
+      "point_operations_per_leg": 20000,
+      "engines": {
+        "cassandra": {
+          "insert_rows_s": {
+            "mean": 15230.672332855986,
+            "minimum": 8384.294170245414,
+            "maximum": 18489.862535794688,
+            "observations": [
+              8384.294170245414,
+              16897.24939029796,
+              17151.28323508588,
+              18489.862535794688
+            ]
+          },
+          "point_ops_s": {
+            "mean": 3563.1974368014767,
+            "minimum": 3197.449845993548,
+            "maximum": 3769.40926005224,
+            "observations": [
+              3197.449845993548,
+              3565.3253354662384,
+              3720.605305693881,
+              3769.40926005224
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 1.8769961249915923,
+            "minimum": 1.782199999979639,
+            "maximum": 2.055994500011593,
+            "observations": [
+              2.055994500011593,
+              1.8561099999772068,
+              1.8136799999979303,
+              1.782199999979639
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 82.60322325000402,
+            "minimum": 44.417577999979585,
+            "maximum": 168.60318700003063,
+            "observations": [
+              168.60318700003063,
+              63.15619700001207,
+              54.2359309999938,
+              44.417577999979585
+            ]
+          },
+          "count_status": "measured",
+          "scan_rows_s": {
+            "mean": 123453.03872942932,
+            "minimum": 105469.75760693481,
+            "maximum": 161981.40842191517,
+            "observations": [
+              109434.95787447403,
+              161981.40842191517,
+              105469.75760693481,
+              116926.03101439326
+            ]
+          },
+          "kernel_syn_rtt_us_p50": [
+            288.0,
+            331.5,
+            340.5,
+            295.5
+          ],
+          "point_plans": null
+        },
+        "ferrosa_cql": {
+          "insert_rows_s": {
+            "mean": 16274.43859359013,
+            "minimum": 16047.087739815279,
+            "maximum": 16579.775860911268,
+            "observations": [
+              16156.226196501857,
+              16579.775860911268,
+              16047.087739815279,
+              16314.664577132116
+            ]
+          },
+          "point_ops_s": {
+            "mean": 3695.687626501707,
+            "minimum": 3568.4382074663126,
+            "maximum": 3866.3781819106957,
+            "observations": [
+              3627.6422363237457,
+              3866.3781819106957,
+              3720.291880306074,
+              3568.4382074663126
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 1.8283762500033163,
+            "minimum": 1.7591305000053126,
+            "maximum": 1.8964194999568917,
+            "observations": [
+              1.850295000025426,
+              1.7591305000053126,
+              1.8076600000256349,
+              1.8964194999568917
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 6.302340250016414,
+            "minimum": 5.452535000017633,
+            "maximum": 6.8202709999809485,
+            "observations": [
+              6.8202709999809485,
+              6.451052000045365,
+              6.485503000021708,
+              5.452535000017633
+            ]
+          },
+          "count_status": "measured",
+          "scan_rows_s": {
+            "mean": 67999.31415600993,
+            "minimum": 61334.64857718656,
+            "maximum": 72409.00487073247,
+            "observations": [
+              61334.64857718656,
+              67094.32589993592,
+              71159.27727618474,
+              72409.00487073247
+            ]
+          },
+          "kernel_syn_rtt_us_p50": [
+            311.0,
+            327.5,
+            290.5,
+            329.5
+          ],
+          "point_plans": null
+        }
+      },
+      "protocol_version": 4,
+      "compression": false,
+      "replication_factor": 1,
+      "consistency": "ONE",
+      "auth": "disabled on both engines",
+      "write_wave_per_worker": 32
+    },
+    "sparql": {
+      "native": "oxigraph",
+      "rows": 2000,
+      "read_concurrency": 8,
+      "write_concurrency": 8,
+      "point_operations_per_leg": 2000,
+      "engines": {
+        "oxigraph": {
+          "insert_rows_s": {
+            "mean": 40821.67771287446,
+            "minimum": 33856.74277682958,
+            "maximum": 46448.294037769636,
+            "observations": [
+              39732.44884135577,
+              46448.294037769636,
+              43249.22519554283,
+              33856.74277682958
+            ]
+          },
+          "point_ops_s": {
+            "mean": 5509.8935956656605,
+            "minimum": 5365.362472688494,
+            "maximum": 5681.087338984028,
+            "observations": [
+              5365.362472688494,
+              5470.283335376,
+              5522.841235614122,
+              5681.087338984028
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 1.2671578750058643,
+            "minimum": 1.2279169999942496,
+            "maximum": 1.3264460000073086,
+            "observations": [
+              1.3264460000073086,
+              1.2279169999942496,
+              1.2616920000141363,
+              1.2525765000077627
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 1.3332210000385203,
+            "minimum": 1.1786260000690163,
+            "maximum": 1.587825999990855,
+            "observations": [
+              1.1786260000690163,
+              1.2390360000154033,
+              1.3273960000788065,
+              1.587825999990855
+            ]
+          },
+          "count_status": "measured",
+          "scan_rows_s": {
+            "mean": 80945.05318265069,
+            "minimum": 69669.24629827357,
+            "maximum": 90535.91831479377,
+            "observations": [
+              90535.91831479377,
+              69669.24629827357,
+              75527.88230756602,
+              88047.16580996942
+            ]
+          },
+          "kernel_syn_rtt_us_p50": [
+            339.0,
+            312.5,
+            307.5,
+            294.5
+          ],
+          "point_plans": null
+        },
+        "ferrosa_sparql": {
+          "insert_rows_s": {
+            "mean": 38443.024545707696,
+            "minimum": 31846.52623983977,
+            "maximum": 45954.41354343212,
+            "observations": [
+              31846.52623983977,
+              45954.41354343212,
+              42304.217667111094,
+              33666.94073244779
+            ]
+          },
+          "point_ops_s": {
+            "mean": 5403.10024085255,
+            "minimum": 5191.3939635419965,
+            "maximum": 5571.70477038405,
+            "observations": [
+              5508.017660532914,
+              5341.28456895124,
+              5191.3939635419965,
+              5571.70477038405
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 1.2556827499992096,
+            "minimum": 1.2077719999865622,
+            "maximum": 1.3139765000005355,
+            "observations": [
+              1.2744910000037635,
+              1.2264915000059773,
+              1.3139765000005355,
+              1.2077719999865622
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 11.535630750017845,
+            "minimum": 11.42610900001273,
+            "maximum": 11.76600700000563,
+            "observations": [
+              11.521108000010827,
+              11.429299000042192,
+              11.76600700000563,
+              11.42610900001273
+            ]
+          },
+          "count_status": "measured",
+          "scan_rows_s": {
+            "mean": 1816.1759330853074,
+            "minimum": 1680.8473736546373,
+            "maximum": 1878.8604976002318,
+            "observations": [
+              1680.8473736546373,
+              1863.5982305622524,
+              1841.397630524108,
+              1878.8604976002318
+            ]
+          },
+          "kernel_syn_rtt_us_p50": [
+            338.5,
+            291.5,
+            314.0,
+            319.5
+          ],
+          "point_plans": null
+        }
+      },
+      "triples_per_row": 3,
+      "triples": 6000,
+      "auth": "disabled on both engines",
+      "batch_rows": 128
+    },
+    "bolt": {
+      "native": "neo4j",
+      "rows": 20000,
+      "point_p50_concurrency": 1,
+      "point_throughput_concurrency": 8,
+      "point_samples_per_leg": {
+        "c1": 500,
+        "c8": 20000
+      },
+      "scan_rows": 10000,
+      "scan_projection": "pk, bucket, payload",
+      "engines": {
+        "ferrosa": {
+          "point_p50_ms": {
+            "mean": 0.7562167499948202,
+            "minimum": 0.6872785000098247,
+            "maximum": 0.8265624999950205,
+            "observations": [
+              0.6872785000098247,
+              0.8265624999950205,
+              0.7483629999853747,
+              0.7626629999890611
+            ]
+          },
+          "point_ops_s": {
+            "mean": 2358.370165017178,
+            "minimum": 2220.3086299867923,
+            "maximum": 2418.8254546682138,
+            "observations": [
+              2399.330948964212,
+              2395.015626449494,
+              2418.8254546682138,
+              2220.3086299867923
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 12.227481250008054,
+            "minimum": 11.80874700000345,
+            "maximum": 12.981894000006378,
+            "observations": [
+              11.80874700000345,
+              11.830747999994173,
+              12.288536000028216,
+              12.981894000006378
+            ]
+          },
+          "scan_rows_s": {
+            "mean": 32552.382933783414,
+            "minimum": 31408.91882319127,
+            "maximum": 34129.635173483104,
+            "observations": [
+              32654.518922214404,
+              34129.635173483104,
+              31408.91882319127,
+              32016.458816244878
+            ]
+          },
+          "insert_rows_s": {
+            "mean": 12053.946438550185,
+            "minimum": 11965.079537273856,
+            "maximum": 12142.813339826513,
+            "observations": [
+              11965.079537273856,
+              12142.813339826513
+            ]
+          }
+        },
+        "neo4j": {
+          "point_p50_ms": {
+            "mean": 1.0128908749997834,
+            "minimum": 0.764777999989974,
+            "maximum": 1.6372504999964121,
+            "observations": [
+              1.6372504999964121,
+              0.7918980000027886,
+              0.8576370000099587,
+              0.764777999989974
+            ]
+          },
+          "point_ops_s": {
+            "mean": 2138.594004166889,
+            "minimum": 1947.3601089202425,
+            "maximum": 2264.039011187097,
+            "observations": [
+              2100.22845398826,
+              1947.3601089202425,
+              2242.748442571957,
+              2264.039011187097
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 1.424885749997884,
+            "minimum": 1.1017059999858247,
+            "maximum": 2.195693999993864,
+            "observations": [
+              1.1722769999948923,
+              2.195693999993864,
+              1.1017059999858247,
+              1.2298660000169548
+            ]
+          },
+          "scan_rows_s": {
+            "mean": 43650.93535664405,
+            "minimum": 24449.27542567343,
+            "maximum": 54245.70765784416,
+            "observations": [
+              24449.27542567343,
+              43845.29671107668,
+              54245.70765784416,
+              52063.46163198192
+            ]
+          },
+          "insert_rows_s": {
+            "mean": 11238.154622353602,
+            "minimum": 9223.648409590416,
+            "maximum": 13252.660835116789,
+            "observations": [
+              9223.648409590416,
+              13252.660835116789
+            ]
+          }
+        }
+      },
+      "kernel_syn_rtt_us_p50": {
+        "ferrosa": 324.0,
+        "neo4j": 292.0
+      },
+      "neo4j_indexes": [
+        {
+          "name": "bench_bucket",
+          "state": "ONLINE",
+          "type": "RANGE",
+          "labelsOrTypes": [
+            "BenchRow"
+          ],
+          "properties": [
+            "bucket"
+          ]
+        },
+        {
+          "name": "bench_payload",
+          "state": "ONLINE",
+          "type": "RANGE",
+          "labelsOrTypes": [
+            "BenchRow"
+          ],
+          "properties": [
+            "payload"
+          ]
+        },
+        {
+          "name": "bench_pk",
+          "state": "ONLINE",
+          "type": "RANGE",
+          "labelsOrTypes": [
+            "BenchRow"
+          ],
+          "properties": [
+            "pk"
+          ]
+        }
+      ],
+      "neo4j_point_plan": {
+        "args": {
+          "planner-impl": "IDP",
+          "Details": "pk, bucket, payload",
+          "planner-version": "5.26.32",
+          "string-representation": "Cypher 5\n\nPlanner COST\n\nRuntime SLOTTED\n\nRuntime version 5.26.32\n\n+------------------+----+---------------------------------------------------------------------------+----------------+\n| Operator         | Id | Details                                                                   | Estimated Rows |\n+------------------+----+---------------------------------------------------------------------------+----------------+\n| +ProduceResults  |  0 | pk, bucket, payload                                                       |              0 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +Projection      |  1 | cache[n.pk] AS pk, cache[n.bucket] AS bucket, cache[n.payload] AS payload |              0 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +CacheProperties |  2 | cache[n.bucket], cache[n.payload]                                         |              0 |\n| |                +----+---------------------------------------------------------------------------+----------------+\n| +NodeIndexSeek   |  3 | RANGE INDEX n:BenchRow(pk) WHERE pk = $pk, cache[n.pk]                    |              0 |\n+------------------+----+---------------------------------------------------------------------------+----------------+\n\nTotal database accesses: ?\n",
+          "runtime-version": "5.26.32",
+          "runtime": "SLOTTED",
+          "Id": 0,
+          "runtime-impl": "SLOTTED",
+          "EstimatedRows": 0.0,
+          "planner": "COST",
+          "version": "5"
+        },
+        "children": [
+          {
+            "args": {
+              "Details": "cache[n.pk] AS pk, cache[n.bucket] AS bucket, cache[n.payload] AS payload",
+              "Id": 1,
+              "EstimatedRows": 0.0
+            },
+            "children": [
+              {
+                "args": {
+                  "Details": "cache[n.bucket], cache[n.payload]",
+                  "Id": 2,
+                  "EstimatedRows": 0.0
+                },
+                "children": [
+                  {
+                    "args": {
+                      "Details": "RANGE INDEX n:BenchRow(pk) WHERE pk = $pk, cache[n.pk]",
+                      "Id": 3,
+                      "EstimatedRows": 0.0
+                    },
+                    "identifiers": [
+                      "n"
+                    ],
+                    "operatorType": "NodeIndexSeek@neo4j"
+                  }
+                ],
+                "identifiers": [
+                  "n"
+                ],
+                "operatorType": "CacheProperties@neo4j"
+              }
+            ],
+            "identifiers": [
+              "n",
+              "pk",
+              "bucket",
+              "payload"
+            ],
+            "operatorType": "Projection@neo4j"
+          }
+        ],
+        "identifiers": [
+          "n",
+          "pk",
+          "bucket",
+          "payload"
+        ],
+        "operatorType": "ProduceResults@neo4j"
+      },
+      "automatic_setup": {
+        "schema_bootstrap": [
+          "CREATE KEYSPACE IF NOT EXISTS bench WITH replication = {'class':'SimpleStrategy','replication_factor':1}"
+        ],
+        "ordinary_bootstrap_writes": [
+          "CREATE pk=-2",
+          "CREATE pk=-1,bucket=-1,payload=bootstrap",
+          "validate old key and new scalar index",
+          "DELETE both sentinels by indexed pk"
+        ],
+        "automatic_indexes": [
+          {
+            "keyspace_name": "bench",
+            "table_name": "benchrow_v",
+            "index_name": "__bolt_benchrow_v_pk_idx",
+            "kind": "COMPOSITES",
+            "options": "{}"
+          },
+          {
+            "keyspace_name": "bench",
+            "table_name": "benchrow_v",
+            "index_name": "__bolt_benchrow_v_bucket_idx",
+            "kind": "COMPOSITES",
+            "options": "{}"
+          },
+          {
+            "keyspace_name": "bench",
+            "table_name": "benchrow_v",
+            "index_name": "__bolt_benchrow_v_payload_idx",
+            "kind": "COMPOSITES",
+            "options": "{}"
+          }
+        ],
+        "initial_label_setup_ms": 14.02418099999636,
+        "first_new_scalar_properties_ms": 20.432733999996344,
+        "first_write_and_index_setup_ms": 34.456914999992705
+      },
+      "load_scope": {
+        "rows_per_label": 20000,
+        "labels": [
+          "BenchRow",
+          "BenchWrite"
+        ],
+        "batch_rows": 128,
+        "concurrency": 1,
+        "setup_excluded": true
+      }
+    }
+  },
+  "graph_before_after": {},
+  "versions": {
+    "postgres": "18.6",
+    "cassandra": "5.0.9",
+    "neo4j": "5.26.32",
+    "oxigraph": "0.5.11"
+  },
+  "native_artifacts": [
+    {
+      "name": "ghcr.io/oxigraph/oxigraph:0.5.11",
+      "id": "e3483733db402870da5b0195352231d8814d684710b57569686d32161e6307a5",
+      "digest": "sha256:858bd397956078d99e4c8ab045004007cc9fbb30f79c952044b8df9dfb4cf4e5",
+      "architecture": "amd64",
+      "entrypoint": [
+        "/usr/local/bin/oxigraph"
+      ],
+      "env": []
+    },
+    {
+      "name": "docker.io/library/cassandra:5.0",
+      "id": "59994f7537a9801de015faf0ca1f89568421e3a83e9ebd7cccdf23727c3c4a99",
+      "digest": "sha256:6868d4e836dc84553977d1e96a8121cff6905a1db720acfbce77285ea6db1b13",
+      "architecture": "amd64",
+      "entrypoint": [
+        "docker-entrypoint.sh"
+      ],
+      "env": [
+        "JAVA_HOME=/opt/java/openjdk",
+        "CASSANDRA_HOME=/opt/cassandra",
+        "CASSANDRA_CONF=/etc/cassandra",
+        "CASSANDRA_VERSION=5.0.9"
+      ]
+    }
+  ],
+  "graph_access": {
+    "vertices_visited": {
+      "point": 1,
+      "count": 0
+    },
+    "schema": "UUID id primary key; regular pk/bucket/payload scalars; automatic Ferrosa indexes and three ONLINE Neo4j RANGE indexes"
+  },
+  "baseline_revision": "5b83561729a0076843434a1846a1393fde23d0fc"
+}
