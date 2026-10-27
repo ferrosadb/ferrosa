@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sparql
 status: implemented
-last_updated: 2026-10-26
+last_updated: 2026-10-27
 executive_summary: >
   The SPARQL 1.1 Query + Update endpoint for ferrosa. Parses SPARQL with
   spargebra/oxrdf, plans algebra into TripleOps over a single CQL-backed
@@ -48,7 +48,9 @@ explicit migration before serving.
 | `property_path` (`src/property_path.rs`, ~440 LoC) | `+ * ? ^` evaluation via BFS with cycle detection over a streamed, bounded adjacency read |
 | `bind` (`src/bind.rs`) | RDF-term-preserving Extend expressions, checked integer arithmetic and bounded decimal division |
 | `filter` (`src/filter.rs`, ~490 LoC) | `Expression` evaluation: comparisons, boolean ops, arithmetic, a function subset; `unsupported_expr` gate for ORDER BY fail-loud |
-| `results` (`src/results.rs`, ~415 LoC) | `Binding`, `SparqlJsonResults`, `ResultFormat`; JSON / W3C XML / N-Triples serializers |
+| `aggregate` (`src/aggregate.rs`) | Bounded global/grouped COUNT with RDF-term DISTINCT identity |
+| `protocol` / `negotiation` | Transport cardinality/version/dataset validation and query-form-aware Accept selection |
+| `results` (`src/results.rs`) | `Binding`, `SparqlJsonResults`, `ResultFormat`; JSON / W3C XML / N-Triples serializers |
 | `http` (`src/http.rs`, ~234 LoC) | axum router, content negotiation, 1 MiB body limit, error→status mapping |
 | `triple_store` (`src/triple_store.rs`) | v2 schema/strict identity codec, v1 schema/decoder, checked keys and legacy fence |
 | `rdf_star` (`src/rdf_star.rs`) | RDF\* annotation evaluation stub — fail-loud, not implemented |
@@ -183,3 +185,19 @@ fallback so neither source nor target disappears on restart. See
 CLEAR/DROP uses two streaming passes: validation followed by deletion. Each pass
 holds storage fragments, rather than buffering every selected triple. A preflight
 error leaves the data unchanged; this is not a transaction over concurrent writers.
+
+## COUNT and SPARQL 1.2 results
+
+The supported COUNT subset streams a single triple pattern, FILTER and BIND
+into counters. Group keys and explicit DISTINCT sets are bounded by max_rows;
+complex joins/path input use the existing bounded evaluator. COUNT scans decode
+triples and are O(N). Unsupported aggregate/input algebra fails during planning.
+
+Bindings are typed RDF terms, with recursive triple objects and directional
+literals for JSON 1.2 SELECT expressions. Scalar v2 storage identities and
+language datatype metadata remain unchanged. RDF 1.2 persistence and graph
+output remain unavailable, with explicit rejection rather than discarded data.
+HTTP negotiation uses the query form, q/specificity and explicit JSON version.
+Dataset transport overrides are refused before writes; service URI BASE and
+operation/version cardinality are validated. See the crate README for the dated
+W3C contracts and remaining conformance limits.

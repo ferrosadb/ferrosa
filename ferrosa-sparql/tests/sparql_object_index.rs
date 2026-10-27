@@ -218,7 +218,12 @@ impl Fixture {
 fn rows_of(bindings: &[std::collections::HashMap<String, Binding>]) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = bindings
         .iter()
-        .map(|row| (row["s"].value.clone(), row["p"].value.clone()))
+        .map(|row| {
+            (
+                row["s"].scalar_value().unwrap().to_owned(),
+                row["p"].scalar_value().unwrap().to_owned(),
+            )
+        })
         .collect();
     out.sort();
     out
@@ -237,7 +242,12 @@ async fn served_object_rows(engine: &SparqlEngine, object: &str) -> HashSet<(Str
             .results
             .bindings
             .iter()
-            .map(|row| (row["s"].value.clone(), row["p"].value.clone()))
+            .map(|row| {
+                (
+                    row["s"].scalar_value().unwrap().to_owned(),
+                    row["p"].scalar_value().unwrap().to_owned(),
+                )
+            })
             .collect(),
         SparqlResult::Ask(_) => panic!("expected SELECT result, got ASK"),
         SparqlResult::Graph(_) => panic!("expected SELECT result, got Graph"),
@@ -270,7 +280,12 @@ async fn served_object_rows_or_error(
             .results
             .bindings
             .iter()
-            .map(|row| (row["s"].value.clone(), row["p"].value.clone()))
+            .map(|row| {
+                (
+                    row["s"].scalar_value().unwrap().to_owned(),
+                    row["p"].scalar_value().unwrap().to_owned(),
+                )
+            })
             .collect()),
         SparqlResult::Ask(_) => Err("expected SELECT result, got ASK".into()),
         SparqlResult::Graph(_) => Err("expected SELECT result, got Graph".into()),

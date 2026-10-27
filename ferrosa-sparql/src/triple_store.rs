@@ -3,6 +3,9 @@
 //! Maps RDF triples to ferrosa's CQL storage model. Each keyspace gets an
 //! `rdf_triples_v2` table keyed by graph/subject and predicate/lexical/identity.
 //! The separate v1 schema and decoder are retained for explicit offline migration.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Borrow typed scalar fields while preserving the persisted v2 codec.
 
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
@@ -207,11 +210,11 @@ pub fn canonical_term(
         },
         _ => return Err(invalid("unsupported object kind")),
     };
-    Ok(Binding {
-        binding_type: kind.into(),
-        value: value.into(),
-        datatype,
-        lang,
+    Ok(match kind {
+        "uri" => Binding::uri(value),
+        "bnode" => Binding::blank_node(value),
+        "literal" => Binding::literal(value, datatype, lang),
+        _ => unreachable!("validated scalar term kind"),
     })
 }
 
@@ -255,28 +258,24 @@ pub fn decode_partition(bytes: &[u8]) -> Result<(String, String), SparqlError> {
 /// partition separators. Identity = version, kind, tagged datatype, tagged
 /// language; its whole encoded length must fit the outer u16 component too.
 pub fn encode_clustering(predicate: &str, term: &Binding) -> Result<Vec<u8>, SparqlError> {
-    let term = canonical_term(
-        &term.binding_type,
-        &term.value,
-        term.datatype.as_deref(),
-        term.lang.as_deref(),
-    )?;
-    let kind = match term.binding_type.as_str() {
+    let (kind, lexical, datatype, language) = term.storage_parts()?;
+    let term = canonical_term(kind, lexical, datatype, language)?;
+    let kind = match term.kind() {
         "uri" => 0,
         "bnode" => 1,
         "literal" => 2,
         _ => unreachable!(),
     };
     let mut identity = vec![2, kind, 0x10];
-    component(
-        &mut identity,
-        term.datatype.as_deref().unwrap_or("").as_bytes(),
-    )?;
+    component(&mut identity, term.datatype().unwrap_or("").as_bytes())?;
     identity.push(0x11);
-    component(&mut identity, term.lang.as_deref().unwrap_or("").as_bytes())?;
+    component(&mut identity, term.lang().unwrap_or("").as_bytes())?;
     let mut out = Vec::new();
     component(&mut out, predicate.as_bytes())?;
-    component(&mut out, term.value.as_bytes())?;
+    component(
+        &mut out,
+        term.scalar_value().expect("canonical scalar").as_bytes(),
+    )?;
     component(&mut out, &identity)?;
     Ok(out)
 }
@@ -367,8 +366,8 @@ pub fn decode_v2_row(row: &Row) -> Result<Option<(String, Binding)>, SparqlError
         return Err(invalid("noncanonical key"));
     }
     if metadata(row, COL_OBJECT_TYPE)?.as_deref() != Some(kind)
-        || metadata(row, COL_DATATYPE)? != term.datatype
-        || metadata(row, COL_LANGUAGE)? != term.lang
+        || metadata(row, COL_DATATYPE)?.as_deref() != term.datatype()
+        || metadata(row, COL_LANGUAGE)?.as_deref() != term.lang()
     {
         return Err(invalid("key/cell mismatch"));
     }
@@ -497,16 +496,16 @@ mod identity_codec_tests {
                 clustering,
                 cells: vec![(
                     COL_OBJECT_TYPE,
-                    CellValue::live(t.binding_type.as_bytes().to_vec(), 1),
+                    CellValue::live(t.kind().as_bytes().to_vec(), 1),
                 )],
                 deletion: DeletionTime::LIVE,
                 primary_key_liveness: LivenessInfo::with_timestamp(1),
             };
-            if let Some(dt) = &t.datatype {
+            if let Some(dt) = &t.datatype() {
                 row.cells
                     .push((COL_DATATYPE, CellValue::live(dt.as_bytes().to_vec(), 1)));
             }
-            if let Some(lang) = &t.lang {
+            if let Some(lang) = &t.lang() {
                 row.cells
                     .push((COL_LANGUAGE, CellValue::live(lang.as_bytes().to_vec(), 1)));
             }
@@ -521,7 +520,7 @@ mod identity_codec_tests {
             let mut bad = row.clone();
             bad.clustering.push(0);
             assert!(decode_v2_row(&bad).is_err());
-            let identity_start = 2 + "urn:p".len() + 2 + t.value.len() + 2;
+            let identity_start = 2 + "urn:p".len() + 2 + t.scalar_value().unwrap().len() + 2;
             let mut bad = row.clone();
             bad.clustering[identity_start] = 99;
             assert!(decode_v2_row(&bad).is_err());

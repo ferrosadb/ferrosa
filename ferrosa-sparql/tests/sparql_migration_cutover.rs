@@ -112,13 +112,13 @@ async fn migrate_replayed_survivors_with_conventions_and_no_v1_resurrection() {
     assert_eq!(got.len(), 5);
     assert!(got
         .iter()
-        .any(|b| b.value == "01" && b.datatype.as_deref() == Some(INTEGER)));
+        .any(|b| b.scalar_value().unwrap() == "01" && b.datatype() == Some(INTEGER)));
     assert!(got
         .iter()
-        .any(|b| b.value == "plain" && b.datatype.as_deref() == Some(XSD_STRING)));
-    assert!(got.iter().any(|b| b.lang.as_deref() == Some("fr")));
-    assert!(got.iter().any(|b| b.binding_type == "uri"));
-    assert!(got.iter().any(|b| b.binding_type == "bnode"));
+        .any(|b| b.scalar_value().unwrap() == "plain" && b.datatype() == Some(XSD_STRING)));
+    assert!(got.iter().any(|b| b.lang() == Some("fr")));
+    assert!(got.iter().any(|b| b.kind() == "uri"));
+    assert!(got.iter().any(|b| b.kind() == "bnode"));
     engine.execute_update("DELETE DATA { GRAPH <urn:g> { <urn:s> <urn:p> \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } }", KS).await.unwrap();
     storage.flush(&triples_table_id(KS)).unwrap();
     drop(engine);
@@ -252,7 +252,12 @@ async fn fresh_populated_v2_is_never_claimed_as_partial_migration() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        decode_v2_row(&target.rows[0]).unwrap().unwrap().1.value,
+        decode_v2_row(&target.rows[0])
+            .unwrap()
+            .unwrap()
+            .1
+            .scalar_value()
+            .unwrap(),
         "fresh"
     );
 }
@@ -338,10 +343,10 @@ async fn wide_source_streams_beyond_a_fragment_and_preserves_literal_variants() 
     assert_eq!(got.len(), 604);
     assert!(got
         .iter()
-        .any(|b| b.value == "custom" && b.datatype.as_deref() == Some("urn:custom")));
+        .any(|b| b.scalar_value().unwrap() == "custom" && b.datatype() == Some("urn:custom")));
     assert!(got
         .iter()
-        .any(|b| b.value == "not-a-number" && b.datatype.as_deref() == Some(INTEGER)));
+        .any(|b| b.scalar_value().unwrap() == "not-a-number" && b.datatype() == Some(INTEGER)));
 }
 
 #[tokio::test]
@@ -401,7 +406,9 @@ async fn empty_registry_keeps_flat_source_and_target_visible_on_restart() {
         1
     );
     assert_eq!(
-        terms(&serving(migration.storage().clone())).await.unwrap()[0].value,
+        terms(&serving(migration.storage().clone())).await.unwrap()[0]
+            .scalar_value()
+            .unwrap(),
         "01"
     );
 }

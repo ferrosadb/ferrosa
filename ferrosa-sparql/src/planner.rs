@@ -2,6 +2,9 @@
 //!
 //! Converts `spargebra` algebra trees into a sequence of storage operations
 //! against ferrosa's CQL-backed triple store.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Plan bounded COUNT and reject unsupported aggregate input algebra.
 
 use spargebra::algebra::GraphPattern;
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
@@ -136,6 +139,21 @@ pub enum PlanStep {
         left: Vec<PlanStep>,
         right: Vec<PlanStep>,
     },
+    /// Fold an independently scoped input into COUNT accumulators.
+    Count {
+        input: Vec<PlanStep>,
+        variables: Vec<String>,
+        aggregates: Vec<(String, CountAggregate)>,
+    },
+}
+
+/// A validated COUNT expression; `None` denotes COUNT(*).
+#[derive(Debug)]
+pub struct CountAggregate {
+    /// Expression whose successfully bound values are counted.
+    pub expression: Option<spargebra::algebra::Expression>,
+    /// Count distinct RDF terms or complete solution mappings.
+    pub distinct: bool,
 }
 
 /// A query execution plan.
@@ -372,6 +390,50 @@ fn collect_ops(
             steps.push(PlanStep::Extend {
                 variable: variable.as_str().to_owned(),
                 expression: expression.clone(),
+            });
+        }
+        GraphPattern::Group {
+            inner,
+            variables,
+            aggregates,
+        } => {
+            validate_count_input(inner)?;
+            use spargebra::algebra::{AggregateExpression, AggregateFunction};
+            let mut counts = Vec::with_capacity(aggregates.len());
+            for (variable, aggregate) in aggregates {
+                let count = match aggregate {
+                    AggregateExpression::CountSolutions { distinct } => CountAggregate {
+                        expression: None,
+                        distinct: *distinct,
+                    },
+                    AggregateExpression::FunctionCall {
+                        name: AggregateFunction::Count,
+                        expr,
+                        distinct,
+                    } => {
+                        crate::bind::validate(expr)?;
+                        CountAggregate {
+                            expression: Some(expr.clone()),
+                            distinct: *distinct,
+                        }
+                    }
+                    _ => {
+                        return Err(SparqlError::Plan(format!(
+                            "unsupported aggregate: {aggregate:?}"
+                        )))
+                    }
+                };
+                counts.push((variable.as_str().to_owned(), count));
+            }
+            let mut input = Vec::new();
+            collect_ops(
+                inner, scope, ops, projection, limit, offset, distinct, order_by, filters,
+                &mut input,
+            )?;
+            steps.push(PlanStep::Count {
+                input,
+                variables: variables.iter().map(|v| v.as_str().to_owned()).collect(),
+                aggregates: counts,
             });
         }
         GraphPattern::Join { left, right } => {
@@ -697,6 +759,18 @@ pub fn extract_describe_iris(pattern: &spargebra::algebra::GraphPattern) -> Vec<
         GraphPattern::Bgp { .. } => vec![],
         _ => vec![],
     }
+}
+
+/// COUNT may only consume algebra the evaluator implements without changing its
+/// bag of solutions. In particular, the older UNION/OPTIONAL/subquery shortcuts
+/// must never silently produce a plausible but incorrect aggregate.
+fn validate_count_input(pattern: &GraphPattern) -> Result<(), SparqlError> {
+    match pattern {
+  GraphPattern::Bgp{..}|GraphPattern::Path{..}=>Ok(()),
+  GraphPattern::Filter{inner,..}|GraphPattern::Extend{inner,..}|GraphPattern::Graph{inner,..}=>validate_count_input(inner),
+  GraphPattern::Join{left,right}=>{validate_count_input(left)?;validate_count_input(right)},
+  _=>Err(SparqlError::Plan("COUNT over this input algebra is not implemented (UNION, OPTIONAL, subqueries and blocking input operators)".into()))
+ }
 }
 
 #[cfg(test)]

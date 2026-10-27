@@ -4,6 +4,7 @@
 //! storage reads against ferrosa's CQL-backed triple store, and serializes
 //! results with its own writers (JSON, XML, CSV/TSV, N-Triples).
 
+mod aggregate;
 mod bind;
 pub mod engine;
 pub mod error;
@@ -19,3 +20,7 @@ pub mod rdf_star;
 pub mod results;
 pub mod triple_store;
 pub mod update;
+
+mod negotiation;
+
+mod protocol;

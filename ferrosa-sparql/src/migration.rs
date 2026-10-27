@@ -1,3 +1,6 @@
+//! Correctness: persisted scalar v2 identities remain unchanged.
+//! Last revised: 2026-10-27
+//! Last changed: Borrow metadata from typed result bindings.
 //! Explicit, quiesced local RDF v1-to-v2 migration. Never called by serving.
 use crate::error::SparqlError;
 use crate::executor::OBJECT_INDEX_NAME;
@@ -158,9 +161,9 @@ fn migrated_row(
     timestamp: i64,
 ) -> Result<Row, SparqlError> {
     let cells = [
-        (COL_DATATYPE, term.datatype.as_deref()),
-        (COL_LANGUAGE, term.lang.as_deref()),
-        (COL_OBJECT_TYPE, Some(term.binding_type.as_str())),
+        (COL_DATATYPE, term.datatype()),
+        (COL_LANGUAGE, term.lang()),
+        (COL_OBJECT_TYPE, Some(term.kind())),
     ]
     .into_iter()
     .filter_map(|(id, value)| {
@@ -411,7 +414,7 @@ impl OfflineMigration {
                 self.storage.read_by_index_each_bytes(
                     &target,
                     OBJECT_INDEX_NAME,
-                    term.value.as_bytes(),
+                    term.scalar_value().expect("decoded v2 scalar").as_bytes(),
                     &mut |part| {
                         if part.key == fragment.key {
                             found = part.rows.iter().any(|row| {

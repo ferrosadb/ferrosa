@@ -1,6 +1,6 @@
 # ferrosa-sparql
 
-> SPARQL 1.1 Query + Update endpoint for ferrosa, built on `spargebra`/`oxrdf`,
+> SPARQL Query + Update endpoint with bounded COUNT and SPARQL 1.2 JSON results, built on `spargebra`/`oxrdf`,
 > translating algebra trees into reads and writes against a single CQL-backed
 > `rdf_triples_v2` table.
 
@@ -10,7 +10,7 @@
 plans the algebra into storage operations against ferrosa's `rdf_triples_v2` table
 (`((graph, subject), predicate, object, object_identity)`), executes them via the cluster write
 path, and serializes results with hand-written JSON / XML / N-Triples / Turtle
-encoders. The HTTP surface implements the SPARQL 1.1 Protocol over `axum`, and
+encoders. The HTTP surface serves GET, form POST and direct POST over `axum`, and
 serves HTTPS only when `SparqlHttpConfig` carries a certificate (`[sparql]
 tls_cert/tls_key`); `require_tls` without one refuses to start (t_d5d122ba). The
 rustls config comes from `ferrosa_net::tls`, the process's single crypto provider.
@@ -40,14 +40,40 @@ until explicit offline migration completes, including empty registered v1 schema
   through one tombstone primitive. `LOAD` and unsupported cross-graph ops fail loud. Constant key lengths are
   prevalidated across the request; instantiated pattern keys are validated before
   applying that operation. Storage failures are not transactionally rolled back.
-- **RDF\* (SPARQL-star)** — quoted triples `<< s p o >>` **parse** (via the
-  `sparql-12` feature) but annotation evaluation is **not implemented**: the
-  planner rejects quoted triples in subject/object position fail-loud.
-- **Serialization** — SPARQL Results JSON, SPARQL Results XML (W3C shape),
-  N-Triples, Turtle (currently an N-Triples subset). Content negotiation via the
-  `Accept` header.
+- **COUNT / GROUP BY** — `COUNT(*)`, `COUNT(expr)`, DISTINCT and grouped counts,
+  including an empty global input returning one zero row. The common single-triple
+  scan feeds counters directly, retaining group keys and requested DISTINCT state,
+  rather than collecting the input solution set. Joins and paths retain their
+  existing bounded evaluator. Counts still read/decode input triples; this is not
+  an O(1) metadata counter. Other aggregates, COUNT over UNION/OPTIONAL/subqueries
+  and blocking input operators fail explicitly.
+- **SPARQL 1.2 Query Results JSON** — typed recursive triple objects and directional
+  language literals (`xml:lang`, `its:dir`). SELECT expressions support `TRIPLE`
+  and triple-term constants. `Accept: application/sparql-results+json; version=1.2`
+  selects a versioned result for SELECT or ASK. Unversioned JSON announces 1.2 only
+  when its terms require it; query-version announcements do not force a result
+  version. Explicit JSON 1.1 and legacy XML cannot silently flatten RDF 1.2 terms.
+- **RDF storage boundary** — persisted RDF v2 still supports scalar RDF 1.1 terms.
+  RDF 1.2 triple/directional storage and graph output are unimplemented and fail
+  explicitly. This is result-format support, not full RDF/SPARQL 1.2 conformance.
+- **Serialization / negotiation** — SELECT/ASK use Results JSON or XML; graph
+  forms use N-Triples or Turtle (an N-Triples subset). Accept quality, q=0,
+  wildcards and JSON media versions are honored; incompatible requests return
+  406. Default graph output is `application/n-triples`, not a custom JSON array
+  labelled as SPARQL Results JSON. RDF/XML and JSON-LD graph output are unavailable.
 - **HTTP** — `POST /sparql`, `GET /sparql?query=…`, `POST /sparql/update`,
-  `GET /sparql/health`, with a 1 MiB request-body limit.
+  `GET /sparql/health`, with a 1 MiB request-body limit. Query/update and version
+  parameters have checked cardinality. Supported operation-version announcements
+  are 1.1/1.2; other versions fail with 400. The service URI is the fallback base,
+  with explicit BASE taking precedence. Protocol dataset overrides
+  (`default-graph-uri`, `named-graph-uri`, `using-graph-uri`,
+  `using-named-graph-uri`) are currently refused with 400 before updates; they are
+  never ignored. Optional HTTP QUERY support is not implemented.
+
+The protocol/JSON contracts are pinned to the W3C Working Drafts of
+[23 July 2026](https://www.w3.org/TR/2026/WD-sparql12-protocol-20260723/) and
+[13 August 2026](https://www.w3.org/TR/2026/WD-sparql12-results-json-20260813/).
+These focused tests do not establish full W3C conformance.
 
 ## How it works
 
@@ -119,7 +145,7 @@ the former `SparqlConfig::max_results` field, which nothing read.
 
 `LIMIT` is pushed **into** the scan — the scan stops after `offset + limit`
 solutions — whenever that is provably safe: exactly one triple pattern, and no
-`ORDER BY`, `DISTINCT`, `FILTER`, or `CONSTRUCT`/`DESCRIBE` above it. Those
+`ORDER BY`, `DISTINCT`, `FILTER`, `COUNT`, or `CONSTRUCT`/`DESCRIBE` above it. Those
 operators either block (they must see every solution before emitting one) or
 drop rows after binding (so stopping early would return too few), and in each
 case the scan runs to completion under the bound instead. `ASK` is planned with

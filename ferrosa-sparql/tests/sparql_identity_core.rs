@@ -89,10 +89,10 @@ impl Fixture {
             .map(|row| {
                 let b = &row[variable];
                 (
-                    b.binding_type.clone(),
-                    b.value.clone(),
-                    b.datatype.clone(),
-                    b.lang.clone(),
+                    b.kind().to_owned(),
+                    b.scalar_value().unwrap().to_owned(),
+                    b.datatype().map(str::to_owned),
+                    b.lang().map(str::to_owned),
                 )
             })
             .collect();
@@ -267,7 +267,7 @@ async fn index_and_fallback_postfilter_typed_constants() {
             .await
             .unwrap();
         assert_eq!(out.results.bindings.len(), 1);
-        assert_eq!(out.results.bindings[0]["s"].value, S);
+        assert_eq!(out.results.bindings[0]["s"].scalar_value().unwrap(), S);
     }
 }
 
@@ -589,7 +589,15 @@ fn v1_decoder_preserves_historical_ordinals_and_literal_conventions() {
         }
         let (p, t) = decode_v1_row(&row).unwrap().unwrap();
         assert_eq!(p, P);
-        assert_eq!((t.binding_type, t.value, t.datatype, t.lang), expected);
+        assert_eq!(
+            (
+                t.kind().to_owned(),
+                t.scalar_value().unwrap().to_owned(),
+                t.datatype().map(str::to_owned),
+                t.lang().map(str::to_owned)
+            ),
+            expected
+        );
         row.clustering.push(0);
         assert!(decode_v1_row(&row).is_err());
     }

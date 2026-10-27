@@ -2,6 +2,9 @@
 //!
 //! Evaluates spargebra `Expression` trees against variable binding sets.
 //! Supports the core expression types needed for common SPARQL patterns.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Compare full typed terms for sameTerm and avoid coercing triples to strings.
 
 use std::collections::HashMap;
 
@@ -197,24 +200,9 @@ fn eval_function(
 fn eval_term(expr: &Expression, bindings: &HashMap<String, Binding>) -> Option<Binding> {
     use crate::triple_store::canonical_term;
     match expr {
-        Expression::Variable(v) => {
-            let b = bindings.get(v.as_str())?;
-            canonical_term(
-                &b.binding_type,
-                &b.value,
-                b.datatype.as_deref(),
-                b.lang.as_deref(),
-            )
-            .ok()
-        }
-        Expression::Literal(l) => canonical_term(
-            "literal",
-            l.value(),
-            Some(l.datatype().as_str()),
-            l.language(),
-        )
-        .ok(),
-        Expression::NamedNode(n) => canonical_term("uri", n.as_str(), None, None).ok(),
+        Expression::Variable(v) => bindings.get(v.as_str()).cloned(),
+        Expression::Literal(literal) => Some(Binding::from_literal(literal)),
+        Expression::NamedNode(node) => Some(Binding::uri(node.as_str())),
         Expression::If(c, t, e) => {
             eval_term(if eval_filter(c, bindings) { t } else { e }, bindings)
         }
@@ -285,30 +273,32 @@ pub fn unsupported_expr(expr: &Expression) -> Option<String> {
 /// arithmetic and numeric ordering. Untyped literals whose value parses as a
 /// number are also treated numerically (xsd:integer/double), matching how
 /// SPARQL promotes numeric literals; everything else is a string.
-fn binding_to_value(b: &Binding) -> Value {
-    if let Some(dt) = b.datatype.as_deref() {
-        return match dt {
+fn binding_to_value(binding: &Binding) -> Value {
+    let Some(value) = binding.scalar_value() else {
+        return Value::Null;
+    };
+    match binding.datatype() {
+        Some(
             "http://www.w3.org/2001/XMLSchema#integer"
             | "http://www.w3.org/2001/XMLSchema#int"
-            | "http://www.w3.org/2001/XMLSchema#long" => b
-                .value
-                .parse::<i64>()
-                .map(Value::Integer)
-                .unwrap_or(Value::Null),
+            | "http://www.w3.org/2001/XMLSchema#long",
+        ) => value
+            .parse::<i64>()
+            .map(Value::Integer)
+            .unwrap_or(Value::Null),
+        Some(
             "http://www.w3.org/2001/XMLSchema#decimal"
             | "http://www.w3.org/2001/XMLSchema#float"
-            | "http://www.w3.org/2001/XMLSchema#double" => b
-                .value
-                .parse::<f64>()
-                .map(Value::Float)
-                .unwrap_or(Value::Null),
-            "http://www.w3.org/2001/XMLSchema#boolean" => {
-                Value::Boolean(b.value == "true" || b.value == "1")
-            }
-            _ => Value::String(b.value.clone()),
-        };
+            | "http://www.w3.org/2001/XMLSchema#double",
+        ) => value
+            .parse::<f64>()
+            .map(Value::Float)
+            .unwrap_or(Value::Null),
+        Some("http://www.w3.org/2001/XMLSchema#boolean") => {
+            Value::Boolean(value == "true" || value == "1")
+        }
+        _ => Value::String(value.to_owned()),
     }
-    Value::String(b.value.clone())
 }
 
 /// SPARQL ORDER BY comparison (URS-QEC-S04).
@@ -439,11 +429,11 @@ mod tests {
     use super::*;
 
     fn binding(typ: &str, val: &str) -> Binding {
-        Binding {
-            binding_type: typ.into(),
-            value: val.into(),
-            datatype: None,
-            lang: None,
+        match typ {
+            "uri" => Binding::uri(val),
+            "bnode" => Binding::blank_node(val),
+            "literal" => Binding::literal(val, None, None),
+            _ => panic!("unsupported fixture term kind"),
         }
     }
 

@@ -62,9 +62,9 @@ stubs), the FMEA ([fmea.md](fmea.md)), and the dependency/usage review.
   quoted-triple terms in key position, insert support for quoted-triple
   subjects, and a join planner that binds the inner pattern before the outer
   annotation property. Today it fails loud (correct, but unimplemented).
-- **Aggregation / GROUP BY / sub-SELECT.** `GraphPattern::Group` and friends are
-  not handled by `collect_ops` and currently hit the catch-all
-  `unsupported graph pattern` error.
+- **Remaining aggregation / sub-SELECT.** Bounded global/grouped COUNT is
+  implemented. Other aggregates and COUNT input involving UNION, OPTIONAL,
+  subqueries or blocking input operators remain explicit errors.
 - **Named-graph support.** Lift the one-graph-per-keyspace restriction so
   `GRAPH <g> { … }`, `ADD`/`MOVE`/`COPY`, and named-graph insert/delete targets
   work instead of failing loud.
@@ -104,3 +104,10 @@ checks. V1 remains retained without union serving or destructive cleanup.
 Next: distributed rollout fencing and operator tooling for coordinated migration;
 recovery of history already lost by older binaries needs an authoritative source.
 Full benchmark reruns and the performance comparison are separate acceptance work.
+
+## COUNT / protocol / JSON increment (2026-10-27)
+
+Implemented: bounded COUNT, query-form-aware HTTP negotiation and SPARQL 1.2
+JSON triple/directional result terms. Remaining: persisted RDF 1.2 terms, 1.2
+RDF graph/XML serialization, protocol dataset overrides, optional HTTP QUERY,
+full language/expression coverage and a complete W3C conformance run.

@@ -109,3 +109,11 @@ changes across all passes; local markers do not fence other nodes. V1 remains
 retained and is never unioned with v2. After v2 writes, downgrade is lossy and
 requires an authoritative checkpoint or export/reimport. Distributed migration
 and historical data silently lost by older binaries remain separate work.
+
+## SPARQL 1.2 boundary controls (2026-10-27)
+
+JSON triple/directional SELECT results are typed recursively. Unsupported RDF
+1.2 persistence/graph output must fail explicitly, and legacy requested formats
+must not flatten those terms. COUNT over unsupported algebra fails before scan.
+Protocol dataset overrides and ambiguous operations are rejected before updates;
+real HTTP regressions cover these boundaries. No full W3C conformance claim.

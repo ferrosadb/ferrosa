@@ -3,6 +3,9 @@
 //! Implements SPARQL 1.1 property path operators (`+`, `*`, `?`) by
 //! walking the adjacency structure of the triple store. Fixes the
 //! silent single-hop degradation bug (BUG-S7).
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Preserve typed scalar term identity through path results.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -262,7 +265,9 @@ fn collect_start_nodes(subject: &TermPattern, adjacency: &[(Binding, Binding)]) 
 /// Check whether a node matches an endpoint pattern.
 fn matches_endpoint(pattern: &TermPattern, node: &Binding) -> bool {
     match pattern {
-        TermPattern::NamedNode(n) => node.binding_type == "uri" && n.as_str() == node.value,
+        TermPattern::NamedNode(n) => {
+            node.kind() == "uri" && node.scalar_value() == Some(n.as_str())
+        }
         TermPattern::Variable(_) => true,
         TermPattern::Literal(l) => literal_term(l) == *node,
         _ => true,
@@ -321,25 +326,14 @@ pub fn path_results_to_bindings(
 }
 
 fn node_term(value: &str) -> Binding {
-    Binding {
-        binding_type: if value.starts_with("_:") {
-            "bnode"
-        } else {
-            "uri"
-        }
-        .into(),
-        value: value.into(),
-        datatype: None,
-        lang: None,
+    if value.starts_with("_:") {
+        Binding::blank_node(value)
+    } else {
+        Binding::uri(value)
     }
 }
-fn literal_term(l: &spargebra::term::Literal) -> Binding {
-    Binding {
-        binding_type: "literal".into(),
-        value: l.value().into(),
-        datatype: Some(l.datatype().as_str().into()),
-        lang: l.language().map(str::to_ascii_lowercase),
-    }
+fn literal_term(literal: &spargebra::term::Literal) -> Binding {
+    Binding::from_literal(literal)
 }
 
 #[cfg(test)]
@@ -472,7 +466,7 @@ mod tests {
             .collect();
         let starts = collect_start_nodes(&subject, &adjacency)
             .into_iter()
-            .map(|b| b.value)
+            .map(|b| b.scalar_value().unwrap().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(starts, vec!["http://ex/alice"]);
     }
@@ -491,7 +485,7 @@ mod tests {
             .collect();
         let starts = collect_start_nodes(&subject, &adjacency)
             .into_iter()
-            .map(|b| b.value)
+            .map(|b| b.scalar_value().unwrap().to_owned())
             .collect::<Vec<_>>();
         assert_eq!(starts, vec!["alice", "bob"]);
     }

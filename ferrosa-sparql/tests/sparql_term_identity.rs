@@ -109,10 +109,10 @@ impl Fixture {
             .map(|row| {
                 let b = &row[variable];
                 (
-                    b.binding_type.clone(),
-                    b.value.clone(),
-                    b.datatype.clone(),
-                    b.lang.clone(),
+                    b.kind().to_owned(),
+                    b.scalar_value().unwrap().to_owned(),
+                    b.datatype().map(str::to_owned),
+                    b.lang().map(str::to_owned),
                 )
             })
             .collect();

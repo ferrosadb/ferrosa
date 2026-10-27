@@ -180,8 +180,9 @@ fn values(rows: &[HashMap<String, Binding>], var: &str) -> Vec<String> {
         .map(|r| {
             r.get(var)
                 .unwrap_or_else(|| panic!("every row must bind ?{var}"))
-                .value
-                .clone()
+                .scalar_value()
+                .unwrap()
+                .to_owned()
         })
         .collect()
 }
@@ -217,13 +218,13 @@ mod baseline_bind {
         let binding = row
             .get(variable)
             .unwrap_or_else(|| panic!("expected ?{variable} to be bound"));
-        assert_eq!(binding.binding_type, "literal");
-        assert_eq!(binding.value, value);
+        assert_eq!(binding.kind(), "literal");
+        assert_eq!(binding.scalar_value().unwrap(), value);
         assert_eq!(
-            binding.datatype.as_deref(),
+            binding.datatype(),
             Some("http://www.w3.org/2001/XMLSchema#integer")
         );
-        assert_eq!(binding.lang, None);
+        assert_eq!(binding.lang(), None);
     }
 
     #[tokio::test]
@@ -307,7 +308,7 @@ mod baseline_bind {
             .await;
         let rows = f.execute("SELECT ?s ?next WHERE { ?s <http://ex/n> ?n BIND(?n + 1 AS ?next) FILTER(?next = 2) ?t <http://ex/n> ?next }").await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["s"].value, "http://ex/a");
+        assert_eq!(rows[0]["s"].scalar_value().unwrap(), "http://ex/a");
         assert_integer(&rows[0], "next", "2");
     }
 
@@ -372,9 +373,9 @@ mod baseline_bind {
         let f = fixture();
         let rows = f.execute("SELECT ?x WHERE { BIND(1 / 2 AS ?x) }").await;
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["x"].value, "0.5");
+        assert_eq!(rows[0]["x"].scalar_value().unwrap(), "0.5");
         assert_eq!(
-            rows[0]["x"].datatype.as_deref(),
+            rows[0]["x"].datatype(),
             Some("http://www.w3.org/2001/XMLSchema#decimal")
         );
     }
@@ -387,10 +388,10 @@ mod baseline_bind {
             .await
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["iri"].binding_type, "uri");
-        assert_eq!(rows[0]["iri"].value, "http://ex/a");
-        assert_eq!(rows[0]["copy"].value, "hello");
-        assert_eq!(rows[0]["copy"].lang.as_deref(), Some("en"));
+        assert_eq!(rows[0]["iri"].kind(), "uri");
+        assert_eq!(rows[0]["iri"].scalar_value().unwrap(), "http://ex/a");
+        assert_eq!(rows[0]["copy"].scalar_value().unwrap(), "hello");
+        assert_eq!(rows[0]["copy"].lang(), Some("en"));
     }
 }
 
@@ -689,8 +690,8 @@ async fn join_emits_only_compatible_solutions() {
         .await;
 
     assert_eq!(rows.len(), 1, "only Bob satisfies both patterns");
-    assert_eq!(rows[0]["x"].value, "http://ex/bob");
-    assert_eq!(rows[0]["n"].value, "Bob");
+    assert_eq!(rows[0]["x"].scalar_value().unwrap(), "http://ex/bob");
+    assert_eq!(rows[0]["n"].scalar_value().unwrap(), "Bob");
 }
 
 /// An empty store yields zero solutions and no error — an empty stream, not a

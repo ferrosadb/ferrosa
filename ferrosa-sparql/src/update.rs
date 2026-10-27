@@ -6,6 +6,9 @@
 //! clause through the SELECT executor to bind solutions, then tombstone each
 //! resulting ground triple via the same low-level [`StorageEngine`] path as
 //! `DELETE DATA`. Genuinely unimplemented ops fail loud (URS-QEC-X01).
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Reject unsupported bound RDF 1.2 terms before mutations.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -193,12 +196,8 @@ fn validate_update(update: &spargebra::Update) -> Result<(), SparqlError> {
                     )?;
                 }
                 for tmpl in delete {
-                    let term = resolve_ground_object(&tmpl.object, &empty).unwrap_or(Binding {
-                        binding_type: "uri".into(),
-                        value: String::new(),
-                        datatype: None,
-                        lang: None,
-                    });
+                    let term = resolve_ground_object(&tmpl.object, &empty)
+                        .unwrap_or(Binding::uri(String::new()));
                     validate_key(
                         target.storage_graph(),
                         &resolve_ground_term(&tmpl.subject, &empty).unwrap_or_default(),
@@ -409,6 +408,29 @@ async fn exec_delete_insert(
     let plan = crate::planner::plan_where(pattern, &scope)?;
     let solutions = crate::executor::execute_bindings(&plan, write_path, limits).await?;
 
+    // Validate only terms actually referenced by a write template, before the
+    // first mutation. RDF 1.2 results are valid in SELECT but not in the v2 codec.
+    for solution in &solutions {
+        for template in insert {
+            match &template.object {
+                TermPattern::Variable(v) => {
+                    if let Some(term) = solution.get(v.as_str()) {
+                        term.storage_parts()?;
+                    }
+                }
+                TermPattern::Literal(l) => {
+                    Binding::from_literal(l).storage_parts()?;
+                }
+                TermPattern::Triple(_) => {
+                    return Err(SparqlError::Plan(
+                        "stored RDF 1.2 triple terms are not implemented".into(),
+                    ))
+                }
+                _ => {}
+            }
+        }
+    }
+
     let deletes: Vec<_> = solutions
         .iter()
         .flat_map(|sol| {
@@ -545,7 +567,10 @@ fn resolve_term(term: &TermPattern, sol: &HashMap<String, Binding>) -> Option<St
         TermPattern::NamedNode(n) => Some(n.as_str().to_string()),
         TermPattern::Literal(l) => Some(l.value().to_string()),
         TermPattern::BlankNode(b) => Some(format!("_:{}", b.as_str())),
-        TermPattern::Variable(v) => sol.get(v.as_str()).map(|b| b.value.clone()),
+        TermPattern::Variable(v) => sol
+            .get(v.as_str())
+            .and_then(Binding::scalar_value)
+            .map(str::to_owned),
         TermPattern::Triple(_) => None,
     }
 }
@@ -555,7 +580,10 @@ fn resolve_ground_term(term: &GroundTermPattern, sol: &HashMap<String, Binding>)
     match term {
         GroundTermPattern::NamedNode(n) => Some(n.as_str().to_string()),
         GroundTermPattern::Literal(l) => Some(l.value().to_string()),
-        GroundTermPattern::Variable(v) => sol.get(v.as_str()).map(|b| b.value.clone()),
+        GroundTermPattern::Variable(v) => sol
+            .get(v.as_str())
+            .and_then(Binding::scalar_value)
+            .map(str::to_owned),
         GroundTermPattern::Triple(_) => None,
     }
 }
@@ -566,18 +594,8 @@ fn resolve_ground_object(
     sol: &HashMap<String, Binding>,
 ) -> Option<Binding> {
     match term {
-        GroundTermPattern::NamedNode(n) => Some(Binding {
-            binding_type: "uri".into(),
-            value: n.as_str().into(),
-            datatype: None,
-            lang: None,
-        }),
-        GroundTermPattern::Literal(l) => Some(Binding {
-            binding_type: "literal".into(),
-            value: l.value().into(),
-            datatype: Some(l.datatype().as_str().into()),
-            lang: l.language().map(str::to_owned),
-        }),
+        GroundTermPattern::NamedNode(n) => Some(Binding::uri(n.as_str())),
+        GroundTermPattern::Literal(l) => Some(Binding::from_literal(l)),
         GroundTermPattern::Variable(v) => sol.get(v.as_str()).cloned(),
         GroundTermPattern::Triple(_) => None,
     }
@@ -587,7 +605,10 @@ fn resolve_ground_object(
 fn resolve_predicate(pred: &NamedNodePattern, sol: &HashMap<String, Binding>) -> Option<String> {
     match pred {
         NamedNodePattern::NamedNode(n) => Some(n.as_str().to_string()),
-        NamedNodePattern::Variable(v) => sol.get(v.as_str()).map(|b| b.value.clone()),
+        NamedNodePattern::Variable(v) => sol
+            .get(v.as_str())
+            .and_then(Binding::scalar_value)
+            .map(str::to_owned),
     }
 }
 
@@ -638,7 +659,11 @@ fn object_metadata(
             ("literal".into(), dt, lang)
         }
         TermPattern::Variable(v) => match sol.get(v.as_str()) {
-            Some(b) => (b.binding_type.clone(), b.datatype.clone(), b.lang.clone()),
+            Some(b) => (
+                b.kind().to_owned(),
+                b.datatype().map(str::to_owned),
+                b.lang().map(str::to_owned),
+            ),
             None => ("literal".into(), None, None),
         },
         TermPattern::Triple(_) => ("triple".into(), None, None),
@@ -785,8 +810,8 @@ fn write_triple(
 ) -> Result<(), SparqlError> {
     let term =
         triple_store::canonical_term(obj_type, object, datatype.as_deref(), language.as_deref())?;
-    let datatype = &term.datatype;
-    let language = &term.lang;
+    let datatype = term.datatype();
+    let language = term.lang();
     let table_id = triple_store::triples_table_id(keyspace);
     let key = triple_store::checked_partition_key(graph, subject)?;
     let timestamp = std::time::SystemTime::now()

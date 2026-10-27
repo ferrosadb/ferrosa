@@ -99,15 +99,7 @@ mod tests {
     fn evaluate_rdf_star_fails_loud_not_silent_inner_bindings() {
         let inner = vec![{
             let mut m = HashMap::new();
-            m.insert(
-                "s".into(),
-                Binding {
-                    binding_type: "uri".into(),
-                    value: "alice".into(),
-                    datatype: None,
-                    lang: None,
-                },
-            );
+            m.insert("s".into(), Binding::uri("alice"));
             m
         }];
 

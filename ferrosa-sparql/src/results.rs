@@ -2,20 +2,183 @@
 //!
 //! Converts internal binding sets to SPARQL JSON Results format
 //! (`application/sparql-results+json`) per the W3C spec.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Add recursive RDF 1.2 JSON terms without changing scalar storage identity.
 
 use serde::Serialize;
 use std::collections::HashMap;
 
-/// A single variable binding in a SPARQL result row.
+/// Initial text direction for an RDF 1.2 language-tagged literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextDirection {
+    Ltr,
+    Rtl,
+}
+
+/// A recursive RDF triple term. Only the object may itself be a triple term.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
-pub struct Binding {
-    #[serde(rename = "type")]
-    pub binding_type: String, // "uri", "literal", "bnode"
-    pub value: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub datatype: Option<String>,
-    #[serde(rename = "xml:lang", skip_serializing_if = "Option::is_none")]
-    pub lang: Option<String>,
+pub struct TripleBinding {
+    pub subject: Binding,
+    pub predicate: Binding,
+    pub object: Binding,
+}
+
+/// A typed result binding: recursive objects never pass through JSON strings.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(tag = "type")]
+pub enum Binding {
+    #[serde(rename = "uri")]
+    Uri { value: String },
+    #[serde(rename = "bnode")]
+    BlankNode {
+        #[serde(serialize_with = "serialize_blank_label")]
+        value: String,
+    },
+    #[serde(rename = "literal")]
+    Literal {
+        value: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        datatype: Option<String>,
+        #[serde(rename = "xml:lang", skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+        #[serde(rename = "its:dir", skip_serializing_if = "Option::is_none")]
+        direction: Option<TextDirection>,
+    },
+    #[serde(rename = "triple")]
+    Triple { value: Box<TripleBinding> },
+}
+
+fn serialize_blank_label<S: serde::Serializer>(
+    value: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(value.strip_prefix("_:").unwrap_or(value))
+}
+
+/// Borrowed fields of a scalar term accepted by the unchanged persisted v2 codec.
+type ScalarParts<'a> = (&'a str, &'a str, Option<&'a str>, Option<&'a str>);
+
+impl Binding {
+    /// Construct an IRI binding.
+    pub fn uri(value: impl Into<String>) -> Self {
+        Self::Uri {
+            value: value.into(),
+        }
+    }
+    /// Construct a blank node, removing the storage marker from its JSON label.
+    pub fn blank_node(value: impl Into<String>) -> Self {
+        let value = value.into();
+        Self::BlankNode { value }
+    }
+    /// Construct a scalar literal; language metadata implies its RDF datatype.
+    pub fn literal(
+        value: impl Into<String>,
+        datatype: Option<String>,
+        lang: Option<String>,
+    ) -> Self {
+        Self::Literal {
+            value: value.into(),
+            datatype: if lang.is_some() { None } else { datatype },
+            lang,
+            direction: None,
+        }
+    }
+    /// Preserve language and base direction from the parser's typed literal.
+    pub fn from_literal(literal: &oxrdf::Literal) -> Self {
+        let direction = literal.direction().map(|d| match d {
+            oxrdf::BaseDirection::Ltr => TextDirection::Ltr,
+            oxrdf::BaseDirection::Rtl => TextDirection::Rtl,
+        });
+        Self::Literal {
+            value: literal.value().to_owned(),
+            datatype: literal
+                .language()
+                .is_none()
+                .then(|| literal.datatype().as_str().to_owned()),
+            lang: literal.language().map(str::to_owned),
+            direction,
+        }
+    }
+    /// Construct a well-formed triple term, or an expression error for bad positions.
+    pub fn triple(subject: Self, predicate: Self, object: Self) -> Option<Self> {
+        if !matches!(subject, Self::Uri { .. } | Self::BlankNode { .. })
+            || !matches!(predicate, Self::Uri { .. })
+        {
+            return None;
+        }
+        Some(Self::Triple {
+            value: Box::new(TripleBinding {
+                subject,
+                predicate,
+                object,
+            }),
+        })
+    }
+    /// The standard JSON term tag, without allocating a per-binding type string.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Uri { .. } => "uri",
+            Self::BlankNode { .. } => "bnode",
+            Self::Literal { .. } => "literal",
+            Self::Triple { .. } => "triple",
+        }
+    }
+    /// Scalar lexical value; triple terms deliberately have no string-valued payload.
+    pub fn scalar_value(&self) -> Option<&str> {
+        match self {
+            Self::Uri { value } | Self::BlankNode { value } | Self::Literal { value, .. } => {
+                Some(value)
+            }
+            Self::Triple { .. } => None,
+        }
+    }
+    /// Effective RDF datatype of a literal.
+    pub fn datatype(&self) -> Option<&str> {
+        match self {
+            Self::Literal {
+                direction: Some(_), ..
+            } => Some("http://www.w3.org/1999/02/22-rdf-syntax-ns#dirLangString"),
+            Self::Literal { lang: Some(_), .. } => {
+                Some("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString")
+            }
+            Self::Literal { datatype, .. } => datatype.as_deref(),
+            _ => None,
+        }
+    }
+    /// Language tag, when present.
+    pub fn lang(&self) -> Option<&str> {
+        match self {
+            Self::Literal { lang, .. } => lang.as_deref(),
+            _ => None,
+        }
+    }
+    /// Borrow the scalar fields supported by the persisted RDF v2 codec.
+    pub(crate) fn storage_parts(&self) -> Result<ScalarParts<'_>, crate::error::SparqlError> {
+        if self.requires_json12() {
+            return Err(crate::error::SparqlError::Plan(
+                "RDF 1.2 triple/directional terms are not supported by stored RDF v2".into(),
+            ));
+        }
+        Ok((
+            self.kind(),
+            self.scalar_value().expect("scalar binding"),
+            self.datatype(),
+            self.lang(),
+        ))
+    }
+    /// Whether the binding requires the RDF 1.2 result representation.
+    pub fn requires_json12(&self) -> bool {
+        matches!(
+            self,
+            Self::Triple { .. }
+                | Self::Literal {
+                    direction: Some(_),
+                    ..
+                }
+        )
+    }
 }
 
 /// SPARQL JSON Results format (W3C).
@@ -52,8 +215,37 @@ impl SparqlJsonResults {
     }
 
     /// Serialize to JSON bytes.
+    pub(crate) fn requires_json12(&self) -> bool {
+        self.results
+            .bindings
+            .iter()
+            .any(|row| row.values().any(Binding::requires_json12))
+    }
+    /// Serialize using the minimum result-format version required by its terms.
     pub fn to_json(&self) -> Result<Vec<u8>, serde_json::Error> {
-        serde_json::to_vec(self)
+        self.to_json_version(self.requires_json12().then_some("1.2"))
+    }
+
+    /// Serialize an explicitly selected JSON version while borrowing all bindings.
+    pub fn to_json_version(&self, version: Option<&str>) -> Result<Vec<u8>, serde_json::Error> {
+        #[derive(Serialize)]
+        struct Head<'a> {
+            vars: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            version: Option<&'a str>,
+        }
+        #[derive(Serialize)]
+        struct Results<'a> {
+            head: Head<'a>,
+            results: &'a ResultBody,
+        }
+        serde_json::to_vec(&Results {
+            head: Head {
+                vars: &self.head.vars,
+                version,
+            },
+            results: &self.results,
+        })
     }
 }
 
@@ -69,6 +261,10 @@ pub struct SparqlAskResult {
 pub enum ResultFormat {
     /// `application/sparql-results+json` (default for SELECT/ASK).
     Json,
+    /// Explicit RDF 1.2 JSON result representation.
+    Json12,
+    /// Explicit legacy JSON representation; rejects RDF 1.2 terms.
+    Json11,
     /// `application/sparql-results+xml` (SPARQL XML Results Format per W3C).
     Xml,
     /// `text/turtle` (Turtle/N-Triples-like serialization).
@@ -99,6 +295,8 @@ impl ResultFormat {
     pub fn content_type(self) -> &'static str {
         match self {
             Self::Json => "application/sparql-results+json",
+            Self::Json12 => "application/sparql-results+json; version=1.2",
+            Self::Json11 => "application/sparql-results+json; version=1.1",
             Self::Xml => "application/sparql-results+xml",
             Self::Turtle => "text/turtle",
             Self::NTriples => "application/n-triples",
@@ -135,7 +333,7 @@ impl SparqlJsonResults {
                     buf.push_str(&format!(
                         "      <binding name=\"{}\">{}</binding>\n",
                         xml_escape(var),
-                        format_xml_binding(binding)
+                        format_xml_binding(binding)?
                     ));
                 }
             }
@@ -151,7 +349,7 @@ impl SparqlJsonResults {
     ///
     /// Produces a simple tabular rendering: each binding row becomes one
     /// line with subject/predicate/object terms in N-Triples syntax.
-    pub fn to_ntriples(&self) -> Vec<u8> {
+    pub fn to_ntriples(&self) -> Result<Vec<u8>, String> {
         let mut buf = String::new();
         for row in &self.results.bindings {
             let parts: Vec<String> = self
@@ -159,20 +357,20 @@ impl SparqlJsonResults {
                 .vars
                 .iter()
                 .filter_map(|var| row.get(var).map(format_ntriples_term))
-                .collect();
+                .collect::<Result<_, _>>()?;
             if !parts.is_empty() {
                 buf.push_str(&parts.join(" "));
                 buf.push_str(" .\n");
             }
         }
-        buf.into_bytes()
+        Ok(buf.into_bytes())
     }
 
     /// Serialize to a simple Turtle-like format.
     ///
     /// Uses the same N-Triples serialization since Turtle is a superset
     /// of N-Triples. Full Turtle grouping/prefixing is deferred.
-    pub fn to_turtle(&self) -> Vec<u8> {
+    pub fn to_turtle(&self) -> Result<Vec<u8>, String> {
         self.to_ntriples()
     }
 }
@@ -192,57 +390,58 @@ fn xml_escape(s: &str) -> String {
 /// - URI → `<uri>iri</uri>`
 /// - bnode → `<bnode>label</bnode>`
 /// - literal → `<literal [xml:lang] [datatype]>value</literal>`
-fn format_xml_binding(binding: &Binding) -> String {
-    match binding.binding_type.as_str() {
-        "uri" => format!("<uri>{}</uri>", xml_escape(&binding.value)),
-        "bnode" => {
-            // Strip leading "_:" label prefix if present.
-            let label = binding.value.strip_prefix("_:").unwrap_or(&binding.value);
-            format!("<bnode>{}</bnode>", xml_escape(label))
-        }
-        _ => {
-            // Literal — may carry xml:lang or datatype attributes.
-            let lang_attr = binding
-                .lang
-                .as_deref()
-                .map(|l| format!(" xml:lang=\"{}\"", xml_escape(l)))
-                .unwrap_or_default();
-            let dt_attr = binding
-                .datatype
-                .as_deref()
-                .map(|d| format!(" datatype=\"{}\"", xml_escape(d)))
-                .unwrap_or_default();
-            format!(
-                "<literal{lang_attr}{dt_attr}>{}</literal>",
-                xml_escape(&binding.value)
-            )
-        }
+fn format_xml_binding(binding: &Binding) -> Result<String, String> {
+    if binding.requires_json12() {
+        return Err("XML RDF 1.2 terms are not implemented".into());
     }
+    let value = binding.scalar_value().ok_or("non-scalar XML term")?;
+    Ok(match binding {
+        Binding::Uri { .. } => format!("<uri>{}</uri>", xml_escape(value)),
+        Binding::BlankNode { .. } => format!(
+            "<bnode>{}</bnode>",
+            xml_escape(value.strip_prefix("_:").unwrap_or(value))
+        ),
+        Binding::Literal { lang, datatype, .. } => {
+            let attr = if let Some(lang) = lang {
+                format!(" xml:lang=\"{}\"", xml_escape(lang))
+            } else if let Some(dt) = datatype {
+                format!(" datatype=\"{}\"", xml_escape(dt))
+            } else {
+                String::new()
+            };
+            format!("<literal{attr}>{}</literal>", xml_escape(value))
+        }
+        Binding::Triple { .. } => return Err("XML triple terms are not implemented".into()),
+    })
 }
 
-/// Format a binding value as an N-Triples term.
-fn format_ntriples_term(binding: &Binding) -> String {
-    match binding.binding_type.as_str() {
-        "uri" => format!("<{}>", binding.value),
-        "bnode" => {
-            if binding.value.starts_with("_:") {
-                binding.value.clone()
+/// Format only the scalar RDF terms supported by this legacy writer.
+fn format_ntriples_term(binding: &Binding) -> Result<String, String> {
+    if binding.requires_json12() {
+        return Err("N-Triples RDF 1.2 terms are not implemented".into());
+    }
+    let value = binding.scalar_value().ok_or("non-scalar RDF term")?;
+    Ok(match binding {
+        Binding::Uri { .. } => format!("<{value}>"),
+        Binding::BlankNode { .. } => {
+            if value.starts_with("_:") {
+                value.to_owned()
             } else {
-                format!("_:{}", binding.value)
+                format!("_:{value}")
             }
         }
-        _ => {
-            // Literal: optionally with datatype or language tag.
-            let escaped = binding.value.replace('\\', "\\\\").replace('"', "\\\"");
-            if let Some(lang) = &binding.lang {
+        Binding::Literal { lang, datatype, .. } => {
+            let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+            if let Some(lang) = lang {
                 format!("\"{escaped}\"@{lang}")
-            } else if let Some(dt) = &binding.datatype {
+            } else if let Some(dt) = datatype {
                 format!("\"{escaped}\"^^<{dt}>")
             } else {
                 format!("\"{escaped}\"")
             }
         }
-    }
+        Binding::Triple { .. } => return Err("RDF triple terms are not implemented".into()),
+    })
 }
 
 #[cfg(test)]
@@ -264,12 +463,11 @@ mod tests {
         let mut row = HashMap::new();
         row.insert(
             "name".into(),
-            Binding {
-                binding_type: "literal".into(),
-                value: "Alice".into(),
-                datatype: Some("http://www.w3.org/2001/XMLSchema#string".into()),
-                lang: None,
-            },
+            Binding::literal(
+                "Alice",
+                Some("http://www.w3.org/2001/XMLSchema#string".into()),
+                None,
+            ),
         );
         results.add_row(row);
         let json = results.to_json().unwrap();
@@ -317,35 +515,11 @@ mod tests {
     fn ntriples_serialization_uri_binding() {
         let mut results = SparqlJsonResults::new(vec!["s".into(), "p".into(), "o".into()]);
         let mut row = HashMap::new();
-        row.insert(
-            "s".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/alice".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
-        row.insert(
-            "p".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/knows".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
-        row.insert(
-            "o".into(),
-            Binding {
-                binding_type: "uri".into(),
-                value: "http://ex/bob".into(),
-                datatype: None,
-                lang: None,
-            },
-        );
+        row.insert("s".into(), Binding::uri("http://ex/alice"));
+        row.insert("p".into(), Binding::uri("http://ex/knows"));
+        row.insert("o".into(), Binding::uri("http://ex/bob"));
         results.add_row(row);
-        let nt = String::from_utf8(results.to_ntriples()).unwrap();
+        let nt = String::from_utf8(results.to_ntriples().unwrap()).unwrap();
         assert!(
             nt.contains("<http://ex/alice>"),
             "subject must be bracketed IRI"
@@ -367,15 +541,10 @@ mod tests {
         let mut row = HashMap::new();
         row.insert(
             "o".into(),
-            Binding {
-                binding_type: "literal".into(),
-                value: "Alice".into(),
-                datatype: None,
-                lang: Some("en".into()),
-            },
+            Binding::literal("Alice", None, Some("en".into())),
         );
         results.add_row(row);
-        let nt = String::from_utf8(results.to_ntriples()).unwrap();
+        let nt = String::from_utf8(results.to_ntriples().unwrap()).unwrap();
         assert!(
             nt.contains("\"Alice\"@en"),
             "literal must include language tag"
@@ -388,15 +557,14 @@ mod tests {
         let mut row = HashMap::new();
         row.insert(
             "o".into(),
-            Binding {
-                binding_type: "literal".into(),
-                value: "42".into(),
-                datatype: Some("http://www.w3.org/2001/XMLSchema#integer".into()),
-                lang: None,
-            },
+            Binding::literal(
+                "42",
+                Some("http://www.w3.org/2001/XMLSchema#integer".into()),
+                None,
+            ),
         );
         results.add_row(row);
-        let nt = String::from_utf8(results.to_ntriples()).unwrap();
+        let nt = String::from_utf8(results.to_ntriples().unwrap()).unwrap();
         assert!(
             nt.contains("\"42\"^^<http://www.w3.org/2001/XMLSchema#integer>"),
             "literal must include datatype"
@@ -405,12 +573,7 @@ mod tests {
 
     #[test]
     fn format_ntriples_term_bnode() {
-        let b = Binding {
-            binding_type: "bnode".into(),
-            value: "_:b0".into(),
-            datatype: None,
-            lang: None,
-        };
-        assert_eq!(format_ntriples_term(&b), "_:b0");
+        let b = Binding::blank_node("_:b0");
+        assert_eq!(format_ntriples_term(&b).unwrap(), "_:b0");
     }
 }

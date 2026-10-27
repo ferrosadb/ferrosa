@@ -2,6 +2,9 @@
 //!
 //! FILTER's value coercions are intentionally not used here: a BIND result is
 //! an RDF term, including its datatype, language and exact integer value.
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Evaluate TRIPLE and directional constants as typed RDF terms.
 
 use std::collections::HashMap;
 
@@ -24,6 +27,14 @@ pub(crate) fn validate(expr: &Expression) -> Result<(), SparqlError> {
             validate(r)
         }
         Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) => validate(inner),
+        Expression::FunctionCall(spargebra::algebra::Function::Triple, arguments)
+            if arguments.len() == 3 =>
+        {
+            for argument in arguments {
+                validate(argument)?;
+            }
+            Ok(())
+        }
         _ => Err(SparqlError::Plan(format!(
             "unsupported BIND expression: {expr:?}"
         ))),
@@ -38,18 +49,22 @@ pub(crate) fn evaluate(
 ) -> Result<Option<Binding>, SparqlError> {
     let term = match expr {
         Expression::Variable(var) => bindings.get(var.as_str()).cloned(),
-        Expression::Literal(lit) => Some(Binding {
-            binding_type: "literal".into(),
-            value: lit.value().into(),
-            datatype: Some(lit.datatype().as_str().into()),
-            lang: lit.language().map(str::to_owned),
-        }),
-        Expression::NamedNode(iri) => Some(Binding {
-            binding_type: "uri".into(),
-            value: iri.as_str().into(),
-            datatype: None,
-            lang: None,
-        }),
+        Expression::Literal(lit) => Some(Binding::from_literal(lit)),
+        Expression::NamedNode(iri) => Some(Binding::uri(iri.as_str())),
+        Expression::FunctionCall(spargebra::algebra::Function::Triple, arguments)
+            if arguments.len() == 3 =>
+        {
+            let Some(subject) = evaluate(&arguments[0], bindings)? else {
+                return Ok(None);
+            };
+            let Some(predicate) = evaluate(&arguments[1], bindings)? else {
+                return Ok(None);
+            };
+            let Some(object) = evaluate(&arguments[2], bindings)? else {
+                return Ok(None);
+            };
+            Binding::triple(subject, predicate, object)
+        }
         Expression::UnaryPlus(inner) | Expression::UnaryMinus(inner) => {
             let Some(value) = integer_operand(inner, bindings)? else {
                 return Ok(None);
@@ -92,12 +107,7 @@ pub(crate) fn evaluate(
 }
 
 fn literal(value: String, datatype: &str) -> Binding {
-    Binding {
-        binding_type: "literal".into(),
-        value,
-        datatype: Some(format!("{XSD}{datatype}")),
-        lang: None,
-    }
+    Binding::literal(value, Some(format!("{XSD}{datatype}")), None)
 }
 
 fn integer_operand(
@@ -107,11 +117,13 @@ fn integer_operand(
     let Some(term) = evaluate(expr, bindings)? else {
         return Ok(None);
     };
-    if term.binding_type != "literal" || term.lang.is_some() {
+    if term.kind() != "literal" || term.lang().is_some() {
         return Ok(None);
     }
-    match term.datatype.as_deref().and_then(|dt| dt.strip_prefix(XSD)) {
-        Some("integer" | "int" | "long") => Ok(term.value.parse().ok()),
+    match term.datatype().and_then(|dt| dt.strip_prefix(XSD)) {
+        Some("integer" | "int" | "long") => {
+            Ok(term.scalar_value().and_then(|value| value.parse().ok()))
+        }
         Some("decimal" | "float" | "double") => Err(SparqlError::Execution(
             "BIND arithmetic on decimal/float/double operands is not supported".into(),
         )),
