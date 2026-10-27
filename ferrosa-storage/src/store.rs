@@ -6903,9 +6903,11 @@ impl<F: FlushTarget> TableStore<F> {
             {
                 let mut owned = Arc::unwrap_or_clone(p);
                 merge::apply_table_deletion(&mut owned, table_delete);
-                owned
+                std::borrow::Cow::Owned(owned)
             } else {
-                Arc::unwrap_or_clone(p)
+                // Counting observes row metadata; it does not need an owned
+                // copy of every resident cell. Keep the merger's shared view.
+                std::borrow::Cow::Borrowed(p.as_ref())
             };
             total = total.saturating_add(p.rows.len() as u64);
             if p.static_row.is_some() {

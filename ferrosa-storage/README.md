@@ -17,6 +17,22 @@ Every query front-end (CQL, Postgres, SPARQL, Graph) and the cluster layer reach
 data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 (`LocalDataStore` in standalone/pair mode; a cluster-routing impl otherwise).
 
+## Count allocation
+
+Single-source resident counts borrow the immutable Arc-pinned partition instead
+of cloning its Row/Cell metadata. The table-deletion branch still owns its
+filtered value, and overlap/TTL/tombstone handling is unchanged. The allocation
+regression varies row width independently of payload size; this removes metadata
+copies and does not introduce an O(1) row counter.
+
+At baseline `5b8356172`, the 32-row allocation fixture requested 5,467 bytes for
+one column and 462,427 for 256 columns. After borrowing the pinned partition,
+both requested 1,083 bytes. The predicate-count fixture changed from
+3,275/231,755 to 1,083/1,083 bytes. These are requested allocator bytes in a
+warmed fixture, not RSS or an end-to-end latency claim. The separate payload-size
+controls already passed before the fix (`tests/count_payload_alloc.rs`).
+
+
 ## What's implemented
 
 - **Write observers** — synchronous derivation borrows the write's mutation;

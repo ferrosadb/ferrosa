@@ -529,3 +529,11 @@ clean tables.
 Set-aside replay retains the exclusive recovery checkpoint gate through its
 durability flush. It uses the guarded flush body directly, avoiding recursive
 read-lock acquisition while retaining the SSTable and WAL durability ordering.
+
+## Count allocation and result-boundary regression coverage (2026-10-27)
+
+The resident single-source count path borrows its Arc-pinned partition. It no
+longer clones the unrelated Row/Cell metadata vector; table-deletion shadowing
+still uses an owned filtered partition. Allocation guards vary column width and
+payload size independently. Counts remain O(N); TTL, tombstone and overlap
+semantics retain their existing read/merge rules.
