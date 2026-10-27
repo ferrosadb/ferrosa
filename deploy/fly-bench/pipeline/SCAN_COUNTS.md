@@ -1,5 +1,20 @@
 # Count and bounded-scan ownership audit
 
+The branch now includes PostgreSQL single-row COUNT pushdown (`148870d00`).
+Eligible unfiltered `COUNT(*)` counts keys/liveness and reconciles MVCC without
+constructing SQL payload rows or using the row channel. TTL/deletion exceptions
+reread pinned physical sources to preserve LWW visibility. Other query/table
+shapes use the ordinary scan. **No matched Fly measurement of this new path has
+run yet.** The timings and remaining-cost discussion below describe measured
+runtime `a2709e100`; they must not be presented as results for the new code.
+
+The published scan rate is a fully consumed, bounded query: the primary probe
+runs one serial scan per observation after warming, rather than measuring
+maximum sustained scan throughput. Same-protocol pairs request the same fields,
+payload width and limit through the same driver. Across protocols, table sizes,
+fetching and query work differ (SPARQL uses a three-pattern join), so the four
+scan rows/s figures are not interchangeable storage-bandwidth measurements.
+
 The first measured candidate (`c24cad554`) still had avoidable work in SQL and
 SPARQL. The follow-up at `a2709e100` removes three costs. Throughput tables must
 retain their measured source identity until the new Fly run is accepted.

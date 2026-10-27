@@ -1,5 +1,11 @@
 # Current performance: PR #625
 
+COUNT pushdown was added after these measurements (`148870d00`); its Fly/native
+comparison is pending. The table remains the measured `a2709e100` runtime.
+Scan rows/s describes bounded, fully consumed query delivery, not sustained
+maximum scan throughput. See [COUNT and scan scope](SCAN_COUNTS.md).
+
+
 Measured 2026-10-27 UTC on code `a2709e100cb016e46b51df7b2052a468c8ef16a2`.
 Each Ferrosa/native pair ran on the **same physical Fly VM, filesystem and network destination**, with matched 2-performance-vCPU/4-GiB guests. One timed workload ran at a time. These are short, warm end-to-end measurements, not maximum sustained capacity or durability equivalence.
 
