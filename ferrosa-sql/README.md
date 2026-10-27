@@ -323,3 +323,7 @@ adds no new dependency. Table projections and precision arguments are unchanged.
 ## Single-row COUNT pushdown
 
 Eligible unfiltered, single-table `COUNT(*)` calls the optional `TableProvider::count_all` capability before opening a row cursor. Aliases, BIGINT overflow checking, LIMIT and OFFSET retain normal semantics. WHERE, joins, grouping, HAVING, DISTINCT, ORDER BY and COUNT(expression) use the ordinary executor. Unsupported capabilities return `None`; a source error fails the statement rather than falling back to a potentially different answer.
+
+## Immutable scalar scan values
+
+`Value::Text` is immutable `ferrosa_common::SharedText`; `Value::Bytea` is immutable `CellBytes`. Clone and repeated projection share payload backing. Comparisons, ordering, hashing and JSON spill representation retain value semantics, with legacy string/byte-array fixtures. Construct owned strings and vectors with `.into()` to transfer their buffers. Mutable string/byte transformations create new values explicitly. The direct dependency on ferrosa-common supplies these shared value types.

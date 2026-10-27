@@ -111,3 +111,9 @@ Refusals are typed (T-151): `decode_value` validates once and returns a `RowBrid
 ## Single-row COUNT pushdown
 
 Row visibility delegates to the SSTable `Row::is_visible_at` predicate, keeping TTL and row-deletion visibility identical between SQL row decoding and the single-row metadata count path. This changes ownership of the shared predicate, not its visibility rules.
+
+## Immutable scalar scan values
+
+Scalar text/blob values retain immutable cell backing through borrowed and consuming row decoders. Consuming simple rows with unique ordered column ordinals and no nonempty static row also avoid the per-row grouping map; static rows, collection-element paths and duplicate/noncanonical ordinals retain existing assembly. UTF-8, TTL, tombstone and corruption behavior still fail or filter through the same typed row-error contract. PostgreSQL and CQL can move `SharedText`/`CellBytes` into their runtime values without converting them back to String/Vec. Collection reconstruction and actual value transformations can still allocate.
+
+The PostgreSQL consumer pulls owned rows lazily from `OwnedPartitionRows`, without collecting a second decoded partition buffer. A decoding failure terminates the iterator and records a statement failure; a streamed prefix never becomes a successful truncated result.

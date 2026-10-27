@@ -286,7 +286,7 @@ fn read_value(reader: pg_mvcc_value::Reader<'_>) -> Result<Value, String> {
         {
             op::NullValue(()) => Value::Null,
             op::IntValue(inner) => Value::Int(inner),
-            op::TextValue(text) => Value::Text(read_text(text, "text value")?),
+            op::TextValue(text) => Value::Text(read_text(text, "text value")?.into()),
             op::BoolValue(inner) => Value::Bool(inner),
             op::FloatValue(bits) => Value::float(f64::from_bits(bits)),
             op::UuidValue(bytes) => {
@@ -300,7 +300,7 @@ fn read_value(reader: pg_mvcc_value::Reader<'_>) -> Result<Value, String> {
             op::ByteaValue(bytes) => {
                 let bytes =
                     bytes.map_err(|error| format!("read PostgreSQL MVCC bytea value: {error}"))?;
-                Value::Bytea(bytes.to_vec())
+                Value::Bytea(bytes.to_vec().into())
             }
             op::TimestampValue(micros) => Value::Timestamp(micros),
             op::DateValue(days) => Value::Date(days),
@@ -398,7 +398,7 @@ mod tests {
             Value::Uuid(uuid::Uuid::from_u128(
                 0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10,
             )),
-            Value::Bytea(vec![0, 255, 128, 7]),
+            Value::Bytea(vec![0, 255, 128, 7].into()),
             Value::Timestamp(1_700_000_000_000_000),
             Value::Date(-1),
             Value::Time(86_399_999_999),

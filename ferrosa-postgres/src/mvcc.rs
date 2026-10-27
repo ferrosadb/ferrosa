@@ -1364,7 +1364,8 @@ fn value_heap_bytes(value: &Value) -> usize {
         | Value::Time(_)
         | Value::Inet(_) => 0,
         Value::Bytea(bytes) => bytes.len(),
-        Value::Text(text) | Value::JsonPath(text) => text.len(),
+        Value::Text(text) => text.len(),
+        Value::JsonPath(text) => text.len(),
         Value::Numeric { unscaled, .. } => unscaled.to_signed_bytes_le().len(),
         Value::Jsonb(doc) => doc.as_bytes().len(),
         Value::TextArray(items) => items
@@ -1546,7 +1547,7 @@ mod tests {
     }
 
     fn row(value: &str) -> Row {
-        Row::new(vec![Value::Text(value.to_string())])
+        Row::new(vec![Value::Text(value.to_string().into())])
     }
 
     fn assert_snapshot_row(

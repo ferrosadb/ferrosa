@@ -12,8 +12,8 @@ fn text_pointer(row: &Row, column: usize) -> *const u8 {
 #[test]
 fn fallible_projection_moves_reordered_payloads() {
     let input = Row(vec![
-        Value::Text("first".repeat(1000)),
-        Value::Text("second".repeat(1000)),
+        Value::Text("first".repeat(1000).into()),
+        Value::Text("second".repeat(1000).into()),
     ]);
     let pointers = [text_pointer(&input, 0), text_pointer(&input, 1)];
     let output = try_project(Box::new(std::iter::once(Ok(input))), vec![1, 0])
@@ -22,12 +22,12 @@ fn fallible_projection_moves_reordered_payloads() {
         .unwrap();
     assert_eq!(text_pointer(&output, 0), pointers[1]);
     assert_eq!(text_pointer(&output, 1), pointers[0]);
-    assert_eq!(output.0[0], Value::Text("second".repeat(1000)));
+    assert_eq!(output.0[0], Value::Text("second".repeat(1000).into()));
 }
 
 #[test]
 fn repeated_projection_moves_one_copy_and_preserves_both_values() {
-    let input = Row(vec![Value::Text("payload".repeat(1000))]);
+    let input = Row(vec![Value::Text("payload".repeat(1000).into())]);
     let pointer = text_pointer(&input, 0);
     let output = project(Box::new(std::iter::once(input)), vec![0, 0])
         .next()

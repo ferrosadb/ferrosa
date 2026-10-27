@@ -1401,7 +1401,7 @@ mod tests {
             .rows
             .iter()
             .map(|row| match row.get(0) {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 other => panic!("expected text, got {other:?}"),
             })
             .collect();

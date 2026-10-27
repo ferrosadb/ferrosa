@@ -73,7 +73,7 @@ fn column_major(ncols: usize, nrows: usize) -> Vec<Vec<Cell>> {
     (0..ncols)
         .map(|c| {
             (0..nrows)
-                .map(|i| Some(CqlValue::Text(format!("col{c}-row{i:06}"))))
+                .map(|i| Some(CqlValue::Text(format!("col{c}-row{i:06}").into())))
                 .collect()
         })
         .collect()

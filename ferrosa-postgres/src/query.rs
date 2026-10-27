@@ -91,7 +91,7 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
     let text = match value {
         SqlValue::Null => return Ok(None),
         SqlValue::Int(i) => i.to_string().into_bytes(),
-        SqlValue::Text(s) => s.clone().into_bytes(),
+        SqlValue::Text(s) => s.as_bytes().to_vec(),
         SqlValue::Bool(b) => {
             if *b {
                 b"t".to_vec()
@@ -425,7 +425,7 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
             }
         }
         // text / varchar / name; OID 0 (unspecified) is text too.
-        0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string())),
+        0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string().into())),
         16 => decode_bool_text(s).ok_or_else(|| bad("not a boolean")),
         700 | 701 => s
             .trim()
@@ -568,7 +568,7 @@ fn decode_bytea_hex_text(s: &str) -> Option<SqlValue> {
         let lo = hex_value(pair[1])?;
         bytes.push((hi << 4) | lo);
     }
-    Some(SqlValue::Bytea(bytes))
+    Some(SqlValue::Bytea(bytes.into()))
 }
 
 /// Parse a single ASCII hex digit (case-insensitive) into its 0..=15 value.
@@ -601,7 +601,7 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
         21 => int(2).map(SqlValue::Int),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => std::str::from_utf8(raw)
-            .map(|s| SqlValue::Text(s.to_string()))
+            .map(|s| SqlValue::Text(s.to_string().into()))
             .map_err(|_| bad("value is not valid UTF-8")),
         // bool: exactly one byte, any non-zero byte is true.
         16 => match raw {
@@ -620,7 +620,7 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
             .map(SqlValue::Uuid)
             .map_err(|_| bad("wrong length")),
         // bytea: the raw bytes, copied verbatim.
-        17 => Ok(SqlValue::Bytea(raw.to_vec())),
+        17 => Ok(SqlValue::Bytea(raw.to_vec().into())),
         // timestamp / timestamptz (1114 / 1184): BE i64 micros since the Postgres epoch
         // (2000-01-01). Shift to the Unix-epoch micros our `Value` carries.
         1114 | 1184 => int(8)?
@@ -768,14 +768,14 @@ pub fn encode_value(
     Ok(match v {
         SqlValue::Null => None,
         SqlValue::Int(i) => Some(encode_int_binary(col_type, *i)?),
-        SqlValue::Text(s) => Some(s.clone().into_bytes()),
+        SqlValue::Text(s) => Some(s.as_bytes().to_vec()),
         SqlValue::Bool(b) => Some(vec![u8::from(*b)]),
         // Floats are advertised as float8 (OID 701); emit 8-byte BE bits.
         SqlValue::Float(of) => Some(of.0.to_be_bytes().to_vec()),
         // uuid (OID 2950): its 16 big-endian bytes.
         SqlValue::Uuid(u) => Some(u.as_bytes().to_vec()),
         // bytea (OID 17): the raw bytes verbatim.
-        SqlValue::Bytea(bytes) => Some(bytes.clone()),
+        SqlValue::Bytea(bytes) => Some(bytes.to_vec()),
         // timestamp (OID 1114): BE i64 micros since the POSTGRES epoch
         // (2000-01-01) — shift our Unix-epoch micros down by the epoch delta.
         SqlValue::Timestamp(micros) => Some(
@@ -1380,7 +1380,7 @@ mod direct_row_tests {
     #[test]
     fn direct_scalar_row_reuses_output_without_allocations() {
         let row = Row(vec![
-            SqlValue::Text("payload".repeat(12)),
+            SqlValue::Text("payload".repeat(12).into()),
             SqlValue::Int(123),
             SqlValue::Bool(true),
             SqlValue::Null,
@@ -1416,7 +1416,7 @@ mod direct_row_tests {
             (SqlValue::Int(7), ColumnType::Int),
             (SqlValue::Bool(false), ColumnType::Bool),
             (SqlValue::Null, ColumnType::Numeric),
-            (SqlValue::Bytea(vec![0, 255]), ColumnType::Bytea),
+            (SqlValue::Bytea(vec![0, 255].into()), ColumnType::Bytea),
             (SqlValue::Int(i64::MAX), ColumnType::Int),
             (SqlValue::Int(42), ColumnType::Numeric),
         ];
@@ -2649,7 +2649,7 @@ fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessag
                 };
                 bytes.push(byte);
             }
-            Ok(SqlValue::Bytea(bytes))
+            Ok(SqlValue::Bytea(bytes.into()))
         }
         // Types whose text form is NOT implemented here. Refused by name rather than guessed,
         // and deliberately not routed through the `42804` catch-all so the message says which
@@ -5131,7 +5131,7 @@ fn concat_text(left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMes
             "concatenation produced bytes with no text representation",
         )
     })?;
-    Ok(SqlValue::Text(text))
+    Ok(SqlValue::Text(text.into()))
 }
 
 /// Evaluate a zero-arg info/session function. Unsupported names fail loud
@@ -5139,9 +5139,11 @@ fn concat_text(left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMes
 fn eval_scalar_func(name: &str, default_schema: &str) -> Result<SqlValue, BackendMessage> {
     match name {
         // Keep in step with the `server_version` ParameterStatus (connection.rs).
-        "VERSION" => Ok(SqlValue::Text("PostgreSQL 16.0 (ferrosa)".to_string())),
+        "VERSION" => Ok(SqlValue::Text(
+            "PostgreSQL 16.0 (ferrosa)".to_string().into(),
+        )),
         "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" => {
-            Ok(SqlValue::Text(default_schema.to_string()))
+            Ok(SqlValue::Text(default_schema.to_string().into()))
         }
         other => Err(error_response(
             "0A000",
@@ -5856,11 +5858,11 @@ mod tests {
     #[test]
     fn bytea_text_render_is_postgres_hex() {
         assert_eq!(
-            rv(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])),
+            rv(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef].into())),
             Some(b"\\xdeadbeef".to_vec())
         );
         // Empty bytea ⇒ just the `\x` prefix.
-        assert_eq!(rv(&SqlValue::Bytea(vec![])), Some(b"\\x".to_vec()));
+        assert_eq!(rv(&SqlValue::Bytea(vec![].into())), Some(b"\\x".to_vec()));
     }
 
     #[test]
@@ -5883,9 +5885,9 @@ mod tests {
     #[test]
     fn bytea_binary_encode_is_raw_bytes_and_round_trips() {
         let raw = vec![0x00, 0x01, 0xff, 0x10];
-        let enc = encode_value(1, ColumnType::Bytea, &SqlValue::Bytea(raw.clone())).unwrap();
+        let enc = encode_value(1, ColumnType::Bytea, &SqlValue::Bytea(raw.clone().into())).unwrap();
         assert_eq!(enc, raw);
-        assert_eq!(decode_param(1, 17, Some(&enc)), SqlValue::Bytea(raw));
+        assert_eq!(decode_param(1, 17, Some(&enc)), SqlValue::Bytea(raw.into()));
     }
 
     #[test]
@@ -5901,10 +5903,13 @@ mod tests {
     fn bytea_text_decode_parses_hex_prefixed() {
         assert_eq!(
             decode_param(0, 17, Some(b"\\xdeadbeef")),
-            SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])
+            SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef].into())
         );
         // Empty hex.
-        assert_eq!(decode_param(0, 17, Some(b"\\x")), SqlValue::Bytea(vec![]));
+        assert_eq!(
+            decode_param(0, 17, Some(b"\\x")),
+            SqlValue::Bytea(vec![].into())
+        );
     }
 
     #[test]
@@ -6296,7 +6301,7 @@ mod tests {
         let row = &result.rows[0].0;
         assert_eq!(row[0], SqlValue::Int(1));
         assert!(matches!(&row[1], SqlValue::Text(s) if s.contains("ferrosa")));
-        assert_eq!(row[2], SqlValue::Text("myks".to_string()));
+        assert_eq!(row[2], SqlValue::Text("myks".to_string().into()));
     }
 
     /// A COPY payload has no types at all: every field arrives as text and the destination COLUMN
@@ -6307,8 +6312,9 @@ mod tests {
     fn text_has_a_form_for_every_scalar_column_type() {
         use ferrosa_common::CqlValue as C;
         let limits = crate::jsonb_wire::test_limits();
-        let c =
-            |text: &str, ty: &CqlType| value_to_cql(&SqlValue::Text(text.to_string()), ty, &limits);
+        let c = |text: &str, ty: &CqlType| {
+            value_to_cql(&SqlValue::Text(text.to_string().into()), ty, &limits)
+        };
         assert_eq!(c("42", &CqlType::Int).unwrap(), C::Int(42));
         assert_eq!(c("-7", &CqlType::Bigint).unwrap(), C::Bigint(-7));
         assert_eq!(c("5", &CqlType::Smallint).unwrap(), C::Smallint(5));
@@ -6332,7 +6338,7 @@ mod tests {
         );
         assert_eq!(
             c("\\x0a0b", &CqlType::Blob).unwrap(),
-            C::Blob(vec![0x0a, 0x0b])
+            C::Blob(vec![0x0a, 0x0b].into())
         );
         // The decimal text form still works, through the same recursion.
         assert!(c("1.5", &CqlType::Decimal).is_ok());
@@ -6351,7 +6357,7 @@ mod tests {
             ("999.1.1.1", CqlType::Inet),
             ("\\x0", CqlType::Blob),
         ] {
-            let err = value_to_cql(&SqlValue::Text(text.to_string()), &ty, &limits)
+            let err = value_to_cql(&SqlValue::Text(text.to_string().into()), &ty, &limits)
                 .expect_err(&format!("`{text}` into {ty:?} must be refused"));
             assert!(
                 format!("{err:?}").contains("22P02"),
@@ -6367,7 +6373,7 @@ mod tests {
     fn a_column_type_without_a_text_form_is_refused_by_name() {
         let limits = crate::jsonb_wire::test_limits();
         let err = value_to_cql(
-            &SqlValue::Text("2024-01-01".to_string()),
+            &SqlValue::Text("2024-01-01".to_string().into()),
             &CqlType::Timestamp,
             &limits,
         )
@@ -6411,7 +6417,7 @@ mod tests {
                 &crate::jsonb_wire::test_limits()
             )
             .unwrap(),
-            C::Text("x".to_string())
+            C::Text("x".to_string().into())
         );
         assert_eq!(
             value_to_cql(
@@ -6570,14 +6576,18 @@ mod tests {
             // The column is text even though the value is NULL.
             assert_eq!(column_type_oid(result.columns[0].ty), 25, "{sql}");
             assert_eq!(result.rows[0].0[0], SqlValue::Null, "{sql}");
-            assert_ne!(result.rows[0].0[0], SqlValue::Text(String::new()), "{sql}");
+            assert_ne!(
+                result.rows[0].0[0],
+                SqlValue::Text(String::new().into()),
+                "{sql}"
+            );
         }
         // Control: an empty string really is an empty string.
         let items = parsed_scalar_items("SELECT '' || ''");
         let result = execute_scalar_select(&items, bare_ctx("ks"))
             .await
             .expect("evaluate");
-        assert_eq!(result.rows[0].0[0], SqlValue::Text(String::new()));
+        assert_eq!(result.rows[0].0[0], SqlValue::Text(String::new().into()));
     }
 
     #[tokio::test]

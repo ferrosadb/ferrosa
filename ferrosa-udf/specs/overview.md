@@ -127,3 +127,7 @@ graph.
 ## jsonb (T-150)
 
 `convert::cql_to_wit` now returns `Result`: a `Jsonb` value (top level or nested) is a typed `UdfError::TypeMismatch` because the WIT contract has no jsonb case (T-150).
+
+## Immutable scalar scan values
+
+CQL runtime text/blob values now use immutable shared backing. WIT/component ABI conversion still produces the owned String/Vec values required by that ABI and explicitly converts returned owned values into shared runtime values. These boundary conversions preserve the existing ABI and do not imply that the ordinary scalar scan path invokes a UDF or copies values through its ABI.

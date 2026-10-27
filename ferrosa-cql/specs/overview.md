@@ -272,3 +272,7 @@ version 1) around the raw scan position and cumulative LIMIT progress. Older
 coordinators reject this envelope instead of interpreting its key as an offset.
 Resume an in-flight limited query from its first page if a coordinator rejects
 its token after an upgrade; unlimited scan tokens retain their existing format.
+
+## Immutable scalar scan values
+
+Plain scalar projection consumes decoded page rows. Identity projection retains the page and row buffers; reordered projection moves cells, and repeated immutable payloads share backing. LIMIT and paging move selected rows rather than cloning a page. Function/UDF/toJson evaluation retains the established evaluation path. Scalar text/blob decoding shares immutable storage backing; wire framing still appends bytes into bounded response buffers. This does not promise end-to-end zero-copy network writes. Page sizes, cursors, row ordering and total-query LIMIT semantics remain unchanged.

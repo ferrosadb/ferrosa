@@ -8,8 +8,12 @@ use std::sync::Arc;
 fn scalar_count_and_sum_need_no_spill_storage() {
     let file = tempfile::NamedTempFile::new().unwrap();
     let ctx = SpillCtx::new(Arc::new(DirReserver::new(file.path())), 1);
-    let rows: TryRowStream<'static> =
-        Box::new((0..1000).map(|i| Ok(Row(vec![Value::Int(i), Value::Text("x".repeat(4096))]))));
+    let rows: TryRowStream<'static> = Box::new((0..1000).map(|i| {
+        Ok(Row(vec![
+            Value::Int(i),
+            Value::Text("x".repeat(4096).into()),
+        ]))
+    }));
     let started = std::time::Instant::now();
     let result = hash_aggregate(
         rows,

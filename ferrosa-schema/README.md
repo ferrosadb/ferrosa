@@ -167,3 +167,7 @@ The registry exposes `lifecycle_read()` for synchronous validation plus physical
 Snapshot import adopts an incoming different table UUID and removes superseded index metadata. The registry owns no storage: callers must retire the old physical incarnation under the write fence before publishing this replacement. Same-UUID imports preserve the existing definition.
 
 Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.
+
+## Immutable scalar scan values
+
+System-schema metadata uses the immutable shared text/blob variants of the common CQL runtime value type. Schema statement formatting still explicitly produces owned textual CQL literals. Schema metadata contents, encoding and persistence contracts remain unchanged.

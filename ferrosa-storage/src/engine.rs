@@ -36651,7 +36651,7 @@ mod tests {
             Some(CqlValue::Set(
                 members
                     .iter()
-                    .map(|m| CqlValue::Text(m.to_string()))
+                    .map(|m| CqlValue::Text(m.to_string().into()))
                     .collect(),
             ))
         };

@@ -594,9 +594,9 @@ mod validation_tests {
     #[test]
     fn physical_validation_does_not_materialize_payloads() {
         let row = vec![
-            Some(CqlValue::Text("x".repeat(4096))),
-            Some(CqlValue::Ascii("y".repeat(4096))),
-            Some(CqlValue::Blob(vec![7; 4096])),
+            Some(CqlValue::Text("x".repeat(4096).into())),
+            Some(CqlValue::Ascii("y".repeat(4096).into())),
+            Some(CqlValue::Blob(vec![7; 4096].into())),
             Some(CqlValue::Int(12)),
             None,
         ];
@@ -686,25 +686,24 @@ async fn produce_scan(
         // Mirror the CQL SELECT path: one engine row per logical CQL row, with
         // values in the table's declared column order. The decomposition is
         // per-partition, so this holds one partition's rows, not the table's.
-        let cql_rows = match ferrosa_row_bridge::partition_to_rows_with_storage_mapping(
-            &partition,
+        let cql_rows = ferrosa_row_bridge::into_partition_rows_with_storage_mapping(
+            partition,
             &ctx.col_names,
             &ctx.col_types,
             &ctx.pk_idx,
             &ctx.ck_idx,
             &ctx.storage_to_table,
-        ) {
-            Ok(rows) => rows,
-            Err(error) => {
-                // A corrupt cell fails the query. It must never surface as a
-                // NULL or a truncated result (PG-Tcf7ca2cc).
-                let error =
-                    error.in_table(format!("{}.{}", ctx.table_id.keyspace, ctx.table_id.table));
-                failure.record(format!("scan failed: {error}"));
-                return;
-            }
-        };
-        for cql_row in cql_rows {
+        );
+        for decoded in cql_rows {
+            let (_, cql_row) = match decoded {
+                Ok(row) => row,
+                Err(error) => {
+                    let error =
+                        error.in_table(format!("{}.{}", ctx.table_id.keyspace, ctx.table_id.table));
+                    failure.record(format!("scan failed: {error}"));
+                    return;
+                }
+            };
             if let Err(error) = validate_decoded_row(&cql_row) {
                 failure.record(format!(
                     "scan of {}.{} cannot represent a stored value: {error}",
@@ -1522,6 +1521,59 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    #[test]
+    fn shared_cell_payload_survives_cql_sql_conversion_and_clone() {
+        for ty in [CqlType::Varchar, CqlType::Blob] {
+            let cell = ferrosa_common::cell::CellValue::live(vec![b'x'; 4096], 1000);
+            let sibling = cell.value.as_ref().unwrap().clone();
+            let original = sibling.as_ref().as_ptr();
+            let partition = ferrosa_sstable::types::Partition {
+                key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                    1i32.to_be_bytes().to_vec(),
+                )),
+                deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                static_row: None,
+                rows: vec![ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(0, cell)],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1000,
+                    ),
+                }],
+            };
+            let mut values = None;
+            ferrosa_row_bridge::consume_partition_rows_with_clustering(
+                partition,
+                &["pk".into(), "value".into()],
+                &[CqlType::Int, ty],
+                &[0],
+                &[],
+                &[1],
+                |_, _, row| {
+                    values = Some(super::decoded_row_values(row).unwrap());
+                    std::ops::ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+            let values = values.unwrap();
+            let clone = values.clone();
+            for values in [&values, &clone] {
+                let bytes: &[u8] = match &values[1] {
+                    Value::Text(text) => text.as_bytes(),
+                    Value::Bytea(bytes) => bytes.as_ref(),
+                    other => panic!("unexpected payload: {other:?}"),
+                };
+                assert_eq!(
+                    bytes.as_ptr(),
+                    original,
+                    "payload copied across CQL/SQL or clone"
+                );
+                assert_eq!(bytes, sibling.as_ref());
+            }
+        }
+    }
+
     // ── Pure conversion tests (no infra) ──────────────────────────────────
 
     #[test]
@@ -1538,17 +1590,17 @@ mod tests {
             (blob.as_ptr(), blob.capacity()),
         ];
         let values = super::decoded_row_values(vec![
-            Some(CqlValue::Text(text)),
-            Some(CqlValue::Ascii(ascii)),
-            Some(CqlValue::Blob(blob)),
+            Some(CqlValue::Text(text.into())),
+            Some(CqlValue::Ascii(ascii.into())),
+            Some(CqlValue::Blob(blob.into())),
             None,
             Some(CqlValue::Int(42)),
         ])
         .unwrap();
         for (value, (pointer, capacity)) in values.iter().zip(allocations) {
             let (actual_pointer, actual_capacity) = match value {
-                Value::Text(text) => (text.as_ptr(), text.capacity()),
-                Value::Bytea(bytes) => (bytes.as_ptr(), bytes.capacity()),
+                Value::Text(text) => (text.as_ptr(), text.retained_capacity()),
+                Value::Bytea(bytes) => (bytes.as_ptr(), bytes.retained_capacity()),
                 _ => panic!("expected an owned payload"),
             };
             assert_eq!(actual_pointer, pointer, "payload must move without a copy");
@@ -1575,7 +1627,7 @@ mod tests {
             CqlValue::Double((-0.0_f64).to_bits()),
             CqlValue::Uuid(Uuid::nil()),
             CqlValue::Timeuuid(Uuid::nil()),
-            CqlValue::Blob(vec![0, 255]),
+            CqlValue::Blob(vec![0, 255].into()),
             CqlValue::Timestamp(1000),
             CqlValue::Timestamp(i64::MAX),
             CqlValue::Date(u32::MAX),
@@ -1613,12 +1665,12 @@ mod tests {
         assert_eq!(cql_to_value(&CqlValue::Smallint(-3)), Value::Int(-3));
         assert_eq!(cql_to_value(&CqlValue::Tinyint(5)), Value::Int(5));
         assert_eq!(
-            cql_to_value(&CqlValue::Text("hi".to_string())),
-            Value::Text("hi".to_string())
+            cql_to_value(&CqlValue::Text("hi".to_string().into())),
+            Value::Text("hi".to_string().into())
         );
         assert_eq!(
-            cql_to_value(&CqlValue::Ascii("a".to_string())),
-            Value::Text("a".to_string())
+            cql_to_value(&CqlValue::Ascii("a".to_string().into())),
+            Value::Text("a".to_string().into())
         );
         assert_eq!(cql_to_value(&CqlValue::Boolean(true)), Value::Bool(true));
     }
@@ -1675,8 +1727,8 @@ mod tests {
         assert_eq!(cql_to_value(&CqlValue::Uuid(u)), Value::Uuid(u));
         assert_eq!(cql_to_value(&CqlValue::Timeuuid(u)), Value::Uuid(u));
         assert_eq!(
-            cql_to_value(&CqlValue::Blob(vec![1, 2, 3])),
-            Value::Bytea(vec![1, 2, 3])
+            cql_to_value(&CqlValue::Blob(vec![1, 2, 3].into())),
+            Value::Bytea(vec![1, 2, 3].into())
         );
     }
 
@@ -1909,6 +1961,46 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn owned_partition_decode_error_fails_statement_after_valid_prefix() {
+        use crate::messages::BackendMessage;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
+        engine.register_table(storage_schema()).unwrap();
+        let schema = schema_with_table();
+        let table = TableId::new("ks", "t");
+        let key = DecoratedKey::new(PartitionKey::new(b"alpha".to_vec()));
+        engine
+            .write(&table, &key, storage_row(1, "valid", 10, 1000), 1000)
+            .unwrap();
+        let mut corrupt = storage_row(2, "bad", 20, 1001);
+        corrupt.cells[0].1 = CellValue::live(vec![0xff], 1001);
+        engine.write(&table, &key, corrupt, 1001).unwrap();
+        for flushed in [false, true] {
+            if flushed {
+                engine.flush_all().unwrap();
+            }
+            let messages = crate::query::execute_query(
+                &engine,
+                &schema,
+                "SELECT id, ck, name, score FROM t",
+                "ks",
+                &crate::jsonb_wire::test_limits(),
+                None,
+            )
+            .await;
+            assert!(messages.iter().any(|message| matches!(message,
+                BackendMessage::ErrorResponse { code, message, .. } if code == "58000" && message.contains("ks.t") && message.contains("name")
+            )), "missing contextual statement failure (flushed={flushed}): {messages:?}");
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, BackendMessage::CommandComplete { .. })),
+                "corrupt stream must not finish successfully: {messages:?}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn load_table_streams_rows_in_declared_order() {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(StorageEngine::new(engine_config(dir.path()), None).unwrap());
@@ -1963,17 +2055,17 @@ mod tests {
         });
 
         // alpha/ck=1 -> ann/10
-        assert_eq!(rows[0].0[0], Value::Text("alpha".to_string()));
+        assert_eq!(rows[0].0[0], Value::Text("alpha".to_string().into()));
         assert_eq!(rows[0].0[1], Value::Int(1));
-        assert_eq!(rows[0].0[2], Value::Text("ann".to_string()));
+        assert_eq!(rows[0].0[2], Value::Text("ann".to_string().into()));
         assert_eq!(rows[0].0[3], Value::Int(10));
         // alpha/ck=2 -> amy/20
         assert_eq!(rows[1].0[1], Value::Int(2));
-        assert_eq!(rows[1].0[2], Value::Text("amy".to_string()));
+        assert_eq!(rows[1].0[2], Value::Text("amy".to_string().into()));
         assert_eq!(rows[1].0[3], Value::Int(20));
         // beta/ck=1 -> bob/30
-        assert_eq!(rows[2].0[0], Value::Text("beta".to_string()));
-        assert_eq!(rows[2].0[2], Value::Text("bob".to_string()));
+        assert_eq!(rows[2].0[0], Value::Text("beta".to_string().into()));
+        assert_eq!(rows[2].0[2], Value::Text("bob".to_string().into()));
         assert_eq!(rows[2].0[3], Value::Int(30));
 
         engine.shutdown().unwrap();

@@ -5508,7 +5508,7 @@ pub(crate) mod txn_atomicity_tests {
         use ferrosa_sql::{ColumnType, Row, Value};
         let mut wire = RecordedWire::default();
         let mut output = BytesMut::with_capacity(RESPONSE_BUFFER_BYTES);
-        let rows = (0..100).map(|_| Row(vec![Value::Text("x".repeat(1024))]));
+        let rows = (0..100).map(|_| Row(vec![Value::Text("x".repeat(1024).into())]));
         let mut sink = SocketSink {
             stream: &mut wire,
             output: &mut output,

@@ -3368,7 +3368,7 @@ fn clear_shim_if(
 fn encode_txn_id_row(id: crate::txn_registry::CqlTxnId) -> BytesMut {
     let names = vec!["txn_id".to_string()];
     let types = vec![CqlType::Varchar];
-    let rows = vec![vec![Some(CqlValue::Text(id.to_string()))]];
+    let rows = vec![vec![Some(CqlValue::Text(id.to_string().into()))]];
     result::encode_rows(&names, &types, "system", "transaction", &rows)
 }
 
@@ -4596,24 +4596,24 @@ async fn route_select(
             let tokens_set: Vec<CqlValue> = info
                 .tokens
                 .iter()
-                .map(|t| CqlValue::Text(t.clone()))
+                .map(|t| CqlValue::Text(t.clone().into()))
                 .collect();
             let row = vec![
-                Some(CqlValue::Text(info.key)),
-                Some(CqlValue::Text(info.cluster_name)),
-                Some(CqlValue::Text(info.data_center)),
-                Some(CqlValue::Text(info.rack)),
+                Some(CqlValue::Text(info.key.into())),
+                Some(CqlValue::Text(info.cluster_name.into())),
+                Some(CqlValue::Text(info.data_center.into())),
+                Some(CqlValue::Text(info.rack.into())),
                 Some(CqlValue::Uuid(info.host_id)),
-                Some(CqlValue::Text(info.partitioner)),
-                Some(CqlValue::Text(info.native_protocol_version)),
-                Some(CqlValue::Text(info.cql_version)),
-                Some(CqlValue::Text(info.release_version)),
+                Some(CqlValue::Text(info.partitioner.into())),
+                Some(CqlValue::Text(info.native_protocol_version.into())),
+                Some(CqlValue::Text(info.cql_version.into())),
+                Some(CqlValue::Text(info.release_version.into())),
                 Some(CqlValue::Uuid(info.schema_version)),
                 Some(CqlValue::Int(info.rpc_port as i32)),
                 Some(CqlValue::Inet(info.listen_address)),
                 Some(CqlValue::Inet(info.broadcast_address)),
                 Some(CqlValue::Inet(info.rpc_address)),
-                Some(CqlValue::Text(info.bootstrapped)),
+                Some(CqlValue::Text(info.bootstrapped.into())),
                 Some(CqlValue::Set(tokens_set)),
             ];
             let (filt_names, filt_types, filt_rows) =
@@ -4734,33 +4734,36 @@ async fn route_select(
             let rows: Vec<Vec<Option<CqlValue>>> = peers
                 .iter()
                 .map(|p| {
-                    let tokens_set: Vec<CqlValue> =
-                        p.tokens.iter().map(|t| CqlValue::Text(t.clone())).collect();
+                    let tokens_set: Vec<CqlValue> = p
+                        .tokens
+                        .iter()
+                        .map(|t| CqlValue::Text(t.clone().into()))
+                        .collect();
                     if is_v2 {
                         vec![
                             Some(CqlValue::Inet(p.peer)),
                             Some(CqlValue::Int(p.peer_port as i32)),
-                            Some(CqlValue::Text(p.data_center.clone())),
-                            Some(CqlValue::Text(p.rack.clone())),
+                            Some(CqlValue::Text(p.data_center.clone().into())),
+                            Some(CqlValue::Text(p.rack.clone().into())),
                             Some(CqlValue::Uuid(p.host_id)),
                             Some(CqlValue::Inet(p.native_address)),
                             Some(CqlValue::Int(p.native_port as i32)),
                             Some(CqlValue::Uuid(p.schema_version)),
-                            Some(CqlValue::Text(p.release_version.clone())),
+                            Some(CqlValue::Text(p.release_version.clone().into())),
                             Some(CqlValue::Set(tokens_set)),
                         ]
                     } else {
                         vec![
                             Some(CqlValue::Inet(p.peer)),
                             Some(CqlValue::Int(p.peer_port as i32)),
-                            Some(CqlValue::Text(p.data_center.clone())),
-                            Some(CqlValue::Text(p.rack.clone())),
+                            Some(CqlValue::Text(p.data_center.clone().into())),
+                            Some(CqlValue::Text(p.rack.clone().into())),
                             Some(CqlValue::Uuid(p.host_id)),
                             Some(CqlValue::Inet(p.native_address)),
                             Some(CqlValue::Int(p.native_port as i32)),
                             Some(CqlValue::Inet(p.native_address)),
                             Some(CqlValue::Uuid(p.schema_version)),
-                            Some(CqlValue::Text(p.release_version.clone())),
+                            Some(CqlValue::Text(p.release_version.clone().into())),
                             Some(CqlValue::Set(tokens_set)),
                         ]
                     }
@@ -4813,11 +4816,14 @@ async fn route_select(
                         .replication
                         .iter()
                         .map(|(key, val)| {
-                            (CqlValue::Text(key.clone()), CqlValue::Text(val.clone()))
+                            (
+                                CqlValue::Text(key.clone().into()),
+                                CqlValue::Text(val.clone().into()),
+                            )
                         })
                         .collect();
                     vec![
-                        Some(CqlValue::Text(k.keyspace_name.clone())),
+                        Some(CqlValue::Text(k.keyspace_name.clone().into())),
                         Some(CqlValue::Boolean(k.durable_writes)),
                         Some(CqlValue::Map(repl_map)),
                     ]
@@ -4896,15 +4902,19 @@ async fn route_select(
                 .iter()
                 .map(|t| {
                     vec![
-                        Some(CqlValue::Text(t.keyspace_name.clone())),
-                        Some(CqlValue::Text(t.table_name.clone())),
+                        Some(CqlValue::Text(t.keyspace_name.clone().into())),
+                        Some(CqlValue::Text(t.table_name.clone().into())),
                         Some(CqlValue::Uuid(t.id)),
                         Some(CqlValue::Boolean(t.cdc)),
                         // Cassandra returns NULL for these on most tables — match.
                         None,
                         None,
                         Some(CqlValue::Set(
-                            t.flags.iter().cloned().map(CqlValue::Text).collect(),
+                            t.flags
+                                .iter()
+                                .cloned()
+                                .map(|value| CqlValue::Text(value.into()))
+                                .collect(),
                         )),
                     ]
                 })
@@ -4970,13 +4980,13 @@ async fn route_select(
                 .iter()
                 .map(|c| {
                     vec![
-                        Some(CqlValue::Text(c.keyspace_name.clone())),
-                        Some(CqlValue::Text(c.table_name.clone())),
-                        Some(CqlValue::Text(c.column_name.clone())),
-                        Some(CqlValue::Text(c.kind.clone())),
+                        Some(CqlValue::Text(c.keyspace_name.clone().into())),
+                        Some(CqlValue::Text(c.table_name.clone().into())),
+                        Some(CqlValue::Text(c.column_name.clone().into())),
+                        Some(CqlValue::Text(c.kind.clone().into())),
                         Some(CqlValue::Int(c.position)),
-                        Some(CqlValue::Text(c.column_type.clone())),
-                        Some(CqlValue::Text(c.clustering_order.clone())),
+                        Some(CqlValue::Text(c.column_type.clone().into())),
+                        Some(CqlValue::Text(c.clustering_order.clone().into())),
                     ]
                 })
                 .collect();
@@ -5040,12 +5050,12 @@ async fn route_select(
                 .iter()
                 .map(|r| {
                     let salted_hash_cell = match (&r.salted_hash, is_superuser_caller) {
-                        (Some(hash), true) => Some(CqlValue::Text(hash.clone())),
-                        (Some(_), false) => Some(CqlValue::Text("[REDACTED]".to_string())),
+                        (Some(hash), true) => Some(CqlValue::Text(hash.clone().into())),
+                        (Some(_), false) => Some(CqlValue::Text("[REDACTED]".to_string().into())),
                         (None, _) => None,
                     };
                     vec![
-                        Some(CqlValue::Text(r.name.clone())),
+                        Some(CqlValue::Text(r.name.clone().into())),
                         Some(CqlValue::Boolean(r.is_superuser)),
                         Some(CqlValue::Boolean(r.can_login)),
                         salted_hash_cell,
@@ -5069,8 +5079,8 @@ async fn route_select(
                 .iter()
                 .map(|r| {
                     vec![
-                        Some(CqlValue::Text(r.role.clone())),
-                        Some(CqlValue::Text(r.member.clone())),
+                        Some(CqlValue::Text(r.role.clone().into())),
+                        Some(CqlValue::Text(r.member.clone().into())),
                     ]
                 })
                 .collect();
@@ -5091,8 +5101,8 @@ async fn route_select(
                 .iter()
                 .map(|r| {
                     vec![
-                        Some(CqlValue::Text(r.role.clone())),
-                        Some(CqlValue::Text(r.resource.clone())),
+                        Some(CqlValue::Text(r.role.clone().into())),
+                        Some(CqlValue::Text(r.resource.clone().into())),
                     ]
                 })
                 .collect();
@@ -5136,16 +5146,18 @@ async fn route_select(
                     let field_names: Vec<CqlValue> = udt
                         .fields
                         .iter()
-                        .map(|(n, _)| CqlValue::Text(n.clone()))
+                        .map(|(n, _)| CqlValue::Text(n.clone().into()))
                         .collect();
                     let field_types: Vec<CqlValue> = udt
                         .fields
                         .iter()
-                        .map(|(_, t)| CqlValue::Text(bridge::cql_type_display_name(t).to_string()))
+                        .map(|(_, t)| {
+                            CqlValue::Text(bridge::cql_type_display_name(t).to_string().into())
+                        })
                         .collect();
                     vec![
-                        Some(CqlValue::Text(udt.keyspace_name.clone())),
-                        Some(CqlValue::Text(udt.type_name.clone())),
+                        Some(CqlValue::Text(udt.keyspace_name.clone().into())),
+                        Some(CqlValue::Text(udt.type_name.clone().into())),
                         Some(CqlValue::List(field_names)),
                         Some(CqlValue::List(field_types)),
                     ]
@@ -5187,11 +5199,13 @@ async fn route_select(
                 .filter(|r| index_row_matches_where(r, &s.where_clauses))
                 .map(|r| {
                     vec![
-                        Some(CqlValue::Text(r.keyspace_name)),
-                        Some(CqlValue::Text(r.table_name)),
-                        Some(CqlValue::Text(r.index_name)),
-                        Some(CqlValue::Text(cassandra_index_kind(&r.kind).to_string())),
-                        Some(CqlValue::Text(r.options)),
+                        Some(CqlValue::Text(r.keyspace_name.into())),
+                        Some(CqlValue::Text(r.table_name.into())),
+                        Some(CqlValue::Text(r.index_name.into())),
+                        Some(CqlValue::Text(
+                            cassandra_index_kind(&r.kind).to_string().into(),
+                        )),
+                        Some(CqlValue::Text(r.options.into())),
                     ]
                 })
                 .collect();
@@ -5370,20 +5384,28 @@ async fn route_select(
                     let arg_types: Vec<CqlValue> = f
                         .arg_types
                         .iter()
-                        .map(|t| CqlValue::Text(bridge::cql_type_display_name(t).to_string()))
+                        .map(|t| {
+                            CqlValue::Text(bridge::cql_type_display_name(t).to_string().into())
+                        })
                         .collect();
-                    let arg_names: Vec<CqlValue> =
-                        f.arg_names.iter().cloned().map(CqlValue::Text).collect();
+                    let arg_names: Vec<CqlValue> = f
+                        .arg_names
+                        .iter()
+                        .cloned()
+                        .map(|value| CqlValue::Text(value.into()))
+                        .collect();
                     vec![
-                        Some(CqlValue::Text(f.keyspace_name)),
-                        Some(CqlValue::Text(f.function_name)),
+                        Some(CqlValue::Text(f.keyspace_name.into())),
+                        Some(CqlValue::Text(f.function_name.into())),
                         Some(CqlValue::List(arg_types)),
                         Some(CqlValue::List(arg_names)),
-                        Some(CqlValue::Text(f.body)),
+                        Some(CqlValue::Text(f.body.into())),
                         Some(CqlValue::Boolean(f.called_on_null)),
-                        Some(CqlValue::Text(f.language)),
+                        Some(CqlValue::Text(f.language.into())),
                         Some(CqlValue::Text(
-                            bridge::cql_type_display_name(&f.return_type).to_string(),
+                            bridge::cql_type_display_name(&f.return_type)
+                                .to_string()
+                                .into(),
                         )),
                     ]
                 })
@@ -8429,8 +8451,15 @@ async fn route_select_user_table_inner(
     }
 
     // Project: column selection, scalar UDFs, toJson().
-    let selected_rows =
-        project_select_rows(state, s, &rows, &all_col_names, &col_names, &resolved_funcs)?;
+    let selected_rows = if s
+        .columns
+        .iter()
+        .all(|column| matches!(column, SelectColumn::Star | SelectColumn::Column(_)))
+    {
+        select_columns_owned(rows, &all_col_names, &col_names)
+    } else {
+        project_select_rows(state, s, &rows, &all_col_names, &col_names, &resolved_funcs)?
+    };
 
     // DISTINCT deduped with a `BTreeSet<Vec<Option<CqlValue>>>`, which keeps a
     // full clone of every distinct row resident — O(distinct rows x row size),
@@ -8486,11 +8515,10 @@ async fn route_select_user_table_inner(
 
     // Apply LIMIT
     let limit_val = s.limit.as_ref().and_then(|l| l.as_literal());
-    let limited = if let Some(limit) = limit_val {
-        &selected_rows[..std::cmp::min(selected_rows.len(), limit as usize)]
-    } else {
-        &selected_rows
-    };
+    let mut selected_rows = selected_rows;
+    if let Some(limit) = limit_val {
+        selected_rows.truncate(limit as usize);
+    }
 
     // Apply pagination: page_size interacts with LIMIT.
     // If both page_size and LIMIT are set, the effective limit is min(page_size, limit).
@@ -8506,15 +8534,15 @@ async fn route_select_user_table_inner(
     // the rows ARE the page and the continuation is the stream cursor.
     let (page_rows, next_paging_state): (Vec<Vec<Option<CqlValue>>>, Option<Vec<u8>>) =
         if let Some(stream_cursor) = streamed_paging_state {
-            (limited.to_vec(), stream_cursor)
+            (selected_rows, stream_cursor)
         } else {
             let paged = crate::paging::apply_pagination(
-                limited.len(),
+                selected_rows.len(),
                 effective_page_size,
                 ctx.paging.paging_state.as_deref(),
             )?;
             (
-                limited[paged.start..paged.end].to_vec(),
+                select_page_rows_owned(selected_rows, paged.start..paged.end),
                 paged.next_paging_state,
             )
         };
@@ -8655,7 +8683,7 @@ fn cell_to_cql_value(
         return Ok(None);
     };
     Ok(Some(match dt {
-        DataType::Text => CqlValue::Text(String::from_utf8_lossy(bytes).into_owned()),
+        DataType::Text => CqlValue::Text(String::from_utf8_lossy(bytes).into_owned().into()),
         DataType::Int => {
             let arr: [u8; 4] = bytes.as_slice().try_into().unwrap_or([0; 4]);
             CqlValue::Int(i32::from_be_bytes(arr))
@@ -8680,7 +8708,7 @@ fn cell_to_cql_value(
             16 => CqlValue::Inet(IpAddr::V6(std::net::Ipv6Addr::from(
                 <[u8; 16]>::try_from(bytes.as_slice()).unwrap_or([0; 16]),
             ))),
-            _ => CqlValue::Blob(bytes.to_vec()),
+            _ => CqlValue::Blob(bytes.to_vec().into()),
         },
         DataType::Timestamp => {
             let arr: [u8; 8] = bytes.as_slice().try_into().unwrap_or([0; 8]);
@@ -8698,10 +8726,10 @@ fn cell_to_cql_value(
             })?;
             CqlValue::Timestamp(ms)
         }
-        DataType::Blob => CqlValue::Blob(bytes.to_vec()),
+        DataType::Blob => CqlValue::Blob(bytes.to_vec().into()),
         // Duration has no virtual-cell decoder yet; it is surfaced as a blob
         // (pre-existing silent fallback, tracked as a fail-loud follow-up).
-        DataType::Duration => CqlValue::Blob(bytes.to_vec()),
+        DataType::Duration => CqlValue::Blob(bytes.to_vec().into()),
     }))
 }
 
@@ -8726,7 +8754,7 @@ fn decode_list_text_cell(cell: &ferrosa_common::CellValue) -> Option<CqlValue> {
         let len = i32::from_be_bytes(bytes[off..off + 4].try_into().ok()?);
         off += 4;
         if len < 0 {
-            items.push(CqlValue::Text(String::new()));
+            items.push(CqlValue::Text(String::new().into()));
             continue;
         }
         let len = len as usize;
@@ -8735,7 +8763,7 @@ fn decode_list_text_cell(cell: &ferrosa_common::CellValue) -> Option<CqlValue> {
         }
         let s = String::from_utf8_lossy(&bytes[off..off + len]).into_owned();
         off += len;
-        items.push(CqlValue::Text(s));
+        items.push(CqlValue::Text(s.into()));
     }
     Some(CqlValue::List(items))
 }
@@ -8933,7 +8961,7 @@ fn route_explain(
 
     let col_names = vec!["plan".to_string()];
     let col_types = vec![CqlType::Varchar];
-    let rows = vec![vec![Some(CqlValue::Text(plan_text))]];
+    let rows = vec![vec![Some(CqlValue::Text(plan_text.into()))]];
     Ok(result::encode_rows(
         &col_names, &col_types, ks, &s.table, &rows,
     ))
@@ -13265,11 +13293,14 @@ async fn route_list_roles(
             let mut members: Vec<String> = r.member_of.iter().cloned().collect();
             members.sort();
             vec![
-                Some(CqlValue::Text(r.name.clone())),
+                Some(CqlValue::Text(r.name.clone().into())),
                 Some(CqlValue::Boolean(r.is_superuser)),
                 Some(CqlValue::Boolean(r.can_login)),
                 Some(CqlValue::Set(
-                    members.into_iter().map(CqlValue::Text).collect(),
+                    members
+                        .into_iter()
+                        .map(|value| CqlValue::Text(value.into()))
+                        .collect(),
                 )),
             ]
         })
@@ -13364,9 +13395,9 @@ async fn route_list_permissions(
                 }
             }
             rows.push(vec![
-                Some(CqlValue::Text(row.role.clone())),
-                Some(CqlValue::Text(row.resource.clone())),
-                Some(CqlValue::Text(perm)),
+                Some(CqlValue::Text(row.role.clone().into())),
+                Some(CqlValue::Text(row.resource.clone().into())),
+                Some(CqlValue::Text(perm.into())),
             ]);
         }
     }
@@ -15224,7 +15255,7 @@ fn apply_system_select(
                     if apply_tojson {
                         let json =
                             bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
-                        agg_row.push(Some(CqlValue::Text(json)));
+                        agg_row.push(Some(CqlValue::Text(json.into())));
                     } else {
                         agg_row.push(val);
                     }
@@ -15261,7 +15292,7 @@ fn apply_system_select(
                         if apply_tojson {
                             let json =
                                 bridge::cql_value_to_json(val.as_ref().unwrap_or(&CqlValue::Null));
-                            Some(CqlValue::Text(json))
+                            Some(CqlValue::Text(json.into()))
                         } else {
                             val
                         }
@@ -15444,7 +15475,7 @@ fn apply_tojson_projections(
                 .and_then(|v| v.as_ref())
                 .unwrap_or(&CqlValue::Null);
             let json = bridge::cql_value_to_json(val);
-            proj_row[proj_idx] = Some(CqlValue::Text(json));
+            proj_row[proj_idx] = Some(CqlValue::Text(json.into()));
         }
     }
 
@@ -15606,6 +15637,58 @@ fn select_columns(
                 .collect()
         })
         .collect()
+}
+
+/// Consume plain projected rows; only repeated output occurrences need copies.
+fn select_columns_owned(
+    rows: Vec<Vec<Option<CqlValue>>>,
+    all_names: &[String],
+    selected: &[String],
+) -> Vec<Vec<Option<CqlValue>>> {
+    if all_names == selected {
+        return rows;
+    }
+    let indices: Vec<Option<usize>> = selected
+        .iter()
+        .map(|name| all_names.iter().position(|candidate| candidate == name))
+        .collect();
+    let mut last_use = vec![usize::MAX; all_names.len()];
+    for (position, index) in indices.iter().enumerate() {
+        if let Some(index) = index {
+            last_use[*index] = position;
+        }
+    }
+    rows.into_iter()
+        .map(|mut row| {
+            indices
+                .iter()
+                .enumerate()
+                .map(|(position, index)| {
+                    index.and_then(|index| {
+                        if last_use[index] == position {
+                            row[index].take()
+                        } else {
+                            row[index].clone()
+                        }
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Move a page's rows, retaining every selected cell allocation.
+fn select_page_rows_owned(
+    mut rows: Vec<Vec<Option<CqlValue>>>,
+    range: std::ops::Range<usize>,
+) -> Vec<Vec<Option<CqlValue>>> {
+    if range.start == 0 {
+        assert!(range.end <= rows.len(), "page end exceeds available rows");
+        rows.truncate(range.end);
+        rows
+    } else {
+        rows.drain(range).collect()
+    }
 }
 
 /// Convert an AST `GrantResource` to a schema `Resource`.
@@ -17033,6 +17116,109 @@ mod tests {
     use ferrosa_cluster::WritePath;
     use ferrosa_schema::NodeConfig;
 
+    #[test]
+    fn scan_owned_projection_reuses_identity_row_and_cell_buffers() {
+        let rows = vec![vec![
+            Some(CqlValue::Text("x".repeat(4096).into())),
+            Some(CqlValue::Blob(vec![7; 4096].into())),
+        ]];
+        let outer = rows.as_ptr();
+        let inner = rows[0].as_ptr();
+        let Some(CqlValue::Text(text)) = &rows[0][0] else {
+            panic!("text")
+        };
+        let text_ptr = text.as_ptr();
+        let Some(CqlValue::Blob(blob)) = &rows[0][1] else {
+            panic!("blob")
+        };
+        let blob_ptr = blob.as_ptr();
+        let names = vec!["text".into(), "blob".into()];
+        let projected = select_columns_owned(rows, &names, &names);
+        assert_eq!(
+            projected.as_ptr(),
+            outer,
+            "identity projection copied outer vector"
+        );
+        assert_eq!(
+            projected[0].as_ptr(),
+            inner,
+            "identity projection copied row cells"
+        );
+        let Some(CqlValue::Text(text)) = &projected[0][0] else {
+            panic!("text")
+        };
+        let Some(CqlValue::Blob(blob)) = &projected[0][1] else {
+            panic!("blob")
+        };
+        assert_eq!(text.as_ptr(), text_ptr, "text payload copied");
+        assert_eq!(blob.as_ptr(), blob_ptr, "blob payload copied");
+    }
+
+    #[test]
+    fn scan_owned_projection_moves_reordered_cells_and_only_clones_duplicates() {
+        let rows = vec![vec![
+            Some(CqlValue::Text("x".repeat(4096).into())),
+            Some(CqlValue::Blob(vec![7; 4096].into())),
+        ]];
+        let Some(CqlValue::Text(text)) = &rows[0][0] else {
+            panic!("text")
+        };
+        let text_ptr = text.as_ptr();
+        let Some(CqlValue::Blob(blob)) = &rows[0][1] else {
+            panic!("blob")
+        };
+        let blob_ptr = blob.as_ptr();
+        let projected = select_columns_owned(
+            rows,
+            &["text".into(), "blob".into()],
+            &[
+                "blob".into(),
+                "text".into(),
+                "text".into(),
+                "missing".into(),
+            ],
+        );
+        let Some(CqlValue::Blob(blob)) = &projected[0][0] else {
+            panic!("blob")
+        };
+        let Some(CqlValue::Text(first)) = &projected[0][1] else {
+            panic!("text")
+        };
+        let Some(CqlValue::Text(last)) = &projected[0][2] else {
+            panic!("text")
+        };
+        assert_eq!(blob.as_ptr(), blob_ptr);
+        assert_eq!(last.as_ptr(), text_ptr);
+        assert_eq!(first, last);
+        assert_eq!(
+            first.as_ptr(),
+            last.as_ptr(),
+            "duplicate immutable values must share payload backing"
+        );
+        assert_eq!(projected[0][3], None);
+    }
+
+    #[test]
+    fn scan_owned_page_keeps_selected_row_and_payload_allocations() {
+        let rows: Vec<_> = (0..3)
+            .map(|n| vec![Some(CqlValue::Blob(vec![n; 4096].into()))])
+            .collect();
+        let row_ptr = rows[1].as_ptr();
+        let Some(CqlValue::Blob(blob)) = &rows[1][0] else {
+            panic!("blob")
+        };
+        let payload_ptr = blob.as_ptr();
+        let page = select_page_rows_owned(rows, 1..2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].as_ptr(), row_ptr, "paging copied row cells");
+        let Some(CqlValue::Blob(blob)) = &page[0][0] else {
+            panic!("blob")
+        };
+        assert_eq!(blob, &vec![1; 4096]);
+        assert_eq!(blob.as_ptr(), payload_ptr, "paging copied cell payload");
+        assert!(select_page_rows_owned(vec![], 0..0).is_empty());
+    }
+
     /// Result cursors: ORDER BY / DISTINCT / function-projection paging.
     mod streaming_results;
 
@@ -18271,7 +18457,7 @@ mod tests {
         );
 
         // Bound, but not an integer: refuse rather than write something that merely looks plausible.
-        let bound = vec![("cur".to_string(), CqlValue::Text("abc".to_string()))];
+        let bound = vec![("cur".to_string(), CqlValue::Text("abc".to_string().into()))];
         let error =
             resolve_bound_operands(&make(Term::IntegerLiteral(1), Some("cur".into())), &bound)
                 .expect_err("a non-integer operand must be refused");
@@ -27655,7 +27841,7 @@ mod tests {
             .iter()
             .map(|r| {
                 let s = |v: &Option<CqlValue>| match v {
-                    Some(CqlValue::Text(t)) => t.clone(),
+                    Some(CqlValue::Text(t)) => t.to_string(),
                     other => panic!("expected text, got {other:?}"),
                 };
                 (s(&r[0]), s(&r[1]))
@@ -27675,7 +27861,7 @@ mod tests {
         for r in &res.rows {
             assert_eq!(
                 r[2],
-                Some(CqlValue::Text("target-entity".to_string())),
+                Some(CqlValue::Text("target-entity".to_string().into())),
                 "returned row must match the indexed predicate"
             );
         }
@@ -29178,8 +29364,10 @@ mod tests {
 
         // A row: id='row1', body='rust programming language'
         let row: Vec<Option<CqlValue>> = vec![
-            Some(CqlValue::Text("row1".to_string())),
-            Some(CqlValue::Text("rust programming language".to_string())),
+            Some(CqlValue::Text("row1".to_string().into())),
+            Some(CqlValue::Text(
+                "rust programming language".to_string().into(),
+            )),
         ];
         let all_col_names: Vec<String> = table_meta.columns.keys().cloned().collect();
         let all_col_types: Vec<CqlType> = all_col_names
@@ -29311,7 +29499,7 @@ mod tests {
             .iter()
             .map(|k| {
                 let dk = bridge::build_decorated_key(
-                    &[CqlValue::Text((*k).to_string())],
+                    &[CqlValue::Text((*k).to_string().into())],
                     &[CqlType::Varchar],
                 )
                 .unwrap();
@@ -29355,7 +29543,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, _)| {
                     if i == id_idx {
-                        Some(CqlValue::Text(key.clone()))
+                        Some(CqlValue::Text(key.clone().into()))
                     } else {
                         Some(CqlValue::Int(0))
                     }
@@ -29813,7 +30001,7 @@ mod tests {
                     cells: vec![(
                         0,
                         ferrosa_common::CellValue::live(
-                            encode_value(&CqlValue::Text("tenant-a".to_string())),
+                            encode_value(&CqlValue::Text("tenant-a".to_string().into())),
                             ts,
                         ),
                     )],
@@ -29901,7 +30089,7 @@ mod tests {
                 cells: vec![(
                     0,
                     ferrosa_common::CellValue::live(
-                        encode_value(&CqlValue::Text("tenant-a".to_string())),
+                        encode_value(&CqlValue::Text("tenant-a".to_string().into())),
                         1,
                     ),
                 )],
@@ -31917,7 +32105,7 @@ mod tests {
         );
         let mut rows = vec![
             vec![
-                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Text("a".to_string().into())),
                 Some(CqlValue::Int(1)),
                 Some(CqlValue::Vector(vec![
                     0.0f32.to_bits(),
@@ -31926,7 +32114,7 @@ mod tests {
                 ])),
             ],
             vec![
-                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Text("a".to_string().into())),
                 Some(CqlValue::Int(2)),
                 Some(CqlValue::Vector(vec![
                     1.0f32.to_bits(),
@@ -31961,7 +32149,7 @@ mod tests {
         let mut rows = vec![
             // embedded, far from the query
             vec![
-                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Text("a".to_string().into())),
                 Some(CqlValue::Int(1)),
                 Some(CqlValue::Vector(vec![
                     0.0f32.to_bits(),
@@ -31971,13 +32159,13 @@ mod tests {
             ],
             // un-embedded: NULL vector — must be skipped, not error
             vec![
-                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Text("a".to_string().into())),
                 Some(CqlValue::Int(99)),
                 None,
             ],
             // embedded, nearest to the query
             vec![
-                Some(CqlValue::Text("a".to_string())),
+                Some(CqlValue::Text("a".to_string().into())),
                 Some(CqlValue::Int(2)),
                 Some(CqlValue::Vector(vec![
                     1.0f32.to_bits(),
@@ -32059,8 +32247,8 @@ mod tests {
         let pk_types = [CqlType::Varchar, CqlType::Varchar];
         let scope = bridge::build_decorated_key(
             &[
-                CqlValue::Text("tenant-a".to_string()),
-                CqlValue::Text("session-1".to_string()),
+                CqlValue::Text("tenant-a".to_string().into()),
+                CqlValue::Text("session-1".to_string().into()),
             ],
             &pk_types,
         )
@@ -33776,7 +33964,7 @@ mod tests {
                     cells: vec![(
                         0,
                         ferrosa_common::CellValue::live(
-                            encode_value(&CqlValue::Text("tenant-a".to_string())),
+                            encode_value(&CqlValue::Text("tenant-a".to_string().into())),
                             ts,
                         ),
                     )],
@@ -36854,7 +37042,7 @@ mod tests {
                     .flatten()
                     .map(|row| {
                         let text_at = |i: usize| match &row[i] {
-                            Some(CqlValue::Text(s)) => s.clone(),
+                            Some(CqlValue::Text(s)) => s.to_string(),
                             other => panic!("expected text at column {i}, got {other:?}"),
                         };
                         (text_at(0), text_at(1))

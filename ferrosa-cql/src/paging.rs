@@ -454,7 +454,7 @@ mod tests {
     // ---- distinct_dedup_key ---------------------------------------------
 
     fn txt(v: &str) -> Option<crate::types::CqlValue> {
-        Some(crate::types::CqlValue::Text(v.to_string()))
+        Some(crate::types::CqlValue::Text(v.to_string().into()))
     }
 
     /// Equal rows must key equal, or DISTINCT emits the same row twice.

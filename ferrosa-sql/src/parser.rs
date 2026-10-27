@@ -1634,7 +1634,7 @@ impl Parser {
         match self.next() {
             Some(Tok::Int(n)) => Ok(Value::Int(n)),
             Some(Tok::Float(f)) => Ok(Value::float(f)),
-            Some(Tok::Str(s)) => Ok(Value::Text(s)),
+            Some(Tok::Str(s)) => Ok(Value::Text(s.into())),
             Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
                 "TRUE" => Ok(Value::Bool(true)),
                 "FALSE" => Ok(Value::Bool(false)),

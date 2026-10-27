@@ -935,3 +935,9 @@ cancellation, original lifetime, idle expiry and pre/post-apply publication.
 ## Single-row COUNT pushdown
 
 Unfiltered `COUNT(*)` on tables with one partition-key column and no clustering/static columns uses a key/liveness count capability. It avoids SQL payload decoding and the per-row producer channel. The physical key pass reconciles sparse own-write and live MVCC before-images, records visited keys, includes historical rows absent from storage, and refuses expired snapshots. Cluster counts retain the requested consistency and replication strategy; an unsupported count capability may use the existing cluster scan, while a count error fails the query. This is a linear scan, not a cached table cardinality. Other table/query shapes retain the normal scan.
+
+## Immutable scalar scan values
+
+Scans consume each owned storage partition through the row bridge, retaining text/blob payload backing in CQL and SQL values. Own writes and MVCC images remain immutable value owners; cloning a text/blob value shares its payload. The direct row encoder borrows these values while appending protocol bytes to its reusable output buffer. The per-row bounded producer channel, MVCC key tracking, storage reconciliation and final wire serialization still have costs; this ownership change does not claim those waits or all scan bottlenecks are eliminated.
+
+The PostgreSQL consumer pulls owned rows lazily from `OwnedPartitionRows`, without collecting a second decoded partition buffer. A decoding failure terminates the iterator and records a statement failure; a streamed prefix never becomes a successful truncated result.

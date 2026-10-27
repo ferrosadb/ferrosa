@@ -213,8 +213,8 @@ where
                 continue;
             }
 
-            let output_row = decode_output_row(&row, &decode_context)?;
-            if let ControlFlow::Break(()) = visit(pk_bytes, row.clustering, output_row) {
+            let (clustering, output_row) = decode_output_row_owned(row, &decode_context)?;
+            if let ControlFlow::Break(()) = visit(pk_bytes, clustering, output_row) {
                 break;
             }
         }
@@ -289,7 +289,81 @@ fn decode_key_component(
     Ok(())
 }
 
-fn decode_output_row(
+/// An owned partition decoder that produces one live row per pull.
+/// Source rows and static cells stay owned until consumed or dropped; decoded
+/// rows are never accumulated in a second partition-sized buffer.
+pub struct OwnedPartitionRows<'a> {
+    rows: std::vec::IntoIter<Row>,
+    partition_key: Vec<u8>,
+    pk_values: Vec<Vec<u8>>,
+    static_row: Option<Row>,
+    column_names: &'a [String],
+    column_types: &'a [CqlType],
+    pk_columns: &'a [usize],
+    ck_columns: &'a [usize],
+    storage_to_table: &'a [usize],
+    now_secs: i32,
+    failed: bool,
+}
+
+/// Decode owned rows lazily while retaining immutable scalar backing.
+pub fn into_partition_rows_with_storage_mapping<'a>(
+    partition: Partition,
+    column_names: &'a [String],
+    column_types: &'a [CqlType],
+    pk_columns: &'a [usize],
+    ck_columns: &'a [usize],
+    storage_to_table: &'a [usize],
+) -> OwnedPartitionRows<'a> {
+    let pk_values = decode_pk(&partition.key, pk_columns.len());
+    OwnedPartitionRows {
+        rows: partition.rows.into_iter(),
+        partition_key: partition.key.key.into_bytes(),
+        pk_values,
+        static_row: partition.static_row,
+        column_names,
+        column_types,
+        pk_columns,
+        ck_columns,
+        storage_to_table,
+        now_secs: read_now_secs(),
+        failed: false,
+    }
+}
+
+impl Iterator for OwnedPartitionRows<'_> {
+    type Item = Result<(Vec<u8>, Vec<Option<CqlValue>>), RowDecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        for row in self.rows.by_ref() {
+            if !row_is_visible(&row, self.now_secs) {
+                continue;
+            }
+            let context = RowDecodeContext {
+                pk_values: &self.pk_values,
+                column_names: self.column_names,
+                column_types: self.column_types,
+                pk_columns: self.pk_columns,
+                ck_columns: self.ck_columns,
+                storage_to_table: self.storage_to_table,
+                now_secs: self.now_secs,
+                partition_key: &self.partition_key,
+                static_row: self.static_row.as_ref(),
+            };
+            let decoded = decode_output_row_owned(row, &context);
+            self.failed = decoded.is_err();
+            return Some(decoded);
+        }
+        None
+    }
+}
+
+impl std::iter::FusedIterator for OwnedPartitionRows<'_> {}
+
+fn decode_output_keys(
     row: &Row,
     context: &RowDecodeContext<'_>,
 ) -> Result<Vec<Option<CqlValue>>, RowDecodeError> {
@@ -305,6 +379,44 @@ fn decode_output_row(
     for (i, &col_idx) in context.ck_columns.iter().enumerate() {
         decode_key_component(context, col_idx, ck_values.get(i), &mut output_row)?;
     }
+
+    Ok(output_row)
+}
+
+/// Consume simple rows without grouping scalar cells or copying unique payloads.
+fn decode_output_row_owned(
+    row: Row,
+    context: &RowDecodeContext<'_>,
+) -> Result<(Vec<u8>, Vec<Option<CqlValue>>), RowDecodeError> {
+    let simple = context.static_row.is_none_or(|row| row.cells.is_empty())
+        && row.cells.iter().all(|(_, cell)| cell.path.is_none())
+        && row.cells.windows(2).all(|pair| pair[0].0 < pair[1].0);
+    if !simple {
+        let output = decode_output_row(&row, context)?;
+        return Ok((row.clustering, output));
+    }
+    let mut output = decode_output_keys(&row, context)?;
+    for (index, cell) in row.cells {
+        let Some(&table_index) = context.storage_to_table.get(index as usize) else {
+            continue;
+        };
+        let Some(ty) = context.column_types.get(table_index) else {
+            continue;
+        };
+        output[table_index] = crate::collection::assemble_owned_simple_cell(ty, cell, context.now_secs)
+            .map_err(|error| {
+                tracing::error!(column = context.column_name(table_index), error = %error, "corrupt cell: failing the read");
+                context.corrupt(table_index, &error).with_jsonb_fault(error.jsonb.clone())
+            })?;
+    }
+    Ok((row.clustering, output))
+}
+
+fn decode_output_row(
+    row: &Row,
+    context: &RowDecodeContext<'_>,
+) -> Result<Vec<Option<CqlValue>>, RowDecodeError> {
+    let mut output_row = decode_output_keys(row, context)?;
 
     // Fill regular/static columns from cells. Cell indices are in storage
     // column space (0-based within static+regular columns); translate to
@@ -810,6 +922,234 @@ mod tests {
         }
     }
 
+    #[test]
+    fn scan_consumed_unique_scalar_cells_keep_payload_allocations() {
+        for ty in [CqlType::Varchar, CqlType::Blob] {
+            let cell = CellValue::live(vec![b'x'; 4096], 1000);
+            let original = cell.value.as_ref().unwrap().as_ref().as_ptr();
+            let partition = single_row_partition(vec![(0, cell)]);
+            let mut received = None;
+            consume_partition_rows_with_clustering(
+                partition,
+                &["pk".into(), "value".into()],
+                &[CqlType::Int, ty],
+                &[0],
+                &[],
+                &[1],
+                |_, _, row| {
+                    received = Some(row);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+            let row = received.unwrap();
+            let bytes = match row[1].as_ref().unwrap() {
+                CqlValue::Text(text) => text.as_bytes(),
+                CqlValue::Blob(bytes) => bytes.as_slice(),
+                other => panic!("unexpected scalar {other:?}"),
+            };
+            assert_eq!(bytes, vec![b'x'; 4096]);
+            assert_eq!(
+                bytes.as_ptr(),
+                original,
+                "unique cell payload copied during decoding"
+            );
+        }
+    }
+
+    #[test]
+    fn scan_consumed_shared_scalar_cells_keep_original_payload_backing() {
+        for ty in [CqlType::Varchar, CqlType::Blob] {
+            let cell = CellValue::live(vec![b'x'; 4096], 1000);
+            let sibling = cell.value.as_ref().unwrap().clone();
+            let original = sibling.as_ref().as_ptr();
+            let partition = single_row_partition(vec![(0, cell)]);
+            let mut received = None;
+            consume_partition_rows_with_clustering(
+                partition,
+                &["pk".into(), "value".into()],
+                &[CqlType::Int, ty],
+                &[0],
+                &[],
+                &[1],
+                |_, _, row| {
+                    received = Some(row);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+            let row = received.unwrap();
+            let bytes: &[u8] = match row[1].as_ref().unwrap() {
+                CqlValue::Text(text) => text.as_bytes(),
+                CqlValue::Blob(bytes) => bytes.as_ref(),
+                other => panic!("unexpected scalar {other:?}"),
+            };
+            assert_eq!(
+                bytes.as_ptr(),
+                original,
+                "shared immutable cell copied during decoding"
+            );
+            assert_eq!(sibling.as_ref(), bytes);
+            drop(row);
+            assert_eq!(sibling.as_ref(), vec![b'x'; 4096]);
+        }
+    }
+
+    #[test]
+    fn borrowed_scalar_decode_retains_shared_payload() {
+        let cell = CellValue::live(vec![b'x'; 4096], 1000);
+        let sibling = cell.value.as_ref().unwrap().clone();
+        let partition = single_row_partition(vec![(0, cell)]);
+        let rows = partition_to_rows_with_storage_mapping(
+            &partition,
+            &["pk".into(), "value".into()],
+            &[CqlType::Int, CqlType::Varchar],
+            &[0],
+            &[],
+            &[1],
+        )
+        .unwrap();
+        let Some(CqlValue::Text(text)) = &rows[0][1] else {
+            panic!("text")
+        };
+        assert_eq!(
+            text.as_bytes().as_ptr(),
+            sibling.as_ref().as_ptr(),
+            "borrowed row decode copied shared immutable bytes"
+        );
+    }
+
+    #[test]
+    fn consuming_invalid_utf8_keeps_column_key_context_and_emits_nothing() {
+        let partition = single_row_partition(vec![(0, CellValue::live(vec![0xff], 1000))]);
+        let mut visited = false;
+        let error = consume_partition_rows_with_clustering(
+            partition,
+            &["pk".into(), "value".into()],
+            &[CqlType::Int, CqlType::Varchar],
+            &[0],
+            &[],
+            &[1],
+            |_, _, _| {
+                visited = true;
+                ControlFlow::Continue(())
+            },
+        )
+        .unwrap_err();
+        assert!(!visited);
+        assert_eq!(error.column, "value");
+        assert_eq!(error.partition_key, 1i32.to_be_bytes());
+        assert!(error.reason.contains("invalid UTF-8"));
+    }
+
+    #[test]
+    fn consuming_and_borrowed_decodes_agree_on_visibility_and_assembly() {
+        let cases = vec![
+            single_row_partition(vec![]),
+            single_row_partition(vec![(
+                0,
+                CellValue::expiring(b"expired".to_vec(), 1000, 1, 1),
+            )]),
+            single_row_partition(vec![(0, CellValue::tombstone(2000, 1))]),
+            single_row_partition(vec![
+                (0, CellValue::live(b"old".to_vec(), 1000)),
+                (0, CellValue::live(b"new".to_vec(), 2000)),
+            ]),
+            {
+                let mut partition =
+                    single_row_partition(vec![(0, CellValue::live(b"old".to_vec(), 1000))]);
+                partition.static_row = Some(Row {
+                    clustering: vec![],
+                    cells: vec![(0, CellValue::live(b"static".to_vec(), 2000))],
+                    deletion: DeletionTime::LIVE,
+                    primary_key_liveness: LivenessInfo::NONE,
+                });
+                partition
+            },
+        ];
+        let collection = single_row_partition(
+            build_collection_cells(
+                CollectionOp::Add,
+                &CqlValue::Set(vec![CqlValue::Text("a".into()), CqlValue::Text("b".into())]),
+                1000,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|cell| (0, cell))
+            .collect(),
+        );
+        // The scalar cases deliberately include empty/duplicate cell ordinals;
+        // collection and static rows must use the established assembly path.
+        for (index, partition) in cases
+            .into_iter()
+            .chain(std::iter::once(collection))
+            .enumerate()
+        {
+            let ty = if index == 5 {
+                CqlType::Set(Box::new(CqlType::Varchar))
+            } else {
+                CqlType::Varchar
+            };
+            let names = vec!["pk".into(), "value".into()];
+            let types = vec![CqlType::Int, ty];
+            let expected =
+                partition_to_rows_with_storage_mapping(&partition, &names, &types, &[0], &[], &[1])
+                    .unwrap();
+            let mut actual = Vec::new();
+            consume_partition_rows_with_clustering(
+                partition,
+                &names,
+                &types,
+                &[0],
+                &[],
+                &[1],
+                |_, _, row| {
+                    actual.push(row);
+                    ControlFlow::Continue(())
+                },
+            )
+            .unwrap();
+            assert_eq!(actual, expected, "case {index}");
+        }
+    }
+
+    #[test]
+    fn owned_row_iterator_emits_prefix_then_contextual_error_and_fuses() {
+        let mut partition =
+            single_row_partition(vec![(0, CellValue::live(b"valid".to_vec(), 1000))]);
+        partition.rows[0].clustering = 1i32.to_be_bytes().to_vec();
+        let clustering_ptr = partition.rows[0].clustering.as_ptr();
+        partition.rows.push(Row {
+            clustering: 2i32.to_be_bytes().to_vec(),
+            cells: vec![(0, CellValue::live(vec![0xff], 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        });
+        let names = vec!["pk".into(), "ck".into(), "value".into()];
+        let types = vec![CqlType::Int, CqlType::Int, CqlType::Varchar];
+        let mut rows =
+            into_partition_rows_with_storage_mapping(partition, &names, &types, &[0], &[1], &[2]);
+        let (clustering, first) = rows.next().unwrap().unwrap();
+        assert_eq!(
+            clustering.as_ptr(),
+            clustering_ptr,
+            "raw cursor bytes must move"
+        );
+        assert_eq!(
+            first,
+            vec![
+                Some(CqlValue::Int(1)),
+                Some(CqlValue::Int(1)),
+                Some(CqlValue::Text("valid".into()))
+            ]
+        );
+        let error = rows.next().unwrap().unwrap_err();
+        assert_eq!(error.column, "value");
+        assert_eq!(error.partition_key, 1i32.to_be_bytes());
+        assert!(rows.next().is_none());
+        assert!(rows.next().is_none());
+    }
+
     /// A partition's static row is part of every clustered row a reader sees;
     /// where a row also holds the static cell, the newer one wins.
     #[test]
@@ -839,10 +1179,14 @@ mod tests {
         .unwrap();
         assert_eq!(rows.len(), 2);
         for row in &rows {
-            assert_eq!(row[1], Some(CqlValue::Blob(b"static".to_vec())), "{rows:?}");
+            assert_eq!(
+                row[1],
+                Some(CqlValue::Blob(b"static".to_vec().into())),
+                "{rows:?}"
+            );
         }
-        assert_eq!(rows[0][2], Some(CqlValue::Blob(b"a1".to_vec())));
-        assert_eq!(rows[1][2], Some(CqlValue::Blob(b"a2".to_vec())));
+        assert_eq!(rows[0][2], Some(CqlValue::Blob(b"a1".to_vec().into())));
+        assert_eq!(rows[1][2], Some(CqlValue::Blob(b"a2".to_vec().into())));
     }
 
     /// The primary SELECT read path assembles a complex `list` column from its
