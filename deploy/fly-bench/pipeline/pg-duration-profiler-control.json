@@ -1,0 +1,169 @@
+{
+  "source_revision": "c24cad554dd61a0fb76bf385bdf0669f6638998f",
+  "duration_seconds": 30,
+  "read_concurrency": 8,
+  "rows": 5000,
+  "payload_bytes": 96,
+  "settle_seconds": 40,
+  "conditions": "Native off, Ferrosa off, Ferrosa on, native on, native on, Ferrosa on, Ferrosa off, native off",
+  "cpu_profiler": "perf49Hz CPU sampling; separate timing conditions",
+  "limitations": [
+    "Two observations per condition; not a maximum capacity result",
+    "No profiler-overhead correction applied to primary results",
+    "SSTable files verified after settling; no cold-cache claim"
+  ],
+  "observations": [
+    {
+      "observation": "duration-1-postgres-perf-off",
+      "target": "postgres",
+      "cpu_profiler_attached": false,
+      "point": {
+        "operations": 318657,
+        "seconds": 30.00042503200001,
+        "ops_s": 10621.74951388535,
+        "p50_ms": 0.6182179999996151,
+        "p99_ms": 2.330682999996725
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-2-ferrosa_pg-perf-off",
+      "target": "ferrosa_pg",
+      "cpu_profiler_attached": false,
+      "point": {
+        "operations": 293046,
+        "seconds": 30.00057251300001,
+        "ops_s": 9768.013589507858,
+        "p50_ms": 0.7365679999935537,
+        "p99_ms": 2.207502999993949
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-3-ferrosa_pg-perf-on",
+      "target": "ferrosa_pg",
+      "cpu_profiler_attached": true,
+      "point": {
+        "operations": 92263,
+        "seconds": 30.00776595299999,
+        "ops_s": 3074.637417010916,
+        "p50_ms": 1.4213059999974575,
+        "p99_ms": 10.174962000007781
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-4-postgres-perf-on",
+      "target": "postgres",
+      "cpu_profiler_attached": true,
+      "point": {
+        "operations": 324124,
+        "seconds": 30.00041758399999,
+        "ops_s": 10803.98294765283,
+        "p50_ms": 0.6136590000096476,
+        "p99_ms": 2.3145239999848854
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-5-postgres-perf-on",
+      "target": "postgres",
+      "cpu_profiler_attached": true,
+      "point": {
+        "operations": 315940,
+        "seconds": 30.00025497300004,
+        "ops_s": 10531.243827238908,
+        "p50_ms": 0.6289085000048544,
+        "p99_ms": 2.3540230000094198
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-6-ferrosa_pg-perf-on",
+      "target": "ferrosa_pg",
+      "cpu_profiler_attached": true,
+      "point": {
+        "operations": 259537,
+        "seconds": 30.000503362000018,
+        "ops_s": 8651.088179031729,
+        "p50_ms": 0.8215380000251571,
+        "p99_ms": 2.818421999961629
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-7-ferrosa_pg-perf-off",
+      "target": "ferrosa_pg",
+      "cpu_profiler_attached": false,
+      "point": {
+        "operations": 288519,
+        "seconds": 30.000580204000016,
+        "ops_s": 9617.11400373288,
+        "p50_ms": 0.7440780000251834,
+        "p99_ms": 2.458963000094627
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    },
+    {
+      "observation": "duration-8-postgres-perf-off",
+      "target": "postgres",
+      "cpu_profiler_attached": false,
+      "point": {
+        "operations": 324133,
+        "seconds": 30.00045151300003,
+        "ops_s": 10804.27072437707,
+        "p50_ms": 0.6087579999984882,
+        "p99_ms": 2.282433999994282
+      },
+      "validated": true,
+      "census": {
+        "expected_rows": 5000,
+        "returned_rows": 5000,
+        "unique_keys": 5000
+      }
+    }
+  ],
+  "final_machine_states": {
+    "825d61a7619e68": "stopped",
+    "2869946c411d68": "stopped",
+    "1854460a667348": "stopped",
+    "83d1e2ecd00018": "stopped",
+    "7841455c1de348": "stopped",
+    "d89341ec500e08": "stopped"
+  }
+}

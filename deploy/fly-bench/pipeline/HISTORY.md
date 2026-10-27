@@ -510,3 +510,29 @@ original revision and workload limits. They are not current product numbers.
   real gaps. The lower 30-second profiled PostgreSQL read rate is explicitly
   separated from short unprofiled results; an instrumentation/duration control
   is pending. CPU stacks and raw scheduling/RSS/disk/network evidence are retained.
+
+## 2026-10-27: count and scan ownership (a2709e100)
+
+Removed scalar SQL aggregate sorting/spilling, moved owned SQL projection
+payloads, and indexed borrowed shared-subject join keys after reproducing
+rejected-pair allocation growth. Requested allocations at 128 records fell
+18,498,367 → 1,916,787 bytes; 32 → 128 records grew 12.24x before versus 3.78x
+after. The scalar aggregate peak stayed 296 bytes at 100k and 1m rows.
+Pointer-preservation, bag/repeated-variable, input-error and short-row
+regressions pass.
+
+All four products were rerun on matched same-VM pairs with runtime a2709e100.
+SPARQL scans measured 29,937 versus Oxigraph 74,329 rows/s, compared with the
+earlier Ferrosa 1,816 rows/s observation. These are separate benchmark epochs;
+the allocation fixture is the isolated causal proof. SQL COUNT/scan remain
+43.967 ms and 92,742 rows/s versus native 0.865 ms and 420,447 rows/s. Copy/sort
+elimination did not close that gap: the provider still decodes, reconciles MVCC
+and delivers rows. SPARQL predicate scans still scan the table per pattern.
+
+Full local gate: 10,249 passed plus 14 isolated process tests, 95 existing
+skips; changed SQL executable-line coverage 100%, SPARQL 94.23%. Raw observations
+and [ownership evidence](SCAN_COUNTS.md) retain attribution limits. The
+preserved eight-writer 40P01 remains unresolved.
+
+This ownership wave changes read/aggregate paths. Insert-rate differences across
+benchmark epochs are not attributed to these fixes; all observations remain.

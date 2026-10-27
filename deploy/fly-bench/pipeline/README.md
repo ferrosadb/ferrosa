@@ -129,3 +129,24 @@ Run native/Ferrosa/Ferrosa/native twice, with no concurrent benchmark work.
 `resources_low_overhead.sh` is the one-process 1 Hz OS collector used by this run;
 CPU stack profiling is a separate phase. `--profile` in the protocol probe
 selects a 30-second duration loop; CPU profiler attachment belongs to the controller.
+
+The [count/scan ownership audit](SCAN_COUNTS.md) records the three follow-up
+changes, their regression evidence, the observed scan improvement and the
+remaining SQL/SPARQL count and predicate-access gaps.
+
+`profile_operation_probe.py` runs the count/scan diagnostic loops used for the
+current CPU captures. It shares the existing adapters and deterministic payloads;
+`--profile` is required. Use the same existing fixture scope and configure CPU
+profiler attachment separately after the ready gate:
+
+```sh
+python3 deploy/fly-bench/pipeline/profile_operation_probe.py \
+  --config /path/to/benchmark-config.json --target ferrosa_pg --protocol pg \
+  --scope existing_fixture --rows 5000 --profile --diagnostic-operation count \
+  --out /tmp/count.json --ready-file /tmp/count.ready --go-file /tmp/count.go
+# Start the process CPU recorder after /tmp/count.ready, then touch /tmp/count.go.
+# Use --diagnostic-operation scan for a complete key/value-validated scan loop.
+```
+
+Each diagnostic loop has eight workers and a 30-second deadline. Full scan
+validation consumes client CPU; these rates are excluded from primary tables.
