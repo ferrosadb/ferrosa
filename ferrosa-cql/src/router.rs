@@ -33685,8 +33685,19 @@ mod tests {
             .expect("row bridge consuming visitor must be present");
 
         assert!(
-            consumer.contains("visit(pk_bytes, row.clustering, output_row)"),
+            consumer.contains("decode_output_row_owned(row, &decode_context)")
+                && consumer.contains("visit(pk_bytes, clustering, output_row)"),
             "consuming row visitor must move clustering bytes into the caller instead of cloning"
+        );
+        let decoder = source
+            .split("fn decode_output_row_owned(")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("owned row decoder must be present");
+        assert!(
+            decoder.contains("Ok((row.clustering, output))")
+                && !decoder.contains("row.clustering.clone()"),
+            "owned decoder must return the original clustering allocation"
         );
         assert!(
             !consumer.contains("row.clustering.clone()"),

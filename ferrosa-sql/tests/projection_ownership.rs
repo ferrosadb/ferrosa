@@ -26,14 +26,14 @@ fn fallible_projection_moves_reordered_payloads() {
 }
 
 #[test]
-fn repeated_projection_moves_one_copy_and_preserves_both_values() {
+fn repeated_projection_shares_payload_and_preserves_both_values() {
     let input = Row(vec![Value::Text("payload".repeat(1000).into())]);
     let pointer = text_pointer(&input, 0);
     let output = project(Box::new(std::iter::once(input)), vec![0, 0])
         .next()
         .unwrap();
     assert_eq!(output.0[0], output.0[1]);
-    assert_ne!(text_pointer(&output, 0), text_pointer(&output, 1));
+    assert_eq!(text_pointer(&output, 0), pointer);
     assert_eq!(text_pointer(&output, 1), pointer);
 }
 

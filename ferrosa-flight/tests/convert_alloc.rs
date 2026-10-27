@@ -1,22 +1,11 @@
-//! Allocation-count guard for the Arrow → CQL (`DoPut`) decode transpose.
+//! Allocation and payload-identity guards for the Arrow → CQL transpose.
 //!
-//! `record_batch_to_rows` decodes an inbound Arrow `RecordBatch` column-major,
-//! then transposes to row-major. The ORIGINAL transpose cloned every cell out of
-//! the still-resident column matrix (`cols.iter().map(|col| col[i].clone())`) —
-//! one deep `CqlValue` clone per cell (a `String`/`Vec<u8>` allocation for every
-//! text/blob cell) while BOTH the column matrix and the growing row matrix were
-//! resident. The fix MOVES each cell out (`into_iter()` per column), so no
-//! `CqlValue` is cloned and the column buffers drain as the rows fill.
+//! The historical transpose cloned owned strings. CQL text now has immutable
+//! shared backing, so both moving and cloning must retain payload allocations.
+//! This isolated fixture bounds allocations to row/iterator vectors and checks
+//! every payload pointer; it does not measure Arrow decoding or Flight throughput.
 //!
-//! This test isolates exactly that transpose: it builds and clones the
-//! column-major input ONCE outside the measurement window, so each strategy
-//! starts from an identical, already-decoded input, and measures only the
-//! transpose step. The column decode is common to both shapes and is
-//! deliberately not measured.
-//!
-//! Counting `#[global_allocator]` (the only one in this test binary); all
-//! measurements run inside ONE `#[test]` fn because the counter is
-//! process-wide and thread-unaware.
+//! The process-wide allocator is armed only inside this binary's single test.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -66,9 +55,7 @@ fn measure<T>(f: impl FnOnce() -> T) -> (T, usize) {
 
 type Cell = Option<CqlValue>;
 
-/// Column-major fixture: `ncols` columns of `nrows` cells, with an owned
-/// variable-width (`Text`) value in every cell — the case where a per-cell
-/// clone allocates.
+/// Column-major fixture with immutable variable-width text in every cell.
 fn column_major(ncols: usize, nrows: usize) -> Vec<Vec<Cell>> {
     (0..ncols)
         .map(|c| {
@@ -100,7 +87,7 @@ fn move_transpose(cols: Vec<Vec<Cell>>, nrows: usize) -> Vec<Vec<Cell>> {
 }
 
 #[test]
-fn transpose_moves_instead_of_cloning_cells() {
+fn transpose_moves_or_shares_cells_without_copying_payloads() {
     const COLS: usize = 2;
     const ROWS: usize = 512;
     let cells = COLS * ROWS;
@@ -108,6 +95,18 @@ fn transpose_moves_instead_of_cloning_cells() {
     // Build the input ONCE, and clone it OUTSIDE the measurement window: the
     // decode is common to both shapes and is not what changed.
     let base = column_major(COLS, ROWS);
+    let pointers: Vec<Vec<*const u8>> = base
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .map(|cell| match cell {
+                    Some(CqlValue::Text(value)) => value.as_bytes().as_ptr(),
+                    _ => panic!("text fixture"),
+                })
+                .collect()
+        })
+        .collect();
     let for_clone = base.clone();
     let for_move = base;
     assert_eq!(for_clone.len(), COLS);
@@ -124,20 +123,24 @@ fn transpose_moves_instead_of_cloning_cells() {
     // Semantic equivalence: same rows, same order, same values.
     assert_eq!(clone_rows, move_rows, "transpose must preserve row content");
 
-    // The move form must not clone cells: strictly fewer allocations, with the
-    // saving ~one allocation per cell (the per-element clone removed).
-    //
-    // The bound is deliberately LOOSE. Asserting an exact delta
-    // (`>= cells - COLS`) is load-sensitive: the same code has been observed to
-    // land one allocation either side of the theoretical value under CI load,
-    // which fails the suite for a correct implementation (observed: delta 1021
-    // vs a required 1022). What this test exists to prove is the ORDER OF
-    // MAGNITUDE — the per-cell clone is gone — so assert that, plus the exact
-    // property that actually matters (strictly fewer), and never exact equality.
-    assert!(
-        clone_alloc - move_alloc >= cells / 2,
-        "expected roughly one allocation saved per cell ({cells}); got {} — the \
-         per-cell clone was not removed",
-        clone_alloc - move_alloc
-    );
+    // Neither strategy may allocate per text cell: sharing replaces the old
+    // deep clone. The small allowance covers row and iterator vectors.
+    for (rows, allocations) in [(&clone_rows, clone_alloc), (&move_rows, move_alloc)] {
+        assert!(
+            allocations <= ROWS + COLS + 4,
+            "per-cell payload allocation returned: {allocations} allocations for {cells} cells"
+        );
+        for (r, row) in rows.iter().enumerate() {
+            for (c, cell) in row.iter().enumerate() {
+                let Some(CqlValue::Text(value)) = cell else {
+                    panic!("text fixture")
+                };
+                assert_eq!(
+                    value.as_bytes().as_ptr(),
+                    pointers[c][r],
+                    "transpose copied payload at row {r}, column {c}"
+                );
+            }
+        }
+    }
 }
