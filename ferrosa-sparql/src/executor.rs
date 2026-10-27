@@ -392,8 +392,29 @@ async fn evaluate_standard_op(
     budget: Option<usize>,
 ) -> Result<Vec<HashMap<String, Binding>>, SparqlError> {
     let mut new_bindings: Vec<HashMap<String, Binding>> = Vec::new();
+    let subject_index = bound_subject_index(tp, existing_bindings);
     for_each_triple(op, write_path, limits, |triple| {
-        for existing in existing_bindings {
+        let kind = if triple.0.starts_with("_:") {
+            "bnode"
+        } else {
+            "uri"
+        };
+        let indexed = subject_index
+            .as_ref()
+            .and_then(|index| index.get(&(kind, triple.0.as_str())))
+            .into_iter()
+            .flatten()
+            .copied();
+        // An unbound subject still needs the general compatibility join.
+        // Otherwise only visit matching indices, retaining duplicates and
+        // arrival order without cloning keys or candidate solutions.
+        let fallback = 0..if subject_index.is_none() {
+            existing_bindings.len()
+        } else {
+            0
+        };
+        for position in indexed.chain(fallback) {
+            let existing = &existing_bindings[position];
             let Some(row) = try_bind_triple(tp, &triple, existing) else {
                 continue;
             };
@@ -407,6 +428,24 @@ async fn evaluate_standard_op(
     })
     .await?;
     Ok(new_bindings)
+}
+
+type SubjectIndex<'a> = HashMap<(&'a str, &'a str), Vec<usize>>;
+
+fn bound_subject_index<'a>(
+    pattern: &spargebra::term::TriplePattern,
+    rows: &'a [HashMap<String, Binding>],
+) -> Option<SubjectIndex<'a>> {
+    let spargebra::term::TermPattern::Variable(var) = &pattern.subject else {
+        return None;
+    };
+    let mut index = HashMap::new();
+    for (position, row) in rows.iter().enumerate() {
+        let value = row.get(var.as_str())?;
+        let key = (value.kind(), value.scalar_value()?);
+        index.entry(key).or_insert_with(Vec::new).push(position);
+    }
+    Some(index)
 }
 
 /// Fail loud when an operator's solution buffer crosses the row bound.
@@ -430,6 +469,11 @@ fn try_merge_bindings(
     a: &HashMap<String, Binding>,
     b: &HashMap<String, Binding>,
 ) -> Option<HashMap<String, Binding>> {
+    if b.iter()
+        .any(|(key, value)| a.get(key).is_some_and(|old| old != value))
+    {
+        return None;
+    }
     let mut merged = a.clone();
     for (key, val) in b {
         if !try_insert_binding(&mut merged, key, val) {
@@ -457,6 +501,29 @@ fn try_bind_triple(
     existing: &HashMap<String, Binding>,
 ) -> Option<HashMap<String, Binding>> {
     let (s, p, o) = triple;
+    // Reject bound join-key mismatches using borrowed terms before cloning
+    // the solution. Most pairs in a selective join do not match.
+    if let spargebra::term::TermPattern::Variable(var) = &tp.subject {
+        if existing.get(var.as_str()).is_some_and(|value| {
+            let kind = if s.starts_with("_:") { "bnode" } else { "uri" };
+            value.kind() != kind || value.scalar_value() != Some(s.as_str())
+        }) {
+            return None;
+        }
+    }
+    if let spargebra::term::NamedNodePattern::Variable(var) = &tp.predicate {
+        if existing
+            .get(var.as_str())
+            .is_some_and(|value| value.kind() != "uri" || value.scalar_value() != Some(p.as_str()))
+        {
+            return None;
+        }
+    }
+    if let spargebra::term::TermPattern::Variable(var) = &tp.object {
+        if existing.get(var.as_str()).is_some_and(|value| value != o) {
+            return None;
+        }
+    }
     let mut row = existing.clone();
 
     if !bind_or_check_subject(&tp.subject, s, &mut row)

@@ -267,3 +267,14 @@ CLEAR/DROP validates a streaming preflight before a streaming delete pass. It
 does not retain a table-sized vector of triples. This preserves refusal before
 mutation for preflight validation/row-budget failures, without claiming atomicity
 against concurrent writers or later storage failures.
+
+### Join ownership and candidate selection
+
+Standard triple-pattern joins reject incompatible bound variables using borrowed
+terms before cloning an output solution. When every input solution binds the
+subject variable, a query-local index borrows typed subject keys and stores row
+positions; each streamed triple visits matching positions only. Duplicate
+solutions retain their bag multiplicity. Unbound subjects use the general
+compatibility path. The executor still retains bounded intermediate solutions
+and decodes RDF terms; this is not an end-to-end zero-copy result stream.
+`tests/join_alloc.rs` verifies allocation scaling and full result contents.

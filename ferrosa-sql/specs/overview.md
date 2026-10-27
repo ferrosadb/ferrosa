@@ -108,3 +108,14 @@ clock evaluation. `ColumnType::TimestampTz` distinguishes timestamp-with-time-zo
 results from `ColumnType::Timestamp`; both carry `Value::Timestamp` microseconds,
 with the column type supplying temporal interpretation and wire typing. This
 adds no new dependency. Table projections and precision arguments are unchanged.
+
+### Scalar accumulation and projection ownership
+
+Without GROUP BY, `hash_aggregate` updates one accumulator set while borrowing
+each owned row, then releases that row. It performs no sort or spill, including
+over empty input; source and arithmetic errors remain errors. Upstream storage
+still decodes rows and applies MVCC, so COUNT is not a constant-time metadata
+lookup. Grouped aggregation continues to spill under its memory budget.
+Projection transfers owned values into their final output occurrence. Repeated
+columns fork only additional occurrences; identity-prefix projections reuse the
+input row vector. This removes payload copies on ordinary bounded SQL scans.

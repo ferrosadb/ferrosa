@@ -537,11 +537,28 @@ pub fn hash_aggregate(
 ) -> Result<TryRowStream<'static>, AggregateError> {
     const LABEL: &str = "hash_aggregate";
 
+    // A global aggregate has exactly one group. Consume and release each
+    // owned input row immediately: sorting it can only retain/copy payloads
+    // and spend I/O without changing the answer.
+    if group_cols.is_empty() {
+        let mut accs: Vec<_> = aggs
+            .iter()
+            .map(|a| Accumulator::new(AccKind::of(a.func, a.arg_type)))
+            .collect();
+        for row in input {
+            let row = row?;
+            for (acc, spec) in accs.iter_mut().zip(aggs) {
+                acc.update(spec, &row);
+            }
+        }
+        let result = finish_group(Vec::new(), &accs)?;
+        return Ok(Box::new(std::iter::once(Ok(result))));
+    }
+
     let mut by_key = SpillSort::new(ctx, SqlOrder::Canonical(Some(group_cols.to_vec())), LABEL)?;
     for row in input {
         by_key.push(row?)?;
     }
-    let rows_in = by_key.pushed();
     let sorted = by_key.finish()?;
 
     // The accumulator kind is fixed per aggregate, from its function and the
@@ -573,11 +590,6 @@ pub fn hash_aggregate(
     }
     if let Some((k, seq, accs)) = current.take() {
         by_seq.push_tagged(SeqRow::new(seq, finish_group(k, &accs)?))?;
-    }
-
-    // Ungrouped aggregate over an empty input: synthesize one all-empty group.
-    if group_cols.is_empty() && rows_in == 0 {
-        by_seq.push_tagged(SeqRow::new(0, finish_group(Vec::new(), &fresh_accs())?))?;
     }
 
     Ok(Box::new(by_seq.finish()?.map(|r| r.map(|s| s.row))))
@@ -670,7 +682,36 @@ pub fn filter<'a>(input: RowStream<'a>, pred: Predicate) -> RowStream<'a> {
 
 /// Project the given columns (in order) out of each row.
 pub fn project<'a>(input: RowStream<'a>, cols: Vec<usize>) -> RowStream<'a> {
-    Box::new(input.map(move |row| Row(cols.iter().map(|&i| row.0[i].clone()).collect())))
+    Box::new(input.map(owned_projection(cols)))
+}
+
+/// Each input value moves into its final output occurrence. Earlier repeated
+/// columns require independent values; those alone are cloned. Build the
+/// occurrence mask once per stream, never once per row.
+fn owned_projection(cols: Vec<usize>) -> impl Fn(Row) -> Row + Send {
+    let mut seen = std::collections::HashSet::new();
+    let mut move_value = vec![false; cols.len()];
+    for (position, &column) in cols.iter().enumerate().rev() {
+        move_value[position] = seen.insert(column);
+    }
+    let identity = cols.iter().copied().eq(0..cols.len());
+    move |mut row| {
+        if identity {
+            row.0.truncate(cols.len());
+            return row;
+        }
+        Row(cols
+            .iter()
+            .zip(&move_value)
+            .map(|(&column, &last)| {
+                if last {
+                    std::mem::replace(&mut row.0[column], Value::Null)
+                } else {
+                    row.0[column].clone()
+                }
+            })
+            .collect())
+    }
 }
 
 /// Keep rows for which `pred` holds, over a fallible stream.
@@ -683,7 +724,8 @@ pub fn try_filter<'a>(input: TryRowStream<'a>, pred: Predicate) -> TryRowStream<
 
 /// Project the given columns (in order) out of each row of a fallible stream.
 pub fn try_project<'a>(input: TryRowStream<'a>, cols: Vec<usize>) -> TryRowStream<'a> {
-    Box::new(input.map(move |row| row.map(|r| Row(cols.iter().map(|&i| r.0[i].clone()).collect()))))
+    let project = owned_projection(cols);
+    Box::new(input.map(move |row| row.map(&project)))
 }
 
 /// Inner equi-join: emit `left ++ right` for every pair where

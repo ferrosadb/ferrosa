@@ -201,3 +201,13 @@ HTTP negotiation uses the query form, q/specificity and explicit JSON version.
 Dataset transport overrides are refused before writes; service URI BASE and
 operation/version cardinality are validated. See the crate README for the dated
 W3C contracts and remaining conformance limits.
+
+### Selective join allocation
+
+Before extending a solution, the executor compares bound subject, predicate and
+object terms by borrowed identity. Rejected pairs do not clone the solution.
+Fully bound shared-subject joins use an index of borrowed `(term kind, value)`
+keys to input positions; matching duplicates remain distinct. If any subject is
+unbound, the executor retains the general compatibility join. Other joins may
+still compare every pair, and intermediate solution vectors remain bounded by
+execution limits rather than fully pipelined.

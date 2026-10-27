@@ -170,6 +170,15 @@ placement: ASC⇒NULLS LAST, DESC⇒NULLS FIRST), `hash_aggregate` (first-seen g
 order; ungrouped-empty yields one row), `dedup` (DISTINCT, first-occurrence
 order), `limit_offset`.
 
+Ungrouped aggregates consume each owned row once using one accumulator set;
+`COUNT(*)` does not sort, retain payloads, or use spill storage. The storage
+provider still decodes visible rows and reconciles MVCC before feeding this
+operator; this is not a metadata-only count. Grouped aggregates retain the
+bounded sort/spill path. Projection moves owned text/blob values, reuses the
+row vector for an identity prefix, and clones only additional occurrences of a
+repeated output column. Ownership regressions are covered by
+`tests/projection_ownership.rs` and `tests/scalar_aggregate.rs`.
+
 **Spill** (`spill`): the four BLOCKING operators — `sort`, `hash_aggregate`,
 `hash_join` and `dedup` — cannot emit a first row before consuming their whole
 input, so they **spill to disk** rather than buffering it (forge `t_50d99192`).
