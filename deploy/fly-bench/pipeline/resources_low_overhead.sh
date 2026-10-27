@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 exec python3 - "$1" <<'SAMPLE_PY'
-import datetime,json,os,time,urllib.request
+import datetime,json,os,time,urllib.request,shutil,subprocess
 from pathlib import Path
 out=Path(__import__('sys').argv[1]);out.mkdir(parents=True,exist_ok=True)
 def read(p):
@@ -18,12 +18,15 @@ for p in Path('/proc').iterdir():
   except OSError:continue
   hw['java_heap_flags'] += [a.decode(errors='replace') for a in args if a.startswith((b'-Xmx',b'-Xms',b'-XX:MaxRAMPercentage'))]
 (out/'hardware.json').write_text(json.dumps(hw,indent=2));(out/'ready').touch()
-paths=['/proc/stat','/proc/diskstats','/proc/net/dev','/proc/meminfo','/proc/vmstat','/proc/pressure/cpu','/proc/pressure/io','/proc/pressure/memory','/sys/fs/cgroup/cpu.stat','/sys/fs/cgroup/memory.events','/sys/fs/cgroup/memory.current','/sys/fs/cgroup/memory.stat','/sys/fs/cgroup/io.stat']
+paths=['/proc/stat','/proc/diskstats','/proc/net/dev','/proc/net/snmp','/proc/net/netstat','/proc/net/tcp','/proc/net/tcp6','/proc/meminfo','/proc/vmstat','/proc/pressure/cpu','/proc/pressure/io','/proc/pressure/memory','/sys/fs/cgroup/cpu.stat','/sys/fs/cgroup/memory.events','/sys/fs/cgroup/memory.current','/sys/fs/cgroup/memory.stat','/sys/fs/cgroup/io.stat']
+ss=shutil.which('ss')
+(out/'socket-info-capability.json').write_text(json.dumps({'ss_available':bool(ss)}))
 with (out/'resources.txt').open('a',buffering=1) as log:
  for n in range(7200):
   if (out/'stop').exists():break
   start=time.monotonic();log.write(str(time.time())+'\n')
   for p in paths:log.write('FILE '+p+'\n'+read(p)+'\n')
+  usage=shutil.disk_usage('/tmp');log.write('FILE /filesystem/tmp\n'+json.dumps({'free_bytes':usage.free,'total_bytes':usage.total})+'\n')
   for p in Path('/proc').iterdir():
    if not p.name.isdecimal():continue
    name=read(p/'comm').strip()
@@ -39,6 +42,11 @@ with (out/'resources.txt').open('a',buffering=1) as log:
     try:
      with urllib.request.urlopen('http://127.0.0.1:9090/metrics',timeout=.2) as req:(out/('metrics-'+str(n)+'.prom')).write_bytes(req.read())
     except OSError:pass
+  if ss:
+   try:
+    result=subprocess.run([ss,'-tinmpH'],capture_output=True,text=True,timeout=.8)
+    (out/('tcp-info-'+str(n)+'.txt')).write_text(str(time.time())+'\nexit='+str(result.returncode)+'\n'+result.stdout+result.stderr)
+   except subprocess.TimeoutExpired:(out/('tcp-info-'+str(n)+'.txt')).write_text('capture-timeout\n')
   time.sleep(max(0,1-(time.monotonic()-start)))
 (out/'finished-at.txt').write_text(stamp());(out/'done').touch()
 SAMPLE_PY

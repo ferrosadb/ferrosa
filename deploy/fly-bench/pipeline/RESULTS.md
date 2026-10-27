@@ -1,111 +1,128 @@
-# Current performance: PR #625
+# Performance comparison: PR #625
 
-COUNT pushdown was added after these measurements (`148870d00`); its Fly/native
-comparison is pending. The table remains the measured `a2709e100` runtime.
-Scan rows/s describes bounded, fully consumed query delivery, not sustained
-maximum scan throughput. See [COUNT and scan scope](SCAN_COUNTS.md).
+PostgreSQL/CQL below measure production code `2286f389ac6669d44d5cfef1e71c7facdce37c30`.
+Later Rust commits change tests only (`03cf9511e`). **Bolt/SPARQL retain older
+`a2709e100` results and were not rerun after the shared-value change.**
 
+PG COUNT is 8.3× faster than before; CQL scan mean rises
+12.7%. PG bounded-scan means are effectively unchanged.
+These small samples do not establish maximum capacity or statistical significance.
+[Every observation and its range](current-results.json) is retained.
 
-Measured 2026-10-27 UTC on code `a2709e100cb016e46b51df7b2052a468c8ef16a2`.
-Each Ferrosa/native pair ran on the **same physical Fly VM, filesystem and network destination**, with matched 2-performance-vCPU/4-GiB guests. One timed workload ran at a time. These are short, warm end-to-end measurements, not maximum sustained capacity or durability equivalence.
+**Quality limits:** one native PostgreSQL leg flagged **2.83% CPU steal** over
+its sampled three-second interval. Its observation is retained; the native PG
+comparison is provisional. Primary measurements are complete, but **five PG
+CPU captures were interrupted by Fly SSH timeouts**. Three CQL scan captures
+and native PG COUNT completed. All six machines were verified stopped; volumes remain.
 
-**Current limitations:** the preserved eight-writer PostgreSQL load failed with SQLSTATE `40P01` and remains unresolved; the PostgreSQL table below is a matched **one-writer** diagnostic. Counts and scans retain significant gaps. A matched 30-second profiler control after flush settling measured unprofiled Ferrosa at 9,617–9,768 reads/s versus PostgreSQL at 10,622–10,804. Ferrosa’s profiled repetitions varied widely (3,075–8,651/s); these instrumented rates do not establish a sustained threefold read gap. Two repetitions per condition do not establish maximum capacity.
+Higher rates are better; lower milliseconds are better. Tables use means of
+four per-leg rates or medians. Before/after also include the COUNT metadata
+change; they do not isolate immutable payload sharing alone.
 
 ## PostgreSQL
 
-| Operation | Ferrosa | PostgreSQL |
-| --- | ---: | ---: |
-| INSERT, logical rows/s | **22,127** | 38,319 |
-| Point reads, ops/s | **9,150** | 9,953 |
-| Point-read p50, ms | **0.765** | 0.652 |
-| COUNT p50, ms | **43.967** | 0.865 |
-| Bounded scan, logical rows/s | **92,742** | 420,447 |
+| Operation | Before `a2709e100` | Current `2286f389a` | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| INSERT, logical rows/s | 27,535 | 32,641 | 38,993 |
+| Point reads, ops/s | 9,633 | 9,836 | 10,571 |
+| Point-read p50, ms | 0.727 | 0.715 | 0.593 |
+| COUNT p50, ms | 45.716 | 5.496 | 0.672 |
+| Bounded scan, logical rows/s | 98,575 | 98,713 | 487,618 |
 
-Higher rates are better; lower milliseconds are better.
-One writer, eight readers, 5,000 rows. The eight-writer diagnostic is not repeated here. INSERT observations were Ferrosa 32,183, 13,803, 13,839, 28,685 and native 60,158, 58,013, 18,783, 16,320 rows/s. The short native loads vary substantially; every observation is retained.
+One writer, eight point readers, 5,000 rows.
 
 ## Cassandra / CQL
 
-| Operation | Ferrosa | Cassandra |
+| Operation | Before `a2709e100` | Current `2286f389a` | Cassandra |
+| --- | ---: | ---: | ---: |
+| INSERT, logical rows/s | 16,400 | 16,019 | 13,795 |
+| Point reads, ops/s | 3,729 | 3,784 | 3,461 |
+| Point-read p50, ms | 1.811 | 1.782 | 1.945 |
+| COUNT p50, ms | 6.693 | 7.010 | 75.202 |
+| Bounded scan, logical rows/s | 69,816 | 78,713 | 153,079 |
+
+Eight writers/point readers, 20,000 rows; bounded scan returns 10,000 rows. Complete key/value census passed.
+
+## Older comparisons: not remeasured on current code
+
+### Neo4j / Bolt — runtime `a2709e100`
+
+| Operation | Ferrosa (older runtime) | Native |
 | --- | ---: | ---: |
-| INSERT, logical rows/s | **16,819** | 14,365 |
-| Point reads, ops/s | **3,852** | 3,526 |
-| Point-read p50, ms | **1.763** | 1.914 |
-| COUNT p50, ms | **7.612** | 94.776 |
-| Bounded scan, logical rows/s | **68,296** | 127,761 |
+| INSERT, logical rows/s | 13,223 | 11,994 |
+| Point reads, ops/s | 2,335 | 2,159 |
+| COUNT p50, ms | 13.311 | 1.261 |
+| Bounded scan, logical rows/s | 33,289 | 42,996 |
 
-Higher rates are better; lower milliseconds are better.
-Eight writers/readers, 20,000 rows. Complete key/value census passed for all 20,000 rows; this run does not silently stop at 5,000.
+### Oxigraph / SPARQL — runtime `a2709e100`
 
-## Neo4j / Bolt
-
-| Operation | Ferrosa | Neo4j |
+| Operation | Ferrosa (older runtime) | Native |
 | --- | ---: | ---: |
-| INSERT, logical rows/s | **13,223** | 11,994 |
-| Point reads, ops/s | **2,335** | 2,159 |
-| Point-read p50, ms | **0.764** | 0.967 |
-| COUNT p50, ms | **13.311** | 1.261 |
-| Bounded scan, logical rows/s | **33,289** | 42,996 |
+| INSERT, logical rows/s | 38,763 | 36,407 |
+| Point reads, ops/s | 5,179 | 5,229 |
+| COUNT p50, ms | 11.850 | 1.801 |
+| Bounded scan, logical rows/s | 29,937 | 74,329 |
 
-Higher rates are better; lower milliseconds are better.
-20,000 nodes per label. `id` is Ferrosa’s generated UUID key; `pk` is a regular scalar property. Ferrosa auto-created its scalar indexes; Neo4j’s three RANGE indexes were ONLINE and its point plan used an index seek. Ferrosa access proof reads one vertex for equality and zero vertices for COUNT. Point p50 uses one reader; throughput uses eight. Loads have two observations per product, one per label.
+Bolt used 20,000 nodes, automatic Ferrosa scalar indexes and ONLINE Neo4j
+RANGE indexes. SPARQL used 2,000 logical records/6,000 triples and a three-pattern
+join. These scan rates are not interchangeable physical-storage bandwidths.
+[Older runtime evidence](baseline-a270-results.json).
 
-## Oxigraph / SPARQL
+## Methodology
 
-| Operation | Ferrosa | Oxigraph |
-| --- | ---: | ---: |
-| INSERT, logical rows/s | **38,763** | 36,407 |
-| Point reads, ops/s | **5,179** | 5,229 |
-| Point-read p50, ms | **1.360** | 1.333 |
-| COUNT p50, ms | **11.850** | 1.801 |
-| Bounded scan, logical rows/s | **29,937** | 74,329 |
+- Each Ferrosa/native pair runs on the **same physical Fly VM, filesystem and
+  network destination**, with 2 performance vCPUs/4 GiB and the same client VM.
+  Only Ferrosa's executable changes between A/B; loader/libraries are shared.
+- Order: native/A/B/native/B/A, repeated twice. Each leg has an independent
+  writable fixture, 96-byte payloads from 512 variants, and exact key/value/count
+  validation. PostgreSQL/CQL perform 20,000 warm point reads per leg. All scans
+  project `pk`, `bucket`, `payload` and fully consume their requested rows.
+- Primary scan is **one serial bounded query per leg**, not sustained capacity.
+  Separate 10-second one/eight-reader delivery controls use PG single-row
+  streaming or explicit CQL pages of 5,000. First-row and first-page timings
+  describe different units. These controls do not calibrate profiler overhead.
+- Separate 30-second eight-reader CPU diagnostics use full adapter scans/counts.
+  CPU sampling is 49 Hz; context-switch callchains sample every 100 events for
+  five seconds. Decoding occurs after the workload stops. Files are capped and
+  removed remotely only after verified download; free space is guarded at 1 GiB.
+- OS counters sample CPU/steal, RSS, runqueue/wchan, PSI, process/disk I/O, network,
+  TCP queues and free disk at 1 Hz. CPU stacks and context-switch event weights
+  are **not elapsed mutex waits**. RSS is not allocation volume. Sampling and
+  profiler overhead are uncalibrated; unavailable cgroup counters remain unknown.
+- Native versions: PostgreSQL 18.6, Cassandra 5.0.9; older Neo4j 5.26.32 and
+  Oxigraph 0.5.11. INSERT includes connection/preparation overhead. Short loads,
+  JVM warm-up, flush/cache state and client CPU can materially affect results.
 
-Higher rates are better; lower milliseconds are better.
-Eight writers/readers; 2,000 logical records, each represented by three triples. INSERT uses batches of 128 records. COUNT is now an actual server aggregate, not a client scan substitute. The benchmark uses the common SPARQL query subset; it is not a W3C conformance suite.
+## Limits and remaining work
 
-## Methodology and limits
-
-- Four observations per product in native/Ferrosa/Ferrosa/native order, repeated twice; table values are means of per-leg rates/medians. Bolt seed/load rates have two observations. [Raw observations, minima and maxima](current-results.json) are retained.
-- PostgreSQL/CQL use 20,000 warm point reads per leg; SPARQL uses 2,000; Bolt uses 20,000 at concurrency eight plus 500 serial reads. Read worker connections warm before the timed barrier. PostgreSQL connection creation/preparation is included in loading.
-- Payloads are 96 bytes from 512 deterministic variants. Values, complete key sets and counts validate before accepting a leg. Scans return all three fields and at most 10,000 records (2,000 for SPARQL). All benchmarks are single-node and warm.
-- Native versions: PostgreSQL 18.6, Cassandra 5.0.9, Neo4j 5.26.32 and Oxigraph 0.5.11. Exact source/image/binary identities are in current-results.json. Each code version uses independent writable fixtures.
-- OS sampling records CPU/steal, RSS, scheduler runqueue/wchan, PSI, process I/O, disks and network at 1 Hz; CPU stacks are recorded separately at 49 Hz. RSS is not allocation volume; scheduler/wchan samples do not measure individual mutex wait durations. Guest cgroup CPU/memory-event files are unavailable and are not treated as zero.
-- Hardware quality checks invalidate OOM/counter resets and flag CPU steal >=1%, exposed throttling >=1% wall or full-memory PSI >=0.1% wall. Checks cover phase and SSH-bounded primary-leg windows. The current resource collector’s own overhead is not independently calibrated.
-- Client CPU can limit these driver workloads. Profiled 30-second loops are diagnostic and must not replace the unprofiled primary rates. Cold, larger, sustained, traversal, replication/HA, crash recovery and S3 recovery performance are unmeasured.
-- Native PostgreSQL has fsync/synchronous_commit on. Ferrosa’s atomic PostgreSQL batch path synchronizes its commit log before publication; direct-write periodic policies differ from native defaults. No crash test establishes equivalent durability guarantees.
-
-## Implemented changes and remaining features
-
-- Bolt creates scalar columns/indexes on first ordinary writes and memoizes physical schema setup. Explicit Cypher index DDL is still unsupported.
-- Counts over eligible Bolt shapes use live-row metadata rather than vertex JSON materialization. The resident count path now borrows its pinned partition; a 32-row, 256-column fixture reduced requested allocation bytes from 462,427 to 1,083. This is allocation evidence, not a claimed end-to-end COUNT speedup. Counts still walk metadata; flushed reads/cache contention remain costs.
-- SPARQL supports bounded global/grouped COUNT and DISTINCT. Single-pattern COUNT streams into counters; joins and property paths retain their bounded evaluator. Other aggregates and COUNT over UNION/OPTIONAL/subqueries remain explicit errors.
-- SPARQL 1.2 Results JSON supports recursive triple terms and directional literals for SELECT expressions, plus version negotiation for SELECT/ASK. HTTP cardinality, dataset refusal, query-form negotiation and service-base handling are tested. These contracts target the W3C Protocol draft of 2026-07-23 and JSON draft of 2026-08-13.
-- RDF 1.2 persistence and graph/XML output, protocol dataset overrides, optional HTTP QUERY, strict operation-version-specific grammar validation and full W3C conformance remain unimplemented. Unsupported persistence/graph paths fail explicitly.
-- PostgreSQL COUNT/scan and SPARQL multi-pattern scan rates remain gaps. SPARQL now uses borrowed-key indexing for fully bound shared-subject joins, but every predicate pattern still performs a streaming full scan. General unbound joins retain a compatibility fallback. The eight-writer PostgreSQL deadlock remains a bug, not a supported performance result.
-
-SQL scalar aggregation now consumes and releases rows without sorting/spilling;
-SQL projections move owned payload values. In the isolated SPARQL join fixture,
-128 records requested 18,498,367 bytes before versus 1,916,787 after. The matched
-SPARQL scan now reaches 29,937 rows/s versus the earlier candidate’s 1,816;
-PostgreSQL COUNT/scan did not materially improve. [Ownership proof, CPU evidence
-and remaining count work](SCAN_COUNTS.md) distinguish the measured costs.
-
-The measured runtime is `a2709e100`. Final documentation includes only a
-rustfmt layout change to the projection guard; normalized source equivalence
-was checked. CPU profiles are separate eight-reader diagnostics and can cover
-a different flush/cache state from serial primary counts.
+- PG uses **one writer**: the eight-writer load still fails with `40P01`.
+  This remains an unresolved bug. Point reads are near native rates; PG and CQL
+  scans retain substantial gaps. Sharing removed payload copies but did not
+  close the PG scan gap. [Ownership and remaining costs](SCAN_COUNTS.md).
+- Eligible PG unfiltered single-row-table `COUNT(*)` walks key/liveness metadata
+  and reconciles MVCC without SQL payload rows or the row channel. Other shapes
+  stream normally. COUNT remains linear metadata work, not constant time.
+- Immutable scalar values retain backing storage; CQL projection/page selection
+  moves rows, and PG decodes lazily. Text adoption still allocates an ownership
+  handle. Storage parsing, complex-value assembly, owned ABI boundaries and
+  final wire framing still have costs; this is not end-to-end zero-copy.
+- These are short, warm, single-node **local-file object-store** measurements.
+  Cold/S3, large data, sustained/JIT convergence, replication/HA and crash recovery
+  are unmeasured. Native PG fsync/synchronous_commit are on; direct-write periodic
+  policies differ, and no crash test establishes durability equivalence.
+- Bolt automatic scalar columns/indexes and memoized setup are implemented;
+  explicit Cypher index DDL remains unsupported. Eligible counts use liveness
+  metadata. Current-code Bolt throughput has not been established by this rerun.
+- SPARQL has bounded COUNT/DISTINCT and targeted SPARQL 1.2 Protocol/Results JSON
+  contracts. Other aggregates and COUNT over UNION/OPTIONAL/subqueries remain
+  explicit errors. RDF 1.2 persistence/graph XML, dataset overrides, optional HTTP
+  QUERY and full W3C conformance remain unimplemented. Predicate scans still
+  traverse the triples table. Current-code SPARQL throughput is unmeasured here.
 
 ## Evidence
 
-- [Current observations and artifact identity](current-results.json)
-- [Earlier candidate at c24cad554](baseline-c24-results.json)
-- [Matched baseline at 5b8356172](baseline-5b835-results.json)
-- [Earlier experiment journey](HISTORY.md)
-- [Eighteen CPU flamegraphs and CPU/RSS/wait/disk/network summaries](profiles-current/README.md)
+- [Current observations, ranges and artifact identities](current-results.json)
+- [Journey and earlier experiments](HISTORY.md)
+- [COUNT/scan ownership evidence](SCAN_COUNTS.md)
+- [CPU/context-switch graphs and resource summaries](profiles-current/README.md)
 - [Hardware-quality windows](hardware-quality-current.json)
-- [Eight matched PostgreSQL duration/profiler-control observations](pg-duration-profiler-control.json). All six Fly machines were verified stopped after the control; volumes were retained.
-
-Hardware checks covered 84 phase/primary-leg windows with no invalid intervals
-or threshold flags; maximum observed CPU steal was 0.51%. Cgroup accounting
-was unavailable, so throttling and cgroup memory events remain unknown. All
-six Fly machines were verified stopped after the final run; volumes remain.

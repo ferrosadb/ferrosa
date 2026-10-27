@@ -1,11 +1,11 @@
 {
   "measured_date": "2026-10-27",
   "runtime": {
-    "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
-    "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
-    "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb"
+    "revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+    "image": "registry.fly.io/ferrosa-bench-main@sha256:5ebb0fa28dab22fcc74c510e4472de9d91bd912f8dc1b5402cb86ec23e855a7e",
+    "binary_sha256": "94bcb79721b0afe60230b862be95f94cef8fad4fea083d4557e1119da2495c84"
   },
-  "scope": "Warm single-node end-to-end microbenchmarks; no durability or scale equivalence claim",
+  "scope": "PG/CQL measured at current runtime. Bolt/SPARQL retain older a270 measurements and were not rerun after the shared-value change.",
   "vm": {
     "cpu_kind": "performance",
     "cpus": 2,
@@ -24,71 +24,71 @@
       "engines": {
         "postgres": {
           "insert_rows_s": {
-            "mean": 38318.74902620852,
-            "minimum": 16320.438412411288,
-            "maximum": 60157.916214492216,
+            "mean": 38992.760604718474,
+            "minimum": 11771.455967569715,
+            "maximum": 62020.23549102455,
             "observations": [
-              60157.916214492216,
-              58013.29996670646,
-              18783.34151122412,
-              16320.438412411288
+              20532.335286636284,
+              62020.23549102455,
+              61647.01567364336,
+              11771.455967569715
             ]
           },
           "point_ops_s": {
-            "mean": 9953.320197372672,
-            "minimum": 9332.439052983224,
-            "maximum": 10355.589443278488,
+            "mean": 10571.327871748459,
+            "minimum": 10302.737461142719,
+            "maximum": 10997.644853254054,
             "observations": [
-              9992.42483765861,
-              10355.589443278488,
-              9332.439052983224,
-              10132.82745557037
+              10302.737461142719,
+              10677.671883966615,
+              10997.644853254054,
+              10307.257288630448
             ]
           },
           "point_p50_ms": {
-            "mean": 0.6522706250073895,
-            "minimum": 0.634093000016378,
-            "maximum": 0.6811885000104212,
+            "mean": 0.5931358749649007,
+            "minimum": 0.5862735000619068,
+            "maximum": 0.5995839999286545,
             "observations": [
-              0.6509779999959164,
-              0.634093000016378,
-              0.6811885000104212,
-              0.6428230000068424
+              0.5918829999700392,
+              0.5948029998990023,
+              0.5862735000619068,
+              0.5995839999286545
             ]
           },
           "count_p50_ms": {
-            "mean": 0.8653524999928663,
-            "minimum": 0.7613969999908932,
-            "maximum": 1.0397169999976086,
+            "mean": 0.671995500056255,
+            "minimum": 0.609439000072598,
+            "maximum": 0.8364770001207944,
             "observations": [
-              0.8587579999925765,
-              1.0397169999976086,
-              0.8015379999903871,
-              0.7613969999908932
+              0.612258000046495,
+              0.609439000072598,
+              0.8364770001207944,
+              0.6298079999851325
             ]
           },
-          "count_status": "measured",
           "scan_rows_s": {
-            "mean": 420447.18321740144,
-            "minimum": 394486.18765778025,
-            "maximum": 435107.31225717574,
+            "mean": 487618.17227808107,
+            "minimum": 479183.7315970492,
+            "maximum": 494735.42143766757,
             "observations": [
-              427604.17570863187,
-              394486.18765778025,
-              424591.0572460179,
-              435107.31225717574
+              492719.96398972423,
+              479183.7315970492,
+              494735.42143766757,
+              483833.57208788325
             ]
           },
+          "count_status": "supported server aggregate",
           "kernel_syn_rtt_us_p50": [
-            383.0,
-            332.0,
-            392.0,
-            322.5
+            313.0,
+            279.5,
+            299.5,
+            329.5
           ],
           "point_plans": [
             [
               [
-                "Index Scan using pipeline139_pg_1_pkey on pipeline139_pg_1  (cost=0.29..8.30 rows=1 width=40)"
+                "Index Scan using pipeline144_pg_1_pkey on pipeline144_pg_1  (cost=0.29..8.30 rows=1 width=40)"
               ],
               [
                 "  Index Cond: (pk = 42)"
@@ -96,7 +96,7 @@
             ],
             [
               [
-                "Index Scan using pipeline139_pg_4_pkey on pipeline139_pg_4  (cost=0.29..8.30 rows=1 width=40)"
+                "Index Scan using pipeline144_pg_4_pkey on pipeline144_pg_4  (cost=0.29..8.30 rows=1 width=40)"
               ],
               [
                 "  Index Cond: (pk = 42)"
@@ -104,7 +104,7 @@
             ],
             [
               [
-                "Index Scan using pipeline139_pg_5_pkey on pipeline139_pg_5  (cost=0.29..8.30 rows=1 width=40)"
+                "Index Scan using pipeline144_pg_7_pkey on pipeline144_pg_7  (cost=0.29..8.30 rows=1 width=40)"
               ],
               [
                 "  Index Cond: (pk = 42)"
@@ -112,7 +112,7 @@
             ],
             [
               [
-                "Index Scan using pipeline139_pg_8_pkey on pipeline139_pg_8  (cost=0.29..8.30 rows=1 width=40)"
+                "Index Scan using pipeline144_pg_10_pkey on pipeline144_pg_10  (cost=0.29..8.30 rows=1 width=40)"
               ],
               [
                 "  Index Cond: (pk = 42)"
@@ -122,66 +122,144 @@
         },
         "ferrosa_pg": {
           "insert_rows_s": {
-            "mean": 22127.27064112416,
-            "minimum": 13802.86010941521,
-            "maximum": 32182.623670760637,
+            "mean": 32640.93887276201,
+            "minimum": 32369.7786786182,
+            "maximum": 32813.652364220514,
             "observations": [
-              32182.623670760637,
-              13802.86010941521,
-              13839.026951666347,
-              28684.571832654452
+              32369.7786786182,
+              32766.791145525607,
+              32613.533302683718,
+              32813.652364220514
             ]
           },
           "point_ops_s": {
-            "mean": 9149.971883643477,
-            "minimum": 8534.887252716264,
-            "maximum": 9670.936903994305,
+            "mean": 9835.930185540838,
+            "minimum": 9494.901969224893,
+            "maximum": 10130.124565051545,
             "observations": [
-              8959.451883383252,
-              9670.936903994305,
-              8534.887252716264,
-              9434.611494480085
+              9494.901969224893,
+              9813.17067440253,
+              10130.124565051545,
+              9905.52353348438
             ]
           },
           "point_p50_ms": {
-            "mean": 0.7650216249999175,
-            "minimum": 0.7398179999995591,
-            "maximum": 0.8077174999954195,
+            "mean": 0.7146755000064786,
+            "minimum": 0.7024980000096548,
+            "maximum": 0.7270779999544175,
             "observations": [
-              0.7616930000011735,
-              0.7398179999995591,
-              0.8077174999954195,
-              0.7508580000035181
+              0.7270779999544175,
+              0.7144280000375147,
+              0.7024980000096548,
+              0.7146980000243275
             ]
           },
           "count_p50_ms": {
-            "mean": 43.96740199999627,
-            "minimum": 39.46969199998307,
-            "maximum": 47.715338999978485,
+            "mean": 5.49603499996465,
+            "minimum": 4.907916999854933,
+            "maximum": 5.98925400004191,
             "observations": [
-              46.685672000009504,
-              41.99890500001402,
-              39.46969199998307,
-              47.715338999978485
+              5.98925400004191,
+              4.907916999854933,
+              5.577773999903002,
+              5.509195000058753
             ]
           },
-          "count_status": "measured",
           "scan_rows_s": {
-            "mean": 92741.89495248854,
-            "minimum": 77867.63044781498,
-            "maximum": 101749.51162779627,
+            "mean": 98712.7129904144,
+            "minimum": 82133.80605599389,
+            "maximum": 109924.95972586336,
             "observations": [
-              96431.94661559386,
-              101749.51162779627,
-              94918.49111874908,
-              77867.63044781498
+              82133.80605599389,
+              95548.2612740382,
+              107243.82490576213,
+              109924.95972586336
             ]
           },
+          "count_status": "supported server aggregate",
           "kernel_syn_rtt_us_p50": [
-            344.5,
-            318.5,
-            368.5,
-            365.0
+            317.5,
+            325.0,
+            297.0,
+            323.0
+          ],
+          "point_plans": [
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ],
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ],
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ],
+            [
+              "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+            ]
+          ]
+        },
+        "ferrosa_pg_before": {
+          "insert_rows_s": {
+            "mean": 27534.74974913111,
+            "minimum": 15610.938934587366,
+            "maximum": 33477.433598527045,
+            "observations": [
+              28502.35060024983,
+              15610.938934587366,
+              32548.2758631602,
+              33477.433598527045
+            ]
+          },
+          "point_ops_s": {
+            "mean": 9633.119441105422,
+            "minimum": 9342.290649361701,
+            "maximum": 10218.069377209293,
+            "observations": [
+              9342.290649361701,
+              9484.195097696722,
+              9487.92264015397,
+              10218.069377209293
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 0.727055499993412,
+            "minimum": 0.6949680000616354,
+            "maximum": 0.7558629999948607,
+            "observations": [
+              0.7558629999948607,
+              0.721847999898273,
+              0.735543000018879,
+              0.6949680000616354
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 45.71556175000069,
+            "minimum": 43.62724999987222,
+            "maximum": 47.84901800007901,
+            "observations": [
+              47.84901800007901,
+              43.62724999987222,
+              43.66540000000896,
+              47.72057900004256
+            ]
+          },
+          "scan_rows_s": {
+            "mean": 98575.14977218061,
+            "minimum": 83813.21005822696,
+            "maximum": 104552.36032398992,
+            "observations": [
+              102927.23618770974,
+              104552.36032398992,
+              103007.79251879579,
+              83813.21005822696
+            ]
+          },
+          "count_status": "supported server aggregate",
+          "kernel_syn_rtt_us_p50": [
+            337.0,
+            313.5,
+            312.0,
+            318.5
           ],
           "point_plans": [
             [
@@ -201,7 +279,220 @@
       },
       "write_wave_per_worker": 256,
       "eight_writer_status": "FAILED: DeadlockDetected during5000-row insert; preserved inrun131",
-      "auth": "authenticated connections; creation included in load, excluded from warm reads"
+      "auth": "authenticated connections; creation included in load, excluded from warm reads",
+      "measured_runtime": {
+        "revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:5ebb0fa28dab22fcc74c510e4472de9d91bd912f8dc1b5402cb86ec23e855a7e",
+        "binary_sha256": "94bcb79721b0afe60230b862be95f94cef8fad4fea083d4557e1119da2495c84"
+      },
+      "measured_scope": "current measured production code",
+      "baseline_runtime": {
+        "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
+        "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb"
+      },
+      "raw_observations": [
+        {
+          "insert_rows_s": 20532.335286636284,
+          "count_p50_ms": 0.612258000046495,
+          "scan_rows_s": 492719.96398972423,
+          "kernel_syn_rtt_us_p50": 313.0,
+          "ordinal": 1,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 10302.737461142719,
+          "point_p50_ms": 0.5918829999700392,
+          "validated": true,
+          "point_plan": [
+            [
+              "Index Scan using pipeline144_pg_1_pkey on pipeline144_pg_1  (cost=0.29..8.30 rows=1 width=40)"
+            ],
+            [
+              "  Index Cond: (pk = 42)"
+            ]
+          ]
+        },
+        {
+          "insert_rows_s": 28502.35060024983,
+          "count_p50_ms": 47.84901800007901,
+          "scan_rows_s": 102927.23618770974,
+          "kernel_syn_rtt_us_p50": 337.0,
+          "ordinal": 2,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 9342.290649361701,
+          "point_p50_ms": 0.7558629999948607,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 32369.7786786182,
+          "count_p50_ms": 5.98925400004191,
+          "scan_rows_s": 82133.80605599389,
+          "kernel_syn_rtt_us_p50": 317.5,
+          "ordinal": 3,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 9494.901969224893,
+          "point_p50_ms": 0.7270779999544175,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 62020.23549102455,
+          "count_p50_ms": 0.609439000072598,
+          "scan_rows_s": 479183.7315970492,
+          "kernel_syn_rtt_us_p50": 279.5,
+          "ordinal": 4,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 10677.671883966615,
+          "point_p50_ms": 0.5948029998990023,
+          "validated": true,
+          "point_plan": [
+            [
+              "Index Scan using pipeline144_pg_4_pkey on pipeline144_pg_4  (cost=0.29..8.30 rows=1 width=40)"
+            ],
+            [
+              "  Index Cond: (pk = 42)"
+            ]
+          ]
+        },
+        {
+          "insert_rows_s": 32766.791145525607,
+          "count_p50_ms": 4.907916999854933,
+          "scan_rows_s": 95548.2612740382,
+          "kernel_syn_rtt_us_p50": 325.0,
+          "ordinal": 5,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 9813.17067440253,
+          "point_p50_ms": 0.7144280000375147,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 15610.938934587366,
+          "count_p50_ms": 43.62724999987222,
+          "scan_rows_s": 104552.36032398992,
+          "kernel_syn_rtt_us_p50": 313.5,
+          "ordinal": 6,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 9484.195097696722,
+          "point_p50_ms": 0.721847999898273,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 61647.01567364336,
+          "count_p50_ms": 0.8364770001207944,
+          "scan_rows_s": 494735.42143766757,
+          "kernel_syn_rtt_us_p50": 299.5,
+          "ordinal": 7,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 10997.644853254054,
+          "point_p50_ms": 0.5862735000619068,
+          "validated": true,
+          "point_plan": [
+            [
+              "Index Scan using pipeline144_pg_7_pkey on pipeline144_pg_7  (cost=0.29..8.30 rows=1 width=40)"
+            ],
+            [
+              "  Index Cond: (pk = 42)"
+            ]
+          ]
+        },
+        {
+          "insert_rows_s": 32548.2758631602,
+          "count_p50_ms": 43.66540000000896,
+          "scan_rows_s": 103007.79251879579,
+          "kernel_syn_rtt_us_p50": 312.0,
+          "ordinal": 8,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 9487.92264015397,
+          "point_p50_ms": 0.735543000018879,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 32613.533302683718,
+          "count_p50_ms": 5.577773999903002,
+          "scan_rows_s": 107243.82490576213,
+          "kernel_syn_rtt_us_p50": 297.0,
+          "ordinal": 9,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 10130.124565051545,
+          "point_p50_ms": 0.7024980000096548,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 11771.455967569715,
+          "count_p50_ms": 0.6298079999851325,
+          "scan_rows_s": 483833.57208788325,
+          "kernel_syn_rtt_us_p50": 329.5,
+          "ordinal": 10,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 10307.257288630448,
+          "point_p50_ms": 0.5995839999286545,
+          "validated": true,
+          "point_plan": [
+            [
+              "Index Scan using pipeline144_pg_10_pkey on pipeline144_pg_10  (cost=0.29..8.30 rows=1 width=40)"
+            ],
+            [
+              "  Index Cond: (pk = 42)"
+            ]
+          ]
+        },
+        {
+          "insert_rows_s": 32813.652364220514,
+          "count_p50_ms": 5.509195000058753,
+          "scan_rows_s": 109924.95972586336,
+          "kernel_syn_rtt_us_p50": 323.0,
+          "ordinal": 11,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 9905.52353348438,
+          "point_p50_ms": 0.7146980000243275,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        },
+        {
+          "insert_rows_s": 33477.433598527045,
+          "count_p50_ms": 47.72057900004256,
+          "scan_rows_s": 83813.21005822696,
+          "kernel_syn_rtt_us_p50": 318.5,
+          "ordinal": 12,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 10218.069377209293,
+          "point_p50_ms": 0.6949680000616354,
+          "validated": true,
+          "point_plan": [
+            "EXPLAIN unsupported; primary-key schema and exact-key SELECT validated"
+          ]
+        }
+      ]
     },
     "cql": {
       "native": "cassandra",
@@ -212,133 +503,213 @@
       "engines": {
         "cassandra": {
           "insert_rows_s": {
-            "mean": 14364.977877286641,
-            "minimum": 7850.553349393075,
-            "maximum": 17787.480872308995,
+            "mean": 13794.75451583326,
+            "minimum": 8661.13351249313,
+            "maximum": 17144.493486792184,
             "observations": [
-              7850.553349393075,
-              14742.772324907695,
-              17079.1049625368,
-              17787.480872308995
+              8661.13351249313,
+              14976.012385569371,
+              14397.378678478355,
+              17144.493486792184
             ]
           },
           "point_ops_s": {
-            "mean": 3526.0507462584596,
-            "minimum": 3107.1373098652352,
-            "maximum": 3802.772382646756,
+            "mean": 3461.3828096088628,
+            "minimum": 3065.0767345332115,
+            "maximum": 3765.818172838863,
             "observations": [
-              3107.1373098652352,
-              3427.7860299479207,
-              3802.772382646756,
-              3766.5072625739263
+              3065.0767345332115,
+              3269.3673807841774,
+              3765.818172838863,
+              3745.268950279198
             ]
           },
           "point_p50_ms": {
-            "mean": 1.9140808750108818,
-            "minimum": 1.7949750000525455,
-            "maximum": 2.1155389999876206,
+            "mean": 1.9454948749810796,
+            "minimum": 1.7874354999776187,
+            "maximum": 2.151709499997878,
             "observations": [
-              2.1155389999876206,
-              1.9507545000010396,
-              1.7950550000023213,
-              1.7949750000525455
+              2.151709499997878,
+              2.0253545000059603,
+              1.7874354999776187,
+              1.8174799999428615
             ]
           },
           "count_p50_ms": {
-            "mean": 94.77593449997812,
-            "minimum": 46.77728100000422,
-            "maximum": 205.60018499998023,
+            "mean": 75.20178800001531,
+            "minimum": 48.68710599998849,
+            "maximum": 145.826919000001,
             "observations": [
-              205.60018499998023,
-              64.32216299992888,
-              62.40410899999915,
-              46.77728100000422
+              145.826919000001,
+              49.49812400002429,
+              56.79500300004747,
+              48.68710599998849
             ]
           },
-          "count_status": "measured",
           "scan_rows_s": {
-            "mean": 127761.06052962267,
-            "minimum": 88381.25914636967,
-            "maximum": 170956.30512397722,
+            "mean": 153079.0764734166,
+            "minimum": 116707.48939037863,
+            "maximum": 176807.53659799462,
             "observations": [
-              88381.25914636967,
-              113064.47964387447,
-              138642.19820426934,
-              170956.30512397722
+              116707.48939037863,
+              160428.20469655408,
+              176807.53659799462,
+              158373.07520873897
             ]
           },
+          "count_status": "supported server aggregate",
           "kernel_syn_rtt_us_p50": [
-            371.5,
-            326.5,
-            311.0,
-            323.0
+            336.5,
+            322.0,
+            301.5,
+            321.5
           ],
-          "point_plans": null
+          "point_plans": [
+            null,
+            null,
+            null,
+            null
+          ]
         },
         "ferrosa_cql": {
           "insert_rows_s": {
-            "mean": 16818.640214831543,
-            "minimum": 16736.78196974084,
-            "maximum": 16957.368976838716,
+            "mean": 16019.109722114146,
+            "minimum": 14262.41992350077,
+            "maximum": 17080.4163818126,
             "observations": [
-              16811.94963723977,
-              16736.78196974084,
-              16957.368976838716,
-              16768.46027550684
+              14262.41992350077,
+              16201.427448150864,
+              17080.4163818126,
+              16532.175134992354
             ]
           },
           "point_ops_s": {
-            "mean": 3851.706191858665,
-            "minimum": 3784.2524434025613,
-            "maximum": 3921.3202356495276,
+            "mean": 3784.07644711828,
+            "minimum": 3519.9481251446573,
+            "maximum": 3879.656075278325,
             "observations": [
-              3905.0002961786695,
-              3784.2524434025613,
-              3796.251792203902,
-              3921.3202356495276
+              3519.9481251446573,
+              3857.443460795923,
+              3879.656075278325,
+              3879.2581272542166
             ]
           },
           "point_p50_ms": {
-            "mean": 1.7631677500133947,
-            "minimum": 1.7349950000493664,
-            "maximum": 1.7905605000123614,
+            "mean": 1.7818062500083443,
+            "minimum": 1.7294749999905434,
+            "maximum": 1.8905000000017935,
             "observations": [
-              1.7349950000493664,
-              1.7905605000123614,
-              1.7896700000505916,
-              1.7374454999412592
+              1.8905000000017935,
+              1.7661300000213487,
+              1.7411200000196914,
+              1.7294749999905434
             ]
           },
           "count_p50_ms": {
-            "mean": 7.612484250017815,
-            "minimum": 5.182736000051591,
-            "maximum": 10.57765100006236,
+            "mean": 7.010498249996999,
+            "minimum": 4.6924269998953605,
+            "maximum": 10.88906000006773,
             "observations": [
-              7.373529999995299,
-              5.182736000051591,
-              10.57765100006236,
-              7.316019999962009
+              5.6527539999819965,
+              6.80775200004291,
+              4.6924269998953605,
+              10.88906000006773
             ]
           },
-          "count_status": "measured",
           "scan_rows_s": {
-            "mean": 68296.22065583587,
-            "minimum": 62386.67888689638,
-            "maximum": 71503.45853289473,
+            "mean": 78712.57544862434,
+            "minimum": 74654.98831718504,
+            "maximum": 82455.30322700823,
             "observations": [
-              68605.03374751972,
-              71503.45853289473,
-              70689.7114560327,
-              62386.67888689638
+              82455.30322700823,
+              74654.98831718504,
+              76458.8183896796,
+              81281.1918606245
             ]
           },
+          "count_status": "supported server aggregate",
           "kernel_syn_rtt_us_p50": [
-            321.0,
-            326.5,
-            304.5,
-            300.0
+            334.0,
+            295.0,
+            299.5,
+            343.0
           ],
-          "point_plans": null
+          "point_plans": [
+            null,
+            null,
+            null,
+            null
+          ]
+        },
+        "ferrosa_cql_before": {
+          "insert_rows_s": {
+            "mean": 16400.08197357806,
+            "minimum": 15813.750642083056,
+            "maximum": 17281.655698749688,
+            "observations": [
+              15813.750642083056,
+              16368.960253375537,
+              17281.655698749688,
+              16135.961300103965
+            ]
+          },
+          "point_ops_s": {
+            "mean": 3728.9160917921727,
+            "minimum": 3657.348662463611,
+            "maximum": 3802.2712089501797,
+            "observations": [
+              3657.348662463611,
+              3675.671704638932,
+              3780.3727911159667,
+              3802.2712089501797
+            ]
+          },
+          "point_p50_ms": {
+            "mean": 1.8107612499989045,
+            "minimum": 1.7758299999854898,
+            "maximum": 1.8439450000187207,
+            "observations": [
+              1.8439450000187207,
+              1.8402549999905204,
+              1.7758299999854898,
+              1.783015000000887
+            ]
+          },
+          "count_p50_ms": {
+            "mean": 6.692686750014332,
+            "minimum": 6.194022999977733,
+            "maximum": 7.191400000010617,
+            "observations": [
+              6.194022999977733,
+              6.280973000002632,
+              7.104351000066345,
+              7.191400000010617
+            ]
+          },
+          "scan_rows_s": {
+            "mean": 69815.67865449157,
+            "minimum": 57130.367138739035,
+            "maximum": 76510.89507496197,
+            "observations": [
+              72911.07598207414,
+              57130.367138739035,
+              72710.37642219114,
+              76510.89507496197
+            ]
+          },
+          "count_status": "supported server aggregate",
+          "kernel_syn_rtt_us_p50": [
+            325.0,
+            306.5,
+            294.5,
+            326.5
+          ],
+          "point_plans": [
+            null,
+            null,
+            null,
+            null
+          ]
         }
       },
       "protocol_version": 4,
@@ -346,7 +717,176 @@
       "replication_factor": 1,
       "consistency": "ONE",
       "auth": "disabled on both engines",
-      "write_wave_per_worker": 32
+      "write_wave_per_worker": 32,
+      "measured_runtime": {
+        "revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:5ebb0fa28dab22fcc74c510e4472de9d91bd912f8dc1b5402cb86ec23e855a7e",
+        "binary_sha256": "94bcb79721b0afe60230b862be95f94cef8fad4fea083d4557e1119da2495c84"
+      },
+      "measured_scope": "current measured production code",
+      "baseline_runtime": {
+        "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
+        "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb"
+      },
+      "raw_observations": [
+        {
+          "insert_rows_s": 8661.13351249313,
+          "count_p50_ms": 145.826919000001,
+          "scan_rows_s": 116707.48939037863,
+          "kernel_syn_rtt_us_p50": 336.5,
+          "ordinal": 1,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 3065.0767345332115,
+          "point_p50_ms": 2.151709499997878,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 15813.750642083056,
+          "count_p50_ms": 6.194022999977733,
+          "scan_rows_s": 72911.07598207414,
+          "kernel_syn_rtt_us_p50": 325.0,
+          "ordinal": 2,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 3657.348662463611,
+          "point_p50_ms": 1.8439450000187207,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 14262.41992350077,
+          "count_p50_ms": 5.6527539999819965,
+          "scan_rows_s": 82455.30322700823,
+          "kernel_syn_rtt_us_p50": 334.0,
+          "ordinal": 3,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 3519.9481251446573,
+          "point_p50_ms": 1.8905000000017935,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 14976.012385569371,
+          "count_p50_ms": 49.49812400002429,
+          "scan_rows_s": 160428.20469655408,
+          "kernel_syn_rtt_us_p50": 322.0,
+          "ordinal": 4,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 3269.3673807841774,
+          "point_p50_ms": 2.0253545000059603,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 16201.427448150864,
+          "count_p50_ms": 6.80775200004291,
+          "scan_rows_s": 74654.98831718504,
+          "kernel_syn_rtt_us_p50": 295.0,
+          "ordinal": 5,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 3857.443460795923,
+          "point_p50_ms": 1.7661300000213487,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 16368.960253375537,
+          "count_p50_ms": 6.280973000002632,
+          "scan_rows_s": 57130.367138739035,
+          "kernel_syn_rtt_us_p50": 306.5,
+          "ordinal": 6,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 3675.671704638932,
+          "point_p50_ms": 1.8402549999905204,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 14397.378678478355,
+          "count_p50_ms": 56.79500300004747,
+          "scan_rows_s": 176807.53659799462,
+          "kernel_syn_rtt_us_p50": 301.5,
+          "ordinal": 7,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 3765.818172838863,
+          "point_p50_ms": 1.7874354999776187,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 17281.655698749688,
+          "count_p50_ms": 7.104351000066345,
+          "scan_rows_s": 72710.37642219114,
+          "kernel_syn_rtt_us_p50": 294.5,
+          "ordinal": 8,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 3780.3727911159667,
+          "point_p50_ms": 1.7758299999854898,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 17080.4163818126,
+          "count_p50_ms": 4.6924269998953605,
+          "scan_rows_s": 76458.8183896796,
+          "kernel_syn_rtt_us_p50": 299.5,
+          "ordinal": 9,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 3879.656075278325,
+          "point_p50_ms": 1.7411200000196914,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 17144.493486792184,
+          "count_p50_ms": 48.68710599998849,
+          "scan_rows_s": 158373.07520873897,
+          "kernel_syn_rtt_us_p50": 321.5,
+          "ordinal": 10,
+          "runtime_arm": "native",
+          "source_revision": null,
+          "point_ops_s": 3745.268950279198,
+          "point_p50_ms": 1.8174799999428615,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 16532.175134992354,
+          "count_p50_ms": 10.88906000006773,
+          "scan_rows_s": 81281.1918606245,
+          "kernel_syn_rtt_us_p50": 343.0,
+          "ordinal": 11,
+          "runtime_arm": "B",
+          "source_revision": "2286f389ac6669d44d5cfef1e71c7facdce37c30",
+          "point_ops_s": 3879.2581272542166,
+          "point_p50_ms": 1.7294749999905434,
+          "validated": true,
+          "point_plan": null
+        },
+        {
+          "insert_rows_s": 16135.961300103965,
+          "count_p50_ms": 7.191400000010617,
+          "scan_rows_s": 76510.89507496197,
+          "kernel_syn_rtt_us_p50": 326.5,
+          "ordinal": 12,
+          "runtime_arm": "A",
+          "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+          "point_ops_s": 3802.2712089501797,
+          "point_p50_ms": 1.783015000000887,
+          "validated": true,
+          "point_plan": null
+        }
+      ]
     },
     "sparql": {
       "native": "oxigraph",
@@ -489,7 +1029,13 @@
       "triples_per_row": 3,
       "triples": 6000,
       "auth": "disabled on both engines",
-      "batch_rows": 128
+      "batch_rows": 128,
+      "measured_runtime": {
+        "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
+        "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb"
+      },
+      "measured_scope": "Older available measurement; not rerun after the current shared scalar change."
     },
     "bolt": {
       "native": "neo4j",
@@ -763,7 +1309,13 @@
         "batch_rows": 128,
         "concurrency": 1,
         "setup_excluded": true
-      }
+      },
+      "measured_runtime": {
+        "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+        "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
+        "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb"
+      },
+      "measured_scope": "Older available measurement; not rerun after the current shared scalar change."
     }
   },
   "graph_before_after": {},
@@ -807,5 +1359,54 @@
     },
     "schema": "UUID id primary key; regular pk/bucket/payload scalars; automatic Ferrosa indexes and three ONLINE Neo4j RANGE indexes"
   },
-  "baseline_revision": "5b83561729a0076843434a1846a1393fde23d0fc"
+  "baseline_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+  "baseline_runtime": {
+    "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+    "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
+    "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb"
+  },
+  "tested_rust_revision": "03cf9511e01f95f23dc67f79db97730b4c6b2bd4",
+  "production_source_equivalence": "All Rust changes after the measured runtime are test-only.",
+  "methodology": {
+    "primary_order": [
+      "native",
+      "before",
+      "after",
+      "native",
+      "after",
+      "before",
+      "native",
+      "before",
+      "after",
+      "native",
+      "after",
+      "before"
+    ],
+    "observations_per_arm": 4,
+    "placement": "Each Ferrosa/native pair uses the same physical VM, filesystem and network destination; one timed workload at a time.",
+    "primary_scan": "One serial fully consumed bounded query per observation, not maximum sustained scan capacity.",
+    "payload_bytes": 96,
+    "payload_variants": 512,
+    "delivery_controls": "10-second unprofiled 1/8-reader loops; PG single-row cursor streaming, CQL explicit 5000-row paging. These differ from primary fetch-all delivery and are not strict profiler-overhead controls.",
+    "cpu_profiles": "Separate 30-second 8-reader adapter count/full-scan loops; CPU49Hz,5s context-switch sampling period100; decode only after workload completion.",
+    "profile_limits": "CPU samples are not elapsed request fractions; sampled context-switch event weights are not blocked durations; RSS is not allocation volume.",
+    "disk_reserve_bytes": 1073741824,
+    "warm_scope": "Short warm single-node tests; no steady-state/JIT convergence or matched internal memtable/SST tier is established.",
+    "durability": "Native PG fsync/synchronous_commit enabled; direct-write periodic policies differ. No crash test establishes durability equivalence."
+  },
+  "historical_baseline_revision": "5b83561729a0076843434a1846a1393fde23d0fc",
+  "quality_status": {
+    "pg": "Provisional native comparison: one native leg flagged2.83% CPU steal; no observations discarded.",
+    "cql": "No declared hardware flags in primary-leg windows."
+  },
+  "profiling_status": {
+    "completed_cpu_captures": 4,
+    "missing_pg_cpu_captures": 5,
+    "reason": "Fly SSH control timeouts; primary observations remain complete."
+  },
+  "shutdown": {
+    "benchmark_machines_stopped": 6,
+    "volumes_retained": true,
+    "verified_at": "2026-10-27T18:19:58.794994+00:00"
+  }
 }

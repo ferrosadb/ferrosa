@@ -1,5 +1,16 @@
 # Pipeline performance experiments
 
+Latest PG/CQL measurements use production code `2286f389a`, including metadata
+COUNT and immutable scalar ownership. [Current results](RESULTS.md) retain all
+observations, one native PG CPU-steal flag, and the incomplete PG profiling scope.
+Bolt/SPARQL tables are explicitly older `a2709e100` measurements.
+
+[Delivery timing observations](scan-delivery-results.json) use a separate probe:
+PG single-row streaming and CQL 5,000-row pages at one/eight readers. These are
+not maximum capacity or profiler-overhead controls. The measured
+[profiling helper](instruments/scan144_profiler.py) samples bounded recordings
+and decodes them after workload completion; [usage](instruments/README.md).
+
 [Measurement status](RESULTS.md): PR #625 combines automatic Bolt scalar schema
 and index setup, streaming CQL LIMIT pages, and protocol transaction/RDF fixes.
 Current matched-VM comparisons are recorded in RESULTS.md and current-results.json;

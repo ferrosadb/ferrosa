@@ -1,39 +1,25 @@
-# CPU flamegraphs and sampled resources
+# Current CPU captures and resource evidence
 
-Runtime `a2709e100`; CPU stacks sampled at 49 Hz in separate eight-reader loops. Primary rates are measured without CPU profiling. PostgreSQL/SPARQL include separate count and complete-scan recordings with exact value validation. Client validation consumes CPU; these instrumented rates are diagnostic.
+Production code `2286f389a` (B), baseline `a2709e100` (A). Primary throughput
+observations are complete. **Five PostgreSQL CPU captures were interrupted
+by Fly SSH control timeouts**; only completed captures below are published.
 
-| Capture | Flamegraph | CPU samples |
-| --- | --- | ---: |
-| bolt-B | [SVG](bolt-B.svg) | 238 |
-| bolt-B-count | [SVG](bolt-B-count.svg) | 906 |
-| bolt-neo4j | [SVG (gzip)](bolt-neo4j.svg.gz) | 1,880 |
-| bolt-neo4j-count | [SVG](bolt-neo4j-count.svg) | 786 |
-| cql-cassandra-profile | [SVG](cql-cassandra-profile.svg) | 550 |
-| cql-ferrosa_cql-profile | [SVG](cql-ferrosa_cql-profile.svg) | 194 |
-| pg-ferrosa_pg-count-profile | [SVG](pg-ferrosa_pg-count-profile.svg) | 1,382 |
-| pg-ferrosa_pg-profile | [SVG](pg-ferrosa_pg-profile.svg) | 450 |
-| pg-ferrosa_pg-scan-profile | [SVG](pg-ferrosa_pg-scan-profile.svg) | 1,365 |
-| pg-postgres-count-profile | [SVG](pg-postgres-count-profile.svg) | 1,878 |
-| pg-postgres-profile | [SVG](pg-postgres-profile.svg) | 392 |
-| pg-postgres-scan-profile | [SVG](pg-postgres-scan-profile.svg) | 152 |
-| sparql-ferrosa_sparql-count-profile | [SVG](sparql-ferrosa_sparql-count-profile.svg) | 364 |
-| sparql-ferrosa_sparql-profile | [SVG](sparql-ferrosa_sparql-profile.svg) | 409 |
-| sparql-ferrosa_sparql-scan-profile | [SVG](sparql-ferrosa_sparql-scan-profile.svg) | 1,587 |
-| sparql-oxigraph-count-profile | [SVG](sparql-oxigraph-count-profile.svg) | 2,575 |
-| sparql-oxigraph-profile | [SVG](sparql-oxigraph-profile.svg) | 742 |
-| sparql-oxigraph-scan-profile | [SVG](sparql-oxigraph-scan-profile.svg) | 2,339 |
+| Capture | CPU graph | CPU samples | Context-switch graph | Sampled callchains |
+| --- | --- | ---: | --- | ---: |
+| cql-cassandra-scan-profile | [CPU](scan144-cql-cassandra-scan-profile-cpu.svg) | 1522 | [Switches](scan144-cql-cassandra-scan-profile-switches.svg) | 796 |
+| cql-ferrosa_cql-A-scan-profile | [CPU](scan144-cql-ferrosa_cql-A-scan-profile-cpu.svg) | 562 | [Switches](scan144-cql-ferrosa_cql-A-scan-profile-switches.svg) | 2185 |
+| cql-ferrosa_cql-B-scan-profile | [CPU](scan144-cql-ferrosa_cql-B-scan-profile-cpu.svg) | 622 | [Switches](scan144-cql-ferrosa_cql-B-scan-profile-switches.svg) | 943 |
+| pg-postgres-count-profile | [CPU](scan144-pg-postgres-count-profile-cpu.svg) | 1870 | [Switches](scan144-pg-postgres-count-profile-switches.svg) | 108 |
 
-[Detailed resource summaries](summary.json) include CPU time, per-process RSS peaks, scheduler/wchan, PSI, I/O, disks and network. Gzip SVGs can be opened after `gunzip -k <file.svg.gz>`.
+[Resource/CPU/TCP summaries](summary.json) · [Hardware quality](../hardware-quality-current.json)
 
-- CPU widths are sample counts, not elapsed request time.
-- RSS is sampled per-process resident memory, not allocation volume. Do not sum process peaks/shared pages.
-- Scheduler runqueue delay and wchan samples do not measure individual mutex wait.
-- Resource windows include setup/census and sampling overhead; primary rate measurements exclude profiling.
-- Server OS counters include all monitored colocated processes, so their CPU totals are not engine-only CPU.
-- Native/JVM and shared-library frames may lack function names even when unknown-leaf percentage is zero; retain raw recordings and Neo4j JFR privately.
+- CPU stacks sample at 49 Hz in separate 30-second eight-reader count/full-scan loops.
+- Context switches sample every 100 events for five seconds. Widths are sampled event weights, **not wait durations**.
+- Recordings are decoded after the workload stops. Context files cap at 64 MiB; verified downloads precede remote cleanup.
+- RSS is not allocation volume. Runqueue/wchan do not measure individual mutex waits. CPU inclusive frames overlap.
+- Delivery controls use PG single-row streaming/CQL explicit paging; their rates do not replace primary fetch-all rates or calibrate profiler overhead.
+- Native Java frames are mostly module-only. No empty graphs or unfinished PG captures are presented as complete.
+- One native PG primary leg flagged 2.83% CPU steal over its sampled 3-second interval; the table retains it.
+- Gzip graphs open after `gunzip -k file.svg.gz`. Raw recordings/configuration remain private.
 
-Primary serial counts and the longer concurrent profiles can have different flush/cache states. CPU categories overlap; samples are not elapsed wait durations.
-
-The [earlier matched profiler control](../pg-duration-profiler-control.json) at `c24cad554` measured unprofiled 30-second PostgreSQL reads at 9,617–9,768/s versus native 10,622–10,804/s. Profiled Ferrosa varied 3,075–8,651/s. These results do not justify replacing primary rates with instrumented throughput.
-
-Raw perf/JFR/configuration logs remain private. No empty flamegraphs are published.
+[Earlier a270 profile collection](README-a270.md) is historical and is not a current-code comparison.

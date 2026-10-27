@@ -536,3 +536,71 @@ preserved eight-writer 40P01 remains unresolved.
 
 This ownership wave changes read/aggregate paths. Insert-rate differences across
 benchmark epochs are not attributed to these fixes; all observations remain.
+
+## Immutable scalar ownership and COUNT metadata — 2026-10-27
+
+
+Production runtime `2286f389a` combines metadata COUNT and the subsequent scalar
+ownership work. The current table uses one complete balanced matched-VM cohort,
+not the best rate from earlier diagnostic attempts.
+
+## PostgreSQL
+
+| Operation | Before `a2709e100` | Current `2286f389a` | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| INSERT, logical rows/s | 27,535 | 32,641 | 38,993 |
+| Point reads, ops/s | 9,633 | 9,836 | 10,571 |
+| Point-read p50, ms | 0.727 | 0.715 | 0.593 |
+| COUNT p50, ms | 45.716 | 5.496 | 0.672 |
+| Bounded scan, logical rows/s | 98,575 | 98,713 | 487,618 |
+
+One writer, eight point readers, 5,000 rows.
+
+## Cassandra / CQL
+
+| Operation | Before `a2709e100` | Current `2286f389a` | Cassandra |
+| --- | ---: | ---: | ---: |
+| INSERT, logical rows/s | 16,400 | 16,019 | 13,795 |
+| Point reads, ops/s | 3,729 | 3,784 | 3,461 |
+| Point-read p50, ms | 1.811 | 1.782 | 1.945 |
+| COUNT p50, ms | 6.693 | 7.010 | 75.202 |
+| Bounded scan, logical rows/s | 69,816 | 78,713 | 153,079 |
+
+Eight writers/point readers, 20,000 rows; bounded scan returns 10,000 rows. Complete key/value census passed.
+
+
+The CQL row-movement checkpoint removed two clone boundaries before changing
+scalar representation. The later SharedText/CellBytes migration retained stored
+payload pointers through CQL/SQL/clones and preserved legacy serialization. A
+lazy owned iterator replaced the initial decoded-partition Vec after the read
+memory guard rejected that materialization. The guard was fixed, not waived.
+
+PG partial diagnostic cohorts showed scan means91.5k→106.1k and105.3k→110.7k;
+the final cohort is essentially flat. Those differences do not establish a stable
+PG scan gain. CQL's final mean rises12.7%, while both protocols
+still trail native scans. Native and Ferrosa short INSERT rates also vary; every
+leg and range is retained in current-results.json.
+
+The first context-switch recorder emitted GiB-sized text and competed with the
+workload while decoding, eventually exhausting scratch disk before CQL completed.
+A later SSH timeout interrupted profiling. Those incomplete attempts remain
+private evidence. The accepted harness uses sample period 100,64 MiB context-file
+caps, explicit workload stop before decoding, verified download/cleanup,1 GiB
+free-space guards and idempotent profiler start/readback.
+
+Validation: 10,279 main tests + 14 isolated tests passed, 95 existing main-suite
+skips; strict formatting/clippy/docs and repository/read guards passed. A distinct
+verifier passed 9 focused tests. Targeted library coverage passed 278 tests; the new
+SharedText module passed the default 80% gate at 87.4%. Portable benchmark contracts
+passed 9 tests. No new skips/waivers were added. A reconnect test's simultaneous
+peer-return/outage assertion was ordered with a gate, retaining its timing bounds.
+
+See [current comparison](RESULTS.md), [ownership scope](SCAN_COUNTS.md) and
+[profiles](profiles-current/README.md). Bolt/SPARQL remain the older `a270` snapshot.
+
+The published cohort retains one native PostgreSQL leg flagged 2.83% CPU steal
+over three sampled seconds. The native comparison is provisional; no slower
+observation was discarded. Three CQL CPU captures and native PG COUNT completed;
+five PG captures were interrupted by Fly SSH control timeouts. Their absence is
+explicitly recorded, rather than presenting earlier confounded profiles as current.
+All six benchmark machines were verified stopped after the interruption; volumes remain.
