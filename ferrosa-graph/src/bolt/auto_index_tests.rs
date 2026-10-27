@@ -1030,27 +1030,40 @@ async fn bolt_foreach_keeps_values_when_a_later_clause_adds_a_column() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn bolt_waiting_for_first_write_column_setup_respects_the_query_timeout() {
     let f = Fixture::with_config(crate::executor::expand::GraphEngineConfig {
         query_timeout: std::time::Duration::from_millis(50),
         ..Default::default()
     });
-    f.query(&mut f.connection(), "CREATE (n:Evolving {pk: 1})")
-        .await;
-    let _blocked = f.engine.hold_bolt_schema_setup_for_test().await;
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        f.engine.execute_bolt_stream_with_params(
-            "CREATE (n:Evolving {pk: 2, score: 42})",
+    // Seed without Bolt index setup: its blocking work must not auto-advance
+    // Tokio's clock and consume the deadline before the gate is exercised.
+    f.engine
+        .execute(
+            "CREATE (n:Evolving {pk: 1}) RETURN 1 AS inserted",
             "bolt_auto",
             &Fixture::auth(),
-            &HashMap::new(),
-        ),
-    )
-    .await
-    .expect("the setup timeout must include waiting for column DDL");
-    assert!(result.is_err());
+        )
+        .await
+        .unwrap();
+    let _blocked = f.engine.hold_bolt_schema_setup_for_test().await;
+    let auth = Fixture::auth();
+    let params = HashMap::new();
+    let query = f.engine.execute_bolt_stream_with_params(
+        "CREATE (n:Evolving {pk: 2, score: 42})",
+        "bolt_auto",
+        &auth,
+        &params,
+    );
+    tokio::pin!(query);
+    assert!(futures::poll!(&mut query).is_pending());
+    tokio::time::advance(std::time::Duration::from_millis(50)).await;
+    let result = futures::poll!(&mut query);
+    assert!(matches!(result, std::task::Poll::Ready(Err(_))));
+    assert_eq!(f.coordinator.columns.load(Ordering::Relaxed), 0);
+    let snapshot = f.schema.snapshot();
+    let table = &snapshot.tables[&("bolt_auto".into(), "evolving_v".into())];
+    assert!(!table.columns.contains_key("score"));
 }
 
 #[tokio::test]

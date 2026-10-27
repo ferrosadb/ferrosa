@@ -1689,3 +1689,7 @@ Existing WAL must be recovered via `StorageEngine::open`. Constructors using
 `new` detect pre-existing WAL artifacts and refuse admission for that engine,
 without decoding or reimplementing WAL recovery. Fresh `new` engines can admit
 clean tables.
+
+Set-aside replay retains the exclusive recovery checkpoint gate through its
+durability flush. It uses the guarded flush body directly, avoiding recursive
+read-lock acquisition while retaining the SSTable and WAL durability ordering.

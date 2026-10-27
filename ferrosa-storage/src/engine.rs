@@ -849,7 +849,9 @@ impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
 
     fn make_durable(&mut self) -> ferrosa_common::Result<()> {
         for table_id in self.touched.drain() {
-            self.engine.flush(&table_id)?;
+            // Re-ingest holds the exclusive recovery gate through durability.
+            // Public flush would deadlock trying to acquire its shared guard.
+            self.engine.flush_under_recovery_gate(&table_id)?;
         }
         if self.faults.fail_after_flush {
             return Err(ferrosa_common::Error::InvalidData(
@@ -12011,6 +12013,12 @@ impl StorageEngine {
             }
         });
         let _recovery = self.recovery_checkpoint_gate.read();
+        self.flush_under_recovery_gate(table_id)
+    }
+
+    /// Flush while the caller holds the shared or exclusive recovery gate.
+    /// Re-ingest keeps its exclusive guard through the durability barrier.
+    fn flush_under_recovery_gate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         let _span = tracing::info_span!(
             "storage.flush",
             table = %table_id,
