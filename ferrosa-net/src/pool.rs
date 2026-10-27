@@ -183,7 +183,7 @@ impl PriorityPool {
         let raft_task_pool_for_ctx = raft_task_pool.clone();
         let raft = spawn_raft_lane_actor_with_timeout(
             Lane::Raft,
-            LaneState::Connected(raft_client),
+            LaneState::Connected(Box::new(raft_client)),
             config.lane_timeout(Lane::Raft),
             peer_label,
             move |h| ActorReconnectContext {
@@ -213,7 +213,7 @@ impl PriorityPool {
         };
         let data = spawn_lane_actor_on_pool_with_timeout(
             Lane::Data,
-            LaneState::Connected(data_client),
+            LaneState::Connected(Box::new(data_client)),
             config.lane_timeout(Lane::Data),
             data_task_pool,
             data_ctx,
@@ -235,7 +235,7 @@ impl PriorityPool {
         };
         let bulk = spawn_lane_actor_on_pool_with_timeout(
             Lane::Bulk,
-            LaneState::Connected(bulk_client),
+            LaneState::Connected(Box::new(bulk_client)),
             config.lane_timeout(Lane::Bulk),
             bulk_task_pool,
             bulk_ctx,

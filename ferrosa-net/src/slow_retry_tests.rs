@@ -211,8 +211,10 @@ async fn connected_lane(addr: SocketAddr) -> LaneHandle {
     )
     .await
     .expect("initial connect to the fake peer");
-    spawn_lane_actor(Lane::Data, LaneState::Connected(client), move |h| {
-        ActorReconnectContext {
+    spawn_lane_actor(
+        Lane::Data,
+        LaneState::Connected(Box::new(client)),
+        move |h| ActorReconnectContext {
             lane: Lane::Data,
             config,
             local_host_id,
@@ -221,8 +223,8 @@ async fn connected_lane(addr: SocketAddr) -> LaneHandle {
             cancelled: h.cancel_token(),
             handle: h,
             task_pool: TaskPool::current("slow-retry-test"),
-        }
-    })
+        },
+    )
 }
 
 /// Advance the paused clock by `total` in `hop`-sized steps, pausing real time
