@@ -888,7 +888,21 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   `FERROSA_VECTOR_REPAIR_CONCURRENCY` (default 1) rebuilds at once; ANN over
   the index refuses (retryable) meanwhile, `/readyz` stays ready with
   `degraded_recall`, and `ferrosa_index_repairs_total{index,reason}` /
-  `ferrosa_index_invalid{table,index}` report it.
+  `ferrosa_index_invalid{table,index}` report it. The check maps each sidecar
+  and streams it, holding counters rather than the sidecar; the rebuild
+  consumes a partition's rows as it decodes their vectors and streams the
+  graph to a temp file (`FlushTarget::{map_vector_sidecar,
+  write_vector_sidecar_streamed}`), so neither holds the encoded sidecar
+  (ST-99). A check that passes writes a `{index}__verified` sidecar holding the
+  manifest it vouched for; at registration a generation whose manifest still
+  matches is marked verified without being decoded again, so a restart does not
+  repeat the check. Dropping the index, clearing the generation's sidecars or
+  invalidating it removes the marker. Sidecars are written in the binary FHNW
+  layout and ANN searches them where they lie, over a mapping; legacy JSON
+  sidecars are still read. The memtable vector index holds `Arc<[f32]>`
+  vectors and `Arc<[u8]>` scopes, so a flush builds its global and scoped
+  sidecars from borrowed slices instead of copies. Every vector sidecar is
+  written to a temp file, fsynced, renamed, and the directory fsynced (ST-100).
 - **Replay without a schema degrades instead of exiting** (`replay_set_aside.rs`,
   FMEA ST-52) — when no `schema.json`/`storage-schema.json` is usable, replay
   buffers up to `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` mutations in memory

@@ -3753,7 +3753,12 @@ impl StorageEngine {
     ) -> ferrosa_common::Result<Vec<String>> {
         match self.object_store_and_config() {
             Ok((config, store)) if !config.is_local() => {
-                crate::upload::config::enforce_bucket_access(store.as_ref(), required).await
+                crate::upload::config::enforce_bucket_access(
+                    store.as_ref(),
+                    &config.prefix,
+                    required,
+                )
+                .await
             }
             _ => Ok(Vec::new()),
         }

@@ -58,12 +58,31 @@ Mature. Each implements `IndexBuilder` (`add_row` → `finish`) and `IndexReader
 `RowPosition`, and `IndexCapability` (separate from the crate-root ones, because
 vector search has a different query shape and result/capability model):
 
-- **HNSW** (`vector::hnsw`) — Hierarchical Navigable Small World graph for ANN;
-  serialized to JSON on disk, loaded whole into memory on open.
-  `inspect_bytes` decodes a serialized sidecar and checks it is internally
-  consistent (tables agree, neighbours in range, one dimension), reporting its
-  vector count and dimension without searching it; storage's vector-index
-  self-heal uses it to find corrupt sidecars.
+- **HNSW** (`vector::hnsw`, `vector::hnsw_binary`) — Hierarchical Navigable
+  Small World graph for ANN. Storage sidecars (`build_and_write`, and
+  `build_and_serialize` into a `Vec`) are written in the binary **FHNW v1**
+  layout: a 64-byte little-endian header (magic, version, metric, dimension,
+  node count, `m`, `ef_construction`, entry point, top layer, layer count),
+  then the vectors, the row positions, and per layer the neighbour offsets and
+  ids. `search_from_bytes` searches it where it lies, typically over a memory
+  map: it checks the header and that every table's length matches it, reads
+  each distance from the stored bytes (`distance_le`, bit-identical to the
+  decoded `distance`), and checks each neighbour id as it reads it, so a
+  damaged sidecar fails the search rather than panicking it. Legacy JSON
+  sidecars are still read (dispatched on the magic) and answer bit-for-bit as
+  the binary encoding of the same graph does. `inspect_bytes` checks either
+  encoding is internally consistent (tables agree, neighbours in range, one
+  dimension) and reports its count and dimension without holding the vectors;
+  storage's vector self-heal uses it to find corrupt sidecars. A build takes
+  borrowed vectors (`impl AsRef<[f32]>`), reuses its visited stamps, search
+  heaps and prune scores across inserts, and sizes each neighbour list once.
+  One search core (`GraphView`) serves the builder, the legacy JSON graph and
+  the binary sidecar, so they cannot drift. **A binary older than FHNW cannot
+  read these sidecars** (FMEA IDX-11). The `HnswFactory` index-directory path
+  (`HnswBuilder::finish`) still writes JSON and loads it whole (IDX-7).
+  Distances (`vector::{l2,cosine,inner_product}_distance`) sum in eight
+  independent lanes so they vectorize; results can differ from a serial sum in
+  the last bits.
 - **IVFFlat** (`vector::ivfflat`) — k-means inverted-file + flat rerank; JSON on
   disk, simpler/cheaper build than HNSW, accuracy tuned by `probes`.
 - **Quantized** (`vector::quantized`) — page-addressable `.qvec` artifacts:
@@ -162,7 +181,8 @@ IndexKey / GeoPredicate / FtsQuery / query vec  ──read──▶  Vec<RowPosi
 The engine streams rows into a builder during memtable flush / compaction (or
 the standalone `ferrosa-index-builder` does it out of process), `finish()`
 writes the artifact, and a reader is opened lazily to serve lookups. Secondary
-indexes use compact length-prefixed binary; HNSW/IVFFlat use JSON; quantized
+indexes use compact length-prefixed binary; HNSW storage sidecars use the
+binary FHNW layout; the `HnswFactory` artifact and IVFFlat use JSON; quantized
 vectors use the paged `.qvec` container.
 
 ## Public API (key entry points)

@@ -189,9 +189,9 @@ const INDEX_RESULT_CAP: usize = 10_000;
 const RANGE_READ_MATERIALIZATION_CAP: usize = 10_000;
 const QVEC_HNSW_MAGIC: &[u8] = b"FERROSA-QVEC-HNSW-V1\n";
 
-fn build_quantized_vector_artifact(
+fn build_quantized_vector_artifact<V: AsRef<[f32]>>(
     cfg: &VectorIndexConfig,
-    drained: Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+    drained: impl IntoIterator<Item = (ferrosa_index::vector::RowPosition, V)>,
 ) -> Result<Vec<u8>> {
     let hnsw_bytes = ferrosa_index::vector::hnsw::build_and_serialize(
         cfg.m,
@@ -1597,6 +1597,8 @@ fn vector_index_from_rows(
         cfg.ef_construction,
     ));
     for partition in partitions {
+        // One scope per partition, shared by its rows' entries.
+        let mut scope: Option<Arc<[u8]>> = None;
         for row in partition.static_row.iter().chain(partition.rows.iter()) {
             let Some(value) = row
                 .cells
@@ -1606,15 +1608,14 @@ fn vector_index_from_rows(
             else {
                 continue;
             };
-            let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) else {
+            let Ok(vector) = ferrosa_index::bytes_to_f32s::<Arc<[f32]>>(value) else {
                 continue;
             };
             let position = ferrosa_index::vector::RowPosition::new(vector_index.len() as u64);
-            vector_index.insert_with_scope(
-                position,
-                vector,
-                Some(partition.key.key.as_bytes().to_vec()),
-            );
+            let scope = scope
+                .get_or_insert_with(|| Arc::from(partition.key.key.as_bytes()))
+                .clone();
+            vector_index.insert_with_scope(position, vector, Some(scope));
         }
     }
     vector_index
@@ -1718,6 +1719,14 @@ fn scope_of_vector_sidecar(index_name: &str, sidecar_name: &str) -> Option<Resul
     Some(scope)
 }
 
+/// One ANN query's terms, as every sidecar search takes them.
+#[derive(Debug, Clone, Copy)]
+struct ScopedQuery<'q> {
+    query: &'q [f32],
+    k: usize,
+    ef_search: usize,
+}
+
 /// Sidecar name of the manifest that marks `index_name`'s scoped sidecars
 /// of a generation complete. It is a `-VEC-` file, so it lives and dies with
 /// the generation's other vector sidecars.
@@ -1778,6 +1787,32 @@ impl VectorSidecarManifest {
     }
 }
 
+/// Sidecar name of the marker that a generation's scoped sidecars for
+/// `index_name` passed a full check. Like the manifest it is a `-VEC-` file of
+/// the generation; binaries that predate it pass it over (it is neither a
+/// manifest nor a scoped sidecar), so it changes nothing for them.
+fn vector_verified_marker_name(index_name: &str) -> String {
+    format!("{index_name}__verified")
+}
+
+/// What a verified marker records: the manifest of the sidecars that were
+/// checked. It vouches for those sidecars only. A rebuild writes a new
+/// manifest, and a marker that does not match the manifest on disk vouches
+/// for nothing, so that generation is checked again.
+const VECTOR_VERIFIED_MAGIC: &[u8; 4] = b"FVV1";
+
+fn encode_vector_verified(manifest: &VectorSidecarManifest) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + VectorSidecarManifest::ENCODED_LEN);
+    out.extend_from_slice(VECTOR_VERIFIED_MAGIC);
+    out.extend_from_slice(&manifest.encode());
+    out
+}
+
+/// The manifest a verified marker vouches for; `None` if it is malformed.
+fn decode_vector_verified(bytes: &[u8]) -> Option<VectorSidecarManifest> {
+    VectorSidecarManifest::decode(bytes.strip_prefix(VECTOR_VERIFIED_MAGIC)?)
+}
+
 /// Key of `(gen, index_name)` in a store's set of vector-ready generations.
 fn vector_ready_key(gen: &str, index_name: &str) -> String {
     format!("{gen}/{index_name}")
@@ -1804,30 +1839,28 @@ fn build_generation_vector_sidecars<F: FlushTarget>(
     let mut manifest = VectorSidecarManifest::default();
     while let Some(mut partition) = iter.next_partition()? {
         mapping.remap_partition(&mut partition);
-        let entries = partition_vectors(&partition, cfg.column_position)?;
+        // The key is moved out, not copied; the rows are consumed as their
+        // vectors are taken, so rows and vectors are never both held whole.
+        let Partition {
+            key,
+            static_row,
+            rows,
+            ..
+        } = partition;
+        let entries = partition_vectors(static_row, rows, cfg.column_position)?;
         if entries.is_empty() {
             continue;
         }
         let vectors = entries.len();
-        let scope = partition.key.key.as_bytes();
-        let bytes = ferrosa_index::vector::hnsw::build_and_serialize(
-            cfg.m,
-            cfg.ef_construction,
-            cfg.metric,
-            entries,
-        )
-        .map_err(|e| {
-            ferrosa_common::Error::InvalidData(format!(
-                "vector index {}: building generation {gen}'s sidecar for one scope: {e}",
-                cfg.index_name
-            ))
-        })?;
-        flush_target.write_vector_sidecar(
+        let scope = key.key.as_bytes();
+        let bytes = write_streamed_vector_sidecar(
+            flush_target,
             gen,
             &scoped_vector_sidecar_name(&cfg.index_name, scope),
-            &bytes,
+            cfg,
+            entries,
         )?;
-        manifest.add_scope(vectors, bytes.len());
+        manifest.add_scope(vectors, bytes as usize);
         on_scope(scope);
     }
     flush_target.write_vector_sidecar(
@@ -1838,15 +1871,56 @@ fn build_generation_vector_sidecars<F: FlushTarget>(
     Ok(manifest)
 }
 
-/// The live vectors of `partition`'s `column_position` column, positioned in
-/// row order. A deleted row or cell carries none; a value that is not a
-/// float vector is an error, not a silently unindexed row.
+/// Build `cfg`'s HNSW graph over `entries` and stream it into generation
+/// `gen`'s sidecar `name`, returning the bytes written. The graph holds each
+/// vector as given (moved or borrowed, never copied) and the encoding is
+/// never held whole.
+fn write_streamed_vector_sidecar<F: FlushTarget + ?Sized, V: AsRef<[f32]>>(
+    flush_target: &F,
+    gen: u64,
+    name: &str,
+    cfg: &VectorIndexConfig,
+    entries: impl IntoIterator<Item = (ferrosa_index::vector::RowPosition, V)>,
+) -> Result<u64> {
+    let mut entries = Some(entries);
+    flush_target.write_vector_sidecar_streamed(gen, name, &mut |out| {
+        let entries = entries.take().ok_or_else(|| {
+            ferrosa_common::Error::InvalidData(format!(
+                "vector sidecar {name}'s writer was called twice"
+            ))
+        })?;
+        ferrosa_index::vector::hnsw::build_and_write(
+            cfg.m,
+            cfg.ef_construction,
+            cfg.metric,
+            entries,
+            out,
+        )
+        .map_err(|e| {
+            ferrosa_common::Error::InvalidData(format!(
+                "vector index {}: building generation {gen}'s sidecar {name}: {e}",
+                cfg.index_name
+            ))
+        })
+    })
+}
+
+/// The live vectors of a partition's `column_position` column, positioned in
+/// row order (static row first). A deleted row or cell carries none; a value
+/// that is not a float vector is an error, not a silently unindexed row.
+///
+/// Consumes the rows: each is freed once its vector is decoded, so the peak
+/// is the vectors plus one row, not the vectors plus every row.
 fn partition_vectors(
-    partition: &Partition,
+    static_row: Option<Row>,
+    rows: Vec<Row>,
     column_position: usize,
 ) -> Result<Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>> {
-    let mut entries = Vec::new();
-    for row in partition.static_row.iter().chain(partition.rows.iter()) {
+    let rows = static_row.into_iter().chain(rows);
+    // Sized once from the row count: growing by doubling would hold up to
+    // twice the vectors' table while it reallocates.
+    let mut entries = Vec::with_capacity(rows.size_hint().0);
+    for row in rows {
         if !row.deletion.is_live() {
             continue;
         }
@@ -3889,7 +3963,7 @@ impl<F: FlushTarget> TableStore<F> {
                     .find(|(idx, _)| *idx as usize == cfg.column_position)
                 {
                     if let Some(ref value) = cell.1.value {
-                        if let Ok(vector) = ferrosa_index::bytes_to_vec_f32(value) {
+                        if let Ok(vector) = ferrosa_index::bytes_to_f32s::<Arc<[f32]>>(value) {
                             // Use a sequential position based on current index size
                             // (placeholder offset; not a true file offset).
                             let pos = ferrosa_index::vector::RowPosition::new(
@@ -3903,7 +3977,7 @@ impl<F: FlushTarget> TableStore<F> {
                                 vi.insert_with_scope(
                                     pos,
                                     vector,
-                                    Some(key.key.as_bytes().to_vec()),
+                                    Some(Arc::from(key.key.as_bytes())),
                                 );
                             }
                         }
@@ -6092,8 +6166,11 @@ impl<F: FlushTarget> TableStore<F> {
                 continue;
             };
             {
-                let drained_with_scopes = vi.entries_with_scopes();
-                if drained_with_scopes.is_empty() {
+                // Shared with the frozen memtable's index, which keeps serving
+                // reads until the sidecars are installed: every build below
+                // borrows these vectors, none copies one.
+                let entries = vi.entries_with_scopes();
+                if entries.is_empty() {
                     self.complete_flushed_vector_sidecars(
                         gen,
                         cfg,
@@ -6101,46 +6178,29 @@ impl<F: FlushTarget> TableStore<F> {
                     );
                     continue;
                 }
-
-                let drained: Vec<_> = drained_with_scopes
-                    .iter()
-                    .map(|(_, pos, vector)| (*pos, vector.clone()))
-                    .collect();
+                let all = || entries.iter().map(|(_, pos, vector)| (*pos, &**vector));
 
                 match target_catalog.vector_index_method(&cfg.index_name) {
                     VectorIndexMethod::Hnsw => {
-                        // Build HNSW graph and serialize via the public API.
-                        match ferrosa_index::vector::hnsw::build_and_serialize(
-                            cfg.m,
-                            cfg.ef_construction,
-                            cfg.metric,
-                            drained,
+                        match write_streamed_vector_sidecar(
+                            &*self.flush_target,
+                            gen,
+                            &cfg.index_name,
+                            cfg,
+                            all(),
                         ) {
-                            Ok(vec_bytes) => {
-                                if let Err(e) = self.flush_target.write_vector_sidecar(
-                                    gen,
-                                    &cfg.index_name,
-                                    &vec_bytes,
-                                ) {
-                                    tracing::error!(%e, index_name = %cfg.index_name, gen,
-                                        "store: vector sidecar persist failed");
-                                    #[cfg(debug_assertions)]
-                                    panic!("vector sidecar persist failed: {e}");
-                                } else {
-                                    tracing::debug!(index_name = %cfg.index_name, gen,
-                                        "flush: vector sidecar written");
-                                }
-                            }
+                            Ok(_) => tracing::debug!(index_name = %cfg.index_name, gen,
+                                "flush: vector sidecar written"),
                             Err(e) => {
                                 tracing::error!(%e, index_name = %cfg.index_name, gen,
-                                    "store: vector sidecar serialization failed");
+                                    "store: vector sidecar build or persist failed");
                                 #[cfg(debug_assertions)]
-                                panic!("vector sidecar serialize failed: {e}");
+                                panic!("vector sidecar build or persist failed: {e}");
                             }
                         }
                     }
                     VectorIndexMethod::QuantizedIvf => {
-                        match build_quantized_vector_artifact(cfg, drained) {
+                        match build_quantized_vector_artifact(cfg, all()) {
                             Ok(qvec_bytes) => {
                                 if let Err(e) = self.flush_target.write_quantized_vector_sidecar(
                                     gen,
@@ -6166,17 +6226,22 @@ impl<F: FlushTarget> TableStore<F> {
                     }
                 }
 
+                // Grouped by reference: the scope and each vector stay where
+                // they are, one entry per row points at them.
                 let mut by_scope: HashMap<
-                    Vec<u8>,
-                    Vec<(ferrosa_index::vector::RowPosition, Vec<f32>)>,
+                    &[u8],
+                    Vec<(ferrosa_index::vector::RowPosition, &[f32])>,
                 > = HashMap::new();
                 // A vector with no scope is in no scoped sidecar, so the
                 // generation is left without a manifest and rebuilt from its
                 // rows rather than marked complete without that row.
                 let mut complete = true;
-                for (scope, pos, vector) in drained_with_scopes {
+                for (scope, pos, vector) in &entries {
                     match scope {
-                        Some(scope) => by_scope.entry(scope).or_default().push((pos, vector)),
+                        Some(scope) => by_scope
+                            .entry(&**scope)
+                            .or_default()
+                            .push((*pos, &**vector)),
                         None => complete = false,
                     }
                 }
@@ -6185,40 +6250,25 @@ impl<F: FlushTarget> TableStore<F> {
                 // Remember these scopes so `ann_search_partitions` can later
                 // enumerate the scoped sidecars and recover partition keys
                 // (the global sidecar drops the scope on write).
-                self.record_vector_scopes(&cfg.index_name, by_scope.keys());
+                self.record_vector_scopes(&cfg.index_name, by_scope.keys().copied());
                 for (scope, scoped_entries) in by_scope {
-                    let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, &scope);
+                    let scoped_index_name = scoped_vector_sidecar_name(&cfg.index_name, scope);
                     let vectors = scoped_entries.len();
-                    match ferrosa_index::vector::hnsw::build_and_serialize(
-                        cfg.m,
-                        cfg.ef_construction,
-                        cfg.metric,
+                    match write_streamed_vector_sidecar(
+                        &*self.flush_target,
+                        gen,
+                        &scoped_index_name,
+                        cfg,
                         scoped_entries,
                     ) {
-                        Ok(vec_bytes) => {
-                            if let Err(e) = self.flush_target.write_vector_sidecar(
-                                gen,
-                                &scoped_index_name,
-                                &vec_bytes,
-                            ) {
-                                complete = false;
-                                tracing::error!(%e, index_name = %scoped_index_name, gen,
-                                    "store: scoped vector sidecar persist failed; the generation \
-                                     is rebuilt from its rows before ANN answers over it");
-                                if cfg!(debug_assertions) {
-                                    panic!("scoped vector sidecar persist failed: {e}");
-                                }
-                            } else {
-                                manifest.add_scope(vectors, vec_bytes.len());
-                            }
-                        }
+                        Ok(bytes) => manifest.add_scope(vectors, bytes as usize),
                         Err(e) => {
                             complete = false;
                             tracing::error!(%e, index_name = %scoped_index_name, gen,
-                                "store: scoped vector sidecar serialization failed; the \
+                                "store: scoped vector sidecar build or persist failed; the \
                                  generation is rebuilt from its rows before ANN answers over it");
                             if cfg!(debug_assertions) {
-                                panic!("scoped vector sidecar serialize failed: {e}");
+                                panic!("scoped vector sidecar build or persist failed: {e}");
                             }
                         }
                     }
@@ -9040,11 +9090,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// written its sidecars, and a scope left unrecorded makes
     /// `ann_search_partitions` miss that scope's sidecar until the next
     /// flush records it again.
-    fn record_vector_scopes<'a>(
-        &self,
-        index_name: &str,
-        scopes: impl Iterator<Item = &'a Vec<u8>>,
-    ) {
+    fn record_vector_scopes<'a>(&self, index_name: &str, scopes: impl Iterator<Item = &'a [u8]>) {
         if let Err(e) = self.try_record_vector_scopes(index_name, scopes) {
             tracing::error!(
                 index_name,
@@ -9059,9 +9105,9 @@ impl<F: FlushTarget> TableStore<F> {
     fn try_record_vector_scopes<'a>(
         &self,
         index_name: &str,
-        scopes: impl Iterator<Item = &'a Vec<u8>>,
+        scopes: impl Iterator<Item = &'a [u8]>,
     ) -> Result<()> {
-        let scopes: Vec<&Vec<u8>> = scopes.collect();
+        let scopes: Vec<&[u8]> = scopes.collect();
         crate::lockfree::update(&self.vector_index_scopes, "vector index scopes", |map| {
             let known = map.get(index_name);
             if scopes
@@ -9071,7 +9117,7 @@ impl<F: FlushTarget> TableStore<F> {
                 return (None, ());
             }
             let mut set = known.map(|set| (**set).clone()).unwrap_or_default();
-            set.extend(scopes.iter().map(|scope| (*scope).clone()));
+            set.extend(scopes.iter().map(|scope| scope.to_vec()));
             let mut next = map.clone();
             next.insert(index_name.to_string(), Arc::new(set));
             (Some(next), ())
@@ -9112,8 +9158,10 @@ impl<F: FlushTarget> TableStore<F> {
     fn recover_vector_scopes(&self, index_name: &str) -> Result<()> {
         let live = self.live_generations();
         let manifest_name = vector_manifest_name(index_name);
+        let marker_name = vector_verified_marker_name(index_name);
         let mut scoped_bytes: HashMap<u64, u64> = HashMap::new();
         let mut with_manifest = Vec::new();
+        let mut with_marker = std::collections::HashSet::new();
         let mut scopes = std::collections::HashSet::new();
         for file in self.flush_target.list_vector_sidecars()? {
             if !live.contains(&file.generation) {
@@ -9121,17 +9169,25 @@ impl<F: FlushTarget> TableStore<F> {
             }
             if file.name == manifest_name {
                 with_manifest.push(file.generation);
+            } else if file.name == marker_name {
+                with_marker.insert(file.generation);
             } else if let Some(scope) = scope_of_vector_sidecar(index_name, &file.name) {
                 scopes.insert(scope?);
                 let total = scoped_bytes.entry(file.generation).or_default();
                 *total = total.saturating_add(file.len);
             }
         }
-        let mut ready = 0usize;
+        let (mut ready, mut verified) = (0usize, 0usize);
         for gen in with_manifest {
             let on_disk = scoped_bytes.get(&gen).copied().unwrap_or(0);
             match self.read_vector_manifest(gen, index_name) {
                 Ok(Some(manifest)) if manifest.bytes == on_disk => {
+                    if with_marker.contains(&gen)
+                        && self.vector_marker_vouches_for(gen, index_name, &manifest)
+                    {
+                        self.note_vector_verified(&gen.to_string(), index_name);
+                        verified += 1;
+                    }
                     self.mark_vector_ready(&gen.to_string(), index_name);
                     ready += 1;
                 }
@@ -9149,10 +9205,11 @@ impl<F: FlushTarget> TableStore<F> {
             index_name,
             scopes = scopes.len(),
             ready_generations = ready,
+            verified_generations = verified,
             pending_generations = live.len().saturating_sub(ready),
             "recovered vector sidecars from disk"
         );
-        self.record_vector_scopes(index_name, scopes.iter());
+        self.record_vector_scopes(index_name, scopes.iter().map(Vec::as_slice));
         Ok(())
     }
 
@@ -9189,6 +9246,63 @@ impl<F: FlushTarget> TableStore<F> {
     fn unmark_vector_ready(&self, gen: &str, index_name: &str) {
         if let Err(e) = self.vector_ready.remove(&vector_ready_key(gen, index_name)) {
             tracing::error!(%e, gen, index_name, "could not unmark a generation's vector sidecars");
+        }
+    }
+
+    /// Whether generation `gen`'s verified marker for `index_name` was
+    /// written for exactly `manifest`. An unreadable or malformed marker
+    /// vouches for nothing (logged): the generation is checked again.
+    fn vector_marker_vouches_for(
+        &self,
+        gen: u64,
+        index_name: &str,
+        manifest: &VectorSidecarManifest,
+    ) -> bool {
+        let marker = self
+            .flush_target
+            .read_vector_sidecar(gen, &vector_verified_marker_name(index_name));
+        match marker {
+            Ok(Some(bytes)) => match decode_vector_verified(&bytes) {
+                Some(vouched) => vouched == *manifest,
+                None => {
+                    tracing::warn!(
+                        gen,
+                        index_name,
+                        "vector verified marker is malformed; the generation is checked again"
+                    );
+                    false
+                }
+            },
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(%e, gen, index_name, "vector verified marker is unreadable; the generation is checked again");
+                false
+            }
+        }
+    }
+
+    /// Mark generation `gen`'s sidecars for `index_name` verified in memory.
+    fn note_vector_verified(&self, gen: &str, index_name: &str) {
+        if let Err(e) = self
+            .vector_verified
+            .insert(&vector_ready_key(gen, index_name))
+        {
+            // Unmarked, it is decoded again next pass: costlier, never wrong.
+            tracing::error!(%e, gen, index_name, "could not mark a generation's vector sidecars verified");
+        }
+    }
+
+    /// Mark generation `gen`'s sidecars for `index_name`, described by
+    /// `manifest`, verified: in memory, and on disk so a restart does not
+    /// decode them again.
+    fn mark_vector_verified(&self, gen: u64, index_name: &str, manifest: &VectorSidecarManifest) {
+        self.note_vector_verified(&gen.to_string(), index_name);
+        if let Err(e) = self.flush_target.write_vector_sidecar(
+            gen,
+            &vector_verified_marker_name(index_name),
+            &encode_vector_verified(manifest),
+        ) {
+            tracing::error!(%e, gen, index_name, "could not persist a generation's verified mark; it is decoded again after a restart");
         }
     }
 
@@ -9272,9 +9386,11 @@ impl<F: FlushTarget> TableStore<F> {
     /// the dropped index's vectors.
     fn remove_vector_sidecars(&self, index_name: &str) -> Result<()> {
         let manifest_name = vector_manifest_name(index_name);
+        let marker_name = vector_verified_marker_name(index_name);
         for file in self.flush_target.list_vector_sidecars()? {
             if file.name == index_name
                 || file.name == manifest_name
+                || file.name == marker_name
                 || scope_of_vector_sidecar(index_name, &file.name).is_some()
             {
                 self.flush_target
@@ -9298,9 +9414,11 @@ impl<F: FlushTarget> TableStore<F> {
     fn clear_generation_vector_sidecars(&self, gen: u64, index_name: &str) -> Result<()> {
         self.unmark_vector_ready(&gen.to_string(), index_name);
         let manifest_name = vector_manifest_name(index_name);
+        let marker_name = vector_verified_marker_name(index_name);
         for file in self.flush_target.list_vector_sidecars()? {
             if file.generation == gen
                 && (file.name == manifest_name
+                    || file.name == marker_name
                     || scope_of_vector_sidecar(index_name, &file.name).is_some())
             {
                 self.flush_target.remove_vector_sidecar(gen, &file.name)?;
@@ -9346,18 +9464,23 @@ impl<F: FlushTarget> TableStore<F> {
             build_generation_vector_sidecars(&*self.flush_target, reader, schema, gen, cfg, |s| {
                 scopes.insert(s.to_vec());
             })?;
-        self.try_record_vector_scopes(&cfg.index_name, scopes.iter())?;
+        self.try_record_vector_scopes(&cfg.index_name, scopes.iter().map(Vec::as_slice))?;
         Ok(manifest)
     }
 
-    /// Mark generation `gen`'s freshly built sidecars for `index_name`
-    /// verified and complete: ANN answers over it from here on.
-    fn complete_vector_build(&self, gen: &str, index_name: &str) {
-        if let Err(e) = self
-            .vector_verified
-            .insert(&vector_ready_key(gen, index_name))
-        {
-            tracing::error!(%e, gen, index_name, "could not mark freshly built vector sidecars verified; they are decoded once more");
+    /// Mark generation `gen`'s freshly built sidecars for `index_name`,
+    /// described by `manifest`, verified and complete: ANN answers over it
+    /// from here on.
+    fn complete_vector_build(&self, gen: &str, index_name: &str, manifest: &VectorSidecarManifest) {
+        match gen.parse::<u64>() {
+            Ok(number) => self.mark_vector_verified(number, index_name, manifest),
+            // Unreachable from the builds, which name sidecars by number;
+            // unmarked, the generation is decoded once more.
+            Err(_) => tracing::error!(
+                gen,
+                index_name,
+                "generation id is not numeric; its fresh vector sidecars are not marked verified"
+            ),
         }
         self.mark_vector_ready(gen, index_name);
     }
@@ -9420,7 +9543,7 @@ impl<F: FlushTarget> TableStore<F> {
                         index_name,
                         self.take_vector_invalid_reason(&key).as_str(),
                     );
-                    self.complete_vector_build(&gen, index_name);
+                    self.complete_vector_build(&gen, index_name, &manifest);
                     tracing::info!(
                         index_name,
                         gen = %gen,
@@ -9496,6 +9619,15 @@ impl<F: FlushTarget> TableStore<F> {
         }
         if let Err(e) = self.vector_verified.remove(&key) {
             tracing::error!(%e, gen, index_name, "could not clear a generation's verified mark");
+        }
+        // And on disk, so a restart before the repair does not trust it. A
+        // non-numeric generation has no sidecars to remove: they are named
+        // by number.
+        if let Ok(number) = gen.parse::<u64>() {
+            let marker = vector_verified_marker_name(index_name);
+            if let Err(e) = self.flush_target.remove_vector_sidecar(number, &marker) {
+                tracing::error!(%e, gen, index_name, "could not remove an invalid generation's verified marker; its rebuild clears it");
+            }
         }
         self.unmark_vector_ready(gen, index_name);
     }
@@ -9619,7 +9751,7 @@ impl<F: FlushTarget> TableStore<F> {
                 "vector index: scopes with sidecars on disk were missing from the scope set; \
                  ANN never probed them. Restored."
             );
-            self.try_record_vector_scopes(index_name, missing_scopes.iter())?;
+            self.try_record_vector_scopes(index_name, missing_scopes.iter().map(Vec::as_slice))?;
             crate::metrics::index_repaired(index_name, VectorInvalidReason::ScopeSet.as_str());
         }
         outcome.pending = self.vector_generations_pending(index_name).len();
@@ -9667,9 +9799,10 @@ impl<F: FlushTarget> TableStore<F> {
             .ok_or(VectorInvalidReason::Missing)?;
         let mut vectors = 0u64;
         for (_, name, _) in files {
+            // Mapped and streamed: the check holds counters, not the sidecar.
             let bytes = self
                 .flush_target
-                .read_vector_sidecar(gen, name)
+                .map_vector_sidecar(gen, name)
                 .map_err(|_| VectorInvalidReason::Corrupt)?
                 .ok_or(VectorInvalidReason::Missing)?;
             let stats = ferrosa_index::vector::hnsw::inspect_bytes(&bytes)
@@ -9684,13 +9817,7 @@ impl<F: FlushTarget> TableStore<F> {
         if vectors != manifest.vectors {
             return Err(VectorInvalidReason::CountMismatch);
         }
-        if let Err(e) = self
-            .vector_verified
-            .insert(&vector_ready_key(&gen.to_string(), index_name))
-        {
-            // Unmarked, it is decoded again next pass: costlier, never wrong.
-            tracing::error!(%e, gen, index_name, "could not mark a generation's vector sidecars verified");
-        }
+        self.mark_vector_verified(gen, index_name, &manifest);
         Ok(())
     }
 
@@ -9779,7 +9906,7 @@ impl<F: FlushTarget> TableStore<F> {
                 Ok(manifest) => {
                     outcome.repaired += 1;
                     outcome.vectors += manifest.vectors;
-                    self.complete_vector_build(output_gen, &cfg.index_name);
+                    self.complete_vector_build(output_gen, &cfg.index_name, &manifest);
                 }
                 Err(e) => {
                     outcome.failed += 1;
@@ -10653,8 +10780,10 @@ impl<F: FlushTarget> TableStore<F> {
             if let Ok(gen) = gen_str.parse::<u64>() {
                 match method {
                     VectorIndexMethod::Hnsw => {
+                        // Mapped and searched where it lies: a query reads the
+                        // nodes it visits, never the whole sidecar.
                         if let Some(vec_bytes) =
-                            self.flush_target.read_vector_sidecar(gen, index_name)?
+                            self.flush_target.map_vector_sidecar(gen, index_name)?
                         {
                             let results = ferrosa_index::vector::hnsw::search_from_bytes(
                                 &vec_bytes, query, k, ef_search,
@@ -10765,37 +10894,19 @@ impl<F: FlushTarget> TableStore<F> {
             }
         }
 
-        let scoped_index_name = scoped_vector_sidecar_name(index_name, partition_scope);
-        for (gen_str, _dir) in guard.sstable_ids.iter() {
-            if let Ok(gen) = gen_str.parse::<u64>() {
-                if let Some(vec_bytes) = self
-                    .flush_target
-                    .read_vector_sidecar(gen, &scoped_index_name)?
-                {
-                    // A sidecar that cannot be searched fails the query:
-                    // skipping it would answer without this scope's rows.
-                    let results = ferrosa_index::vector::hnsw::search_from_bytes(
-                        &vec_bytes, query, k, ef_search,
-                    )
-                    .map_err(|e| {
-                        // Fail this query, and queue the generation for the
-                        // repair so the next one is not failed the same way.
-                        self.invalidate_vector_generation(
-                            gen_str,
-                            index_name,
-                            VectorInvalidReason::Corrupt,
-                        );
-                        ferrosa_common::Error::InvalidData(format!(
-                            "scoped vector sidecar {scoped_index_name} of generation {gen} \
-                             cannot be searched: {e}"
-                        ))
-                    })?;
-                    for result in results {
-                        merged.insert(VectorRowRef::sstable(gen, result.position), result);
-                    }
-                }
-            }
-        }
+        self.search_scoped_sidecars(
+            &guard,
+            index_name,
+            partition_scope,
+            ScopedQuery {
+                query,
+                k,
+                ef_search,
+            },
+            &mut |gen, result| {
+                merged.insert(VectorRowRef::sstable(gen, result.position), result);
+            },
+        )?;
 
         let mut all: Vec<(VectorRowRef, IndexResult)> = merged.into_iter().collect();
         all.sort_by(|a, b| {
@@ -10806,6 +10917,54 @@ impl<F: FlushTarget> TableStore<F> {
         });
         all.truncate(k);
         Ok(all.into_iter().map(|(_, result)| result).collect())
+    }
+
+    /// Search every live generation's sidecar for `scope` of `index_name`,
+    /// handing each result to `found` with its generation. Each sidecar is
+    /// mapped and searched where it lies.
+    ///
+    /// A sidecar that cannot be searched fails the query, since skipping it
+    /// would answer without this scope's rows, and queues its generation for
+    /// the repair so the next query is not failed the same way.
+    fn search_scoped_sidecars(
+        &self,
+        view: &StoreView,
+        index_name: &str,
+        scope: &[u8],
+        q: ScopedQuery<'_>,
+        found: &mut dyn FnMut(u64, ferrosa_index::vector::IndexResult),
+    ) -> Result<()> {
+        let scoped_index_name = scoped_vector_sidecar_name(index_name, scope);
+        for (gen_str, _dir) in view.sstable_ids.iter() {
+            let Ok(gen) = gen_str.parse::<u64>() else {
+                // Sidecars are named by number: a non-numeric generation
+                // has none.
+                continue;
+            };
+            let Some(bytes) = self
+                .flush_target
+                .map_vector_sidecar(gen, &scoped_index_name)?
+            else {
+                continue;
+            };
+            let results =
+                ferrosa_index::vector::hnsw::search_from_bytes(&bytes, q.query, q.k, q.ef_search)
+                    .map_err(|e| {
+                    self.invalidate_vector_generation(
+                        gen_str,
+                        index_name,
+                        VectorInvalidReason::Corrupt,
+                    );
+                    ferrosa_common::Error::InvalidData(format!(
+                        "scoped vector sidecar {scoped_index_name} of generation {gen} \
+                             cannot be searched: {e}"
+                    ))
+                })?;
+            for result in results {
+                found(gen, result);
+            }
+        }
+        Ok(())
     }
 
     /// Consult the vector index for the `k` nearest rows and return their
@@ -10877,7 +11036,7 @@ impl<F: FlushTarget> TableStore<F> {
             })?;
             for (result, scope) in results {
                 match scope {
-                    Some(scope) => consider(scope, result.score),
+                    Some(scope) => consider(scope.to_vec(), result.score),
                     None => scopeless_memtable_hits += 1,
                 }
             }
@@ -10893,17 +11052,27 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         // Source (b): flushed scoped sidecars — probe each remembered scope.
-        let scopes: Vec<Vec<u8>> = self
-            .vector_index_scopes
-            .load()
-            .get(index_name)
-            .map(|set| set.iter().cloned().collect())
-            .unwrap_or_default();
-        for scope in scopes {
-            let scoped =
-                self.ann_search_in_partition_scope(index_name, &scope, query, k, ef_search)?;
-            for result in scoped {
-                consider(scope.clone(), result.score);
+        // The set is shared, not copied, and the memtables were searched
+        // above with their scopes inline, so only the sidecars are probed
+        // here. A scope's nearest result is all `consider` keeps.
+        let scopes = self.vector_index_scopes.load().get(index_name).cloned();
+        for scope in scopes.iter().flat_map(|set| set.iter()) {
+            let mut nearest: Option<f32> = None;
+            self.search_scoped_sidecars(
+                &guard,
+                index_name,
+                scope,
+                ScopedQuery {
+                    query,
+                    k,
+                    ef_search,
+                },
+                &mut |_, result| {
+                    nearest = Some(nearest.map_or(result.score, |n| n.min(result.score)));
+                },
+            )?;
+            if let Some(score) = nearest {
+                consider(scope.clone(), score);
             }
         }
 
@@ -12539,6 +12708,36 @@ mod tests {
         });
     }
 
+    /// A verified marker carries the manifest it was written for and nothing
+    /// else decodes as one; the marker is never mistaken for a scoped
+    /// sidecar of its index, which would add a phantom scope.
+    #[test]
+    fn a_verified_marker_records_exactly_the_manifest_it_vouches_for() {
+        let mut manifest = VectorSidecarManifest::default();
+        manifest.add_scope(1_500, 4_600_000);
+        let marker = encode_vector_verified(&manifest);
+        assert_eq!(decode_vector_verified(&marker), Some(manifest));
+
+        let mut rebuilt = manifest;
+        rebuilt.add_scope(1, 10);
+        assert_ne!(decode_vector_verified(&marker), Some(rebuilt));
+
+        assert_eq!(
+            decode_vector_verified(&manifest.encode()),
+            None,
+            "a manifest is not a marker"
+        );
+        assert_eq!(
+            decode_vector_verified(&marker[..marker.len() - 1]),
+            None,
+            "truncated"
+        );
+        assert_eq!(decode_vector_verified(b""), None);
+        assert!(
+            scope_of_vector_sidecar("vec_idx", &vector_verified_marker_name("vec_idx")).is_none()
+        );
+    }
+
     /// A scoped sidecar name maps back to the scope it was written for, and
     /// nothing else is mistaken for one of the index's scoped sidecars.
     #[test]
@@ -12580,7 +12779,7 @@ mod tests {
                     let index = format!("vec_{}", t % 2);
                     (0..SCOPES).for_each(|i| {
                         let scope = format!("{t}-{i}").into_bytes();
-                        store.record_vector_scopes(&index, std::iter::once(&scope));
+                        store.record_vector_scopes(&index, std::iter::once(scope.as_slice()));
                     });
                 })
             })
@@ -17141,7 +17340,7 @@ mod tests {
                 m: 4,
                 ef_construction: 8,
             },
-            vec![],
+            Vec::<(ferrosa_index::vector::RowPosition, Vec<f32>)>::new(),
         )
         .expect("build empty quantized artifact");
         let reader = RecordingReadAt {

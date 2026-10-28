@@ -4,6 +4,8 @@
 //! Unlike the scalar MemtableIndex (persistent/functional), HNSW mutation
 //! is inherently in-place, so we use locking instead of path-copying.
 
+use std::sync::Arc;
+
 use parking_lot::RwLock;
 
 use ferrosa_index::vector::{distance, IndexResult, RowPosition};
@@ -11,7 +13,10 @@ use ferrosa_index::DistanceMetric;
 
 /// An ANN result paired with the partition-key scope captured at insert time
 /// (`None` when the entry was inserted without a scope).
-pub type ScopedIndexResult = (IndexResult, Option<Vec<u8>>);
+pub type ScopedIndexResult = (IndexResult, Option<Arc<[u8]>>);
+
+/// One entry as a flush reads it: shared with the index, not copied out of it.
+pub type ScopedVector = (Option<Arc<[u8]>>, RowPosition, Arc<[f32]>);
 
 /// Mutable in-memory vector index backed by a brute-force linear scan.
 ///
@@ -26,10 +31,13 @@ pub struct VectorMemtableIndex {
     inner: RwLock<VectorMemtableInner>,
 }
 
+/// Vectors and scopes are shared slices, so a flush (which must leave the
+/// index serving reads until its sidecar is installed) reads them out as
+/// reference counts instead of copies.
 struct VectorMemtableInner {
-    vectors: Vec<Vec<f32>>,
+    vectors: Vec<Arc<[f32]>>,
     positions: Vec<RowPosition>,
-    scopes: Vec<Option<Vec<u8>>>,
+    scopes: Vec<Option<Arc<[u8]>>>,
 }
 
 impl VectorMemtableInner {
@@ -58,17 +66,20 @@ impl VectorMemtableIndex {
     }
 
     /// Insert a vector and its associated row position.
-    pub fn insert(&self, position: RowPosition, vector: Vec<f32>) {
+    pub fn insert(&self, position: RowPosition, vector: impl Into<Arc<[f32]>>) {
         self.insert_with_scope(position, vector, None);
     }
 
-    /// Insert a vector and its associated row position plus optional prefix scope.
+    /// Insert a vector and its associated row position plus optional prefix
+    /// scope. Pass an `Arc` to share a slice already built (one scope per
+    /// partition, not one per row); a `Vec` is copied into one.
     pub fn insert_with_scope(
         &self,
         position: RowPosition,
-        vector: Vec<f32>,
-        scope: Option<Vec<u8>>,
+        vector: impl Into<Arc<[f32]>>,
+        scope: Option<Arc<[u8]>>,
     ) {
+        let vector = vector.into();
         let mut inner = self.inner.write();
         inner.positions.push(position);
         inner.vectors.push(vector);
@@ -170,12 +181,12 @@ impl VectorMemtableIndex {
             return Ok(Vec::new());
         }
 
-        let mut scored: Vec<(f32, RowPosition, Option<Vec<u8>>)> = inner
+        // Scored by index; only the k kept take a reference to their scope.
+        let mut scored: Vec<(f32, usize)> = inner
             .vectors
             .iter()
-            .zip(inner.positions.iter())
-            .zip(inner.scopes.iter())
-            .map(|((vec, pos), scope)| (distance(&self.metric, query, vec), *pos, scope.clone()))
+            .enumerate()
+            .map(|(i, vec)| (distance(&self.metric, query, vec), i))
             .collect();
 
         scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -183,7 +194,10 @@ impl VectorMemtableIndex {
 
         Ok(scored
             .into_iter()
-            .map(|(score, position, scope)| (IndexResult { position, score }, scope))
+            .map(|(score, i)| {
+                let position = inner.positions[i];
+                (IndexResult { position, score }, inner.scopes[i].clone())
+            })
             .collect())
     }
 
@@ -200,7 +214,7 @@ impl VectorMemtableIndex {
     /// Drain all vectors from the index, returning them for use during flush.
     ///
     /// After calling this, the index is empty and ready to receive new writes.
-    pub fn drain(&self) -> Vec<(RowPosition, Vec<f32>)> {
+    pub fn drain(&self) -> Vec<(RowPosition, Arc<[f32]>)> {
         let mut inner = self.inner.write();
         let positions = std::mem::take(&mut inner.positions);
         let vectors = std::mem::take(&mut inner.vectors);
@@ -210,21 +224,22 @@ impl VectorMemtableIndex {
 
     /// Every vector with its optional prefix scope, leaving the index intact:
     /// a flush reads a frozen memtable's index this way so ANN reads can keep
-    /// using it until the flushed sidecar is installed.
-    pub fn entries_with_scopes(&self) -> Vec<(Option<Vec<u8>>, RowPosition, Vec<f32>)> {
+    /// using it until the flushed sidecar is installed. Each vector and scope
+    /// is shared with the index, never copied.
+    pub fn entries_with_scopes(&self) -> Vec<ScopedVector> {
         let inner = self.inner.read();
         inner
             .scopes
             .iter()
             .cloned()
-            .zip(inner.positions.iter().cloned())
+            .zip(inner.positions.iter().copied())
             .zip(inner.vectors.iter().cloned())
             .map(|((scope, position), vector)| (scope, position, vector))
             .collect()
     }
 
     /// Drain all vectors from the index with their optional prefix scopes.
-    pub fn drain_with_scopes(&self) -> Vec<(Option<Vec<u8>>, RowPosition, Vec<f32>)> {
+    pub fn drain_with_scopes(&self) -> Vec<ScopedVector> {
         let mut inner = self.inner.write();
         let positions = std::mem::take(&mut inner.positions);
         let vectors = std::mem::take(&mut inner.vectors);
@@ -381,17 +396,17 @@ mod tests {
         index.insert_with_scope(
             RowPosition::new(0),
             vec![10.0, 0.0],
-            Some(b"pk_far".to_vec()),
+            Some(Arc::from(&b"pk_far"[..])),
         );
         index.insert_with_scope(
             RowPosition::new(1),
             vec![1.0, 0.0],
-            Some(b"pk_near".to_vec()),
+            Some(Arc::from(&b"pk_near"[..])),
         );
         index.insert_with_scope(
             RowPosition::new(2),
             vec![5.0, 0.0],
-            Some(b"pk_mid".to_vec()),
+            Some(Arc::from(&b"pk_mid"[..])),
         );
 
         let results = index.search_with_scopes(&[0.0, 0.0], 3, 50).unwrap();
@@ -413,7 +428,7 @@ mod tests {
             index.insert_with_scope(
                 RowPosition::new(i),
                 vec![i as f32, 0.0],
-                Some(format!("pk{i}").into_bytes()),
+                Some(Arc::from(format!("pk{i}").as_bytes())),
             );
         }
         let results = index.search_with_scopes(&[0.0, 0.0], 3, 50).unwrap();

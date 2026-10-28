@@ -13,6 +13,7 @@
 //! vectors and 8192 for f16 vectors, with a performance warning above 2048.
 
 pub mod hnsw;
+mod hnsw_binary;
 pub mod ivfflat;
 pub mod quantized;
 
@@ -158,20 +159,40 @@ pub trait IndexReader: Send + Sync {
 // Distance functions
 // ---------------------------------------------------------------------------
 
+/// Independent partial sums per distance. A plain `iter().sum::<f32>()` is
+/// one serial chain of dependent adds, which the compiler may not reorder
+/// (float addition is not associative), so it runs a lane at a time; eight
+/// independent sums vectorize. Results can differ from the serial sum in the
+/// last bits.
+const LANES: usize = 8;
+
+/// `Σ f(a[i], b[i])`, accumulated in [`LANES`] independent sums.
+#[inline(always)]
+fn lane_sum(a: &[f32], b: &[f32], f: impl Fn(f32, f32) -> f32) -> f32 {
+    let len = a.len().min(b.len());
+    let (a, b) = (&a[..len], &b[..len]);
+    let mut acc = [0.0f32; LANES];
+    let (a_blocks, a_rest) = a.as_chunks::<LANES>();
+    let (b_blocks, b_rest) = b.as_chunks::<LANES>();
+    for (xa, xb) in a_blocks.iter().zip(b_blocks) {
+        for ((sum, &x), &y) in acc.iter_mut().zip(xa).zip(xb) {
+            *sum += f(x, y);
+        }
+    }
+    let rest: f32 = a_rest.iter().zip(b_rest).map(|(&x, &y)| f(x, y)).sum();
+    acc.iter().sum::<f32>() + rest
+}
+
 /// Euclidean (L2) distance between two vectors.
 pub fn l2_distance(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
+    lane_sum(a, b, |x, y| (x - y) * (x - y)).sqrt()
 }
 
 /// Cosine distance: `1 - cosine_similarity(a, b)`.
 pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let dot = lane_sum(a, b, |x, y| x * y);
+    let norm_a = lane_sum(a, a, |x, _| x * x).sqrt();
+    let norm_b = lane_sum(b, b, |x, _| x * x).sqrt();
     let denom = norm_a * norm_b;
     if denom == 0.0 {
         return 1.0;
@@ -181,7 +202,7 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
 
 /// Negative inner (dot) product distance: `-dot(a, b)`.
 pub fn inner_product_distance(a: &[f32], b: &[f32]) -> f32 {
-    -a.iter().zip(b.iter()).map(|(x, y)| x * y).sum::<f32>()
+    -lane_sum(a, b, |x, y| x * y)
 }
 
 /// Compute the distance between two vectors using the specified metric.
@@ -193,9 +214,126 @@ pub fn distance(metric: &DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// [`lane_sum`] with `a` given as little-endian `f32` bytes, read where they
+/// lie: the shape of a vector in a mapped sidecar, which need not be 4-byte
+/// aligned. Same lanes in the same order, so the same result.
+#[inline(always)]
+fn lane_sum_le(a: &[u8], b: &[f32], f: impl Fn(f32, f32) -> f32) -> f32 {
+    let (a_words, _) = a.as_chunks::<4>();
+    let len = a_words.len().min(b.len());
+    let (a_words, b) = (&a_words[..len], &b[..len]);
+    let mut acc = [0.0f32; LANES];
+    let (a_blocks, a_rest) = a_words.as_chunks::<LANES>();
+    let (b_blocks, b_rest) = b.as_chunks::<LANES>();
+    for (xa, xb) in a_blocks.iter().zip(b_blocks) {
+        for ((sum, &x), &y) in acc.iter_mut().zip(xa).zip(xb) {
+            *sum += f(f32::from_le_bytes(x), y);
+        }
+    }
+    let rest: f32 = a_rest
+        .iter()
+        .zip(b_rest)
+        .map(|(&x, &y)| f(f32::from_le_bytes(x), y))
+        .sum();
+    acc.iter().sum::<f32>() + rest
+}
+
+/// [`distance`] from a stored vector, as little-endian `f32` bytes, to
+/// `query`: bit-for-bit what `distance(metric, stored, query)` returns for
+/// the decoded vector, without decoding it.
+pub fn distance_le(metric: &DistanceMetric, stored: &[u8], query: &[f32]) -> f32 {
+    match metric {
+        DistanceMetric::L2 => lane_sum_le(stored, query, |x, y| (x - y) * (x - y)).sqrt(),
+        DistanceMetric::Cosine => {
+            let dot = lane_sum_le(stored, query, |x, y| x * y);
+            let norm_stored = lane_sum_le(stored, query, |x, _| x * x).sqrt();
+            let norm_query = lane_sum(query, query, |x, _| x * x).sqrt();
+            let denom = norm_stored * norm_query;
+            if denom == 0.0 {
+                return 1.0;
+            }
+            1.0 - dot / denom
+        }
+        DistanceMetric::InnerProduct => -lane_sum_le(stored, query, |x, y| x * y),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The serial reference each lane-split metric must agree with: the
+    /// formulas as first written, summed in index order in f64.
+    fn reference(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f64 {
+        let pairs = a.iter().zip(b).map(|(&x, &y)| (f64::from(x), f64::from(y)));
+        match metric {
+            DistanceMetric::L2 => pairs.map(|(x, y)| (x - y).powi(2)).sum::<f64>().sqrt(),
+            DistanceMetric::InnerProduct => -pairs.map(|(x, y)| x * y).sum::<f64>(),
+            DistanceMetric::Cosine => {
+                let (dot, na, nb) = pairs.fold((0.0, 0.0, 0.0), |(d, na, nb), (x, y)| {
+                    (d + x * y, na + x * x, nb + y * y)
+                });
+                if na * nb == 0.0 {
+                    1.0
+                } else {
+                    1.0 - dot / (na.sqrt() * nb.sqrt())
+                }
+            }
+        }
+    }
+
+    /// Every length from empty through several lane widths plus a
+    /// remainder, so each element is counted exactly once whether it falls
+    /// in a full lane block or in the tail.
+    #[test]
+    fn every_metric_matches_the_serial_formula_at_every_length() {
+        for len in 0..=67usize {
+            let a: Vec<f32> = (0..len).map(|i| ((i * 7 % 13) as f32) - 6.0).collect();
+            let b: Vec<f32> = (0..len)
+                .map(|i| ((i * 5 % 11) as f32) * 0.5 - 2.0)
+                .collect();
+            for metric in [
+                DistanceMetric::L2,
+                DistanceMetric::Cosine,
+                DistanceMetric::InnerProduct,
+            ] {
+                let got = f64::from(distance(&metric, &a, &b));
+                let want = reference(metric, &a, &b);
+                assert!(
+                    (got - want).abs() <= 1e-4 * want.abs().max(1.0),
+                    "{metric:?} at length {len}: got {got}, want {want}"
+                );
+            }
+        }
+    }
+
+    /// A stored vector read in place gives exactly the distance its decoded
+    /// copy does, so a search over a mapped sidecar ranks as a search over
+    /// the decoded graph did. Bytes start off a word boundary on purpose.
+    #[test]
+    fn a_vector_read_in_place_scores_bit_for_bit_as_its_decoded_copy() {
+        for len in 0..=67usize {
+            let a: Vec<f32> = (0..len).map(|i| ((i * 7 % 13) as f32) - 6.25).collect();
+            let b: Vec<f32> = (0..len)
+                .map(|i| ((i * 5 % 11) as f32) * 0.5 - 2.0)
+                .collect();
+            let mut stored = vec![0u8];
+            stored.extend(a.iter().flat_map(|x| x.to_le_bytes()));
+            for metric in [
+                DistanceMetric::L2,
+                DistanceMetric::Cosine,
+                DistanceMetric::InnerProduct,
+            ] {
+                let in_place = distance_le(&metric, &stored[1..], &b);
+                let decoded = distance(&metric, &a, &b);
+                assert_eq!(
+                    in_place.to_bits(),
+                    decoded.to_bits(),
+                    "{metric:?} at length {len}: {in_place} vs {decoded}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn l2_same_vector_is_zero() {
