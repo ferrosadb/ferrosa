@@ -8399,95 +8399,11 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
         let schema = self.schema.load();
 
-        // Collect the window from every source. The answer is the `limit`
-        // smallest keys in `[start, end]` across ALL sources, and those are
-        // contained in the union of each source's own `limit` smallest keys in
-        // that range, so each source contributes up to `limit` — never a
-        // budget left over by an earlier source, which skipped smaller keys
-        // held later (a short, wrong page). Peak is `limit` partitions per
-        // source, bounded by the caller's limit and the source count.
-        //
-        // One table-tombstone key may sit in the window and is dropped after
-        // the merge, so memtables are asked for one more than `limit`; the
-        // SSTable walk skips it without counting it.
-        let window = limit.saturating_add(1);
-        let mut all_partitions: Vec<Partition> = Vec::new();
-
-        let trim_rows = |partitions: &mut Vec<Partition>| {
-            if row_limit > 0 {
-                for partition in partitions {
-                    partition.rows.truncate(row_limit);
-                }
-            }
-        };
-
-        // Active memtable: clone only the requested window, not the whole
-        // active memtable. This keeps CQL LIMIT/page-size scans from hanging
-        // behind full-table materialization.
-        let mut active = guard.active.snapshot_range_limited(start, end, window);
-        trim_rows(&mut active);
-        all_partitions.extend(active);
-
-        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
-            let mut flushing_parts = flushing.snapshot_range_limited(start, end, window);
-            trim_rows(&mut flushing_parts);
-            all_partitions.extend(flushing_parts);
-        }
-
-        // SSTables: seek each to `start` and stream its window. When a row cap
-        // is requested, unretained rows are skipped while decoding instead of
-        // materializing full wide partitions and truncating afterwards.
-        for desc in guard.sstables.iter() {
-            // One reader open at a time — opened, drained, dropped per loop.
-            let sstable = self
-                .open_reader(desc)
-                .map_err(|e| self.unreadable_sstable("read_range", "open", desc, &e))?;
-            let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-            let fail = |e| self.unreadable_sstable("read_range", "read", desc, &e);
-            let mut iter = sstable.partitions_iter().map_err(fail)?;
-            if let Some(s) = start {
-                iter.seek_to_token(s.token.0).map_err(fail)?;
-            }
-            let mut taken = 0;
-            while taken < limit {
-                let Some(mut partition) =
-                    iter.next_partition_limited_rows(row_limit).map_err(fail)?
-                else {
-                    break;
-                };
-                if start.is_some_and(|s| partition.key < *s) {
-                    continue;
-                }
-                if end.is_some_and(|e| partition.key > *e) {
-                    break; // SSTables are key-ordered: nothing later is in range.
-                }
-                if crate::table_tombstone::is_table_tombstone_key(&partition.key) {
-                    continue;
-                }
-                mapping.remap_partition(&mut partition);
-                all_partitions.push(partition);
-                taken += 1;
-            }
-        }
-
-        // Deduplicate and merge partitions with the same key
-        all_partitions.sort_by(|a, b| a.key.cmp(&b.key));
-        let mut merged: Vec<Partition> = Vec::new();
-        for p in all_partitions {
-            if let Some(last) = merged.last_mut() {
-                if last.key == p.key {
-                    *last = merge::merge_partitions(vec![last.clone(), p]);
-                    continue;
-                }
-            }
-            merged.push(p);
-        }
-
-        // Apply deletion suppression to all partitions. Partitions that
-        // came from a single source (no multi-source merge above) still
-        // need row-level and partition-level deletions applied because
-        // the memtable's merge-on-write sets deletion markers but does
-        // not suppress the covered cells.
+        // A k-way merge in key order that stops once `limit` partitions are
+        // out. Only the merge's current key group is decoded, so the peak is
+        // the memtable windows plus one partition per SSTable, not `limit`
+        // partitions per source. The table deletion is probed first: a
+        // corrupt probe fails the read before any work.
         let (table_delete, probe_corrupt) = self.table_deletion(&guard)?;
         if let Some(c) = probe_corrupt {
             // `with_retried_scan` retries this typed error against a fresh view:
@@ -8498,38 +8414,135 @@ impl<F: FlushTarget> TableStore<F> {
                 c.max_token,
             ));
         }
-        for p in &mut merged {
-            merge::apply_table_deletion(p, table_delete);
+
+        // Memtables: clone only the requested window. One table-tombstone key
+        // may sit in it and is skipped by the merge, so ask for one more.
+        let window = limit.saturating_add(1);
+        let mut mem_sources: Vec<std::iter::Peekable<std::vec::IntoIter<Partition>>> =
+            std::iter::once(&guard.active)
+                .chain(guard.flushing.iter().map(|sealed| &sealed.memtable))
+                .map(|memtable| {
+                    let mut parts = memtable.snapshot_range_limited(start, end, window);
+                    parts.sort_by(|a, b| a.key.cmp(&b.key));
+                    parts.into_iter().peekable()
+                })
+                .collect();
+
+        // SSTables: the overlapping readers, through the bounded multi-pass
+        // merge (at most `merge_reader_budget()` open), each parked at `start`.
+        let start_token = start.map_or(i64::MIN, |s| s.token.0);
+        let end_token = end.map_or(i64::MAX, |e| e.token.0.saturating_add(1));
+        let merge_readers = self.bounded_overlap_readers(start_token, end_token)?;
+        let fail = |idx: usize, stage: &'static str, cause: ferrosa_common::Error| {
+            self.merge_reader_failure("read_range", stage, &merge_readers[idx], cause)
+        };
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+            Vec::with_capacity(merge_readers.len());
+        let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(merge_readers.len());
+        for (idx, mr) in merge_readers.iter().enumerate() {
+            let mut iter = mr
+                .reader
+                .partitions_iter()
+                .map_err(|e| fail(idx, "iter", e))?;
+            position_iter_at_token(&mut iter, start_token).map_err(|e| fail(idx, "position", e))?;
+            sst_iters.push(iter);
+            sst_mappings.push(ColumnOrdinalMapping::for_header(
+                &schema,
+                mr.reader.header(),
+            ));
+        }
+
+        let mut out: Vec<Partition> = Vec::new();
+        while out.len() < limit {
+            let mut smallest: Option<DecoratedKey> = None;
+            for src in mem_sources.iter_mut() {
+                if let Some(p) = src.peek() {
+                    if smallest.as_ref().is_none_or(|k| p.key < *k) {
+                        smallest = Some(p.key.clone());
+                    }
+                }
+            }
+            for (idx, iter) in sst_iters.iter_mut().enumerate() {
+                if let Some(k) = iter
+                    .peek_partition_key()
+                    .map_err(|e| fail(idx, "peek", e))?
+                {
+                    if smallest.as_ref().is_none_or(|s| k < *s) {
+                        smallest = Some(k);
+                    }
+                }
+            }
+            let Some(key) = smallest else {
+                break; // every source exhausted
+            };
+            if end.is_some_and(|e| key > *e) {
+                break; // the smallest remaining key is past the range
+            }
+            // Keys before `start` (same token, smaller key) and the table
+            // tombstone key are passed over without decoding their bodies.
+            let skip = start.is_some_and(|s| key < *s)
+                || crate::table_tombstone::is_table_tombstone_key(&key);
+
+            let mut group: Vec<Partition> = Vec::new();
+            for src in mem_sources.iter_mut() {
+                if let Some(p) = src.next_if(|p| p.key == key) {
+                    group.push(p);
+                }
+            }
+            for (idx, iter) in sst_iters.iter_mut().enumerate() {
+                let peeked = iter
+                    .peek_partition_key()
+                    .map_err(|e| fail(idx, "peek", e))?;
+                if peeked.as_ref() != Some(&key) {
+                    continue;
+                }
+                if skip {
+                    iter.skip_to_next_partition()
+                        .map_err(|e| fail(idx, "skip", e))?;
+                    continue;
+                }
+                let Some(mut p) = iter
+                    .next_partition_limited_rows(row_limit)
+                    .map_err(|e| fail(idx, "decode", e))?
+                else {
+                    return Err(fail(
+                        idx,
+                        "decode",
+                        ferrosa_common::Error::InvalidData(format!(
+                            "SSTable peeked partition {key:?} but yielded none"
+                        )),
+                    ));
+                };
+                sst_mappings[idx].remap_partition(&mut p);
+                group.push(p);
+            }
+            if skip {
+                continue;
+            }
+
+            let mut merged = if group.len() == 1 {
+                group.pop().expect("len 1")
+            } else {
+                merge::merge_partitions(group)
+            };
+            merge::apply_table_deletion(&mut merged, table_delete);
             // Each source kept its first `row_limit` rows, so a key merged from
             // several sources can hold more; the caller asked for at most that.
             if row_limit > 0 {
-                p.rows.truncate(row_limit);
+                merged.rows.truncate(row_limit);
             }
+            out.push(merged);
         }
+        debug_assert!(out.len() <= limit);
+        debug_assert!(
+            out.windows(2).all(|w| w[0].key < w[1].key),
+            "merge emitted keys out of order: {:?}",
+            out.iter()
+                .map(|p| (p.key.token.0, p.key.key.as_bytes().len()))
+                .collect::<Vec<_>>()
+        );
 
-        // Apply range filter and limit
-        let filtered: Vec<Partition> = merged
-            .into_iter()
-            .filter(|p| {
-                if crate::table_tombstone::is_table_tombstone_key(&p.key) {
-                    return false;
-                }
-                if let Some(s) = start {
-                    if p.key < *s {
-                        return false;
-                    }
-                }
-                if let Some(e) = end {
-                    if p.key > *e {
-                        return false;
-                    }
-                }
-                true
-            })
-            .take(limit)
-            .collect();
-
-        Ok(filtered)
+        Ok(out)
     }
 
     /// Visit every row matching a secondary-index key, in row order. See
