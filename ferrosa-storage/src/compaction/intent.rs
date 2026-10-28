@@ -27,7 +27,8 @@
 //! # Relationship to `upload::PendingUploadsLog`
 //!
 //! The two records answer different questions and neither replaces the other.
-//! `PendingUploadsLog` (a single per-node append-only file) tracks whether a
+//! `PendingUploadsLog` (a per-node directory tree with one file per pending
+//! upload, `pending-uploads/<table>/<sstable>.pending`) tracks whether a
 //! *local* SSTable has been durably uploaded to S3 and the manifest updated --
 //! it is written only after promote/swap/retire already happened, and only
 //! when S3 is configured. This record is the source of truth for whether
