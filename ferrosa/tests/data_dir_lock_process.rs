@@ -116,12 +116,26 @@ impl Node {
     }
 
     fn sigterm(&self) {
+        self.signal("TERM");
+    }
+
+    /// Stop the process where it is. It keeps every descriptor, so its data
+    /// dir lock stays held, but it writes nothing until [`Node::thaw`].
+    fn freeze(&self) {
+        self.signal("STOP");
+    }
+
+    fn thaw(&self) {
+        self.signal("CONT");
+    }
+
+    fn signal(&self, name: &str) {
         let pid = self.child.id().to_string();
         let sent = Command::new("kill")
-            .args(["-TERM", &pid])
+            .args([&format!("-{name}"), &pid])
             .status()
             .expect("run kill");
-        assert!(sent.success(), "kill -TERM {pid} failed");
+        assert!(sent.success(), "kill -{name} {pid} failed");
     }
 
     fn stderr(&mut self) -> String {
@@ -196,10 +210,19 @@ fn second_process_on_one_data_dir_refuses_and_touches_nothing() {
     );
     let sentinel = data_dir.join("sentinel-do-not-touch");
     std::fs::write(&sentinel, b"first node's file").expect("write sentinel");
+
+    // The first node keeps writing its own files while it runs: it rewrote
+    // schema.json during one CI run (2026-10-27), and a directory listing
+    // racing that rename saw the staging name without schema.json. Frozen,
+    // it still holds the lock, so anything that changes between the two
+    // listings is the second process's doing.
+    first.freeze();
     let before = tree(&data_dir);
 
     let mut second = Node::start(root.path(), &data_dir, "second");
     let status = second.wait();
+    let after = tree(&data_dir);
+    first.thaw();
     let stderr = second.stderr();
     assert_eq!(
         status.code(),
@@ -233,8 +256,7 @@ fn second_process_on_one_data_dir_refuses_and_touches_nothing() {
         b"first node's file"
     );
     assert_eq!(
-        tree(&data_dir),
-        before,
+        after, before,
         "the second process must not create, remove or rename anything in the data dir"
     );
 
