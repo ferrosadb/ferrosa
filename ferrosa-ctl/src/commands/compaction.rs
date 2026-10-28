@@ -61,11 +61,12 @@ async fn send_stop(
         bytes.extend_from_slice(&chunk);
     }
     if status != reqwest::StatusCode::ACCEPTED {
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-        let message = body
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("server did not acknowledge the cancellation request");
+        // Prefer the server's `error` field; otherwise show what it did send
+        // (a proxy page, a plain-text error) rather than a generic line.
+        let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|body| body.get("error")?.as_str().map(str::to_owned))
+            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
         return Err(format!("compaction stop failed (HTTP {status}): {message}").into());
     }
     let report: StopResponse = serde_json::from_slice(&bytes)?;
@@ -197,6 +198,16 @@ mod tests {
         let (headers, body) = server.await.unwrap();
         assert!(!headers.to_ascii_lowercase().contains("authorization:"));
         assert_eq!(body, "{}");
+    }
+
+    /// A non-JSON error body (a proxy page, plain text) is shown, not replaced
+    /// by a generic line.
+    #[tokio::test]
+    async fn compaction_stop_cli_shows_a_non_json_error_body() {
+        let (address, server) = serve_once(502, "upstream connect error".into()).await;
+        let err = send_stop(address, None, None, None).await.unwrap_err();
+        server.await.unwrap();
+        assert!(err.to_string().contains("upstream connect error"), "{err}");
     }
 
     #[tokio::test]

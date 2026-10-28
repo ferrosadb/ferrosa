@@ -217,6 +217,19 @@ pub struct ValueSpan {
     pub len: usize,
 }
 
+/// What [`DataReader::salvage_partition`] recovered from one partition.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SalvageOutcome {
+    /// Clustered rows delivered.
+    pub rows: u64,
+    /// Static rows delivered.
+    pub static_rows: u64,
+    /// `true` if the partition ended on a clean `END_OF_PARTITION`.
+    pub complete: bool,
+    /// Why recovery stopped early, when it did.
+    pub stopped: Option<String>,
+}
+
 /// Reads partitions sequentially from a Data.db file.
 ///
 /// The reader tracks its current byte position and advances through the file
@@ -787,65 +800,68 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         }))
     }
 
-    /// Best-effort recovery of a single partition at the current position.
+    /// Best-effort recovery of a single partition at the current position,
+    /// streamed: each recovered row is decoded into the caller's reused `row`
+    /// buffer and handed to `on_row` (key, row, is_static) before the next is
+    /// read, so a wide partition is never held.
     ///
-    /// Reads the partition header (key + deletion), then decodes clustered rows
-    /// one at a time, **stopping at the first row that fails to parse** instead
-    /// of propagating the error. This is the salvage path for SSTables corrupted
+    /// Reads the partition header (key + deletion), then decodes rows one at a
+    /// time, **stopping at the first row that fails to parse** instead of
+    /// propagating the error. This is the salvage path for SSTables corrupted
     /// by the historical writer-bitmap-under-count bug: the partition header and
     /// the leading rows decode cleanly, then an intra-partition parse drift
-    /// trips a later row. The leading rows are real data worth recovering.
+    /// trips a later row. The leading rows are real data worth recovering. Why
+    /// recovery stopped is kept in [`SalvageOutcome::stopped`].
     ///
     /// Returns `Ok(None)` at EOF. Returns `Err` only if the partition *header*
     /// itself cannot be read (no key → nothing to attribute rows to); the
-    /// caller seeks to the next partition's indexed offset and continues.
-    ///
-    /// The boolean in the tuple is `complete`: `true` if the partition ended on
-    /// a clean `END_OF_PARTITION`, `false` if recovery stopped early (drift or
-    /// truncation). `pos` is left undefined after a partial recovery — callers
-    /// MUST re-seek to the next partition's offset rather than continue.
-    #[allow(clippy::type_complexity)]
-    pub fn salvage_partition(
+    /// caller seeks to the next partition's offset and continues. `pos` is
+    /// left undefined after a partial recovery — callers MUST re-seek to the
+    /// next partition's offset rather than continue.
+    pub fn salvage_partition<F>(
         &mut self,
-    ) -> Result<Option<(DecoratedKey, DeletionTime, Option<Row>, Vec<Row>, bool)>> {
+        row: &mut Row,
+        mut on_row: F,
+    ) -> Result<Option<SalvageOutcome>>
+    where
+        F: FnMut(&DecoratedKey, &Row, bool),
+    {
         let file_len = self.reader.len()?;
         if self.pos >= file_len {
             return Ok(None);
         }
         // Header failure is unrecoverable for this partition — propagate so the
-        // caller counts it and moves to the next indexed offset.
-        let (key_bytes, deletion) = self.read_partition_header()?;
+        // caller counts it and moves to the next offset.
+        let (key_bytes, _deletion) = self.read_partition_header()?;
         let key = DecoratedKey::new(PartitionKey::new(key_bytes));
 
-        let mut static_row: Option<Row> = None;
-        let mut rows: Vec<Row> = Vec::new();
-        let mut complete = false;
+        let mut outcome = SalvageOutcome::default();
         loop {
             if self.pos >= file_len {
-                // Ran off the end without an END_OF_PARTITION — truncated.
+                outcome.stopped = Some(format!(
+                    "Data.db ended at byte {file_len} inside the partition (truncated)"
+                ));
                 break;
             }
             let mut flags_buf = [0u8; 1];
-            if self.reader.read_exact_at(&mut flags_buf, self.pos).is_err() {
+            if let Err(e) = self.reader.read_exact_at(&mut flags_buf, self.pos) {
+                outcome.stopped = Some(format!("row flags at byte {}: {e}", self.pos));
                 break;
             }
             self.pos += 1;
             let flags = flags_buf[0];
 
-            if flags & END_OF_PARTITION != 0 {
-                complete = true;
-                break;
-            }
-            if flags & IS_MARKER != 0 {
-                // Range tombstone marker — not a row. Matches the streaming
-                // reader, which treats it as the partition boundary.
-                complete = true;
+            // A range tombstone marker is not a row; it ends recovery exactly as
+            // the streaming reader treats it as the partition boundary.
+            if flags & (END_OF_PARTITION | IS_MARKER) != 0 {
+                outcome.complete = true;
                 break;
             }
 
             let extended_flags = if flags & EXTENSION_FLAG != 0 {
                 let mut ext_buf = [0u8; 1];
-                if self.reader.read_exact_at(&mut ext_buf, self.pos).is_err() {
+                if let Err(e) = self.reader.read_exact_at(&mut ext_buf, self.pos) {
+                    outcome.stopped = Some(format!("extended flags at byte {}: {e}", self.pos));
                     break;
                 }
                 self.pos += 1;
@@ -854,20 +870,21 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
                 0
             };
             let is_static = extended_flags & EXT_IS_STATIC != 0;
+            let row_start = self.pos;
             // The salvage point: a row that fails to decode ends recovery for
-            // this partition. Everything before it is kept.
-            match self.read_row(flags, is_static) {
-                Ok(row) => {
-                    if is_static {
-                        static_row = Some(row);
-                    } else {
-                        rows.push(row);
-                    }
-                }
-                Err(_) => break,
+            // this partition. Everything before it was already delivered.
+            if let Err(e) = self.read_row_into(flags, is_static, row, None) {
+                outcome.stopped = Some(format!("row at byte {row_start}: {e}"));
+                break;
             }
+            if is_static {
+                outcome.static_rows += 1;
+            } else {
+                outcome.rows += 1;
+            }
+            on_row(&key, row, is_static);
         }
-        Ok(Some((key, deletion, static_row, rows, complete)))
+        Ok(Some(outcome))
     }
 
     /// Returns the current read position in the data file.
