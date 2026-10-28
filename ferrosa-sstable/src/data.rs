@@ -149,6 +149,37 @@ fn complex_col_meta(column_type: &str, complex_collections: bool) -> (bool, &str
     }
 }
 
+/// Refuse a row whose decoded body length disagrees with its declared
+/// `row_size`.
+///
+/// The writer frames every row body with its length, and the body is
+/// self-describing through the column bitmap. When the two disagree the bytes
+/// cannot be trusted either way: the April 2026 writer bugs (unsorted cells,
+/// duplicate column indexes) wrote a correct `row_size` around a body with more
+/// cells than its bitmap named. A reader that trusts the bitmap stops early
+/// and decodes the next "row" from leftover cell bytes, which is how a tenant
+/// UUID came to be read back as a clustering key (t_78c7f689). Failing here
+/// turns that silent misread into a named error before compaction can persist
+/// it into a well-framed file.
+///
+/// Two conventions are accepted, because they differ on whether `row_size`
+/// counts the prev-unfiltered-size varint that sits between it and the body.
+/// Cassandra counts it (`UnfilteredSerializer` writes
+/// `body + sizeofUnsignedVInt(previousUnfilteredSize)`); ferrosa's writer
+/// counts the body alone. `prev_len` is that varint's encoded width. The
+/// residual blind spot is a body that under-reads by exactly `prev_len` bytes.
+fn check_row_framing(body_start: u64, prev_len: u64, row_size: u64, body_end: u64) -> Result<()> {
+    let decoded = body_end.saturating_sub(body_start);
+    if decoded == row_size || decoded + prev_len == row_size {
+        return Ok(());
+    }
+    Err(Error::InvalidData(format!(
+        "row framing: decoded a {decoded}-byte row body at offset {body_start} \
+         but row_size declares {row_size} bytes; the column bitmap and the \
+         row length disagree, so the row and every row after it would be misread"
+    )))
+}
+
 /// Represent a non-live complex `DeletionTime` as a `path == None` tombstone
 /// cell — the collection-level tombstone that flows through the `(col, path)`
 /// merge and is applied at read-assembly. `LIVE` (or absent) yields nothing.
@@ -1446,14 +1477,17 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
         };
         self.maybe_skip_legacy_empty_clustering_prefix(flags, is_static)?;
 
-        // Row body size (serialized row size varint — we skip this, it's used
-        // for skipping rows during filtering but we always read fully).
-        let (_row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        // Row body size. The body is decoded fully, then checked against this
+        // declared length: a body that disagrees with its own framing is
+        // refused (t_78c7f689), because continuing would decode the next row
+        // from the leftover cell bytes.
+        let (row_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
         self.pos += n as u64;
 
         // Previous unfiltered size (used for reverse iteration — skip).
-        let (_prev_size, n) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
-        self.pos += n as u64;
+        let (_prev_size, prev_len) = varint::read_unsigned_vint_at(self.reader, self.pos)?;
+        self.pos += prev_len as u64;
+        let body_start = self.pos;
 
         // Liveness info (unsigned varint deltas against SerializationHeader)
         let mut liveness = LivenessInfo::NONE;
@@ -1564,6 +1598,7 @@ impl<'a, R: ReadAt> DataReader<'a, R> {
             }
         }
 
+        check_row_framing(body_start, prev_len as u64, row_size, self.pos)?;
         cells.truncate(used);
         if let Some(spans) = spans {
             spans.resize(used, ValueSpan::default());
@@ -2349,8 +2384,8 @@ mod tests {
         push_unsigned_vint(&mut data, 0); // header: all non-null, non-empty
         data.extend_from_slice(&clustering);
 
-        // Row body size (dummy — reader skips it)
-        push_unsigned_vint(&mut data, 20);
+        // Row body size: liveness (1) + cell flags (1) + length (1) + "hello" (5).
+        push_unsigned_vint(&mut data, 8);
         // Previous unfiltered size
         push_unsigned_vint(&mut data, 0);
 
@@ -2512,7 +2547,8 @@ mod tests {
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
-        push_unsigned_vint(&mut data, 30);
+        // liveness (1) + cell flags (1) + timestamp 200 (2) + length (1) + "world" (5)
+        push_unsigned_vint(&mut data, 10);
         push_unsigned_vint(&mut data, 0);
 
         // Liveness timestamp delta = 100 (unsigned varint)
@@ -2582,7 +2618,8 @@ mod tests {
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
-        push_unsigned_vint(&mut data, 10);
+        // liveness (1) + cell flags (1) + timestamp (1) + local deletion time (1)
+        push_unsigned_vint(&mut data, 4);
         push_unsigned_vint(&mut data, 0);
 
         // Liveness timestamp delta = 50 (unsigned)
@@ -2676,7 +2713,8 @@ mod tests {
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
-        push_unsigned_vint(&mut data, 30);
+        // liveness (1) + deletion ts (1) + deletion ldt 500 (2) + cell flags (1) + length (1) + "x" (1)
+        push_unsigned_vint(&mut data, 7);
         push_unsigned_vint(&mut data, 0);
 
         // Liveness timestamp delta = 10 (unsigned)
@@ -2749,7 +2787,8 @@ mod tests {
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
-        push_unsigned_vint(&mut data, 20);
+        // liveness (1) + bitmap (1) + cell flags (1) + length (1) + "only_a" (6)
+        push_unsigned_vint(&mut data, 10);
         push_unsigned_vint(&mut data, 0);
 
         // Liveness timestamp delta = 10 (unsigned)
@@ -3224,8 +3263,19 @@ mod tests {
         assert!(reader.read_partition_projected(&[]).unwrap().is_none());
     }
 
+    /// A `row_size` that declares more bytes than the row body decodes to is
+    /// refused by the full decoder.
+    ///
+    /// This test used to assert the opposite: that the full decode "establishes
+    /// row truth" and the key-only projection must agree with it. Measured on
+    /// 2026-10-28 (t_78c7f689), that shape is exactly the April 2026 drift: 233
+    /// of 234 archived drifted generations decode short of their `row_size`,
+    /// and what the old full decode returned for them was garbage built from
+    /// leftover cell bytes. No live generation on the three memory-cluster nodes
+    /// has the shape. When the bitmap and the length disagree neither can be
+    /// trusted, so the reader names the disagreement instead of picking one.
     #[test]
-    fn projected_empty_projection_counts_rows_when_legacy_row_size_overstates_body() {
+    fn a_row_size_that_overstates_the_decoded_body_is_refused() {
         let header = test_header();
 
         fn row_bytes(
@@ -3269,21 +3319,162 @@ mod tests {
         data.extend_from_slice(&second_row);
         data.push(END_OF_PARTITION);
 
-        let full = DataReader::new(&data, &header, 0)
+        let err = DataReader::new(&data, &header, 0)
+            .read_partition()
+            .expect_err("a body shorter than its row_size must be refused")
+            .to_string();
+        assert!(
+            err.contains("row framing") && err.contains("row_size declares"),
+            "expected a row-framing refusal, got: {err}"
+        );
+    }
+
+    /// Two UTF8 regular columns, so a row can carry a column-subset bitmap.
+    fn two_column_header() -> SerializationHeader {
+        SerializationHeader {
+            regular_columns: vec![
+                (
+                    b"a".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+                (
+                    b"b".to_vec(),
+                    "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                ),
+            ],
+            ..test_header()
+        }
+    }
+
+    /// One clustered row of [`two_column_header`]: `missing` is the subset
+    /// bitmap (`None` = all columns), `cells` the values actually written,
+    /// and `row_size` the true length of the body that follows it.
+    fn framed_row(clustering_value: i32, missing: Option<u64>, cells: &[&[u8]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        push_unsigned_vint(&mut body, 7); // liveness timestamp delta
+        if let Some(bits) = missing {
+            push_unsigned_vint(&mut body, bits);
+        }
+        for &value in cells {
+            body.push(CELL_USE_ROW_TIMESTAMP);
+            push_unsigned_vint(&mut body, <[u8]>::len(value) as u64);
+            body.extend_from_slice(value);
+        }
+        let mut row = vec![
+            HAS_TIMESTAMP
+                | if missing.is_none() {
+                    HAS_ALL_COLUMNS
+                } else {
+                    0
+                },
+        ];
+        push_unsigned_vint(&mut row, 0); // clustering header bits
+        row.extend_from_slice(&clustering_value.to_be_bytes());
+        push_unsigned_vint(&mut row, body.len() as u64);
+        push_unsigned_vint(&mut row, 0); // previous unfiltered size
+        row.extend_from_slice(&body);
+        row
+    }
+
+    fn partition_blob(key: &[u8], rows: &[Vec<u8>]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        data.extend_from_slice(key);
+        push_live_deletion(&mut data);
+        for row in rows {
+            data.extend_from_slice(row);
+        }
+        data.push(END_OF_PARTITION);
+        data
+    }
+
+    /// P0 t_78c7f689. The April 2026 writer bugs (`bda1e257` unsorted cells,
+    /// and the duplicate-`col_idx` bitmap under-count) wrote a row whose
+    /// column bitmap names FEWER cells than its body holds, while `row_size`
+    /// still records the true body length. A reader that ignores `row_size`
+    /// stops one cell short and decodes the next row from the leftover cell:
+    /// on the live memory cluster that made a `co_occurs_with.entity_b` out
+    /// of `00 08 10` (a cell's flags and length) plus 13 bytes of the tenant
+    /// UUID, and compaction re-encoded such rows into clean SSTables.
+    ///
+    /// RED as written on main: `read_partition` returns `Ok` with a row the
+    /// file never contained. The decoder must refuse a row whose decode does
+    /// not end at the body end `row_size` declares.
+    #[test]
+    fn a_row_whose_cells_overrun_its_column_bitmap_is_refused_not_misframed() {
+        let header = two_column_header();
+        // Row 1: bitmap says only `a` (bit 1 = `b` missing), body holds `a` AND `b`.
+        let undercounted = framed_row(1, Some(0b10), &[b"aa", b"bbb"]);
+        let next = framed_row(2, None, &[b"x", b"y"]);
+        let data = partition_blob(b"pk_bitmap_undercount", &[undercounted, next]);
+
+        let result = DataReader::new(&data, &header, 0).read_partition();
+
+        let err = match result {
+            Err(e) => e.to_string(),
+            Ok(p) => panic!(
+                "a row whose body overruns its column bitmap must be refused, \
+                 but it decoded as {p:?}"
+            ),
+        };
+        assert!(
+            err.contains("row_size"),
+            "the refusal must name the framing check, got: {err}"
+        );
+    }
+
+    /// Positive control for the framing check: correctly framed rows, with
+    /// and without a column subset, read back exactly.
+    #[test]
+    fn correctly_framed_rows_with_and_without_a_column_subset_read_back() {
+        let header = two_column_header();
+        let sparse = framed_row(1, Some(0b10), &[b"aa"]);
+        let full = framed_row(2, None, &[b"x", b"y"]);
+        let data = partition_blob(b"pk_framed", &[sparse, full]);
+
+        let p = DataReader::new(&data, &header, 0)
             .read_partition()
             .unwrap()
-            .expect("expected full partition");
-        assert_eq!(full.rows.len(), 2, "full decode establishes row truth");
+            .expect("expected partition");
 
-        let projected = DataReader::new(&data, &header, 0)
-            .read_partition_projected(&[])
-            .unwrap()
-            .expect("expected projected partition");
+        assert_eq!(p.rows.len(), 2);
+        assert_eq!(p.rows[0].clustering, 1i32.to_be_bytes());
+        assert_eq!(p.rows[0].cells.len(), 1);
+        assert_eq!(p.rows[0].cells[0].0, 0);
+        assert_eq!(p.rows[0].cells[0].1.value.as_deref(), Some(&b"aa"[..]));
+        assert_eq!(p.rows[1].clustering, 2i32.to_be_bytes());
+        let values: Vec<_> = p.rows[1]
+            .cells
+            .iter()
+            .map(|(i, c)| (*i, c.value.as_deref().map(<[u8]>::to_vec)))
+            .collect();
         assert_eq!(
-            projected.rows.len(),
-            full.rows.len(),
-            "key-only projection must not skip later rows when a legacy SSTable overstates row_size"
+            values,
+            vec![(0, Some(b"x".to_vec())), (1, Some(b"y".to_vec()))]
         );
+    }
+
+    /// Cassandra's `UnfilteredSerializer` counts the prev-unfiltered-size
+    /// varint inside `row_size`; ferrosa's writer does not. The framing check
+    /// accepts both, so a Cassandra-written row is not refused.
+    #[test]
+    fn a_row_size_that_counts_the_prev_size_varint_is_accepted() {
+        let header = two_column_header();
+        let mut cassandra_framed = framed_row(1, None, &[b"aa", b"b"]);
+        // flags (1) + clustering header (1) + int32 clustering (4), then the
+        // one-byte row_size this small row encodes to.
+        const ROW_SIZE_AT: usize = 6;
+        cassandra_framed[ROW_SIZE_AT] += 1;
+        let data = partition_blob(b"pk_cassandra", &[cassandra_framed]);
+
+        let p = DataReader::new(&data, &header, 0)
+            .read_partition()
+            .expect("a Cassandra-convention row_size must be accepted")
+            .expect("expected partition");
+
+        assert_eq!(p.rows.len(), 1);
+        assert_eq!(p.rows[0].cells.len(), 2);
+        assert_eq!(p.rows[0].cells[1].1.value.as_deref(), Some(&b"b"[..]));
     }
 
     #[test]
@@ -3329,7 +3520,8 @@ mod tests {
         data.extend_from_slice(&clustering);
 
         // Row body size + prev size
-        push_unsigned_vint(&mut data, 20);
+        // liveness 999 (2) + cell flags (1) + timestamp 1500 (2) + length (1) + "ts_value" (8)
+        push_unsigned_vint(&mut data, 14);
         push_unsigned_vint(&mut data, 0);
 
         // Liveness timestamp delta = 999 (unsigned)

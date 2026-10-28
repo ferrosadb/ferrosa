@@ -602,6 +602,251 @@ fn print_salvage_summary(reports: &[GenSalvage], table_dir: &Path) {
     );
 }
 
+// ── find (locate rows by a byte pattern) ────────────────────────────────────────
+
+/// One cell of a row [`find`](sstable_find) matched.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FoundCell {
+    /// Column name from the generation's own serialization header, or
+    /// `#<index>` when the index is outside the header.
+    pub column: String,
+    /// The column's marshal type from the header.
+    pub column_type: String,
+    /// `None` for a tombstone.
+    pub value_hex: Option<String>,
+    pub timestamp: i64,
+    pub ttl: i32,
+    pub local_deletion_time: i32,
+}
+
+/// One row [`find`](sstable_find) matched, with everything needed to tell a
+/// correctly written value from bytes taken out of a neighbouring field.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct FoundRow {
+    pub gen: u64,
+    pub location: String,
+    pub partition_key_hex: String,
+    pub clustering_hex: String,
+    /// `i64::MIN` when the row has no primary-key liveness.
+    pub liveness_timestamp: i64,
+    /// Where the pattern occurred: `partition_key`, `clustering`, or a column.
+    pub matched_in: Vec<String>,
+    pub cells: Vec<FoundCell>,
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String cannot fail.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Parse a hex pattern, ignoring `-`, `:` and spaces so a UUID pastes as is.
+fn parse_hex_pattern(text: &str) -> Result<Vec<u8>, CtlError> {
+    let digits: Vec<u8> = text
+        .bytes()
+        .filter(|b| !matches!(b, b'-' | b':' | b' '))
+        .collect();
+    if digits.is_empty() || !digits.len().is_multiple_of(2) {
+        return Err(format!("pattern {text:?} is not an even number of hex digits").into());
+    }
+    digits
+        .chunks(2)
+        .map(|pair| {
+            let s = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
+            u8::from_str_radix(s, 16).map_err(|e| format!("pattern {text:?}: {e}").into())
+        })
+        .collect()
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// The row with every cell rendered, or `None` when the pattern occurs
+/// nowhere in it (partition key, clustering, or any cell value).
+///
+/// A cell's column index counts within its own row kind: the decoder indexes
+/// a static row's cells into `static_columns` and a clustered row's into
+/// `regular_columns`, so `is_static` picks the list.
+fn match_row(
+    header: &SerializationHeader,
+    key: &DecoratedKey,
+    row: &Row,
+    is_static: bool,
+    pattern: &[u8],
+    gen: u64,
+    location: &str,
+) -> Option<FoundRow> {
+    let key_bytes = key.key.as_bytes();
+    let mut matched_in = Vec::new();
+    if contains(key_bytes, pattern) {
+        matched_in.push("partition_key".to_string());
+    }
+    if contains(&row.clustering, pattern) {
+        matched_in.push("clustering".to_string());
+    }
+    let columns = if is_static {
+        &header.static_columns
+    } else {
+        &header.regular_columns
+    };
+    let mut cells = Vec::with_capacity(row.cells.len());
+    for (col_idx, cell) in &row.cells {
+        let idx = *col_idx as usize;
+        let column = columns.get(idx);
+        let (name, ty) = column.map_or_else(
+            || (format!("#{idx}"), "?".to_string()),
+            |(n, t)| (String::from_utf8_lossy(n).into_owned(), t.clone()),
+        );
+        if cell.value.as_deref().is_some_and(|v| contains(v, pattern)) {
+            matched_in.push(name.clone());
+        }
+        cells.push(FoundCell {
+            column: name,
+            column_type: ty,
+            value_hex: cell.value.as_deref().map(to_hex),
+            timestamp: cell.timestamp,
+            ttl: cell.ttl,
+            local_deletion_time: cell.local_deletion_time,
+        });
+    }
+    if matched_in.is_empty() {
+        return None;
+    }
+    Some(FoundRow {
+        gen,
+        location: location.to_string(),
+        partition_key_hex: to_hex(key_bytes),
+        clustering_hex: to_hex(&row.clustering),
+        liveness_timestamp: row.primary_key_liveness.timestamp,
+        matched_in,
+        cells,
+    })
+}
+
+/// What [`find_rows`] saw: the matching rows, and every generation it could
+/// not read to the end. A corrupt generation is exactly what this command is
+/// pointed at, so it does not abort the search, but it is never a silent gap:
+/// the rows decoded before the failure are kept and the failure is reported.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct FindReport {
+    pub rows: Vec<FoundRow>,
+    pub unreadable: Vec<UnreadableGen>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UnreadableGen {
+    pub gen: u64,
+    pub location: String,
+    /// Partitions decoded before the failure.
+    pub partitions_read: u64,
+    pub error: String,
+}
+
+/// Every row in `table_dir` (and, when asked, its `quarantine/`) whose key,
+/// clustering or a cell value contains `pattern`. Pure read. Streams one
+/// partition at a time.
+pub fn find_rows(
+    table_dir: &Path,
+    pattern: &[u8],
+    include_quarantine: bool,
+) -> Result<FindReport, CtlError> {
+    if !table_dir.is_dir() {
+        return Err(format!("not a directory: {}", table_dir.display()).into());
+    }
+    if pattern.is_empty() {
+        return Err("empty pattern matches everything".into());
+    }
+    let mut dirs = vec![(table_dir.to_path_buf(), "live")];
+    let q = table_dir.join("quarantine");
+    if include_quarantine && q.is_dir() {
+        dirs.push((q, "quarantine"));
+    }
+    let mut report = FindReport::default();
+    for (dir, location) in &dirs {
+        for gen in StorageEngine::list_generations_in_dir(dir) {
+            let mut partitions_read = 0u64;
+            let outcome = (|| -> Result<(), CtlError> {
+                let reader = open_reader(dir, gen)?;
+                let header = reader.header().clone();
+                let mut iter = reader.scan_iter()?;
+                while let Some(p) = iter.next_partition()? {
+                    partitions_read += 1;
+                    let rows = (p.static_row.iter().map(|row| (row, true)))
+                        .chain(p.rows.iter().map(|row| (row, false)));
+                    report.rows.extend(rows.filter_map(|(row, is_static)| {
+                        match_row(&header, &p.key, row, is_static, pattern, gen, location)
+                    }));
+                }
+                Ok(())
+            })();
+            if let Err(e) = outcome {
+                report.unreadable.push(UnreadableGen {
+                    gen,
+                    location: location.to_string(),
+                    partitions_read,
+                    error: e.to_string(),
+                });
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// `ferrosa-ctl sstable find` entry point.
+pub fn sstable_find(
+    table_dir: &Path,
+    pattern_hex: &str,
+    include_quarantine: bool,
+    json: bool,
+) -> Result<(), CtlError> {
+    let pattern = parse_hex_pattern(pattern_hex)?;
+    let report = find_rows(table_dir, &pattern, include_quarantine)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    for r in &report.rows {
+        println!(
+            "gen {} ({}) pk={} ck={} liveness_ts={} matched_in={:?}",
+            r.gen,
+            r.location,
+            r.partition_key_hex,
+            r.clustering_hex,
+            r.liveness_timestamp,
+            r.matched_in
+        );
+        for c in &r.cells {
+            println!(
+                "    {} ({}) = {} ts={} ttl={} ldt={}",
+                c.column,
+                c.column_type,
+                c.value_hex.as_deref().unwrap_or("<tombstone>"),
+                c.timestamp,
+                c.ttl,
+                c.local_deletion_time
+            );
+        }
+    }
+    for u in &report.unreadable {
+        eprintln!(
+            "UNREADABLE gen {} ({}) after {} partition(s): {}",
+            u.gen, u.location, u.partitions_read, u.error
+        );
+    }
+    println!(
+        "{}: {} matching row(s); {} generation(s) could not be read to the end",
+        table_dir.display(),
+        report.rows.len(),
+        report.unreadable.len()
+    );
+    Ok(())
+}
+
 // ── reingest (recover salvaged rows through the live write path) ─────────────────
 
 /// A table's partition-key and clustering column names, in position order,
@@ -1177,6 +1422,103 @@ mod tests {
     use ferrosa_storage::self_heal::test_fixtures::{
         corrupt_one_generation, table_dir_with_n_generations,
     };
+
+    #[test]
+    fn find_reports_the_one_row_holding_a_value_with_its_generation() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+
+        let report = find_rows(&table_dir, b"v1", false).unwrap();
+
+        assert!(report.unreadable.is_empty(), "{:?}", report.unreadable);
+        assert_eq!(report.rows.len(), 1, "only pk1 holds v1: {:?}", report.rows);
+        let row = &report.rows[0];
+        assert_eq!(row.partition_key_hex, to_hex(b"pk1"));
+        assert_eq!(row.location, "live");
+        assert!(
+            StorageEngine::list_generations_in_dir(&table_dir).contains(&row.gen),
+            "the row names a generation that exists"
+        );
+        assert!(
+            !row.matched_in.is_empty() && !row.matched_in.contains(&"partition_key".to_string()),
+            "the match is in a cell, not the key: {:?}",
+            row.matched_in
+        );
+        assert!(
+            row.cells
+                .iter()
+                .any(|c| c.value_hex.as_deref() == Some(to_hex(b"v1").as_str())),
+            "the matching cell is rendered: {:?}",
+            row.cells
+        );
+    }
+
+    /// A corrupt generation is what `find` is pointed at: it is reported, and
+    /// the search carries on through the healthy ones.
+    #[test]
+    fn find_reports_an_unreadable_generation_and_keeps_searching() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+        let bad = corrupt_one_generation(&table_dir);
+
+        let report = find_rows(&table_dir, b"pk", false).unwrap();
+
+        assert_eq!(report.unreadable.len(), 1, "{:?}", report.unreadable);
+        assert_eq!(report.unreadable[0].gen, bad);
+        assert!(!report.unreadable[0].error.is_empty());
+        assert!(
+            report.rows.iter().any(|r| r.gen != bad),
+            "the healthy generation is still searched: {:?}",
+            report.rows
+        );
+    }
+
+    /// Each row kind indexes its cells into its own column list, so a regular
+    /// row's column 0 is the first REGULAR column even when the table has
+    /// static columns.
+    #[test]
+    fn find_names_cells_from_the_column_list_of_their_own_row_kind() {
+        use ferrosa_common::{CellValue, PartitionKey};
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo};
+        let utf8 = "org.apache.cassandra.db.marshal.UTF8Type".to_string();
+        let header = SerializationHeader {
+            complex_collections: false,
+            min_timestamp: 0,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: utf8.clone(),
+            clustering_types: vec![],
+            static_columns: vec![(b"s".to_vec(), utf8.clone())],
+            regular_columns: vec![(b"r".to_vec(), utf8)],
+        };
+        let key = DecoratedKey::new(PartitionKey::new(b"k".to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"hit".to_vec(), 1))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+
+        let regular = match_row(&header, &key, &row, false, b"hit", 1, "live").unwrap();
+        let static_ = match_row(&header, &key, &row, true, b"hit", 1, "live").unwrap();
+
+        assert_eq!(regular.cells[0].column, "r");
+        assert_eq!(regular.matched_in, vec!["r".to_string()]);
+        assert_eq!(static_.cells[0].column, "s");
+    }
+
+    #[test]
+    fn find_pattern_accepts_a_pasted_uuid_and_refuses_bad_hex() {
+        assert_eq!(
+            parse_hex_pattern("0008109a-5f8f:bf d8").unwrap(),
+            vec![0x00, 0x08, 0x10, 0x9a, 0x5f, 0x8f, 0xbf, 0xd8]
+        );
+        assert!(parse_hex_pattern("abc").is_err(), "odd digit count");
+        assert!(parse_hex_pattern("zz").is_err(), "not hex");
+        assert!(
+            parse_hex_pattern("--").is_err(),
+            "nothing left after separators"
+        );
+    }
 
     #[test]
     fn scan_reports_ok_for_healthy_generations() {
