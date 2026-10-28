@@ -122,6 +122,18 @@ pub type PartitionStream = Pin<Box<dyn Stream<Item = Result<Partition, String>> 
 /// empty or short stream.
 #[async_trait::async_trait]
 pub trait RangeRead: Send + Sync {
+    /// Optional consistency-aware metadata count. The predicate runs once per
+    /// merged partition/fragment at the coordinator, never on individual replicas.
+    /// An unsupported capability returns `None`; a read failure remains an error.
+    async fn count_matching(
+        &self,
+        _table_id: &TableId,
+        _cl: ConsistencyLevel,
+        _strategy: &ReplicationStrategy,
+        _matches: &(dyn for<'key> Fn(&'key ferrosa_common::DecoratedKey) -> bool + Sync),
+    ) -> Result<Option<u64>, String> {
+        Ok(None)
+    }
     /// Read exactly one partition at the same consistency and replication policy
     /// as a scan. Implementations without a keyed operation retain the complete
     /// cluster scan; they must never substitute local storage on a read failure.
@@ -168,6 +180,20 @@ impl ClusterRangeRead {
 
 #[async_trait::async_trait]
 impl RangeRead for ClusterRangeRead {
+    async fn count_matching(
+        &self,
+        table_id: &TableId,
+        cl: ConsistencyLevel,
+        strategy: &ReplicationStrategy,
+        matches: &(dyn for<'key> Fn(&'key ferrosa_common::DecoratedKey) -> bool + Sync),
+    ) -> Result<Option<u64>, String> {
+        self.path
+            .load_full()
+            .count_live_single_row_matching_with(table_id, cl, strategy, matches)
+            .await
+            .map(Some)
+            .map_err(|error| error.to_string())
+    }
     async fn stream_key(
         &self,
         table_id: &TableId,

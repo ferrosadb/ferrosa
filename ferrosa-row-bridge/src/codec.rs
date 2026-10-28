@@ -24,7 +24,7 @@ pub fn encode_value(value: &CqlValue) -> Vec<u8> {
         CqlValue::Bigint(n) | CqlValue::Counter(n) | CqlValue::Timestamp(n) => {
             n.to_be_bytes().to_vec()
         }
-        CqlValue::Blob(b) => b.clone(),
+        CqlValue::Blob(b) => b.to_vec(),
         CqlValue::Boolean(b) => vec![if *b { 1 } else { 0 }],
         CqlValue::Decimal { scale, unscaled } => {
             let mut buf = scale.to_be_bytes().to_vec();
@@ -138,15 +138,34 @@ fn decode_jsonb(bytes: &[u8]) -> Result<CqlValue, RowBridgeError> {
 }
 
 /// Decode a [`CqlValue`] from CQL wire-format bytes given its type.
+/// Adopt a uniquely owned scalar payload; shared backing stays immutable.
+pub(crate) fn decode_value_owned(
+    cql_type: &CqlType,
+    bytes: ferrosa_common::cell_bytes::CellBytes,
+) -> Result<CqlValue, RowBridgeError> {
+    match cql_type {
+        CqlType::Ascii => ferrosa_common::SharedText::from_cell(bytes)
+            .map(CqlValue::Ascii)
+            .map_err(|error| RowBridgeError::invalid(format!("invalid ASCII: {error}"))),
+        CqlType::Varchar => ferrosa_common::SharedText::from_cell(bytes)
+            .map(CqlValue::Text)
+            .map_err(|error| RowBridgeError::invalid(format!("invalid UTF-8: {error}"))),
+        CqlType::Blob => Ok(CqlValue::Blob(bytes)),
+        _ => decode_value(cql_type, bytes.as_ref()),
+    }
+}
+
 pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, RowBridgeError> {
     match cql_type {
         CqlType::Ascii => Ok(CqlValue::Ascii(
             String::from_utf8(bytes.to_vec())
-                .map_err(|e| RowBridgeError::invalid(format!("invalid ASCII: {e}")))?,
+                .map_err(|e| RowBridgeError::invalid(format!("invalid ASCII: {e}")))?
+                .into(),
         )),
         CqlType::Varchar => Ok(CqlValue::Text(
             String::from_utf8(bytes.to_vec())
-                .map_err(|e| RowBridgeError::invalid(format!("invalid UTF-8: {e}")))?,
+                .map_err(|e| RowBridgeError::invalid(format!("invalid UTF-8: {e}")))?
+                .into(),
         )),
         CqlType::Bigint => {
             let arr: [u8; 8] = bytes
@@ -160,7 +179,7 @@ pub fn decode_value(cql_type: &CqlType, bytes: &[u8]) -> Result<CqlValue, RowBri
                 .map_err(|_| RowBridgeError::invalid("counter requires 8 bytes"))?;
             Ok(CqlValue::Counter(i64::from_be_bytes(arr)))
         }
-        CqlType::Blob => Ok(CqlValue::Blob(bytes.to_vec())),
+        CqlType::Blob => Ok(CqlValue::Blob(bytes.to_vec().into())),
         CqlType::Boolean => {
             if bytes.len() != 1 {
                 return Err(RowBridgeError::invalid("boolean requires 1 byte"));

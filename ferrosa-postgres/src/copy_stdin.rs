@@ -440,8 +440,10 @@ async fn insert_rows(
                     // cases, so this is a move; invalid UTF-8 still degrades to a lossy String
                     // exactly as before, so no input changes meaning.
                     Some(bytes) => Value::Text(match String::from_utf8(bytes) {
-                        Ok(text) => text,
-                        Err(not_utf8) => String::from_utf8_lossy(not_utf8.as_bytes()).into_owned(),
+                        Ok(text) => text.into(),
+                        Err(not_utf8) => String::from_utf8_lossy(not_utf8.as_bytes())
+                            .into_owned()
+                            .into(),
                     }),
                 })
             })

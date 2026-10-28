@@ -146,6 +146,29 @@ pub struct Row {
     pub primary_key_liveness: LivenessInfo,
 }
 
+impl Row {
+    /// Logical visibility shared by row projection and liveness-only counts.
+    /// An expired primary-key marker may be resurrected by a live cell; a row
+    /// deletion may likewise be superseded by newer primary-key/cell data.
+    pub fn is_visible_at(&self, now_secs: i32) -> bool {
+        let expired = |ldt| ldt != i32::MAX && now_secs >= ldt;
+        if self.primary_key_liveness.has_ttl()
+            && expired(self.primary_key_liveness.local_deletion_time)
+            && !self.cells.iter().any(|(_, c)| {
+                !(c.is_tombstone() || c.is_expiring() && expired(c.local_deletion_time))
+            })
+        {
+            return false;
+        }
+        self.deletion.is_live()
+            || self.primary_key_liveness.timestamp > self.deletion.marked_for_delete_at
+            || self
+                .cells
+                .iter()
+                .any(|(_, c)| c.timestamp > self.deletion.marked_for_delete_at)
+    }
+}
+
 /// A deserialized partition from an SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Partition {

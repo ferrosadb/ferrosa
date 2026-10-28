@@ -459,6 +459,7 @@ fn local_fulltext_key_stream(
 ///
 /// Uses enum dispatch instead of trait objects so that `ArcSwap` works
 /// (trait objects are `!Sized` and `ArcSwap` requires `Sized`).
+#[derive(Clone)]
 pub enum WritePath {
     /// Standalone mode: writes directly to StorageEngine.
     Direct(Arc<StorageEngine>),
@@ -1074,6 +1075,32 @@ impl WritePath {
             Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
                 .local_storage()
                 .count_range_matching(table_id, None, None, matches)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Unavailable => self.count_range(table_id).await,
+        }
+    }
+
+    /// Visibility-correct count for non-clustered single-row tables. Remote
+    /// responses are merged at the requested consistency before reconciliation.
+    pub async fn count_live_single_row_matching_with(
+        &self,
+        table_id: &TableId,
+        cl: crate::consistency::ConsistencyLevel,
+        strategy: &crate::ring::strategy::ReplicationStrategy,
+        matches: &(dyn Fn(&ferrosa_common::key::DecoratedKey) -> bool + Sync),
+    ) -> crate::error::Result<u64> {
+        match self {
+            Self::Cluster(coordinator) => {
+                coordinator
+                    .coordinate_live_single_row_count_matching(table_id, cl, strategy, matches)
+                    .await
+            }
+            Self::Direct(engine) => engine
+                .count_live_single_row_range_matching(table_id, None, None, matches)
+                .map_err(crate::error::ClusterError::Storage),
+            Self::Pair(coordinator) | Self::DegradedPair(coordinator) => coordinator
+                .local_storage()
+                .count_live_single_row_range_matching(table_id, None, None, matches)
                 .map_err(crate::error::ClusterError::Storage),
             Self::Unavailable => self.count_range(table_id).await,
         }

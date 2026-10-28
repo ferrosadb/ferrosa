@@ -154,7 +154,7 @@ fn column(name: &str, kind: ColumnKind, ty: &str) -> ColumnMetadata {
 
 /// Keyspace `public` + table `users(id int PK, name text)`, through the public
 /// DDL API — the identical fixture the single-node PG tests use.
-fn create_schema() -> Schema {
+fn create_schema(table_id: Uuid) -> Schema {
     let schema = Schema::new(schema_config()).expect("schema bootstraps");
     let auth = superuser();
 
@@ -190,7 +190,7 @@ fn create_schema() -> Schema {
             TableMetadata {
                 keyspace: "public".to_string(),
                 name: "users".to_string(),
-                id: Uuid::new_v4(),
+                id: table_id,
                 columns: users_cols,
                 partition_key: vec!["id".to_string()],
                 clustering_key: vec![],
@@ -344,6 +344,7 @@ fn resolve_for(placement: Placement, hosts: &[Uuid]) -> ferrosa_cluster::accord:
 /// A committer for one node plus the PG listener port it serves.
 async fn start_pg_on_node(
     node: &Node,
+    table_id: Uuid,
     hosts: &[Uuid],
     placement: Placement,
     transport: Arc<dyn ferrosa_cluster::accord::transport::AccordTransport>,
@@ -368,7 +369,7 @@ async fn start_pg_on_node(
     let ctx = Arc::new(QueryContext {
         cluster_read: Default::default(),
         engine: node.engine.clone(),
-        schema: Arc::new(create_schema()),
+        schema: Arc::new(create_schema(table_id)),
         default_schema: "public".into(),
         mvcc: Arc::new(ferrosa_postgres::MvccManager::default()),
         accord: AccordAccess::fixed(query_committer),
@@ -398,6 +399,8 @@ struct Cluster {
 /// coordinator the clients connect to.
 async fn cluster(placement: Placement) -> Cluster {
     let nodes = build_nodes();
+    // Replicated DDL assigns one incarnation UUID, shared by every replica.
+    let table_id = Uuid::new_v4();
     let hosts: Vec<Uuid> = nodes.iter().map(|n| n.host).collect();
     let transport: Arc<dyn ferrosa_cluster::accord::transport::AccordTransport> =
         Arc::new(AccordTestTransport {
@@ -407,7 +410,8 @@ async fn cluster(placement: Placement) -> Cluster {
     let mut ports = Vec::new();
     let mut committers = Vec::new();
     for node in &nodes {
-        let (port, committer) = start_pg_on_node(node, &hosts, placement, transport.clone()).await;
+        let (port, committer) =
+            start_pg_on_node(node, table_id, &hosts, placement, transport.clone()).await;
         ports.push(port);
         committers.push(committer);
     }

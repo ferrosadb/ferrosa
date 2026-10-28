@@ -1,8 +1,8 @@
-"""Require explicit, indexed Bolt benchmark fixtures before timing.
+"""Require ready Bolt benchmark fixtures before timing.
 
 Correctness: missing, failed and mismatched indexes reject a benchmark run.
 Last revised: 2026-10-26
-Last changed: Add schema-readiness contracts for the Bolt comparison harness.
+Last changed: Exercise Ferrosa's ordinary Bolt schema/index bootstrap path.
 """
 
 import importlib.util
@@ -24,11 +24,13 @@ SPEC.loader.exec_module(BENCH)
 class Result:
     def __init__(self, rows):
         self.rows = rows
+        self.consumed = False
 
     def single(self):
         return self.rows[0] if self.rows else None
 
     def consume(self):
+        self.consumed = True
         return None
 
     def __iter__(self):
@@ -38,6 +40,7 @@ class Result:
 class Driver:
     def __init__(self):
         self.calls = []
+        self.results = []
         self.rows = [
             {
                 "name": f"bench_{prop}",
@@ -63,7 +66,9 @@ class Driver:
         self.calls.append(query)
         if self.fail_ddl and query.startswith("CREATE INDEX"):
             raise RuntimeError("DDL rejected")
-        return Result(self.rows if query.startswith("SHOW INDEXES") else [])
+        result = Result(self.rows if query.startswith("SHOW INDEXES") else [])
+        self.results.append(result)
+        return result
 
 
 class BoltBenchmarkSchema(unittest.TestCase):
@@ -101,7 +106,7 @@ class BoltBenchmarkSchema(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.adapter.ensure_schema()
 
-    def test_ferrosa_declares_shared_storage_indexes_through_cql(self):
+    def ferrosa_setup(self):
         self.adapter.args = SimpleNamespace(
             bolt_backend="ferrosa",
             keyspace="bench",
@@ -116,14 +121,45 @@ class BoltBenchmarkSchema(unittest.TestCase):
             statements = [
                 call.args[0] for call in cql.return_value.session.execute.call_args_list
             ]
-            self.assertTrue(
-                any("'graph.label': 'BenchRow'" in query for query in statements)
-            )
-            indexes = [
-                query for query in statements if query.startswith("CREATE INDEX")
-            ]
-            self.assertEqual(len(indexes), 3)
             cql.return_value.close.assert_called_once()
+        return statements
+
+    def test_ferrosa_default_setup_does_not_predeclare_tables_or_indexes(self):
+        statements = self.ferrosa_setup()
+        self.assertTrue(any(query.startswith("CREATE KEYSPACE") for query in statements))
+        ddl = [
+            query.upper().strip()
+            for query in statements
+            if query.upper().strip().startswith(("CREATE ", "ALTER ", "DROP "))
+        ]
+        self.assertTrue(
+            all(query.startswith("CREATE KEYSPACE") for query in ddl),
+            f"Ferrosa's default Bolt benchmark must derive its table/indexes through Bolt: {ddl}",
+        )
+
+    def test_ferrosa_bootstraps_with_ordinary_bolt_create_then_removes_its_sentinel(self):
+        self.ferrosa_setup()
+        creates = [
+            (i, query)
+            for i, query in enumerate(self.driver.calls)
+            if query.strip().startswith("CREATE (") and ":BenchRow" in query
+        ]
+        self.assertEqual(len(creates), 1, "bootstrap must exercise an ordinary Bolt CREATE")
+        create_at, create = creates[0]
+        for prop in ("pk", "bucket", "payload"):
+            self.assertRegex(create, rf"\b{prop}\s*:")
+        self.assertTrue(self.driver.results[create_at].consumed)
+        deletes = [
+            (i, query)
+            for i, query in enumerate(self.driver.calls)
+            if ":BenchRow" in query and "DELETE" in query.upper()
+        ]
+        self.assertEqual(len(deletes), 1, "remove the owned bootstrap row before timing")
+        delete_at, delete = deletes[0]
+        self.assertGreater(delete_at, create_at)
+        self.assertRegex(delete, r"(?:\{\s*pk\s*:|WHERE\s+\w+\.pk\s*=)")
+        self.assertTrue(self.driver.results[delete_at].consumed)
+        self.assertFalse(any(query.startswith("CREATE INDEX") for query in self.driver.calls))
 
 
 class BenchmarkScanValues(unittest.TestCase):

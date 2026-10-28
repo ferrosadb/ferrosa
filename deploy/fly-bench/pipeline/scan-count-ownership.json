@@ -1,0 +1,43 @@
+{
+  "source_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+  "environment": "Linux ARM64 local verification container; development profile; not a Fly throughput benchmark",
+  "sparql_join": {
+    "rows": [
+      32,
+      128
+    ],
+    "payload_bytes": 96,
+    "patterns": 3,
+    "before_requested_bytes": [
+      1511043,
+      18498367
+    ],
+    "after_requested_bytes": [
+      506703,
+      1916787
+    ],
+    "measurement": "TLS requested allocation bytes during one warmed query; exact full result census outside the window",
+    "limits": "Includes parsing/storage/term/result allocations; does not establish zero-copy or end-to-end throughput"
+  },
+  "scalar_sql_aggregate": {
+    "input_rows": [
+      100000,
+      1000000
+    ],
+    "peak_live_bytes": [
+      296,
+      296
+    ],
+    "spill": false,
+    "verification": "Exact integer SUM and COUNT; source errors propagate; unusable scratch storage is not consulted"
+  },
+  "sql_projection": {
+    "verification": "Original heap pointers survive reordered output; repeated column has one clone plus one moved value; identity projection rejects short input",
+    "zero_copy_scope": "Owned SQL values and identity row vector; not the entire storage-to-socket pipeline"
+  },
+  "runtime_source_equivalence": {
+    "runtime_revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+    "final_source_difference": "rustfmt-only layout of projection width assertion; no added/removed Rust tokens",
+    "normalized_sha256": "c70ecb7d23710768c87766eb1be8bb439009b642fb0d2cf72429ff83e0fff7ad"
+  }
+}

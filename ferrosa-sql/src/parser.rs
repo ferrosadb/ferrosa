@@ -754,6 +754,7 @@ impl Parser {
             Some(Tok::Ident(w)) => {
                 let up = w.to_ascii_uppercase();
                 matches!(up.as_str(), "TRUE" | "FALSE" | "NULL")
+                    || bare_value_function(&up)
                     || (!is_aggregate_name(w)
                         && matches!(self.toks.get(self.pos + 2), Some(Tok::LParen)))
             }
@@ -820,6 +821,12 @@ impl Parser {
             };
             self.expect(&Tok::LParen, "(")?;
             self.expect(&Tok::RParen, ")")?;
+            ScalarValue::Func(w.to_ascii_uppercase())
+        } else if matches!(self.peek(), Some(Tok::Ident(w)) if bare_value_function(&w.to_ascii_uppercase()))
+        {
+            let Some(Tok::Ident(w)) = self.next() else {
+                unreachable!("peeked a bare value function above");
+            };
             ScalarValue::Func(w.to_ascii_uppercase())
         } else {
             ScalarValue::Literal(self.parse_value()?)
@@ -1627,7 +1634,7 @@ impl Parser {
         match self.next() {
             Some(Tok::Int(n)) => Ok(Value::Int(n)),
             Some(Tok::Float(f)) => Ok(Value::float(f)),
-            Some(Tok::Str(s)) => Ok(Value::Text(s)),
+            Some(Tok::Str(s)) => Ok(Value::Text(s.into())),
             Some(Tok::Ident(w)) => match w.to_ascii_uppercase().as_str() {
                 "TRUE" => Ok(Value::Bool(true)),
                 "FALSE" => Ok(Value::Bool(false)),
@@ -4093,5 +4100,24 @@ mod tests {
         // in WHERE stays unsupported (the WHERE grammar takes a column/aggregate
         // operand or a literal/`$N` term), and is refused loudly, not ignored.
         assert!(parse_statement("SELECT a FROM t WHERE k = (SELECT 1)").is_err());
+    }
+}
+
+#[cfg(test)]
+mod timestamp_regression {
+    use super::*;
+
+    #[test]
+    fn bare_timestamp_and_now_are_scalar_expressions() {
+        for sql in [
+            "SELECT CURRENT_TIMESTAMP, now()",
+            "SELECT now(), current_timestamp AS started",
+        ] {
+            let Statement::SelectExprs(items) = parse_statement(sql).unwrap() else {
+                panic!("expected scalar SELECT");
+            };
+            assert_eq!(items.len(), 2);
+            assert!(items.iter().all(|item| matches!(&item.value, ScalarValue::Func(name) if name == "CURRENT_TIMESTAMP" || name == "NOW")));
+        }
     }
 }

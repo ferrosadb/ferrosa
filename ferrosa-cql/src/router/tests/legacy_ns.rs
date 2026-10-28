@@ -91,7 +91,7 @@ async fn legacy_ns_writetime_and_ttl_metadata_of_an_lwt_cell_are_microseconds() 
         &[],
     )
     .unwrap();
-    assert_eq!(rows[0][1], Some(CqlValue::Text("lwt".to_string())));
+    assert_eq!(rows[0][1], Some(CqlValue::Text("lwt".to_string().into())));
     assert_eq!(meta[0][1].timestamp, t0, "writetime(v) in micros");
     assert_eq!(meta[0][1].ttl, 3600, "TTL(v)");
 }
@@ -109,7 +109,7 @@ async fn legacy_ns_a_cql_update_beats_a_legacy_lwt_row() {
     );
     run_ddl(&state, &ctx, "UPDATE lns.t SET v = 'plain' WHERE id = 'k'").await;
     let row = select(&state, &ctx, "SELECT v FROM lns.t WHERE id = 'k'").await;
-    assert_eq!(row[0], Some(CqlValue::Text("plain".to_string())));
+    assert_eq!(row[0], Some(CqlValue::Text("plain".to_string().into())));
 }
 
 /// Test 13: `USING TIMESTAMP` at or above 1e18 is refused as an invalid
@@ -144,7 +144,7 @@ async fn legacy_ns_using_timestamp_at_or_above_1e18_is_refused() {
     )
     .await;
     let row = select(&state, &ctx, "SELECT v FROM lns.t WHERE id = 'k'").await;
-    assert_eq!(row[0], Some(CqlValue::Text("edge".to_string())));
+    assert_eq!(row[0], Some(CqlValue::Text("edge".to_string().into())));
     let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"k".to_vec()));
     let partition = state
         .engine

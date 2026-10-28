@@ -77,3 +77,13 @@ Leaf-adjacent: depends only on `ferrosa-common`, `ferrosa-sstable`,
 `encode_value` writes the canonical jsonb cell bytes; `decode_value` validates them (`JsonbValue::from_bytes`) and a corrupt cell is an error, never NULL. jsonb nests in list, map value, tuple and UDT (D21). `parse_cql_type*` accept `jsonb` and refuse `set<jsonb>`, `map<jsonb, _>` and `vector<jsonb, _>` at parse (T-150).
 
 Refusals are typed (T-151): `decode_value` validates once and returns a `RowBridgeError` carrying a `JsonbFault`, either `CorruptJsonb { reason, len }` or `UnknownEnvelope { byte, len }` (a future codec version, distinct from corruption). The fault survives collection/UDT nesting through `AssembleError` into `RowDecodeError::jsonb_fault()` (column from `column()`, table from `in_table`), and reaches clients as `CqlError::CorruptCell`, never NULL. `corrupt_jsonb_count()` counts refusals (M10).
+
+## Single-row COUNT pushdown
+
+Row visibility delegates to the SSTable `Row::is_visible_at` predicate, keeping TTL and row-deletion visibility identical between SQL row decoding and the single-row metadata count path. This changes ownership of the shared predicate, not its visibility rules.
+
+## Immutable scalar scan values
+
+Scalar text/blob values retain immutable cell backing through borrowed and consuming row decoders. Consuming simple rows with unique ordered column ordinals and no nonempty static row also avoid the per-row grouping map; static rows, collection-element paths and duplicate/noncanonical ordinals retain existing assembly. UTF-8, TTL, tombstone and corruption behavior still fail or filter through the same typed row-error contract. PostgreSQL and CQL can move `SharedText`/`CellBytes` into their runtime values without converting them back to String/Vec. Collection reconstruction and actual value transformations can still allocate.
+
+The PostgreSQL consumer pulls owned rows lazily from `OwnedPartitionRows`, without collecting a second decoded partition buffer. A decoding failure terminates the iterator and records a statement failure; a streamed prefix never becomes a successful truncated result.

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ferrosa-common = { path = "../ferrosa-common" }
 ordered-float = { version = "4", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 # `Value::Numeric` carries an arbitrary-precision `BigInt` so DECIMAL/VARINT

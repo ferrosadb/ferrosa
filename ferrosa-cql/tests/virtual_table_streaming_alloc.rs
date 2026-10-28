@@ -179,7 +179,10 @@ fn virtual_table_read_path_allocation_profile() {
     let text_row = || {
         let mut row = std::collections::HashMap::new();
         for i in 0..8 {
-            row.insert(format!("c{i}"), Some(CqlValue::Text(format!("v{i}"))));
+            row.insert(
+                format!("c{i}"),
+                Some(CqlValue::Text(format!("v{i}").into())),
+            );
         }
         row
     };

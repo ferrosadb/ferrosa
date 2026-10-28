@@ -9,6 +9,12 @@ use crate::types::{RelSchema, Row};
 /// (with predicate/projection pushdown) in production.
 pub trait TableProvider {
     fn schema(&self) -> &RelSchema;
+    /// Exact visible row count without decoding unselected values, when supported.
+    /// `None` selects the normal scan; an error aborts instead of falling back.
+    /// Like scanning, this may block and must run on a blocking-capable thread.
+    fn count_all(&self) -> Option<Result<u64, String>> {
+        None
+    }
     /// A pull-based scan over the table's rows.
     ///
     /// The iterator owns what it reads and is `Send`: a query suspended between

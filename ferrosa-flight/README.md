@@ -142,3 +142,7 @@ ListFlights succeeds. CI's secure-compose job runs it against a
 ## jsonb (T-150)
 
 jsonb has no Arrow mapping yet: `cql_type_to_arrow` returns `None`, the column builder returns `ConvertError::Unsupported`, and `cql_literal` reports it unsupported (T-150).
+
+## Immutable scalar scan values
+
+CQL runtime text/blob values now carry shared immutable backing. Conversion into Flight batches retains the existing owned column-batch API and explicitly materializes String/Vec values where that API requires them; Flight wire/output types are unchanged. The PostgreSQL/CQL scalar scan optimization does not claim a zero-copy Flight conversion path.

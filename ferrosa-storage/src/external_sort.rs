@@ -585,8 +585,11 @@ mod tests {
     fn udt_payload_counts_its_fields() {
         let big = "x".repeat(10_000);
         let udt = CqlValue::Udt(vec![
-            ("name".to_string(), Some(CqlValue::Text(big))),
-            ("tags".to_string(), Some(CqlValue::Blob(vec![0; 5_000]))),
+            ("name".to_string(), Some(CqlValue::Text(big.into()))),
+            (
+                "tags".to_string(),
+                Some(CqlValue::Blob(vec![0; 5_000].into())),
+            ),
             ("gone".to_string(), None),
         ]);
         let bytes = cql_value_payload_bytes(&udt);
@@ -625,7 +628,10 @@ mod tests {
         // must never account as 0 bytes (jsonb hazard H3, FM-18).
         assert_eq!(cql_value_payload_bytes(&CqlValue::Text("abcd".into())), 4);
         assert_eq!(cql_value_payload_bytes(&CqlValue::Ascii("ab".into())), 2);
-        assert_eq!(cql_value_payload_bytes(&CqlValue::Blob(vec![0; 9])), 9);
+        assert_eq!(
+            cql_value_payload_bytes(&CqlValue::Blob(vec![0; 9].into())),
+            9
+        );
         assert_eq!(cql_value_payload_bytes(&CqlValue::Vector(vec![0; 3])), 12);
         assert!(cql_value_payload_bytes(&CqlValue::List(vec![CqlValue::Text("x".into())])) > 1);
         assert!(cql_value_payload_bytes(&CqlValue::Set(vec![CqlValue::Int(1)])) > 0);

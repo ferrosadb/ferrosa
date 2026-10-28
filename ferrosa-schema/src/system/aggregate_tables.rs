@@ -96,7 +96,7 @@ fn cql_value_to_literal(val: &CqlValue) -> String {
         CqlValue::Float(bits) => format!("{}", f32::from_bits(*bits)),
         CqlValue::Double(bits) => format!("{}", f64::from_bits(*bits)),
         CqlValue::Boolean(v) => v.to_string(),
-        CqlValue::Text(v) | CqlValue::Ascii(v) => v.clone(),
+        CqlValue::Text(v) | CqlValue::Ascii(v) => v.to_string(),
         CqlValue::Tuple(fields) => {
             let inner: Vec<String> = fields
                 .iter()

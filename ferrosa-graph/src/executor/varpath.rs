@@ -5,11 +5,14 @@
 //! Uses a visited set for cycle detection (FMEA F2) and a total vertex
 //! budget for DoS protection (threat T13, FMEA F3).
 
+use crate::executor::io::GraphWrite;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use futures::StreamExt;
 
+#[cfg(test)]
 use ferrosa_cluster::write_path::WritePath;
 use ferrosa_common::{DecoratedKey, PartitionKey};
 use ferrosa_schema::VirtualTableRegistry;
@@ -64,7 +67,7 @@ fn admit_neighbor(
 /// vertex budget for DoS protection (threat T13, FMEA F3).
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_var_length(
-    write_path: &WritePath,
+    write_path: &dyn GraphWrite,
     keyspace: &str,
     anchor: &Anchor,
     hop: &Hop,

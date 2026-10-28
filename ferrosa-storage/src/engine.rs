@@ -15,6 +15,9 @@
 //! take no global lock — the commit log uses CAS, memtable is lock-free.
 //! Only flush and compaction take per-table serialized guards.
 
+#[path = "recovery_status.rs"]
+mod recovery_status;
+
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -833,7 +836,11 @@ impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
             self.report_stale(&table_id, dropped_ms);
             return Ok(FrameFate::Stale);
         }
-        if !StorageEngine::apply_replay_mutation_strict(&self.engine.tables, mutation)? {
+        if !StorageEngine::apply_replay_mutation_strict(
+            &self.engine.config.data_dir,
+            &self.engine.tables,
+            mutation,
+        )? {
             return Ok(FrameFate::Keep);
         }
         self.touched.insert(table_id);
@@ -842,7 +849,9 @@ impl crate::replay_set_aside::SetAsideSink for EngineSetAsideSink<'_> {
 
     fn make_durable(&mut self) -> ferrosa_common::Result<()> {
         for table_id in self.touched.drain() {
-            self.engine.flush(&table_id)?;
+            // Re-ingest holds the exclusive recovery gate through durability.
+            // Public flush would deadlock trying to acquire its shared guard.
+            self.engine.flush_under_recovery_gate(&table_id)?;
         }
         if self.faults.fail_after_flush {
             return Err(ferrosa_common::Error::InvalidData(
@@ -1557,6 +1566,12 @@ impl Drop for DigestFailurePause {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_RETAINED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    static RECOVERY_FLUSH_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
 pub struct StorageEngine {
     config: StorageEngineConfig,
     runtime_tuning: crate::runtime_tuning::StorageRuntimeTuning,
@@ -1570,6 +1585,14 @@ pub struct StorageEngine {
     /// Commitlog mutations replayed before their table schema is registered.
     /// These are applied lazily when the table is later registered.
     deferred_replay_mutations: parking_lot::Mutex<Vec<Mutation>>,
+    /// Metadata only for the bounded pending vector handed back by `open`.
+    /// Registration alone cannot certify these caller-owned rows as replayed.
+    pending_replay_admission: parking_lot::Mutex<Vec<(TableId, [u8; 16])>>,
+    /// Serializes replay retention/application with flush position capture,
+    /// memtable rotation and checkpoint/discard. Ordinary writes remain concurrent.
+    recovery_checkpoint_gate: parking_lot::RwLock<()>,
+    /// `new` does not replay: pre-existing WAL requires reopening with `open`.
+    unreplayed_wal_on_creation: bool,
     /// Mutations startup replay wrote to disk instead of a memtable because no
     /// schema was available and the in-memory buffer was full, and that have
     /// not been re-ingested yet. Empty when nothing is set aside. These rows
@@ -1786,6 +1809,9 @@ struct TableState {
     /// plus an atomic pointer swap, with no mutex contention even when
     /// many threads write to the same table concurrently.
     last_commit_log_position: ArcSwap<Option<CommitLogPosition>>,
+    /// Set before recording rejected replay. Also protects the WAL if the
+    /// durable status write itself fails. Never reset by successful replay.
+    recovery_incomplete: AtomicBool,
     /// Per-table waiters are woken after a successful flush. This is only
     /// consulted in the soft-pressure zone; ordinary writes do not touch it.
     write_pressure_notify: Arc<tokio::sync::Notify>,
@@ -3561,6 +3587,8 @@ impl StorageEngine {
         })?;
         Self::cleanup_stale_compaction_staging(&config)?;
 
+        let unreplayed_wal_on_creation =
+            recovery_status::wal_artifacts(&config.commit_log.log_dir)?;
         let commit_log = CommitLog::new(config.commit_log.clone())?;
         // Engine-wide reader pool, created before the compaction executor so the
         // executor can route input opens through it (FMEA #11).
@@ -3622,6 +3650,9 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            pending_replay_admission: parking_lot::Mutex::new(Vec::new()),
+            unreplayed_wal_on_creation,
             set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
@@ -3758,6 +3789,8 @@ impl StorageEngine {
         })?;
         Self::cleanup_stale_compaction_staging(&config)?;
 
+        let unreplayed_wal_on_creation =
+            recovery_status::wal_artifacts(&config.commit_log.log_dir)?;
         let mut commit_log = CommitLog::new(config.commit_log.clone())?;
         // Engine-wide reader pool, created before the compaction executor so the
         // executor can route input opens through it (FMEA #11).
@@ -3889,6 +3922,9 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            pending_replay_admission: parking_lot::Mutex::new(Vec::new()),
+            unreplayed_wal_on_creation,
             set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
@@ -4101,7 +4137,7 @@ impl StorageEngine {
         // Absent-table overflow, per table id, for the ERROR below.
         let mut absent_table_spilled: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
-        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming_with_barrier(
+        let commit_log = crate::commitlog::CommitLog::open_and_replay_streaming_with_rejections(
             config.commit_log.clone(),
             |mutation, relog| {
                 if !mutation.has_legacy_id() && !seen_replay_ids.insert(mutation.mutation_id) {
@@ -4116,7 +4152,12 @@ impl StorageEngine {
                     }
                     relog.retain(&mutation)?;
                     pending_mutations.push(mutation);
-                } else if !Self::replay_into_registered_table(&tables, &mutation, relog)? {
+                } else if !Self::replay_into_registered_table(
+                    &config.data_dir,
+                    &tables,
+                    &mutation,
+                    relog,
+                )? {
                     Self::defer_or_set_aside_absent_table_mutation(
                         &deferred_replay_mutations,
                         &set_aside,
@@ -4129,6 +4170,7 @@ impl StorageEngine {
                 Ok(())
             },
             || set_aside.lock().sync(),
+            || recovery_status::record_unknown(&config.data_dir),
             // A replay can run for minutes; say where it is every 5 s.
             Some(&mut crate::commitlog::LogReplayProgress),
         )?;
@@ -4182,6 +4224,14 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations,
+            unreplayed_wal_on_creation: false,
+            recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            pending_replay_admission: parking_lot::Mutex::new(
+                pending_mutations
+                    .iter()
+                    .map(|m| (TableId::new(&m.keyspace, &m.table), m.mutation_id))
+                    .collect(),
+            ),
             set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
@@ -4760,33 +4810,148 @@ impl StorageEngine {
         }
     }
 
-    /// Replays a set of pending mutations into their respective table memtables.
+    /// Checks a registered table's recorded recovery state and pending artifacts.
     ///
-    /// This is called after [`open`](Self::open) and after all table schemas
-    /// have been registered via [`register_table`](Self::register_table).
-    /// Mutations for unregistered tables are silently skipped.
-    pub fn replay_mutations(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
-        // Deduplicate by mutation_id to make replay idempotent.
-        //
-        // If the process crashed during a previous replay (after some rows were
-        // written to the memtable but before a flush checkpoint was saved), the
-        // next startup will present the same mutations again.  We track all
-        // non-zero ids we have already applied and skip duplicates.
-        //
-        // Zero ids are the legacy sentinel for segments written before the
-        // mutation_id field was added — they are always re-applied (LWW
-        // timestamp semantics keeps them safe).
-        let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    /// Known blocker: the commit-log reader can currently skip CRC-invalid or
+    /// undecodable frames before engine callbacks. Until it exposes rejection
+    /// status, this method MUST NOT be used as a full migration cutover gate.
+    /// `recovery_reader_admission_requires_rejection_hook` pins that boundary.
+    ///
+    /// Requires quiesced local Direct usage: submit all mutations returned by
+    /// `open`, finish registration/replay, and exclude writers and lifecycle
+    /// changes before calling. This is not a cluster fence or proof that old
+    /// binaries never discarded data. Any observed rejected replay is permanent
+    /// evidence; existing pending/quarantine artifacts also reject admission.
+    pub fn assert_table_recovery_complete(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        let state = self.require_table(table_id)?;
+        let incomplete = recovery_status::incomplete(&self.config.data_dir, table_id)?;
+        if incomplete
+            || state.recovery_incomplete.load(Ordering::Acquire)
+            || self.has_pending_table_replay(table_id)
+            || !state.store.quarantined_sstable_gens().is_empty()
+        {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "incomplete recovery for {table_id}: rejected or pending replay"
+            )));
+        }
+        let quarantine = state.store.flush_dir().join("quarantine");
+        match std::fs::symlink_metadata(&quarantine) {
+            Ok(_) => {
+                return Err(ferrosa_common::Error::InvalidData(format!(
+                    "incomplete recovery for {table_id}: quarantine artifact {}",
+                    quarantine.display()
+                )))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        // Rescan disk, not only the cached readiness ledger: external/offline
+        // artifacts and unreadable files must also fail closed.
+        let key = table_id.to_string();
+        let status = crate::replay_set_aside::scan_set_aside_dir(&self.config.data_dir)?;
+        if status
+            .files
+            .iter()
+            .any(|f| f.error.is_some() || f.tables.contains_key(&key))
+        {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "incomplete recovery for {table_id}: pending or unreadable set-aside frames"
+            )));
+        }
+        let stale_dir = self
+            .config
+            .data_dir
+            .join(crate::replay_set_aside::STALE_QUARANTINE_DIR);
+        let entries = match std::fs::read_dir(&stale_dir) {
+            Ok(entries) => Some(entries),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
+        if let Some(entries) = entries {
+            for entry in entries {
+                let status = crate::replay_set_aside::summarize_set_aside_file(&entry?.path());
+                if status.error.is_some() || status.tables.contains_key(&key) {
+                    return Err(ferrosa_common::Error::InvalidData(format!(
+                        "incomplete recovery for {table_id}: quarantined set-aside frames"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 
-        for mutation in mutations {
-            // Skip duplicate non-zero ids.
+    fn has_pending_table_replay(&self, table_id: &TableId) -> bool {
+        self.unreplayed_wal_on_creation
+            || self
+                .pending_replay_admission
+                .lock()
+                .iter()
+                .any(|(id, _)| id == table_id)
+            || self
+                .deferred_replay_mutations
+                .lock()
+                .iter()
+                .any(|m| m.keyspace == table_id.keyspace() && m.table == table_id.table())
+    }
+
+    /// Replays caller-owned mutations, durably retaining them before application.
+    /// Unregistered tables are deferred. On failure, the failed mutation and
+    /// every unattempted mutation remain queued for later registration/retry.
+    pub fn replay_mutations(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
+        let _recovery = self.recovery_checkpoint_gate.write();
+        // Explicit callers may supply mutations not returned by open. Retain
+        // the entire supplied batch, including the unattempted suffix, before
+        // any application can fail. Do not advance a flush checkpoint here.
+        let retained = (|| {
+            for mutation in &mutations {
+                self.commit_log.append_for_explicit_sync(mutation)?;
+            }
+            self.commit_log.force_sync()
+        })();
+        if let Err(error) = retained {
+            self.deferred_replay_mutations.lock().extend(mutations);
+            return Err(error);
+        }
+        #[cfg(test)]
+        RECOVERY_RETAINED_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        // Transfer pending ownership from the open-time handoff to this replay
+        // pass. Legacy zero UUIDs are counted individually, never deduplicated.
+        {
+            let mut pending = self.pending_replay_admission.lock();
+            for mutation in &mutations {
+                if let Some(index) = pending.iter().position(|(id, uuid)| {
+                    id.keyspace() == mutation.keyspace
+                        && id.table() == mutation.table
+                        && *uuid == mutation.mutation_id
+                }) {
+                    pending.swap_remove(index);
+                }
+            }
+        }
+        self.apply_pending_replay(mutations)
+    }
+
+    fn apply_pending_replay(&self, mutations: Vec<Mutation>) -> ferrosa_common::Result<()> {
+        let mut seen = HashSet::new();
+        let mut mutations = mutations.into_iter();
+        while let Some(mutation) = mutations.next() {
             if !mutation.has_legacy_id() && !seen.insert(mutation.mutation_id) {
-                // Already applied this mutation in this replay pass — skip.
                 continue;
             }
-
-            if !self.apply_replay_mutation_if_registered(&mutation) {
-                self.deferred_replay_mutations.lock().push(mutation);
+            match Self::apply_replay_mutation_strict(&self.config.data_dir, &self.tables, &mutation)
+            {
+                Ok(true) => {}
+                Ok(false) => self.deferred_replay_mutations.lock().push(mutation),
+                Err(error) => {
+                    let mut deferred = self.deferred_replay_mutations.lock();
+                    deferred.push(mutation);
+                    deferred.extend(mutations);
+                    return Err(error);
+                }
             }
         }
         Ok(())
@@ -4824,6 +4989,7 @@ impl StorageEngine {
     /// next flush discards the re-logged copy like any other write.
     /// `Ok(false)` when the table is not registered (nothing is re-logged).
     fn replay_into_registered_table(
+        data_dir: &Path,
         tables: &ArcSwap<TableMap>,
         mutation: &Mutation,
         relog: &crate::commitlog::ReplayRelog<'_>,
@@ -4833,36 +4999,14 @@ impl StorageEngine {
             return Ok(false);
         };
         let position = relog.retain(mutation)?;
-        let applied = Self::apply_replay_mutation_to_tables(tables, mutation);
+        let applied = Self::apply_replay_mutation_strict(data_dir, tables, mutation)?;
         debug_assert!(applied, "table {table_id} vanished during open-time replay");
-        state
-            .last_commit_log_position
-            .store(Arc::new(Some(position)));
-        Ok(true)
-    }
-
-    fn apply_replay_mutation_if_registered(&self, mutation: &Mutation) -> bool {
-        Self::apply_replay_mutation_to_tables(&self.tables, mutation)
-    }
-
-    /// Commit-log replay: applies `mutation` if its table is registered.
-    ///
-    /// A row that fails to apply is logged per row at ERROR by the strict
-    /// path, and the commit-log segment still carries the mutation, so replay
-    /// does not abort. Returns whether the table was registered.
-    fn apply_replay_mutation_to_tables(tables: &ArcSwap<TableMap>, mutation: &Mutation) -> bool {
-        match Self::apply_replay_mutation_strict(tables, mutation) {
-            Ok(registered) => registered,
-            Err(e) => {
-                tracing::error!(
-                    %e,
-                    keyspace = %mutation.keyspace,
-                    table = %mutation.table,
-                    "replay: a row of this mutation failed to apply (see the preceding errors)"
-                );
-                true
-            }
+        if !state.recovery_incomplete.load(Ordering::Acquire) {
+            state
+                .last_commit_log_position
+                .store(Arc::new(Some(position)));
         }
+        Ok(true)
     }
 
     /// Applies `mutation` to its table's memtable. `Ok(false)` when the table
@@ -4871,6 +5015,7 @@ impl StorageEngine {
     /// has been attempted), so a caller that is about to discard its only copy
     /// of the mutation can refuse to.
     fn apply_replay_mutation_strict(
+        data_dir: &Path,
         tables: &ArcSwap<TableMap>,
         mutation: &Mutation,
     ) -> ferrosa_common::Result<bool> {
@@ -4903,6 +5048,14 @@ impl StorageEngine {
             match normalized.and_then(|normalized| state.store.write(&mutation.key, normalized)) {
                 Ok(()) => {}
                 Err(ferrosa_common::Error::InvalidData(reason)) => {
+                    // Set the live latch BEFORE attempting persistence. If
+                    // persistence fails, callers retain the frame and return
+                    // an error; even later valid writes cannot checkpoint it.
+                    state.recovery_incomplete.store(true, Ordering::Release);
+                    if let Err(error) = recovery_status::record(data_dir, &table_id) {
+                        first_error.get_or_insert(error);
+                        continue;
+                    }
                     if quarantine_writer.is_none() {
                         let schema = state.store.schema();
                         match crate::quarantine::QuarantineWriter::new(
@@ -4912,10 +5065,10 @@ impl StorageEngine {
                         ) {
                             Ok(qw) => quarantine_writer = Some(qw),
                             Err(e) => {
-                                tracing::error!(%e, %table_id, "replay: failed to open quarantine writer; row dropped");
+                                tracing::error!(%e, %table_id, "replay: failed to open quarantine writer; frame must be retained");
                                 first_error.get_or_insert_with(|| {
                                     ferrosa_common::Error::InvalidFormat(format!(
-                                        "{table_id}: quarantine writer unavailable, row dropped: {e}"
+                                        "{table_id}: quarantine writer unavailable, frame must be retained: {e}"
                                     ))
                                 });
                                 continue;
@@ -4938,9 +5091,18 @@ impl StorageEngine {
                     }
                 }
                 Err(e) => {
+                    state.recovery_incomplete.store(true, Ordering::Release);
+                    if let Err(status_error) = recovery_status::record(data_dir, &table_id) {
+                        first_error.get_or_insert(status_error);
+                    }
                     tracing::error!(%e, %table_id, "replay: failed to replay row");
                     first_error.get_or_insert(e);
                 }
+            }
+        }
+        if let Some(writer) = &quarantine_writer {
+            if let Err(error) = writer.sync() {
+                first_error.get_or_insert(error);
             }
         }
         if quarantined_in_partition > 0 {
@@ -4960,12 +5122,16 @@ impl StorageEngine {
         }
     }
 
-    fn replay_deferred_mutations_for_table(&self, table_id: &TableId) {
-        self.reingest_set_aside_for_table(table_id);
+    fn replay_deferred_mutations_for_table(
+        &self,
+        table_id: &TableId,
+    ) -> ferrosa_common::Result<()> {
+        self.reingest_set_aside_for_table(table_id)?;
+        let _recovery = self.recovery_checkpoint_gate.write();
         let pending = {
             let mut deferred = self.deferred_replay_mutations.lock();
             if deferred.is_empty() {
-                return;
+                return Ok(());
             }
             let mut ready = Vec::new();
             let mut remaining = Vec::with_capacity(deferred.len());
@@ -4981,11 +5147,7 @@ impl StorageEngine {
             ready
         };
 
-        for mutation in pending {
-            if !self.apply_replay_mutation_if_registered(&mutation) {
-                self.deferred_replay_mutations.lock().push(mutation);
-            }
-        }
+        self.apply_pending_replay(pending)
     }
 
     /// Estimate local SSTable bytes that a full scan of `keyspace.table` would touch.
@@ -5118,6 +5280,7 @@ impl StorageEngine {
         state: &Arc<TableState>,
         ddl: impl FnOnce(&TableStore<FileFlushTarget>) -> ferrosa_common::Result<(T, FlushOutcome)>,
     ) -> ferrosa_common::Result<T> {
+        let _recovery = self.recovery_checkpoint_gate.read();
         // Read before the rotation: the checkpoint may cover only mutations
         // already in the memtable the rotation flushes.
         let cl_position = **state.last_commit_log_position.load();
@@ -5252,6 +5415,7 @@ impl StorageEngine {
         }
 
         let table_id = TableId::new(&schema.keyspace, &schema.table);
+        let recovery_incomplete = recovery_status::incomplete(&config.data_dir, &table_id)?;
         let table_dir = config.data_dir.join("sstables").join(table_id.to_string());
 
         // A DROP/TRUNCATE that could not remove this table's directory left
@@ -5350,6 +5514,7 @@ impl StorageEngine {
             pin: ArcSwap::from_pointee(PinState::default()),
             first_unflushed_write_at_nanos: std::sync::atomic::AtomicI64::new(0),
             last_commit_log_position: ArcSwap::from_pointee(None),
+            recovery_incomplete: AtomicBool::new(recovery_incomplete),
             write_pressure_notify: Arc::new(tokio::sync::Notify::new()),
             write_pressure_percent: Arc::new(AtomicU64::new(0)),
             in_write_soft_zone: AtomicBool::new(false),
@@ -5390,7 +5555,7 @@ impl StorageEngine {
                         &table_id,
                         &indexed_columns,
                     )?;
-                    self.replay_deferred_mutations_for_table(&table_id);
+                    self.replay_deferred_mutations_for_table(&table_id)?;
                     return Ok(());
                 }
                 // Retire the stale store; the rebuild below installs a clean
@@ -5424,7 +5589,7 @@ impl StorageEngine {
         let late_indexed_columns = state.store.indexed_columns().to_vec();
         if !self.install_table_state_if_absent(&table_id, state)? {
             self.merge_index_declarations_for_registered_table(&table_id, &late_indexed_columns)?;
-            self.replay_deferred_mutations_for_table(&table_id);
+            self.replay_deferred_mutations_for_table(&table_id)?;
             return Ok(());
         }
 
@@ -5445,7 +5610,7 @@ impl StorageEngine {
             self.maybe_compact(&table_id, &state);
         }
 
-        self.replay_deferred_mutations_for_table(&table_id);
+        self.replay_deferred_mutations_for_table(&table_id)?;
         // An index whose CREATE INDEX outran this CREATE TABLE is built now,
         // not at the next restart.
         self.drain_deferred_index_builds(&table_id);
@@ -5545,6 +5710,7 @@ impl StorageEngine {
         table_id: &TableId,
         new_schema: TableSchema,
     ) -> ferrosa_common::Result<()> {
+        let _recovery = self.recovery_checkpoint_gate.read();
         let time_series_handle = self.build_time_series_consolidator(table_id, &new_schema)?;
         let state = self.require_table(table_id)?;
         // The old-schema flush and the schema swap are ONE memtable rotation
@@ -10065,8 +10231,24 @@ impl StorageEngine {
     /// larger than a fresh commit-log segment) fails the whole set before
     /// anything is appended. A staging or decode failure fails loud.
     pub fn write_atomic_batch<S: WriteSetSource>(&self, source: S) -> ferrosa_common::Result<()> {
+        self.write_atomic_batch_inner(source, None)
+    }
+
+    fn write_atomic_batch_inner<S: WriteSetSource>(
+        &self,
+        source: S,
+        record: Option<Mutation>,
+    ) -> ferrosa_common::Result<()> {
         if source.is_empty_set() {
             return Ok(());
+        }
+
+        if let Some(record) = &record {
+            if CommitLog::entry_size(record) > self.commit_log.max_entry_size() {
+                return Err(ferrosa_common::Error::InvalidData(
+                    "transaction batch exceeds commit-log segment capacity".into(),
+                ));
+            }
         }
 
         // Preflight every target table AND every entry's size before appending
@@ -10112,12 +10294,32 @@ impl StorageEngine {
         // Sync health must not refuse an append partway (that would leave a
         // torn prefix); the force_sync below is this batch's durability.
         let mut positions: HashMap<TableId, CommitLogPosition> = HashMap::new();
-        source.for_each_mutation(&mut |m| {
-            let cl_pos = self.commit_log.append_for_explicit_sync(m)?;
-            let table_id = TableId::new(&m.keyspace, &m.table);
-            positions.insert(table_id, cl_pos);
-            Ok(())
-        })?;
+        if let Some(record) = &record {
+            let mut targets = Vec::new();
+            source.for_each_mutation(&mut |m| {
+                targets.push(TableId::new(&m.keyspace, &m.table));
+                Ok(())
+            })?;
+            let position = self
+                .commit_log
+                .append_transaction_record(record, &targets)?;
+            for (index, table) in targets.into_iter().enumerate() {
+                positions.insert(
+                    table,
+                    CommitLogPosition {
+                        offset: position.offset + index as u64,
+                        ..position
+                    },
+                );
+            }
+        } else {
+            source.for_each_mutation(&mut |m| {
+                let cl_pos = self.commit_log.append_for_explicit_sync(m)?;
+                let table_id = TableId::new(&m.keyspace, &m.table);
+                positions.insert(table_id, cl_pos);
+                Ok(())
+            })?;
+        }
 
         // Durability barrier: synchronously fsync the appended batch BEFORE it
         // is made visible in the memtable (Phase 2). Without this, under the
@@ -10165,6 +10367,9 @@ impl StorageEngine {
         // Phase 3: Notify observers, in the same order the log was appended.
         source.for_each_mutation(&mut |m| {
             let table_id = TableId::new(&m.keyspace, &m.table);
+            if record.is_some() {
+                self.commit_log.publish_transaction_mutation(m);
+            }
             self.dispatch_sync_observers(&table_id, m);
             self.dispatch_async_observers(&table_id, || m.clone());
             Ok(())
@@ -10188,7 +10393,11 @@ impl StorageEngine {
             return Ok(());
         }
         let mutations: Vec<Mutation> = ops.into_iter().map(BatchOp::into_mutation).collect();
-        self.write_atomic_batch(mutations)
+        let record = crate::commitlog::transaction_record::encode(
+            &mutations,
+            self.commit_log.max_entry_size(),
+        )?;
+        self.write_atomic_batch_inner(mutations, Some(record))
     }
 
     /// Open a staging handle for a Bolt explicit transaction (B02).
@@ -10531,6 +10740,27 @@ impl StorageEngine {
             Some(state) => {
                 state.note_foreground_read();
                 state.store.count_range_matching(start, end, matches)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Exact visibility count for tables with one row per partition and no static
+    /// columns. Stable PK liveness skips payloads; TTL/deletion exceptions read
+    /// original pinned source records to retain full LWW value-tie semantics.
+    pub fn count_live_single_row_range_matching(
+        &self,
+        table_id: &TableId,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> ferrosa_common::Result<u64> {
+        match self.table_state(table_id) {
+            Some(state) => {
+                state.note_foreground_read();
+                state
+                    .store
+                    .count_live_single_row_range_matching(start, end, matches)
             }
             None => Ok(0),
         }
@@ -11802,6 +12032,19 @@ impl StorageEngine {
     /// to the compaction executor. For pinned tables, S3 upload is skipped
     /// and max_bytes eviction is enforced if configured.
     pub fn flush(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        #[cfg(test)]
+        RECOVERY_FLUSH_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        let _recovery = self.recovery_checkpoint_gate.read();
+        self.flush_under_recovery_gate(table_id)
+    }
+
+    /// Flush while the caller holds the shared or exclusive recovery gate.
+    /// Re-ingest keeps its exclusive guard through the durability barrier.
+    fn flush_under_recovery_gate(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
         let _span = tracing::info_span!(
             "storage.flush",
             table = %table_id,
@@ -11888,7 +12131,14 @@ impl StorageEngine {
         // mutations are now durable in SSTables up to cl_position. This allows
         // closed segments with no remaining dirty tables to be GC'd, preventing
         // file descriptor leaks from accumulating segment file handles.
-        if let Some(pos) = cl_position {
+        // A later valid write must not checkpoint across an earlier rejected
+        // or still-pending replay frame. Evidence is monotone across restarts;
+        // unreadable status fails the flush before any checkpoint update.
+        let incomplete = recovery_status::incomplete(&self.config.data_dir, table_id)?;
+        let checkpoint_allowed = !incomplete
+            && !state.recovery_incomplete.load(Ordering::Acquire)
+            && !self.has_pending_table_replay(table_id);
+        if let Some(pos) = cl_position.filter(|_| checkpoint_allowed) {
             if let Err(e) = self.commit_log.discard_completed(table_id, pos) {
                 tracing::warn!(%e, "commit log discard_completed failed for {}", table_id);
             }
@@ -12041,12 +12291,9 @@ impl StorageEngine {
     /// re-ingests whatever the tables registered so far can take. Tables
     /// registered later re-ingest through `replay_deferred_mutations_for_table`.
     ///
-    /// A failure to re-ingest is logged and the frames stay set aside, reported
-    /// by `/readyz`; it does not fail construction.
+    /// A re-ingest failure propagates and leaves the original frames set aside.
     fn finish_construction(self) -> ferrosa_common::Result<Self> {
-        if let Err(e) = self.reingest_set_aside_with_faults(None, SetAsideFaults::default()) {
-            tracing::error!(%e, "startup re-ingest of set-aside mutations is incomplete");
-        }
+        self.reingest_set_aside_with_faults(None, SetAsideFaults::default())?;
         Ok(self)
     }
 
@@ -12087,24 +12334,9 @@ impl StorageEngine {
     }
 
     /// Called whenever a table becomes known: replays that table's set-aside
-    /// mutations. A failure is logged and leaves them set aside; it never fails
-    /// the registration, because `/readyz` already reports the remainder.
-    fn reingest_set_aside_for_table(&self, table_id: &TableId) {
-        let key = format!("{}.{}", table_id.keyspace(), table_id.table());
-        let pending = self
-            .set_aside_status
-            .lock()
-            .files
-            .iter()
-            .any(|f| f.error.is_none() && f.tables.contains_key(&key));
-        if !pending {
-            return;
-        }
-        if let Err(e) =
-            self.reingest_set_aside_with_faults(Some(table_id), SetAsideFaults::default())
-        {
-            tracing::error!(%e, table = %table_id, "set-aside mutations for this table stay set aside");
-        }
+    /// mutations. A failure propagates to registration and leaves them set aside.
+    fn reingest_set_aside_for_table(&self, table_id: &TableId) -> ferrosa_common::Result<()> {
+        self.reingest_set_aside_with_faults(Some(table_id), SetAsideFaults::default())
     }
 
     pub(crate) fn reingest_set_aside_with_faults(
@@ -12112,6 +12344,7 @@ impl StorageEngine {
         only: Option<&TableId>,
         faults: SetAsideFaults,
     ) -> ferrosa_common::Result<()> {
+        let _recovery = self.recovery_checkpoint_gate.write();
         let _serial = self.set_aside_reingest.lock();
         let mut first_error = None;
         for path in crate::replay_set_aside::list_set_aside_files(&self.config.data_dir)? {
@@ -16712,6 +16945,8 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
 
+        let unreplayed_wal_on_creation =
+            recovery_status::wal_artifacts(&config.commit_log.log_dir)?;
         let commit_log = CommitLog::new(config.commit_log.clone())?;
         let reader_pool: crate::store::SharedReaderPool<ferrosa_sstable::io::FileReadAt> = Arc::new(
             crate::reader_pool::ReaderPool::new(crate::reader_pool::configured_reader_cache_cap()),
@@ -16773,6 +17008,9 @@ impl StorageEngine {
             pending_index_uploads,
             commit_log,
             deferred_replay_mutations: parking_lot::Mutex::new(Vec::new()),
+            recovery_checkpoint_gate: parking_lot::RwLock::new(()),
+            pending_replay_admission: parking_lot::Mutex::new(Vec::new()),
+            unreplayed_wal_on_creation,
             set_aside_status,
             set_aside_reingest: parking_lot::Mutex::new(()),
             deferred_index_builds: parking_lot::Mutex::new(HashMap::new()),
@@ -23332,6 +23570,788 @@ mod tests {
             .read(&table_a, &make_key("replayed-6"))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn recovery_admission_observable_unreplayed_wal_in_new_constructor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mut mutation, _) = recovery_admission_fixture();
+        mutation.rows.truncate(1);
+        recovery_admission_seed(dir.path(), &schema, &mutation);
+        // `new` deliberately does not recover an existing WAL. Its admission
+        // method must not certify an empty scan as complete in that case.
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema).unwrap();
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_admission_observable_unreadable_status_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, _, _) = recovery_admission_fixture();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("missing-target"),
+            dir.path().join("recovery-incomplete"),
+        )
+        .unwrap();
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+    }
+
+    #[test]
+    fn recovery_admission_set_aside_startup_failure_is_loud() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, _) = recovery_admission_fixture();
+        {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(schema).unwrap();
+            engine.flush(&tid).unwrap();
+            std::fs::write(
+                engine.table_sstable_dir(&tid).join("quarantine"),
+                b"obstruction",
+            )
+            .unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+        let mut aside = crate::replay_set_aside::ReplaySetAside::new(dir.path());
+        aside.append(&mutation).unwrap();
+        aside.sync().unwrap();
+        let report = aside.into_report().unwrap();
+        let original = std::fs::read(&report.path).unwrap();
+        assert!(StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).is_err());
+        assert_eq!(std::fs::read(report.path).unwrap(), original);
+    }
+
+    /// Scope-boundary RED: the reader currently discards this frame before any
+    /// engine callback can persist incomplete recovery. Keep this test separate
+    /// from the decoded-row focused GREEN filter until the hook is authorized.
+    #[test]
+    fn recovery_reader_admission_requires_rejection_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
+        mutation.rows = vec![survivor.clone()];
+        let config = StorageEngineConfig::test_config(dir.path());
+        let position = {
+            let engine =
+                StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            engine.register_table(schema).unwrap();
+            engine.flush(&tid).unwrap();
+            engine.commit_log.append(&mutation).unwrap();
+            let mut rejected = mutation.clone();
+            rejected.mutation_id = [91; 16];
+            let position = engine.commit_log.append(&rejected).unwrap();
+            engine.commit_log.shutdown().unwrap();
+            position
+        };
+        let path = config
+            .commit_log
+            .log_dir
+            .join(format!("commitlog-{}.log", position.segment_id));
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offset = position.offset as usize;
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let payload = &mut bytes[offset + 8..offset + 8 + size];
+        payload.fill(0xff);
+        assert!(
+            Mutation::deserialize_from(payload).is_err(),
+            "fixture must be undecodable"
+        );
+        let crc = crc32fast::hash(payload).to_be_bytes();
+        bytes[offset + 8 + size..offset + 12 + size].copy_from_slice(&crc);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::File::open(&path).unwrap().sync_all().unwrap();
+        match StorageEngine::open(config, None) {
+            Err(error) => assert!(
+                error.to_string().contains("recovery") || error.to_string().contains("mutation"),
+                "unrelated startup error: {error}"
+            ),
+            Ok((engine, pending)) => {
+                assert!(pending.is_empty());
+                assert_eq!(
+                    engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
+                    vec![survivor]
+                );
+                assert!(engine.assert_table_recovery_complete(&tid).is_err(),
+                    "reader skipped a CRC-valid undecodable frame, but engine admission falsely reports complete");
+            }
+        }
+    }
+
+    // Reader admission test list: CRCs, undecodable payload, atomic envelope,
+    // rejected marker/tail, clean padding, persistence failure, restart.
+    fn recovery_reader_seed_raw(
+        dir: &Path,
+        kind: &str,
+    ) -> (std::path::PathBuf, Vec<u8>, Mutation, Mutation) {
+        use crate::commitlog::{segment::Segment, transaction_record};
+        let (schema, tid, mut first, survivor) = recovery_admission_fixture();
+        first.rows = vec![survivor];
+        {
+            let engine = StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap();
+            engine.register_table(schema).unwrap();
+            engine.flush(&tid).unwrap();
+            engine.commit_log.shutdown().unwrap();
+        }
+        let config = StorageEngineConfig::test_config(dir);
+        let segment = Segment::new(50, 65536, &config.commit_log.log_dir);
+        let put = |m: &Mutation| {
+            let off = segment.allocate(Segment::entry_total_size(m)).unwrap();
+            segment.write_entry(off, m);
+            off as usize
+        };
+        put(&first);
+        let mut bad = first.clone();
+        bad.mutation_id = [92; 16];
+        bad.key = make_key("rejected-batch-member");
+        if kind == "envelope" {
+            bad = transaction_record::encode(&[bad], 32000).unwrap();
+            // A valid first member followed by a malformed second member.
+            let mut payload = bad.rows[0].cells[0].1.value.as_deref().unwrap().to_vec();
+            payload.extend_from_slice(&[0, 0, 0, 8, 0xff]);
+            bad.rows[0].cells[0].1 = CellValue::live(payload, 0);
+        }
+        let offset = put(&bad);
+        segment.allocate_and_link_sync_marker().unwrap();
+        let mut last = first.clone();
+        last.mutation_id = [93; 16];
+        last.key = make_key("after-rejected-frame");
+        put(&last);
+        segment.flush_to_disk().unwrap();
+        let path = segment.path().to_path_buf();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        match kind {
+            "payload_crc" => bytes[offset + 8 + size] ^= 0xff,
+            "size_crc" => bytes[offset + 4] ^= 0xff,
+            "decode" => {
+                bytes[offset + 8..offset + 8 + size].fill(0xff);
+                let crc = crc32fast::hash(&bytes[offset + 8..offset + 8 + size]);
+                bytes[offset + 8 + size..offset + 12 + size].copy_from_slice(&crc.to_be_bytes());
+            }
+            "marker" => bytes[21] ^= 0xff,
+            "short_tail" => {
+                bytes.truncate(offset + 7);
+            }
+            "envelope" => {}
+            _ => panic!("unknown fixture"),
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        std::fs::File::open(&path).unwrap().sync_all().unwrap();
+        (path, bytes, first, last)
+    }
+
+    fn recovery_reader_rejected_survives_restart(kind: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, bytes, first, last) = recovery_reader_seed_raw(dir.path(), kind);
+        for _ in 0..2 {
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(pending.is_empty());
+            assert!(
+                engine.assert_table_recovery_complete(&table_id()).is_err(),
+                "raw rejection must block admission: {kind}"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                bytes,
+                "suspect source must remain byte exact"
+            );
+            if kind != "marker" {
+                assert_eq!(
+                    engine.read(&table_id(), &first.key).unwrap().unwrap().rows,
+                    first.rows
+                );
+            }
+            if kind != "marker" && kind != "short_tail" {
+                assert_eq!(
+                    engine.read(&table_id(), &last.key).unwrap().unwrap().rows,
+                    last.rows
+                );
+            }
+            if kind == "envelope" {
+                assert!(
+                    engine
+                        .read(&table_id(), &make_key("rejected-batch-member"))
+                        .unwrap()
+                        .is_none(),
+                    "malformed batch cannot yield its valid prefix"
+                );
+            }
+            let mut other = test_schema();
+            other.table = "unrelated".into();
+            engine.register_table(other).unwrap();
+            assert!(engine
+                .assert_table_recovery_complete(&TableId::new("test_ks", "unrelated"))
+                .is_err());
+            engine.flush(&table_id()).unwrap();
+            let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
+                &engine.config.commit_log.checkpoint_dir,
+            )
+            .unwrap();
+            assert!(!cp.contains_key(&table_id()));
+            engine.commit_log.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn recovery_reader_payload_crc_retained_restart() {
+        recovery_reader_rejected_survives_restart("payload_crc");
+    }
+    #[test]
+    fn recovery_reader_size_crc_retained_restart() {
+        recovery_reader_rejected_survives_restart("size_crc");
+    }
+    #[test]
+    fn recovery_reader_decode_retained_restart() {
+        recovery_reader_rejected_survives_restart("decode");
+    }
+    #[test]
+    fn recovery_reader_envelope_atomic_retained_restart() {
+        recovery_reader_rejected_survives_restart("envelope");
+    }
+    #[test]
+    fn recovery_reader_marker_retained_restart() {
+        recovery_reader_rejected_survives_restart("marker");
+    }
+    #[test]
+    fn recovery_reader_short_nonempty_tail_retained_restart() {
+        recovery_reader_rejected_survives_restart("short_tail");
+    }
+
+    #[test]
+    fn recovery_reader_status_write_failure_keeps_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, bytes, _, _) = recovery_reader_seed_raw(dir.path(), "decode");
+        let obstruction = dir
+            .path()
+            .join("recovery-incomplete/.unknown-source.json.lock");
+        std::fs::create_dir_all(&obstruction).unwrap();
+        let result = StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None);
+        assert!(
+            result.is_err(),
+            "failed status publication must abort replay"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_dir(&obstruction).unwrap();
+        let (engine, _) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert!(engine.assert_table_recovery_complete(&table_id()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        engine.commit_log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_reader_clean_empty_padding_and_torn_create_admit() {
+        use crate::commitlog::segment::Segment;
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
+        mutation.rows = vec![survivor];
+        recovery_admission_seed(dir.path(), &schema, &mutation);
+        let config = StorageEngineConfig::test_config(dir.path());
+        let segment = Segment::new(50, 65536, &config.commit_log.log_dir);
+        segment.flush_to_disk().unwrap();
+        let padding = std::fs::OpenOptions::new()
+            .write(true)
+            .open(segment.path())
+            .unwrap();
+        padding.set_len(65536).unwrap();
+        padding.sync_all().unwrap();
+        for (id, bytes) in [(51, vec![]), (52, vec![1, 2, 3]), (53, vec![0; 4096])] {
+            std::fs::write(
+                config
+                    .commit_log
+                    .log_dir
+                    .join(format!("commitlog-{id}.log")),
+                bytes,
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(pending.is_empty());
+            engine.assert_table_recovery_complete(&tid).unwrap();
+            assert_eq!(
+                engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
+                mutation.rows
+            );
+            engine.commit_log.shutdown().unwrap();
+        }
+        assert!(!segment.path().exists(), "clean padding may retire");
+    }
+
+    #[test]
+    fn recovery_reader_flush_cannot_cross_unhandled_replay() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, survivor) = recovery_admission_fixture();
+        let engine = Arc::new(
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap(),
+        );
+        engine.register_table(schema).unwrap();
+        engine.flush(&tid).unwrap();
+        let (retained_tx, retained_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let replay_engine = engine.clone();
+        let replay_mutation = mutation.clone();
+        let replay = std::thread::spawn(move || {
+            RECOVERY_RETAINED_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    retained_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+            });
+            replay_engine.replay_mutations(vec![replay_mutation])
+        });
+        retained_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        // This write puts a flush position AFTER the retained but unhandled frame.
+        engine
+            .write(&tid, &make_key("after-inflight-replay"), survivor, 2000)
+            .unwrap();
+        let (flush_started_tx, flush_started_rx) = mpsc::channel();
+        let (flush_done_tx, flush_done_rx) = mpsc::channel();
+        let flush_engine = engine.clone();
+        let flush_tid = tid.clone();
+        let flush = std::thread::spawn(move || {
+            RECOVERY_FLUSH_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    flush_started_tx.send(()).unwrap();
+                }))
+            });
+            let result = flush_engine.flush(&flush_tid);
+            flush_done_tx.send(()).unwrap();
+            result
+        });
+        flush_started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        let finished_while_unhandled = flush_done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .is_ok();
+        // Always release/join before asserting, even on RED.
+        release_tx.send(()).unwrap();
+        replay.join().unwrap().unwrap();
+        flush.join().unwrap().unwrap();
+        let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
+            &engine.config.commit_log.checkpoint_dir,
+        )
+        .unwrap();
+        assert!(
+            !finished_while_unhandled,
+            "flush passed the recovery gate with an unhandled retained frame"
+        );
+        assert!(
+            !cp.contains_key(&tid),
+            "flush checkpoint crossed rejected replay"
+        );
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        engine.commit_log.shutdown().unwrap();
+        drop(engine);
+        recovery_admission_assert_wal(dir.path(), &mutation);
+        let (reopened, _) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert!(reopened.assert_table_recovery_complete(&tid).is_err());
+        reopened.commit_log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_reader_zero_header_with_nonempty_body_is_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, mut bytes, _, _) = recovery_reader_seed_raw(dir.path(), "decode");
+        bytes[..crate::commitlog::descriptor::HEADER_SIZE].fill(0);
+        std::fs::write(&path, &bytes).unwrap();
+        let result = StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None);
+        assert!(
+            result.is_err(),
+            "nonempty records behind a destroyed header cannot be retired as empty"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn recovery_reader_unknown_status_survives_without_original_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _, _, _) = recovery_reader_seed_raw(dir.path(), "decode");
+        let (engine, _) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert!(engine.assert_table_recovery_complete(&table_id()).is_err());
+        let status = dir.path().join("recovery-incomplete/unknown-source.json");
+        assert!(std::fs::metadata(&status).unwrap().len() <= 256);
+        engine.commit_log.shutdown().unwrap();
+        drop(engine);
+        // Test-only removal proves restart refusal comes from durable evidence,
+        // independent of observing the bad frame again.
+        std::fs::remove_file(path).unwrap();
+        let (engine, _) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert!(engine.assert_table_recovery_complete(&table_id()).is_err());
+        engine.commit_log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_reader_partial_initial_marker_contains_no_records() {
+        use crate::commitlog::{descriptor::HEADER_SIZE, segment::Segment};
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
+        mutation.rows = vec![survivor];
+        recovery_admission_seed(dir.path(), &schema, &mutation);
+        let config = StorageEngineConfig::test_config(dir.path());
+        for extra in 0..8 {
+            let segment = Segment::new(50 + extra, 4096, &config.commit_log.log_dir);
+            segment.flush_to_disk().unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(segment.path())
+                .unwrap();
+            file.set_len(HEADER_SIZE as u64 + extra).unwrap();
+            file.sync_all().unwrap();
+        }
+        let (engine, _) = StorageEngine::open(config, None).unwrap();
+        engine.assert_table_recovery_complete(&tid).unwrap();
+        engine.commit_log.shutdown().unwrap();
+    }
+
+    fn recovery_admission_fixture() -> (TableSchema, TableId, Mutation, Row) {
+        let mut schema = test_schema();
+        schema.clustering_columns = vec![ColumnDefinition {
+            name: "ck".into(),
+            type_name: "org.apache.cassandra.db.marshal.TimeUUIDType".into(),
+        }];
+        let survivor = Row {
+            clustering: vec![1; 16],
+            ..make_row(b"original-01", 1000)
+        };
+        let malformed = Row {
+            clustering: vec![0],
+            ..survivor.clone()
+        };
+        let mutation = Mutation::new(
+            schema.keyspace.clone(),
+            schema.table.clone(),
+            make_key("recovery-admission"),
+            vec![survivor.clone(), malformed],
+            1000,
+        );
+        (schema, table_id(), mutation, survivor)
+    }
+
+    fn recovery_admission_seed(dir: &Path, schema: &TableSchema, mutation: &Mutation) {
+        let engine = StorageEngine::new(StorageEngineConfig::test_config(dir), None).unwrap();
+        engine.register_table(schema.clone()).unwrap();
+        engine
+            .flush(&TableId::new(&schema.keyspace, &schema.table))
+            .unwrap();
+        engine.commit_log.append(mutation).unwrap();
+        engine.commit_log.shutdown().unwrap();
+    }
+
+    fn recovery_admission_assert_wal(dir: &Path, mutation: &Mutation) {
+        let (log, retained) =
+            CommitLog::open_and_replay(StorageEngineConfig::test_config(dir).commit_log).unwrap();
+        assert!(
+            retained
+                .iter()
+                .any(|m| m.mutation_id == mutation.mutation_id && m.rows == mutation.rows),
+            "the complete original rejected frame must remain replayable"
+        );
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn recovery_admission_clean_recovery_and_pending_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mut mutation, survivor) = recovery_admission_fixture();
+        mutation.rows = vec![survivor.clone()];
+        // No schema: open returns a caller-owned pending vector.
+        let log = CommitLog::new(StorageEngineConfig::test_config(dir.path()).commit_log).unwrap();
+        log.append(&mutation).unwrap();
+        log.shutdown().unwrap();
+        drop(log);
+        let (engine, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert_eq!(pending.len(), 1);
+        engine.register_table(schema).unwrap();
+        assert!(
+            engine.assert_table_recovery_complete(&tid).is_err(),
+            "unsubmitted pending WAL must block admission"
+        );
+        engine.replay_mutations(pending).unwrap();
+        engine.assert_table_recovery_complete(&tid).unwrap();
+        assert_eq!(
+            engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
+            vec![survivor]
+        );
+        engine.flush(&tid).unwrap();
+        engine.commit_log.shutdown().unwrap();
+        drop(engine);
+        let (engine, pending) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert!(pending.is_empty());
+        engine.assert_table_recovery_complete(&tid).unwrap();
+    }
+
+    #[test]
+    fn recovery_admission_quarantine_survivor_and_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, survivor) = recovery_admission_fixture();
+        recovery_admission_seed(dir.path(), &schema, &mutation);
+        for _ in 0..2 {
+            let (engine, pending) =
+                StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+            assert!(pending.is_empty());
+            assert_eq!(
+                engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
+                vec![survivor.clone()]
+            );
+            assert!(engine.assert_table_recovery_complete(&tid).is_err());
+            engine.replay_mutations(vec![mutation.clone()]).unwrap();
+            assert!(engine.assert_table_recovery_complete(&tid).is_err());
+            engine.flush(&tid).unwrap();
+            let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
+                &engine.config.commit_log.checkpoint_dir,
+            )
+            .unwrap();
+            assert!(
+                !cp.contains_key(&tid),
+                "rejected application cannot advance checkpoint"
+            );
+            engine.commit_log.shutdown().unwrap();
+        }
+        let summaries = std::fs::read_dir(dir.path().join("recovery-incomplete"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 1, "one bounded summary, not row history");
+        assert!(std::fs::metadata(&summaries[0]).unwrap().len() < 256);
+        assert!(std::fs::read_dir(
+            dir.path()
+                .join("sstables")
+                .join(tid.to_string())
+                .join("quarantine")
+        )
+        .unwrap()
+        .next()
+        .is_some());
+        recovery_admission_assert_wal(dir.path(), &mutation);
+    }
+
+    #[test]
+    fn recovery_admission_startup_quarantine_failure_retains_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, survivor) = recovery_admission_fixture();
+        recovery_admission_seed(dir.path(), &schema, &mutation);
+        let quarantine = dir
+            .path()
+            .join("sstables")
+            .join(tid.to_string())
+            .join("quarantine");
+        std::fs::write(&quarantine, b"obstruction").unwrap();
+        assert!(StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).is_err());
+        assert!(
+            recovery_status::incomplete(dir.path(), &tid).unwrap(),
+            "failure evidence must be durable even when quarantine fails"
+        );
+        recovery_admission_assert_wal(dir.path(), &mutation);
+        std::fs::remove_file(quarantine).unwrap();
+        let (engine, _) =
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        assert_eq!(
+            engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
+            vec![survivor]
+        );
+    }
+
+    #[test]
+    fn recovery_admission_status_persistence_failure_retains_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, _) = recovery_admission_fixture();
+        recovery_admission_seed(dir.path(), &schema, &mutation);
+        // Reading an absent status succeeds; only the atomic publisher's
+        // lock creation fails, after the rejection is actually observed.
+        let encode = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let filename = format!(
+            "{}-{}.json",
+            encode(&schema.keyspace),
+            encode(&schema.table)
+        );
+        let obstruction = dir
+            .path()
+            .join("recovery-incomplete")
+            .join(format!(".{filename}.lock"));
+        std::fs::create_dir_all(&obstruction).unwrap();
+        assert!(
+            !recovery_status::incomplete(dir.path(), &tid).unwrap(),
+            "fixture must pass status loading and fail only atomic publication"
+        );
+        assert!(
+            StorageEngine::open(StorageEngineConfig::test_config(dir.path()), None).is_err(),
+            "cannot retire a frame before incomplete status is durable"
+        );
+        recovery_admission_assert_wal(dir.path(), &mutation);
+    }
+
+    #[test]
+    fn recovery_admission_failed_status_write_latch_protects_later_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, survivor) = recovery_admission_fixture();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema.clone()).unwrap();
+        engine.assert_table_recovery_complete(&tid).unwrap();
+        let encode = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let filename = format!(
+            "{}-{}.json",
+            encode(&schema.keyspace),
+            encode(&schema.table)
+        );
+        std::fs::create_dir_all(
+            dir.path()
+                .join("recovery-incomplete")
+                .join(format!(".{filename}.lock")),
+        )
+        .unwrap();
+        assert!(engine.replay_mutations(vec![mutation.clone()]).is_err());
+        assert!(!recovery_status::incomplete(dir.path(), &tid).unwrap());
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        engine
+            .write(&tid, &make_key("new-after-status-failure"), survivor, 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
+            &engine.config.commit_log.checkpoint_dir,
+        )
+        .unwrap();
+        assert!(!cp.contains_key(&tid));
+        engine.commit_log.shutdown().unwrap();
+        drop(engine);
+        recovery_admission_assert_wal(dir.path(), &mutation);
+    }
+
+    #[test]
+    fn recovery_admission_explicit_failure_requeues_unfinished_and_freezes_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, survivor) = recovery_admission_fixture();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema.clone()).unwrap();
+        std::fs::write(
+            engine.table_sstable_dir(&tid).join("quarantine"),
+            b"obstruction",
+        )
+        .unwrap();
+        let mut later = mutation.clone();
+        later.mutation_id = [42; 16];
+        later.key = make_key("later");
+        later.rows = vec![survivor.clone()];
+        assert!(engine
+            .replay_mutations(vec![mutation.clone(), later.clone()])
+            .is_err());
+        assert_eq!(engine.deferred_replay_mutation_count_for_test(), 2);
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        // A later valid write/flush must not checkpoint past the failed frame.
+        engine
+            .write(&tid, &make_key("new"), survivor, 2000)
+            .unwrap();
+        engine.flush(&tid).unwrap();
+        let cp = crate::commitlog::checkpoint::CommitLogCheckpoint::load(
+            &engine.config.commit_log.checkpoint_dir,
+        )
+        .unwrap();
+        assert!(!cp.contains_key(&tid));
+        engine.commit_log.shutdown().unwrap();
+        drop(engine);
+        recovery_admission_assert_wal(dir.path(), &mutation);
+        recovery_admission_assert_wal(dir.path(), &later);
+    }
+
+    #[test]
+    fn recovery_admission_deferred_registration_failure_keeps_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, _) = recovery_admission_fixture();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine
+            .replay_mutations(vec![mutation.clone(), mutation.clone()])
+            .unwrap();
+        let table_dir = engine.table_sstable_dir(&tid);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("quarantine"), b"obstruction").unwrap();
+        assert!(engine.register_table(schema.clone()).is_err());
+        assert_eq!(
+            engine.deferred_replay_mutation_count_for_test(),
+            1,
+            "UUID dedup remains intact"
+        );
+        assert!(engine.register_table(schema.clone()).is_err());
+        assert_eq!(engine.deferred_replay_mutation_count_for_test(), 1);
+        std::fs::remove_file(table_dir.join("quarantine")).unwrap();
+        engine.register_table(schema).unwrap();
+        assert_eq!(engine.deferred_replay_mutation_count_for_test(), 0);
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+    }
+
+    #[test]
+    fn recovery_admission_set_aside_failure_retains_original_and_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, survivor) = recovery_admission_fixture();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema).unwrap();
+        let mut aside = crate::replay_set_aside::ReplaySetAside::new(dir.path());
+        aside.append(&mutation).unwrap();
+        aside.sync().unwrap();
+        let report = aside.into_report().unwrap();
+        let original = std::fs::read(&report.path).unwrap();
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        std::fs::write(
+            engine.table_sstable_dir(&tid).join("quarantine"),
+            b"obstruction",
+        )
+        .unwrap();
+        assert!(engine.reingest_set_aside().is_err());
+        assert_eq!(std::fs::read(&report.path).unwrap(), original);
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        std::fs::remove_file(engine.table_sstable_dir(&tid).join("quarantine")).unwrap();
+        engine.reingest_set_aside().unwrap();
+        assert!(!report.path.exists());
+        assert_eq!(
+            engine.read(&tid, &mutation.key).unwrap().unwrap().rows,
+            vec![survivor]
+        );
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+    }
+
+    #[test]
+    fn recovery_admission_legacy_quarantine_and_unreadable_status_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (schema, tid, mutation, _) = recovery_admission_fixture();
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_table(schema).unwrap();
+        let quarantine = engine.table_sstable_dir(&tid).join("quarantine");
+        std::fs::create_dir_all(&quarantine).unwrap();
+        std::fs::write(quarantine.join("legacy.jsonl"), b"old forensic evidence").unwrap();
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        engine.replay_mutations(vec![mutation]).unwrap();
+        let status = std::fs::read_dir(dir.path().join("recovery-incomplete"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|x| x == "json"))
+            .unwrap();
+        std::fs::write(&status, b"broken status").unwrap();
+        assert!(engine.assert_table_recovery_complete(&tid).is_err());
+        // Unreadable evidence must not be replaced by a subsequent replay.
+        let (_, _, mutation, _) = recovery_admission_fixture();
+        assert!(engine.replay_mutations(vec![mutation]).is_err());
+        assert_eq!(std::fs::read(status).unwrap(), b"broken status");
     }
 
     /// Layer 3 of the timeuuid-flush-wedge fix: a malformed mutation
@@ -35636,7 +36656,7 @@ mod tests {
             Some(CqlValue::Set(
                 members
                     .iter()
-                    .map(|m| CqlValue::Text(m.to_string()))
+                    .map(|m| CqlValue::Text(m.to_string().into()))
                     .collect(),
             ))
         };

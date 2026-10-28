@@ -1476,23 +1476,25 @@ async fn cross_node_serializable_transaction_keeps_its_snapshot_after_peer_commi
 }
 
 #[tokio::test]
-async fn unsupported_explicit_isolation_levels_fail_loud() {
+async fn read_committed_is_accepted_and_repeatable_read_fails_loud() {
     let (client, _dir) = dml_client().await;
 
-    for statement in [
-        "BEGIN ISOLATION LEVEL READ COMMITTED",
-        "BEGIN ISOLATION LEVEL REPEATABLE READ",
-    ] {
-        let error = client
+    for statement in ["BEGIN ISOLATION LEVEL READ COMMITTED", "SELECT 1", "COMMIT"] {
+        client
             .batch_execute(statement)
             .await
-            .expect_err("unsupported explicit isolation level must be rejected");
-        assert_eq!(
-            error.code().map(|code| code.code()),
-            Some("0A000"),
-            "unsupported isolation level must use feature_not_supported: {statement}"
-        );
+            .expect("READ COMMITTED must execute and commit successfully");
     }
+
+    let error = client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .expect_err("unimplemented REPEATABLE READ must be rejected");
+    assert_eq!(
+        error.code().map(|code| code.code()),
+        Some("0A000"),
+        "unimplemented isolation level must use feature_not_supported"
+    );
 }
 
 #[tokio::test]

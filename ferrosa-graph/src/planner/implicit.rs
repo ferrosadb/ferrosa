@@ -48,6 +48,9 @@
 //! whose endpoints carry no label anywhere in the statement cannot be given the
 //! contract the DDL enforces, so it is refused rather than created without one.
 
+mod columns;
+pub use columns::columns_needing_declarations;
+
 use std::collections::HashMap;
 
 use indexmap::IndexMap;

@@ -246,6 +246,8 @@ impl DdlCoordinator {
     pub(crate) async fn apply_ddl_locally(&self, op: &DdlOperation) -> Result<()> {
         let _pauses =
             crate::ddl_path::pause_ddl_compactions(op, &self.schema, &self.engine).await?;
+        // All remaining work is synchronous: keep registry/storage transitions together.
+        let _lifecycle = self.schema.lifecycle_write();
         match op {
             DdlOperation::CreateKeyspace(ks) => {
                 self.schema
@@ -819,6 +821,7 @@ impl PairSchemaSyncHandler {
     /// missed DROP + CREATE when the table id changed), and drop what the
     /// primary no longer has (a missed DROP).
     fn converge(&self, snapshot: &SchemaSnapshot) -> std::result::Result<(), String> {
+        let _lifecycle = self.schema.lifecycle_write();
         let local = self.schema.snapshot();
 
         // Tables this node's schema held that the snapshot no longer does:

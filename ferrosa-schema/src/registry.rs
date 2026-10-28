@@ -134,6 +134,7 @@ pub struct Schema {
     inner: Arc<ArcSwap<SchemaSnapshot>>,
     /// Serializes writes (clone → mutate → store).
     write_lock: Mutex<()>,
+    lifecycle: Arc<crate::lifecycle::Lifecycle>,
     /// Password hashing configuration.
     hasher_config: PasswordHasher,
     /// Password strength policy (used by create_role/alter_role in CRUD operations).
@@ -228,6 +229,7 @@ impl Schema {
         let schema = Self {
             inner: Arc::new(ArcSwap::new(Arc::new(snapshot))),
             write_lock: Mutex::new(()),
+            lifecycle: Arc::new(crate::lifecycle::Lifecycle::default()),
             hasher_config: config.hasher,
             password_policy: config.password_policy,
             rate_limiter: AuthRateLimiter::new(config.rate_limit),
@@ -250,6 +252,20 @@ impl Schema {
         schema.emit_audit(AuditEventKind::SchemaBootstrapped);
 
         Ok(schema)
+    }
+
+    /// Fence synchronous physical apply against schema mutation.
+    /// Acquire before validating table UUIDs; release after storage and MVCC publication.
+    /// Never hold this lease across an await.
+    pub fn lifecycle_read(&self) -> crate::SchemaReadLease {
+        self.lifecycle.read()
+    }
+
+    /// Fence synchronous storage/schema reconciliation (including snapshot restore).
+    /// Reentrant on the current thread; acquire before other schema/storage locks.
+    /// Never hold this guard across an await.
+    pub fn lifecycle_write(&self) -> crate::SchemaWriteLease {
+        self.lifecycle.write()
     }
 
     /// Return a lock-free snapshot of the current schema state.
@@ -288,8 +304,9 @@ impl Schema {
     }
 
     /// Bulk-load schema from a snapshot. Bypasses auth and audit.
-    /// Used for pair mode catch-up. Idempotent — silently skips
-    /// keyspaces/tables that already exist.
+    /// Used for pair mode catch-up. Existing same-incarnation tables are kept;
+    /// a different authoritative UUID replaces the old incarnation. Callers must
+    /// reconcile its physical storage under `lifecycle_write` before installing it.
     ///
     /// **Important:** Does NOT register tables with StorageEngine —
     /// caller must call `engine.register_table()` for each table separately.
@@ -298,6 +315,7 @@ impl Schema {
     /// schema state, so the registry must re-adopt that name along with the
     /// contents. See the inline note below.
     pub fn apply_snapshot(&self, snapshot: SchemaSnapshot) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut current = (**self.inner.load()).clone();
         self.check_snapshot_jsonb(&current, &snapshot)?;
@@ -329,10 +347,21 @@ impl Schema {
             if is_system_keyspace(ks) {
                 continue;
             }
-            current
+            let key = (ks.clone(), tbl.clone());
+            if current
                 .tables
-                .entry((ks.clone(), tbl.clone()))
-                .or_insert_with(|| table.clone());
+                .get(&key)
+                .is_some_and(|old| old.id != table.id)
+            {
+                // The caller reconciles physical storage under lifecycle_write.
+                // Retaining this entry would assign restored rows the retired UUID.
+                current
+                    .indexes
+                    .retain(|(index_ks, index_table, _), _| index_ks != ks || index_table != tbl);
+                current.tables.insert(key, table.clone());
+            } else {
+                current.tables.entry(key).or_insert_with(|| table.clone());
+            }
         }
 
         for (name, role) in &snapshot.roles {
@@ -470,6 +499,7 @@ impl Schema {
     /// Used by the Raft state machine to apply the leader-generated version
     /// so all nodes converge on the same schema version.
     pub fn set_schema_version(&self, version: Uuid) {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.version = version;
@@ -480,6 +510,7 @@ impl Schema {
     /// if keyspace already exists.
     pub fn create_keyspace_internal(&self, ks: KeyspaceMetadata) -> crate::Result<()> {
         crate::validation::validate_keyspace(&ks)?;
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if snap.keyspaces.contains_key(&ks.name) {
@@ -494,6 +525,7 @@ impl Schema {
     /// if table already exists.
     pub fn create_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
         crate::validation::validate_table(&table)?;
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         self.check_table_jsonb(&table, &snap.types)?;
@@ -515,6 +547,7 @@ impl Schema {
     /// missed ALTER was lost.
     pub fn replace_table_internal(&self, table: TableMetadata) -> crate::Result<()> {
         crate::validation::validate_table(&table)?;
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         self.check_table_jsonb(&table, &snap.types)?;
@@ -527,6 +560,7 @@ impl Schema {
     /// Drop a keyspace without auth checks. Idempotent — succeeds silently
     /// if keyspace doesn't exist.
     pub fn drop_keyspace_internal(&self, name: &str) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.keyspaces.remove(name);
@@ -538,6 +572,7 @@ impl Schema {
     /// Drop a table without auth checks. Idempotent — succeeds silently
     /// if table doesn't exist.
     pub fn drop_table_internal(&self, keyspace: &str, table: &str) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.tables
@@ -558,6 +593,7 @@ impl Schema {
         name: &str,
         updates: KeyspaceUpdates,
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let Some(ks) = snap.keyspaces.get_mut(name) else {
@@ -581,6 +617,7 @@ impl Schema {
         table: &str,
         updates: TableUpdates,
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), table.to_string());
@@ -611,6 +648,7 @@ impl Schema {
     /// Create a role without auth checks. Idempotent — succeeds silently if role exists.
     /// Used for pair mode DDL replication.
     pub fn create_role_internal(&self, role: RoleMetadata) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if snap.roles.contains_key(&role.name) {
@@ -634,6 +672,7 @@ impl Schema {
                 PasswordHasher::verify_password_any("cassandra", hash).unwrap_or(false)
             });
 
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.roles.insert(name.clone(), role);
@@ -654,6 +693,7 @@ impl Schema {
     /// and stored directly as `salted_hash` (not re-hashed).
     /// Used for pair mode DDL replication.
     pub fn alter_role_internal(&self, name: &str, updates: RoleUpdates) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let Some(role) = snap.roles.get_mut(name) else {
@@ -683,6 +723,7 @@ impl Schema {
     /// Also removes all grants associated with the role.
     /// Used for pair mode DDL replication.
     pub fn drop_role_internal(&self, name: &str) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         snap.roles.remove(name);
@@ -695,6 +736,7 @@ impl Schema {
     /// If the role already has a grant for the same resource, permissions are merged.
     /// Used for pair mode DDL replication.
     pub fn grant_internal(&self, entry: GrantEntry) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let grants = snap.grants.entry(entry.role.clone()).or_default();
@@ -720,6 +762,7 @@ impl Schema {
     /// applies — the first edge is already present — so it is rejected rather
     /// than corrupting the hierarchy. Idempotent if `member` no longer exists.
     pub fn grant_role_internal(&self, member: &str, granted_role: &str) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if !snap.roles.contains_key(member) {
@@ -742,6 +785,7 @@ impl Schema {
     /// `member`'s `member_of` set. Subtractive and idempotent — touches one
     /// edge, so it never clobbers other concurrently-replicated memberships.
     pub fn revoke_role_internal(&self, member: &str, granted_role: &str) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if let Some(role) = snap.roles.get_mut(member) {
@@ -760,6 +804,7 @@ impl Schema {
         resource: &Resource,
         permission: &Permission,
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         if let Some(grants) = snap.grants.get_mut(role) {
@@ -845,6 +890,7 @@ impl Schema {
         let role_data = role_data.unwrap();
         if let Some(hash) = &role_data.salted_hash {
             if self.hasher_config.needs_rehash(hash) {
+                let _lifecycle = self.lifecycle_write();
                 let _guard = self.write_lock.lock().unwrap();
                 let mut new_snap = (*self.snapshot()).clone();
                 if let Some(r) = new_snap.roles.get_mut(username) {
@@ -1092,6 +1138,7 @@ impl Schema {
         if is_system_keyspace(&ks.name) {
             return Err(SchemaError::SystemKeyspaceProtected(ks.name));
         }
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if snap.keyspaces.contains_key(&ks.name) {
@@ -1123,6 +1170,7 @@ impl Schema {
         if is_system_keyspace(name) {
             return Err(SchemaError::SystemKeyspaceProtected(name.to_string()));
         }
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         let ks = snap
@@ -1155,6 +1203,7 @@ impl Schema {
         if is_system_keyspace(name) {
             return Err(SchemaError::SystemKeyspaceProtected(name.to_string()));
         }
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if snap.keyspaces.remove(name).is_none() {
@@ -1191,6 +1240,7 @@ impl Schema {
         if is_system_keyspace(&table.keyspace) {
             return Err(SchemaError::SystemKeyspaceProtected(table.keyspace));
         }
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if !snap.keyspaces.contains_key(&table.keyspace) {
@@ -1257,6 +1307,7 @@ impl Schema {
             }
         }
         drop(snap_ref);
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         let existing = snap
@@ -1330,6 +1381,7 @@ impl Schema {
             }
         }
         drop(snap_ref);
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if snap.tables.remove(&key).is_none() {
@@ -1360,6 +1412,7 @@ impl Schema {
     /// Inserts the index if it does not already exist. Succeeds silently
     /// on duplicates (idempotent).
     pub fn create_index_internal(&self, index: IndexMetadata) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (*self.inner.load_full()).clone();
         let key = (
@@ -1382,6 +1435,7 @@ impl Schema {
         table: &str,
         name: &str,
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (*self.inner.load_full()).clone();
         snap.indexes
@@ -1397,6 +1451,7 @@ impl Schema {
     pub fn create_index(&self, index: IndexMetadata, auth: &AuthContext) -> crate::Result<()> {
         let resource = Resource::Table(index.keyspace.clone(), index.table.clone());
         self.check_permission(auth, Permission::Alter, &resource)?;
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (*self.inner.load_full()).clone();
         let key = (
@@ -1423,6 +1478,7 @@ impl Schema {
     ) -> crate::Result<()> {
         let resource = Resource::Table(keyspace.to_string(), table.to_string());
         self.check_permission(auth, Permission::Alter, &resource)?;
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (*self.inner.load_full()).clone();
         snap.indexes
@@ -1458,6 +1514,7 @@ impl Schema {
         } else {
             (None, None)
         };
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if snap.roles.contains_key(&role.name) {
@@ -1512,6 +1569,7 @@ impl Schema {
     ) -> crate::Result<()> {
         self.check_permission(auth, Permission::Create, &Resource::AllRoles)?;
         PasswordHasher::validate_password_hash(hashed_password)?;
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if snap.roles.contains_key(&role.name) {
@@ -1581,6 +1639,7 @@ impl Schema {
                 ))
             }
         };
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if !snap.roles.contains_key(name) {
@@ -1640,6 +1699,7 @@ impl Schema {
     /// associated with the role.
     pub fn drop_role(&self, name: &str, auth: &AuthContext) -> crate::Result<()> {
         self.check_permission(auth, Permission::Drop, &Resource::AllRoles)?;
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if snap.roles.remove(name).is_none() {
@@ -1672,6 +1732,7 @@ impl Schema {
         auth: &AuthContext,
     ) -> crate::Result<()> {
         self.check_permission(auth, Permission::Authorize, &Resource::AllRoles)?;
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if !snap.roles.contains_key(role) {
@@ -1713,6 +1774,7 @@ impl Schema {
         auth: &AuthContext,
     ) -> crate::Result<()> {
         self.check_permission(auth, Permission::Authorize, &Resource::AllRoles)?;
+        let _lifecycle = self.lifecycle_write();
         let _guard = self.write_lock.lock().unwrap();
         let mut snap = (*self.snapshot()).clone();
         if !snap.roles.contains_key(role) {
@@ -1749,6 +1811,7 @@ impl Schema {
     /// Create a user-defined type. Returns error if type already exists or
     /// keyspace not found.
     pub fn create_type_internal(&self, udt: &UserTypeMetadata) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (udt.keyspace.clone(), udt.name.clone());
@@ -1768,6 +1831,7 @@ impl Schema {
 
     /// Drop a user-defined type. Returns error if type not found.
     pub fn drop_type_internal(&self, keyspace: &str, name: &str) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), name.to_string());
@@ -1799,6 +1863,7 @@ impl Schema {
         field_name: &str,
         field_type: CqlType,
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), name.to_string());
@@ -1836,6 +1901,7 @@ impl Schema {
         from: &str,
         to: &str,
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), type_name.to_string());
@@ -1864,6 +1930,7 @@ impl Schema {
     /// Create a user-defined function. Returns error if function already exists
     /// (same keyspace, name, and arg_types) or keyspace not found.
     pub fn create_function_internal(&self, func: &UserFunctionMetadata) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (
@@ -1892,6 +1959,7 @@ impl Schema {
         name: &str,
         arg_types: &[CqlType],
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
@@ -1924,6 +1992,7 @@ impl Schema {
     /// Create a user-defined aggregate. Returns error if aggregate already exists
     /// (same keyspace, name, and arg_types) or keyspace not found.
     pub fn create_aggregate_internal(&self, agg: &UserAggregateMetadata) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (
@@ -1952,6 +2021,7 @@ impl Schema {
         name: &str,
         arg_types: &[CqlType],
     ) -> crate::Result<()> {
+        let _lifecycle = self.lifecycle_write();
         let _lock = self.write_lock.lock().unwrap();
         let mut snap = (**self.inner.load()).clone();
         let key = (keyspace.to_string(), name.to_string(), arg_types.to_vec());
@@ -3419,6 +3489,72 @@ mod tests {
 
         let snap = schema.snapshot();
         assert!(snap.keyspaces.contains_key("test_ks"));
+    }
+
+    #[test]
+    fn lifecycle_lease_fences_all_table_retirement_paths() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for route in 0..6 {
+            let schema = Arc::new(test_schema());
+            schema
+                .create_keyspace_internal(test_keyspace("lease_ks"))
+                .unwrap();
+            let table = test_table("lease_ks", "t");
+            schema.create_table_internal(table.clone()).unwrap();
+            let lease = schema.lifecycle_read();
+            let writer_schema = schema.clone();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let writer = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                match route {
+                    0 => writer_schema.drop_table_internal("lease_ks", "t").unwrap(),
+                    1 => writer_schema.drop_keyspace_internal("lease_ks").unwrap(),
+                    2 => {
+                        let mut replacement = table;
+                        replacement.id = Uuid::new_v4();
+                        writer_schema.replace_table_internal(replacement).unwrap();
+                    }
+                    3 => {
+                        let snapshot = (*writer_schema.snapshot()).clone();
+                        writer_schema.apply_snapshot(snapshot).unwrap();
+                    }
+                    4 => writer_schema
+                        .drop_table("lease_ks", "t", &superuser_auth())
+                        .unwrap(),
+                    _ => writer_schema
+                        .drop_keyspace("lease_ks", &superuser_auth())
+                        .unwrap(),
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let raced = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+            drop(lease);
+            writer.join().unwrap();
+            assert!(!raced, "retirement route {route} escaped the apply lease");
+        }
+    }
+
+    #[test]
+    fn snapshot_adopts_recreated_table_incarnation() {
+        let schema = test_schema();
+        let old = test_table("incarnation_ks", "t");
+        schema.create_table_internal(old.clone()).unwrap();
+        let mut replacement = old.clone();
+        replacement.id = Uuid::new_v4();
+        let mut snapshot = SchemaSnapshot::new();
+        snapshot.tables.insert(
+            (old.keyspace.clone(), old.name.clone()),
+            replacement.clone(),
+        );
+        schema.apply_snapshot(snapshot).unwrap();
+        assert_eq!(
+            schema.snapshot().tables[&(old.keyspace, old.name)].id,
+            replacement.id,
+            "snapshot UUID must replace a retired incarnation, not retain the old identity"
+        );
     }
 
     #[test]

@@ -134,7 +134,7 @@ pub fn recorded(meta: &TableMetadata) -> Vec<ForeignKey> {
 fn render_key(value: &CqlValue) -> String {
     match value {
         CqlValue::Null => "NULL".to_string(),
-        CqlValue::Text(s) | CqlValue::Ascii(s) => s.clone(),
+        CqlValue::Text(s) | CqlValue::Ascii(s) => s.to_string(),
         CqlValue::Int(i) => i.to_string(),
         CqlValue::Bigint(i) | CqlValue::Counter(i) | CqlValue::Time(i) => i.to_string(),
         CqlValue::Smallint(i) => i.to_string(),

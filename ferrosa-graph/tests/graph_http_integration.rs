@@ -5842,6 +5842,14 @@ impl BoltTestClient {
     /// Connect and complete handshake + HELLO + LOGON (auth_disabled server,
     /// so credentials are accepted as superuser).
     async fn connect(addr: std::net::SocketAddr) -> Self {
+        Self::connect_with_auth(addr, "tester", "ignored").await
+    }
+
+    async fn connect_with_auth(
+        addr: std::net::SocketAddr,
+        principal: &str,
+        credentials: &str,
+    ) -> Self {
         use ferrosa_graph::bolt::codec::ChunkDecoder;
         use ferrosa_graph::bolt::handshake::{BOLT_MAGIC, BOLT_VERSION_5_0};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -5895,8 +5903,8 @@ impl BoltTestClient {
         let logon = BoltMessage::Logon {
             auth: vec![
                 ("scheme".into(), PackValue::String("basic".into())),
-                ("principal".into(), PackValue::String("tester".into())),
-                ("credentials".into(), PackValue::String("ignored".into())),
+                ("principal".into(), PackValue::String(principal.into())),
+                ("credentials".into(), PackValue::String(credentials.into())),
             ],
         };
         client.send(&logon).await;
@@ -5943,10 +5951,22 @@ impl BoltTestClient {
     /// RUN + PULL a query, returning the result rows (each a list of PackValues).
     /// Panics (fail-loud) if the server returns a Bolt FAILURE for the RUN.
     async fn query(&mut self, cypher: &str, keyspace: &str) -> Vec<Vec<PackValue>> {
+        self.query_with_extra(
+            cypher,
+            vec![("db".into(), PackValue::String(keyspace.to_string()))],
+        )
+        .await
+    }
+
+    async fn query_with_extra(
+        &mut self,
+        cypher: &str,
+        extra: Vec<(String, PackValue)>,
+    ) -> Vec<Vec<PackValue>> {
         let run = BoltMessage::Run {
             query: cypher.to_string(),
             params: vec![],
-            extra: vec![("db".into(), PackValue::String(keyspace.to_string()))],
+            extra,
         };
         self.send(&run).await;
         match self.recv().await {
@@ -5975,6 +5995,1351 @@ impl BoltTestClient {
         }
         rows
     }
+}
+
+// t_a4712717 incremental-write isolation, separate from transaction staging/WAL.
+// Test list:
+// - Overlapping explicit dependent SETs: two commits mean value 2, otherwise an
+//   explicit retryable conflict; never two successes and value 1.
+// - Roll back the first overlapping writer: its increment must not survive.
+// - Overlapping autocommit dependent SETs with a deterministic after-read gate.
+// - Verify exact values and a subsequent increment/ROLLBACK after each overlap.
+// GREEN follow-up test list (no lock implementation in this RED checkpoint):
+// - RESET/disconnect/cancellation release both held locks and queued waiters.
+// - Transaction timeout while holding/waiting releases locks without publishing.
+// - Autocommit cancellation/timeout drops query-owned locks and allows progress.
+// Schema incarnation fencing is a separate cycle, as is distributed execution.
+// Native reference: https://neo4j.com/docs/operations-manual/current/database-internals/concurrent-data-access/#_lost_updates
+// Debug-only because the scheduling probes are absent from release builds.
+#[cfg(debug_assertions)]
+mod bolt_rmw_regressions {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::sync::oneshot;
+
+    const FIRST: &str =
+        "MATCH (n:BoltRmw {id: 'counter'}) SET n.value = n.value + 1 RETURN n.value AS first";
+    const SECOND: &str =
+        "MATCH (n:BoltRmw {id: 'counter'}) SET n.value = n.value + 1 RETURN n.value AS second";
+    const READ: &str = "MATCH (n:BoltRmw {id: 'counter'}) RETURN n.value";
+    type Outcome = Result<Vec<Vec<PackValue>>, Vec<(String, PackValue)>>;
+    type WriteGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+    #[derive(Default)]
+    struct Probe {
+        polled: Mutex<Option<oneshot::Sender<bool>>>,
+        waiting: std::sync::atomic::AtomicBool,
+        write_gate: Mutex<Option<WriteGate>>,
+    }
+
+    impl Probe {
+        fn observe_poll() -> (Arc<Self>, oneshot::Receiver<bool>) {
+            let (tx, rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    polled: Mutex::new(Some(tx)),
+                    ..Default::default()
+                }),
+                rx,
+            )
+        }
+
+        fn pause_write() -> (Arc<Self>, oneshot::Receiver<()>, oneshot::Sender<()>) {
+            let (reached_tx, reached_rx) = oneshot::channel();
+            let (release_tx, release_rx) = oneshot::channel();
+            (
+                Arc::new(Self {
+                    write_gate: Mutex::new(Some((reached_tx, release_rx))),
+                    ..Default::default()
+                }),
+                reached_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ferrosa_graph::engine::QueryExecutionTestProbe for Probe {
+        fn after_poll(&self, ready: bool) {
+            if let Some(tx) = self.polled.lock().unwrap().take() {
+                tx.send(ready).expect("test must observe the query poll");
+            }
+        }
+
+        fn writer_waiting(&self) {
+            self.waiting
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        async fn before_property_write(&self) {
+            let gate = self.write_gate.lock().unwrap().take();
+            if let Some((reached, release)) = gate {
+                reached
+                    .send(())
+                    .expect("test must observe the evaluated RHS");
+                release.await.expect("test must release the write gate");
+            }
+        }
+    }
+
+    struct Fixture {
+        engine: Arc<GraphEngine>,
+        addr: std::net::SocketAddr,
+        shutdown: tokio::sync::watch::Sender<bool>,
+        server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+        _dir: TempDir,
+    }
+
+    impl Fixture {
+        async fn start() -> Self {
+            Self::with_query_timeout(std::time::Duration::from_secs(30)).await
+        }
+
+        async fn with_query_timeout(query_timeout: std::time::Duration) -> Self {
+            let (schema, storage, dir) = setup();
+            schema
+                .create_keyspace(
+                    KeyspaceMetadata {
+                        name: "neo4j".into(),
+                        durable_writes: true,
+                        replication: ReplicationParams {
+                            strategy: "SimpleStrategy".into(),
+                            options: HashMap::from([("replication_factor".into(), "1".into())]),
+                        },
+                    },
+                    &superuser_auth(),
+                )
+                .unwrap();
+            let path = Arc::new(arc_swap::ArcSwap::from_pointee(
+                ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
+            ));
+            let engine = Arc::new(GraphEngine::new(
+                schema.clone(),
+                storage,
+                path,
+                GraphEngineConfig {
+                    query_timeout,
+                    ..Default::default()
+                },
+                std::time::Duration::ZERO,
+            ));
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+            let server = tokio::spawn(ferrosa_graph::bolt::server::start_bolt_server(
+                engine.clone(),
+                schema,
+                ferrosa_graph::bolt::server::BoltConfig {
+                    bind_addr: addr,
+                    auth_disabled: false,
+                    ..Default::default()
+                },
+                shutdown_rx,
+            ));
+            let fixture = Self {
+                engine,
+                addr,
+                shutdown,
+                server: Some(server),
+                _dir: dir,
+            };
+            let mut seed = fixture.client().await;
+            // Materialize the label and row before starting either transaction.
+            // Explicit id makes MATCH a synchronous local primary-key read, not
+            // a range stream with unrelated asynchronous I/O in its first poll.
+            seed.query("CREATE (n:BoltRmw {id: 'counter', value: 0})", "neo4j")
+                .await;
+            assert_eq!(
+                seed.query(READ, "neo4j").await,
+                vec![vec![PackValue::Int(0)]]
+            );
+            seed.send(&BoltMessage::Goodbye).await;
+            fixture
+        }
+
+        async fn client(&self) -> BoltTestClient {
+            BoltTestClient::connect_with_auth(self.addr, "ferrosa_admin", "ferrosa_admin").await
+        }
+
+        async fn stop(mut self) {
+            self.shutdown.send(true).unwrap();
+            self.server.take().unwrap().await.unwrap().unwrap();
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                let _ = self.shutdown.send(true);
+                server.abort();
+            }
+        }
+    }
+
+    async fn begin(client: &mut BoltTestClient) {
+        client
+            .send(&BoltMessage::Begin {
+                extra: vec![("db".into(), PackValue::String("neo4j".into()))],
+            })
+            .await;
+        client.expect_success("BEGIN increment").await;
+    }
+
+    // Unlike the ordinary helper, retain FAILURE metadata so the oracle can
+    // distinguish a retryable conflict from syntax/storage/unsupported errors.
+    // Raw Bolt deliberately has no driver retries.
+    async fn increment(client: &mut BoltTestClient, query: &str) -> Outcome {
+        client
+            .send(&BoltMessage::Run {
+                query: query.into(),
+                params: vec![],
+                extra: vec![("db".into(), PackValue::String("neo4j".into()))],
+            })
+            .await;
+        match client.recv().await {
+            BoltMessage::Success { .. } => {}
+            BoltMessage::Failure { metadata } => return Err(metadata),
+            other => panic!("increment RUN expected SUCCESS or conflict, got {other:?}"),
+        }
+        client
+            .send(&BoltMessage::Pull {
+                extra: vec![("n".into(), PackValue::Int(-1))],
+            })
+            .await;
+        let mut rows = Vec::new();
+        loop {
+            match client.recv().await {
+                BoltMessage::Record { values } => rows.push(values),
+                BoltMessage::Success { .. } => return Ok(rows),
+                BoltMessage::Failure { metadata } => return Err(metadata),
+                other => panic!("increment PULL expected records/SUCCESS/conflict, got {other:?}"),
+            }
+        }
+    }
+
+    async fn commit(client: &mut BoltTestClient, run: Outcome) -> Outcome {
+        let rows = run?;
+        client.send(&BoltMessage::Commit).await;
+        match client.recv().await {
+            BoltMessage::Success { .. } => Ok(rows),
+            BoltMessage::Failure { metadata } => Err(metadata),
+            other => panic!("increment COMMIT expected SUCCESS or conflict, got {other:?}"),
+        }
+    }
+
+    async fn recover(client: &mut BoltTestClient, outcome: &Outcome) {
+        if outcome.is_err() {
+            client.send(&BoltMessage::Reset).await;
+            client
+                .expect_success("RESET after increment conflict")
+                .await;
+        }
+    }
+
+    fn committed_value(outcome: &Outcome) -> Option<i64> {
+        match outcome {
+            Ok(rows) => match rows.as_slice() {
+                [row] => match row.as_slice() {
+                    [PackValue::Int(value)] => Some(*value),
+                    _ => panic!("increment must return exactly one integer: {rows:?}"),
+                },
+                _ => panic!("increment must match exactly the existing counter: {rows:?}"),
+            },
+            Err(metadata) => {
+                let code = metadata
+                    .iter()
+                    .find_map(|(key, value)| match (key.as_str(), value) {
+                        ("code", PackValue::String(code)) => Some(code.as_str()),
+                        _ => None,
+                    });
+                assert!(
+                    matches!(
+                        code,
+                        Some(
+                            "Neo.TransientError.Transaction.DeadlockDetected"
+                                | "Neo.TransientError.Transaction.Conflict"
+                                | "Neo.TransientError.Transaction.TransactionConflict"
+                                | "Neo.TransientError.Transaction.WriteConflict"
+                        )
+                    ),
+                    "only an explicit retryable conflict is acceptable: {metadata:?}"
+                );
+                None
+            }
+        }
+    }
+
+    async fn value(client: &mut BoltTestClient) -> i64 {
+        let rows = client.query(READ, "neo4j").await;
+        committed_value(&Ok(rows)).unwrap()
+    }
+
+    async fn check_rollback_cleanup(client: &mut BoltTestClient, observer: &mut BoltTestClient) {
+        let before = value(observer).await;
+        begin(client).await;
+        let staged = increment(client, FIRST).await;
+        assert_eq!(staged, Ok(vec![vec![PackValue::Int(before + 1)]]));
+        assert_eq!(value(observer).await, before, "pending increment leaked");
+        client.send(&BoltMessage::Rollback).await;
+        client.expect_success("ROLLBACK cleanup increment").await;
+        assert_eq!(
+            value(client).await,
+            before,
+            "rollback retained own pending value"
+        );
+        assert_eq!(
+            value(observer).await,
+            before,
+            "rollback published an increment"
+        );
+    }
+
+    async fn explicit_overlap(rollback_first: bool) {
+        let fixture = Fixture::start().await;
+        let mut first = fixture.client().await;
+        let mut second = fixture.client().await;
+        let mut observer = fixture.client().await;
+        begin(&mut first).await;
+        begin(&mut second).await;
+        assert_eq!(
+            increment(&mut first, FIRST).await,
+            Ok(vec![vec![PackValue::Int(1)]])
+        );
+        assert_eq!(
+            value(&mut first).await,
+            1,
+            "first must read its pending increment"
+        );
+        assert_eq!(
+            value(&mut observer).await,
+            0,
+            "first must remain unpublished"
+        );
+
+        let (probe, polled) = Probe::observe_poll();
+        fixture
+            .engine
+            .set_query_execution_probe_for_test(SECOND, probe);
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let second_task = tokio::spawn(async move {
+            let run = increment(&mut second, SECOND).await;
+            finish_rx.await.unwrap();
+            let outcome = commit(&mut second, run).await;
+            recover(&mut second, &outcome).await;
+            (second, outcome)
+        });
+        // The server polls the second RUN before we finish the first tx. On
+        // today's direct PK path this stages 1 in that poll. With write locking,
+        // the poll may instead pend on the first tx's lock. Do NOT wait for both
+        // RUN responses: doing so would deadlock a correct locking implementation.
+        let ready = polled.await.expect("second execution must be polled");
+        eprintln!("explicit rollback_first={rollback_first}: second first-poll ready={ready}");
+        first
+            .send(&if rollback_first {
+                BoltMessage::Rollback
+            } else {
+                BoltMessage::Commit
+            })
+            .await;
+        first
+            .expect_success("finish first overlapping transaction")
+            .await;
+        finish_tx.send(()).unwrap();
+        let (mut second, outcome) = second_task.await.unwrap();
+        let final_value = value(&mut observer).await;
+        // Exercise cleanup before the RED oracle, so failed isolation does not
+        // hide rollback/recovery checks or leave an open test transaction.
+        check_rollback_cleanup(&mut second, &mut observer).await;
+        first.send(&BoltMessage::Goodbye).await;
+        second.send(&BoltMessage::Goodbye).await;
+        observer.send(&BoltMessage::Goodbye).await;
+        fixture.stop().await;
+
+        let second_value = committed_value(&outcome);
+        let expected = i64::from(!rollback_first) + i64::from(second_value.is_some());
+        assert_eq!(final_value, expected,
+            "lost explicit increment: rollback_first={rollback_first}, second={outcome:?}; successful COMMITs must be conserved");
+        if let Some(second_value) = second_value {
+            assert_eq!(
+                second_value, expected,
+                "second must increment the committed value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_explicit_commits_conserve_increments() {
+        tokio::time::timeout(HANG_GUARD, explicit_overlap(false))
+            .await
+            .expect("overlapping explicit increments must not hang");
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_explicit_rollback_discards_increment_and_releases_writer() {
+        tokio::time::timeout(HANG_GUARD, explicit_overlap(true))
+            .await
+            .expect("overlapping rollback must not hang");
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_autocommit_conserves_overlapping_increments() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::start().await;
+            let mut first = fixture.client().await;
+            let mut second = fixture.client().await;
+            let mut observer = fixture.client().await;
+            assert_eq!(value(&mut observer).await, 0);
+            let (probe, evaluated, release) = Probe::pause_write();
+            fixture.engine.set_query_execution_probe_for_test(FIRST, probe);
+            let first_task = tokio::spawn(async move {
+                let outcome = increment(&mut first, FIRST).await;
+                recover(&mut first, &outcome).await;
+                (first, outcome)
+            });
+            evaluated.await.expect("first increment must evaluate its RHS");
+            let (probe, polled) = Probe::observe_poll();
+            fixture.engine.set_query_execution_probe_for_test(SECOND, probe);
+            let second_task = tokio::spawn(async move {
+                let outcome = increment(&mut second, SECOND).await;
+                recover(&mut second, &outcome).await;
+                (second, outcome)
+            });
+            // Current synchronous Direct PK read/write completes in this poll
+            // while first is paused after reading 0. A future write lock may
+            // instead return Pending; release first then so it can make progress.
+            // No sleep, elapsed-time race, driver retry, or second RUN-response
+            // rendezvous determines the interleaving.
+            let ready = polled.await.expect("second execution must be polled");
+            eprintln!("autocommit: second first-poll ready={ready}");
+            release.send(()).unwrap();
+            let (mut first, first_outcome) = first_task.await.unwrap();
+            let (mut second, second_outcome) = second_task.await.unwrap();
+            let final_value = value(&mut observer).await;
+            check_rollback_cleanup(&mut first, &mut observer).await;
+            first.send(&BoltMessage::Goodbye).await;
+            second.send(&BoltMessage::Goodbye).await;
+            observer.send(&BoltMessage::Goodbye).await;
+            fixture.stop().await;
+
+            let values: Vec<_> = [&first_outcome, &second_outcome].into_iter().filter_map(committed_value).collect();
+            assert!(!values.is_empty(), "one uncontended increment must succeed");
+            assert_eq!(final_value, values.len() as i64,
+                "lost autocommit increment: first={first_outcome:?}, second={second_outcome:?}; successes must be conserved");
+            let mut sorted = values;
+            sorted.sort_unstable();
+            assert_eq!(sorted, (1..=final_value).collect::<Vec<_>>(), "successful increments must return exact successive values");
+        }).await.expect("overlapping autocommit increments must not hang");
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_nested_writes_and_independent_keys_wait() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::start().await;
+            let mut holder = fixture.client().await;
+            begin(&mut holder).await;
+            increment(&mut holder, FIRST).await.unwrap();
+            for query in [
+                "CREATE (n:BoltRmw {id: 'unrelated', value: 1})",
+                "MERGE (n:BoltRmw {id: 'counter'}) SET n.value = 2",
+                "MATCH (n:BoltRmw) REMOVE n.value",
+                "MATCH (n:BoltRmw) DELETE n",
+                "UNWIND $xs AS x CREATE (n:BoltRmw {id: x, value: 1})",
+                "FOREACH (x IN ['other'] | FOREACH (y IN [x] | CREATE (n:BoltRmw {id: y, value: 1})))",
+                "MATCH (n:BoltRmw) CALL { WITH n MATCH (m:BoltRmw {id: 'counter'}) SET m.value = n.value + 1 } RETURN n.value",
+                "RETURN 1 AS x UNION ALL MATCH (n:BoltRmw) SET n.value = n.value + 1 RETURN n.value AS x",
+            ] {
+                let params = HashMap::from([("xs".into(), serde_json::json!(["other"]))]);
+                let (probe, polled) = Probe::observe_poll();
+                fixture.engine.set_query_execution_probe_for_test(query, probe.clone());
+                let engine = fixture.engine.clone();
+                let task = tokio::spawn(async move { engine.execute_with_params(query, "neo4j", &superuser_auth(), &params).await });
+                assert_wait(&probe, polled).await;
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            }
+            // Read-only composites must not queue on the writer.
+            for query in ["RETURN 1", "UNWIND [1] AS x RETURN x", "RETURN 1 UNION ALL RETURN 2", "MATCH (n:BoltRmw) CALL { WITH n RETURN n.value AS v } RETURN v"] {
+                fixture.engine.execute(query, "neo4j", &superuser_auth()).await.unwrap();
+            }
+            holder.send(&BoltMessage::Rollback).await;
+            holder.expect_success("release after composite classification").await;
+            fixture.stop().await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_replacing_unpulled_result_releases_writer() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::with_query_timeout(std::time::Duration::from_millis(500)).await;
+            let mut client = fixture.client().await;
+            client
+                .send(&BoltMessage::Run {
+                    query: FIRST.into(),
+                    params: vec![],
+                    extra: vec![("db".into(), PackValue::String("neo4j".into()))],
+                })
+                .await;
+            client.expect_success("first RUN without PULL").await;
+            // RUN has always replaced the previous pending result. Dropping it
+            // after executing the replacement now self-waits on its own guard.
+            assert_eq!(
+                increment(&mut client, SECOND).await.unwrap(),
+                vec![vec![PackValue::Int(2)]]
+            );
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_reverse_key_order_terminates() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::start().await;
+            let mut first = fixture.client().await;
+            first
+                .query("CREATE (n:BoltRmw {id: 'other', value: 0})", "neo4j")
+                .await;
+            let other = "MATCH (n:BoltRmw {id: 'other'}) SET n.value = n.value + 1 RETURN n.value";
+            let mut second = fixture.client().await;
+            begin(&mut first).await;
+            begin(&mut second).await;
+            increment(&mut first, FIRST).await.unwrap();
+            let (probe, polled) = Probe::observe_poll();
+            fixture
+                .engine
+                .set_query_execution_probe_for_test(other, probe.clone());
+            let task = tokio::spawn(async move {
+                let other_result = increment(&mut second, other).await.unwrap();
+                let counter_result = increment(&mut second, SECOND).await;
+                (
+                    other_result,
+                    commit(&mut second, counter_result).await.unwrap(),
+                )
+            });
+            assert_wait(&probe, polled).await;
+            assert_eq!(
+                increment(&mut first, other).await.unwrap(),
+                vec![vec![PackValue::Int(1)]]
+            );
+            first.send(&BoltMessage::Commit).await;
+            first.expect_success("COMMIT first key order").await;
+            let (a, b) = task.await.unwrap();
+            assert_eq!(a, vec![vec![PackValue::Int(2)]]);
+            assert_eq!(b, vec![vec![PackValue::Int(2)]]);
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_commit_timeout_releases_owner() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::start().await;
+            let mut holder = fixture.client().await;
+            begin_timeout(&mut holder, 1000).await;
+            increment(&mut holder, FIRST).await.unwrap();
+            // A live finite reader deliberately prevents COMMIT publication.
+            let (_, reader, _) = fixture
+                .engine
+                .execute_stream_with_params(READ, "neo4j", &superuser_auth(), &HashMap::new())
+                .await
+                .unwrap();
+            holder.send(&BoltMessage::Commit).await;
+            assert!(matches!(holder.recv().await, BoltMessage::Failure { .. }));
+            drop(reader);
+            let mut fresh = fixture.client().await;
+            assert_eq!(
+                increment(&mut fresh, SECOND).await.unwrap(),
+                vec![vec![PackValue::Int(1)]]
+            );
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_expired_stream_releases_before_error_is_dropped() {
+        use futures::StreamExt;
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::with_query_timeout(std::time::Duration::from_millis(100)).await;
+            let (_, mut rows, _) = fixture
+                .engine
+                .execute_stream_with_params(FIRST, "neo4j", &superuser_auth(), &HashMap::new())
+                .await
+                .unwrap();
+            // Deadline expiry is the behavior under test, not an overlap guess.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                matches!(
+                    rows.next().await,
+                    Some(Err(ferrosa_graph::error::GraphError::Timeout))
+                ),
+                "expired writer stream must report timeout"
+            );
+            // Keep the failed stream alive: yielding the terminal error must have
+            // already released its admission and publication ownership.
+            assert_eq!(
+                fixture
+                    .engine
+                    .execute(SECOND, "neo4j", &superuser_auth())
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec![serde_json::json!(2)]]
+            );
+            assert!(rows.next().await.is_none());
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_cancelled_autocommit_setup_releases_owner() {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::start().await;
+            let (probe, reached, _release) = Probe::pause_write();
+            fixture
+                .engine
+                .set_query_execution_probe_for_test(FIRST, probe);
+            let engine = fixture.engine.clone();
+            let holder =
+                tokio::spawn(
+                    async move { engine.execute(FIRST, "neo4j", &superuser_auth()).await },
+                );
+            reached.await.unwrap();
+            let (probe, polled) = Probe::observe_poll();
+            fixture
+                .engine
+                .set_query_execution_probe_for_test(SECOND, probe.clone());
+            let engine = fixture.engine.clone();
+            let waiter =
+                tokio::spawn(
+                    async move { engine.execute(SECOND, "neo4j", &superuser_auth()).await },
+                );
+            assert_wait(&probe, polled).await;
+            holder.abort();
+            assert!(holder.await.unwrap_err().is_cancelled());
+            assert_eq!(
+                waiter.await.unwrap().unwrap().rows,
+                vec![vec![serde_json::json!(1)]]
+            );
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn begin_timeout(client: &mut BoltTestClient, millis: i64) {
+        client
+            .send(&BoltMessage::Begin {
+                extra: vec![
+                    ("db".into(), PackValue::String("neo4j".into())),
+                    ("tx_timeout".into(), PackValue::Int(millis)),
+                ],
+            })
+            .await;
+        client.expect_success("BEGIN bounded writer").await;
+    }
+
+    async fn assert_wait(probe: &Probe, polled: oneshot::Receiver<bool>) {
+        let ready = polled.await.unwrap();
+        assert!(
+            !ready,
+            "contending writer must wait before evaluating MATCH"
+        );
+        assert!(
+            probe.waiting.load(std::sync::atomic::Ordering::SeqCst),
+            "Pending must be actual writer admission, not unrelated scan I/O"
+        );
+    }
+
+    async fn cross_mode(first_explicit: bool) {
+        let fixture = Fixture::start().await;
+        let mut first = fixture.client().await;
+        let mut second = fixture.client().await;
+        let mut observer = fixture.client().await;
+        let (first_task, release) = if first_explicit {
+            begin(&mut first).await;
+            assert_eq!(
+                increment(&mut first, FIRST).await.unwrap(),
+                vec![vec![PackValue::Int(1)]]
+            );
+            (None, None)
+        } else {
+            begin(&mut second).await;
+            let (probe, reached, release) = Probe::pause_write();
+            fixture
+                .engine
+                .set_query_execution_probe_for_test(FIRST, probe);
+            let mut writer = fixture.client().await;
+            let task = tokio::spawn(async move { increment(&mut writer, FIRST).await });
+            reached.await.unwrap();
+            (Some(task), Some(release))
+        };
+        let (probe, polled) = Probe::observe_poll();
+        fixture
+            .engine
+            .set_query_execution_probe_for_test(SECOND, probe.clone());
+        let task = tokio::spawn(async move {
+            let result = increment(&mut second, SECOND).await;
+            if first_explicit {
+                result
+            } else {
+                commit(&mut second, result).await
+            }
+        });
+        assert_wait(&probe, polled).await;
+        assert_eq!(
+            value(&mut observer).await,
+            0,
+            "reader must complete while holder and waiter exist"
+        );
+        if let Some(release) = release {
+            release.send(()).unwrap();
+        }
+        if let Some(task) = first_task {
+            assert_eq!(task.await.unwrap().unwrap(), vec![vec![PackValue::Int(1)]]);
+        }
+        if first_explicit {
+            first.send(&BoltMessage::Commit).await;
+            first.expect_success("COMMIT holder").await;
+        }
+        assert_eq!(task.await.unwrap().unwrap(), vec![vec![PackValue::Int(2)]]);
+        assert_eq!(value(&mut observer).await, 2);
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_explicit_then_autocommit() {
+        tokio::time::timeout(HANG_GUARD, cross_mode(true))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_autocommit_then_explicit() {
+        tokio::time::timeout(HANG_GUARD, cross_mode(false))
+            .await
+            .unwrap();
+    }
+
+    async fn terminal_release(terminal: &str) {
+        let fixture = Fixture::start().await;
+        let mut holder = fixture.client().await;
+        let mut observer = fixture.client().await;
+        if terminal == "timeout" {
+            begin_timeout(&mut holder, 1000).await;
+        } else {
+            begin(&mut holder).await;
+        }
+        increment(&mut holder, FIRST).await.unwrap();
+        // Reusing admission across RUNs must preserve all own writes.
+        assert_eq!(
+            increment(&mut holder, FIRST).await.unwrap(),
+            vec![vec![PackValue::Int(2)]]
+        );
+        assert_eq!(value(&mut holder).await, 2);
+        let (probe, polled) = Probe::observe_poll();
+        fixture
+            .engine
+            .set_query_execution_probe_for_test(SECOND, probe.clone());
+        let mut waiter = fixture.client().await;
+        let task = tokio::spawn(async move { increment(&mut waiter, SECOND).await });
+        assert_wait(&probe, polled).await;
+        assert_eq!(value(&mut observer).await, 0);
+        match terminal {
+            "rollback" => {
+                holder.send(&BoltMessage::Rollback).await;
+                holder.expect_success("ROLLBACK holder").await;
+            }
+            "reset" => {
+                holder.send(&BoltMessage::Reset).await;
+                holder.expect_success("RESET holder").await;
+            }
+            "eof" => {
+                drop(holder);
+            }
+            "error" => {
+                assert!(
+                    increment(&mut holder, "MATCH (n:BoltRmw) SET n.missing = 1")
+                        .await
+                        .is_err()
+                );
+            }
+            "memory" => {
+                holder
+                    .send(&BoltMessage::Run {
+                        query: "CREATE (n:BoltRmw {id: $large, value: 0})".into(),
+                        params: vec![(
+                            "large".into(),
+                            PackValue::String("x".repeat(5 * 1024 * 1024)),
+                        )],
+                        extra: vec![],
+                    })
+                    .await;
+                let reply = holder.recv().await;
+                assert!(
+                    matches!(&reply, BoltMessage::Failure { metadata } if metadata.iter().any(|(k,v)| k == "message" && matches!(v, PackValue::String(s) if s.contains("memory limit")))),
+                    "{reply:?}"
+                );
+            }
+            "timeout" => {} // Idle holder's absolute deadline is the event under test.
+            _ => unreachable!(),
+        }
+        assert_eq!(task.await.unwrap().unwrap(), vec![vec![PackValue::Int(1)]]);
+        assert_eq!(value(&mut observer).await, 1, "aborted own writes leaked");
+        fixture.stop().await;
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_terminal_rollback() {
+        tokio::time::timeout(HANG_GUARD, terminal_release("rollback"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_terminal_reset() {
+        tokio::time::timeout(HANG_GUARD, terminal_release("reset"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_terminal_eof() {
+        tokio::time::timeout(HANG_GUARD, terminal_release("eof"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_terminal_error() {
+        tokio::time::timeout(HANG_GUARD, terminal_release("error"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_terminal_memory() {
+        tokio::time::timeout(HANG_GUARD, terminal_release("memory"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_terminal_timeout() {
+        tokio::time::timeout(HANG_GUARD, terminal_release("timeout"))
+            .await
+            .unwrap();
+    }
+
+    async fn waiter_timeout(explicit: bool) {
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::with_query_timeout(std::time::Duration::from_millis(500)).await;
+            let mut holder = fixture.client().await;
+            begin(&mut holder).await;
+            increment(&mut holder, FIRST).await.unwrap();
+            {
+                let mut waiter = fixture.client().await;
+                if explicit {
+                    begin_timeout(&mut waiter, 100).await;
+                }
+                let result = increment(&mut waiter, SECOND).await;
+                assert!(
+                    result.is_err(),
+                    "queued writer must time out, got {result:?}"
+                );
+                let metadata = result.unwrap_err();
+                assert!(
+                    metadata.iter().any(|(k, v)| k == "message"
+                        && matches!(v, PackValue::String(s) if s.contains("timeout"))),
+                    "{metadata:?}"
+                );
+                waiter.send(&BoltMessage::Reset).await;
+                waiter.expect_success("RESET timed-out waiter").await;
+            }
+            holder.send(&BoltMessage::Rollback).await;
+            holder.expect_success("release holder").await;
+            assert_eq!(
+                increment(&mut holder, FIRST).await.unwrap(),
+                vec![vec![PackValue::Int(1)]]
+            );
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_waiter_timeout_explicit() {
+        waiter_timeout(true).await;
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_waiter_timeout_autocommit() {
+        waiter_timeout(false).await;
+    }
+
+    #[tokio::test]
+    async fn bolt_rmw_gate_stream_drop_and_cancelled_waiter() {
+        use futures::StreamExt;
+        tokio::time::timeout(HANG_GUARD, async {
+            let fixture = Fixture::start().await;
+            let auth = superuser_auth();
+            let (_, rows, _) = fixture
+                .engine
+                .execute_stream_with_params(FIRST, "neo4j", &auth, &HashMap::new())
+                .await
+                .unwrap();
+            let (probe, polled) = Probe::observe_poll();
+            fixture
+                .engine
+                .set_query_execution_probe_for_test(SECOND, probe.clone());
+            let engine = fixture.engine.clone();
+            let task =
+                tokio::spawn(
+                    async move { engine.execute(SECOND, "neo4j", &superuser_auth()).await },
+                );
+            assert_wait(&probe, polled).await;
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            // No cancelled reservation may acquire and retain the gate later.
+            drop(rows);
+            assert_eq!(
+                fixture
+                    .engine
+                    .execute(SECOND, "neo4j", &auth)
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec![serde_json::json!(2)]]
+            );
+            // Also release after exhaustion without requiring caller to drop the stream object.
+            let (_, mut drained, _) = fixture
+                .engine
+                .execute_stream_with_params(FIRST, "neo4j", &auth, &HashMap::new())
+                .await
+                .unwrap();
+            while let Some(row) = drained.next().await {
+                row.unwrap();
+            }
+            assert_eq!(
+                fixture
+                    .engine
+                    .execute(SECOND, "neo4j", &auth)
+                    .await
+                    .unwrap()
+                    .rows,
+                vec![vec![serde_json::json!(4)]]
+            );
+            fixture.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+}
+
+// t_a4712717 RED checkpoint: authenticated single-node Bolt transactions.
+// Test list: auto-commit control; BEGIN selects neo4j; RUN reads its own writes;
+// another connection sees no pending writes; COMMIT publishes both writes;
+// ROLLBACK publishes neither. No production changes in this bounded cycle.
+#[tokio::test]
+async fn single_node_explicit_transaction_commit_publishes_pending_writes() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("commit"),
+    )
+    .await
+    .expect("Bolt commit lifecycle must not hang");
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_rollback_discards_pending_writes() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("rollback"),
+    )
+    .await
+    .expect("Bolt rollback lifecycle must not hang");
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_error_discards_pending_writes() {
+    tokio::time::timeout(HANG_GUARD, assert_single_node_explicit_transaction("error"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_reset_discards_pending_writes() {
+    tokio::time::timeout(HANG_GUARD, assert_single_node_explicit_transaction("reset"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_disconnect_discards_pending_writes() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("disconnect"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_timeout_discards_pending_writes() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("timeout"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_set_delete_reads_own_changes() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("mutate"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_commit_failure_persists_nothing() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("commit_failure"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_memory_limit_discards_pending_writes() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("memory_limit"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_adjacency_is_published_only_at_commit() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("adjacency"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn single_node_explicit_transaction_timeout_preserves_partial_frame() {
+    tokio::time::timeout(
+        HANG_GUARD,
+        assert_single_node_explicit_transaction("partial_timeout"),
+    )
+    .await
+    .unwrap();
+}
+
+async fn assert_single_node_explicit_transaction(finish_mode: &str) {
+    let (schema, storage, _dir) = setup();
+    let database = if finish_mode == "adjacency" {
+        "social"
+    } else {
+        "neo4j"
+    };
+    if finish_mode == "adjacency" {
+        create_social_graph_schema(&schema);
+        register_social_tables_with_storage(&storage);
+    }
+    schema
+        .create_keyspace(
+            KeyspaceMetadata {
+                name: "neo4j".into(),
+                durable_writes: true,
+                replication: ReplicationParams {
+                    strategy: "SimpleStrategy".into(),
+                    options: HashMap::from([("replication_factor".into(), "1".into())]),
+                },
+            },
+            &superuser_auth(),
+        )
+        .unwrap();
+    // Existing fixture uses the real StorageEngine and WritePath::direct.
+    let (_, engine) = build_app_and_engine(Arc::clone(&schema), storage);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server = tokio::spawn(ferrosa_graph::bolt::server::start_bolt_server(
+        engine,
+        schema,
+        ferrosa_graph::bolt::server::BoltConfig {
+            bind_addr: addr,
+            auth_disabled: false,
+            ..Default::default()
+        },
+        shutdown_rx,
+    ));
+    let mut writer =
+        BoltTestClient::connect_with_auth(addr, "ferrosa_admin", "ferrosa_admin").await;
+    let mut observer =
+        BoltTestClient::connect_with_auth(addr, "ferrosa_admin", "ferrosa_admin").await;
+
+    assert_eq!(
+        writer.query("RETURN 1 AS value", database).await,
+        vec![vec![PackValue::Int(1)]],
+        "authenticated auto-commit control must work before BEGIN"
+    );
+    // Materialize the label before BEGIN so transactional DDL is not required.
+    writer
+        .query(
+            "MERGE (n:BaselineTx {name: 'seed', value: 0, payload: ''}) RETURN n.name",
+            database,
+        )
+        .await;
+    let read = "MATCH (n:BaselineTx) WHERE n.name <> 'seed' RETURN n.name ORDER BY n.name";
+    assert!(observer.query(read, database).await.is_empty());
+
+    writer
+        .send(&BoltMessage::Begin {
+            extra: vec![
+                ("db".into(), PackValue::String(database.into())),
+                (
+                    "tx_timeout".into(),
+                    PackValue::Int(if finish_mode.ends_with("timeout") {
+                        1000
+                    } else {
+                        30000
+                    }),
+                ),
+            ],
+        })
+        .await;
+    writer.expect_success("BEGIN db=neo4j").await;
+    // Like a driver's explicit transaction, RUN inherits the database from BEGIN.
+    assert_eq!(
+        writer.query_with_extra("RETURN 1 AS value", vec![]).await,
+        vec![vec![PackValue::Int(1)]]
+    );
+    for name in ["first", "second"] {
+        writer
+            .query_with_extra(&format!("CREATE (n:BaselineTx {{name: '{name}'}})"), vec![])
+            .await;
+        assert_eq!(
+            writer
+                .query_with_extra(
+                    &format!("MATCH (n:BaselineTx {{name: '{name}'}}) RETURN n.name"),
+                    vec![]
+                )
+                .await,
+            vec![vec![PackValue::String(name.into())]]
+        );
+        assert!(
+            observer.query(read, database).await.is_empty(),
+            "uncommitted writes must remain invisible to another connection"
+        );
+    }
+    let expected = vec![
+        vec![PackValue::String("first".into())],
+        vec![PackValue::String("second".into())],
+    ];
+    assert_eq!(
+        writer.query_with_extra(read, vec![]).await,
+        expected,
+        "a transaction must read its own pending writes"
+    );
+    let mut expected = expected;
+    match finish_mode {
+        "adjacency" => {
+            writer
+                .query_with_extra(
+                    "MERGE (a:Person {name: 'TxA'})-[r:KNOWS]->(b:Person {name: 'TxB'})",
+                    vec![],
+                )
+                .await;
+            let traversal = "MATCH (a:Person {name: 'TxA'})-[:KNOWS]->(b:Person) RETURN b.name";
+            assert_eq!(
+                writer.query_with_extra(traversal, vec![]).await,
+                vec![vec![PackValue::String("TxB".into())]]
+            );
+            assert!(observer.query(traversal, database).await.is_empty());
+            writer.send(&BoltMessage::Commit).await;
+            writer.expect_success("COMMIT adjacency").await;
+            assert_eq!(
+                observer.query(traversal, database).await,
+                vec![vec![PackValue::String("TxB".into())]]
+            );
+        }
+        "memory_limit" => {
+            writer
+                .send(&BoltMessage::Run {
+                    query: format!(
+                        "CREATE (n:BaselineTx {{name: 'large', payload: '{}'}})",
+                        "x".repeat(9 * 1024 * 1024)
+                    ),
+                    params: vec![],
+                    extra: vec![],
+                })
+                .await;
+            assert!(matches!(writer.recv().await, BoltMessage::Failure { .. }));
+            writer.send(&BoltMessage::Reset).await;
+            writer.expect_success("RESET after memory limit").await;
+            expected.clear();
+        }
+        "commit_failure" => {
+            // Staging succeeds; the durable batch preflight rejects a record
+            // larger than the fixture's 4 KiB commit-log segment.
+            writer
+                .query_with_extra(
+                    &format!(
+                        "CREATE (n:BaselineTx {{name: '{}'}}) RETURN n.name",
+                        "x".repeat(5000)
+                    ),
+                    vec![],
+                )
+                .await;
+            writer.send(&BoltMessage::Commit).await;
+            assert!(matches!(writer.recv().await, BoltMessage::Failure { .. }));
+            writer.send(&BoltMessage::Reset).await;
+            writer.expect_success("RESET after commit failure").await;
+            expected.clear();
+        }
+        "mutate" => {
+            writer
+                .query_with_extra(
+                    "MATCH (n:BaselineTx {name: 'seed'}) SET n.value = 7 RETURN n.value",
+                    vec![],
+                )
+                .await;
+            assert_eq!(
+                writer
+                    .query_with_extra("MATCH (n:BaselineTx {name: 'seed'}) RETURN n.value", vec![])
+                    .await,
+                vec![vec![PackValue::Int(7)]]
+            );
+            assert_eq!(
+                observer
+                    .query(
+                        "MATCH (n:BaselineTx {name: 'seed'}) RETURN n.value",
+                        database
+                    )
+                    .await,
+                vec![vec![PackValue::Int(0)]]
+            );
+            writer
+                .query_with_extra(
+                    "MATCH (n:BaselineTx {name: 'first'}) SET n.value = 42 RETURN n.value",
+                    vec![],
+                )
+                .await;
+            assert_eq!(
+                writer
+                    .query_with_extra(
+                        "MATCH (n:BaselineTx {name: 'first'}) RETURN n.value",
+                        vec![]
+                    )
+                    .await,
+                vec![vec![PackValue::Int(42)]]
+            );
+            writer
+                .query_with_extra("MATCH (n:BaselineTx {name: 'second'}) DELETE n", vec![])
+                .await;
+            assert_eq!(
+                writer.query_with_extra(read, vec![]).await,
+                vec![vec![PackValue::String("first".into())]]
+            );
+            assert!(observer.query(read, database).await.is_empty());
+            writer.send(&BoltMessage::Commit).await;
+            writer.expect_success("COMMIT after SET/DELETE").await;
+            expected.truncate(1);
+        }
+        "error" => {
+            writer
+                .send(&BoltMessage::Run {
+                    query: "THIS IS NOT CYPHER".into(),
+                    params: vec![],
+                    extra: vec![],
+                })
+                .await;
+            assert!(matches!(writer.recv().await, BoltMessage::Failure { .. }));
+            writer.send(&BoltMessage::Commit).await;
+            assert!(matches!(
+                writer.recv().await,
+                BoltMessage::Ignored | BoltMessage::Failure { .. }
+            ));
+            writer.send(&BoltMessage::Reset).await;
+            writer.expect_success("RESET after error").await;
+            expected.clear();
+        }
+        "partial_timeout" => {
+            use ferrosa_graph::bolt::codec::{chunk_encode, DEFAULT_MAX_CHUNK_SIZE};
+            use tokio::io::AsyncWriteExt;
+            let frame = chunk_encode(&BoltMessage::Commit.encode(), DEFAULT_MAX_CHUNK_SIZE);
+            writer.stream.write_all(&frame[..3]).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            writer.stream.write_all(&frame[3..]).await.unwrap();
+            assert!(matches!(writer.recv().await, BoltMessage::Failure { .. }));
+            writer.send(&BoltMessage::Reset).await;
+            writer
+                .expect_success("RESET after partial frame timeout")
+                .await;
+            expected.clear();
+        }
+        "timeout" => {
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            writer.send(&BoltMessage::Commit).await;
+            assert!(matches!(writer.recv().await, BoltMessage::Failure { .. }));
+            writer.send(&BoltMessage::Reset).await;
+            writer.expect_success("RESET after timeout").await;
+            expected.clear();
+        }
+        "disconnect" => {
+            drop(writer);
+            writer =
+                BoltTestClient::connect_with_auth(addr, "ferrosa_admin", "ferrosa_admin").await;
+            expected.clear();
+        }
+        mode => {
+            let finish = match mode {
+                "commit" => BoltMessage::Commit,
+                "reset" => BoltMessage::Reset,
+                _ => BoltMessage::Rollback,
+            };
+            writer.send(&finish).await;
+            writer.expect_success(mode).await;
+            if mode != "commit" {
+                expected.clear();
+            }
+        }
+    }
+    assert_eq!(observer.query(read, database).await, expected);
+    assert_eq!(writer.query(read, database).await, expected);
+    assert_eq!(
+        observer
+            .query(
+                "MATCH (n:BaselineTx {name: 'seed'}) RETURN n.name",
+                database
+            )
+            .await,
+        vec![vec![PackValue::String("seed".into())]],
+        "finishing the transaction must preserve earlier committed data"
+    );
+    writer.send(&BoltMessage::Goodbye).await;
+    observer.send(&BoltMessage::Goodbye).await;
+    shutdown_tx.send(true).unwrap();
+    server.await.unwrap().unwrap();
 }
 
 /// Direct-CQL snapshot of the post-delete state of the `Center` node: its

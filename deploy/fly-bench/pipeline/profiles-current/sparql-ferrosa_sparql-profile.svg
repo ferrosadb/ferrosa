@@ -1,0 +1,2814 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="902" onload="init(evt)" viewBox="0 0 1200 902" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="902.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >pipeline_bolt_protocol_139_profile_sparql-ferrosa_sparql-profile CPU</text>
+<text id="details" x="10.00" y="885" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="885" > </text>
+<g id="frames">
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.24%)</title><rect x="739.9" y="149" width="2.9" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="742.93" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;ferrosa_storage::replay_set_aside::SetAsideFileStatus&gt; as core::ops::drop::Drop&gt;::drop (1 samples, 0.24%)</title><rect x="399.5" y="245" width="2.9" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="402.49" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt; as tokio::runtime::task::Schedule&gt;::yield_now (3 samples, 0.73%)</title><rect x="70.6" y="597" width="8.6" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="73.59" y="607.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;ferrosa::supervisor::supervise&lt;ferrosa::run::{closure#0}::{closure#40}, ferrosa::supervisor::run_commit_log_sync_supervisor&lt;ferrosa_storage::engine::StorageEngine&gt;::{closure#0}&gt;::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (1 samples, 0.24%)</title><rect x="1175.6" y="613" width="2.9" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="1178.57" y="623.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (384 samples, 93.89%)</title><rect x="67.7" y="613" width="1107.9" height="15.0" fill="rgb(209,19,4)" rx="2" ry="2" />
+<text  x="70.70" y="623.5" >&lt;tokio::runtime::task::harness::Harness&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Route..</text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.24%)</title><rect x="382.2" y="261" width="2.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="385.18" y="271.5" ></text>
+</g>
+<g >
+<title>alloc::fmt::format::format_inner (1 samples, 0.24%)</title><rect x="918.8" y="149" width="2.9" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="921.80" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::layer::layered::Layered&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt; as tracing_core::subscriber::Subscriber&gt;::try_close (3 samples, 0.73%)</title><rect x="939.0" y="165" width="8.7" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="942.00" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::io::poll_evented::PollEvented&lt;mio::net::tcp::stream::TcpStream&gt;&gt;::poll_read (1 samples, 0.24%)</title><rect x="136.9" y="437" width="2.9" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="139.94" y="447.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::component (3 samples, 0.73%)</title><rect x="1016.9" y="165" width="8.7" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="1019.89" y="175.5" ></text>
+</g>
+<g >
+<title>all (409 samples, 100%)</title><rect x="10.0" y="853" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="863.5" ></text>
+</g>
+<g >
+<title>&lt;axum::routing::Router&gt;::call_with_state (10 samples, 2.44%)</title><rect x="217.7" y="517" width="28.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="220.73" y="527.5" >&lt;a..</text>
+</g>
+<g >
+<title>&lt;crossbeam_skiplist::base::SkipList&lt;ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt;&gt;::search_bound::&lt;ferrosa_common::key::DecoratedKey&gt; (3 samples, 0.73%)</title><rect x="725.5" y="101" width="8.7" height="15.0" fill="rgb(253,221,52)" rx="2" ry="2" />
+<text  x="728.50" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::span_guard_stack::SpanGuardStack&gt;::push (3 samples, 0.73%)</title><rect x="783.2" y="165" width="8.7" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="786.20" y="175.5" ></text>
+</g>
+<g >
+<title>core::io::error::os_functions::get_os_functions (1 samples, 0.24%)</title><rect x="413.9" y="245" width="2.9" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="416.91" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;sentry_core::hub::Hub&gt;&gt;::drop_slow (2 samples, 0.49%)</title><rect x="927.5" y="149" width="5.7" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="930.46" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::combinators::map_err::MapErr&lt;http_body_util::limited::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt; as http_body::Body&gt;::poll_frame (3 samples, 0.73%)</title><rect x="269.7" y="261" width="8.6" height="15.0" fill="rgb(242,174,41)" rx="2" ry="2" />
+<text  x="272.66" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;nu_ansi_term::display::AnsiGenericString&lt;str&gt; as core::fmt::Display&gt;::fmt (1 samples, 0.24%)</title><rect x="901.5" y="85" width="2.9" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="904.49" y="95.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::protocol::validate (2 samples, 0.49%)</title><rect x="1135.2" y="277" width="5.8" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="1138.18" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::table_deletion (3 samples, 0.73%)</title><rect x="725.5" y="165" width="8.7" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="728.50" y="175.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="526.4" y="117" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="529.43" y="127.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="1106.3" y="197" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1109.33" y="207.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.24%)</title><rect x="307.2" y="277" width="2.8" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="310.16" y="287.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_alloc (1 samples, 0.24%)</title><rect x="615.9" y="213" width="2.9" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="618.87" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::algebra::GraphPattern&gt;::lookup_in_scope_variables::&lt;spargebra::parser::build_select::{closure#0}&gt; (2 samples, 0.49%)</title><rect x="480.3" y="213" width="5.7" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="483.27" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt; (4 samples, 0.98%)</title><rect x="745.7" y="117" width="11.5" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="748.70" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::server::conn::auto::UpgradeableConnection&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;, hyper_util::service::glue::TowerToHyperService&lt;tower::util::map_request::MapRequest&lt;axum::routing::Router, axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#2}&gt;&gt;, hyper_util::rt::tokio::TokioExecutor&gt; as core::future::future::Future&gt;::poll (371 samples, 90.71%)</title><rect x="99.4" y="549" width="1070.4" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="102.44" y="559.5" >&lt;hyper_util::server::conn::auto::UpgradeableConnection&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;, hyper_util::service::glue:..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (1 samples, 0.24%)</title><rect x="595.7" y="213" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="598.67" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::registry::extensions::ExtensionsMut&gt;::insert::&lt;sentry_tracing::layer::SentrySpanData&gt; (1 samples, 0.24%)</title><rect x="835.1" y="133" width="2.9" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="838.13" y="143.5" ></text>
+</g>
+<g >
+<title>ferrosa_common::murmur3::get_block_i64 (1 samples, 0.24%)</title><rect x="1080.4" y="181" width="2.9" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="1083.37" y="191.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::protocol::validate_post_options (4 samples, 0.98%)</title><rect x="1129.4" y="293" width="11.6" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="1132.41" y="303.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http_body_util::combinators::map_err::MapErr&lt;http_body_util::limited::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt;&gt; (1 samples, 0.24%)</title><rect x="284.1" y="261" width="2.9" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="287.08" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::park_internal (15 samples, 3.67%)</title><rect x="24.4" y="629" width="43.3" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="27.43" y="639.5" >&lt;tok..</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_common::schema::TableSchema&gt; (1 samples, 0.24%)</title><rect x="370.6" y="245" width="2.9" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="373.64" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::driver::Driver&gt;::turn (9 samples, 2.20%)</title><rect x="36.0" y="597" width="25.9" height="15.0" fill="rgb(224,88,21)" rx="2" ry="2" />
+<text  x="38.97" y="607.5" >&lt;..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_IRIREF (2 samples, 0.49%)</title><rect x="540.9" y="117" width="5.7" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="543.86" y="127.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.24%)</title><rect x="411.0" y="229" width="2.9" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="414.03" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::stream_scan::&lt;ferrosa_sparql::executor::evaluate_standard_op::{closure#0}::{closure#0}&gt;::{closure#0} (1 samples, 0.24%)</title><rect x="1063.1" y="229" width="2.8" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="1066.06" y="239.5" ></text>
+</g>
+<g >
+<title>background-rt (409 samples, 100.00%)</title><rect x="10.0" y="837" width="1180.0" height="15.0" fill="rgb(215,48,11)" rx="2" ry="2" />
+<text  x="13.00" y="847.5" >background-rt</text>
+</g>
+<g >
+<title>&lt;&lt;alloc::vec::Vec&lt;_&gt; as serde_core::de::Deserialize&gt;::deserialize::VecVisitor&lt; (1 samples, 0.24%)</title><rect x="1132.3" y="261" width="2.9" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="1135.30" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;axum::routing::path_router::PathRouter&lt; (1 samples, 0.24%)</title><rect x="246.6" y="517" width="2.9" height="15.0" fill="rgb(227,105,25)" rx="2" ry="2" />
+<text  x="249.58" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::time::wheel::Wheel&gt;::next_expiration (1 samples, 0.24%)</title><rect x="64.8" y="581" width="2.9" height="15.0" fill="rgb(226,96,23)" rx="2" ry="2" />
+<text  x="67.82" y="591.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (1 samples, 0.24%)</title><rect x="209.1" y="501" width="2.9" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="212.07" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;oxiri::VoidOutputBuffer, false&gt;&gt;::parse_host (2 samples, 0.49%)</title><rect x="1120.8" y="261" width="5.7" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="1123.76" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::registry::extensions::ExtensionsMut&gt;::insert::&lt;tracing_subscriber::fmt::fmt_layer::FormattedFields&lt;tracing_subscriber::fmt::format::DefaultFields&gt;&gt; (2 samples, 0.49%)</title><rect x="913.0" y="133" width="5.8" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="916.03" y="143.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.24%)</title><rect x="307.2" y="261" width="2.8" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="310.16" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::future::future::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = http::response::Response&lt;axum_core::body::Body&gt;&gt; + core::marker::Send&gt;&gt;, fn (306 samples, 74.82%)</title><rect x="258.1" y="341" width="882.9" height="15.0" fill="rgb(232,126,30)" rx="2" ry="2" />
+<text  x="261.12" y="351.5" >&lt;futures_util::future::future::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = http::r..</text>
+</g>
+<g >
+<title>&lt;serde_json::ser::Compound&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;, serde_json::ser::CompactFormatter&gt; as serde_core::ser::SerializeMap&gt;::serialize_entry::&lt;str, alloc::vec::Vec&lt;std::collections::hash::map::HashMap&lt;alloc::string::String, ferrosa_sparql::results::Binding&gt;&gt;&gt; (4 samples, 0.98%)</title><rect x="448.5" y="197" width="11.6" height="15.0" fill="rgb(252,216,51)" rx="2" ry="2" />
+<text  x="451.53" y="207.5" ></text>
+</g>
+<g >
+<title>do_rallocx (1 samples, 0.24%)</title><rect x="416.8" y="165" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="419.80" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::registration::Registration&gt;::poll_ready (1 samples, 0.24%)</title><rect x="214.8" y="485" width="2.9" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="217.84" y="495.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::unescape_iriref (1 samples, 0.24%)</title><rect x="592.8" y="197" width="2.9" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="595.79" y="207.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::merge::merge_partitions (1 samples, 0.24%)</title><rect x="739.9" y="165" width="2.9" height="15.0" fill="rgb(242,173,41)" rx="2" ry="2" />
+<text  x="742.93" y="175.5" ></text>
+</g>
+<g >
+<title>sdallocx (1 samples, 0.24%)</title><rect x="139.8" y="517" width="2.9" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="142.83" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;std::collections::hash::map::HashMap&lt;alloc::string::String, ferrosa_sparql::results::Binding&gt;&gt;&gt;::grow_one (1 samples, 0.24%)</title><rect x="959.2" y="213" width="2.9" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="962.19" y="223.5" ></text>
+</g>
+<g >
+<title>bytes::bytes_mut::shared_v_clone (1 samples, 0.24%)</title><rect x="237.9" y="485" width="2.9" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="240.92" y="495.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http_body_util::collected::Collected&lt;bytes::bytes::Bytes&gt;&gt; (1 samples, 0.24%)</title><rect x="266.8" y="261" width="2.9" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="269.77" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;crossbeam_skiplist::base::SkipList&lt;ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt;&gt;::search_bound::&lt;ferrosa_common::key::DecoratedKey&gt; (13 samples, 3.18%)</title><rect x="688.0" y="117" width="37.5" height="15.0" fill="rgb(253,221,52)" rx="2" ry="2" />
+<text  x="691.00" y="127.5" >&lt;cr..</text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;oxiri::VoidOutputBuffer, false&gt;&gt;::parse_host (1 samples, 0.24%)</title><rect x="468.7" y="261" width="2.9" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="471.73" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;http::extensions::IdHasher&gt;&gt;&gt;::insert (1 samples, 0.24%)</title><rect x="1152.5" y="453" width="2.9" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="1155.49" y="463.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_BlankNodePropertyListPath (1 samples, 0.24%)</title><rect x="563.9" y="197" width="2.9" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="566.94" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::entry::VacantEntry&lt;&amp;str, serde_json::value::Value&gt;&gt;::insert_entry (1 samples, 0.24%)</title><rect x="875.5" y="85" width="2.9" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="878.53" y="95.5" ></text>
+</g>
+<g >
+<title>do_rallocx (1 samples, 0.24%)</title><rect x="428.3" y="181" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="431.34" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.49%)</title><rect x="240.8" y="501" width="5.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="243.81" y="511.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="512.0" y="149" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="515.00" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::register_table_inner (1 samples, 0.24%)</title><rect x="373.5" y="261" width="2.9" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="376.52" y="271.5" ></text>
+</g>
+<g >
+<title>do_rallocx (1 samples, 0.24%)</title><rect x="514.9" y="117" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="517.89" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;core::str::pattern::CharSearcher as core::str::pattern::Searcher&gt;::next_match (1 samples, 0.24%)</title><rect x="1129.4" y="277" width="2.9" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="1132.41" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (2 samples, 0.49%)</title><rect x="1019.8" y="149" width="5.8" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="1022.78" y="159.5" ></text>
+</g>
+<g >
+<title>clock_gettime (1 samples, 0.24%)</title><rect x="737.0" y="165" width="2.9" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="740.04" y="175.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::waker::clone_waker (1 samples, 0.24%)</title><rect x="1063.1" y="165" width="2.8" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="1066.06" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::IntoIter&lt;alloc::string::String, alloc::collections::btree::set_val::SetValZST&gt;&gt;::dying_next (1 samples, 0.24%)</title><rect x="344.7" y="229" width="2.9" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="347.67" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt; (1 samples, 0.24%)</title><rect x="1057.3" y="213" width="2.9" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1060.29" y="223.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="852.4" y="133" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="855.44" y="143.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::http::accept_from_headers (2 samples, 0.49%)</title><rect x="310.0" y="293" width="5.8" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="313.05" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (385 samples, 94.13%)</title><rect x="67.7" y="629" width="1110.8" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="70.70" y="639.5" >&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task</text>
+</g>
+<g >
+<title>bytes::bytes_mut::shared_v_drop (1 samples, 0.24%)</title><rect x="263.9" y="229" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="266.89" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::planner::collect_ops (6 samples, 1.47%)</title><rect x="1091.9" y="245" width="17.3" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="1094.91" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::Iri&lt;alloc::string::String&gt;&gt;::parse (2 samples, 0.49%)</title><rect x="1120.8" y="277" width="5.7" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="1123.76" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;tracing::span::Span&gt;::make_with (42 samples, 10.27%)</title><rect x="800.5" y="181" width="121.2" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="803.51" y="191.5" >&lt;tracing::span:..</text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;spargebra::parser::FocusedTripleOrPathPattern&lt; (1 samples, 0.24%)</title><rect x="474.5" y="229" width="2.9" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="477.50" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::text (1 samples, 0.24%)</title><rect x="1031.3" y="181" width="2.9" height="15.0" fill="rgb(247,195,46)" rx="2" ry="2" />
+<text  x="1034.32" y="191.5" ></text>
+</g>
+<g >
+<title>ferrosa_common::murmur3::hash3_x64_128 (1 samples, 0.24%)</title><rect x="1080.4" y="197" width="2.9" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1083.37" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (11 samples, 2.69%)</title><rect x="982.3" y="149" width="31.7" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="985.27" y="159.5" >&lt;a..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::registration::Registration&gt;::poll_io::&lt;usize, &lt;tokio::io::poll_evented::PollEvented&lt;mio::net::tcp::stream::TcpStream&gt;&gt;::poll_write_vectored::{closure#0}&gt; (4 samples, 0.98%)</title><rect x="197.5" y="501" width="11.6" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="200.53" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::stream::unfold::Unfold&lt;tokio::sync::mpsc::bounded::Receiver&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt;, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::range_scan_stream::{closure#2}, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::range_scan_stream::{closure#2}::{closure#0}&gt; as futures_core::stream::Stream&gt;::poll_next (1 samples, 0.24%)</title><rect x="1063.1" y="197" width="2.8" height="15.0" fill="rgb(217,56,13)" rx="2" ry="2" />
+<text  x="1066.06" y="207.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;tracing::span::EnteredSpan&gt; (8 samples, 1.96%)</title><rect x="924.6" y="197" width="23.1" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="927.57" y="207.5" >c..</text>
+</g>
+<g >
+<title>&lt;std::thread::local::LocalKey&lt;core::cell::RefCell&lt;alloc::string::String&gt;&gt;&gt;::with::&lt;&lt;std::thread::local::LocalKey&lt;core::cell::RefCell&lt;alloc::string::String&gt;&gt;&gt;::with_borrow_mut&lt;sentry_tracing::layer::extract_span_data::{closure#0}, alloc::collections::btree::map::BTreeMap&lt;&amp;str, serde_json::value::Value&gt;&gt;::{closure#0}, alloc::collections::btree::map::BTreeMap&lt;&amp;str, serde_json::value::Value&gt;&gt; (4 samples, 0.98%)</title><rect x="875.5" y="117" width="11.6" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="878.53" y="127.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VarOrTerm (3 samples, 0.73%)</title><rect x="546.6" y="181" width="8.7" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="549.63" y="191.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupGraphPattern (25 samples, 6.11%)</title><rect x="486.0" y="213" width="72.2" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="489.04" y="223.5" >spargebr..</text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.24%)</title><rect x="737.0" y="149" width="2.9" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="740.04" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;serde_json::ser::Compound&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;, serde_json::ser::CompactFormatter&gt; as serde_core::ser::SerializeMap&gt;::serialize_entry::&lt;str, &lt;ferrosa_sparql::results::SparqlJsonResults&gt;::to_json_version::Head&gt; (1 samples, 0.24%)</title><rect x="460.1" y="229" width="2.9" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="463.07" y="239.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_U (2 samples, 0.49%)</title><rect x="581.2" y="133" width="5.8" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="584.25" y="143.5" ></text>
+</g>
+<g >
+<title>ticker_geom_fixup (1 samples, 0.24%)</title><rect x="1005.4" y="101" width="2.8" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="1008.35" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::algebra::PropertyPathExpression as core::clone::Clone&gt;::clone (1 samples, 0.24%)</title><rect x="506.2" y="181" width="2.9" height="15.0" fill="rgb(220,71,16)" rx="2" ry="2" />
+<text  x="509.23" y="191.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::rdf_triples_schema (5 samples, 1.22%)</title><rect x="385.1" y="261" width="14.4" height="15.0" fill="rgb(237,147,35)" rx="2" ry="2" />
+<text  x="388.06" y="271.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1103.4" y="181" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1106.45" y="191.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.24%)</title><rect x="347.6" y="197" width="2.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="350.56" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (1 samples, 0.24%)</title><rect x="411.0" y="197" width="2.9" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="414.03" y="207.5" ></text>
+</g>
+<g >
+<title>std::sys::io::error::unix::is_interrupted (1 samples, 0.24%)</title><rect x="425.5" y="213" width="2.8" height="15.0" fill="rgb(241,168,40)" rx="2" ry="2" />
+<text  x="428.45" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap&gt;::try_insert2::&lt;http::header::name::HeaderName&gt; (1 samples, 0.24%)</title><rect x="321.6" y="229" width="2.9" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="324.59" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::time::handle::Handle&gt;::process_at_time (2 samples, 0.49%)</title><rect x="61.9" y="613" width="5.8" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="64.93" y="623.5" ></text>
+</g>
+<g >
+<title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (312 samples, 76.28%)</title><rect x="252.3" y="453" width="900.2" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="255.35" y="463.5" >&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll</text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::results::SparqlJsonResults&gt;::to_json (7 samples, 1.71%)</title><rect x="445.6" y="245" width="20.2" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="448.65" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt; as hyper::proto::h1::io::MemRead&gt;::read_mem (1 samples, 0.24%)</title><rect x="136.9" y="501" width="2.9" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="139.94" y="511.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="509.1" y="181" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="512.12" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::hub_impl::SwitchGuard as core::ops::drop::Drop&gt;::drop (2 samples, 0.49%)</title><rect x="927.5" y="165" width="5.7" height="15.0" fill="rgb(227,103,24)" rx="2" ry="2" />
+<text  x="930.46" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;axum::routing::path_router::PathRouter&lt; (8 samples, 1.96%)</title><rect x="217.7" y="501" width="23.1" height="15.0" fill="rgb(227,105,25)" rx="2" ry="2" />
+<text  x="220.73" y="511.5" >&lt;..</text>
+</g>
+<g >
+<title>_rjem_je_arena_ralloc (1 samples, 0.24%)</title><rect x="843.8" y="37" width="2.9" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="846.79" y="47.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::layer::layered::Layered&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt; as tracing_core::subscriber::Subscriber&gt;::exit (1 samples, 0.24%)</title><rect x="933.2" y="181" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="936.23" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;sentry_core::hub_impl::SwitchGuard&gt;&gt;::grow_one (1 samples, 0.24%)</title><rect x="789.0" y="149" width="2.9" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="791.97" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap as axum_core::extract::FromRequestParts&lt;ferrosa_sparql::http::AppState&gt;&gt;::from_request_parts::{closure#0} (1 samples, 0.24%)</title><rect x="298.5" y="293" width="2.9" height="15.0" fill="rgb(217,55,13)" rx="2" ry="2" />
+<text  x="301.51" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::state::State&gt;::transition_to_notified_by_val (1 samples, 0.24%)</title><rect x="47.5" y="549" width="2.9" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="50.51" y="559.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (4 samples, 0.98%)</title><rect x="50.4" y="581" width="11.5" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="53.39" y="591.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="431.2" y="229" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="434.22" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (1 samples, 0.24%)</title><rect x="416.8" y="197" width="2.9" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="419.80" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tracing::span::Span&gt;::new (42 samples, 10.27%)</title><rect x="800.5" y="197" width="121.2" height="15.0" fill="rgb(239,156,37)" rx="2" ry="2" />
+<text  x="803.51" y="207.5" >&lt;tracing::span:..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PathElt (2 samples, 0.49%)</title><rect x="540.9" y="149" width="5.7" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="543.86" y="159.5" ></text>
+</g>
+<g >
+<title>do_rallocx (1 samples, 0.24%)</title><rect x="1074.6" y="181" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="1077.60" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::io::poll_evented::PollEvented&lt;mio::net::tcp::stream::TcpStream&gt;&gt;::poll_read (1 samples, 0.24%)</title><rect x="157.1" y="469" width="2.9" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="160.14" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;std::time::SystemTime&gt;::now (1 samples, 0.24%)</title><rect x="1161.1" y="533" width="2.9" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="1164.15" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::Iri&lt;alloc::string::String&gt;&gt;::parse (2 samples, 0.49%)</title><rect x="465.8" y="277" width="5.8" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="468.84" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;core::net::ip_addr::Ipv6Addr as core::str::traits::FromStr&gt;::from_str (1 samples, 0.24%)</title><rect x="1123.6" y="245" width="2.9" height="15.0" fill="rgb(216,53,12)" rx="2" ry="2" />
+<text  x="1126.64" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;http::request::Request&lt;axum_core::body::Body&gt; as axum_core::ext_traits::request::RequestExt&gt;::into_limited_body (1 samples, 0.24%)</title><rect x="263.9" y="277" width="2.9" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="266.89" y="287.5" ></text>
+</g>
+<g >
+<title>core::io::error::os_functions::get_os_functions (1 samples, 0.24%)</title><rect x="362.0" y="213" width="2.9" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="364.98" y="223.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::replay_set_aside::list_set_aside_files (1 samples, 0.24%)</title><rect x="350.4" y="197" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="353.44" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (315 samples, 77.02%)</title><rect x="249.5" y="517" width="908.8" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="252.46" y="527.5" >&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll</text>
+</g>
+<g >
+<title>ferrosa_sparql::http::extract_request_from_post (1 samples, 0.24%)</title><rect x="1112.1" y="293" width="2.9" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="1115.10" y="303.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="667.8" y="245" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="670.80" y="255.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.24%)</title><rect x="930.3" y="117" width="2.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="933.34" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::results::SparqlJsonResults&gt;::to_json_version (4 samples, 0.98%)</title><rect x="448.5" y="229" width="11.6" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="451.53" y="239.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="662.0" y="245" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="665.03" y="255.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.24%)</title><rect x="734.2" y="165" width="2.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="737.16" y="175.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pa_alloc (1 samples, 0.24%)</title><rect x="209.1" y="437" width="2.9" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="212.07" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;futures_channel::mpsc::BoundedSenderInner&lt;core::result::Result&lt;bytes::bytes::Bytes, hyper::error::Error&gt;&gt;&gt;::try_send (1 samples, 0.24%)</title><rect x="134.1" y="517" width="2.8" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="137.06" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::limited::Limited&lt;axum_core::body::Body&gt; as http_body::Body&gt;::poll_frame (2 samples, 0.49%)</title><rect x="272.5" y="213" width="5.8" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="275.54" y="223.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;tracing::span::Span&gt; (4 samples, 0.98%)</title><rect x="936.1" y="181" width="11.6" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="939.11" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;serde_json::ser::Compound&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;, serde_json::ser::CompactFormatter&gt; as serde_core::ser::SerializeMap&gt;::serialize_entry::&lt;str, core::option::Option&lt;alloc::string::String&gt;&gt; (3 samples, 0.73%)</title><rect x="448.5" y="165" width="8.7" height="15.0" fill="rgb(213,37,9)" rx="2" ry="2" />
+<text  x="451.53" y="175.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse__ (1 samples, 0.24%)</title><rect x="587.0" y="213" width="2.9" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="590.02" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;u8&gt;&gt;::grow_one (2 samples, 0.49%)</title><rect x="1065.9" y="213" width="5.8" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="1068.94" y="223.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PropertyListPathNotEmpty (12 samples, 2.93%)</title><rect x="512.0" y="181" width="34.6" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="515.00" y="191.5" >sp..</text>
+</g>
+<g >
+<title>&lt;http_body_util::combinators::collect::Collect&lt;axum_core::body::Body&gt; as core::future::future::Future&gt;::poll (3 samples, 0.73%)</title><rect x="269.7" y="277" width="8.6" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="272.66" y="287.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1014.0" y="165" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1017.01" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::net::tcp::stream::TcpStream as tokio::io::async_write::AsyncWrite&gt;::poll_write_vectored (4 samples, 0.98%)</title><rect x="197.5" y="517" width="11.6" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="200.53" y="527.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http::header::map::HeaderMap&gt; (1 samples, 0.24%)</title><rect x="263.9" y="245" width="2.9" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="266.89" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::engine::SparqlResult&gt;::serialize (7 samples, 1.71%)</title><rect x="445.6" y="277" width="20.2" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="448.65" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt; as hyper::rt::io::Read&gt;::poll_read (1 samples, 0.24%)</title><rect x="136.9" y="469" width="2.9" height="15.0" fill="rgb(246,192,45)" rx="2" ry="2" />
+<text  x="139.94" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="523.5" y="133" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="526.55" y="143.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (1 samples, 0.24%)</title><rect x="494.7" y="149" width="2.9" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="497.69" y="159.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (1 samples, 0.24%)</title><rect x="558.2" y="197" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="561.17" y="207.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_iri (2 samples, 0.49%)</title><rect x="540.9" y="133" width="5.7" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="543.86" y="143.5" ></text>
+</g>
+<g >
+<title>sentry_tracing::layer::set_default_attributes (1 samples, 0.24%)</title><rect x="887.1" y="133" width="2.9" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="890.07" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SpanFieldVisitor as tracing_core::field::Visit&gt;::record_debug (3 samples, 0.73%)</title><rect x="878.4" y="85" width="8.7" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="881.41" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (409 samples, 100.00%)</title><rect x="10.0" y="805" width="1180.0" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="13.00" y="815.5" >&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text>
+</g>
+<g >
+<title>&lt;sentry_types::protocol::v7::SpanId as core::default::Default&gt;::default (1 samples, 0.24%)</title><rect x="817.8" y="117" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="820.82" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="506.2" y="165" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="509.23" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;str&gt; (1 samples, 0.24%)</title><rect x="962.1" y="213" width="2.9" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="965.08" y="223.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_ObjectListPath (7 samples, 1.71%)</title><rect x="517.8" y="165" width="20.2" height="15.0" fill="rgb(217,55,13)" rx="2" ry="2" />
+<text  x="520.78" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (2 samples, 0.49%)</title><rect x="338.9" y="245" width="5.8" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="341.90" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::IntoIter&lt;&amp;str, serde_json::value::Value&gt;&gt;::dying_next (2 samples, 0.49%)</title><rect x="812.1" y="133" width="5.7" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="815.05" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::term::TermPattern as core::clone::Clone&gt;::clone (1 samples, 0.24%)</title><rect x="1100.6" y="181" width="2.8" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="1103.56" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (1 samples, 0.24%)</title><rect x="428.3" y="213" width="2.9" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="431.34" y="223.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_IRIREF (1 samples, 0.24%)</title><rect x="552.4" y="149" width="2.9" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="555.40" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::driver::IoHandle&gt;::unpark (2 samples, 0.49%)</title><rect x="73.5" y="565" width="5.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="76.47" y="575.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap&gt;::try_append2::&lt;http::header::name::HeaderName&gt; (1 samples, 0.24%)</title><rect x="142.7" y="517" width="2.9" height="15.0" fill="rgb(205,2,0)" rx="2" ry="2" />
+<text  x="145.71" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="789.0" y="133" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="791.97" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::memtable::skiplist::SkipListMemtable as ferrosa_storage::memtable::Memtable&gt;::get (3 samples, 0.73%)</title><rect x="725.5" y="149" width="8.7" height="15.0" fill="rgb(219,66,15)" rx="2" ry="2" />
+<text  x="728.50" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::read_with_view (30 samples, 7.33%)</title><rect x="682.2" y="181" width="86.6" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="685.22" y="191.5" >&lt;ferrosa_s..</text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt; as tracing_core::subscriber::Subscriber&gt;::new_span (1 samples, 0.24%)</title><rect x="910.1" y="133" width="2.9" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="913.15" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;std::fs::OpenOptions&gt;::_open (2 samples, 0.49%)</title><rect x="422.6" y="229" width="5.7" height="15.0" fill="rgb(241,166,39)" rx="2" ry="2" />
+<text  x="425.57" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::state::State&gt;::transition_to_running (1 samples, 0.24%)</title><rect x="1172.7" y="597" width="2.9" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="1175.69" y="607.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.24%)</title><rect x="494.7" y="133" width="2.9" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="497.69" y="143.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Var (2 samples, 0.49%)</title><rect x="532.2" y="117" width="5.8" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="535.20" y="127.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.49%)</title><rect x="1034.2" y="181" width="5.8" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1037.21" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.49%)</title><rect x="861.1" y="117" width="5.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="864.10" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::conn::Conn&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, bytes::bytes::Bytes, hyper::proto::h1::role::Server&gt;&gt;::write_head (1 samples, 0.24%)</title><rect x="139.8" y="533" width="2.9" height="15.0" fill="rgb(236,142,34)" rx="2" ry="2" />
+<text  x="142.83" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::table_schema (1 samples, 0.24%)</title><rect x="376.4" y="261" width="2.9" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="379.41" y="271.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_NumericLiteral (2 samples, 0.49%)</title><rect x="569.7" y="181" width="5.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="572.71" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1048.6" y="229" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1051.63" y="239.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http::request::Parts&gt; (1 samples, 0.24%)</title><rect x="263.9" y="261" width="2.9" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="266.89" y="271.5" ></text>
+</g>
+<g >
+<title>alloc::fmt::format::format_inner (1 samples, 0.24%)</title><rect x="1126.5" y="277" width="2.9" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="1129.53" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;std::path::Path&gt;::_join (1 samples, 0.24%)</title><rect x="416.8" y="213" width="2.9" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="419.80" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::table_sstable_dir (1 samples, 0.24%)</title><rect x="379.3" y="261" width="2.9" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="382.29" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::memtable::skiplist::SkipListMemtable as ferrosa_storage::memtable::Memtable&gt;::get (14 samples, 3.42%)</title><rect x="685.1" y="165" width="40.4" height="15.0" fill="rgb(219,66,15)" rx="2" ry="2" />
+<text  x="688.11" y="175.5" >&lt;fe..</text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;u8&gt;&gt;::grow_one (1 samples, 0.24%)</title><rect x="976.5" y="165" width="2.9" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="979.50" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt; (1 samples, 0.24%)</title><rect x="514.9" y="149" width="2.9" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="517.89" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::decode::Decoder&gt;::decode::&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt; (1 samples, 0.24%)</title><rect x="136.9" y="517" width="2.9" height="15.0" fill="rgb(241,168,40)" rx="2" ry="2" />
+<text  x="139.94" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;oxrdf::variable::Variable,  (2 samples, 0.49%)</title><rect x="480.3" y="165" width="5.7" height="15.0" fill="rgb(209,19,4)" rx="2" ry="2" />
+<text  x="483.27" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::poll_read_from_io (4 samples, 0.98%)</title><rect x="148.5" y="517" width="11.5" height="15.0" fill="rgb(213,41,9)" rx="2" ry="2" />
+<text  x="151.48" y="527.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VarOrTerm (2 samples, 0.49%)</title><rect x="532.2" y="133" width="5.8" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="535.20" y="143.5" ></text>
+</g>
+<g >
+<title>syscall (2 samples, 0.49%)</title><rect x="27.3" y="597" width="5.8" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="30.31" y="607.5" ></text>
+</g>
+<g >
+<title>crossbeam_skiplist::base::try_pin_loop::&lt;&lt;crossbeam_skiplist::map::SkipMap&lt;ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt;&gt;::get&lt;ferrosa_common::key::DecoratedKey&gt;::{closure#0}, ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt; (3 samples, 0.73%)</title><rect x="725.5" y="117" width="8.7" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="728.50" y="127.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (2 samples, 0.49%)</title><rect x="1051.5" y="229" width="5.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1054.52" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::hub::Hub&gt;::configure_scope::&lt;&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;::on_enter::{closure#0},  (3 samples, 0.73%)</title><rect x="771.7" y="181" width="8.6" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="774.66" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.49%)</title><rect x="1025.6" y="165" width="5.7" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1028.55" y="175.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::nesting::check_nesting (2 samples, 0.49%)</title><rect x="1083.3" y="277" width="5.7" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="1086.25" y="287.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PNAME_NS (2 samples, 0.49%)</title><rect x="581.2" y="165" width="5.8" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="584.25" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;core::fmt::Formatter&gt;::pad (1 samples, 0.24%)</title><rect x="846.7" y="101" width="2.9" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="849.67" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;ferrosa::supervisor::supervise&lt;ferrosa::run::{closure#0}::{closure#40}, ferrosa::supervisor::run_commit_log_sync_supervisor&lt;ferrosa_storage::engine::StorageEngine&gt;::{closure#0}&gt;::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (1 samples, 0.24%)</title><rect x="1175.6" y="597" width="2.9" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1178.57" y="607.5" ></text>
+</g>
+<g >
+<title>&lt;core::net::parser::Parser&gt;::read_ipv6_addr::read_groups (1 samples, 0.24%)</title><rect x="1123.6" y="213" width="2.9" height="15.0" fill="rgb(218,59,14)" rx="2" ry="2" />
+<text  x="1126.64" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (1 samples, 0.24%)</title><rect x="901.5" y="69" width="2.9" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="904.49" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::results::Binding as serde_core::ser::Serialize&gt;::serialize::&lt;&amp;mut serde_json::ser::Serializer&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;&gt;&gt; (3 samples, 0.73%)</title><rect x="448.5" y="181" width="8.7" height="15.0" fill="rgb(244,183,43)" rx="2" ry="2" />
+<text  x="451.53" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="843.8" y="69" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="846.79" y="79.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::evaluate_pattern::{closure#0} (145 samples, 35.45%)</title><rect x="664.9" y="261" width="418.4" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="667.91" y="271.5" >ferrosa_sparql::executor::evaluate_pattern::{closure#0}</text>
+</g>
+<g >
+<title>ferrosa_storage::table_drops::load_pending_sweeps (1 samples, 0.24%)</title><rect x="364.9" y="213" width="2.9" height="15.0" fill="rgb(217,56,13)" rx="2" ry="2" />
+<text  x="367.87" y="223.5" ></text>
+</g>
+<g >
+<title> core::result::Result&lt;http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;&gt; as core::future::future::Future&gt;::poll (306 samples, 74.82%)</title><rect x="258.1" y="325" width="882.9" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="261.12" y="335.5" > core::result::Result&lt;http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;&gt; as core::future::future..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="996.7" y="117" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="999.70" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.49%)</title><rect x="763.0" y="149" width="5.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="766.01" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;spargebra::parser::TripleOrPathPattern&gt; as alloc::vec::spec_extend::SpecExtend&lt;spargebra::parser::TripleOrPathPattern, alloc::vec::into_iter::IntoIter&lt;spargebra::parser::TripleOrPathPattern&gt;&gt;&gt;::spec_extend (1 samples, 0.24%)</title><rect x="529.3" y="133" width="2.9" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="532.32" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="422.6" y="213" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="425.57" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;std::time::SystemTime&gt;::duration_since (1 samples, 0.24%)</title><rect x="797.6" y="197" width="2.9" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="800.63" y="207.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::table_drops::is_pending_sweep (2 samples, 0.49%)</title><rect x="362.0" y="229" width="5.8" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="364.98" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::body::incoming::Sender&gt;::try_send_data (1 samples, 0.24%)</title><rect x="134.1" y="533" width="2.8" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="137.06" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;std::path::Path&gt;::_join (1 samples, 0.24%)</title><rect x="428.3" y="229" width="2.9" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="431.34" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;ferrosa_sstable::types::Row&gt; as core::clone::Clone&gt;::clone (5 samples, 1.22%)</title><rect x="742.8" y="133" width="14.4" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="745.81" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="203.3" y="469" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="206.30" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;crossbeam_skiplist::map::SkipMap&lt;ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt;&gt;::get::&lt;ferrosa_common::key::DecoratedKey&gt; (14 samples, 3.42%)</title><rect x="685.1" y="149" width="40.4" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="688.11" y="159.5" >&lt;cr..</text>
+</g>
+<g >
+<title>bytes::bytes_mut::shared_v_drop (1 samples, 0.24%)</title><rect x="307.2" y="293" width="2.8" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="310.16" y="303.5" ></text>
+</g>
+<g >
+<title>arena_slab_alloc (1 samples, 0.24%)</title><rect x="209.1" y="453" width="2.9" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="212.07" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (2 samples, 0.49%)</title><rect x="840.9" y="101" width="5.8" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="843.90" y="111.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;spargebra::algebra::PropertyPathExpression&gt; (1 samples, 0.24%)</title><rect x="491.8" y="197" width="2.9" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="494.81" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::service::glue::TowerToHyperServiceFuture&lt;tower::util::map_request::MapRequest&lt;axum::routing::Router, axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#2}&gt;, http::request::Request&lt;hyper::body::incoming::Incoming&gt;&gt; as core::future::future::Future&gt;::poll (327 samples, 79.95%)</title><rect x="217.7" y="533" width="943.4" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="220.73" y="543.5" >&lt;hyper_util::service::glue::TowerToHyperServiceFuture&lt;tower::util::map_request::MapRequest&lt;axum::routing::Router, axum::serve::hand..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (1 samples, 0.24%)</title><rect x="555.3" y="197" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="558.28" y="207.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::raw::schedule::&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (1 samples, 0.24%)</title><rect x="41.7" y="565" width="2.9" height="15.0" fill="rgb(235,141,33)" rx="2" ry="2" />
+<text  x="44.74" y="575.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::performance::TransactionContext&gt;::builder (3 samples, 0.73%)</title><rect x="817.8" y="133" width="8.7" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="820.82" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;crossbeam_skiplist::map::SkipMap&lt;ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt;&gt;::get::&lt;ferrosa_common::key::DecoratedKey&gt; (3 samples, 0.73%)</title><rect x="725.5" y="133" width="8.7" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="728.50" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::secondary_index_declared (1 samples, 0.24%)</title><rect x="336.0" y="245" width="2.9" height="15.0" fill="rgb(208,15,3)" rx="2" ry="2" />
+<text  x="339.01" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::future::future::map::Map&lt;futures_util::future::try_future::into_future::IntoFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;&gt;, futures_util::fns::MapErrFn&lt;&lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (313 samples, 76.53%)</title><rect x="249.5" y="469" width="903.0" height="15.0" fill="rgb(207,12,2)" rx="2" ry="2" />
+<text  x="252.46" y="479.5" >&lt;futures_util::future::future::map::Map&lt;futures_util::future::try_future::into_future::IntoFuture&lt;axum::routing::route::Route..</text>
+</g>
+<g >
+<title>recv (1 samples, 0.24%)</title><rect x="157.1" y="437" width="2.9" height="15.0" fill="rgb(222,82,19)" rx="2" ry="2" />
+<text  x="160.14" y="447.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse__ (1 samples, 0.24%)</title><rect x="630.3" y="229" width="2.9" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="633.29" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::table_sstable_dir (1 samples, 0.24%)</title><rect x="411.0" y="245" width="2.9" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="414.03" y="255.5" ></text>
+</g>
+<g >
+<title>crossbeam_epoch::default::with_handle::&lt;crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard&gt; (1 samples, 0.24%)</title><rect x="685.1" y="133" width="2.9" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="688.11" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::into_iter::IntoIter&lt;core::option::Option&lt;spargebra::parser::FocusedTripleOrPathPattern&lt; (1 samples, 0.24%)</title><rect x="514.9" y="165" width="2.9" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="517.89" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::registry::sharded::Registry as tracing_core::subscriber::Subscriber&gt;::current_span (1 samples, 0.24%)</title><rect x="910.1" y="117" width="2.9" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="913.15" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;::schedule_local (1 samples, 0.24%)</title><rect x="70.6" y="581" width="2.9" height="15.0" fill="rgb(208,15,3)" rx="2" ry="2" />
+<text  x="73.59" y="591.5" ></text>
+</g>
+<g >
+<title>&lt;axum::util::MapIntoResponseFuture&lt;axum::handler::future::IntoServiceFuture&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = http::response::Response&lt;axum_core::body::Body&gt;&gt; + core::marker::Send&gt;&gt;&gt;&gt; as core::future::future::Future&gt;::poll (306 samples, 74.82%)</title><rect x="258.1" y="357" width="882.9" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="261.12" y="367.5" >&lt;axum::util::MapIntoResponseFuture&lt;axum::handler::future::IntoServiceFuture&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::fut..</text>
+</g>
+<g >
+<title>&lt;core::net::parser::Parser&gt;::read_ipv6_addr (1 samples, 0.24%)</title><rect x="1123.6" y="229" width="2.9" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="1126.64" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::context::scoped::Scoped&lt;tokio::runtime::scheduler::Context&gt;&gt;::set::&lt;tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0},  (409 samples, 100.00%)</title><rect x="10.0" y="661" width="1180.0" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="13.00" y="671.5" >&lt;tokio::runtime::context::scoped::Scoped&lt;tokio::runtime::scheduler::Context&gt;&gt;::set::&lt;tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0}, </text>
+</g>
+<g >
+<title>&lt;serde_json::value::Value as core::convert::From&lt;&amp;str&gt;&gt;::from (1 samples, 0.24%)</title><rect x="832.2" y="133" width="2.9" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="835.25" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1100.6" y="165" width="2.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1103.56" y="175.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_BASE (2 samples, 0.49%)</title><rect x="581.2" y="117" width="5.8" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="584.25" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0},  (409 samples, 100.00%)</title><rect x="10.0" y="789" width="1180.0" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="13.00" y="799.5" >&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, </text>
+</g>
+<g >
+<title>ferrosa_sparql::protocol::parameters (1 samples, 0.24%)</title><rect x="1132.3" y="277" width="2.9" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="1135.30" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::Iri&lt;alloc::string::String&gt;&gt;::resolve (1 samples, 0.24%)</title><rect x="543.7" y="101" width="2.9" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="546.74" y="111.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::planner::collect_ops (5 samples, 1.22%)</title><rect x="1094.8" y="229" width="14.4" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="1097.79" y="239.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http_body_util::combinators::map_err::MapErr&lt;tower_http::body::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt;&gt; (1 samples, 0.24%)</title><rect x="284.1" y="245" width="2.9" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="287.08" y="255.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_common::schema::TableSchema&gt; (2 samples, 0.49%)</title><rect x="356.2" y="229" width="5.8" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="359.21" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::future::future::catch_unwind::CatchUnwind&lt;core::panic::unwind_safe::AssertUnwindSafe&lt;ferrosa::supervisor::supervise&lt;ferrosa::run::{closure#0}::{closure#40}, ferrosa::supervisor::run_commit_log_sync_supervisor&lt;ferrosa_storage::engine::StorageEngine&gt;::{closure#0}&gt;::{closure#0}::{closure#0}&gt;&gt; as core::future::future::Future&gt;::poll (1 samples, 0.24%)</title><rect x="1175.6" y="565" width="2.9" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="1178.57" y="575.5" ></text>
+</g>
+<g >
+<title>&lt;atomic_waker::AtomicWaker&gt;::wake (1 samples, 0.24%)</title><rect x="284.1" y="213" width="2.9" height="15.0" fill="rgb(206,8,1)" rx="2" ry="2" />
+<text  x="287.08" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;std::thread::local::LocalKey&lt;core::cell::RefCell&lt;sentry_tracing::layer::span_guard_stack::SpanGuardStack&gt;&gt;&gt;::with::&lt;&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;&gt;::on_enter::{closure#1},  (3 samples, 0.73%)</title><rect x="783.2" y="181" width="8.7" height="15.0" fill="rgb(237,151,36)" rx="2" ry="2" />
+<text  x="786.20" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.49%)</title><rect x="757.2" y="133" width="5.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="760.24" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;http::extensions::Extensions&gt;::insert::&lt;axum::extract::original_uri::OriginalUri&gt; (1 samples, 0.24%)</title><rect x="226.4" y="485" width="2.9" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="229.38" y="495.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::scheduler::multi_thread::worker::run (409 samples, 100.00%)</title><rect x="10.0" y="693" width="1180.0" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="703.5" >tokio::runtime::scheduler::multi_thread::worker::run</text>
+</g>
+<g >
+<title>_rjem_je_arena_ralloc_no_move (1 samples, 0.24%)</title><rect x="1008.2" y="117" width="2.9" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="1011.24" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1149.6" y="437" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1152.61" y="447.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::planner::plan_triple_pattern (1 samples, 0.24%)</title><rect x="1103.4" y="197" width="2.9" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1106.45" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tower::util::oneshot::Oneshot&lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Body&gt;, http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;, http::request::Request&lt;axum_core::body::Body&gt;&gt; as core::future::future::Future&gt;::poll (309 samples, 75.55%)</title><rect x="258.1" y="373" width="891.5" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="261.12" y="383.5" >&lt;tower::util::oneshot::Oneshot&lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::B..</text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::with_retried_view::&lt;ferrosa_sstable::types::Partition, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::read_limited_rows::{closure#0}&gt; (32 samples, 7.82%)</title><rect x="679.3" y="197" width="92.4" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="682.34" y="207.5" >&lt;ferrosa_st..</text>
+</g>
+<g >
+<title>&lt;std::collections::hash::map::HashMap&lt;alloc::string::String, ferrosa_sparql::results::Binding&gt; as core::iter::traits::collect::FromIterator&lt; (3 samples, 0.73%)</title><rect x="656.3" y="261" width="8.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="659.26" y="271.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse__ (1 samples, 0.24%)</title><rect x="624.5" y="213" width="2.9" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="627.52" y="223.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::evaluate_steps::{closure#0} (143 samples, 34.96%)</title><rect x="670.7" y="245" width="412.6" height="15.0" fill="rgb(217,58,14)" rx="2" ry="2" />
+<text  x="673.68" y="255.5" >ferrosa_sparql::executor::evaluate_steps::{closure#0}</text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (3 samples, 0.73%)</title><rect x="1071.7" y="213" width="8.7" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="1074.71" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="636.1" y="277" width="2.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="639.06" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::performance::TransactionOrSpan&gt;::set_data (2 samples, 0.49%)</title><rect x="826.5" y="133" width="5.7" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="829.48" y="143.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.24%)</title><rect x="904.4" y="69" width="2.9" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="907.38" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::mpsc::chan::Rx&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;, tokio::sync::mpsc::bounded::Semaphore&gt;&gt;::recv (1 samples, 0.24%)</title><rect x="1063.1" y="181" width="2.8" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1066.06" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (1 samples, 0.24%)</title><rect x="411.0" y="213" width="2.9" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="414.03" y="223.5" ></text>
+</g>
+<g >
+<title>sdallocx (2 samples, 0.49%)</title><rect x="439.9" y="261" width="5.7" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="442.88" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::collected::Collected&lt;bytes::bytes::Bytes&gt;&gt;::to_bytes (1 samples, 0.24%)</title><rect x="266.8" y="277" width="2.9" height="15.0" fill="rgb(222,81,19)" rx="2" ry="2" />
+<text  x="269.77" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::read_limited_rows (1 samples, 0.24%)</title><rect x="1045.7" y="229" width="2.9" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="1048.75" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap&gt;::try_reserve_one (1 samples, 0.24%)</title><rect x="321.6" y="213" width="2.9" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="324.59" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;axum::util::MapIntoResponseFuture&lt;axum::handler::future::IntoServiceFuture&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn core::future::future::Future&lt;Output = http::response::Response&lt;axum_core::body::Body&gt;&gt; + core::marker::Send&gt;&gt;&gt;&gt; as core::future::future::Future&gt;::poll (1 samples, 0.24%)</title><rect x="255.2" y="373" width="2.9" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="258.23" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::limited::Limited&lt;axum_core::body::Body&gt; as http_body::Body&gt;::poll_frame (2 samples, 0.49%)</title><rect x="272.5" y="245" width="5.8" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="275.54" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;serde_json::value::Value as core::convert::From&lt;&amp;str&gt;&gt;::from (1 samples, 0.24%)</title><rect x="884.2" y="69" width="2.9" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="887.18" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::table_sstable_dir (2 samples, 0.49%)</title><rect x="416.8" y="229" width="5.8" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="419.80" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::body::incoming::Incoming&gt;::new_channel (3 samples, 0.73%)</title><rect x="122.5" y="533" width="8.7" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="125.52" y="543.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_alloc_zeroed (1 samples, 0.24%)</title><rect x="125.4" y="517" width="2.9" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="128.40" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="976.5" y="149" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="979.50" y="159.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_sstable::types::Partition&gt; (2 samples, 0.49%)</title><rect x="1057.3" y="229" width="5.8" height="15.0" fill="rgb(224,87,21)" rx="2" ry="2" />
+<text  x="1060.29" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::planner::plan_query (7 samples, 1.71%)</title><rect x="1089.0" y="277" width="20.2" height="15.0" fill="rgb(237,147,35)" rx="2" ry="2" />
+<text  x="1092.02" y="287.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_no_alloc_shim_is_unstable_v2 (1 samples, 0.24%)</title><rect x="613.0" y="197" width="2.9" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="615.98" y="207.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GroupGraphPattern (38 samples, 9.29%)</title><rect x="486.0" y="229" width="109.7" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="489.04" y="239.5" >spargebra::pa..</text>
+</g>
+<g >
+<title>__rustc::__rust_no_alloc_shim_is_unstable_v2 (1 samples, 0.24%)</title><rect x="1155.4" y="469" width="2.9" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="1158.38" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll (310 samples, 75.79%)</title><rect x="255.2" y="389" width="894.4" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="258.23" y="399.5" >&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt; as core::future::future::Future&gt;::poll</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="232.2" y="485" width="2.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="235.15" y="495.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.24%)</title><rect x="402.4" y="213" width="2.9" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="405.37" y="223.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_alloc_small_hard (1 samples, 0.24%)</title><rect x="209.1" y="485" width="2.9" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="212.07" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::park::Inner&gt;::park_condvar (2 samples, 0.49%)</title><rect x="27.3" y="613" width="5.8" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="30.31" y="623.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_cluster::write_path::WritePath&gt;::read::{closure#0} (95 samples, 23.23%)</title><rect x="676.5" y="229" width="274.0" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="679.45" y="239.5" >&lt;ferrosa_cluster::write_path::WriteP..</text>
+</g>
+<g >
+<title>&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt; as hyper::rt::io::Read&gt;::poll_read (1 samples, 0.24%)</title><rect x="136.9" y="453" width="2.9" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="139.94" y="463.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ralloc (3 samples, 0.73%)</title><rect x="999.6" y="117" width="8.6" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="1002.58" y="127.5" ></text>
+</g>
+<g >
+<title>extent_split_impl.isra.0 (1 samples, 0.24%)</title><rect x="209.1" y="357" width="2.9" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="212.07" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;arc_swap::strategy::hybrid::HybridStrategy&lt;arc_swap::strategy::hybrid::DefaultConfig&gt; as arc_swap::strategy::sealed::InnerStrategy&lt;alloc::sync::Arc&lt;ferrosa_storage::store::StoreView&gt;&gt;&gt;::load::{closure#0} (1 samples, 0.24%)</title><rect x="679.3" y="181" width="2.9" height="15.0" fill="rgb(233,132,31)" rx="2" ry="2" />
+<text  x="682.34" y="191.5" ></text>
+</g>
+<g >
+<title>&lt; (1 samples, 0.24%)</title><rect x="321.6" y="277" width="2.9" height="15.0" fill="rgb(225,96,23)" rx="2" ry="2" />
+<text  x="324.59" y="287.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_HavingClause (1 samples, 0.24%)</title><rect x="595.7" y="229" width="2.9" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="598.67" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tower::util::map_future::MapFuture&lt;axum::util::MapIntoResponse&lt;axum::handler::service::HandlerService&lt;ferrosa_sparql::http::handle_sparql_post,  (3 samples, 0.73%)</title><rect x="1141.0" y="357" width="8.6" height="15.0" fill="rgb(219,64,15)" rx="2" ry="2" />
+<text  x="1143.95" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::combinators::map_err::MapErr&lt;tower_http::body::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt; as http_body::Body&gt;::poll_frame (2 samples, 0.49%)</title><rect x="272.5" y="229" width="5.8" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="275.54" y="239.5" ></text>
+</g>
+<g >
+<title>_rjem_je_ecache_alloc_grow (1 samples, 0.24%)</title><rect x="209.1" y="389" width="2.9" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="212.07" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;spargebra::algebra::GraphPattern&gt;&gt;::grow_one (1 samples, 0.24%)</title><rect x="494.7" y="181" width="2.9" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="497.69" y="191.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VARNAME (2 samples, 0.49%)</title><rect x="532.2" y="101" width="5.8" height="15.0" fill="rgb(240,163,39)" rx="2" ry="2" />
+<text  x="535.20" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt; as tracing_core::subscriber::Subscriber&gt;::exit (1 samples, 0.24%)</title><rect x="933.2" y="165" width="2.9" height="15.0" fill="rgb(207,11,2)" rx="2" ry="2" />
+<text  x="936.23" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::table_schema (1 samples, 0.24%)</title><rect x="408.1" y="245" width="2.9" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="411.14" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;bytes::bytes::Bytes as axum_core::extract::FromRequest&lt;ferrosa_sparql::http::AppState&gt;&gt;::from_request::{closure#0} (9 samples, 2.20%)</title><rect x="263.9" y="293" width="26.0" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="266.89" y="303.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;u8&gt; as axum_core::response::into_response::IntoResponse&gt;::into_response (1 samples, 0.24%)</title><rect x="324.5" y="277" width="2.9" height="15.0" fill="rgb(246,192,46)" rx="2" ry="2" />
+<text  x="327.47" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt;&gt;::poll (409 samples, 100.00%)</title><rect x="10.0" y="725" width="1180.0" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="13.00" y="735.5" >&lt;tokio::runtime::task::core::Core&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, toki..</text>
+</g>
+<g >
+<title>std::sys::fs::exists (2 samples, 0.49%)</title><rect x="434.1" y="245" width="5.8" height="15.0" fill="rgb(217,55,13)" rx="2" ry="2" />
+<text  x="437.11" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;tower::util::map_future::MapFuture&lt;axum::util::MapIntoResponse&lt;tower::util::map_err::MapErr&lt;axum::extension::AddExtension&lt;axum::routing::route::Route, ferrosa_sparql::http::ServiceScheme&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt;, &lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Body&gt;, http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;&gt;::new&lt;axum::util::MapIntoResponse&lt;tower::util::map_err::MapErr&lt;axum::extension::AddExtension&lt;axum::routing::route::Route, ferrosa_sparql::http::ServiceScheme&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt;&gt;::{closure#0}&gt; as tower_service::Service&lt;http::request::Request&lt;axum_core::body::Body&gt;&gt;&gt;::call (2 samples, 0.49%)</title><rect x="1152.5" y="485" width="5.8" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="1155.49" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;::on_new_span (30 samples, 7.33%)</title><rect x="803.4" y="149" width="86.6" height="15.0" fill="rgb(240,161,38)" rx="2" ry="2" />
+<text  x="806.40" y="159.5" >&lt;sentry_tr..</text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (2 samples, 0.49%)</title><rect x="840.9" y="85" width="5.8" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="843.90" y="95.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_TriplesBlock (20 samples, 4.89%)</title><rect x="497.6" y="197" width="57.7" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="500.58" y="207.5" >sparge..</text>
+</g>
+<g >
+<title>pac_alloc_real (1 samples, 0.24%)</title><rect x="209.1" y="405" width="2.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="212.07" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;u8&gt; as axum_core::response::into_response::IntoResponse&gt;::into_response (1 samples, 0.24%)</title><rect x="321.6" y="261" width="2.9" height="15.0" fill="rgb(246,192,46)" rx="2" ry="2" />
+<text  x="324.59" y="271.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;tracing::span::EnteredSpan&gt; (1 samples, 0.24%)</title><rect x="947.7" y="213" width="2.8" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="950.65" y="223.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Var (2 samples, 0.49%)</title><rect x="618.8" y="213" width="5.7" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="621.75" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;axum::handler::service::HandlerService&lt;ferrosa_sparql::http::handle_sparql_post,  (1 samples, 0.24%)</title><rect x="1141.0" y="341" width="2.8" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="1143.95" y="351.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1169.8" y="549" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1172.80" y="559.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="223.5" y="453" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="226.50" y="463.5" ></text>
+</g>
+<g >
+<title>axum::serve::handle_connection::&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3} (377 samples, 92.18%)</title><rect x="85.0" y="581" width="1087.7" height="15.0" fill="rgb(222,82,19)" rx="2" ry="2" />
+<text  x="88.01" y="591.5" >axum::serve::handle_connection::&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3}</text>
+</g>
+<g >
+<title>sdallocx (1 samples, 0.24%)</title><rect x="1109.2" y="277" width="2.9" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="1112.22" y="287.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (4 samples, 0.98%)</title><rect x="840.9" y="117" width="11.5" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="843.90" y="127.5" ></text>
+</g>
+<g >
+<title>sdallocx (1 samples, 0.24%)</title><rect x="353.3" y="197" width="2.9" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="356.33" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::register_table (12 samples, 2.93%)</title><rect x="338.9" y="261" width="34.6" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="341.90" y="271.5" >&lt;f..</text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (1 samples, 0.24%)</title><rect x="497.6" y="181" width="2.9" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="500.58" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::name::HeaderName&gt;::from_bytes (4 samples, 0.98%)</title><rect x="168.7" y="501" width="11.5" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="171.68" y="511.5" ></text>
+</g>
+<g >
+<title>_rjem_je_hook_invoke_expand (1 samples, 0.24%)</title><rect x="1011.1" y="117" width="2.9" height="15.0" fill="rgb(236,146,35)" rx="2" ry="2" />
+<text  x="1014.12" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;http::method::Method&gt;::from_bytes (1 samples, 0.24%)</title><rect x="145.6" y="517" width="2.9" height="15.0" fill="rgb(218,64,15)" rx="2" ry="2" />
+<text  x="148.60" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::poll_flush (4 samples, 0.98%)</title><rect x="197.5" y="533" width="11.6" height="15.0" fill="rgb(237,149,35)" rx="2" ry="2" />
+<text  x="200.53" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;::on_enter (9 samples, 2.20%)</title><rect x="771.7" y="197" width="25.9" height="15.0" fill="rgb(237,151,36)" rx="2" ry="2" />
+<text  x="774.66" y="207.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;core::str::pattern::CharSearcher as core::str::pattern::Searcher&gt;::next_match (1 samples, 0.24%)</title><rect x="1112.1" y="277" width="2.9" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="1115.10" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;&gt;::on_close (2 samples, 0.49%)</title><rect x="939.0" y="149" width="5.8" height="15.0" fill="rgb(236,142,34)" rx="2" ry="2" />
+<text  x="942.00" y="159.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::metadata (2 samples, 0.49%)</title><rect x="1025.6" y="181" width="5.7" height="15.0" fill="rgb(242,173,41)" rx="2" ry="2" />
+<text  x="1028.55" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (12 samples, 2.93%)</title><rect x="979.4" y="165" width="34.6" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="982.39" y="175.5" >&lt;a..</text>
+</g>
+<g >
+<title>&lt;tokio::net::tcp::stream::TcpStream as tokio::io::async_write::AsyncWrite&gt;::poll_write_vectored (1 samples, 0.24%)</title><rect x="1164.0" y="533" width="2.9" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="1167.03" y="543.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;sentry_core::scope::real::Scope&gt; (2 samples, 0.49%)</title><rect x="774.5" y="165" width="5.8" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="777.55" y="175.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;hyper::body::incoming::Incoming&gt; (1 samples, 0.24%)</title><rect x="284.1" y="229" width="2.9" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="287.08" y="239.5" ></text>
+</g>
+<g >
+<title>spargebra::algebra::lookup_triple_pattern_variables::&lt;spargebra::parser::build_select::{closure#0}&gt; (2 samples, 0.49%)</title><rect x="480.3" y="181" width="5.7" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="483.27" y="191.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http_body_util::combinators::collect::Collect&lt;axum_core::body::Body&gt;&gt; (3 samples, 0.73%)</title><rect x="281.2" y="277" width="8.7" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="284.20" y="287.5" ></text>
+</g>
+<g >
+<title>do_rallocx (1 samples, 0.24%)</title><rect x="976.5" y="133" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="979.50" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::fmt::Write&gt;::write_str (1 samples, 0.24%)</title><rect x="419.7" y="197" width="2.9" height="15.0" fill="rgb(244,180,43)" rx="2" ry="2" />
+<text  x="422.68" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::engine::SparqlResult&gt;::to_json (7 samples, 1.71%)</title><rect x="445.6" y="261" width="20.2" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="448.65" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::hub::Hub&gt;::new (1 samples, 0.24%)</title><rect x="780.3" y="165" width="2.9" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="783.32" y="175.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::raw::poll::&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (1 samples, 0.24%)</title><rect x="1187.1" y="629" width="2.9" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="1190.11" y="639.5" ></text>
+</g>
+<g >
+<title>&lt;arc_swap::strategy::hybrid::HybridStrategy&lt;arc_swap::strategy::hybrid::DefaultConfig&gt; as arc_swap::strategy::sealed::InnerStrategy&lt;alloc::sync::Arc&lt;std::collections::hash::map::HashMap&lt;ferrosa_storage::commitlog::config::TableId, alloc::sync::Arc&lt;ferrosa_storage::engine::TableState&gt;&gt;&gt;&gt;&gt;::load::{closure#0} (1 samples, 0.24%)</title><rect x="408.1" y="229" width="2.9" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="411.14" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::protocol::service_base (5 samples, 1.22%)</title><rect x="1115.0" y="293" width="14.4" height="15.0" fill="rgb(242,173,41)" rx="2" ry="2" />
+<text  x="1117.99" y="303.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_alloc (1 samples, 0.24%)</title><rect x="823.6" y="117" width="2.9" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="826.59" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;serde_json::ser::Compound&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;, serde_json::ser::CompactFormatter&gt; as serde_core::ser::SerializeMap&gt;::serialize_entry::&lt;str, alloc::string::String&gt; (1 samples, 0.24%)</title><rect x="457.2" y="181" width="2.9" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="460.19" y="191.5" ></text>
+</g>
+<g >
+<title>httparse::simd::avx2::match_header_value_vectored (1 samples, 0.24%)</title><rect x="191.8" y="453" width="2.8" height="15.0" fill="rgb(236,143,34)" rx="2" ry="2" />
+<text  x="194.76" y="463.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_DECIMAL (1 samples, 0.24%)</title><rect x="569.7" y="165" width="2.9" height="15.0" fill="rgb(214,45,10)" rx="2" ry="2" />
+<text  x="572.71" y="175.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_BASE (1 samples, 0.24%)</title><rect x="535.1" y="69" width="2.9" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="538.09" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::string::String as core::clone::Clone&gt;::clone (1 samples, 0.24%)</title><rect x="1040.0" y="181" width="2.9" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="1042.98" y="191.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_iri (2 samples, 0.49%)</title><rect x="589.9" y="213" width="5.8" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="592.90" y="223.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::build_select (3 samples, 0.73%)</title><rect x="477.4" y="229" width="8.6" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="480.38" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::checked_partition_key (6 samples, 1.47%)</title><rect x="1065.9" y="229" width="17.4" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="1068.94" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;spargebra::parser::FocusedTripleOrPathPattern&lt; (1 samples, 0.24%)</title><rect x="512.0" y="165" width="2.9" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="515.00" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::engine::SparqlEngine&gt;::ensure_table_registered (41 samples, 10.02%)</title><rect x="327.4" y="277" width="118.2" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="330.36" y="287.5" >&lt;ferrosa_sparq..</text>
+</g>
+<g >
+<title>clock_gettime (3 samples, 0.73%)</title><rect x="1178.5" y="629" width="8.6" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1181.46" y="639.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_TriplesBlock (9 samples, 2.20%)</title><rect x="561.1" y="213" width="25.9" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="564.05" y="223.5" >s..</text>
+</g>
+<g >
+<title>&lt;axum::routing::method_routing::MethodRouter&gt;::call_with_state (2 samples, 0.49%)</title><rect x="220.6" y="485" width="5.8" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="223.61" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;std::time::Instant&gt;::elapsed (2 samples, 0.49%)</title><rect x="18.7" y="629" width="5.7" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="21.66" y="639.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::reingest_set_aside_with_faults (3 samples, 0.73%)</title><rect x="347.6" y="213" width="8.6" height="15.0" fill="rgb(253,224,53)" rx="2" ry="2" />
+<text  x="350.56" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::conn::Conn&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, bytes::bytes::Bytes, hyper::proto::h1::role::Server&gt;&gt;::poll_read_body (1 samples, 0.24%)</title><rect x="136.9" y="533" width="2.9" height="15.0" fill="rgb(229,112,26)" rx="2" ry="2" />
+<text  x="139.94" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;bytes::bytes_mut::BytesMut&gt;::reserve_inner (1 samples, 0.24%)</title><rect x="209.1" y="517" width="2.9" height="15.0" fill="rgb(243,174,41)" rx="2" ry="2" />
+<text  x="212.07" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt; as tracing_core::subscriber::Subscriber&gt;::new_span (8 samples, 1.96%)</title><rect x="895.7" y="149" width="23.1" height="15.0" fill="rgb(213,40,9)" rx="2" ry="2" />
+<text  x="898.72" y="159.5" >&lt;..</text>
+</g>
+<g >
+<title>__rustc::__rust_alloc (1 samples, 0.24%)</title><rect x="387.9" y="245" width="2.9" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="390.95" y="255.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_NIL (1 samples, 0.24%)</title><rect x="566.8" y="181" width="2.9" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="569.82" y="191.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::context::with_scheduler::&lt; (1 samples, 0.24%)</title><rect x="44.6" y="533" width="2.9" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="47.62" y="543.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::merge::merge_partitions (1 samples, 0.24%)</title><rect x="768.8" y="181" width="2.9" height="15.0" fill="rgb(242,173,41)" rx="2" ry="2" />
+<text  x="771.78" y="191.5" ></text>
+</g>
+<g >
+<title>sentry_core::performance::start_transaction (4 samples, 0.98%)</title><rect x="855.3" y="133" width="11.6" height="15.0" fill="rgb(218,63,15)" rx="2" ry="2" />
+<text  x="858.33" y="143.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::try_bind_triple (1 samples, 0.24%)</title><rect x="1040.0" y="213" width="2.9" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="1042.98" y="223.5" ></text>
+</g>
+<g >
+<title>httparse::parse_headers_iter_uninit (4 samples, 0.98%)</title><rect x="183.1" y="469" width="11.5" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="186.11" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::declares_index (2 samples, 0.49%)</title><rect x="333.1" y="261" width="5.8" height="15.0" fill="rgb(216,52,12)" rx="2" ry="2" />
+<text  x="336.13" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;str&gt; (1 samples, 0.24%)</title><rect x="336.0" y="229" width="2.9" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="339.01" y="239.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::build_bgp (1 samples, 0.24%)</title><rect x="494.7" y="197" width="2.9" height="15.0" fill="rgb(206,8,1)" rx="2" ry="2" />
+<text  x="497.69" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;mio::net::tcp::stream::TcpStream as std::io::Read&gt;::read (1 samples, 0.24%)</title><rect x="157.1" y="453" width="2.9" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="160.14" y="463.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.24%)</title><rect x="405.3" y="229" width="2.8" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="408.26" y="239.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_avail_first (1 samples, 0.24%)</title><rect x="209.1" y="341" width="2.9" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="212.07" y="351.5" ></text>
+</g>
+<g >
+<title>&lt;futures_channel::mpsc::queue::Queue&lt;core::result::Result&lt;bytes::bytes::Bytes, hyper::error::Error&gt;&gt;&gt;::pop_spin (1 samples, 0.24%)</title><rect x="275.4" y="149" width="2.9" height="15.0" fill="rgb(214,45,10)" rx="2" ry="2" />
+<text  x="278.43" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::scheduled_io::ScheduledIo&gt;::wake (3 samples, 0.73%)</title><rect x="41.7" y="581" width="8.7" height="15.0" fill="rgb(254,226,54)" rx="2" ry="2" />
+<text  x="44.74" y="591.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::body::incoming::Sender&gt;::poll_ready (1 samples, 0.24%)</title><rect x="131.2" y="533" width="2.9" height="15.0" fill="rgb(253,224,53)" rx="2" ry="2" />
+<text  x="134.17" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SentrySpanData as core::any::Any&gt;::type_id (1 samples, 0.24%)</title><rect x="939.0" y="133" width="2.9" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="942.00" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="73.5" y="533" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="76.47" y="543.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_IRIREF (1 samples, 0.24%)</title><rect x="589.9" y="197" width="2.9" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="592.90" y="207.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::planner::plan_select (6 samples, 1.47%)</title><rect x="1091.9" y="261" width="17.3" height="15.0" fill="rgb(209,18,4)" rx="2" ry="2" />
+<text  x="1094.91" y="271.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VARNAME (1 samples, 0.24%)</title><rect x="621.6" y="197" width="2.9" height="15.0" fill="rgb(240,163,39)" rx="2" ry="2" />
+<text  x="624.64" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="514.9" y="133" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="517.89" y="143.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Query (55 samples, 13.45%)</title><rect x="474.5" y="245" width="158.7" height="15.0" fill="rgb(213,36,8)" rx="2" ry="2" />
+<text  x="477.50" y="255.5" >spargebra::parser::p..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS (2 samples, 0.49%)</title><rect x="581.2" y="149" width="5.8" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="584.25" y="159.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (2 samples, 0.49%)</title><rect x="1181.3" y="613" width="5.8" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="1184.34" y="623.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_core::field::DisplayValue&lt;&amp;&amp;ferrosa_storage::commitlog::config::TableId&gt; as core::fmt::Debug&gt;::fmt (1 samples, 0.24%)</title><rect x="904.4" y="85" width="2.9" height="15.0" fill="rgb(239,156,37)" rx="2" ry="2" />
+<text  x="907.38" y="95.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::decode_partition (1 samples, 0.24%)</title><rect x="1042.9" y="213" width="2.8" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="1045.86" y="223.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::waker::wake_by_val (2 samples, 0.49%)</title><rect x="44.6" y="565" width="5.8" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="47.62" y="575.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::into_iter::IntoIter&lt;spargebra::parser::FocusedTripleOrPathPattern&lt;spargebra::parser::ReifiedTerm&gt;&gt; as core::iter::traits::iterator::Iterator&gt;::fold::&lt;spargebra::parser::FocusedTripleOrPathPattern&lt;alloc::vec::Vec&lt;spargebra::parser::ReifiedTerm&gt;&gt;, spargebra::parser::parser::__parse_ObjectListPath::{closure#0}::{closure#0}&gt; (2 samples, 0.49%)</title><rect x="526.4" y="149" width="5.8" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="529.43" y="159.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Path (3 samples, 0.73%)</title><rect x="538.0" y="165" width="8.6" height="15.0" fill="rgb(248,197,47)" rx="2" ry="2" />
+<text  x="540.97" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::time::sleep::Sleep as core::future::future::Future&gt;::poll (1 samples, 0.24%)</title><rect x="1175.6" y="533" width="2.9" height="15.0" fill="rgb(227,105,25)" rx="2" ry="2" />
+<text  x="1178.57" y="543.5" ></text>
+</g>
+<g >
+<title>serde_json::ser::format_escaped_str::&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;, serde_json::ser::CompactFormatter&gt; (3 samples, 0.73%)</title><rect x="448.5" y="149" width="8.7" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="451.53" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::registration::Registration&gt;::poll_ready (1 samples, 0.24%)</title><rect x="206.2" y="485" width="2.9" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="209.19" y="495.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_U (1 samples, 0.24%)</title><rect x="535.1" y="85" width="2.9" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="538.09" y="95.5" ></text>
+</g>
+<g >
+<title>httparse::simd::avx2::match_uri_vectored (1 samples, 0.24%)</title><rect x="194.6" y="469" width="2.9" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="197.65" y="479.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_GraphNodePath (2 samples, 0.49%)</title><rect x="532.2" y="149" width="5.8" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="535.20" y="159.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="965.0" y="197" width="2.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="967.96" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;http::header::map::Bucket&lt;http::header::value::HeaderValue&gt;&gt; as core::ops::drop::Drop&gt;::drop (1 samples, 0.24%)</title><rect x="321.6" y="197" width="2.9" height="15.0" fill="rgb(212,33,8)" rx="2" ry="2" />
+<text  x="324.59" y="207.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::waker::clone_waker (1 samples, 0.24%)</title><rect x="131.2" y="517" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="134.17" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::registry::sharded::Data as tracing_subscriber::registry::SpanData&gt;::extensions_mut (1 samples, 0.24%)</title><rect x="944.8" y="149" width="2.9" height="15.0" fill="rgb(211,32,7)" rx="2" ry="2" />
+<text  x="947.77" y="159.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_VarOrTerm (7 samples, 1.71%)</title><rect x="566.8" y="197" width="20.2" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="569.82" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::registry::extensions::ExtensionsInner&gt;::remove::&lt;sentry_tracing::layer::SentrySpanData&gt; (1 samples, 0.24%)</title><rect x="941.9" y="133" width="2.9" height="15.0" fill="rgb(221,78,18)" rx="2" ry="2" />
+<text  x="944.88" y="143.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::decode_v2_row (25 samples, 6.11%)</title><rect x="967.8" y="197" width="72.2" height="15.0" fill="rgb(235,140,33)" rx="2" ry="2" />
+<text  x="970.85" y="207.5" >ferrosa_..</text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.24%)</title><rect x="523.5" y="101" width="2.9" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="526.55" y="111.5" ></text>
+</g>
+<g >
+<title>open64 (1 samples, 0.24%)</title><rect x="364.9" y="181" width="2.9" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="367.87" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="794.7" y="181" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="797.74" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;alloc::string::String, ferrosa_sparql::results::Binding, std::hash::random::RandomState&gt;&gt;::insert (1 samples, 0.24%)</title><rect x="656.3" y="245" width="2.8" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="659.26" y="255.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::context::runtime::enter_runtime::&lt;tokio::runtime::scheduler::multi_thread::worker::run::{closure#0},  (409 samples, 100.00%)</title><rect x="10.0" y="677" width="1180.0" height="15.0" fill="rgb(218,59,14)" rx="2" ry="2" />
+<text  x="13.00" y="687.5" >tokio::runtime::context::runtime::enter_runtime::&lt;tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}, </text>
+</g>
+<g >
+<title>&lt;bytes::bytes_mut::BytesMut&gt;::split_to (1 samples, 0.24%)</title><rect x="165.8" y="501" width="2.9" height="15.0" fill="rgb(208,16,3)" rx="2" ry="2" />
+<text  x="168.79" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::map::HeaderMap&gt;::get::&lt;http::header::name::HeaderName&gt; (1 samples, 0.24%)</title><rect x="1117.9" y="277" width="2.9" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="1120.87" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::state::State&gt;::transition_to_notified_by_val (1 samples, 0.24%)</title><rect x="134.1" y="501" width="2.8" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="137.06" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt;&gt;::poll (409 samples, 100.00%)</title><rect x="10.0" y="741" width="1180.0" height="15.0" fill="rgb(219,64,15)" rx="2" ry="2" />
+<text  x="13.00" y="751.5" >&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;..</text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn core::any::Any + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;tracing_subscriber::registry::extensions::IdHasher&gt;&gt;&gt;::insert (2 samples, 0.49%)</title><rect x="913.0" y="117" width="5.8" height="15.0" fill="rgb(232,125,30)" rx="2" ry="2" />
+<text  x="916.03" y="127.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (1 samples, 0.24%)</title><rect x="419.7" y="213" width="2.9" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="422.68" y="223.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::QueryUnit (55 samples, 13.45%)</title><rect x="474.5" y="261" width="158.7" height="15.0" fill="rgb(248,200,48)" rx="2" ry="2" />
+<text  x="477.50" y="271.5" >spargebra::parser::p..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="921.7" y="197" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="924.69" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::algebra::GraphPattern&gt;::lookup_in_scope_variables::&lt;spargebra::parser::build_select::{closure#0}&gt; (2 samples, 0.49%)</title><rect x="480.3" y="197" width="5.7" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="483.27" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::time::Driver&gt;::park_internal (10 samples, 2.44%)</title><rect x="33.1" y="613" width="28.8" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="36.08" y="623.5" >&lt;t..</text>
+</g>
+<g >
+<title>&lt;httparse::ParserConfig&gt;::parse_request_with_uninit_headers (5 samples, 1.22%)</title><rect x="183.1" y="501" width="14.4" height="15.0" fill="rgb(214,41,9)" rx="2" ry="2" />
+<text  x="186.11" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::name::StandardHeader&gt;::from_bytes (1 samples, 0.24%)</title><rect x="180.2" y="501" width="2.9" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="183.22" y="511.5" ></text>
+</g>
+<g >
+<title>ferrosa::supervisor::supervise::&lt;ferrosa::run::{closure#0}::{closure#40}, ferrosa::supervisor::run_commit_log_sync_supervisor&lt;ferrosa_storage::engine::StorageEngine&gt;::{closure#0}&gt;::{closure#0} (1 samples, 0.24%)</title><rect x="1175.6" y="581" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="1178.57" y="591.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ralloc (1 samples, 0.24%)</title><rect x="1074.6" y="165" width="2.9" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="1077.60" y="175.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (1 samples, 0.24%)</title><rect x="601.4" y="213" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="604.44" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::layer::layered::Layered&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt; as tracing_core::subscriber::Subscriber&gt;::new_span (42 samples, 10.27%)</title><rect x="800.5" y="165" width="121.2" height="15.0" fill="rgb(240,163,39)" rx="2" ry="2" />
+<text  x="803.51" y="175.5" >&lt;tracing_subscr..</text>
+</g>
+<g >
+<title>&lt;alloc::collections::vec_deque::VecDeque&lt;bytes::bytes::Bytes&gt; as core::ops::drop::Drop&gt;::drop (1 samples, 0.24%)</title><rect x="266.8" y="245" width="2.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="269.77" y="255.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="849.6" y="101" width="2.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="852.56" y="111.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::encode_clustering (18 samples, 4.40%)</title><rect x="973.6" y="181" width="52.0" height="15.0" fill="rgb(213,40,9)" rx="2" ry="2" />
+<text  x="976.62" y="191.5" >ferro..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_SelectClause (9 samples, 2.20%)</title><rect x="604.3" y="229" width="26.0" height="15.0" fill="rgb(226,100,23)" rx="2" ry="2" />
+<text  x="607.33" y="239.5" >s..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::executor::Scan&lt;ferrosa_sparql::executor::evaluate_standard_op::{closure#0}::{closure#0}&gt;&gt;::feed (1 samples, 0.24%)</title><rect x="664.9" y="245" width="2.9" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="667.91" y="255.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_iri (2 samples, 0.49%)</title><rect x="581.2" y="181" width="5.8" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="584.25" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::pool::Inner&gt;::run (409 samples, 100.00%)</title><rect x="10.0" y="757" width="1180.0" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="13.00" y="767.5" >&lt;tokio::runtime::blocking::pool::Inner&gt;::run</text>
+</g>
+<g >
+<title>&lt;tracing_core::span::Attributes&gt;::record (4 samples, 0.98%)</title><rect x="875.5" y="101" width="11.6" height="15.0" fill="rgb(213,40,9)" rx="2" ry="2" />
+<text  x="878.53" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::executor::Scan&lt;ferrosa_sparql::executor::evaluate_standard_op::{closure#0}::{closure#0}&gt;&gt;::feed (33 samples, 8.07%)</title><rect x="950.5" y="229" width="95.2" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="953.54" y="239.5" >&lt;ferrosa_sp..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_iri (1 samples, 0.24%)</title><rect x="552.4" y="165" width="2.9" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="555.40" y="175.5" ></text>
+</g>
+<g >
+<title>core::fmt::write (3 samples, 0.73%)</title><rect x="898.6" y="101" width="8.7" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="901.61" y="111.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::triple_store::refuse_legacy (14 samples, 3.42%)</title><rect x="399.5" y="261" width="40.4" height="15.0" fill="rgb(247,197,47)" rx="2" ry="2" />
+<text  x="402.49" y="271.5" >fer..</text>
+</g>
+<g >
+<title>ferrosa_sparql::http::execute_and_respond::{closure#0} (275 samples, 67.24%)</title><rect x="318.7" y="293" width="793.4" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="321.70" y="303.5" >ferrosa_sparql::http::execute_and_respond::{closure#0}</text>
+</g>
+<g >
+<title>extent_recycle (1 samples, 0.24%)</title><rect x="209.1" y="373" width="2.9" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="212.07" y="383.5" ></text>
+</g>
+<g >
+<title>crossbeam_skiplist::base::try_pin_loop::&lt;&lt;crossbeam_skiplist::map::SkipMap&lt;ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt;&gt;::get&lt;ferrosa_common::key::DecoratedKey&gt;::{closure#0}, ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock&lt;parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;&gt; (13 samples, 3.18%)</title><rect x="688.0" y="133" width="37.5" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="691.00" y="143.5" >cro..</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;[ferrosa_sstable::types::Row]&gt; (1 samples, 0.24%)</title><rect x="1060.2" y="213" width="2.9" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="1063.17" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::commitlog::config::TableId as core::fmt::Display&gt;::fmt (1 samples, 0.24%)</title><rect x="402.4" y="229" width="2.9" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="405.37" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::fmt::format::DefaultVisitor as tracing_core::field::Visit&gt;::record_debug (4 samples, 0.98%)</title><rect x="895.7" y="117" width="11.6" height="15.0" fill="rgb(235,141,33)" rx="2" ry="2" />
+<text  x="898.72" y="127.5" ></text>
+</g>
+<g >
+<title>sentry_tracing::layer::extract_span_data (7 samples, 1.71%)</title><rect x="866.9" y="133" width="20.2" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="869.87" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::types::Partition as core::clone::Clone&gt;::clone (7 samples, 1.71%)</title><rect x="742.8" y="149" width="20.2" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="745.81" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::body::incoming::Incoming as http_body::Body&gt;::poll_frame (2 samples, 0.49%)</title><rect x="272.5" y="181" width="5.8" height="15.0" fill="rgb(216,53,12)" rx="2" ry="2" />
+<text  x="275.54" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::into_iter::IntoIter&lt;spargebra::parser::TripleOrPathPattern&gt; as core::ops::drop::Drop&gt;::drop (1 samples, 0.24%)</title><rect x="500.5" y="149" width="2.8" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="503.46" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;spargebra::parser::FocusedTripleOrPathPattern&lt;spargebra::term::TermPattern&gt;&gt;&gt;::grow_one (1 samples, 0.24%)</title><rect x="526.4" y="133" width="2.9" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="529.43" y="143.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Prologue (1 samples, 0.24%)</title><rect x="601.4" y="229" width="2.9" height="15.0" fill="rgb(253,225,53)" rx="2" ry="2" />
+<text  x="604.44" y="239.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_sparql::planner::QueryPlan&gt; (1 samples, 0.24%)</title><rect x="641.8" y="277" width="2.9" height="15.0" fill="rgb(215,48,11)" rx="2" ry="2" />
+<text  x="644.83" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::hub::Hub&gt;::new_from_top::&lt;&amp;alloc::sync::Arc&lt;sentry_core::hub::Hub&gt;&gt; (1 samples, 0.24%)</title><rect x="780.3" y="181" width="2.9" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="783.32" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;tower_http::limit::future::ResponseFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (310 samples, 75.79%)</title><rect x="255.2" y="421" width="894.4" height="15.0" fill="rgb(232,126,30)" rx="2" ry="2" />
+<text  x="258.23" y="431.5" >&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;tower_http::limit::future::ResponseFuture&lt;axum::routin..</text>
+</g>
+<g >
+<title>&lt;alloc::borrow::Cow&lt;[u8]&gt; as axum_core::response::into_response::IntoResponse&gt;::into_response (1 samples, 0.24%)</title><rect x="321.6" y="245" width="2.9" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="324.59" y="255.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::try_insert_binding (1 samples, 0.24%)</title><rect x="1040.0" y="197" width="2.9" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="1042.98" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tower::util::oneshot::Oneshot&lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Body&gt;, http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;, http::request::Request&lt;axum_core::body::Body&gt;&gt; as core::future::future::Future&gt;::poll (315 samples, 77.02%)</title><rect x="249.5" y="501" width="908.8" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="252.46" y="511.5" >&lt;tower::util::oneshot::Oneshot&lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Body..</text>
+</g>
+<g >
+<title>&lt;tokio::time::interval::Interval&gt;::poll_tick (1 samples, 0.24%)</title><rect x="1175.6" y="549" width="2.9" height="15.0" fill="rgb(212,33,8)" rx="2" ry="2" />
+<text  x="1178.57" y="559.5" ></text>
+</g>
+<g >
+<title>__open64_nocancel (1 samples, 0.24%)</title><rect x="350.4" y="181" width="2.9" height="15.0" fill="rgb(240,161,38)" rx="2" ry="2" />
+<text  x="353.44" y="191.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_U (1 samples, 0.24%)</title><rect x="618.8" y="197" width="2.8" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="621.75" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::Iri&lt;alloc::string::String&gt;&gt;::resolve (1 samples, 0.24%)</title><rect x="552.4" y="133" width="2.9" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="555.40" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;futures_channel::mpsc::Receiver&lt;core::result::Result&lt;bytes::bytes::Bytes, hyper::error::Error&gt;&gt; as futures_core::stream::Stream&gt;::poll_next (2 samples, 0.49%)</title><rect x="272.5" y="165" width="5.8" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="275.54" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::http::handle_sparql_post as axum::handler::Handler&lt; (306 samples, 74.82%)</title><rect x="258.1" y="309" width="882.9" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="261.12" y="319.5" >&lt;ferrosa_sparql::http::handle_sparql_post as axum::handler::Handler&lt;</text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::default_span_filter as core::ops::function::Fn&lt; (2 samples, 0.49%)</title><rect x="890.0" y="149" width="5.7" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="892.95" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::time::wheel::Wheel&gt;::poll (1 samples, 0.24%)</title><rect x="64.8" y="597" width="2.9" height="15.0" fill="rgb(239,156,37)" rx="2" ry="2" />
+<text  x="67.82" y="607.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;&gt;::on_close (1 samples, 0.24%)</title><rect x="936.1" y="165" width="2.9" height="15.0" fill="rgb(236,142,34)" rx="2" ry="2" />
+<text  x="939.11" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::combinators::map_err::MapErr&lt;hyper::body::incoming::Incoming, &lt;axum_core::error::Error&gt;::new&lt;hyper::error::Error&gt;&gt; as http_body::Body&gt;::poll_frame (2 samples, 0.49%)</title><rect x="272.5" y="197" width="5.8" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="275.54" y="207.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="1077.5" y="197" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1080.48" y="207.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (2 samples, 0.49%)</title><rect x="18.7" y="597" width="5.7" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="21.66" y="607.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::into_iter::IntoIter&lt;spargebra::algebra::PropertyPathExpression&gt; as core::iter::traits::iterator::Iterator&gt;::fold::&lt;core::option::Option&lt;spargebra::algebra::PropertyPathExpression&gt;, spargebra::parser::not_empty_fold&lt;spargebra::algebra::PropertyPathExpression, alloc::vec::into_iter::IntoIter&lt;spargebra::algebra::PropertyPathExpression&gt;, spargebra::parser::parser::__parse_PathSequence::{closure#0}::{closure#0}&gt;::{closure#0}&gt; (1 samples, 0.24%)</title><rect x="538.0" y="149" width="2.9" height="15.0" fill="rgb(242,174,41)" rx="2" ry="2" />
+<text  x="540.97" y="159.5" ></text>
+</g>
+<g >
+<title>axum::extract::matched_path::set_matched_path_for_request (1 samples, 0.24%)</title><rect x="235.0" y="485" width="2.9" height="15.0" fill="rgb(207,12,2)" rx="2" ry="2" />
+<text  x="238.04" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;http::header::name::StandardHeader&gt;::from_bytes (2 samples, 0.49%)</title><rect x="174.4" y="485" width="5.8" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="177.45" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt; as hyper::rt::io::Read&gt;::poll_read (2 samples, 0.49%)</title><rect x="212.0" y="517" width="5.7" height="15.0" fill="rgb(246,192,45)" rx="2" ry="2" />
+<text  x="214.96" y="527.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;http_body_util::combinators::map_err::MapErr&lt;tower_http::body::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt;&gt; (1 samples, 0.24%)</title><rect x="287.0" y="261" width="2.9" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="289.97" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::performance::Transaction&gt;::set_origin (1 samples, 0.24%)</title><rect x="800.5" y="149" width="2.9" height="15.0" fill="rgb(211,31,7)" rx="2" ry="2" />
+<text  x="803.51" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::role::Server as hyper::proto::h1::Http1Transaction&gt;::parse (13 samples, 3.18%)</title><rect x="160.0" y="517" width="37.5" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="163.02" y="527.5" >&lt;hy..</text>
+</g>
+<g >
+<title>__rustc::__rust_alloc (1 samples, 0.24%)</title><rect x="463.0" y="229" width="2.8" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="465.96" y="239.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_NumericLiteral (2 samples, 0.49%)</title><rect x="546.6" y="165" width="5.8" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="549.63" y="175.5" ></text>
+</g>
+<g >
+<title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0},  (409 samples, 100.00%)</title><rect x="10.0" y="773" width="1180.0" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="13.00" y="783.5" >std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0}, </text>
+</g>
+<g >
+<title>&lt;ferrosa_schema::registry::Schema&gt;::check_permission (1 samples, 0.24%)</title><rect x="289.9" y="293" width="2.8" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="292.85" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::register_table_inner (8 samples, 1.96%)</title><rect x="344.7" y="245" width="23.1" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="347.67" y="255.5" >&lt;..</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_TripleTerm (1 samples, 0.24%)</title><rect x="578.4" y="181" width="2.8" height="15.0" fill="rgb(245,188,45)" rx="2" ry="2" />
+<text  x="581.36" y="191.5" ></text>
+</g>
+<g >
+<title>write (1 samples, 0.24%)</title><rect x="76.4" y="533" width="2.8" height="15.0" fill="rgb(228,107,25)" rx="2" ry="2" />
+<text  x="79.36" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="416.8" y="181" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="419.80" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;oxiri::IriParser&lt;alloc::string::String, false&gt;&gt;::parse_path::&lt;false&gt; (1 samples, 0.24%)</title><rect x="552.4" y="117" width="2.9" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="555.40" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;mio::sys::unix::waker::Waker&gt;::wake (2 samples, 0.49%)</title><rect x="73.5" y="549" width="5.7" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="76.47" y="559.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::context::with_scheduler::&lt; (2 samples, 0.49%)</title><rect x="73.5" y="581" width="5.7" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="76.47" y="591.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::http::authorize_keyspace (1 samples, 0.24%)</title><rect x="315.8" y="293" width="2.9" height="15.0" fill="rgb(229,112,26)" rx="2" ry="2" />
+<text  x="318.82" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::entry::VacantEntry&lt;&amp;str, serde_json::value::Value&gt;&gt;::insert_entry (1 samples, 0.24%)</title><rect x="881.3" y="69" width="2.9" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="884.30" y="79.5" ></text>
+</g>
+<g >
+<title>futures_channel::mpsc::channel::&lt;core::result::Result&lt;bytes::bytes::Bytes, hyper::error::Error&gt;&gt; (1 samples, 0.24%)</title><rect x="128.3" y="517" width="2.9" height="15.0" fill="rgb(212,33,8)" rx="2" ry="2" />
+<text  x="131.29" y="527.5" ></text>
+</g>
+<g >
+<title>core::slice::sort::shared::smallsort::insertion_sort_shift_left::&lt;ferrosa_common::schema::ColumnDefinition, &lt;[ferrosa_common::schema::ColumnDefinition]&gt;::sort_by&lt;ferrosa_sparql::triple_store::rdf_triples_schema::{closure#0}&gt;::{closure#0}&gt; (1 samples, 0.24%)</title><rect x="396.6" y="245" width="2.9" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="399.60" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::replay_deferred_mutations_for_table (3 samples, 0.73%)</title><rect x="347.6" y="229" width="8.6" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="350.56" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::migration::admit (6 samples, 1.47%)</title><rect x="416.8" y="245" width="17.3" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="419.80" y="255.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::store::clone_partition_limited (9 samples, 2.20%)</title><rect x="742.8" y="165" width="26.0" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="745.81" y="175.5" >f..</text>
+</g>
+<g >
+<title>_rjem_je_nstime_copy (1 samples, 0.24%)</title><rect x="494.7" y="117" width="2.9" height="15.0" fill="rgb(244,181,43)" rx="2" ry="2" />
+<text  x="497.69" y="127.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_LimitClause (1 samples, 0.24%)</title><rect x="598.6" y="229" width="2.8" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="601.56" y="239.5" ></text>
+</g>
+<g >
+<title>rand_chacha::guts::refill_wide::impl_avx2 (1 samples, 0.24%)</title><rect x="820.7" y="101" width="2.9" height="15.0" fill="rgb(207,13,3)" rx="2" ry="2" />
+<text  x="823.71" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;core::option::Option&lt;spargebra::parser::FocusedTripleOrPathPattern&lt; (1 samples, 0.24%)</title><rect x="613.0" y="213" width="2.9" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="615.98" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;spargebra::parser::TripleOrPathPattern&gt; as alloc::vec::spec_from_iter_nested::SpecFromIterNested&lt;spargebra::parser::TripleOrPathPattern, core::iter::adapters::flatten::Flatten&lt;alloc::vec::into_iter::IntoIter&lt;alloc::vec::Vec&lt;spargebra::parser::TripleOrPathPattern&gt;&gt;&gt;&gt;&gt;::from_iter (2 samples, 0.49%)</title><rect x="500.5" y="181" width="5.7" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="503.46" y="191.5" ></text>
+</g>
+<g >
+<title>bytes::bytes::static_drop (1 samples, 0.24%)</title><rect x="304.3" y="293" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="307.28" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;core::any::TypeId, alloc::boxed::Box&lt;dyn http::extensions::AnyClone + core::marker::Send + core::marker::Sync&gt;, core::hash::BuildHasherDefault&lt;http::extensions::IdHasher&gt;&gt;&gt;::insert (1 samples, 0.24%)</title><rect x="226.4" y="469" width="2.9" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="229.38" y="479.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PNAME_NS (1 samples, 0.24%)</title><rect x="575.5" y="181" width="2.9" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="578.48" y="191.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_Query (1 samples, 0.24%)</title><rect x="633.2" y="261" width="2.9" height="15.0" fill="rgb(213,36,8)" rx="2" ry="2" />
+<text  x="636.18" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_tracing::layer::SentryLayer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt; as tracing_subscriber::layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;ferrosa_cluster::telemetry::FerrosaTelemetryLayer, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::fmt::fmt_layer::Layer&lt;tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;, tracing_subscriber::fmt::format::DefaultFields, tracing_subscriber::fmt::format::Format, ferrosa::lifecycle::CountingQueue&gt;, tracing_subscriber::layer::layered::Layered&lt;tracing_subscriber::filter::env::EnvFilter, tracing_subscriber::registry::sharded::Registry&gt;&gt;&gt;&gt;&gt;::on_exit (3 samples, 0.73%)</title><rect x="924.6" y="181" width="8.6" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="927.57" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::engine::StorageEngine&gt;::read_limited_rows (94 samples, 22.98%)</title><rect x="676.5" y="213" width="271.2" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="679.45" y="223.5" >&lt;ferrosa_storage::engine::StorageEng..</text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="494.7" y="165" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="497.69" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::poll_read_from_io (1 samples, 0.24%)</title><rect x="136.9" y="485" width="2.9" height="15.0" fill="rgb(213,41,9)" rx="2" ry="2" />
+<text  x="139.94" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt; as core::future::future::Future&gt;::poll (409 samples, 100.00%)</title><rect x="10.0" y="709" width="1180.0" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="13.00" y="719.5" >&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt; as core::future::future::Future&gt;::poll</text>
+</g>
+<g >
+<title>&lt;core::iter::adapters::flatten::Flatten&lt;alloc::vec::into_iter::IntoIter&lt;alloc::vec::Vec&lt;spargebra::parser::TripleOrPathPattern&gt;&gt;&gt; as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.24%)</title><rect x="500.5" y="165" width="2.8" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="503.46" y="175.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_INTEGER (1 samples, 0.24%)</title><rect x="572.6" y="165" width="2.9" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="575.59" y="175.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_PN_CHARS_BASE (1 samples, 0.24%)</title><rect x="621.6" y="181" width="2.9" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="624.64" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_core::span::Attributes&gt;::record (4 samples, 0.98%)</title><rect x="895.7" y="133" width="11.6" height="15.0" fill="rgb(213,40,9)" rx="2" ry="2" />
+<text  x="898.72" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt; as hyper::rt::io::Read&gt;::poll_read (4 samples, 0.98%)</title><rect x="148.5" y="501" width="11.5" height="15.0" fill="rgb(246,192,45)" rx="2" ry="2" />
+<text  x="151.48" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt; (1 samples, 0.24%)</title><rect x="330.2" y="261" width="2.9" height="15.0" fill="rgb(238,155,37)" rx="2" ry="2" />
+<text  x="333.24" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;serde_urlencoded::de::PartIterator as core::iter::traits::iterator::Iterator&gt;::next (1 samples, 0.24%)</title><rect x="1132.3" y="245" width="2.9" height="15.0" fill="rgb(214,45,10)" rx="2" ry="2" />
+<text  x="1135.30" y="255.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ralloc_no_move (1 samples, 0.24%)</title><rect x="1002.5" y="101" width="2.9" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="1005.47" y="111.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;core::iter::adapters::flatten::Flatten&lt;alloc::vec::into_iter::IntoIter&lt;alloc::vec::Vec&lt;spargebra::parser::TripleOrPathPattern&gt;&gt;&gt;&gt; (1 samples, 0.24%)</title><rect x="503.3" y="165" width="2.9" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="506.35" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;std::sync::poison::rwlock::RwLock&lt;sentry_core::scope::real::Stack&gt;&gt;&gt;::drop_slow (1 samples, 0.24%)</title><rect x="930.3" y="133" width="2.9" height="15.0" fill="rgb(239,160,38)" rx="2" ry="2" />
+<text  x="933.34" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;std::sys::pal::unix::time::Timespec&gt;::now (1 samples, 0.24%)</title><rect x="10.0" y="645" width="2.9" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="13.00" y="655.5" ></text>
+</g>
+<g >
+<title>&lt;httparse::Request&gt;::parse_with_config_and_uninit_headers (5 samples, 1.22%)</title><rect x="183.1" y="485" width="14.4" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="186.11" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (2 samples, 0.49%)</title><rect x="1065.9" y="197" width="5.8" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="1068.94" y="207.5" ></text>
+</g>
+<g >
+<title>axum::routing::route::set_allow_header (1 samples, 0.24%)</title><rect x="1158.3" y="517" width="2.8" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="1161.26" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_types::protocol::v7::TraceId as core::default::Default&gt;::default (1 samples, 0.24%)</title><rect x="858.2" y="101" width="2.9" height="15.0" fill="rgb(230,115,27)" rx="2" ry="2" />
+<text  x="861.22" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;core::ffi::c_str::CStr&gt;::from_bytes_with_nul (2 samples, 0.49%)</title><rect x="434.1" y="229" width="5.8" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="437.11" y="239.5" ></text>
+</g>
+<g >
+<title>do_rallocx (2 samples, 0.49%)</title><rect x="1065.9" y="181" width="5.8" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="1068.94" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::scheduled_io::ScheduledIo&gt;::poll_readiness (1 samples, 0.24%)</title><rect x="136.9" y="421" width="2.9" height="15.0" fill="rgb(205,0,0)" rx="2" ry="2" />
+<text  x="139.94" y="431.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1166.9" y="533" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1169.92" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;ferrosa_storage::commitlog::config::TableId, alloc::sync::Arc&lt;ferrosa_storage::engine::TableState&gt;, std::hash::random::RandomState&gt;&gt;::contains_key::&lt;ferrosa_storage::commitlog::config::TableId&gt; (1 samples, 0.24%)</title><rect x="367.8" y="245" width="2.8" height="15.0" fill="rgb(215,49,11)" rx="2" ry="2" />
+<text  x="370.75" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::commitlog::config::TableId as alloc::string::SpecToString&gt;::spec_to_string (2 samples, 0.49%)</title><rect x="402.4" y="245" width="5.7" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="405.37" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;tower::util::map_future::MapFuture&lt;axum::util::MapIntoResponse&lt;tower::util::map_err::MapErr&lt;axum::extension::AddExtension&lt;axum::routing::route::Route, ferrosa_sparql::http::ServiceScheme&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt;, &lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Body&gt;, http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;&gt;::new&lt;axum::util::MapIntoResponse&lt;tower::util::map_err::MapErr&lt;axum::extension::AddExtension&lt;axum::routing::route::Route, ferrosa_sparql::http::ServiceScheme&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt;&gt;::{closure#0}&gt; as tower::util::boxed_clone_sync::CloneService&lt;http::request::Request&lt;axum_core::body::Body&gt;&gt;&gt;::clone_box (2 samples, 0.49%)</title><rect x="220.6" y="469" width="5.8" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="223.61" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_core::performance::Transaction&gt;::new (2 samples, 0.49%)</title><rect x="855.3" y="117" width="5.8" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="858.33" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;core::future::poll_fn::PollFn&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3}::{closure#0}&gt; as core::future::future::Future&gt;::poll (376 samples, 91.93%)</title><rect x="87.9" y="565" width="1084.8" height="15.0" fill="rgb(222,79,18)" rx="2" ry="2" />
+<text  x="90.90" y="575.5" >&lt;core::future::poll_fn::PollFn&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{c..</text>
+</g>
+<g >
+<title>&lt;tokio::process::imp::orphan::OrphanQueueImpl&lt;std::process::Child&gt;&gt;::reap_orphans (1 samples, 0.24%)</title><rect x="33.1" y="597" width="2.9" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="36.08" y="607.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::results::ResultBody as serde_core::ser::Serialize&gt;::serialize::&lt;&amp;mut serde_json::ser::Serializer&lt;&amp;mut alloc::vec::Vec&lt;u8&gt;&gt;&gt; (4 samples, 0.98%)</title><rect x="448.5" y="213" width="11.6" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="451.53" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="122.5" y="517" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="125.52" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&lt;_&gt;&gt;::reserve::do_reserve_and_handle::&lt;alloc::alloc::Global&gt; (1 samples, 0.24%)</title><rect x="967.8" y="181" width="2.9" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="970.85" y="191.5" ></text>
+</g>
+<g >
+<title>std::fs::read::inner (1 samples, 0.24%)</title><rect x="364.9" y="197" width="2.9" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="367.87" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::poll_read_from_io (3 samples, 0.73%)</title><rect x="209.1" y="533" width="8.6" height="15.0" fill="rgb(213,41,9)" rx="2" ry="2" />
+<text  x="212.07" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::io::Buffered&lt;hyper_util::common::rewind::Rewind&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;, hyper::proto::h1::encode::EncodedBuf&lt;bytes::bytes::Bytes&gt;&gt;&gt;::parse::&lt;hyper::proto::h1::role::Server&gt; (19 samples, 4.65%)</title><rect x="142.7" y="533" width="54.8" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="145.71" y="543.5" >&lt;hype..</text>
+</g>
+<g >
+<title>&lt;tower::util::oneshot::Oneshot&lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Body&gt;, http::response::Response&lt;axum_core::body::Body&gt;, core::convert::Infallible&gt;, http::request::Request&lt;axum_core::body::Body&gt;&gt; as core::future::future::Future&gt;::poll (310 samples, 75.79%)</title><rect x="255.2" y="437" width="894.4" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="258.23" y="447.5" >&lt;tower::util::oneshot::Oneshot&lt;tower::util::boxed_clone_sync::BoxCloneSyncService&lt;http::request::Request&lt;axum_core::body::Bo..</text>
+</g>
+<g >
+<title>&lt;spargebra::parser::SparqlParser&gt;::parse_query (57 samples, 13.94%)</title><rect x="471.6" y="277" width="164.5" height="15.0" fill="rgb(251,215,51)" rx="2" ry="2" />
+<text  x="474.61" y="287.5" >&lt;spargebra::parser::S..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="1094.8" y="213" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1097.79" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (2 samples, 0.49%)</title><rect x="1019.8" y="133" width="5.8" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="1022.78" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run (408 samples, 99.76%)</title><rect x="12.9" y="645" width="1177.1" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="15.89" y="655.5" >&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run</text>
+</g>
+<g >
+<title>&lt;sharded_slab::pool::Pool&lt;tracing_subscriber::registry::sharded::DataInner&gt;&gt;::get (1 samples, 0.24%)</title><rect x="791.9" y="165" width="2.8" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="794.86" y="175.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_fill_small (1 samples, 0.24%)</title><rect x="209.1" y="469" width="2.9" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="212.07" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;core::future::poll_fn::PollFn&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3}::{closure#0}&gt; as core::future::future::Future&gt;::poll (1 samples, 0.24%)</title><rect x="82.1" y="581" width="2.9" height="15.0" fill="rgb(222,79,18)" rx="2" ry="2" />
+<text  x="85.13" y="591.5" ></text>
+</g>
+<g >
+<title>clock_gettime (2 samples, 0.49%)</title><rect x="18.7" y="613" width="5.7" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="21.66" y="623.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::execute::{closure#0} (148 samples, 36.19%)</title><rect x="656.3" y="277" width="427.0" height="15.0" fill="rgb(238,154,36)" rx="2" ry="2" />
+<text  x="659.26" y="287.5" >ferrosa_sparql::executor::execute::{closure#0}</text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_i (1 samples, 0.24%)</title><rect x="627.4" y="213" width="2.9" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="630.41" y="223.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_no_alloc_shim_is_unstable_v2 (2 samples, 0.49%)</title><rect x="390.8" y="245" width="5.8" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="393.83" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="1074.6" y="197" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="1077.60" y="207.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (409 samples, 100.00%)</title><rect x="10.0" y="821" width="1180.0" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="13.00" y="831.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt; (1 samples, 0.24%)</title><rect x="1060.2" y="197" width="2.9" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1063.17" y="207.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;spargebra::query::Query&gt; (1 samples, 0.24%)</title><rect x="644.7" y="277" width="2.9" height="15.0" fill="rgb(216,54,12)" rx="2" ry="2" />
+<text  x="647.72" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt; as tokio::runtime::task::Schedule&gt;::schedule (1 samples, 0.24%)</title><rect x="44.6" y="549" width="2.9" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="47.62" y="559.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (1 samples, 0.24%)</title><rect x="523.5" y="117" width="2.9" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="526.55" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::fmt::format::DefaultVisitor as tracing_core::field::Visit&gt;::record_debug (1 samples, 0.24%)</title><rect x="907.3" y="133" width="2.8" height="15.0" fill="rgb(235,141,33)" rx="2" ry="2" />
+<text  x="910.26" y="143.5" ></text>
+</g>
+<g >
+<title>alloc::fmt::format::format_inner (5 samples, 1.22%)</title><rect x="838.0" y="133" width="14.4" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="841.02" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::combinators::map_err::MapErr&lt;tower_http::body::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt; as http_body::Body&gt;::poll_frame (1 samples, 0.24%)</title><rect x="269.7" y="245" width="2.8" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="272.66" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::{closure#0}::{closure#3}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (379 samples, 92.67%)</title><rect x="79.2" y="597" width="1093.5" height="15.0" fill="rgb(235,140,33)" rx="2" ry="2" />
+<text  x="82.24" y="607.5" >&lt;tokio::runtime::task::core::Core&lt;axum::serve::handle_connection&lt;tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router&gt;::..</text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.49%)</title><rect x="1143.8" y="341" width="5.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1146.84" y="351.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::executor::decode_triple (26 samples, 6.36%)</title><rect x="965.0" y="213" width="75.0" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="967.96" y="223.5" >ferrosa_..</text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.24%)</title><rect x="739.9" y="133" width="2.9" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="742.93" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::stream::stream::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt; + core::marker::Send&gt;&gt;, ferrosa_cluster::write_path::local_range_stream::{closure#0}&gt; as futures_core::stream::Stream&gt;::poll_next (1 samples, 0.24%)</title><rect x="1063.1" y="213" width="2.8" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="1066.06" y="223.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.24%)</title><rect x="226.4" y="453" width="2.9" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="229.38" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;spargebra::term::TriplePattern as core::clone::Clone&gt;::clone (2 samples, 0.49%)</title><rect x="1097.7" y="197" width="5.7" height="15.0" fill="rgb(246,193,46)" rx="2" ry="2" />
+<text  x="1100.68" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;http_body_util::combinators::map_err::MapErr&lt;http_body_util::limited::Limited&lt;axum_core::body::Body&gt;, &lt;axum_core::error::Error&gt;::new&lt;alloc::boxed::Box&lt;dyn core::error::Error + core::marker::Send + core::marker::Sync&gt;&gt;&gt; as http_body::Body&gt;::poll_frame (1 samples, 0.24%)</title><rect x="278.3" y="277" width="2.9" height="15.0" fill="rgb(242,174,41)" rx="2" ry="2" />
+<text  x="281.31" y="287.5" ></text>
+</g>
+<g >
+<title>spargebra::parser::parser::__parse_ServiceGraphPattern (1 samples, 0.24%)</title><rect x="558.2" y="213" width="2.9" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="561.17" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="659.1" y="245" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="662.14" y="255.5" ></text>
+</g>
+<g >
+<title>pac_alloc_impl (1 samples, 0.24%)</title><rect x="209.1" y="421" width="2.9" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="212.07" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt; as hyper::rt::io::Read&gt;::poll_read (1 samples, 0.24%)</title><rect x="214.8" y="501" width="2.9" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="217.84" y="511.5" ></text>
+</g>
+<g >
+<title>do_rallocx (2 samples, 0.49%)</title><rect x="1019.8" y="117" width="5.8" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="1022.78" y="127.5" ></text>
+</g>
+<g >
+<title>ferrosa_sparql::planner::collect_ops (4 samples, 0.98%)</title><rect x="1097.7" y="213" width="11.5" height="15.0" fill="rgb(225,92,22)" rx="2" ry="2" />
+<text  x="1100.68" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::future::future::map::Map&lt;futures_util::future::try_future::into_future::IntoFuture&lt;tower_http::limit::future::ResponseFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;&gt;&gt;, futures_util::fns::MapErrFn&lt;&lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (310 samples, 75.79%)</title><rect x="255.2" y="405" width="894.4" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="258.23" y="415.5" >&lt;futures_util::future::future::map::Map&lt;futures_util::future::try_future::into_future::IntoFuture&lt;tower_http::limit::future:..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="301.4" y="293" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="304.39" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::finish_grow (1 samples, 0.24%)</title><rect x="428.3" y="197" width="2.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="431.34" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;hyper::proto::h1::encode::Encoder&gt;::encode_and_end::&lt;bytes::bytes::Bytes&gt; (2 samples, 0.49%)</title><rect x="93.7" y="549" width="5.7" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="96.67" y="559.5" ></text>
+</g>
+<g >
+<title>core::str::converts::from_utf8 (1 samples, 0.24%)</title><rect x="970.7" y="181" width="2.9" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="973.73" y="191.5" ></text>
+</g>
+<g >
+<title>core::slice::memchr::memchr_aligned (3 samples, 0.73%)</title><rect x="647.6" y="277" width="8.7" height="15.0" fill="rgb(251,214,51)" rx="2" ry="2" />
+<text  x="650.60" y="287.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.24%)</title><rect x="638.9" y="277" width="2.9" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="641.95" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;tracing_subscriber::registry::sharded::Registry as tracing_subscriber::registry::LookupSpan&gt;::span_data (1 samples, 0.24%)</title><rect x="791.9" y="181" width="2.8" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="794.86" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="385.1" y="245" width="2.8" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="388.06" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;mio::net::tcp::stream::TcpStream as std::io::Write&gt;::write_vectored (3 samples, 0.73%)</title><rect x="197.5" y="485" width="8.7" height="15.0" fill="rgb(238,152,36)" rx="2" ry="2" />
+<text  x="200.53" y="495.5" ></text>
+</g>
+<g >
+<title>do_rallocx (1 samples, 0.24%)</title><rect x="843.8" y="53" width="2.9" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="846.79" y="63.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;spargebra::parser::FocusedTripleOrPathPattern&lt;spargebra::parser::ReifiedTerm&gt;&gt;&gt;::grow_one (2 samples, 0.49%)</title><rect x="520.7" y="149" width="5.7" height="15.0" fill="rgb(226,100,24)" rx="2" ry="2" />
+<text  x="523.66" y="159.5" ></text>
+</g>
+<g >
+<title>do_rallocx (10 samples, 2.44%)</title><rect x="985.2" y="133" width="28.8" height="15.0" fill="rgb(246,191,45)" rx="2" ry="2" />
+<text  x="988.16" y="143.5" >do..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.24%)</title><rect x="471.6" y="261" width="2.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="474.61" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;http::extensions::Extensions&gt;::insert::&lt;ferrosa_sparql::http::ServiceScheme&gt; (1 samples, 0.24%)</title><rect x="1152.5" y="469" width="2.9" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="1155.49" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sparql::engine::SparqlEngine&gt;::ensure_table_registered (2 samples, 0.49%)</title><rect x="292.7" y="293" width="5.8" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="295.74" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;std::hash::random::RandomState as core::hash::BuildHasher&gt;::hash_one::&lt;&amp;axum::routing::RouteId&gt; (1 samples, 0.24%)</title><rect x="229.3" y="485" width="2.9" height="15.0" fill="rgb(213,37,9)" rx="2" ry="2" />
+<text  x="232.27" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;hyper_util::rt::tokio::TokioIo&lt;tokio::net::tcp::stream::TcpStream&gt; as hyper::rt::io::Read&gt;::poll_read (2 samples, 0.49%)</title><rect x="154.3" y="485" width="5.7" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="157.25" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infallible&gt;, &lt;core::convert::Infallible as core::convert::Into&lt;core::convert::Infallible&gt;&gt;::into&gt;&gt; as core::future::future::Future&gt;::poll (313 samples, 76.53%)</title><rect x="249.5" y="485" width="903.0" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="252.46" y="495.5" >&lt;axum::util::MapIntoResponseFuture&lt;tower::util::map_err::MapErrFuture&lt;axum::routing::route::RouteFuture&lt;core::convert::Infall..</text>
+</g>
+<g >
+<title>&lt;tracing_core::field::DisplayValue&lt;&amp;&amp;ferrosa_storage::commitlog::config::TableId&gt; as core::fmt::Debug&gt;::fmt (1 samples, 0.24%)</title><rect x="895.7" y="101" width="2.9" height="15.0" fill="rgb(239,156,37)" rx="2" ry="2" />
+<text  x="898.72" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::key::DecoratedKey&gt;::new (1 samples, 0.24%)</title><rect x="1080.4" y="213" width="2.9" height="15.0" fill="rgb(215,49,11)" rx="2" ry="2" />
+<text  x="1083.37" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;sentry_types::protocol::v7::TraceId as core::default::Default&gt;::default (1 samples, 0.24%)</title><rect x="820.7" y="117" width="2.9" height="15.0" fill="rgb(230,115,27)" rx="2" ry="2" />
+<text  x="823.71" y="127.5" ></text>
+</g>
+</g>
+</svg>

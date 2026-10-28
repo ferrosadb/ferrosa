@@ -363,18 +363,30 @@ async fn lane_reconnects_after_outage_longer_than_fast_budget() {
     let peer_id = Uuid::new_v4();
     let handle = lane_whose_peer_just_died(addr, peer_id).await;
 
-    let returned = spawn_fake_peer(addr, peer_id, 20 * MINUTE, None);
+    // The peer must remain absent until the outage assertion has observed it.
+    // A timer at exactly twenty minutes races run_for's final readiness turn.
+    let (return_peer, peer_return) = tokio::sync::oneshot::channel();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&accepted);
+    let returned = tokio::spawn(async move {
+        peer_return.await.expect("release returning peer");
+        let listener = TcpListener::bind(addr).await.expect("returning peer bind");
+        serve(listener, peer_id, None, false, counter).await;
+    });
 
     run_for(20 * MINUTE).await;
     assert_ne!(status(&handle).await, LaneStatusReport::Connected);
+    assert_eq!(accepted.load(Ordering::SeqCst), 0);
+    return_peer.send(()).expect("returning peer task");
 
     // Slow-retry interval is 30 s plus up to 25% jitter; two minutes is ample.
     assert!(
         run_until(&handle, 2 * MINUTE, |s| s == LaneStatusReport::Connected).await,
         "lane did not reconnect within two minutes of the peer returning"
     );
-    assert!(returned.accepted() >= 1);
+    assert!(accepted.load(Ordering::SeqCst) >= 1);
     handle.shutdown().await;
+    returned.abort();
 }
 
 /// An hour of outage must produce one line when the lane drops into

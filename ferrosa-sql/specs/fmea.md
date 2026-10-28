@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 doc: fmea
-last_updated: 2026-10-11
+last_updated: 2026-10-26
 ---
 
 # ferrosa-sql — FMEA / Known Issues
@@ -78,3 +78,5 @@ row's own columns); `BEGIN/COMMIT/ROLLBACK/SET/RESET` parsed for the front-end.
   aggregate edge cases, numeric normalization, and binder fail-loud paths.
 - `ferrosa-postgres` integration tests drive the engine end-to-end over the wire
   (the real consumer-facing surface check).
+
+Transaction clock parsing is covered by `parser::timestamp_regression`; column typing by `types::timestamp_regression`. Bare CURRENT_TIMESTAMP must remain a function AST node, and TimestampTz must remain distinct from Timestamp. Evaluation belongs to the frontend, so the parser cannot freeze a prepared clock.

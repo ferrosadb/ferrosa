@@ -521,7 +521,11 @@ build; the codec's own cost is its delta against `none`.
   refuses the walk (truncated `Done` → `TruncatedReplica`) instead of
   contributing zero rows, so a tenant-wide read through a partition-key index
   either unions every node's slice or fails (t_50c8bc7d); callers with a scan
-  alternative check `WritePath::declares_index_locally` first.
+  alternative check `WritePath::declares_index_locally` first. The merge initializes
+  every source before yielding its first row. Bolt's cold index setup uses a
+  bounded first-result probe to observe initially stale remote indexes; this is
+  not a guarantee about later topology/readiness changes. `WritePath::clone`
+  shares its Arc-backed destinations for lazy scalar-alias streams.
   The consume path is **bounded memory**: `stream_consumer::PartitionSink` +
   `consume_range_stream_into` MOVE each decoded partition into a sink one at a
   time (resident set `O(chunk)`), and `coordinate_range_read_stream_limited_rows`
@@ -1221,3 +1225,16 @@ Related reference specs: `specs/reference/cluster-formation-architecture.md`,
 Raft cell DTOs carry `CellBytes` and serialize the same byte sequence as
 the former owned vector. Frozen legacy-format tests cover this boundary; replay
 identities and digest ordering are unchanged.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+PostgreSQL replica apply acquires each MVCC observer's lifecycle lease before preparing row images and retains the leases through the complete atomic storage batch and publication. Stale table UUIDs reject the whole batch before any storage effect; a fresh applier also rejects replay into a replacement incarnation. Schema/storage reconciliation uses synchronous lifecycle write fences with the lifecycle fence acquired before registry/storage locks; no guard spans an await. PostgreSQL metadata without incarnation UUIDs requires explicit upgrade handling and is refused by the new observer.
+
+Raft restore retires physical rows when authoritative incoming schema names a different UUID, then installs the replacement; storage/schema reconciliation errors propagate instead of reporting a successful snapshot. Direct DDL and pair catch-up retain one write fence across registry and storage transitions. The all-serving TRUNCATE fan-out is a separate raw-marker path and is not covered by the MVCC observer lease.
+
+Storage schemas now persist the authoritative UUID in the reserved `ferrosa.table_id` extension (overwriting caller-supplied values). Restore prefers that provenance, with the local schema registry supplying legacy provenance when available. Unidentified data or malformed UUID metadata is refused before any table is retired; recoverable data is preserved for explicit repair. Empty registrations can adopt the incoming schema.
+
+## Single-row COUNT pushdown
+
+The single-row liveness-count route follows the same consistency/replication selection as range reads. When the selected read needs no remote replica it invokes the exact local metadata counter; otherwise it counts the existing consistency-merged partition stream and applies row visibility. Remote errors propagate; they never become a local-only or zero count. Remote reconciliation can still decode payloads: the metadata-only optimization applies to the local route.
