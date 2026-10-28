@@ -35,8 +35,8 @@ use ferrosa_storage::engine::StorageEngine;
 use ferrosa_storage::TableId;
 
 use crate::raft::handlers::{
-    decode_request, partition_from_wire, partition_to_wire, reply_outcome, storage_failure,
-    unexpected_message, PartitionWire,
+    decode_request, partition_from_wire, reply_outcome, storage_failure, unexpected_message,
+    PartitionWire,
 };
 
 use super::merkle::MerkleTree;
@@ -112,6 +112,27 @@ pub struct RepairApplyRequestPayload {
     pub keyspace: String,
     pub table: String,
     pub partitions: Vec<PartitionWire>,
+}
+
+/// The bincode bytes of a [`RepairApplyRequestPayload`] for `partitions`,
+/// written from the borrowed partitions: no `Vec<PartitionWire>` and no
+/// partition clone, so an apply chunk costs its wire bytes, not a second copy
+/// of every cell. Byte-identical to serializing the struct — pinned by
+/// `repair_apply_request_borrowed_emit_matches_legacy`.
+fn encode_apply_request(
+    keyspace: &str,
+    table: &str,
+    partitions: &[Partition],
+) -> Result<Vec<u8>, bincode::Error> {
+    // RepairApplyRequestPayload field order: keyspace, table, partitions.
+    let mut body: Vec<u8> = Vec::new();
+    bincode::serialize_into(&mut body, keyspace)?;
+    bincode::serialize_into(&mut body, table)?;
+    bincode::serialize_into(&mut body, &(partitions.len() as u64))?;
+    for partition in partitions {
+        crate::raft::handlers::serialize_partition_to_wire_borrowed(&mut body, partition)?;
+    }
+    Ok(body)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -441,12 +462,8 @@ impl RepairStore for RemoteRepairStore {
         // (decoded `PartitionWire` → `Partition`) and the cgroup
         // OOMs.
         for chunk in partitions.chunks(super::executor::REPAIR_APPLY_CHUNK_PARTITIONS) {
-            let req = RepairApplyRequestPayload {
-                keyspace: table.keyspace.clone(),
-                table: table.table.clone(),
-                partitions: chunk.iter().cloned().map(partition_to_wire).collect(),
-            };
-            let body = bincode::serialize(&req).map_err(|e| format!("serialize: {e}"))?;
+            let body = encode_apply_request(&table.keyspace, &table.table, chunk)
+                .map_err(|e| format!("serialize: {e}"))?;
             let resp = self
                 .peer_manager
                 .send(
@@ -519,6 +536,7 @@ impl RepairStore for RemoteRepairStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::raft::handlers::partition_to_wire;
 
     /// A multi-row, multi-cell partition: exercises every layer of the wire
     /// encoding so a byte-equivalence assertion below is not trivially true.
@@ -586,6 +604,29 @@ mod tests {
             borrowed, legacy,
             "borrowed repair-fetch emission diverged from the legacy collect"
         );
+    }
+
+    /// The repair Apply request is written from borrowed partitions. Its bytes
+    /// must equal serializing the struct built from cloned `PartitionWire`s —
+    /// the shape a peer decodes — or repair would apply garbage.
+    #[test]
+    fn repair_apply_request_borrowed_emit_matches_legacy() {
+        let parts = vec![repair_fetch_fixture(), repair_fetch_fixture()];
+        let legacy = bincode::serialize(&RepairApplyRequestPayload {
+            keyspace: "ks".into(),
+            table: "t".into(),
+            partitions: parts.iter().cloned().map(partition_to_wire).collect(),
+        })
+        .unwrap();
+
+        let borrowed = encode_apply_request("ks", "t", &parts).unwrap();
+
+        assert_eq!(
+            borrowed, legacy,
+            "borrowed repair-apply emission diverged from the struct serialization"
+        );
+        let decoded: RepairApplyRequestPayload = bincode::deserialize(&borrowed).unwrap();
+        assert_eq!(decoded.partitions.len(), parts.len());
     }
 
     /// Encode + decode the three payload structs to confirm bincode +

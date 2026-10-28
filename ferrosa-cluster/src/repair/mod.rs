@@ -497,13 +497,18 @@ fn row_content_hash(row: &ferrosa_sstable::types::Row) -> u64 {
 /// equal timestamp rather than settle it by timestamp alone. That is
 /// observability, not a blocker: repair converges those rows too, because
 /// leaving them alone left replicas divergent forever while reporting success.
-pub fn diff_partition_sets(a: &[Partition], b: &[Partition]) -> RepairPlan {
+pub fn diff_partition_sets<'a>(
+    a: impl IntoIterator<Item = &'a Partition>,
+    b: impl IntoIterator<Item = &'a Partition>,
+) -> RepairPlan {
     use std::collections::HashMap;
     // Key the lookups by raw partition-key bytes — DecoratedKey isn't Hash.
+    // Both sides are borrowed: only a partition that goes into the plan is
+    // copied, never the inputs being compared.
     let a_by_key: HashMap<&[u8], &Partition> =
-        a.iter().map(|p| (p.key.key.as_bytes(), p)).collect();
+        a.into_iter().map(|p| (p.key.key.as_bytes(), p)).collect();
     let b_by_key: HashMap<&[u8], &Partition> =
-        b.iter().map(|p| (p.key.key.as_bytes(), p)).collect();
+        b.into_iter().map(|p| (p.key.key.as_bytes(), p)).collect();
     let mut plan = RepairPlan::default();
 
     for (key, p_a) in &a_by_key {
@@ -676,17 +681,13 @@ pub fn compute_repair_plan(
 
     let mut plan = RepairPlan::default();
     for (sub_start, sub_end) in divergent {
-        let a_in_leaf: Vec<Partition> = parts_a
-            .iter()
-            .filter(|p| p.key.token.0 >= sub_start && p.key.token.0 < sub_end)
-            .cloned()
-            .collect();
-        let b_in_leaf: Vec<Partition> = parts_b
-            .iter()
-            .filter(|p| p.key.token.0 >= sub_start && p.key.token.0 < sub_end)
-            .cloned()
-            .collect();
-        let sub_plan = diff_partition_sets(&a_in_leaf, &b_in_leaf);
+        // Borrow each side's slice of the leaf; the diff copies only what
+        // the plan carries.
+        let in_leaf = |p: &&Partition| p.key.token.0 >= sub_start && p.key.token.0 < sub_end;
+        let sub_plan = diff_partition_sets(
+            parts_a.iter().filter(in_leaf),
+            parts_b.iter().filter(in_leaf),
+        );
         plan.a_to_b.extend(sub_plan.a_to_b);
         plan.b_to_a.extend(sub_plan.b_to_a);
         plan.timestamp_ties.extend(sub_plan.timestamp_ties);

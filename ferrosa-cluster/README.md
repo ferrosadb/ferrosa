@@ -606,7 +606,8 @@ spilling_to_the_staging_file_applies_every_mutation, resident_buffer_knob_is_tun
 (bounds resident Apply *frames*, not their size — CL-53); `accord/apply.rs`
 `DEFAULT_PARKED_APPLY_RECLAIM_SECS` (a TIME bound; parked write-sets already spill, CL-55);
 `repair` fetch/apply chunk sizes (mid-stream chunks carrying a resume cursor, every batch
-sent); `hints/` per-peer byte budget (`ClusterError::Overloaded` — loud backpressure,
+sent; leaves are diffed by borrowing their partitions, and an apply chunk is encoded
+from borrowed partitions, so repair holds no second copy — CL-78); `hints/` per-peer byte budget (`ClusterError::Overloaded` — loud backpressure,
 never a silent drop); `MAX_CONNECTED_PEERS` / `MAX_PENDING_JOINS` / `MAX_SEEN_INVITE_INITIATORS`
 (evict-oldest maps that never refuse a real member); `cluster_rejoin`
 `MAX_REJOIN_ATTEMPTS` / `BACKOFF_MAX_SECS` (retries/backoff); `ferrosa-net` lane
