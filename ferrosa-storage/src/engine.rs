@@ -14369,28 +14369,40 @@ impl StorageEngine {
         // Swallowing this error is what let 36,572 of them accumulate unnoticed.
         if component_dir != table_dir {
             if let Err(e) = std::fs::remove_dir(&component_dir) {
-                // Every leftover is named: a component directory holds one
-                // generation's component files, a handful by construction, so
-                // the list is small and a sample would hide which one stayed.
-                // An entry or listing that cannot be read is named as such
-                // rather than dropped from the report.
-                let leftovers: Vec<String> = match std::fs::read_dir(&component_dir) {
-                    Ok(entries) => entries
-                        .map(|entry| match entry {
-                            Ok(entry) => entry.file_name().to_string_lossy().into_owned(),
-                            Err(err) => format!("<unreadable entry: {err}>"),
-                        })
-                        .collect(),
-                    Err(err) => vec![format!("<directory could not be listed: {err}>")],
-                };
                 tracing::error!(
                     dir = %component_dir.display(),
                     error = %e,
-                    ?leftovers,
                     "delete_sstable_files: SSTable component directory survived deletion — \
                      it will be re-examined by compaction planning on every cycle and can \
-                     never be compacted. This is an SSTable husk leak."
+                     never be compacted. This is an SSTable husk leak. Each leftover follows."
                 );
+                // Every leftover is named, one line each as the listing is
+                // walked: a sample would hide which one stayed, and collecting
+                // the names would hold a directory of any size. An entry or
+                // listing that cannot be read is named as such, not dropped.
+                match std::fs::read_dir(&component_dir) {
+                    Ok(entries) => {
+                        for entry in entries {
+                            match entry {
+                                Ok(entry) => tracing::error!(
+                                    dir = %component_dir.display(),
+                                    leftover = %entry.file_name().to_string_lossy(),
+                                    "delete_sstable_files: leftover in a surviving component directory"
+                                ),
+                                Err(err) => tracing::error!(
+                                    dir = %component_dir.display(),
+                                    error = %err,
+                                    "delete_sstable_files: unreadable entry in a surviving component directory"
+                                ),
+                            }
+                        }
+                    }
+                    Err(err) => tracing::error!(
+                        dir = %component_dir.display(),
+                        error = %err,
+                        "delete_sstable_files: surviving component directory could not be listed"
+                    ),
+                }
             }
         }
 
