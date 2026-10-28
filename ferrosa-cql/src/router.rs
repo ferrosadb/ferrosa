@@ -9698,26 +9698,48 @@ async fn eval_local_condition(
     if_exists: bool,
 ) -> Result<Option<BytesMut>, CqlError> {
     let existing = read_lwt_row(state, target).await?;
-    let as_map: Option<HashMap<String, Option<CqlValue>>> = existing.as_ref().map(|row| {
-        target
-            .table_meta
-            .columns
-            .keys()
-            .cloned()
-            .zip(row.iter().cloned())
-            .collect()
+    let columns = &target.table_meta.columns;
+    // The row MOVES into the evaluator's map (no per-cell clone). A failed
+    // condition hands the map back as `current_values`, and the row is
+    // rebuilt from it in column order for the `[applied]=false` frame.
+    // Values past the last column (none, for a well-formed row) are not
+    // evaluated and are kept aside for the frame exactly as read.
+    let mut head_and_tail = existing.map(|mut row| {
+        let tail = row.split_off(columns.len().min(row.len()));
+        (row, tail)
     });
-    let verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map);
+    let head_len = head_and_tail.as_ref().map(|(head, _)| head.len());
+    let as_map: Option<HashMap<String, Option<CqlValue>>> = head_and_tail
+        .as_mut()
+        .map(|(head, _)| columns.keys().cloned().zip(std::mem::take(head)).collect());
+    let mut verdict = crate::accord_router::eval_if_conditions(conditions, if_exists, as_map);
     if verdict.applied {
         return Ok(None);
     }
+    let current: Option<Vec<Option<CqlValue>>> = match (head_and_tail, head_len) {
+        (Some((_, tail)), Some(len)) => {
+            let mut row: Vec<Option<CqlValue>> = columns
+                .keys()
+                .map_while(|k| verdict.current_values.remove(k))
+                .collect();
+            if row.len() != len {
+                return Err(CqlError::ServerError(format!(
+                    "IF evaluation returned {} of the {len} current values it was given",
+                    row.len()
+                )));
+            }
+            row.extend(tail);
+            Some(row)
+        }
+        _ => None,
+    };
     Ok(Some(encode_lwt_applied(
         false,
         target.ks,
         &target.table_id.table,
         target.table_meta,
         &state.schema,
-        existing.as_deref(),
+        current.as_deref(),
     )?))
 }
 
@@ -30188,6 +30210,49 @@ mod tests {
         assert!(
             !text.contains('2'),
             "the version must not advance past a refused CAS. Rows: {text}"
+        );
+    }
+
+    /// A refused conditional UPDATE answers `[applied]=false` WITH the current
+    /// row. The row is moved into the evaluator and rebuilt from what it hands
+    /// back, so the frame must still carry every stored value.
+    #[tokio::test]
+    async fn refused_conditional_update_returns_the_current_row() {
+        let (state, _dir) = setup();
+        let auth = dev_auth();
+        let no_ks = None;
+        let ctx = test_ctx(&auth, &no_ks);
+
+        for stmt in [
+            "CREATE KEYSPACE cwr WITH REPLICATION = \
+             {'class': 'SimpleStrategy', 'replication_factor': '1'}",
+            "CREATE TABLE cwr.t (k int PRIMARY KEY, v text, version bigint)",
+            "INSERT INTO cwr.t (k, v, version) VALUES (7, 'stored-value', 1)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(stmt).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let cas = crate::parser::parse(
+            "UPDATE cwr.t SET v = 'clobbered', version = 2 WHERE k = 7 IF version = 99",
+        )
+        .unwrap();
+        let RouteResult::Result(bytes) = route(&state, &ctx, cas).await.unwrap() else {
+            panic!("a refused conditional UPDATE must answer with a result frame");
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("[applied]") && text.contains("version"),
+            "the refusal frame must name [applied] and the table's columns: {text}"
+        );
+        assert!(
+            text.contains("stored-value"),
+            "the refusal frame must carry the current row's values: {text}"
+        );
+        assert!(
+            !text.contains("clobbered"),
+            "the refused write's values must not appear: {text}"
         );
     }
 
