@@ -666,22 +666,33 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
-/// The row with every cell rendered, or `None` when the pattern occurs
-/// nowhere in it (partition key, clustering, or any cell value).
+/// Whether the pattern occurs in the row's partition key, clustering or any
+/// cell value. Borrow-only: the scan calls this for EVERY row, so it must not
+/// allocate. Only a row that passes is rendered by [`render_row`].
+fn row_matches(key_bytes: &[u8], row: &Row, pattern: &[u8]) -> bool {
+    contains(key_bytes, pattern)
+        || contains(&row.clustering, pattern)
+        || row
+            .cells
+            .iter()
+            .any(|(_, cell)| cell.value.as_deref().is_some_and(|v| contains(v, pattern)))
+}
+
+/// Render a row that [`row_matches`] accepted, every cell named from the
+/// generation's own header.
 ///
 /// A cell's column index counts within its own row kind: the decoder indexes
 /// a static row's cells into `static_columns` and a clustered row's into
 /// `regular_columns`, so `is_static` picks the list.
-fn match_row(
+fn render_row(
     header: &SerializationHeader,
-    key: &DecoratedKey,
+    key_bytes: &[u8],
     row: &Row,
     is_static: bool,
     pattern: &[u8],
     gen: u64,
     location: &str,
-) -> Option<FoundRow> {
-    let key_bytes = key.key.as_bytes();
+) -> FoundRow {
     let mut matched_in = Vec::new();
     if contains(key_bytes, pattern) {
         matched_in.push("partition_key".to_string());
@@ -697,8 +708,7 @@ fn match_row(
     let mut cells = Vec::with_capacity(row.cells.len());
     for (col_idx, cell) in &row.cells {
         let idx = *col_idx as usize;
-        let column = columns.get(idx);
-        let (name, ty) = column.map_or_else(
+        let (name, ty) = columns.get(idx).map_or_else(
             || (format!("#{idx}"), "?".to_string()),
             |(n, t)| (String::from_utf8_lossy(n).into_owned(), t.clone()),
         );
@@ -714,10 +724,8 @@ fn match_row(
             local_deletion_time: cell.local_deletion_time,
         });
     }
-    if matched_in.is_empty() {
-        return None;
-    }
-    Some(FoundRow {
+    debug_assert!(!matched_in.is_empty(), "render_row called on a non-match");
+    FoundRow {
         gen,
         location: location.to_string(),
         partition_key_hex: to_hex(key_bytes),
@@ -725,17 +733,23 @@ fn match_row(
         liveness_timestamp: row.primary_key_liveness.timestamp,
         matched_in,
         cells,
-    })
+    }
 }
 
-/// What [`find_rows`] saw: the matching rows, and every generation it could
-/// not read to the end. A corrupt generation is exactly what this command is
-/// pointed at, so it does not abort the search, but it is never a silent gap:
-/// the rows decoded before the failure are kept and the failure is reported.
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct FindReport {
-    pub rows: Vec<FoundRow>,
-    pub unreadable: Vec<UnreadableGen>,
+/// One thing [`find_rows`] observed, handed to the caller's sink the moment it
+/// is seen. Nothing is accumulated: a tenant-wide pattern can match tens of
+/// thousands of rows, and holding them to print at the end is exactly the
+/// materialization this tool must not do.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FindEvent {
+    /// A matching row.
+    Row(FoundRow),
+    /// A generation that could not be read to the end. A corrupt generation is
+    /// what this command is pointed at, so it does not abort the search, but it
+    /// is never a silent gap: rows decoded before the failure were already
+    /// emitted, and this event follows them.
+    Unreadable(UnreadableGen),
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -747,104 +761,223 @@ pub struct UnreadableGen {
     pub error: String,
 }
 
+/// Counts only; the rows themselves went to the sink.
+#[derive(Debug, Clone, Copy, Serialize, Default, PartialEq)]
+pub struct FindSummary {
+    pub generations_scanned: u64,
+    pub rows_scanned: u64,
+    pub rows_matched: u64,
+    pub generations_unreadable: u64,
+}
+
+/// The caller's consumer for [`FindEvent`]s. An `Err` (stdout closed, disk
+/// full) aborts the whole search: losing output is not a per-generation
+/// failure, and carrying on would report a search nobody saw.
+pub type FindSink<'a> = dyn FnMut(FindEvent) -> Result<(), CtlError> + 'a;
+
 /// Every row in `table_dir` (and, when asked, its `quarantine/`) whose key,
-/// clustering or a cell value contains `pattern`. Pure read. Streams one
-/// partition at a time.
+/// clustering or a cell value contains `pattern`, emitted to `sink` as found.
+/// Pure read.
+///
+/// Streams rows, not partitions: `partitions_iter` +
+/// `next_partition_header_only` + `stream_clustered_rows`, the same walk the
+/// startup smoke test uses, so a wide partition is never materialized and at
+/// most one decoded row is live at a time. Non-matching rows are tested by
+/// borrow and never rendered.
 pub fn find_rows(
     table_dir: &Path,
     pattern: &[u8],
     include_quarantine: bool,
-) -> Result<FindReport, CtlError> {
+    sink: &mut FindSink<'_>,
+) -> Result<FindSummary, CtlError> {
     if !table_dir.is_dir() {
         return Err(format!("not a directory: {}", table_dir.display()).into());
     }
     if pattern.is_empty() {
         return Err("empty pattern matches everything".into());
     }
-    let mut dirs = vec![(table_dir.to_path_buf(), "live")];
     let q = table_dir.join("quarantine");
-    if include_quarantine && q.is_dir() {
-        dirs.push((q, "quarantine"));
-    }
-    let mut report = FindReport::default();
-    for (dir, location) in &dirs {
-        for gen in StorageEngine::list_generations_in_dir(dir) {
-            let mut partitions_read = 0u64;
-            let outcome = (|| -> Result<(), CtlError> {
-                let reader = open_reader(dir, gen)?;
-                let header = reader.header().clone();
-                let mut iter = reader.scan_iter()?;
-                while let Some(p) = iter.next_partition()? {
-                    partitions_read += 1;
-                    let rows = (p.static_row.iter().map(|row| (row, true)))
-                        .chain(p.rows.iter().map(|row| (row, false)));
-                    report.rows.extend(rows.filter_map(|(row, is_static)| {
-                        match_row(&header, &p.key, row, is_static, pattern, gen, location)
-                    }));
-                }
-                Ok(())
-            })();
+    let quarantine = (include_quarantine && q.is_dir()).then_some((q, "quarantine"));
+    let dirs = std::iter::once((table_dir.to_path_buf(), "live")).chain(quarantine);
+    let mut summary = FindSummary::default();
+    for (dir, location) in dirs {
+        for gen in StorageEngine::list_generations_in_dir(&dir) {
+            summary.generations_scanned += 1;
+            let mut scan = GenScan {
+                gen,
+                location,
+                pattern,
+                sink: &mut *sink,
+                summary: &mut summary,
+                partitions_read: 0,
+                sink_error: None,
+            };
+            let outcome = scan.run(&dir);
+            let (partitions_read, sink_error) = (scan.partitions_read, scan.sink_error);
+            if let Some(e) = sink_error {
+                return Err(e);
+            }
             if let Err(e) = outcome {
-                report.unreadable.push(UnreadableGen {
+                summary.generations_unreadable += 1;
+                sink(FindEvent::Unreadable(UnreadableGen {
                     gen,
                     location: location.to_string(),
                     partitions_read,
                     error: e.to_string(),
-                });
+                }))?;
             }
         }
     }
-    Ok(report)
+    Ok(summary)
 }
 
-/// `ferrosa-ctl sstable find` entry point.
+/// The walk of one generation. A sink failure inside the row callback has to
+/// stop the decoder, which only understands its own error type, so the real
+/// error is parked in `sink_error` and [`find_rows`] returns it instead of
+/// reporting the generation as unreadable.
+struct GenScan<'s, 'k> {
+    gen: u64,
+    location: &'static str,
+    pattern: &'s [u8],
+    sink: &'s mut FindSink<'k>,
+    summary: &'s mut FindSummary,
+    partitions_read: u64,
+    sink_error: Option<CtlError>,
+}
+
+impl GenScan<'_, '_> {
+    fn run(&mut self, dir: &Path) -> Result<(), CtlError> {
+        let reader = open_reader(dir, self.gen)?;
+        let header = reader.header();
+        let mut iter = reader.partitions_iter()?;
+        while let Some((key, _deletion, static_row)) = iter.next_partition_header_only()? {
+            self.partitions_read += 1;
+            let key_bytes = key.key.as_bytes();
+            if let Some(row) = &static_row {
+                self.offer(header, key_bytes, row, true);
+            }
+            iter.stream_clustered_rows(|row| {
+                self.offer(header, key_bytes, row, false);
+                match self.sink_error {
+                    None => Ok(()),
+                    Some(_) => Err(ferrosa_common::Error::InvalidFormat(
+                        "find: output failed; stopping the scan".to_string(),
+                    )),
+                }
+            })?;
+            if self.sink_error.is_some() {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Test one row; render and emit it only if it matches.
+    fn offer(
+        &mut self,
+        header: &SerializationHeader,
+        key_bytes: &[u8],
+        row: &Row,
+        is_static: bool,
+    ) {
+        self.summary.rows_scanned += 1;
+        if self.sink_error.is_some() || !row_matches(key_bytes, row, self.pattern) {
+            return;
+        }
+        self.summary.rows_matched += 1;
+        let found = render_row(
+            header,
+            key_bytes,
+            row,
+            is_static,
+            self.pattern,
+            self.gen,
+            self.location,
+        );
+        if let Err(e) = (self.sink)(FindEvent::Row(found)) {
+            self.sink_error = Some(e);
+        }
+    }
+}
+
+/// `ferrosa-ctl sstable find` entry point. Each match is written as it is
+/// found: JSON Lines (one [`FindEvent`] per line, then a `summary` line) with
+/// `json`, or text otherwise. Output errors are returned, never swallowed.
 pub fn sstable_find(
     table_dir: &Path,
     pattern_hex: &str,
     include_quarantine: bool,
     json: bool,
 ) -> Result<(), CtlError> {
+    use std::io::Write as _;
     let pattern = parse_hex_pattern(pattern_hex)?;
-    let report = find_rows(table_dir, &pattern, include_quarantine)?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
-    }
-    for r in &report.rows {
-        println!(
-            "gen {} ({}) pk={} ck={} liveness_ts={} matched_in={:?}",
-            r.gen,
-            r.location,
-            r.partition_key_hex,
-            r.clustering_hex,
-            r.liveness_timestamp,
-            r.matched_in
-        );
-        for c in &r.cells {
-            println!(
-                "    {} ({}) = {} ts={} ttl={} ldt={}",
-                c.column,
-                c.column_type,
-                c.value_hex.as_deref().unwrap_or("<tombstone>"),
-                c.timestamp,
-                c.ttl,
-                c.local_deletion_time
-            );
+    let mut out = std::io::BufWriter::new(std::io::stdout().lock());
+    let summary = find_rows(table_dir, &pattern, include_quarantine, &mut |event| {
+        if json {
+            serde_json::to_writer(&mut out, &event)?;
+            writeln!(out)?;
+        } else {
+            write_event_text(&mut out, &event)?;
         }
+        Ok(())
+    })?;
+    if json {
+        serde_json::to_writer(
+            &mut out,
+            &serde_json::json!({ "kind": "summary", "summary": summary }),
+        )?;
+        writeln!(out)?;
+    } else {
+        writeln!(
+            out,
+            "{}: {} matching row(s) of {} scanned in {} generation(s); \
+             {} generation(s) could not be read to the end",
+            table_dir.display(),
+            summary.rows_matched,
+            summary.rows_scanned,
+            summary.generations_scanned,
+            summary.generations_unreadable
+        )?;
     }
-    for u in &report.unreadable {
-        eprintln!(
+    out.flush()?;
+    Ok(())
+}
+
+fn write_event_text(out: &mut impl std::io::Write, event: &FindEvent) -> std::io::Result<()> {
+    match event {
+        FindEvent::Row(r) => {
+            writeln!(
+                out,
+                "gen {} ({}) pk={} ck={} liveness_ts={} matched_in={:?}",
+                r.gen,
+                r.location,
+                r.partition_key_hex,
+                r.clustering_hex,
+                r.liveness_timestamp,
+                r.matched_in
+            )?;
+            for c in &r.cells {
+                writeln!(
+                    out,
+                    "    {} ({}) = {} ts={} ttl={} ldt={}",
+                    c.column,
+                    c.column_type,
+                    c.value_hex.as_deref().unwrap_or("<tombstone>"),
+                    c.timestamp,
+                    c.ttl,
+                    c.local_deletion_time
+                )?;
+            }
+            Ok(())
+        }
+        // Unreadable generations go in the same stream as the rows, in order,
+        // so a reader sees which rows preceded the failure.
+        FindEvent::Unreadable(u) => writeln!(
+            out,
             "UNREADABLE gen {} ({}) after {} partition(s): {}",
             u.gen, u.location, u.partitions_read, u.error
-        );
+        ),
     }
-    println!(
-        "{}: {} matching row(s); {} generation(s) could not be read to the end",
-        table_dir.display(),
-        report.rows.len(),
-        report.unreadable.len()
-    );
-    Ok(())
 }
 
 // ── reingest (recover salvaged rows through the live write path) ─────────────────
@@ -1349,6 +1482,16 @@ fn resolve_gen_dir(dir: &Path, gen: u64) -> Option<PathBuf> {
     None
 }
 
+/// A component whose absence is a designed state: `Ok(None)` only for
+/// `NotFound`; every other I/O error is returned with the path.
+fn read_optional_component(path: &Path) -> Result<Option<Vec<u8>>, CtlError> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display()).into()),
+    }
+}
+
 /// Open a BTI reader for `gen` in `dir`, mirroring `ferrosa-sstable-dump`.
 fn open_reader(dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>, CtlError> {
     let gdir = resolve_gen_dir(dir, gen)
@@ -1357,9 +1500,24 @@ fn open_reader(dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>, CtlErr
     let data = FileReadAt::open(comp("Data.db"))?;
     let partitions = FileReadAt::open(comp("Partitions.db"))?;
     let rows = FileReadAt::open(comp("Rows.db"))?;
-    let filter = std::fs::read(comp("Filter.db")).unwrap_or_default();
-    let statistics = std::fs::read(comp("Statistics.db")).unwrap_or_default();
-    let compression_info = std::fs::read(comp("CompressionInfo.db")).ok();
+    // `SSTableReader::open` takes these three as resident buffers: they are
+    // the per-generation metadata the engine also keeps in memory (a bloom
+    // filter sized by partition count, the stats header, the chunk offsets),
+    // bounded by the generation rather than by the rows in it. Data, Partitions
+    // and Rows, which do scale with the data, are read through `FileReadAt`.
+    //
+    // Absence is meaningful for two of them, and only absence: no
+    // CompressionInfo.db means the generation is uncompressed, and a missing
+    // Filter.db degrades to "no filter" with a warning. Any other read error,
+    // and a missing Statistics.db, fails the open instead of handing the
+    // reader an empty buffer it would misread.
+    let filter = read_optional_component(&comp("Filter.db"))?.unwrap_or_else(|| {
+        eprintln!("warning: generation {gen}: no Filter.db; opening without a bloom filter");
+        Vec::new()
+    });
+    let statistics = std::fs::read(comp("Statistics.db"))
+        .map_err(|e| format!("generation {gen}: Statistics.db: {e}"))?;
+    let compression_info = read_optional_component(&comp("CompressionInfo.db"))?;
     let is_compressed = compression_info.is_some();
     let mut reader = SSTableReader::open(SSTableComponents {
         data,
@@ -1423,15 +1581,38 @@ mod tests {
         corrupt_one_generation, table_dir_with_n_generations,
     };
 
+    /// Run `find_rows`, collecting what the sink saw (tests only: the real
+    /// command writes each event out as it arrives).
+    fn collect_find(
+        table_dir: &Path,
+        pattern: &[u8],
+    ) -> (FindSummary, Vec<FoundRow>, Vec<UnreadableGen>) {
+        let (mut rows, mut unreadable) = (Vec::new(), Vec::new());
+        let summary = find_rows(table_dir, pattern, false, &mut |event| {
+            match event {
+                FindEvent::Row(r) => rows.push(r),
+                FindEvent::Unreadable(u) => unreadable.push(u),
+            }
+            Ok(())
+        })
+        .unwrap();
+        (summary, rows, unreadable)
+    }
+
     #[test]
     fn find_reports_the_one_row_holding_a_value_with_its_generation() {
         let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
 
-        let report = find_rows(&table_dir, b"v1", false).unwrap();
+        let (summary, rows, unreadable) = collect_find(&table_dir, b"v1");
 
-        assert!(report.unreadable.is_empty(), "{:?}", report.unreadable);
-        assert_eq!(report.rows.len(), 1, "only pk1 holds v1: {:?}", report.rows);
-        let row = &report.rows[0];
+        assert!(unreadable.is_empty(), "{unreadable:?}");
+        assert_eq!(rows.len(), 1, "only pk1 holds v1: {rows:?}");
+        assert_eq!(summary.rows_matched, 1);
+        assert!(
+            summary.rows_scanned > summary.rows_matched,
+            "the other rows were scanned and not emitted: {summary:?}"
+        );
+        let row = &rows[0];
         assert_eq!(row.partition_key_hex, to_hex(b"pk1"));
         assert_eq!(row.location, "live");
         assert!(
@@ -1459,15 +1640,57 @@ mod tests {
         let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
         let bad = corrupt_one_generation(&table_dir);
 
-        let report = find_rows(&table_dir, b"pk", false).unwrap();
+        let (summary, rows, unreadable) = collect_find(&table_dir, b"pk");
 
-        assert_eq!(report.unreadable.len(), 1, "{:?}", report.unreadable);
-        assert_eq!(report.unreadable[0].gen, bad);
-        assert!(!report.unreadable[0].error.is_empty());
+        assert_eq!(unreadable.len(), 1, "{unreadable:?}");
+        assert_eq!(summary.generations_unreadable, 1);
+        assert_eq!(unreadable[0].gen, bad);
+        assert!(!unreadable[0].error.is_empty());
         assert!(
-            report.rows.iter().any(|r| r.gen != bad),
-            "the healthy generation is still searched: {:?}",
-            report.rows
+            rows.iter().any(|r| r.gen != bad),
+            "the healthy generation is still searched: {rows:?}"
+        );
+    }
+
+    /// Losing output is not a corrupt generation: the first sink error stops
+    /// the search and is returned, and nothing more is offered to the sink.
+    #[test]
+    fn find_stops_and_returns_the_error_when_the_sink_fails() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+        let mut offered = 0u32;
+
+        let result = find_rows(&table_dir, b"pk", false, &mut |_event| {
+            offered += 1;
+            Err("stdout closed".into())
+        });
+
+        let err = result.expect_err("a sink failure must fail the search");
+        assert_eq!(err.to_string(), "stdout closed");
+        assert_eq!(offered, 1, "no event is offered after the sink failed");
+    }
+
+    /// A Filter.db that exists but cannot be read used to become an empty
+    /// filter with no message. Only absence is a designed state; an I/O
+    /// error must fail the open and name the path.
+    #[cfg(unix)]
+    #[test]
+    fn open_reader_refuses_an_unreadable_filter_component() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(1);
+        let gen = StorageEngine::list_generations_in_dir(&table_dir)[0];
+        let gdir = resolve_gen_dir(&table_dir, gen).expect("fixture generation");
+        let filter = gdir.join(format!("{gen}-Filter.db"));
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = open_reader(&table_dir, gen);
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = result
+            .err()
+            .expect("an unreadable Filter.db must fail the open");
+        assert!(
+            err.to_string().contains("Filter.db"),
+            "the error names the component: {err}"
         );
     }
 
@@ -1498,8 +1721,11 @@ mod tests {
             primary_key_liveness: LivenessInfo::NONE,
         };
 
-        let regular = match_row(&header, &key, &row, false, b"hit", 1, "live").unwrap();
-        let static_ = match_row(&header, &key, &row, true, b"hit", 1, "live").unwrap();
+        let key_bytes = key.key.as_bytes();
+        assert!(row_matches(key_bytes, &row, b"hit"));
+        assert!(!row_matches(key_bytes, &row, b"miss"));
+        let regular = render_row(&header, key_bytes, &row, false, b"hit", 1, "live");
+        let static_ = render_row(&header, key_bytes, &row, true, b"hit", 1, "live");
 
         assert_eq!(regular.cells[0].column, "r");
         assert_eq!(regular.matched_in, vec!["r".to_string()]);
