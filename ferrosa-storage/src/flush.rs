@@ -316,6 +316,44 @@ fn visit_postings(
         })
 }
 
+/// A vector sidecar's bytes, from [`FlushTarget::map_vector_sidecar`]:
+/// owned by a target that keeps sidecars in memory, mapped by one that
+/// writes files.
+pub enum SidecarBytes {
+    /// Bytes the target already held.
+    Owned(Vec<u8>),
+    /// A read-only map of the sidecar file. Sidecars are replaced by rename,
+    /// never rewritten in place, so the mapped file does not change under it.
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for SidecarBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mapped(map) => map,
+        }
+    }
+}
+
+/// Counts the bytes that pass through to `inner`.
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 pub trait FlushTarget {
     /// The reader type used to access component data after flushing.
     type Reader: ReadAt + Send + Sync + 'static;
@@ -515,6 +553,47 @@ pub trait FlushTarget {
     /// rather than answer without that SSTable's rows.
     fn read_vector_sidecar(&self, _generation: u64, _index_name: &str) -> Result<Option<Vec<u8>>> {
         Ok(None)
+    }
+
+    /// Write a vector sidecar by streaming it: `write` is handed the
+    /// sidecar's writer and produces its bytes, so a large sidecar is never
+    /// held whole. Returns the bytes written. Same file, same atomicity as
+    /// [`FlushTarget::write_vector_sidecar`].
+    ///
+    /// The default collects the bytes and calls `write_vector_sidecar`; a
+    /// target that writes files streams them instead.
+    ///
+    /// # Errors
+    ///
+    /// `write` failed, or the sidecar could not be written. Nothing is
+    /// left under the sidecar's name either way.
+    fn write_vector_sidecar_streamed(
+        &self,
+        generation: u64,
+        index_name: &str,
+        write: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<()>,
+    ) -> Result<u64> {
+        let mut bytes = Vec::new();
+        write(&mut bytes)?;
+        self.write_vector_sidecar(generation, index_name, &bytes)?;
+        Ok(bytes.len() as u64)
+    }
+
+    /// A vector sidecar's bytes for scanning in place: mapped by a target
+    /// that writes files, so reading a large sidecar costs page cache, not
+    /// heap. `None` exactly when [`FlushTarget::read_vector_sidecar`] is.
+    ///
+    /// # Errors
+    ///
+    /// As [`FlushTarget::read_vector_sidecar`].
+    fn map_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+    ) -> Result<Option<SidecarBytes>> {
+        Ok(self
+            .read_vector_sidecar(generation, index_name)?
+            .map(SidecarBytes::Owned))
     }
 
     /// Every vector sidecar written by [`FlushTarget::write_vector_sidecar`],
@@ -1432,6 +1511,29 @@ impl FileFlushTarget {
         #[cfg(test)]
         Self::record_dir_fsync(dir);
         Ok(())
+    }
+
+    /// Rename a complete temp sidecar onto `path`, durably: the temp file is
+    /// synced before the rename and the directory after it. A rename alone
+    /// leaves both the file's blocks and the new entry in the page cache, so
+    /// a crash could publish the name over a short file or lose the name.
+    fn publish_vector_sidecar(&self, tmp: &Path, path: &Path) -> Result<()> {
+        Self::fsync_path(tmp)?;
+        std::fs::rename(tmp, path)?;
+        #[cfg(test)]
+        fsync_probe::note_rename(path);
+        Self::fsync_dir(&self.base_dir)?;
+        Ok(())
+    }
+
+    /// Best effort, and logged: a temp sidecar left behind carries no
+    /// `-VEC-` in its name, so it is never read as one.
+    fn remove_temp_vector_sidecar(tmp: &Path) {
+        if let Err(cleanup) = std::fs::remove_file(tmp) {
+            if cleanup.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(path = %tmp.display(), %cleanup, "could not remove temp vector sidecar");
+            }
+        }
     }
 
     /// fsync every component file that exists for this generation, then fsync
@@ -2643,16 +2745,79 @@ impl FlushTarget for FileFlushTarget {
             ".vec-{generation}-{index_name}.{}.tmp",
             std::process::id()
         ));
-        if let Err(e) = std::fs::write(&tmp, vec_bytes).and_then(|()| std::fs::rename(&tmp, &path))
-        {
-            if let Err(cleanup) = std::fs::remove_file(&tmp) {
-                if cleanup.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %tmp.display(), %cleanup, "could not remove temp vector sidecar");
-                }
-            }
-            return Err(e.into());
+        let written = std::fs::write(&tmp, vec_bytes)
+            .map_err(Into::into)
+            .and_then(|()| self.publish_vector_sidecar(&tmp, &path));
+        if written.is_err() {
+            Self::remove_temp_vector_sidecar(&tmp);
         }
-        Ok(())
+        written
+    }
+
+    /// [`Self::write_vector_sidecar`], streamed: `write` fills a buffered
+    /// temp file that is renamed over the sidecar only once it is complete.
+    fn write_vector_sidecar_streamed(
+        &self,
+        generation: u64,
+        index_name: &str,
+        write: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<()>,
+    ) -> Result<u64> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        let tmp = self.base_dir.join(format!(
+            ".vec-{generation}-{index_name}.{}.tmp",
+            std::process::id()
+        ));
+        let written = (|| -> Result<u64> {
+            let file = std::fs::File::create(&tmp)?;
+            let mut out = CountingWriter {
+                inner: std::io::BufWriter::with_capacity(64 * 1024, file),
+                written: 0,
+            };
+            write(&mut out)?;
+            std::io::Write::flush(&mut out)?;
+            let written = out.written;
+            drop(out);
+            self.publish_vector_sidecar(&tmp, &path)?;
+            Ok(written)
+        })();
+        if written.is_err() {
+            Self::remove_temp_vector_sidecar(&tmp);
+        }
+        written
+    }
+
+    /// Mapped, not read: a scoped sidecar can be hundreds of MiB.
+    fn map_vector_sidecar(
+        &self,
+        generation: u64,
+        index_name: &str,
+    ) -> Result<Option<SidecarBytes>> {
+        let path = self
+            .base_dir
+            .join(format!("{generation}-VEC-{index_name}.db"));
+        let unreadable = |e: std::io::Error| {
+            ferrosa_common::Error::InvalidData(format!(
+                "vector sidecar {} is unreadable: {e}",
+                path.display()
+            ))
+        };
+        let file = match std::fs::File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(unreadable(e)),
+        };
+        if file.metadata().map_err(unreadable)?.len() == 0 {
+            // A zero-length map is an error on some platforms; an empty
+            // sidecar is simply empty (and will not decode).
+            return Ok(Some(SidecarBytes::Owned(Vec::new())));
+        }
+        // SAFETY: sidecars are written to a temp name and renamed into place,
+        // never modified after; a later rebuild renames a new file over the
+        // name and leaves this inode intact while it is mapped.
+        let map = unsafe { memmap2::Mmap::map(&file) }.map_err(unreadable)?;
+        Ok(Some(SidecarBytes::Mapped(map)))
     }
 
     /// The HNSW sidecar `write_vector_sidecar` wrote, read back from disk.
@@ -2995,6 +3160,67 @@ mod tests {
             assert!(
                 pos < data_pos,
                 "{suffix} must be promoted before Data.db; renamed={renamed:?}"
+            );
+        }
+    }
+
+    /// A vector sidecar (and the scope manifest, which is written as one)
+    /// replaces its file by rename, and a rename alone is not durable: the
+    /// temp file's blocks and the new directory entry both sit in the page
+    /// cache, so a crash can publish the name over a short or empty file, or
+    /// lose the name. Both writers must sync the temp file, rename it, then
+    /// sync the directory, in that order (t_4853c0d5).
+    ///
+    /// RED as written: neither writer synced anything, so no `FileFsync`
+    /// appears in the timeline.
+    #[test]
+    fn vector_sidecar_writes_sync_the_file_then_rename_then_sync_the_directory() {
+        use fsync_probe::Event;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let target = FileFlushTarget::new(base.clone()).unwrap();
+        let _probe = fsync_probe::exclusive();
+
+        target.write_vector_sidecar(7, "vec_idx", b"whole").unwrap();
+        target
+            .write_vector_sidecar_streamed(8, "vec_idx__manifest", &mut |out| {
+                out.write_all(b"streamed")?;
+                Ok(())
+            })
+            .unwrap();
+
+        let events = fsync_probe::events();
+        for (gen, name, body) in [
+            (7u64, "vec_idx", &b"whole"[..]),
+            (8, "vec_idx__manifest", &b"streamed"[..]),
+        ] {
+            let final_path = base.join(format!("{gen}-VEC-{name}.db"));
+            let tmp_prefix = format!(".vec-{gen}-{name}.");
+            let synced = events
+                .iter()
+                .position(|e| {
+                    matches!(e, Event::FileFsync(p) if p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(&tmp_prefix)))
+                })
+                .unwrap_or_else(|| panic!("gen {gen}: the temp file was never synced: {events:?}"));
+            let renamed = events
+                .iter()
+                .position(|e| *e == Event::Rename(final_path.clone()))
+                .unwrap_or_else(|| panic!("gen {gen}: no rename onto {final_path:?}: {events:?}"));
+            assert!(
+                events[renamed..].contains(&Event::DirFsync(base.clone())),
+                "gen {gen}: the directory was not synced after the rename: {events:?}"
+            );
+            assert!(
+                synced < renamed,
+                "gen {gen}: the file must be synced before it is renamed: {events:?}"
+            );
+            assert_eq!(
+                std::fs::read(&final_path).unwrap(),
+                body,
+                "gen {gen}: contents"
             );
         }
     }

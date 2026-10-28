@@ -496,6 +496,13 @@ impl<'de> serde::Deserialize<'de> for FilterPredicate {
 /// cells are populated straight from those stored cell bytes, so the codec must
 /// agree with CQL or the index ranks byte-swapped garbage.
 pub fn bytes_to_vec_f32(bytes: &[u8]) -> Result<Vec<f32>, IndexError> {
+    bytes_to_f32s(bytes)
+}
+
+/// [`bytes_to_vec_f32`] into any collection: `Arc<[f32]>` decodes straight
+/// into the shared slice, one allocation, where `Arc::from(Vec)` would
+/// allocate twice and copy.
+pub fn bytes_to_f32s<C: FromIterator<f32>>(bytes: &[u8]) -> Result<C, IndexError> {
     if !bytes.len().is_multiple_of(4) {
         return Err(IndexError::Format(format!(
             "vector byte length {} is not a multiple of 4",

@@ -65,6 +65,16 @@
 //! The bound is 1.5x: 35% above every correct curve measured and 34% below the
 //! defect's, and no single sample can move a median across it.
 //!
+//! Two samples can, and on PR #628's CI (2026-10-27) two did. The sharded
+//! curve, in us at N = 5k/10k/20k/40k, was 538 / 808 / 589 / 1,059: the 10k
+//! and 40k points were each inflated, the ratios came out 1.50 / 0.73 / 1.80,
+//! and the median sat on the bound. The code was fine: 1 ms against the
+//! defect's 422 ms, at 0 allocations. The four sizes were then sampled one
+//! after another, each point's batches within one window, so a burst of
+//! contention covered whole points. The sizes are now timed in interleaved
+//! rounds (one batch of each per round, fastest kept), so a burst inflates
+//! every size's batch of that round alike and the other rounds stay clean.
+//!
 //! The blind spot, stated because it is a real loss of sensitivity: this
 //! criterion fails when the growth is typical of the whole curve, so a
 //! regression confined to the LARGEST size alone (40k slow, 5k-20k correct)
@@ -118,8 +128,9 @@ static GLOBAL: CountingAlloc = CountingAlloc;
 const SIZES: [i32; 4] = [5_000, 10_000, 20_000, 40_000];
 /// Writes per measured batch.
 const BATCH: i32 = 500;
-/// Batches per point; the fastest is kept.
-const REPS: usize = 5;
+/// Rounds of batches; the fastest batch per point is kept. A batch costs
+/// ~0.5 ms here (the defect costs ~400 ms), so rounds are cheap.
+const REPS: usize = 15;
 /// Allowed median growth in per-write cost for each doubling of the partition.
 const MAX_DOUBLING_RATIO: f64 = 1.5;
 
@@ -158,46 +169,68 @@ struct Point {
     allocs_per_batch: usize,
 }
 
-/// Fill one partition to `rows`, then time `REPS` batches of overwrites spread
-/// across it (overwrites do not grow the partition, so every rep measures the
-/// same N). Rows are built before the clock and the counter start.
-fn measure(mem: &dyn Memtable, rows: i32) -> Point {
-    let schema = schema();
-    let key = DecoratedKey::new(PartitionKey::new(b"pk".to_vec()));
+fn partition_key() -> DecoratedKey {
+    DecoratedKey::new(PartitionKey::new(b"pk".to_vec()))
+}
+
+/// A memtable whose one partition holds `rows` rows.
+fn filled(make: &dyn Fn() -> Box<dyn Memtable>, rows: i32) -> Box<dyn Memtable> {
+    let (schema, key) = (schema(), partition_key());
+    let mem = make();
     for ck in 0..rows {
         mem.put(&key, row(ck, 1), &schema).unwrap();
     }
-    let mut fastest = Duration::MAX;
-    let mut allocs = usize::MAX;
-    for rep in 0..REPS {
-        let batch: Vec<Row> = (0..BATCH)
-            .map(|i| row((i * 7_919 + rep as i32) % rows, 2 + rep as i64))
-            .collect();
-        ALLOCS.store(0, Ordering::Relaxed);
-        ARMED.store(true, Ordering::Relaxed);
-        let started = Instant::now();
-        for r in batch {
-            mem.put(&key, r, &schema).unwrap();
-        }
-        let took = started.elapsed();
-        ARMED.store(false, Ordering::Relaxed);
-        fastest = fastest.min(took);
-        allocs = allocs.min(ALLOCS.load(Ordering::Relaxed));
-    }
-    assert_eq!(
-        mem.partition_count(),
-        1,
-        "every write went to one partition"
-    );
-    Point {
-        rows,
-        fastest_batch: fastest,
-        allocs_per_batch: allocs,
-    }
+    mem
 }
 
+/// Time one batch of overwrites spread across the partition (overwrites do
+/// not grow it, so every rep measures the same N). Rows are built before the
+/// clock and the counter start.
+fn time_batch(mem: &dyn Memtable, rows: i32, rep: usize) -> (Duration, usize) {
+    let (schema, key) = (schema(), partition_key());
+    let batch: Vec<Row> = (0..BATCH)
+        .map(|i| row((i * 7_919 + rep as i32) % rows, 2 + rep as i64))
+        .collect();
+    ALLOCS.store(0, Ordering::Relaxed);
+    ARMED.store(true, Ordering::Relaxed);
+    let started = Instant::now();
+    for r in batch {
+        mem.put(&key, r, &schema).unwrap();
+    }
+    let took = started.elapsed();
+    ARMED.store(false, Ordering::Relaxed);
+    (took, ALLOCS.load(Ordering::Relaxed))
+}
+
+/// Fill one memtable per size, then time the sizes in ROUNDS: every round
+/// takes one batch from each size, back to back. Contention on a busy runner
+/// then lands on all four points alike instead of on whichever size happened
+/// to be sampled during a burst, and the fastest batch per size is kept.
 fn curve(make: &dyn Fn() -> Box<dyn Memtable>) -> Vec<Point> {
-    SIZES.iter().map(|&n| measure(make().as_ref(), n)).collect()
+    let mems: Vec<Box<dyn Memtable>> = SIZES.iter().map(|&n| filled(make, n)).collect();
+    let mut points: Vec<Point> = SIZES
+        .iter()
+        .map(|&rows| Point {
+            rows,
+            fastest_batch: Duration::MAX,
+            allocs_per_batch: usize::MAX,
+        })
+        .collect();
+    for rep in 0..REPS {
+        for (mem, point) in mems.iter().zip(points.iter_mut()) {
+            let (took, allocs) = time_batch(mem.as_ref(), point.rows, rep);
+            point.fastest_batch = point.fastest_batch.min(took);
+            point.allocs_per_batch = point.allocs_per_batch.min(allocs);
+        }
+    }
+    for mem in &mems {
+        assert_eq!(
+            mem.partition_count(),
+            1,
+            "every write went to one partition"
+        );
+    }
+    points
 }
 
 /// The curve's typical growth in per-write cost for each doubling of the
