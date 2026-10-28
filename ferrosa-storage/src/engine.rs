@@ -5838,20 +5838,14 @@ impl StorageEngine {
             return Ok(IndexReloadOutcome::default());
         }
 
-        // Full scan of system_schema.indexes. This table holds one row per
-        // index cluster-wide; it is tiny. Bound the scan at the engine's
-        // range-read materialization cap and warn loudly if we hit it, so a
-        // truncated reload is visible rather than silently dropping indexes.
-        const MAX_INDEXES_TO_RELOAD: usize = 10_000;
-        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_RELOAD)?;
-
+        // Full scan of system_schema.indexes, a page of keyspaces at a time,
+        // so every registration is reloaded however many there are. It used to
+        // read one capped window and warn past it, which dropped indexes.
         let mut restored = 0usize;
         let mut skipped = 0usize;
-        let mut rows_seen = 0usize;
-        for partition in &partitions {
+        self.for_each_partition_paged(&indexes_tid, &mut |partition| {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
-                rows_seen += 1;
                 // A row fully shadowed by a DROP INDEX / DROP TABLE tombstone
                 // surfaces from the merge with its cells suppressed and the
                 // row-level deletion set. That is a *normal* deleted
@@ -5867,14 +5861,8 @@ impl StorageEngine {
                     skipped += 1;
                 }
             }
-        }
-        if rows_seen >= MAX_INDEXES_TO_RELOAD {
-            tracing::warn!(
-                rows_seen,
-                cap = MAX_INDEXES_TO_RELOAD,
-                "system_schema.indexes reload hit the read cap — some indexes may not have been restored"
-            );
-        }
+            Ok(())
+        })?;
         if skipped > 0 {
             // One summary warn instead of a warn per orphan — dangling
             // registrations (DROP TABLE debris predating the tombstone
@@ -5909,18 +5897,16 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_INDEXES_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&indexes_tid, None, None, MAX_INDEXES_TO_READ)?;
-
         let mut out = Vec::new();
-        for partition in &partitions {
+        self.for_each_partition_paged(&indexes_tid, &mut |partition| {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
                 if let Some(decoded) = decode_persisted_index_row(&keyspace, row) {
                     out.push(decoded);
                 }
             }
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -5937,18 +5923,16 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_TYPES_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&types_tid, None, None, MAX_TYPES_TO_READ)?;
-
         let mut out = Vec::new();
-        for partition in &partitions {
+        self.for_each_partition_paged(&types_tid, &mut |partition| {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
                 if let Some(decoded) = decode_persisted_type_row(&keyspace, row) {
                     out.push(decoded);
                 }
             }
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -5965,20 +5949,66 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        const MAX_FUNCTIONS_TO_READ: usize = 10_000;
-        let partitions = self.read_range(&functions_tid, None, None, MAX_FUNCTIONS_TO_READ)?;
-
         let mut out = Vec::new();
-        for partition in &partitions {
+        self.for_each_partition_paged(&functions_tid, &mut |partition| {
             let keyspace = String::from_utf8_lossy(partition.key.key.as_bytes()).to_string();
             for row in &partition.rows {
                 if let Some(decoded) = decode_persisted_function_row(&keyspace, row) {
                     out.push(decoded);
                 }
             }
-        }
+            Ok(())
+        })?;
         Ok(out)
     }
+
+    /// Visit every partition of `table_id` in key order, one bounded page at a
+    /// time, with no cap on how many there are. Memory is one page of
+    /// [`Self::SCHEMA_SCAN_PAGE_PARTITIONS`] partitions, never the table.
+    ///
+    /// Pages resume from the last key seen (`read_range`'s start is
+    /// inclusive, so that key is skipped). Every page must move strictly past
+    /// the previous one; a page that does not is a broken key order and fails
+    /// the walk rather than looping or ending early.
+    fn for_each_partition_paged(
+        &self,
+        table_id: &TableId,
+        visit: &mut dyn FnMut(&Partition) -> ferrosa_common::Result<()>,
+    ) -> ferrosa_common::Result<()> {
+        let page_len = Self::SCHEMA_SCAN_PAGE_PARTITIONS + 1;
+        let mut after: Option<DecoratedKey> = None;
+        loop {
+            let page = self.read_range(table_id, after.as_ref(), None, page_len)?;
+            let full = page.len() == page_len;
+            let mut last: Option<DecoratedKey> = None;
+            for partition in &page {
+                if after.as_ref() == Some(&partition.key) {
+                    continue;
+                }
+                visit(partition)?;
+                last = Some(partition.key.clone());
+            }
+            if !full {
+                return Ok(());
+            }
+            match (last, after.as_ref()) {
+                (Some(next), Some(prev)) if next <= *prev => {
+                    return Err(ferrosa_common::Error::InvalidData(format!(
+                        "paged scan of {table_id} did not advance past {prev:?}"
+                    )));
+                }
+                (None, _) => {
+                    return Err(ferrosa_common::Error::InvalidData(format!(
+                        "paged scan of {table_id} returned a full page of no new keys"
+                    )));
+                }
+                (next, _) => after = next,
+            }
+        }
+    }
+
+    /// Partitions per page in [`Self::for_each_partition_paged`].
+    const SCHEMA_SCAN_PAGE_PARTITIONS: usize = 256;
 
     /// Tombstones a `system_schema.indexes` row (DROP INDEX) using the same
     /// composite-clustering encoding as the create path.
@@ -14339,15 +14369,20 @@ impl StorageEngine {
         // Swallowing this error is what let 36,572 of them accumulate unnoticed.
         if component_dir != table_dir {
             if let Err(e) = std::fs::remove_dir(&component_dir) {
-                let leftovers: Vec<String> = std::fs::read_dir(&component_dir)
-                    .map(|entries| {
-                        entries
-                            .flatten()
-                            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
-                            .take(8)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                // Every leftover is named: a component directory holds one
+                // generation's component files, a handful by construction, so
+                // the list is small and a sample would hide which one stayed.
+                // An entry or listing that cannot be read is named as such
+                // rather than dropped from the report.
+                let leftovers: Vec<String> = match std::fs::read_dir(&component_dir) {
+                    Ok(entries) => entries
+                        .map(|entry| match entry {
+                            Ok(entry) => entry.file_name().to_string_lossy().into_owned(),
+                            Err(err) => format!("<unreadable entry: {err}>"),
+                        })
+                        .collect(),
+                    Err(err) => vec![format!("<directory could not be listed: {err}>")],
+                };
                 tracing::error!(
                     dir = %component_dir.display(),
                     error = %e,
@@ -15472,13 +15507,18 @@ impl StorageEngine {
         // many: a max-heap capped at LISTED_FAILURES yields the same lowest-N
         // sorted sample the old `sort().take(N)` produced, in O(N) memory rather
         // than one string per failed generation (352-373 per node on 2026-09-29).
-        // `failure_count` carries the true total into the error message.
+        // `failure_count` carries the true total into the error message, and
+        // every failure is logged as it is found, so none is unobservable.
         let mut failures: std::collections::BinaryHeap<String> =
             std::collections::BinaryHeap::new();
         let mut failure_count = 0usize;
         let note_failure =
             |heap: &mut std::collections::BinaryHeap<String>, count: &mut usize, msg: String| {
                 *count += 1;
+                tracing::error!(
+                    failure = %msg,
+                    "storage-engine: evicted SSTable generation could not be registered"
+                );
                 heap.push(msg);
                 if heap.len() > LISTED_FAILURES {
                     heap.pop();
@@ -15577,8 +15617,9 @@ impl StorageEngine {
             }
         }
         if failure_count > 0 {
-            let mut shown = failures.into_sorted_vec();
-            shown.truncate(LISTED_FAILURES);
+            // The heap already holds at most LISTED_FAILURES (see above).
+            let shown = failures.into_sorted_vec();
+            debug_assert!(shown.len() <= LISTED_FAILURES);
             return Err(ferrosa_common::Error::InvalidFormat(format!(
                 "{} evicted SSTable generation(s) are neither local nor resolvable from the \
                  object store; refusing to start and serve their tables without them: {}",
@@ -34265,6 +34306,50 @@ mod tests {
         );
     }
 
+    /// `read_persisted_types` returns EVERY persisted type, however many
+    /// keyspaces hold them, a bounded page at a time. The fixture spans
+    /// several pages, an SSTable and the memtable, so the paged walk must seek
+    /// and merge across both. The slow companion straddles the old fixed
+    /// 10,000-keyspace window.
+    #[test]
+    fn read_persisted_types_pages_through_every_type() {
+        assert_reads_every_persisted_type(3 * StorageEngine::SCHEMA_SCAN_PAGE_PARTITIONS + 7);
+    }
+
+    /// Persist one type in each of `keyspaces` keyspaces, half flushed to an
+    /// SSTable and half left in the memtable, and require all of them back.
+    fn assert_reads_every_persisted_type(keyspaces: usize) {
+        use ferrosa_common::CqlType;
+        use ferrosa_schema::metadata::user_type::UserTypeMetadata;
+        use ferrosa_schema::system::persistence;
+
+        let dir = tempfile::tempdir().unwrap();
+        let types_tid = TableId::new("system_schema", "types");
+        let engine =
+            StorageEngine::new(StorageEngineConfig::test_config(dir.path()), None).unwrap();
+        engine.register_system_tables().unwrap();
+        let ts = now_micros_for_test();
+        for i in 0..keyspaces {
+            let udt = UserTypeMetadata {
+                keyspace: format!("ks{i:05}"),
+                name: "t".to_string(),
+                fields: vec![("x".to_string(), CqlType::Int)],
+            };
+            let row = persistence::type_to_row(&udt);
+            engine.write(&types_tid, &row.key, row.row, ts).unwrap();
+            if i == keyspaces / 2 {
+                engine.flush(&types_tid).unwrap();
+            }
+        }
+
+        let stored = engine.read_persisted_types().unwrap();
+        let mut seen: Vec<&str> = stored.iter().map(|t| t.keyspace_name.as_str()).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(stored.len(), keyspaces, "every persisted type must be read");
+        assert_eq!(seen.len(), keyspaces, "each keyspace exactly once");
+    }
+
     /// A tombstoned `system_schema.types` row (DROP TYPE) masks the live row:
     /// `read_persisted_types` returns nothing after the tombstone is written.
     #[test]
@@ -39688,6 +39773,14 @@ mod tests {
     #[cfg(feature = "slow-tests")]
     mod slow {
         use super::*;
+
+        /// Past the old fixed window: `read_persisted_types` used to read the
+        /// first 10,000 keyspaces of `system_schema.types` and silently drop
+        /// the rest, so a large schema lost UDTs at boot.
+        #[test]
+        fn read_persisted_types_returns_every_type_past_the_old_window() {
+            assert_reads_every_persisted_type(10_050);
+        }
 
         /// Measures the one-time vector re-index an upgraded node runs on its
         /// first start, at ferrosa-memory scale: `FERROSA_VECTOR_REPAIR_ROWS`
