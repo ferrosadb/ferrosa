@@ -35,9 +35,12 @@ dependency/usage review.
 
 ## Later
 
-- **Page-bounded HNSW / IVFFlat reads** (FMEA IDX-7). Extend the quantized staged
-  reader's page-budget model to the JSON-backed vector indexes so large indexes
-  no longer load whole into memory on open.
+- **Page-bounded HNSW / IVFFlat reads** (FMEA IDX-7). HNSW storage sidecars
+  are searched in place since 2026-10-27 (FHNW). Still whole: the
+  `HnswFactory` artifact (t_2e22f80a) and IVFFlat.
+- **FHNW rollback path** (FMEA IDX-11, t_1648aaf8): decide between a
+  documented one-way upgrade, a write gate until every node reads FHNW, and a
+  downgrade rewrite.
 - **Geo Phase 2** — polygons with holes, the currently-unsupported two-geometry
   predicate combinations, and a true geo index *kind* wired to a factory rather
   than the pure cover/refine library over a BTree sidecar.
