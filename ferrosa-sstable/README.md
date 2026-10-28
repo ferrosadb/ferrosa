@@ -106,7 +106,11 @@ resolution beyond the serialization header, or cluster routing.
 - **Corruption resilience** — `validate_data_extent` (index-vs-data truncation
   check), `salvage` (best-effort per-partition recovery with `SalvageStats`),
   and a hard `MAX_VALUE_LEN` ceiling that rejects bogus on-disk lengths before
-  they drive a pathological allocation.
+  they drive a pathological allocation. The full row decoder checks every
+  decoded row body against its declared `row_size` and refuses a row where the
+  two disagree, rather than decoding the next row from leftover cell bytes
+  (t_78c7f689, fmea ST-21). Both `row_size` conventions are accepted:
+  Cassandra's, which counts the prev-size varint, and ferrosa's, which does not.
 - **Tooling binaries** — `ferrosa-sstable-dump` and `ferrosa-sstable-import`.
 
 ## Runtime tuning
