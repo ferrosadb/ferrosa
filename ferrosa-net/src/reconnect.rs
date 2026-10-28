@@ -492,8 +492,9 @@ impl ExponentialBackoff {
 ///   Dormant ─(probe fail)────────────────────────► Dormant (stays; probes forever)
 /// ```
 pub enum LaneState {
-    /// The TCP connection is established and the client is usable.
-    Connected(RpcClient),
+    /// The TCP connection is established and the client is usable. Boxed: the
+    /// client is ~200 bytes and the other variants are a few words.
+    Connected(Box<RpcClient>),
     /// The connection is down; a background task is retrying with backoff.
     Reconnecting {
         /// Current attempt index within this exhaustion cycle.

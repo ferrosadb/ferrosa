@@ -7,6 +7,7 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::codec::Framed;
+use tokio_util::sync::CancellationToken;
 
 use crate::codec::{
     Frame, FrameHeader, InternodeCodec, Lane, FLAG_FIRE_AND_FORGET, FLAG_RPC_ERROR,
@@ -149,9 +150,29 @@ pub struct RpcClient {
     pub bandwidth: Arc<BandwidthMetrics>,
     /// In-flight RPC gauge: incremented on send, decremented on response/timeout.
     pub in_flight: Arc<std::sync::atomic::AtomicI64>,
+    /// Cancelled by [`RpcClient::close`]. The client is cloned per request, so
+    /// dropping a copy closes nothing: the read loop owns the socket's read half
+    /// and, against a peer that is alive but not answering, reads forever.
+    closing: CancellationToken,
 }
 
 impl RpcClient {
+    /// Close this connection for every clone: stop the read and write loops so
+    /// the socket is released, and fail whatever is still pending on it.
+    ///
+    /// For a connection the caller has given up on while the peer may still be
+    /// alive — a lane condemned by its own failure run. A clean close by the
+    /// peer needs no call; the read loop sees it.
+    pub(crate) fn close(&self) {
+        self.closing.cancel();
+    }
+
+    /// A token cancelled once [`RpcClient::close`] is called on any clone. Lets
+    /// the alive watcher tell a deliberate local close from a lost connection.
+    pub(crate) fn closing_token(&self) -> CancellationToken {
+        self.closing.clone()
+    }
+
     pub fn peer_addr(&self) -> std::net::SocketAddr {
         self.peer_addr
     }
@@ -311,22 +332,46 @@ impl RpcClient {
         let (alive_tx, _alive_rx_init) = watch::channel(true);
 
         let (mut sink, mut stream) = framed.split();
+        let closing = CancellationToken::new();
 
         // Write loop
+        let write_closing = closing.clone();
         task_pool.spawn(async move {
-            while let Some(frame) = rx.recv().await {
+            loop {
+                let frame = tokio::select! {
+                    _ = write_closing.cancelled() => break,
+                    next = rx.recv() => match next {
+                        Some(frame) => frame,
+                        None => break,
+                    },
+                };
                 if sink.send(frame).await.is_err() {
                     break;
                 }
             }
         });
 
-        // Read loop — signals `alive_tx` false when the stream ends or errors.
+        // Read loop — signals `alive_tx` false when the stream ends or errors,
+        // or when the connection is closed locally (`close`).
         let pending_clone = pending.clone();
         let alive_tx_clone = alive_tx.clone();
         let read_loop_peer = peer_addr;
+        let read_closing = closing.clone();
         task_pool.spawn(async move {
-            while let Some(read) = stream.next().await {
+            loop {
+                let read = tokio::select! {
+                    _ = read_closing.cancelled() => {
+                        tracing::info!(
+                            peer = %read_loop_peer,
+                            "RPC connection closed locally; releasing the socket"
+                        );
+                        break;
+                    }
+                    next = stream.next() => match next {
+                        Some(read) => read,
+                        None => break,
+                    },
+                };
                 // A frame the codec rejects (e.g. `FrameTooLarge`) ends the
                 // connection, and with it every request still pending on it.
                 let frame = match read {
@@ -385,6 +430,7 @@ impl RpcClient {
             alive_tx,
             bandwidth: Arc::new(BandwidthMetrics::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            closing,
         })
     }
 

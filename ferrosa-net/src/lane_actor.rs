@@ -696,16 +696,7 @@ async fn lane_actor_loop(
 
     // If initial state is Connected, attach an alive watcher immediately.
     if let LaneState::Connected(ref client) = state {
-        let alive_rx = client.alive_rx();
-        let watcher_ctx = ctx.clone();
-        spawn_alive_watcher(
-            alive_rx,
-            move || {
-                watcher_ctx.handle.mark_reconnecting();
-                watcher_ctx.spawn_reconnect(0);
-            },
-            ctx.task_pool.clone(),
-        );
+        watch_connection(client, &ctx);
     }
 
     loop {
@@ -808,7 +799,7 @@ async fn lane_actor_loop(
                 match action {
                     LaneAction::Probe => spawn_lane_probe(&ctx),
                     LaneAction::Reconnect => {
-                        begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host)
+                        condemn_lane(&mut state, &mut pending_streams, lane, &ctx)
                     }
                     LaneAction::None => {}
                 }
@@ -829,7 +820,7 @@ async fn lane_actor_loop(
                 match action {
                     LaneAction::Probe => spawn_lane_probe(&ctx),
                     LaneAction::Reconnect => {
-                        begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host)
+                        condemn_lane(&mut state, &mut pending_streams, lane, &ctx)
                     }
                     LaneAction::None => {}
                 }
@@ -896,17 +887,8 @@ async fn lane_actor_loop(
                 } else {
                     tracing::info!(?lane, peer = %ctx.peer_host, "lane reconnected");
                 }
-                let alive_rx = new_client.alive_rx();
-                state = LaneState::Connected(new_client);
-                let watcher_ctx = ctx.clone();
-                spawn_alive_watcher(
-                    alive_rx,
-                    move || {
-                        watcher_ctx.handle.mark_reconnecting();
-                        watcher_ctx.spawn_reconnect(0);
-                    },
-                    ctx.task_pool.clone(),
-                );
+                watch_connection(&new_client, &ctx);
+                state = LaneState::Connected(Box::new(new_client));
                 dispatch_retry_scheduled = dispatch_stream_window(
                     &state,
                     lane,
@@ -1033,9 +1015,7 @@ async fn lane_actor_loop(
                         peer = %ctx.peer_host,
                         "lane probe failed; the peer is unreachable, reconnecting"
                     );
-                    if matches!(state, LaneState::Connected(_)) {
-                        begin_reconnect(&mut state, &mut pending_streams, lane, &ctx.peer_host);
-                    }
+                    condemn_lane(&mut state, &mut pending_streams, lane, &ctx);
                 }
             }
             LaneCommand::QueryStatus { reply } => {
@@ -1304,6 +1284,50 @@ fn begin_reconnect(
     fail_pending_streams_reconnecting(lane, pending_streams);
 }
 
+/// Give up on a connected lane that its own failure run condemned (timeouts,
+/// then a failed probe) and dial the peer again.
+///
+/// `begin_reconnect` alone only changes state: on the `ConnectionLost` path the
+/// alive watcher has already started the dial, but a condemned connection is
+/// still open, so nothing else ever would — the lane sat in `Reconnecting`
+/// answering `lane is reconnecting` forever (t_dbcde486). The condemned client
+/// is closed first so its socket is released rather than read forever, and its
+/// watcher ignores that close (see [`watch_connection`]).
+fn condemn_lane(
+    state: &mut LaneState,
+    pending_streams: &mut VecDeque<PendingLaneCommand>,
+    lane: Lane,
+    ctx: &ActorReconnectContext,
+) {
+    let LaneState::Connected(client) = &*state else {
+        // Already reconnecting or dormant: a dial is in flight or scheduled.
+        return;
+    };
+    client.close();
+    begin_reconnect(state, pending_streams, lane, &ctx.peer_host);
+    ctx.spawn_reconnect(0);
+}
+
+/// Watch `client`'s connection and hand the lane to the reconnect ladder when
+/// it is lost — unless the actor closed it itself ([`condemn_lane`]), which has
+/// already started the one redial; acting on it again would dial twice and
+/// condemn the replacement connection with a stale `ConnectionLost`.
+fn watch_connection(client: &RpcClient, ctx: &ActorReconnectContext) {
+    let closed_locally = client.closing_token();
+    let watcher_ctx = ctx.clone();
+    spawn_alive_watcher(
+        client.alive_rx(),
+        move || {
+            if closed_locally.is_cancelled() {
+                return;
+            }
+            watcher_ctx.handle.mark_reconnecting();
+            watcher_ctx.spawn_reconnect(0);
+        },
+        ctx.task_pool.clone(),
+    );
+}
+
 fn fail_pending_streams_reconnecting(
     lane: Lane,
     pending_streams: &mut VecDeque<PendingLaneCommand>,
@@ -1434,6 +1458,213 @@ mod tests {
     fn actor_reconnect_context_is_clone() {
         fn assert_clone<T: Clone>() {}
         assert_clone::<ActorReconnectContext>();
+    }
+
+    /// A loopback peer that completes the internode handshake on every
+    /// connection and then never answers again: the half-open case, where the
+    /// socket stays open so the alive watcher never fires. Returns the address
+    /// and counters of the handshakes it completed and of the connections the
+    /// CLIENT closed (the peer read EOF).
+    async fn spawn_silent_peer(peer_id: Uuid) -> SilentPeer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&handshakes);
+        let closed_counter = Arc::clone(&closed);
+        tokio::spawn(async move {
+            let config = NetConfig::default();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut framed = tokio_util::codec::Framed::new(
+                    stream,
+                    crate::codec::InternodeCodec::new(config.max_frame_body_size),
+                );
+                if crate::handshake::accept_handshake(&mut framed, &config, peer_id)
+                    .await
+                    .is_ok()
+                {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                // Hold the connection open and never answer; count it when the
+                // client closes its end.
+                let closed_counter = Arc::clone(&closed_counter);
+                tokio::spawn(async move {
+                    use futures::StreamExt;
+                    while let Some(Ok(_ignored)) = framed.next().await {}
+                    closed_counter.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        SilentPeer {
+            addr,
+            handshakes,
+            closed,
+        }
+    }
+
+    struct SilentPeer {
+        addr: std::net::SocketAddr,
+        handshakes: Arc<AtomicUsize>,
+        closed: Arc<AtomicUsize>,
+    }
+
+    /// Open a Raft lane, already `Connected`, to `peer`.
+    async fn connected_raft_lane(peer: &SilentPeer) -> LaneHandle {
+        let config = Arc::new(NetConfig::default());
+        let pool = TaskPool::current("test-lane");
+        let client = crate::reconnect::connect_once_cancelable(
+            Arc::clone(&config),
+            Uuid::new_v4(),
+            &peer.addr.to_string(),
+            Lane::Raft,
+            None,
+            None,
+            pool.clone(),
+        )
+        .await
+        .expect("the silent peer completes the first handshake");
+        assert_eq!(peer.handshakes.load(Ordering::SeqCst), 1);
+        let peer_host = peer.addr.to_string();
+        spawn_lane_actor(Lane::Raft, LaneState::Connected(Box::new(client)), |h| {
+            ActorReconnectContext {
+                lane: Lane::Raft,
+                config,
+                local_host_id: Uuid::new_v4(),
+                peer_host,
+                tls_connector: None,
+                cancelled: h.cancel_token(),
+                handle: h,
+                task_pool: pool,
+            }
+        })
+    }
+
+    /// Time out enough requests to cross the failure threshold. The probe that
+    /// follows also times out against the silent peer and condemns the lane.
+    async fn drive_lane_to_condemnation(handle: &LaneHandle) {
+        for nonce in 0..u64::from(crate::reconnect::lane_failure_threshold()) {
+            let sent = handle
+                .send(
+                    Message::Ping { nonce, sent_at: 0 },
+                    Some(Duration::from_millis(100)),
+                )
+                .await;
+            assert!(
+                sent.is_err(),
+                "the silent peer must not answer, got {sent:?}"
+            );
+        }
+    }
+
+    /// Bounded wait for `counter` to reach `want`: well past the probe timeout
+    /// plus the first reconnect backoff.
+    async fn wait_for_count(counter: &AtomicUsize, want: usize) {
+        let deadline =
+            Instant::now() + crate::reconnect::lane_probe_timeout() + Duration::from_secs(10);
+        while counter.load(Ordering::SeqCst) < want && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// t_dbcde486: a lane condemned by its own failure run (timeouts, then a
+    /// failed probe) must DIAL THE PEER AGAIN and return to `Connected`.
+    ///
+    /// Live symptom: on a 3-node cluster every Raft lane went to `Reconnecting`
+    /// together ~5 min after a rolling restart and stayed there for hours —
+    /// every RPC answered `lane is reconnecting; retry later`, no
+    /// `lane reconnected` line, metadata Raft in an election storm.
+    ///
+    /// RED as written against v0.29.0: the condemn path (`begin_reconnect`)
+    /// only flips the state to `Reconnecting`. Unlike the alive-watcher path it
+    /// never calls `spawn_reconnect`, so no dial is ever made and the peer sees
+    /// exactly one handshake. It fails on the actor's behaviour, not on a
+    /// missing symbol.
+    #[tokio::test]
+    async fn a_condemned_lane_redials_the_peer_and_reconnects() {
+        let peer = spawn_silent_peer(Uuid::new_v4()).await;
+        let handle = connected_raft_lane(&peer).await;
+
+        drive_lane_to_condemnation(&handle).await;
+
+        wait_for_count(&peer.handshakes, 2).await;
+        assert_eq!(
+            peer.handshakes.load(Ordering::SeqCst),
+            2,
+            "a condemned lane never dialled the peer again; status = {:?}",
+            handle.query_status().await
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut status = handle.query_status().await.unwrap();
+        while status != LaneStatusReport::Connected && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            status = handle.query_status().await.unwrap();
+        }
+        assert_eq!(status, LaneStatusReport::Connected);
+
+        handle.shutdown().await;
+    }
+
+    /// t_dbcde486: condemning a lane must CLOSE the connection it gives up on.
+    ///
+    /// `RpcClient` is cloned per request, so dropping the actor's copy closes
+    /// nothing: the read loop owns the socket's read half and, against a peer
+    /// that is alive but not answering, reads forever. Live, node1 held 15
+    /// sockets to node3 where 3 lanes need 3.
+    ///
+    /// RED as written against v0.29.0: the peer never reads EOF on the
+    /// condemned connection.
+    #[tokio::test]
+    async fn a_condemned_lane_closes_the_connection_it_gave_up_on() {
+        let peer = spawn_silent_peer(Uuid::new_v4()).await;
+        let handle = connected_raft_lane(&peer).await;
+
+        drive_lane_to_condemnation(&handle).await;
+
+        wait_for_count(&peer.closed, 1).await;
+        assert_eq!(
+            peer.closed.load(Ordering::SeqCst),
+            1,
+            "the condemned connection was never closed; status = {:?}",
+            handle.query_status().await
+        );
+
+        handle.shutdown().await;
+    }
+
+    /// One condemnation is ONE redial. Closing the condemned connection ends its
+    /// read loop, which fires that connection's alive watcher; a watcher that
+    /// acted on a connection the actor already retired would dial a second time
+    /// and condemn the fresh connection with a stale `ConnectionLost`.
+    #[tokio::test]
+    async fn a_condemned_lane_redials_exactly_once() {
+        let peer = spawn_silent_peer(Uuid::new_v4()).await;
+        let handle = connected_raft_lane(&peer).await;
+
+        drive_lane_to_condemnation(&handle).await;
+        wait_for_count(&peer.handshakes, 2).await;
+        wait_for_count(&peer.closed, 1).await;
+
+        // Long enough for a stray watcher's redial to land (first backoff step).
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            peer.handshakes.load(Ordering::SeqCst),
+            2,
+            "one condemnation must produce exactly one redial"
+        );
+        assert_eq!(
+            peer.closed.load(Ordering::SeqCst),
+            1,
+            "the fresh connection must not be torn down by a stale loss signal"
+        );
+        assert_eq!(
+            handle.query_status().await.unwrap(),
+            LaneStatusReport::Connected
+        );
+
+        handle.shutdown().await;
     }
 
     #[tokio::test]
