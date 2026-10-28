@@ -11749,7 +11749,11 @@ impl<F: FlushTarget> TableStore<F> {
     }
 }
 
+/// Local on-disk size of generation `id`, or `None` when a required component
+/// is absent or empty. The generation may live flat in `table_dir` or in its
+/// own `table_dir/<id>/` (see [`crate::flush::generation_files_dir`]).
 fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> Option<u64> {
+    let dir = crate::flush::generation_files_dir(table_dir, id);
     let mut total = 0u64;
     for suffix in [
         "Data.db",
@@ -11759,24 +11763,32 @@ fn sstable_compaction_component_size(table_dir: &std::path::Path, id: &str) -> O
         "Statistics.db",
         "TOC.txt",
     ] {
-        let path = table_dir.join(format!("{id}-{suffix}"));
-        let meta = std::fs::metadata(&path).ok()?;
-        if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && meta.len() == 0 {
+        let len = component_len(&dir.join(format!("{id}-{suffix}")))?;
+        if matches!(suffix, "Data.db" | "Partitions.db" | "Statistics.db") && len == 0 {
             return None;
         }
-        total = total.saturating_add(meta.len());
+        total = total.saturating_add(len);
     }
-    let compression_info = table_dir.join(format!("{id}-CompressionInfo.db"));
-    if let Ok(meta) = std::fs::metadata(compression_info) {
-        total = total.saturating_add(meta.len());
-    }
-    for suffix in ["Digest.crc32", "CRC.db"] {
-        let path = table_dir.join(format!("{id}-{suffix}"));
-        if let Ok(meta) = std::fs::metadata(path) {
-            total = total.saturating_add(meta.len());
+    for suffix in ["CompressionInfo.db", "Digest.crc32", "CRC.db"] {
+        if let Some(len) = component_len(&dir.join(format!("{id}-{suffix}"))) {
+            total = total.saturating_add(len);
         }
     }
     Some(total)
+}
+
+/// A component's length. Absence is the designed `None` (an evicted or
+/// optional component); any other stat failure is also `None`, so planning
+/// falls back to the cached size, but it is logged rather than read as absence.
+fn component_len(path: &std::path::Path) -> Option<u64> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Some(meta.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "compaction planning: could not stat an SSTable component");
+            None
+        }
+    }
 }
 
 fn sstable_compaction_remote_component_available(table_dir: &std::path::Path, id: &str) -> bool {
@@ -12022,6 +12034,49 @@ mod tests {
     use ferrosa_common::key::PartitionKey;
     use ferrosa_common::schema::ColumnDefinition;
     use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Partition};
+
+    /// Write the components compaction planning sizes, each `len` bytes.
+    fn write_sized_components(dir: &std::path::Path, id: &str, len: usize) -> u64 {
+        std::fs::create_dir_all(dir).unwrap();
+        let suffixes = [
+            "Data.db",
+            "Partitions.db",
+            "Rows.db",
+            "Filter.db",
+            "Statistics.db",
+            "TOC.txt",
+        ];
+        suffixes.iter().for_each(|suffix| {
+            std::fs::write(dir.join(format!("{id}-{suffix}")), vec![1u8; len]).unwrap();
+        });
+        (suffixes.len() * len) as u64
+    }
+
+    /// A generation restored from S3 into `<table>/<gen>/` while registered
+    /// with its table dir was sized as "missing" by planning, which warned on
+    /// every pass (122k times in two hours on one live node) and fell back to
+    /// a cached size.
+    #[test]
+    fn compaction_sizing_finds_a_generation_in_its_own_directory() {
+        let table = tempfile::tempdir().unwrap();
+        let id = "1793143261618700";
+        let want = write_sized_components(&table.path().join(id), id, 7);
+        assert_eq!(
+            sstable_compaction_component_size(table.path(), id),
+            Some(want)
+        );
+    }
+
+    #[test]
+    fn compaction_sizing_still_reads_a_flat_generation_and_refuses_a_missing_one() {
+        let table = tempfile::tempdir().unwrap();
+        let want = write_sized_components(table.path(), "11", 3);
+        assert_eq!(
+            sstable_compaction_component_size(table.path(), "11"),
+            Some(want)
+        );
+        assert_eq!(sstable_compaction_component_size(table.path(), "12"), None);
+    }
 
     fn test_schema() -> TableSchema {
         TableSchema {

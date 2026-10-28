@@ -573,6 +573,12 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   `<table>/<gen>/` and is reopened with that directory, so
   `rehydrate_if_evicted` looks one level up for it (without that, an evicted
   compaction output failed to reopen and was quarantined as corrupt).
+  The reverse also happens: a FLUSHED generation stays registered with its
+  table directory, but a restore from S3 (`download_sstables_into`, used by
+  the background hot-table restore) brings it back as `<table>/<gen>/`.
+  `flush::generation_files_dir` resolves where a generation's files actually
+  are; the read open (`open_file_sstable`), compaction input open, and
+  compaction planning's size check all go through it (ST-101).
 - **Cache invariants** (`engine/cache_invariants.rs`) — an engine over an
   in-memory object store, cache far smaller than its data, several tables (plain,
   secondary-indexed, full-text), checked after every flush+sync cycle against a

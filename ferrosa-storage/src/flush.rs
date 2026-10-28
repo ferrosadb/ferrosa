@@ -2117,8 +2117,36 @@ pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
     }
 }
 
+/// The directory that actually holds generation `gen`'s components, given the
+/// directory a reader was registered with.
+///
+/// A generation lives either flat in its table directory (a flush) or in its
+/// own `<table>/<gen>/` directory (a compaction output, or any generation
+/// restored from S3 by `download_sstables_into`). A flushed generation that was
+/// evicted and then restored keeps its flat registration but comes back
+/// nested, so the registered directory alone is not enough. The nested
+/// directory wins when it holds this generation's `Data.db`, matching
+/// `StorageEngine::generation_dir_path`; a generation id names immutable
+/// content, so a copy in both places is the same data. When neither holds
+/// `Data.db` (an evicted or compacted-away generation) the registered
+/// directory is returned unchanged, so the eviction gate and the
+/// missing-component errors behave exactly as before.
+pub(crate) fn generation_files_dir(dir: &Path, gen: &str) -> PathBuf {
+    if dir.file_name().is_some_and(|name| name == gen) {
+        return dir.to_path_buf();
+    }
+    let nested = dir.join(gen);
+    if nested.join(format!("{gen}-Data.db")).exists() {
+        nested
+    } else {
+        dir.to_path_buf()
+    }
+}
+
 /// Open a file-backed SSTable reader from component files for generation `gen`
-/// in `dir`. Shared by [`FileFlushTarget::open_reader`] and the engine's
+/// in `dir`, or in `dir/<gen>/` when the generation was restored there (see
+/// `generation_files_dir`). Shared by
+/// [`FileFlushTarget::open_reader`] and the engine's
 /// startup/load path so on-demand reopens go through one code path.
 ///
 /// Required components (`Data.db`, `Partitions.db`, `Rows.db`, `Filter.db`) must
@@ -2127,6 +2155,8 @@ pub(crate) fn prepare_evicted_for_query(dir: &Path, gen: &str) -> Result<bool> {
 /// absence is a defect, not an optional omission. Genuinely-optional components
 /// (`Statistics.db`, `CompressionInfo.db`) default to empty/absent when missing.
 pub fn open_file_sstable(dir: &Path, gen: &str) -> Result<SSTableReader<FileReadAt>> {
+    let generation_dir = generation_files_dir(dir, gen);
+    let dir = generation_dir.as_path();
     let remote_data = prepare_evicted_for_query(dir, gen)?;
     let [data_component, partitions_component, rows_component, filter_component] =
         REQUIRED_SSTABLE_COMPONENTS;
@@ -3858,6 +3888,56 @@ mod tests {
             .path()
             .join(format!("{gen}-CompressionInfo.db"))
             .exists());
+    }
+
+    /// A flushed generation is registered with its TABLE directory, but a
+    /// restore from S3 (`download_sstables_into`, used by the background
+    /// hot-table restore after an eviction) lays it out as `<table>/<gen>/`.
+    /// The reader must find the files where they are: reading only the flat
+    /// path reported "missing required Data.db" for a generation that was
+    /// fully on disk, and the read path then quarantined it as corrupt and
+    /// anti-entropy repair could not build a Merkle tree over it (live,
+    /// 2026-10-28).
+    #[test]
+    fn open_file_sstable_reads_a_generation_restored_into_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = test_schema();
+        let mut partitions = vec![make_partition("k1", b"v1", 5000)];
+        partitions.sort_by(|a, b| a.key.cmp(&b.key));
+        let header = build_serialization_header(&schema, &partitions);
+        let mut writer = SSTableWriter::new(WriteOptions::default(), header);
+        for p in &partitions {
+            writer.add_partition(p).unwrap();
+        }
+        let target = FileFlushTarget::new(dir.path().to_path_buf()).unwrap();
+        let _reader = target.flush(writer.finish().unwrap()).unwrap();
+        let gen = target.generation().to_string();
+
+        // Move every component into <table>/<gen>/, as the restore writes it.
+        let nested = dir.path().join(&gen);
+        std::fs::create_dir(&nested).unwrap();
+        let prefix = format!("{gen}-");
+        let mut moved = 0;
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&prefix) {
+                std::fs::rename(entry.path(), nested.join(&name)).unwrap();
+                moved += 1;
+            }
+        }
+        assert!(moved >= 4, "fixture must move the required components");
+        assert!(!dir.path().join(format!("{gen}-Data.db")).exists());
+
+        let reader = open_file_sstable(dir.path(), &gen)
+            .expect("a generation restored into <table>/<gen>/ must open from its table dir");
+        assert_eq!(reader.key_count(), 1);
+        let mut iter = reader.partitions_iter().unwrap();
+        assert!(iter.next_partition_count().unwrap().is_some());
+        assert!(iter.next_partition_count().unwrap().is_none());
+
+        // Opening with the generation's own directory keeps working too.
+        open_file_sstable(&nested, &gen).expect("the nested dir itself must open");
     }
 
     /// Window-1 fail-loud: `Filter.db` is always written for a live SSTable, so
