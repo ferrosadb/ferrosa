@@ -269,6 +269,13 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   set depends on maximum row width and fan-in, rather than partition length. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
   `FERROSA_COMPACTION_WORKERS` still override; the resolved values are logged at
   startup.
+  **Evicted inputs in planning (FMEA ST-100):** every maintenance pass plans
+  over every SSTable. A generation whose local components are gone but whose
+  `Data.db` has a remote length is evicted, not broken: it stays plannable at
+  its cached verified-reader size and execution rehydrates it. Planning reports
+  each generation's state on change only — evicted, local again, or
+  unplannable (no remote length, skipped) — through a state shared by every
+  clone of its descriptor, not once per pass.
   **Direct-read + read-ahead input (on by default):** compaction
   opens each input `Data.db` as a private cache-bypassing scan
   (`FileReadAt::open_scan`: O_DIRECT / `F_NOCACHE`) with a background read-ahead of
@@ -404,6 +411,25 @@ controls already passed before the fix (`tests/count_payload_alloc.rs`).
   corruption, not an optional gap — the generation is withheld and never uploaded,
   never worked around (ST-91).
   **Wired into the flush path.**
+  **Pending-upload ledger** (`upload/pending_log.rs`, FMEA ST-99): one JSON
+  file per unconfirmed upload under `{data_dir}/pending-uploads/`, published by
+  temp file + fsync + rename + directory fsync and removed by unlink. No
+  mutation reads or rewrites another entry, so concurrent compaction
+  finalizers and replay tasks need no lock. It replaces the single
+  `pending-uploads.log`, whose in-place rewrite on every removal lost
+  concurrent adds, stripped every other entry's compaction context, and left
+  NUL holes that became table names (t_c14245f9). Engine constructors migrate a
+  legacy log once, before the engine exists: NUL-prefixed records are salvaged
+  under the name after the hole, unparseable lines are quarantined to
+  `pending-uploads/quarantine/`, and the old log is kept as
+  `pending-uploads.log.migrated-<unix secs>`. A corrupt entry file is
+  quarantined at ERROR on read, never replayed. At replay, an entry whose files
+  are not on local disk is retired if the S3 manifest lists its generation
+  (upload completed, removal lost) and otherwise quarantined at ERROR (nothing
+  left to upload); it no longer warns "cannot replay" on every startup.
+  Metrics: `pending_upload_ledger_corrupt_entries_total`,
+  `pending_upload_unreplayable_total`. A binary older than this change reads
+  only the legacy log, so after a downgrade it sees no pending uploads.
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
   Set `FERROSA_LOCAL_STORE_PATH` (or `[s3].local_path` in `ferrosa.toml`) to use
