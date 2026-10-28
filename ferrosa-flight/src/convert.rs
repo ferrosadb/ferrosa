@@ -22,8 +22,36 @@ use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use ferrosa_common::{CqlType, CqlValue};
 
-/// Decoded Arrow batch: column names + row-major CQL values (the `DoPut` shape).
-pub type DecodedRows = (Vec<String>, Vec<Vec<Option<CqlValue>>>);
+/// The rows of one decoded Arrow batch, yielded one at a time in batch order
+/// (the `DoPut` shape). Each row is MOVED out of the decoded column buffers as
+/// it is pulled, so the batch is never held twice and no row matrix is built.
+#[derive(Debug)]
+pub struct BatchRows {
+    cols: Vec<std::vec::IntoIter<Option<CqlValue>>>,
+    remaining: usize,
+}
+
+impl Iterator for BatchRows {
+    type Item = Vec<Option<CqlValue>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        // Every column holds exactly `num_rows` cells, so each yields one here.
+        Some(self.cols.iter_mut().filter_map(Iterator::next).collect())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for BatchRows {}
+
+/// Decoded Arrow batch: column names + its rows, streamed (the `DoPut` shape).
+pub type DecodedRows = (Vec<String>, BatchRows);
 
 /// Error converting a CQL result set to an Arrow record batch.
 #[derive(Debug)]
@@ -187,38 +215,46 @@ pub fn record_batch_to_rows(batch: &RecordBatch) -> Result<DecodedRows, ConvertE
     let schema = batch.schema();
     let names: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
 
-    // Decode each column exactly once into a per-column `Vec`, then transpose
-    // column-major -> row-major by MOVING every cell out of its column.
+    // Decode each column exactly once into a per-column `Vec`, then hand the
+    // rows out lazily by MOVING every cell out of its column (`BatchRows`).
     //
-    // The previous shape cloned each cell (`col[i].clone()`) into a freshly
+    // An earlier shape cloned each cell (`col[i].clone()`) into a freshly
     // allocated row vector while the whole column matrix was still alive, so a
     // broad batch paid one `CqlValue` deep clone per cell (a `String`/`Vec<u8>`
-    // allocation for text/blob/jsonb cells) AND held both matrices at once.
-    // Consuming each column through `into_iter()` makes the transpose a pure
-    // move: no `CqlValue` is cloned and the column buffers are drained as the
-    // row vectors are filled.
+    // allocation for text/blob/jsonb cells) AND held both matrices at once. The
+    // next shape moved cells but still built the full row matrix. Now no row
+    // matrix exists: the caller pulls a row, and only that row is built.
     //
     // Bound: this is one inbound Arrow `RecordBatch` (the `DoPut` client's
-    // batch), so peak is O(batch), independent of the total stream — the batch,
-    // not the table, sizes it. Each `CqlValue` in the result is a MOVE out of a
-    // column buffer; the only remaining per-cell allocation is inside
-    // `decode_column` itself (unavoidable: decoding an Arrow value into an owned
-    // `CqlValue` allocates for variable-width types).
+    // batch), so the decoded columns are O(batch), independent of the total
+    // stream — the batch, not the table, sizes them, and they drain as rows are
+    // pulled. The only per-cell allocation is inside `decode_column` itself
+    // (unavoidable: decoding an Arrow value into an owned `CqlValue` allocates
+    // for variable-width types). Every column is decoded before the first row
+    // is yielded, so a column that cannot be decoded fails the whole batch
+    // before any row of it is written.
     let num_rows = batch.num_rows();
     let mut cols: Vec<std::vec::IntoIter<Option<CqlValue>>> =
         Vec::with_capacity(batch.num_columns());
     for c in 0..batch.num_columns() {
-        cols.push(decode_column(batch.column(c), schema.field(c).data_type())?.into_iter());
+        let decoded = decode_column(batch.column(c), schema.field(c).data_type())?;
+        if decoded.len() != num_rows {
+            return Err(ConvertError::Arrow(
+                arrow::error::ArrowError::InvalidArgumentError(format!(
+                    "column {c} decoded {} cells for a {num_rows}-row batch",
+                    decoded.len()
+                )),
+            ));
+        }
+        cols.push(decoded.into_iter());
     }
-
-    let mut rows: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(num_rows);
-    for _ in 0..num_rows {
-        // Every column has exactly `num_rows` cells; `flatten` maps a missing
-        // trailing cell to `None` (the same "absent cell" convention the rest of
-        // the module uses).
-        rows.push(cols.iter_mut().filter_map(Iterator::next).collect());
-    }
-    Ok((names, rows))
+    Ok((
+        names,
+        BatchRows {
+            cols,
+            remaining: num_rows,
+        },
+    ))
 }
 
 /// Decode one Arrow column into per-row `Option<CqlValue>` (NULL slot -> `None`).
@@ -406,21 +442,80 @@ fn build_values(
     })
 }
 
-/// Assemble an Arrow `StructArray` from ordered `(name, type)` fields, the
-/// per-field value columns (each `values.len()` long), and per-row validity.
-fn assemble_struct(
+/// The struct-shaped CQL values (`tuple` / `udt`) [`build_struct`] reads.
+#[derive(Clone, Copy)]
+enum StructKind {
+    Tuple,
+    Udt,
+}
+
+impl StructKind {
+    /// The type name a mismatch reports.
+    fn expected(self) -> &'static str {
+        match self {
+            StructKind::Tuple => "tuple",
+            StructKind::Udt => "udt",
+        }
+    }
+
+    /// Whether `v` is a value of this kind.
+    fn is_kind(self, v: &CqlValue) -> bool {
+        matches!(
+            (self, v),
+            (StructKind::Tuple, CqlValue::Tuple(_)) | (StructKind::Udt, CqlValue::Udt(_))
+        )
+    }
+
+    /// Field `i` of `v` (`None` when absent, NULL, or `v` is another kind).
+    fn field(self, v: &CqlValue, i: usize) -> Option<CqlValue> {
+        match (self, v) {
+            (StructKind::Tuple, CqlValue::Tuple(elems)) => elems.get(i).cloned().flatten(),
+            (StructKind::Udt, CqlValue::Udt(entries)) => {
+                entries.get(i).and_then(|(_, val)| val.clone())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Build an Arrow `StructArray` for a `tuple`/`udt` column from ordered
+/// `(name, type)` fields. A NULL value is a null row.
+///
+/// One field at a time: field `i`'s values are gathered across the column,
+/// built into its child array through `build_values`, and dropped before the
+/// next field is gathered. Peak is one field's column, never every field's
+/// column at once (an `arity x rows` matrix).
+fn build_struct(
     field_defs: &[(String, CqlType)],
-    per_field: Vec<Vec<Option<CqlValue>>>,
-    valid: Vec<bool>,
+    values: &[Option<CqlValue>],
     column: usize,
+    kind: StructKind,
 ) -> Result<ArrayRef, ConvertError> {
     use arrow::array::StructArray;
     use arrow::buffer::NullBuffer;
 
+    let mut valid = Vec::with_capacity(values.len());
+    for v in values {
+        match v.as_ref() {
+            None | Some(CqlValue::Null) => valid.push(false),
+            Some(x) if kind.is_kind(x) => valid.push(true),
+            Some(_) => {
+                return Err(ConvertError::TypeMismatch {
+                    column,
+                    expected: kind.expected(),
+                })
+            }
+        }
+    }
+
     let mut fields = Vec::with_capacity(field_defs.len());
     let mut children: Vec<ArrayRef> = Vec::with_capacity(field_defs.len());
-    for ((name, ft), col) in field_defs.iter().zip(per_field) {
-        let arr = build_values(ft, &col, column)?;
+    for (i, (name, ft)) in field_defs.iter().enumerate() {
+        let field_values: Vec<Option<CqlValue>> = values
+            .iter()
+            .map(|v| v.as_ref().and_then(|x| kind.field(x, i)))
+            .collect();
+        let arr = build_values(ft, &field_values, column)?;
         fields.push(Arc::new(Field::new(name, arr.data_type().clone(), true)));
         children.push(arr);
     }
@@ -438,41 +533,12 @@ fn build_tuple(
     values: &[Option<CqlValue>],
     column: usize,
 ) -> Result<ArrayRef, ConvertError> {
-    let arity = elem_types.len();
-    let mut per_field: Vec<Vec<Option<CqlValue>>> = (0..arity)
-        .map(|_| Vec::with_capacity(values.len()))
-        .collect();
-    let mut valid = Vec::with_capacity(values.len());
-
-    for v in values {
-        match v.as_ref() {
-            None | Some(CqlValue::Null) => {
-                for col in per_field.iter_mut() {
-                    col.push(None);
-                }
-                valid.push(false);
-            }
-            Some(CqlValue::Tuple(elems)) => {
-                for (i, col) in per_field.iter_mut().enumerate() {
-                    col.push(elems.get(i).cloned().flatten());
-                }
-                valid.push(true);
-            }
-            Some(_) => {
-                return Err(ConvertError::TypeMismatch {
-                    column,
-                    expected: "tuple",
-                })
-            }
-        }
-    }
-
     let defs: Vec<(String, CqlType)> = elem_types
         .iter()
         .enumerate()
         .map(|(i, t)| (i.to_string(), t.clone()))
         .collect();
-    assemble_struct(&defs, per_field, valid, column)
+    build_struct(&defs, values, column, StructKind::Tuple)
 }
 
 /// `udt` -> Arrow `StructArray` with the UDT's named fields (positional, matching
@@ -482,35 +548,7 @@ fn build_udt(
     values: &[Option<CqlValue>],
     column: usize,
 ) -> Result<ArrayRef, ConvertError> {
-    let n = field_defs.len();
-    let mut per_field: Vec<Vec<Option<CqlValue>>> =
-        (0..n).map(|_| Vec::with_capacity(values.len())).collect();
-    let mut valid = Vec::with_capacity(values.len());
-
-    for v in values {
-        match v.as_ref() {
-            None | Some(CqlValue::Null) => {
-                for col in per_field.iter_mut() {
-                    col.push(None);
-                }
-                valid.push(false);
-            }
-            Some(CqlValue::Udt(entries)) => {
-                for (i, col) in per_field.iter_mut().enumerate() {
-                    col.push(entries.get(i).and_then(|(_, val)| val.clone()));
-                }
-                valid.push(true);
-            }
-            Some(_) => {
-                return Err(ConvertError::TypeMismatch {
-                    column,
-                    expected: "udt",
-                })
-            }
-        }
-    }
-
-    assemble_struct(field_defs, per_field, valid, column)
+    build_struct(field_defs, values, column, StructKind::Udt)
 }
 
 /// Build an Arrow `MapArray` for a `map<k, v>` column: flatten every row's
@@ -989,7 +1027,16 @@ mod tests {
         let batch = rows_to_record_batch(&names, &types, &rows).unwrap();
         let (decoded_names, decoded_rows) = record_batch_to_rows(&batch).unwrap();
         assert_eq!(decoded_names, names);
-        assert_eq!(decoded_rows, rows, "scalars round-trip CQL -> Arrow -> CQL");
+        assert_eq!(
+            decoded_rows.len(),
+            rows.len(),
+            "the row count is known up front"
+        );
+        assert_eq!(
+            decoded_rows.collect::<Vec<_>>(),
+            rows,
+            "scalars round-trip CQL -> Arrow -> CQL"
+        );
     }
 
     #[test]

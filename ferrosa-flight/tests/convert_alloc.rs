@@ -1,7 +1,7 @@
 //! Allocation-count guard for the Arrow → CQL (`DoPut`) decode transpose.
 //!
 //! `record_batch_to_rows` decodes an inbound Arrow `RecordBatch` column-major,
-//! then transposes to row-major. The ORIGINAL transpose cloned every cell out of
+//! then yields it row-major, one row at a time. The ORIGINAL transpose cloned every cell out of
 //! the still-resident column matrix (`cols.iter().map(|col| col[i].clone())`) —
 //! one deep `CqlValue` clone per cell (a `String`/`Vec<u8>` allocation for every
 //! text/blob cell) while BOTH the column matrix and the growing row matrix were
@@ -89,7 +89,8 @@ fn clone_transpose(cols: &[Vec<Cell>], nrows: usize) -> Vec<Vec<Cell>> {
 }
 
 /// The FIXED transpose: consume each column through `into_iter()` and MOVE each
-/// cell into its row. Mirrors `record_batch_to_rows` exactly.
+/// cell into its row: the per-row move `convert::BatchRows` performs as each
+/// row of `record_batch_to_rows` is pulled.
 fn move_transpose(cols: Vec<Vec<Cell>>, nrows: usize) -> Vec<Vec<Cell>> {
     let mut cols: Vec<std::vec::IntoIter<Cell>> = cols.into_iter().map(|c| c.into_iter()).collect();
     let mut rows = Vec::with_capacity(nrows);

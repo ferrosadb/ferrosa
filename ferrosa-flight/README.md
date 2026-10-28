@@ -65,7 +65,7 @@ Every RPC is implemented — there are **no `Unimplemented` stubs**.
 | Module | Responsibility |
 |--------|----------------|
 | `service` (`src/service.rs`) | `FerrosaFlight` — the `FlightService` impl: all RPCs, auth, `query_to_batch`, write-path `build_insert`/`write_batch`, endpoint assembly |
-| `convert` (`src/convert.rs`) | CQL result ↔ Arrow: `rows_to_record_batch` (full CQL type coverage) and `record_batch_to_rows` (scalar Arrow → CQL, fail-loud on the rest) |
+| `convert` (`src/convert.rs`) | CQL result ↔ Arrow: `rows_to_record_batch` (full CQL type coverage) and `record_batch_to_rows` (scalar Arrow → CQL, fail-loud on the rest; returns `BatchRows`, which yields one row at a time from the decoded columns) |
 | `plan` (`src/plan.rs`) | Pure distributed-read planner: ring token ranges → token-bounded `SELECT` endpoints with replica locations (W-002) |
 | `token` (`src/token.rs`) | HMAC-SHA256 signed bearer tokens: `issue` / `verify` / `verify_with_keys` (key rotation) |
 | `server` (`src/server.rs`) | gRPC bootstrap: `flight_service` (mount on a `tonic` server), `FlightTlsConfig` (cert/key/require_tls → rustls config via `ferrosa_net::tls`, ALPN h2), `serve_service` / `serve_on_listener` (TLS-only when configured, plaintext otherwise), `serve` (plaintext convenience) |
