@@ -628,8 +628,10 @@ pub struct SSTableComponents<R> {
 /// reader. The summary is downsampled to at most this many `(token, offset)`
 /// pairs (~16 B each → ~1 MB) regardless of partition count, so a reader's
 /// memory does not scale with table size. Tables with fewer partitions keep a
-/// full (stride-1) index. See `build_token_summary`.
-const PARTITION_TOKEN_SUMMARY_MAX_ENTRIES: usize = 65_536;
+/// full (stride-1) index. See `build_token_summary`. A capacity of a resident
+/// seek index, not a result bound: a downsampled summary only lands a seek
+/// earlier, and the walk from there still reaches every partition.
+const PARTITION_TOKEN_SUMMARY_CAPACITY: usize = 65_536;
 
 /// Composes all SSTable component readers into a single read interface.
 pub struct SSTableReader<R: ReadAt> {
@@ -903,7 +905,7 @@ impl<R: ReadAt> SSTableReader<R> {
     /// linear scan from byte 0.
     pub fn partition_token_offsets(&self) -> std::sync::Arc<Vec<(i64, u64)>> {
         self.partition_token_offsets
-            .get_or_init(|| self.build_token_summary(PARTITION_TOKEN_SUMMARY_MAX_ENTRIES))
+            .get_or_init(|| self.build_token_summary(PARTITION_TOKEN_SUMMARY_CAPACITY))
             .clone()
     }
 
@@ -975,7 +977,7 @@ impl<R: ReadAt> SSTableReader<R> {
     /// `row_limit` clustered rows when the limit is non-zero.
     ///
     /// This is the point-read counterpart to
-    /// [`Self::read_partitions_limited_rows`]. CQL single-partition
+    /// [`PartitionIter::next_partition_limited_rows`]. CQL single-partition
     /// `LIMIT` queries use it so a wide partition can return its first
     /// requested rows without decoding the full row body first.
     pub fn get_partition_limited_rows(
@@ -1311,42 +1313,6 @@ impl<R: ReadAt> SSTableReader<R> {
         })
     }
 
-    /// Scan partitions sequentially, stopping once `limit` partitions have
-    /// been decoded. Production full-table callers should use
-    /// [`Self::partitions_iter`] instead of passing an effectively unbounded
-    /// limit.
-    pub fn read_partitions_limited(&self, limit: usize) -> Result<Vec<crate::types::Partition>> {
-        self.read_partitions_limited_rows(limit, 0)
-    }
-
-    /// Scan partitions sequentially, retaining at most `row_limit` rows per
-    /// decoded partition when `row_limit > 0`.
-    pub fn read_partitions_limited_rows(
-        &self,
-        limit: usize,
-        row_limit: usize,
-    ) -> Result<Vec<crate::types::Partition>> {
-        let mut partitions = Vec::new();
-        if limit == 0 {
-            return Ok(partitions);
-        }
-        let source = self.data_source()?;
-        let mut reader = crate::data::DataReader::new(&source, &self.stored, 0);
-        while partitions.len() < limit {
-            let is_final_requested_partition = row_limit > 0 && partitions.len() + 1 == limit;
-            let partition = if is_final_requested_partition {
-                reader.read_partition_prefix_rows(row_limit)?
-            } else {
-                reader.read_partition_limited_rows(row_limit)?
-            };
-            let Some(partition) = partition else {
-                break;
-            };
-            partitions.push(partition);
-        }
-        Ok(partitions)
-    }
-
     /// How many legacy nanosecond timestamps (t_cf637b6e) Data.db holds,
     /// counted by decoding every partition once. Zero for a file written by a
     /// fixed build or rewritten by compaction. Memory is bounded to one
@@ -1676,20 +1642,27 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
     /// range merger's fragment path: a single multi-million-row
     /// partition is read in `limit`-sized batches so peak working set
     /// is `O(limit)` rows, never the whole partition. `limit` must be
-    /// `>= 1`. The returned `Vec` has capacity `limit` but length
-    /// `<= limit`; an empty `Vec` means the partition is exhausted
-    /// (the next [`Self::next_partition_header_only`] advances to the
-    /// following partition).
-    pub fn next_partition_rows(&mut self, limit: usize) -> Result<Vec<crate::types::Row>> {
-        debug_assert!(limit >= 1, "next_partition_rows limit must be >= 1");
-        let mut rows = Vec::with_capacity(limit);
-        while rows.len() < limit {
+    /// `>= 1`. Rows are appended to the caller's `rows` buffer, which the
+    /// caller clears and reuses between batches, so a long walk allocates
+    /// its batch storage once. Returns how many rows were appended; `0`
+    /// means the partition is exhausted (the next
+    /// [`Self::next_partition_header_only`] advances to the following
+    /// partition).
+    pub fn next_partition_rows_into(
+        &mut self,
+        limit: usize,
+        rows: &mut Vec<crate::types::Row>,
+    ) -> Result<usize> {
+        debug_assert!(limit >= 1, "next_partition_rows_into limit must be >= 1");
+        let mut appended = 0;
+        while appended < limit {
             match self.next_clustered_row()? {
                 Some(row) => rows.push(row),
                 None => break,
             }
+            appended += 1;
         }
-        Ok(rows)
+        Ok(appended)
     }
 
     /// Phase 2 of the row-streamed partition read: walk clustered
@@ -1746,6 +1719,23 @@ impl<'a, R: ReadAt> PartitionIter<'a, R> {
         let header = &self.sst.stored;
         let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
         let result = reader.read_partition()?;
+        self.pos = reader.position();
+        Ok(result)
+    }
+
+    /// [`Self::next_partition`] retaining at most `row_limit` clustered rows
+    /// (`0` keeps them all). Rows past the limit are skipped while decoding,
+    /// never materialized, and the iterator ends aligned on the following
+    /// partition. This is the bounded-window read: a caller wanting N
+    /// partitions pulls N times, so memory is one partition of
+    /// `<= row_limit` rows per call, never the file.
+    pub fn next_partition_limited_rows(
+        &mut self,
+        row_limit: usize,
+    ) -> Result<Option<crate::types::Partition>> {
+        let header = &self.sst.stored;
+        let mut reader = crate::data::DataReader::new(&self.source, header, self.pos);
+        let result = reader.read_partition_limited_rows(row_limit)?;
         self.pos = reader.position();
         Ok(result)
     }
@@ -2370,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn read_partitions_limited_rows_skips_unretained_rows_and_continues() {
+    fn next_partition_limited_rows_skips_unretained_rows_and_continues() {
         let header = test_header();
 
         let dk1 = DecoratedKey::new(PartitionKey::from(b"k1".as_slice()));
@@ -2396,15 +2386,20 @@ mod tests {
         };
 
         let reader = SSTableReader::open(components).unwrap();
-        let partitions = reader.read_partitions_limited_rows(2, 1).unwrap();
+        let mut iter = reader.partitions_iter().unwrap();
+        let first = iter.next_partition_limited_rows(1).unwrap().expect("k1");
+        let second = iter.next_partition_limited_rows(1).unwrap().expect("k2");
 
-        assert_eq!(partitions.len(), 2);
-        assert_eq!(partitions[0].key.key.as_bytes(), b"k1");
-        assert_eq!(partitions[1].key.key.as_bytes(), b"k2");
-        assert_eq!(partitions[0].rows.len(), 1);
-        assert_eq!(partitions[1].rows.len(), 1);
-        assert_eq!(partitions[0].rows[0].clustering, 1_i32.to_be_bytes());
-        assert_eq!(partitions[1].rows[0].clustering, 1_i32.to_be_bytes());
+        assert_eq!(first.key.key.as_bytes(), b"k1");
+        assert_eq!(second.key.key.as_bytes(), b"k2");
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(first.rows[0].clustering, 1_i32.to_be_bytes());
+        assert_eq!(second.rows[0].clustering, 1_i32.to_be_bytes());
+        assert!(
+            iter.next_partition_limited_rows(1).unwrap().is_none(),
+            "skipping k1's unretained rows must leave the iterator aligned on EOF after k2"
+        );
     }
 
     #[test]
@@ -2969,10 +2964,11 @@ mod tests {
         assert!(reader.compression_info().is_none());
     }
 
-    /// Parity: streaming `partitions_iter()` yields the same sequence as a
-    /// small, explicitly bounded partition read.
+    /// Parity: streaming `partitions_iter()` yields every partition the index
+    /// holds, each identical to a point read of its key, and the windowed
+    /// `next_partition_limited_rows(0)` read yields the same sequence.
     #[test]
-    fn partitions_iter_matches_bounded_partition_read() {
+    fn partitions_iter_matches_point_reads() {
         let header = test_header();
         let dks: Vec<_> = (0..7u32)
             .map(|i| DecoratedKey::new(PartitionKey::from(format!("pk{i:02}").as_bytes())))
@@ -2999,19 +2995,25 @@ mod tests {
         };
         let reader = SSTableReader::open(components).unwrap();
 
-        let materialized = reader
-            .read_partitions_limited(dks.len())
-            .expect("bounded partition read");
         let mut streamed = Vec::new();
         let mut iter = reader.partitions_iter().expect("partitions_iter");
         while let Some(p) = iter.next_partition().expect("next") {
             streamed.push(p);
         }
+        let mut windowed = Vec::new();
+        let mut window_iter = reader.partitions_iter().expect("partitions_iter");
+        while let Some(p) = window_iter.next_partition_limited_rows(0).expect("next") {
+            windowed.push(p);
+        }
 
-        assert_eq!(materialized.len(), streamed.len(), "same partition count");
-        for (m, s) in materialized.iter().zip(streamed.iter()) {
-            assert_eq!(m.key, s.key);
-            assert_eq!(m.rows.len(), s.rows.len());
+        assert_eq!(streamed.len(), dks.len(), "every indexed partition streams");
+        assert_eq!(windowed, streamed, "the windowed read is the same sequence");
+        for s in &streamed {
+            let point = reader
+                .get_partition(&s.key)
+                .expect("point read")
+                .expect("streamed key must be point-readable");
+            assert_eq!(&point, s, "streamed partition must equal its point read");
         }
         // EOF stays at EOF
         assert!(iter.next_partition().unwrap().is_none());
@@ -3289,15 +3291,15 @@ mod tests {
         }
     }
 
-    /// `next_partition_rows(limit)` yields the SAME clustered rows,
+    /// `next_partition_rows_into(limit, ..)` yields the SAME clustered rows,
     /// in the same order, as the whole-partition `next_partition`
     /// path — only chunked into `limit`-sized batches. Each batch is
     /// `<= limit`; concatenating all batches reproduces the partition
     /// body byte-for-byte. This is the intra-partition streaming
     /// primitive that lets a multi-million-row partition be read in
-    /// `O(limit)` resident rows.
+    /// `O(limit)` resident rows, into one reused batch buffer.
     #[test]
-    fn next_partition_rows_batches_match_whole_partition() {
+    fn next_partition_rows_into_batches_match_whole_partition() {
         let header = test_header();
         let dk = DecoratedKey::new(PartitionKey::from(b"wide".as_slice()));
         let mut data_bytes = Vec::new();
@@ -3326,7 +3328,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Batched: header_only + next_partition_rows(3).
+        // Batched: header_only + next_partition_rows_into(3, ..).
         let mut iter = reader.partitions_iter().unwrap();
         let (key, deletion, static_row) = iter.next_partition_header_only().unwrap().unwrap();
         assert_eq!(key, whole.key);
@@ -3336,18 +3338,21 @@ mod tests {
         let limit = 3;
         let mut batched: Vec<crate::types::Row> = Vec::new();
         let mut batch_sizes = Vec::new();
+        let mut batch: Vec<crate::types::Row> = Vec::new();
         loop {
-            let batch = iter.next_partition_rows(limit).unwrap();
-            if batch.is_empty() {
+            batch.clear();
+            let appended = iter.next_partition_rows_into(limit, &mut batch).unwrap();
+            assert_eq!(
+                appended,
+                batch.len(),
+                "the count must match the rows appended"
+            );
+            if appended == 0 {
                 break;
             }
-            assert!(
-                batch.len() <= limit,
-                "batch {} exceeds limit {limit}",
-                batch.len()
-            );
-            batch_sizes.push(batch.len());
-            batched.extend(batch);
+            assert!(appended <= limit, "batch {appended} exceeds limit {limit}");
+            batch_sizes.push(appended);
+            batched.append(&mut batch);
         }
         assert_eq!(batch_sizes, vec![3, 3, 1], "expected 7 rows chunked 3/3/1");
         assert_eq!(

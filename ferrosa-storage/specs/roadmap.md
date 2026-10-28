@@ -119,13 +119,6 @@ open work lives in specs and the items below.
   - **Index result cap (10k).** Partition-scoped and geo index consults refuse
     above `INDEX_RESULT_CAP`; stream/spill the postings (as
     `read_by_index_each` already does) instead of erroring.
-  - **`system_schema` read caps (10k).** `reload_indexes_from_system_schema`
-    and `read_persisted_indexes` cap the `system_schema.indexes` scan at 10k
-    rows and warn on truncation (t_1ec2e3fc); `MAX_INDEXES_TO_READ`,
-    `MAX_TYPES_TO_READ` and `MAX_FUNCTIONS_TO_READ` silently truncate the same
-    way. A legitimately huge schema population needs pagination instead of a
-    cap. The DROP TABLE cascade (t_ae06e925, landed) stops the table growing
-    with orphans.
   - **Schema-snapshot size bound.** `schema_snapshot.rs` refuses to persist or
     load a registry document above `DEFAULT_MAX_BYTES`; externalize the bound
     and stream the document.

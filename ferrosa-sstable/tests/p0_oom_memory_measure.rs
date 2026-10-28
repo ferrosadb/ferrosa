@@ -158,8 +158,20 @@ fn report(
     let _ = total;
 }
 
+/// Collect every partition into one `Vec`: the materializing shape the reader
+/// no longer offers, kept here only as the baseline a streaming peak is
+/// compared against.
+fn materialize_all(reader: &SSTableReader<FileReadAt>) -> usize {
+    let mut iter = reader.partitions_iter().expect("iter");
+    let mut held = Vec::new();
+    while let Some(p) = iter.next_partition().expect("next") {
+        held.push(p);
+    }
+    held.len()
+}
+
 /// The core question: does the SSTable read path's peak heap scale with the
-/// FILE SIZE? Materializing (`read_partitions_limited_rows`) SHOULD; streaming
+/// FILE SIZE? Materializing (holding every partition) SHOULD; streaming
 /// (`partitions_iter` + `next_partition`, dropping each) should NOT.
 #[test]
 fn sstable_read_peak_scales_with_file_only_for_the_materializing_path() {
@@ -197,18 +209,8 @@ fn sstable_read_peak_scales_with_file_only_for_the_materializing_path() {
     });
 
     // Materializing baseline: peak should track the whole file.
-    let (small_count, small_mat) = measure_peak(|| {
-        small
-            .read_partitions_limited_rows(SMALL, 0)
-            .expect("bounded read")
-            .len()
-    });
-    let (large_count, large_mat) = measure_peak(|| {
-        large
-            .read_partitions_limited_rows(LARGE, 0)
-            .expect("bounded read")
-            .len()
-    });
+    let (small_count, small_mat) = measure_peak(|| materialize_all(&small));
+    let (large_count, large_mat) = measure_peak(|| materialize_all(&large));
     assert_eq!(small_count, SMALL);
     assert_eq!(large_count, LARGE);
 

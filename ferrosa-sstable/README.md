@@ -37,7 +37,10 @@ resolution beyond the serialization header, or cluster routing.
   point lookups (`get_partition`, `get_partition_limited_rows`,
   `get_clustering_row`), bloom/bounds pre-checks (`may_contain_key`), and
   streaming iteration in token order (`partitions_iter` → `PartitionIter`) with
-  token-seek (`seek_to_token`) and projection variants.
+  token-seek (`seek_to_token`) and projection variants. A partition can be read
+  with a row limit (`PartitionIter::next_partition_limited_rows`) or in row
+  batches into a caller-owned buffer (`next_partition_rows_into`). There is no
+  whole-file `Vec<Partition>` reader.
 - **Component output (T-040)** — every physical SSTable component write uses
   `AlignedPump`, including metadata and buffered Data.db output from the memory
   writer. Metadata uses depth 0: one aligned segment, exact logical-length

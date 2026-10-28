@@ -103,7 +103,7 @@ O(partitions) resident cost.
 
 ### Chosen plan
 - **Approach 1 (LANDED — branch `fix/sstable-sampled-partition-index`, TDD):** `partition_token_offsets`
-  is now a bounded downsampled summary (`build_token_summary`, ≤ `PARTITION_TOKEN_SUMMARY_MAX_ENTRIES`
+  is now a bounded downsampled summary (`build_token_summary`, ≤ `PARTITION_TOKEN_SUMMARY_CAPACITY`
   = 65 536 → ~1 MB hard cap; stride 1 for small tables so behaviour is unchanged). `seek_to_token`
   binary-searches the summary to the floor anchor then forward-scans (bounded by stride) to the exact
   landing via `next_partition_metadata` — the **index-free** advance, which also stops the build from

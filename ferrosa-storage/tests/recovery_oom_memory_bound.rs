@@ -170,6 +170,28 @@ fn open_vec_reader(table_dir: &Path, gen_str: &str) -> SSTableReader<Vec<u8>> {
     SSTableReader::open(components).expect("open reconstructed SSTable reader")
 }
 
+/// Hold every partition of `reader` at once: the OLD recovery shape
+/// (`read_all_partitions`), kept only as the baseline the streaming smoke
+/// test's peak is compared against. The reader no longer offers it.
+fn materialize_all(reader: &SSTableReader<Vec<u8>>) -> Vec<ferrosa_sstable::types::Partition> {
+    let mut iter = reader.partitions_iter().expect("partitions_iter");
+    let mut held = Vec::new();
+    while let Some(p) = iter.next_partition().expect("materialize all partitions") {
+        held.push(p);
+    }
+    held
+}
+
+/// Partitions in `reader`, counted without holding them.
+fn partition_count(reader: &SSTableReader<Vec<u8>>) -> usize {
+    let mut iter = reader.partitions_iter().expect("partitions_iter");
+    let mut n = 0;
+    while iter.next_partition().expect("count partitions").is_some() {
+        n += 1;
+    }
+    n
+}
+
 fn big_row(seed: usize, ts: i64) -> Row {
     // Vary the bytes per partition so the payload is not trivially deduplicated.
     let value: Vec<u8> = (0..VALUE_BYTES)
@@ -221,12 +243,7 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
     // biggest single SSTable regardless of how many shards the flush emitted.
     let gen = *gens
         .iter()
-        .max_by_key(|g| {
-            open_vec_reader(&table_dir, &g.to_string())
-                .read_partitions_limited(usize::MAX)
-                .map(|p| p.len())
-                .unwrap_or(0)
-        })
+        .max_by_key(|g| partition_count(&open_vec_reader(&table_dir, &g.to_string())))
         .expect("at least one generation");
     let gen_str = gen.to_string();
 
@@ -236,11 +253,7 @@ fn measure_recovery_peaks(n: usize) -> Peaks {
 
     // Baseline: materialize every partition — the OLD recovery behavior
     // (`read_all_partitions`) whose peak scales with partition count.
-    let (materialized, materialize) = measure_peak(|| {
-        reader
-            .read_partitions_limited(usize::MAX)
-            .expect("materialize all partitions")
-    });
+    let (materialized, materialize) = measure_peak(|| materialize_all(&reader));
     assert!(
         !materialized.is_empty() && materialized.len() <= n,
         "the largest generation must hold a non-empty subset of the {n} written partitions \

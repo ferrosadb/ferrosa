@@ -1474,7 +1474,7 @@ buffer whose overflow is written durably to disk and re-ingested automatically
 | `MAX_DURABLE_CDC_PAGE_BYTES` single-event refusal | `commitlog/cdc.rs` | a single event over the byte budget returned `EventTooLarge`, permanently undeliverable | **FIXED** — the byte budget now bounds only how many events a page batches (backpressure); one oversized event is delivered alone in its own page. Red test `durable_cdc_page_delivers_an_event_larger_than_byte_budget` |
 | `FERROSA_MAX_DEFERRED_REPLAY_MUTATIONS` (10000), `FERROSA_MAX_PENDING_REPLAY_WITHOUT_SCHEMA` | `engine.rs` | overflow is written to the set-aside file and re-ingested, not refused | **LEGITIMATE** — bounded resident buffer whose overflow SPILLS to disk; the ERROR is a log line, not a returned error |
 | `MAX_DURABLE_CDC_PAGE_MUTATIONS` (128) | `commitlog/cdc.rs` | the page ends; the caller re-requests | **LEGITIMATE** — streaming page backpressure |
-| `MAX_COMPACTION_CANDIDATES`, `MAX_COMBINE_ROUNDS` | `store.rs` | a batch takes fewer inputs / a round ends; the rest round | **LEGITIMATE** — work bounds |
+| `COMPACTION_MAX_FANIN`, `MAX_COMBINE_ROUNDS` | `store.rs` | a batch takes fewer inputs / a round ends; the rest round | **LEGITIMATE** — work bounds |
 | `MAX_CAS_RETRIES`, `MAX_CAS_ATTEMPTS`, `MAX_ATTEMPTS`, `MAX_BACKOFF` | `manifest.rs`, `lockfree.rs`, `upload/download.rs` | retry, then fail loud | **LEGITIMATE** — retries / backoff |
 | upload in-flight / rate / idle-pool bounds | `upload/*` | requests queue | **LEGITIMATE** — concurrency / throttle |
 | `runtime_tuning.rs` bound set | `runtime_tuning.rs` | an out-of-range value logs and uses the default | **LEGITIMATE** — parallelism / queue / backpressure / chunk / memory-budget knobs |
@@ -1491,7 +1491,6 @@ so they are deferred rather than removed unsafely. They are tracked here and in
 |---|---|---|---|
 | `RANGE_READ_MATERIALIZATION_CAP` (10000) | `store.rs` | a range read is REFUSED | re-point the materializing path at the existing streaming twin `range_iter` |
 | `INDEX_RESULT_CAP` (10000) | `store.rs` | an index query is REFUSED | stream / spill index postings instead of materializing them |
-| `MAX_INDEXES_TO_RELOAD` / `_READ`, `MAX_TYPES_TO_READ`, `MAX_FUNCTIONS_TO_READ` (10000) | `engine.rs` | `system_schema` rows are silently skipped | the paginated `system_schema` scan (roadmap t_1ec2e3fc) |
 | `DEFAULT_MAX_BYTES` | `schema_snapshot.rs` | a schema-snapshot persist/load is REFUSED | externalize the bound and stream the registry document |
 | `MAX_RECORD_BYTES` | `eviction_audit.rs` | one audit record is REFUSED (that pass is lost) | drop the per-record cap; the ring already bounds the total |
 | RRD ring memory budget | `timeseries/aggregator.rs` | a rollup ring is SKIPPED when the budget is exhausted | spill rollups to disk instead of skipping the ring |

@@ -39,8 +39,9 @@ pub enum LookupResult {
 /// Maximum bytes we ever need to read for a single node.
 ///
 /// Dense nodes can be up to ~2060 bytes (LongDense with 256 children at 8
-/// bytes each + 3 header + payload), so we use a generous buffer.
-const MAX_NODE_READ: usize = 2560;
+/// bytes each + 3 header + payload), so we use a generous buffer. This sizes
+/// ONE node's read buffer; it bounds no result.
+const MAX_NODE_READ_BYTES: usize = 2560;
 
 /// Look up an exact key in the trie.
 ///
@@ -51,6 +52,8 @@ pub fn lookup(reader: &impl ReadAt, root_pos: u64, key: &[u8]) -> Result<LookupR
     let data_len = reader.len()?;
     let mut pos = root_pos;
     let mut key_idx = 0;
+    // One node buffer for the whole descent, not one allocation per level.
+    let mut node_buf = [0u8; MAX_NODE_READ_BYTES];
 
     loop {
         if pos >= data_len {
@@ -60,15 +63,16 @@ pub fn lookup(reader: &impl ReadAt, root_pos: u64, key: &[u8]) -> Result<LookupR
         }
 
         // Read enough bytes to decode any node type.
-        let read_len = MAX_NODE_READ.min((data_len - pos) as usize);
-        let mut buf = vec![0u8; read_len];
-        reader.read_exact_at(&mut buf[..read_len], pos)?;
+        let read_len = MAX_NODE_READ_BYTES.min((data_len - pos) as usize);
+        let buf = &mut node_buf[..read_len];
+        reader.read_exact_at(buf, pos)?;
+        let buf = &*buf;
 
-        let header = read_node_header(&buf)?;
+        let header = read_node_header(buf)?;
 
         if key_idx >= key.len() {
             // Key fully consumed — check for payload at this node.
-            return extract_payload(&buf, &header);
+            return extract_payload(buf, &header);
         }
 
         // Find a transition matching the current key byte.
@@ -89,7 +93,7 @@ pub fn lookup(reader: &impl ReadAt, root_pos: u64, key: &[u8]) -> Result<LookupR
                 // may carry a payload even though the full key hasn't been consumed.
                 // The trie only stores enough bytes to distinguish keys; the hash
                 // byte in the payload verifies the match.
-                return extract_payload(&buf, &header);
+                return extract_payload(buf, &header);
             }
         }
     }

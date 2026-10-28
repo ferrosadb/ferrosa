@@ -29,7 +29,10 @@ use std::time::Instant;
 /// while background compaction drains the backlog.
 const READ_FANOUT_ALERT_SSTABLES: usize = 32;
 const READ_FANOUT_ERROR_INTERVAL_SECS: u64 = 60;
-const MAX_COMPACTION_CANDIDATES: usize = 64;
+/// Most input SSTables one compaction takes (its fan-in): bounds the readers
+/// a single compaction holds open. It sizes one batch, not a result: the
+/// SSTables a batch leaves out wait for a later compaction cycle.
+const COMPACTION_MAX_FANIN: usize = 64;
 static LAST_READ_FANOUT_ERROR_UNIX_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -2099,7 +2102,7 @@ struct RangeScan<F: FlushTarget> {
     delivered: Option<Delivered>,
     /// Set while a resumed merger re-reads the partition it stopped in.
     skip: Option<Delivered>,
-    /// Resumes so far; bounded by [`RANGE_SCAN_MAX_RESUMES`].
+    /// Resumes so far; bounded by [`RANGE_SCAN_RESUME_ATTEMPTS`].
     resumes: u32,
     /// The table-level tombstone resolved against the scan's initial view.
     /// Folded into every partition the scan yields so a TRUNCATE hides rows on the
@@ -2122,7 +2125,7 @@ struct Delivered {
 /// Resumes a single scan may make before its error is delivered. Each is a
 /// compaction retiring an input under it; more than this in one scan means
 /// something other than compaction is removing files.
-const RANGE_SCAN_MAX_RESUMES: u32 = 8;
+const RANGE_SCAN_RESUME_ATTEMPTS: u32 = 8;
 
 static RANGE_SCAN_COMPACTION_RESUMES_TOTAL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -2223,7 +2226,7 @@ where
     /// missed. `false`: the file is missing for some other reason, or the
     /// scan has resumed too often; the caller delivers the error.
     fn resume_after_retired_input(&mut self, error: &ferrosa_common::Error) -> bool {
-        if !is_missing_file(error) || self.resumes >= RANGE_SCAN_MAX_RESUMES {
+        if !is_missing_file(error) || self.resumes >= RANGE_SCAN_RESUME_ATTEMPTS {
             return false;
         }
         let current = self.live_view.load_full();
@@ -8396,9 +8399,18 @@ impl<F: FlushTarget> TableStore<F> {
         let guard = self.view.load();
         let schema = self.schema.load();
 
-        // Collect partitions from bounded sources only. This is still a
-        // materializing read path, so fail closed once the requested window is
-        // exhausted instead of continuing to decode arbitrary table volume.
+        // Collect the window from every source. The answer is the `limit`
+        // smallest keys in `[start, end]` across ALL sources, and those are
+        // contained in the union of each source's own `limit` smallest keys in
+        // that range, so each source contributes up to `limit` — never a
+        // budget left over by an earlier source, which skipped smaller keys
+        // held later (a short, wrong page). Peak is `limit` partitions per
+        // source, bounded by the caller's limit and the source count.
+        //
+        // One table-tombstone key may sit in the window and is dropped after
+        // the merge, so memtables are asked for one more than `limit`; the
+        // SSTable walk skips it without counting it.
+        let window = limit.saturating_add(1);
         let mut all_partitions: Vec<Partition> = Vec::new();
 
         let trim_rows = |partitions: &mut Vec<Partition>| {
@@ -8412,40 +8424,50 @@ impl<F: FlushTarget> TableStore<F> {
         // Active memtable: clone only the requested window, not the whole
         // active memtable. This keeps CQL LIMIT/page-size scans from hanging
         // behind full-table materialization.
-        let mut active = guard.active.snapshot_range_limited(start, end, limit);
+        let mut active = guard.active.snapshot_range_limited(start, end, window);
         trim_rows(&mut active);
         all_partitions.extend(active);
 
-        // Flushing memtable
-        if all_partitions.len() < limit {
-            for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
-                let remaining = limit.saturating_sub(all_partitions.len());
-                let mut flushing_parts = flushing.snapshot_range_limited(start, end, remaining);
-                trim_rows(&mut flushing_parts);
-                all_partitions.extend(flushing_parts);
-            }
+        for flushing in guard.flushing.iter().map(|sealed| &sealed.memtable) {
+            let mut flushing_parts = flushing.snapshot_range_limited(start, end, window);
+            trim_rows(&mut flushing_parts);
+            all_partitions.extend(flushing_parts);
         }
 
-        // SSTables — read only the remaining budget from each, and when a row
-        // cap is requested skip unretained rows while decoding instead of
+        // SSTables: seek each to `start` and stream its window. When a row cap
+        // is requested, unretained rows are skipped while decoding instead of
         // materializing full wide partitions and truncating afterwards.
         for desc in guard.sstables.iter() {
-            let remaining = limit.saturating_sub(all_partitions.len());
-            if remaining == 0 {
-                break;
-            }
             // One reader open at a time — opened, drained, dropped per loop.
             let sstable = self
                 .open_reader(desc)
                 .map_err(|e| self.unreadable_sstable("read_range", "open", desc, &e))?;
-            let mut parts = sstable
-                .read_partitions_limited_rows(remaining, row_limit)
-                .map_err(|e| self.unreadable_sstable("read_range", "read", desc, &e))?;
             let mapping = ColumnOrdinalMapping::for_header(&schema, sstable.header());
-            for partition in &mut parts {
-                mapping.remap_partition(partition);
+            let fail = |e| self.unreadable_sstable("read_range", "read", desc, &e);
+            let mut iter = sstable.partitions_iter().map_err(fail)?;
+            if let Some(s) = start {
+                iter.seek_to_token(s.token.0).map_err(fail)?;
             }
-            all_partitions.extend(parts);
+            let mut taken = 0;
+            while taken < limit {
+                let Some(mut partition) =
+                    iter.next_partition_limited_rows(row_limit).map_err(fail)?
+                else {
+                    break;
+                };
+                if start.is_some_and(|s| partition.key < *s) {
+                    continue;
+                }
+                if end.is_some_and(|e| partition.key > *e) {
+                    break; // SSTables are key-ordered: nothing later is in range.
+                }
+                if crate::table_tombstone::is_table_tombstone_key(&partition.key) {
+                    continue;
+                }
+                mapping.remap_partition(&mut partition);
+                all_partitions.push(partition);
+                taken += 1;
+            }
         }
 
         // Deduplicate and merge partitions with the same key
@@ -8478,6 +8500,11 @@ impl<F: FlushTarget> TableStore<F> {
         }
         for p in &mut merged {
             merge::apply_table_deletion(p, table_delete);
+            // Each source kept its first `row_limit` rows, so a key merged from
+            // several sources can hold more; the caller asked for at most that.
+            if row_limit > 0 {
+                p.rows.truncate(row_limit);
+            }
         }
 
         // Apply range filter and limit
@@ -11591,7 +11618,7 @@ impl<F: FlushTarget> TableStore<F> {
         max_sstables: usize,
         max_input_bytes: u64,
     ) -> (usize, Vec<crate::compaction::metadata::SSTableMetadata>) {
-        let max_sstables = max_sstables.min(MAX_COMPACTION_CANDIDATES);
+        let max_sstables = max_sstables.min(COMPACTION_MAX_FANIN);
         if max_sstables == 0 || max_input_bytes == 0 {
             return (self.sstable_count(), Vec::new());
         }
@@ -15287,6 +15314,61 @@ mod tests {
         }
         let results = store.read_range(None, None, 3).unwrap();
         assert_eq!(results.len(), 3);
+    }
+
+    /// A limited range read with a `start` bound over an SSTable must return
+    /// the `limit` partitions AT OR AFTER `start`. It used to decode the
+    /// first `limit` partitions of the file and filter them by `start`
+    /// afterwards, so a page past the first `limit` keys came back short or
+    /// empty and read as the rows not existing.
+    #[test]
+    fn read_range_limited_from_start_over_sstable_returns_the_window_after_start() {
+        let store = test_store();
+        for i in 0..50 {
+            store
+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        let all: Vec<DecoratedKey> = store
+            .read_range(None, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|p| p.key)
+            .collect();
+        assert_eq!(all.len(), 50, "fixture must hold fifty partitions");
+
+        let page = store.read_range(Some(&all[20]), None, 5).unwrap();
+        let got: Vec<&DecoratedKey> = page.iter().map(|p| &p.key).collect();
+        let want: Vec<&DecoratedKey> = all[20..25].iter().collect();
+        assert_eq!(got, want, "the page must be the five keys from start");
+    }
+
+    /// A limited range read over several sources must return the `limit`
+    /// smallest keys across ALL of them. It used to fill the budget from the
+    /// memtable first and skip every SSTable once it was full, so smaller keys
+    /// living in an SSTable were silently left out of the page.
+    #[test]
+    fn read_range_limited_across_sources_returns_the_smallest_keys_overall() {
+        let store = test_store();
+        for i in 0..40 {
+            store
+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .unwrap();
+        }
+        store.flush().unwrap();
+        for i in 40..80 {
+            store
+                .write(&make_key(&format!("k{i:04}")), make_row(b"v", 1000 + i))
+                .unwrap();
+        }
+        let mut all: Vec<DecoratedKey> = (0..80).map(|i| make_key(&format!("k{i:04}"))).collect();
+        all.sort();
+
+        let page = store.read_range(None, None, 10).unwrap();
+        let got: Vec<&DecoratedKey> = page.iter().map(|p| &p.key).collect();
+        let want: Vec<&DecoratedKey> = all[..10].iter().collect();
+        assert_eq!(got, want, "the page must be the ten smallest keys overall");
     }
 
     // -------------------------------------------------------------------------
