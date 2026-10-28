@@ -56,7 +56,7 @@ bincode tag order is asserted stable (`lib.rs::bincode_index_type_variant_tag_st
 | `composite` (~737) | Multi-column key; full-key + prefix scan |
 | `phonetic/*` (~431 + algos) | Soundex / Metaphone / Double Metaphone / Caverphone fuzzy-match index |
 | `filtered` (~840) | Predicate-at-build wrapper + planner soundness helpers |
-| `vector/hnsw` (~669) | HNSW graph ANN (JSON artifact) |
+| `vector/hnsw`, `vector/hnsw_binary` | HNSW graph ANN: binary FHNW sidecars searched in place, legacy JSON read; factory artifact JSON |
 | `vector/ivfflat` (~504) | k-means inverted-file ANN (JSON artifact) |
 | `vector/quantized/*` (~2200) | Paged `.qvec` container, scalar codec, deterministic quantized-IVF builder, staged page-budget reader |
 | `fulltext/*` (~2600) | Analyzer (+ `analyze_query` query-side parity so stop-word/punctuation terms match the index), builder, BM25 reader (`search` + bounded `search_top_k`), query parser, scoring, compaction merge, streaming sidecar term search (`stream`), bounded top-k selection (`topk`) |
@@ -87,7 +87,8 @@ flowchart TD
 compaction (in process via `ferrosa-storage`/`ferrosa-cluster`, or out of process
 via `ferrosa-index-builder`). The builder extracts the bytes at
 `column_positions`, encodes a key, and on `finish()` writes the artifact(s):
-compact length-prefixed binary (secondary), JSON (HNSW / IVFFlat), or a paged
+compact length-prefixed binary (secondary), binary FHNW (HNSW storage
+sidecars), JSON (HNSW factory artifact / IVFFlat), or a paged
 `.qvec` container (quantized). Full-text serializes to a single byte buffer;
 geo writes cell ids through a BTree sidecar.
 

@@ -6,8 +6,10 @@ with no lane-loss event, until the *local* node restarts.
 **Component:** `ferrosa-net` — `lane_actor.rs` (actor loop + alive watcher),
 `reconnect.rs` (`spawn_alive_watcher`), `pool.rs` / `peer.rs` (pool ownership)
 **Status:** in-process — probe-first detection implemented and unit-tested;
-**the accumulation window that hid sparse failures has been removed** (see
-Implementation Notes); **live verification still pending**
+**the accumulation window that hid sparse failures has been removed**; live
+verification (2026-10-27) **found that a condemned lane never redials and leaks
+its socket** — fixed with actor-level tests (see Implementation Notes
+2026-10-27); live re-verification of the fix pending
 
 ## Symptom
 
@@ -167,3 +169,50 @@ Still outstanding:
 - [ ] **remove the inert knob**: the now-ignored second parameter of
       `LaneHealth::new`, `lane_failure_window()`, `DEFAULT_LANE_FAILURE_WINDOW_MS`,
       `ENV_LANE_FAILURE_WINDOW_MS`, and the ~10 test call sites that pass it.
+
+## Implementation Notes (2026-10-27) — a condemned lane never dialled again (t_dbcde486)
+
+**Live verification found the "Desired behaviour" was never wired.** On the local
+3-node dev cluster (v0.29.0) every Raft lane on all three nodes logged `lane probe
+failed; the peer is unreachable, reconnecting` → `entering reconnecting state`
+within 3 s of each other (18:01:31–34Z), ~5 min after a rolling restart, and then
+**no `lane reconnected` for hours**: every RPC answered `lane is reconnecting;
+retry later`, the metadata Raft group ran an election storm (node2 elected and
+stepping down on CheckQuorum, nodes 1/3 triggering elections every few seconds),
+~3k ERROR lines per 20 min, while Data/Bulk and ordinary reads kept working.
+node1 also held **15** sockets to node3 where its 3 lanes need 3.
+
+**Cause — the condemn path copied `ConnectionLost`'s transition but not its dial.**
+`begin_reconnect` only sets `state = Reconnecting`. On the alive-watcher path that
+is fine because the watcher closure has already called `spawn_reconnect(0)`; on the
+condemn paths (`SendComplete`/`FireComplete` → `LaneAction::Reconnect`, and
+`ProbeFailed`) nothing ever dialled, so no `SwapClient`/`MarkFailed` could arrive
+and the lane was stranded in `Reconnecting` for good. Second defect: the condemned
+`RpcClient` was merely dropped, but the client is cloned per request and its read
+loop owns the socket's read half, so against a peer that is alive-but-stalled the
+socket and its task leaked forever.
+
+**Fix:** `condemn_lane` closes the condemned client (`RpcClient::close`, a
+`CancellationToken` both I/O loops select on), enters `Reconnecting`, and calls
+`spawn_reconnect(0)`. `watch_connection` (now shared by both watcher sites) ignores
+a connection the actor closed itself, so one condemnation is one redial and a stale
+`ConnectionLost` cannot condemn the replacement. `LaneState::Connected` now boxes
+the client (clippy `large_enum_variant` after the new field).
+
+**Tests (actor level, real loopback peer that handshakes then never answers):**
+red first against v0.29.0 —
+- `a_condemned_lane_redials_the_peer_and_reconnects`: failed `left: 1, right: 2`
+  handshakes, status `Reconnecting`.
+- `a_condemned_lane_closes_the_connection_it_gave_up_on`: failed `left: 0, right: 1`
+  (the peer never read EOF).
+- `a_condemned_lane_redials_exactly_once`: guard for the watcher interplay; negative
+  control — disabling the `closed_locally` check made it fail `left: 3, right: 2`.
+`ferrosa-net`: 286 passed / 0 failed; clippy `--all-targets --all-features -D
+warnings` clean; fmt clean.
+
+Still outstanding:
+
+- [ ] live re-verification on the dev cluster with the fixed binary: a probe-failed
+      lane logs `lane reconnected` and Raft keeps a stable leader past the ~5 min mark
+- [ ] why every Raft probe failed at once ~5 min after the roll (the trigger, as
+      opposed to the missing recovery) — not yet explained

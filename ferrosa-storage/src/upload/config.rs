@@ -443,20 +443,44 @@ fn is_remote_endpoint(endpoint: &str) -> bool {
     !(host.eq_ignore_ascii_case("localhost") || host == "::1" || host.starts_with("127."))
 }
 
+/// The object the startup check writes and deletes: `<prefix>/.ferrosa/connectivity-check`,
+/// or `.ferrosa/connectivity-check` with no prefix.
+pub fn connectivity_probe_path(prefix: &str) -> object_store::path::Path {
+    if prefix.is_empty() {
+        object_store::path::Path::from(".ferrosa/connectivity-check")
+    } else {
+        object_store::path::Path::from(format!("{prefix}/.ferrosa/connectivity-check"))
+    }
+}
+
 /// Validate S3 bucket connectivity and write permissions at startup.
 ///
 /// Performs a list + put + delete cycle to confirm the bucket is accessible
 /// and writable. Returns warnings (non-fatal) or an error (fatal).
-pub async fn validate_s3_bucket(store: &dyn ObjectStore) -> ferrosa_common::Result<Vec<String>> {
+///
+/// Everything happens under `prefix` (`FERROSA_S3_PREFIX`), the only part of the
+/// bucket the node writes: a deployment that grants each node its own prefix, and
+/// nothing at the bucket root, must pass. Checking the root instead failed every
+/// such node, fatally when `FERROSA_S3_REQUIRED` is set.
+pub async fn validate_s3_bucket(
+    store: &dyn ObjectStore,
+    prefix: &str,
+) -> ferrosa_common::Result<Vec<String>> {
     let mut warnings = Vec::new();
 
-    // Check connectivity — list root with a short prefix
-    store.list_with_delimiter(None).await.map_err(|e| {
-        ferrosa_common::Error::InvalidFormat(format!("S3 bucket not accessible: {e}"))
-    })?;
+    // Check connectivity — list the node's own prefix (the bucket root when none)
+    let list_prefix = (!prefix.is_empty()).then(|| object_store::path::Path::from(prefix));
+    store
+        .list_with_delimiter(list_prefix.as_ref())
+        .await
+        .map_err(|e| {
+            ferrosa_common::Error::InvalidFormat(format!(
+                "S3 bucket not accessible under prefix {prefix:?}: {e}"
+            ))
+        })?;
 
     // Check write permission — write a test object
-    let test_path = object_store::path::Path::from(".ferrosa/connectivity-check");
+    let test_path = connectivity_probe_path(prefix);
     let test_data = bytes::Bytes::from_static(b"ok");
     store.put(&test_path, test_data.into()).await.map_err(|e| {
         ferrosa_common::Error::InvalidFormat(format!("S3 write permission check failed: {e}"))
@@ -529,9 +553,10 @@ pub fn resolve_object_store(
 /// warning, never swallowed.
 pub async fn enforce_bucket_access(
     store: &dyn ObjectStore,
+    prefix: &str,
     required: bool,
 ) -> ferrosa_common::Result<Vec<String>> {
-    match validate_s3_bucket(store).await {
+    match validate_s3_bucket(store, prefix).await {
         Ok(warnings) => Ok(warnings),
         Err(reason) if required => Err(ferrosa_common::Error::InvalidFormat(format!(
             "S3 access failed and FERROSA_S3_REQUIRED is set: {reason}"
@@ -792,7 +817,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn required_s3_fails_startup_when_the_bucket_is_unreachable() {
-        let err = enforce_bucket_access(&unreachable_s3(), true)
+        let err = enforce_bucket_access(&unreachable_s3(), "", true)
             .await
             .expect_err("required S3 must not start against an unreachable bucket")
             .to_string();
@@ -802,7 +827,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn optional_s3_reports_an_unreachable_bucket_instead_of_hiding_it() {
-        let warnings = enforce_bucket_access(&unreachable_s3(), false)
+        let warnings = enforce_bucket_access(&unreachable_s3(), "", false)
             .await
             .expect("not required: startup continues");
         assert_eq!(warnings.len(), 1, "the failure is returned, not swallowed");
@@ -812,11 +837,175 @@ pub(crate) mod tests {
     async fn a_reachable_bucket_passes_whether_or_not_it_is_required() {
         for required in [false, true] {
             let store = object_store::memory::InMemory::new();
-            assert!(enforce_bucket_access(&store, required)
+            assert!(enforce_bucket_access(&store, "", required)
                 .await
                 .unwrap()
                 .is_empty());
         }
+    }
+
+    /// A store that, like a bucket policy granting one node its own prefix, refuses
+    /// every path outside `scope/`.
+    #[derive(Debug)]
+    struct ScopedStore {
+        inner: object_store::memory::InMemory,
+        scope: String,
+    }
+
+    impl std::fmt::Display for ScopedStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "ScopedStore({})", self.scope)
+        }
+    }
+
+    impl ScopedStore {
+        fn new(scope: &str) -> Self {
+            Self {
+                inner: object_store::memory::InMemory::new(),
+                scope: scope.to_string(),
+            }
+        }
+
+        fn check(&self, path: &object_store::path::Path) -> object_store::Result<()> {
+            let p = path.as_ref();
+            if p == self.scope || p.starts_with(&format!("{}/", self.scope)) {
+                Ok(())
+            } else {
+                Err(object_store::Error::PermissionDenied {
+                    path: p.to_string(),
+                    source: format!("outside the granted prefix {}", self.scope).into(),
+                })
+            }
+        }
+
+        fn check_listing(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<()> {
+            match prefix {
+                Some(p) => self.check(p),
+                None => self.check(&object_store::path::Path::from("")),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for ScopedStore {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            self.check(location)?;
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOpts,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.check(location)?;
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.check(location)?;
+            self.inner.get_opts(location, options).await
+        }
+
+        async fn delete(&self, location: &object_store::path::Path) -> object_store::Result<()> {
+            self.check(location)?;
+            self.inner.delete(location).await
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>>
+        {
+            use futures::StreamExt;
+            match self.check_listing(prefix) {
+                Ok(()) => self.inner.list(prefix),
+                Err(e) => futures::stream::once(async move { Err(e) }).boxed(),
+            }
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.check_listing(prefix)?;
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.check(from)?;
+            self.check(to)?;
+            self.inner.copy(from, to).await
+        }
+
+        async fn copy_if_not_exists(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+        ) -> object_store::Result<()> {
+            self.check(from)?;
+            self.check(to)?;
+            self.inner.copy_if_not_exists(from, to).await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_access_check_stays_inside_the_configured_prefix() {
+        // A node granted only database/database-1/* (the enterprise bucket policy) must
+        // pass the required check: it lists and probes under its own prefix, not at the
+        // bucket root.
+        let store = ScopedStore::new("database/database-1");
+        let warnings = enforce_bucket_access(&store, "database/database-1", true)
+            .await
+            .expect("a node with its own prefix granted passes the required check");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let left = store
+            .inner
+            .list_with_delimiter(None)
+            .await
+            .expect("list the backing store");
+        assert!(
+            left.objects.is_empty() && left.common_prefixes.is_empty(),
+            "the probe is cleaned up: {left:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_access_check_still_fails_when_the_prefix_is_not_granted() {
+        let store = ScopedStore::new("database/database-2");
+        let err = enforce_bucket_access(&store, "database/database-1", true)
+            .await
+            .expect_err("a prefix the node may not write is still refused")
+            .to_string();
+        assert!(err.contains("FERROSA_S3_REQUIRED"), "{err}");
+    }
+
+    #[test]
+    fn the_probe_path_is_under_the_prefix_and_at_the_root_without_one() {
+        assert_eq!(
+            connectivity_probe_path("database/database-1").as_ref(),
+            "database/database-1/.ferrosa/connectivity-check"
+        );
+        assert_eq!(
+            connectivity_probe_path("").as_ref(),
+            ".ferrosa/connectivity-check"
+        );
     }
 
     #[test]
@@ -1251,7 +1440,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn validate_s3_bucket_succeeds_with_in_memory_store() {
         let store = object_store::memory::InMemory::new();
-        let warnings = validate_s3_bucket(&store).await.unwrap();
+        let warnings = validate_s3_bucket(&store, "").await.unwrap();
         assert!(warnings.is_empty());
     }
 
