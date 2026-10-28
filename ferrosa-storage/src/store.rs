@@ -293,6 +293,38 @@ pub(crate) struct SstableDescriptor {
     /// Whether either persisted key bound uses the legacy non-byte-comparable
     /// encoding and therefore needs a sorting rewrite.
     pub legacy_format: bool,
+    /// What compaction planning last reported about this generation's local
+    /// components, shared by every clone of the descriptor so a view swap
+    /// does not reset it. Planning runs over every SSTable on every pass, so
+    /// it reports a change of state, never the state itself (t_c14245f9).
+    planning_report: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Compaction planning's view of one generation's local components, as stored
+/// in [`SstableDescriptor::planning_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum PlanningComponents {
+    /// Every required component is on local disk (the initial state).
+    Local = 0,
+    /// Local components are missing but `Data.db` has a remote length, so the
+    /// generation is evicted and execution can rehydrate it.
+    Evicted = 1,
+    /// Missing locally and no remote length: planning skips it.
+    Unplannable = 2,
+}
+
+impl PlanningComponents {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::Local,
+            1 => Self::Evicted,
+            2 => Self::Unplannable,
+            other => {
+                unreachable!("planning_report holds only PlanningComponents values, got {other}")
+            }
+        }
+    }
 }
 
 /// Normalise every last-write-wins timestamp `row` carries (cells, primary-key
@@ -383,7 +415,20 @@ impl SstableDescriptor {
             max_timestamp: header.max_timestamp,
             partition_count: reader.key_count(),
             legacy_format,
+            planning_report: Arc::new(std::sync::atomic::AtomicU8::new(
+                PlanningComponents::Local as u8,
+            )),
         }
+    }
+
+    /// Record that planning now sees this generation's components as `now`,
+    /// returning the state it saw before. Equal values mean nothing changed
+    /// and nothing is reported.
+    fn swap_planning_report(&self, now: PlanningComponents) -> PlanningComponents {
+        PlanningComponents::from_u8(
+            self.planning_report
+                .swap(now as u8, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn compaction_metadata(
@@ -420,23 +465,49 @@ impl SstableDescriptor {
         if self.dir.as_os_str().is_empty() {
             return Some(metadata);
         }
+        // Planning runs over every SSTable on every maintenance pass, so each
+        // branch reports only when this generation's state CHANGES: once when
+        // it is evicted, once when it is local again, once when it becomes
+        // unplannable. A per-pass warning logged the same evicted generations
+        // 18–72 times a minute on every dev node (t_c14245f9).
         match sstable_compaction_component_size(&metadata.path, &metadata.id) {
-            Some(size_bytes) => metadata.size_bytes = size_bytes,
+            Some(size_bytes) => {
+                metadata.size_bytes = size_bytes;
+                let before = self.swap_planning_report(PlanningComponents::Local);
+                if before != PlanningComponents::Local {
+                    tracing::info!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        previously = ?before,
+                        "compaction planning: SSTable local components are present again"
+                    );
+                }
+            }
             None if sstable_compaction_remote_component_available(&metadata.path, &metadata.id) => {
-                tracing::warn!(
-                    sstable_id = %metadata.id,
-                    table_dir = ?metadata.path,
-                    size_bytes = metadata.size_bytes,
-                    "compaction planning: SSTable local components are missing or empty; \
-                     using cached verified-reader size and allowing execution to rehydrate inputs"
-                );
+                if self.swap_planning_report(PlanningComponents::Evicted)
+                    != PlanningComponents::Evicted
+                {
+                    tracing::warn!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        size_bytes = metadata.size_bytes,
+                        "compaction planning: SSTable local components are missing or empty; \
+                         using cached verified-reader size and allowing execution to rehydrate inputs \
+                         (reported once per eviction, not per planning pass)"
+                    );
+                }
             }
             None => {
-                tracing::warn!(
-                    sstable_id = %metadata.id,
-                    table_dir = ?metadata.path,
-                    "compaction planning: skipping SSTable because required components are missing or empty and no remote length is registered"
-                );
+                if self.swap_planning_report(PlanningComponents::Unplannable)
+                    != PlanningComponents::Unplannable
+                {
+                    tracing::warn!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        "compaction planning: skipping SSTable because required components are missing \
+                         or empty and no remote length is registered (reported once, not per planning pass)"
+                    );
+                }
                 return None;
             }
         }
@@ -17116,6 +17187,96 @@ mod tests {
             "compaction planning must not select SSTable {gen} after {:?} is missing",
             data_path
         );
+    }
+
+    /// Count the lines of `logs` that carry `needle`.
+    fn log_lines_with(logs: &crate::upload::config::tests::CapturedLogs, needle: &str) -> usize {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// An evicted generation (Data.db in S3, not on disk) is a designed steady
+    /// state, and every maintenance pass plans over every SSTable of every
+    /// table. Warning on each pass logged the same three to thirty-six
+    /// generations 18–72 times a minute on every dev node for days
+    /// (t_c14245f9). The planner must still plan the generation each pass, but
+    /// report it once per transition: evicted, local again, evicted again.
+    #[test]
+    fn compaction_planning_reports_an_evicted_sstable_on_each_transition_not_each_pass() {
+        const EVICTED: &str = "compaction planning: SSTable local components are missing or empty";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        store
+            .write(&make_key("evicted-planning"), make_row(b"v1", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        let data = std::fs::read(&data_path).unwrap();
+        let remote_path = data_path.clone();
+        let remote_len = data.len() as u64;
+        ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
+            Ok((path == remote_path.as_path()).then_some(remote_len))
+        }));
+
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            std::fs::remove_file(&data_path).unwrap();
+            for _ in 0..5 {
+                assert_eq!(
+                    store.sstable_metadata(tmp.path()).len(),
+                    1,
+                    "an evicted generation with a remote Data.db stays plannable"
+                );
+            }
+            assert_eq!(
+                log_lines_with(&logs, EVICTED),
+                1,
+                "one report per eviction:\n{}",
+                logs.text()
+            );
+
+            std::fs::write(&data_path, &data).unwrap();
+            for _ in 0..3 {
+                assert_eq!(store.sstable_metadata(tmp.path()).len(), 1);
+            }
+            std::fs::remove_file(&data_path).unwrap();
+            for _ in 0..5 {
+                assert_eq!(store.sstable_metadata(tmp.path()).len(), 1);
+            }
+        });
+        assert_eq!(
+            log_lines_with(&logs, EVICTED),
+            2,
+            "a second eviction is a new edge and reports again:\n{}",
+            logs.text()
+        );
+    }
+
+    /// The other half of the same edge rule: a generation with no local
+    /// components and no remote length is skipped by every pass, and is
+    /// reported once, not on each of them.
+    #[test]
+    fn compaction_planning_reports_an_unplannable_sstable_once_not_each_pass() {
+        const SKIPPED: &str = "compaction planning: skipping SSTable because required components";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        store
+            .write(&make_key("unplannable"), make_row(b"v1", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let gen = store.last_flush_generation();
+        std::fs::remove_file(tmp.path().join(format!("{gen}-Data.db"))).unwrap();
+
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            for _ in 0..5 {
+                assert!(store.sstable_metadata(tmp.path()).is_empty());
+            }
+        });
+        assert_eq!(log_lines_with(&logs, SKIPPED), 1, "{}", logs.text());
     }
 
     #[test]

@@ -465,7 +465,7 @@ pub struct TimeSeriesMaterializationStatusSnapshot {
 struct PendingUploadReplayFinalize {
     store: Arc<dyn object_store::ObjectStore>,
     prefix: String,
-    pending_log_path: PathBuf,
+    data_dir: PathBuf,
     table_id: String,
     sstable_id: String,
     total_size: u64,
@@ -3180,14 +3180,31 @@ impl StorageEngine {
     /// Compaction output is only live while an in-process compaction result is
     /// waiting to be promoted. On startup there are no such in-memory results,
     /// so any files under `compaction/` are disk-only debris. Durable SSTables
-    /// used for reads and pending S3 replay live under `sstables/`; replay drops
-    /// missing-file entries instead of treating staging files as authoritative.
+    /// used for reads and pending S3 replay live under `sstables/`; replay
+    /// resolves missing-file entries against the S3 manifest instead of
+    /// treating staging files as authoritative.
     fn cleanup_stale_compaction_staging(
         config: &StorageEngineConfig,
     ) -> ferrosa_common::Result<()> {
         Self::cleanup_staging_dir(&config.compaction.output_dir, |dir| {
             std::fs::remove_dir_all(dir)
         })
+    }
+
+    /// Convert a legacy single-file pending-upload log into the ledger
+    /// directory before the engine exists, so nothing else in the process can
+    /// be mutating the ledger while it runs. A failure is fatal: starting with
+    /// a ledger half read would let eviction delete SSTables whose uploads are
+    /// unconfirmed.
+    fn migrate_pending_upload_ledger(config: &StorageEngineConfig) -> ferrosa_common::Result<()> {
+        crate::upload::pending_log::migrate_legacy_log(&config.data_dir)
+            .map(|_outcome| ())
+            .map_err(|e| {
+                ferrosa_common::Error::InvalidFormat(format!(
+                    "failed to migrate the legacy pending upload log in {}: {e}",
+                    config.data_dir.display()
+                ))
+            })
     }
 
     /// [`Self::cleanup_stale_compaction_staging`] with the removal injectable,
@@ -3586,6 +3603,7 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
         Self::cleanup_stale_compaction_staging(&config)?;
+        Self::migrate_pending_upload_ledger(&config)?;
 
         let unreplayed_wal_on_creation =
             recovery_status::wal_artifacts(&config.commit_log.log_dir)?;
@@ -3788,6 +3806,7 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
         Self::cleanup_stale_compaction_staging(&config)?;
+        Self::migrate_pending_upload_ledger(&config)?;
 
         let unreplayed_wal_on_creation =
             recovery_status::wal_artifacts(&config.commit_log.log_dir)?;
@@ -4033,6 +4052,7 @@ impl StorageEngine {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
         Self::cleanup_stale_compaction_staging(&config)?;
+        Self::migrate_pending_upload_ledger(&config)?;
 
         // Engine-wide reader pool, created here so tables registered during
         // startup replay share it with those registered later — and so the
@@ -4431,15 +4451,18 @@ impl StorageEngine {
 
     /// Replays pending S3 uploads that were interrupted by a crash.
     ///
-    /// Reads the pending-uploads.log and re-submits upload tasks for each
-    /// entry. The upload is idempotent (S3 PUT overwrites). Call this after
-    /// the engine is opened and tables are registered.
+    /// Reads the pending-upload ledger and re-submits upload tasks for each
+    /// entry. The upload is idempotent (S3 PUT overwrites). An entry whose
+    /// files are no longer on local disk cannot be replayed and is resolved
+    /// instead, against the S3 manifest: retired when the manifest lists its
+    /// generation, quarantined when it does not. Call this
+    /// after the engine is opened and tables are registered.
     pub async fn replay_pending_uploads(&self) {
-        let pending_log_path = self.config.data_dir.join("pending-uploads.log");
-        let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
+        let data_dir = self.config.data_dir.clone();
+        let pending_log = match crate::upload::PendingUploadsLog::open(&data_dir) {
             Ok(log) => log,
             Err(e) => {
-                tracing::error!(%e, path = %pending_log_path.display(), "could not open pending upload ledger during compaction recovery");
+                tracing::error!(%e, data_dir = %data_dir.display(), "could not open pending upload ledger during compaction recovery");
                 return;
             }
         };
@@ -4453,14 +4476,14 @@ impl StorageEngine {
             }
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!("failed to read pending-uploads.log: {e}");
+                tracing::warn!("failed to read the pending upload ledger: {e}");
                 return;
             }
         };
 
         if self.upload_manager.is_none() && self.compaction_upload_manager.is_none() {
             tracing::warn!(
-                "pending-uploads.log has {} entries but no upload manager configured — \
+                "pending upload ledger has {} entries but no upload manager configured — \
                  these SSTables may not be in S3",
                 records.len()
             );
@@ -4474,7 +4497,7 @@ impl StorageEngine {
 
         let Some((store, prefix)) = self.resolve_store_and_prefix() else {
             tracing::warn!(
-                "pending-uploads.log has {} entries but no object store configured — \
+                "pending upload ledger has {} entries but no object store configured — \
                  these SSTables may not be in S3",
                 records.len()
             );
@@ -4482,6 +4505,8 @@ impl StorageEngine {
         };
         let cas_supported = self.cas_supported();
         let mut finalize_handles = Vec::new();
+        // Loaded on the first record whose files are gone, at most once.
+        let mut manifest: Option<Result<crate::manifest::Manifest, String>> = None;
 
         for (idx, record) in records.iter().enumerate() {
             let upload_mgr = if record.compaction.is_some() {
@@ -4502,11 +4527,16 @@ impl StorageEngine {
                 &record.table_id,
                 &record.sstable_id,
             ) else {
-                tracing::warn!(
-                    table = record.table_id,
-                    sstable = record.sstable_id,
-                    "pending upload: SSTable files not found on disk — cannot replay"
-                );
+                let manifest = match &mut manifest {
+                    Some(loaded) => loaded,
+                    None => manifest.insert(
+                        crate::manifest::Manifest::load(store.as_ref(), &prefix)
+                            .await
+                            .map(|(manifest, _version)| manifest)
+                            .map_err(|e| e.to_string()),
+                    ),
+                };
+                Self::resolve_pending_upload_without_files(&pending_log, record, manifest);
                 continue;
             };
             let total_size = files.iter().map(|file| file.size_bytes).sum();
@@ -4524,7 +4554,7 @@ impl StorageEngine {
                             PendingUploadReplayFinalize {
                                 store: Arc::clone(&store),
                                 prefix: prefix.clone(),
-                                pending_log_path: pending_log_path.clone(),
+                                data_dir: data_dir.clone(),
                                 table_id: record.table_id.clone(),
                                 sstable_id: record.sstable_id.clone(),
                                 total_size,
@@ -4666,6 +4696,76 @@ impl StorageEngine {
         }
     }
 
+    /// Decide what a pending-upload record whose SSTable files are not on
+    /// local disk means, since it can never be replayed.
+    ///
+    /// - The S3 manifest lists the generation: the upload and manifest update
+    ///   completed and only the ledger removal was lost. The entry is retired.
+    /// - The manifest does not list it: nothing is left to upload anywhere.
+    ///   Either compaction retired the generation without its entry (its rows
+    ///   live in the output) or a flush was lost. The record is quarantined
+    ///   at ERROR and counted, so it stops warning on every startup — the dev
+    ///   cluster carried such records from May to October (t_c14245f9) — and
+    ///   an operator still has it.
+    /// - The manifest cannot be read: nothing can be decided, so the entry
+    ///   stays for the next startup, with a warning.
+    fn resolve_pending_upload_without_files(
+        pending_log: &crate::upload::PendingUploadsLog,
+        record: &crate::upload::pending_log::PendingUploadRecord,
+        manifest: &Result<crate::manifest::Manifest, String>,
+    ) {
+        let manifest = match manifest {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                tracing::warn!(
+                    table = record.table_id,
+                    sstable = record.sstable_id,
+                    error = %e,
+                    "pending upload: SSTable files not found on disk and the manifest could not be \
+                     loaded; leaving the entry for the next startup"
+                );
+                return;
+            }
+        };
+        let listed = manifest
+            .sstables
+            .get(&record.table_id)
+            .is_some_and(|entries| entries.iter().any(|entry| entry.id == record.sstable_id));
+        let resolved = if listed {
+            tracing::info!(
+                table = record.table_id,
+                sstable = record.sstable_id,
+                "pending upload: SSTable files not on disk but the manifest lists the generation; \
+                 its upload completed, retiring the entry"
+            );
+            pending_log.remove_entry(&record.table_id, &record.sstable_id)
+        } else {
+            crate::metrics::inc_pending_upload_unreplayable();
+            tracing::error!(
+                table = record.table_id,
+                sstable = record.sstable_id,
+                has_compaction_context = record.compaction.is_some(),
+                quarantine = %pending_log.quarantine_dir().display(),
+                "pending upload: SSTable files are neither on local disk nor in the S3 manifest, so \
+                 nothing is left to upload; quarantining the entry. If compaction retired this \
+                 generation its rows live in the output; otherwise a flush was lost and the \
+                 table needs repair from a replica"
+            );
+            pending_log.quarantine(
+                record,
+                "SSTable files neither on local disk nor in the S3 manifest at replay",
+            )
+        };
+        if let Err(e) = resolved {
+            tracing::error!(
+                %e,
+                table = record.table_id,
+                sstable = record.sstable_id,
+                "pending upload: could not retire an unreplayable entry; it stays in the ledger"
+            );
+        }
+    }
+
     async fn finalize_replayed_pending_upload(
         ctx: PendingUploadReplayFinalize,
         rx: tokio::sync::oneshot::Receiver<Result<(), String>>,
@@ -4761,12 +4861,7 @@ impl StorageEngine {
             .as_ref()
             .and_then(|compaction| compaction.intent_task_id.as_deref())
         {
-            let table_dir = ctx
-                .pending_log_path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join("sstables")
-                .join(&ctx.table_id);
+            let table_dir = ctx.data_dir.join("sstables").join(&ctx.table_id);
             match crate::compaction::intent::CompactionIntentRecord::read_at(
                 &crate::compaction::intent::CompactionIntentRecord::path(&table_dir, task_id),
             ) {
@@ -4795,7 +4890,7 @@ impl StorageEngine {
             }
         }
 
-        match crate::upload::PendingUploadsLog::open(&ctx.pending_log_path)
+        match crate::upload::PendingUploadsLog::open(&ctx.data_dir)
             .and_then(|log| log.remove_entry(&ctx.table_id, &ctx.sstable_id))
         {
             Ok(()) => {}
@@ -13357,8 +13452,7 @@ impl StorageEngine {
             // This is paired with the replacement record: if a crash happens
             // after input retirement, startup can replay the upload and resume
             // from the record's phase.
-            let pending_log_path = self.config.data_dir.join("pending-uploads.log");
-            let pending_log = match crate::upload::PendingUploadsLog::open(&pending_log_path) {
+            let pending_log = match crate::upload::PendingUploadsLog::open(&self.config.data_dir) {
                 Ok(pending_log) => {
                     let compaction = crate::upload::pending_log::PendingCompactionUpload {
                         intent_task_id: Some(intent.task_id.clone()),
@@ -14815,10 +14909,8 @@ impl StorageEngine {
         // read, fail closed: evict nothing rather than risk deleting an SSTable
         // whose durability we cannot confirm.
         let pending: std::collections::HashSet<(String, String)> =
-            match crate::upload::PendingUploadsLog::open(
-                &self.config.data_dir.join("pending-uploads.log"),
-            )
-            .and_then(|log| log.pending_entries())
+            match crate::upload::PendingUploadsLog::open(&self.config.data_dir)
+                .and_then(|log| log.pending_entries())
             {
                 Ok(pending_entries) => pending_entries.into_iter().collect(),
                 Err(e) => {
@@ -16944,6 +17036,7 @@ impl StorageEngine {
         std::fs::create_dir_all(&config.commit_log.log_dir).map_err(|e| {
             ferrosa_common::Error::InvalidFormat(format!("failed to create commitlog dir: {e}"))
         })?;
+        Self::migrate_pending_upload_ledger(&config)?;
 
         let unreplayed_wal_on_creation =
             recovery_status::wal_artifacts(&config.commit_log.log_dir)?;
@@ -17574,9 +17667,7 @@ mod tests {
         let table_dir = config.data_dir.join("sstables").join(table_id);
         std::fs::create_dir_all(&table_dir).unwrap();
 
-        let pending_log =
-            crate::upload::PendingUploadsLog::open(&config.data_dir.join("pending-uploads.log"))
-                .unwrap();
+        let pending_log = crate::upload::PendingUploadsLog::open(&config.data_dir).unwrap();
         for sstable_id in ["1", "2", "3"] {
             std::fs::write(table_dir.join(format!("{sstable_id}-Data.db")), b"sstable").unwrap();
             pending_log.add_entry(table_id, sstable_id).unwrap();
@@ -17617,46 +17708,167 @@ mod tests {
         );
     }
 
-    #[test]
-    fn replay_pending_uploads_keeps_missing_files_retryable() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = StorageEngineConfig::test_config(dir.path());
-        let table_id = "agent_memory.entity_store";
+    /// Live ledger records for `data_dir`, through the same reader replay uses.
+    fn pending_upload_records(
+        data_dir: &std::path::Path,
+    ) -> Vec<crate::upload::pending_log::PendingUploadRecord> {
+        crate::upload::PendingUploadsLog::open(data_dir)
+            .unwrap()
+            .pending_records()
+            .unwrap()
+    }
 
-        let pending_log =
-            crate::upload::PendingUploadsLog::open(&config.data_dir.join("pending-uploads.log"))
-                .unwrap();
-        pending_log.add_entry(table_id, "missing-101").unwrap();
+    /// Files in the ledger's quarantine under `data_dir`.
+    fn quarantined_files(data_dir: &std::path::Path) -> usize {
+        let quarantine = crate::upload::PendingUploadsLog::open(data_dir)
+            .unwrap()
+            .quarantine_dir();
+        match std::fs::read_dir(&quarantine) {
+            Ok(entries) => entries.count(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => panic!("cannot list {}: {e}", quarantine.display()),
+        }
+    }
 
+    /// Open an upload-backed engine over `data_dir` whose upload worker never
+    /// runs, replay its pending uploads, and return it. Records that could be
+    /// replayed stay queued, so what the ledger holds afterwards is exactly
+    /// what replay decided about each record.
+    fn replay_with_idle_uploader(
+        config: StorageEngineConfig,
+        store: Arc<object_store::memory::InMemory>,
+    ) -> (StorageEngine, tokio::runtime::Runtime) {
         let upload_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let store = Arc::new(object_store::memory::InMemory::new());
         let engine = StorageEngine::new_with_upload_store_and_queue_depth(
             config,
             store,
             "test-prefix".to_string(),
             upload_runtime.handle(),
-            1,
+            8,
         )
         .unwrap();
-
         let replay_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         replay_runtime.block_on(engine.replay_pending_uploads());
+        (engine, upload_runtime)
+    }
 
-        let remaining = crate::upload::PendingUploadsLog::open(
-            &engine.config.data_dir.join("pending-uploads.log"),
-        )
-        .unwrap()
-        .pending_entries()
-        .unwrap();
+    /// A record whose files are neither on local disk nor in the S3 manifest
+    /// can never be replayed. It used to stay in the ledger forever and warn
+    /// "cannot replay" on every startup (agent_memory.tool_usage_log on the dev
+    /// cluster, generations from May still listed in October, t_c14245f9).
+    /// It must leave the live ledger, loudly, into quarantine.
+    #[test]
+    fn replay_quarantines_a_record_whose_files_are_neither_local_nor_in_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        crate::upload::PendingUploadsLog::open(&config.data_dir)
+            .unwrap()
+            .add_entry("agent_memory.entity_store", "101")
+            .unwrap();
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (engine, _upload_runtime) = replay_with_idle_uploader(config, store);
+
         assert!(
-            !remaining.is_empty(),
-            "missing SSTable uploads should stay in pending-uploads.log so crash recovery remains retryable"
+            pending_upload_records(&engine.config.data_dir).is_empty(),
+            "an unreplayable record must not stay in the live ledger"
+        );
+        assert_eq!(
+            quarantined_files(&engine.config.data_dir),
+            1,
+            "the unreplayable record is kept in quarantine, not dropped"
+        );
+    }
+
+    /// A record whose files are gone locally but whose generation the S3
+    /// manifest lists completed its upload; only the ledger removal was lost.
+    /// It is retired as durable, not quarantined as lost.
+    #[test]
+    fn replay_retires_a_record_whose_generation_the_manifest_already_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table_id = "agent_memory.entity_store";
+        crate::upload::PendingUploadsLog::open(&config.data_dir)
+            .unwrap()
+            .add_entry(table_id, "202")
+            .unwrap();
+        let store = Arc::new(object_store::memory::InMemory::new());
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut manifest = crate::manifest::Manifest::new();
+                manifest.add_sstable(
+                    table_id,
+                    crate::manifest::ManifestEntry {
+                        id: "202".to_string(),
+                        size: 10,
+                        min_token: -5,
+                        max_token: 5,
+                        min_timestamp: 1,
+                        max_timestamp: 2,
+                    },
+                );
+                manifest
+                    .save_unconditional(store.as_ref(), "test-prefix")
+                    .await
+                    .unwrap();
+            });
+
+        let (engine, _upload_runtime) = replay_with_idle_uploader(config, store);
+
+        assert!(
+            pending_upload_records(&engine.config.data_dir).is_empty(),
+            "a record the manifest already lists is durable and must be retired"
+        );
+        assert_eq!(
+            quarantined_files(&engine.config.data_dir),
+            0,
+            "a durable record is retired, not quarantined as lost"
+        );
+    }
+
+    /// The live dev ledgers held records whose table name was a run of NUL
+    /// bytes followed by the real name: a hole left by two overlapping
+    /// in-place rewrites. The bytes after the hole are a complete record a
+    /// writer appended, so recovery salvages it under its real table name —
+    /// dropping it would let eviction delete an SSTable whose upload is not
+    /// confirmed — and keeps the raw line as evidence.
+    #[test]
+    fn replay_salvages_a_nul_prefixed_ledger_record_under_its_real_table_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table_id = "agent_memory.typed_edges";
+        let table_dir = config.data_dir.join("sstables").join(table_id);
+        std::fs::create_dir_all(&table_dir).unwrap();
+        std::fs::write(table_dir.join("303-Data.db"), b"sstable").unwrap();
+        let mut legacy = vec![0u8; 106];
+        legacy.extend_from_slice(format!("{table_id}\t303\n").as_bytes());
+        std::fs::write(config.data_dir.join("pending-uploads.log"), &legacy).unwrap();
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (engine, _upload_runtime) = replay_with_idle_uploader(config, store);
+
+        let records = pending_upload_records(&engine.config.data_dir);
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| (record.table_id.as_str(), record.sstable_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(table_id, "303")],
+            "the NUL hole must be stripped, the record kept pending"
+        );
+        assert_eq!(
+            quarantined_files(&engine.config.data_dir),
+            1,
+            "the raw NUL-prefixed line is kept as evidence"
         );
     }
 
@@ -18503,9 +18715,7 @@ mod tests {
         std::fs::write(table_dir.join("1-Data.db"), vec![1u8; 80]).unwrap();
         std::fs::write(table_dir.join("2-Data.db"), vec![2u8; 80]).unwrap();
 
-        let pending =
-            crate::upload::PendingUploadsLog::open(&dir.path().join("pending-uploads.log"))
-                .unwrap();
+        let pending = crate::upload::PendingUploadsLog::open(dir.path()).unwrap();
         pending.add_entry(&table_id, "1").unwrap();
 
         let mut manifest = crate::manifest::Manifest::new();
@@ -18971,7 +19181,7 @@ mod tests {
         let stale_data = compaction_table_dir.join("404-Data.db");
         std::fs::write(&legacy_pending_data, b"legacy pending upload output").unwrap();
         std::fs::write(&stale_data, b"stale compaction output").unwrap();
-        crate::upload::PendingUploadsLog::open(&config.data_dir.join("pending-uploads.log"))
+        crate::upload::PendingUploadsLog::open(&config.data_dir)
             .unwrap()
             .add_entry(&table, "303")
             .unwrap();
@@ -23548,6 +23758,10 @@ mod tests {
             drop(engine);
         }
 
+        // Engine-opening tests running in parallel hit the same callsites with
+        // no subscriber; without an always-interested global default, a
+        // callsite can be interned as disabled and this capture stays empty.
+        crate::test_span_collector::ensure_installed();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -30891,7 +31105,7 @@ mod tests {
                 "replay from {point} must publish only the compacted output"
             );
             assert!(
-                crate::upload::PendingUploadsLog::open(&dir.path().join("pending-uploads.log"))
+                crate::upload::PendingUploadsLog::open(dir.path())
                     .unwrap()
                     .pending_records()
                     .unwrap()
@@ -31096,8 +31310,7 @@ mod tests {
             output_size,
         );
 
-        let pending_log_path = engine.config.data_dir.join("pending-uploads.log");
-        let pending_log = crate::upload::PendingUploadsLog::open(&pending_log_path).unwrap();
+        let pending_log = crate::upload::PendingUploadsLog::open(&engine.config.data_dir).unwrap();
         pending_log
             .add_compaction_entry(
                 &tid_str,
@@ -38519,14 +38732,15 @@ mod tests {
             "test setup must contain the two compaction inputs"
         );
 
-        // `PendingUploadsLog::open` accepts an existing path, but appending to
-        // this directory fails. That precisely exercises the durability-marker
-        // error branch without altering the object-store upload path.
-        let pending_log_path = dir.path().join("pending-uploads.log");
-        if pending_log_path.exists() {
-            std::fs::remove_file(&pending_log_path).unwrap();
+        // A regular file where the ledger directory belongs makes recording
+        // the pending upload fail. That precisely exercises the
+        // durability-marker error branch without altering the object-store
+        // upload path.
+        let ledger_dir = dir.path().join(crate::upload::pending_log::LEDGER_DIR);
+        if ledger_dir.exists() {
+            std::fs::remove_dir_all(&ledger_dir).unwrap();
         }
-        std::fs::create_dir(&pending_log_path).unwrap();
+        std::fs::write(&ledger_dir, b"not a directory").unwrap();
 
         // Completion witness: `poll_compactions` promotes the compacted output
         // into the table SSTable directory under a NEW generation before the
@@ -40540,7 +40754,7 @@ mod tests {
     // Fix (engine.rs poll_compactions): replace blocking submit+await with
     // try_submit + bounded timeout on the confirmation, so the loop body
     // for each result completes in bounded time. Durability is preserved
-    // by the pending-uploads.log (Step 1) and the periodic
+    // by the pending-upload ledger (Step 1) and the periodic
     // sync_sstables_to_s3 retry.
     //
     // The tests below pin the contract that the read-correctness path (swap

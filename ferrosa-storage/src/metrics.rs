@@ -494,6 +494,13 @@ static COMPACTION_PURGE_HELD_BACK_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compactions that ran without purging because the table's `gc_grace_seconds`
 /// could not be read. Non-zero means a table option is corrupt; alert on it.
 static COMPACTION_PURGE_POLICY_ERRORS_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Pending-upload ledger entries (or legacy log lines) that were damaged:
+/// unparseable, misfiled, or prefixed by a NUL hole (t_c14245f9).
+static PENDING_UPLOAD_LEDGER_CORRUPT_ENTRIES_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Pending uploads quarantined at replay because their files were neither on
+/// local disk nor in the S3 manifest. Non-zero means a flush or compaction
+/// output was lost or retired without its ledger entry; alert on it.
+static PENDING_UPLOAD_UNREPLAYABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compactions rolled back after their replacement record committed but before
 /// retirement (reader-open, sidecar-merge, or swap failure) -- T-022.
 static COMPACTION_INTENT_ROLLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -770,6 +777,26 @@ pub fn inc_compaction_purge_policy_errors() {
 /// Compactions that skipped purging on an unreadable `gc_grace_seconds`.
 pub fn compaction_purge_policy_errors_total() -> u64 {
     COMPACTION_PURGE_POLICY_ERRORS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a damaged pending-upload ledger entry or legacy line.
+pub fn inc_pending_upload_ledger_corrupt_entries() {
+    PENDING_UPLOAD_LEDGER_CORRUPT_ENTRIES_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Damaged pending-upload ledger entries seen since startup.
+pub fn pending_upload_ledger_corrupt_entries_total() -> u64 {
+    PENDING_UPLOAD_LEDGER_CORRUPT_ENTRIES_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record a pending upload quarantined because nothing is left to upload.
+pub fn inc_pending_upload_unreplayable() {
+    PENDING_UPLOAD_UNREPLAYABLE_TOTAL.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Pending uploads quarantined as unreplayable since startup.
+pub fn pending_upload_unreplayable_total() -> u64 {
+    PENDING_UPLOAD_UNREPLAYABLE_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total deletion markers dropped by compaction since startup.
@@ -1770,6 +1797,18 @@ queues (sum over registered observers); depth / capacity is the saturation ratio
     out.push_str(&format!(
         "ferrosa_storage_compaction_purge_policy_errors_total {}\n",
         COMPACTION_PURGE_POLICY_ERRORS_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_pending_upload_ledger_corrupt_entries_total Pending-upload ledger entries found damaged (unparseable, misfiled, or NUL-prefixed) and quarantined or salvaged.\n");
+    out.push_str("# TYPE ferrosa_storage_pending_upload_ledger_corrupt_entries_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_pending_upload_ledger_corrupt_entries_total {}\n",
+        PENDING_UPLOAD_LEDGER_CORRUPT_ENTRIES_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_pending_upload_unreplayable_total Pending uploads quarantined at replay because their files were neither on local disk nor in the S3 manifest; non-zero means lost or untracked SSTables.\n");
+    out.push_str("# TYPE ferrosa_storage_pending_upload_unreplayable_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_pending_upload_unreplayable_total {}\n",
+        PENDING_UPLOAD_UNREPLAYABLE_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_input_bytes_total Input bytes read by completed compactions.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_input_bytes_total counter\n");
