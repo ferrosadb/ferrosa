@@ -8,12 +8,33 @@
 //!
 //! # Layout
 //!
-//! One file per pending upload under `{data_dir}/pending-uploads/`, named
-//! `{table_id}~{sstable_id}.pending` with both parts percent-encoded, holding
-//! the record as JSON. Adding an entry writes a uniquely named temp file,
-//! fsyncs it, renames it into place and fsyncs the directory; removing one
-//! unlinks it and fsyncs the directory. No mutation reads or rewrites another
-//! entry, so concurrent writers need no lock and cannot corrupt each other.
+//! ```text
+//! {data_dir}/pending-uploads/
+//!     {enc(table_id)}/{enc(sstable_id)}.pending     one JSON record per upload
+//!     quarantine/{YYYY-MM-DD}/…                     records that can never replay
+//!     quarantine/archive/{YYYY-MM-DD}.jsonl         days past the retention bound
+//! ```
+//!
+//! Both id parts are percent-encoded so each is one path component. Adding an
+//! entry makes sure its table directory exists — creating it fsyncs the table
+//! directory, and every add then fsyncs the ledger directory, because a writer
+//! that finds the table directory already there cannot tell whether its
+//! creator's fsync has finished — then writes a uniquely named temp file,
+//! fsyncs it, renames it into place and fsyncs the table directory. Removing
+//! one unlinks it and fsyncs the table directory. No mutation reads or
+//! rewrites another entry, so concurrent writers need no lock and cannot
+//! corrupt each other.
+//!
+//! **An emptied table directory stays.** Removing it would race a concurrent
+//! add: the add can find the directory, then lose it to the `rmdir` before its
+//! temp file is created. The number of table directories is bounded by the
+//! number of tables, and [`migrate_ledger`] removes empty ones at engine open,
+//! when nothing else can be writing.
+//!
+//! **The eviction guard costs one `stat` per candidate**
+//! ([`PendingUploadsLog::contains`]): it never lists, opens or parses the
+//! ledger, so a ledger grown by an S3 outage does not slow the cycle that has
+//! to free disk. Only startup replay walks the tree.
 //!
 //! # Why not one log file
 //!
@@ -30,14 +51,16 @@
 //! - the rewrite kept only two fields, so every OTHER entry lost its
 //!   compaction context and would replay with full-ring manifest bounds.
 //!
-//! # The legacy log
+//! # Migration
 //!
-//! [`migrate_legacy_log`] converts a `{data_dir}/pending-uploads.log` once,
-//! at engine open, before anything else can touch the ledger. A NUL-prefixed
-//! line is salvaged under the name after the hole (the bytes after the hole
-//! are a complete line another writer appended) and its raw bytes kept in
-//! quarantine; any other line that does not parse is quarantined, never
-//! replayed. The migrated log is kept, renamed, as evidence.
+//! [`migrate_ledger`] runs once at engine open, before anything else can touch
+//! the ledger. It converts a legacy `{data_dir}/pending-uploads.log` straight
+//! into the tree: a NUL-prefixed line is salvaged under the name after the
+//! hole (the bytes after the hole are a complete line another writer
+//! appended) and its raw bytes kept in quarantine; any other line that does
+//! not parse is quarantined, never replayed; the old log is kept, renamed, as
+//! evidence. It also converts the flat `{table}~{sstable}.pending` layout an
+//! unmerged revision of this change wrote, and is idempotent.
 //!
 //! A binary older than this change reads only the legacy log, so after a
 //! downgrade it sees no pending uploads: replay does not re-upload, and
@@ -54,15 +77,27 @@ use serde::{Deserialize, Serialize};
 
 use crate::manifest::ManifestEntry;
 
-/// Directory, under the data directory, that holds one file per pending upload.
+/// Directory, under the data directory, that holds the ledger tree.
 pub const LEDGER_DIR: &str = "pending-uploads";
-/// The single-file ledger written up to 0.29; see [`migrate_legacy_log`].
+/// The single-file ledger written up to 0.29; see [`migrate_ledger`].
 pub const LEGACY_LOG_FILE: &str = "pending-uploads.log";
 /// Directory, under [`LEDGER_DIR`], for records that can never be replayed.
 pub const QUARANTINE_DIR: &str = "quarantine";
+/// Directory, under [`QUARANTINE_DIR`], for days past the retention bound.
+pub const QUARANTINE_ARCHIVE_DIR: &str = "archive";
+/// Quarantined entries kept unarchived; see [`QuarantineRetention`].
+pub const QUARANTINE_MAX_ENTRIES_ENV: &str = "FERROSA_PENDING_UPLOAD_QUARANTINE_MAX_ENTRIES";
+/// Age in days past which a quarantine day is archived.
+pub const QUARANTINE_MAX_AGE_DAYS_ENV: &str = "FERROSA_PENDING_UPLOAD_QUARANTINE_MAX_AGE_DAYS";
+const DEFAULT_QUARANTINE_MAX_ENTRIES: usize = 1_000;
+const DEFAULT_QUARANTINE_MAX_AGE_DAYS: u64 = 30;
 const ENTRY_SUFFIX: &str = ".pending";
 /// An entry is a few hundred bytes of JSON; anything larger is not one.
 const MAX_ENTRY_BYTES: u64 = 1 << 20;
+/// A legacy log is one short line per pending upload; the largest live one
+/// was 5 KB. Anything near this is not a ledger.
+const MAX_LEGACY_LOG_BYTES: u64 = 64 << 20;
+const SECS_PER_DAY: u64 = 86_400;
 
 /// Distinguishes the temp files of concurrent writers of the same entry.
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -92,6 +127,69 @@ struct QuarantinedRecord {
     quarantined_at_unix_secs: u64,
 }
 
+/// How much quarantine is kept as individual files before whole days are
+/// archived. Defaults: 1,000 entries and 30 days; override with
+/// `FERROSA_PENDING_UPLOAD_QUARANTINE_MAX_ENTRIES` and
+/// `FERROSA_PENDING_UPLOAD_QUARANTINE_MAX_AGE_DAYS`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantineRetention {
+    /// Entries kept across all unarchived days; the oldest days go first.
+    pub max_entries: usize,
+    /// Days older than this are archived regardless of count.
+    pub max_age_days: u64,
+}
+
+impl Default for QuarantineRetention {
+    fn default() -> Self {
+        Self {
+            max_entries: DEFAULT_QUARANTINE_MAX_ENTRIES,
+            max_age_days: DEFAULT_QUARANTINE_MAX_AGE_DAYS,
+        }
+    }
+}
+
+impl QuarantineRetention {
+    /// The bounds from the environment. A value that is not a positive
+    /// integer is reported at WARN and the default applies.
+    pub fn from_env() -> Self {
+        let defaults = Self::default();
+        Self {
+            max_entries: env_bound(QUARANTINE_MAX_ENTRIES_ENV, defaults.max_entries),
+            max_age_days: env_bound(QUARANTINE_MAX_AGE_DAYS_ENV, defaults.max_age_days),
+        }
+    }
+}
+
+fn env_bound<T: std::str::FromStr + PartialOrd + Default + Copy + std::fmt::Display>(
+    name: &str,
+    default: T,
+) -> T {
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<T>() {
+            Ok(value) if value > T::default() => value,
+            _ => {
+                tracing::warn!(
+                    variable = name,
+                    value = raw,
+                    %default,
+                    "pending upload quarantine: bound is not a positive integer; using the default"
+                );
+                default
+            }
+        },
+    }
+}
+
+/// What [`PendingUploadsLog::prune_quarantine`] archived.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct QuarantinePrune {
+    /// The days archived, oldest first.
+    pub archived_days: Vec<String>,
+    /// Entries those days held.
+    pub archived_entries: usize,
+}
+
 /// The SSTable uploads that have been written locally but not yet confirmed
 /// by S3. See the module documentation for the layout.
 pub struct PendingUploadsLog {
@@ -109,6 +207,17 @@ impl PendingUploadsLog {
     /// Where records that can never be replayed are kept.
     pub fn quarantine_dir(&self) -> PathBuf {
         self.dir.join(QUARANTINE_DIR)
+    }
+
+    /// Whether an entry for `(table_id, sstable_id)` is pending: one `stat`,
+    /// no read. An error other than "not found" is returned, so a caller
+    /// deciding whether an SSTable may be deleted can fail closed.
+    pub fn contains(&self, table_id: &str, sstable_id: &str) -> std::io::Result<bool> {
+        match std::fs::symlink_metadata(self.entry_path(table_id, sstable_id)) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Record a pending upload with no compaction context, durably.
@@ -151,11 +260,13 @@ impl PendingUploadsLog {
     }
 
     /// Remove the entry for `(table_id, sstable_id)`, durably. Removing an
-    /// entry that is not there succeeds: removal is idempotent.
+    /// entry that is not there succeeds: removal is idempotent. The table
+    /// directory stays, even when this empties it (see the module docs).
     pub fn remove_entry(&self, table_id: &str, sstable_id: &str) -> std::io::Result<()> {
         let start = Instant::now();
-        match std::fs::remove_file(self.entry_path(table_id, sstable_id)) {
-            Ok(()) => sync_dir(&self.dir)?,
+        let path = self.entry_path(table_id, sstable_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_dir(path.parent().expect("an entry path has a table directory"))?,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
         }
@@ -166,7 +277,8 @@ impl PendingUploadsLog {
         Ok(())
     }
 
-    /// Move `record` out of the live ledger into quarantine, with `reason`.
+    /// Move `record` out of the live ledger into today's quarantine, with
+    /// `reason`.
     ///
     /// For a record that can never be replayed: it stops being retried on
     /// every startup and stops protecting anything from eviction, and the
@@ -179,11 +291,13 @@ impl PendingUploadsLog {
         };
         let bytes = serde_json::to_vec_pretty(&quarantined).map_err(std::io::Error::other)?;
         let name = format!(
-            "{}.{}",
-            entry_file_name(&record.table_id, &record.sstable_id),
+            "{}~{}.{}.json",
+            encode_component(&record.table_id),
+            encode_component(&record.sstable_id),
             quarantined.quarantined_at_unix_secs
         );
-        write_durably(&self.quarantine_dir(), &name, &bytes)?;
+        let day_dir = self.quarantine_day_dir(quarantined.quarantined_at_unix_secs)?;
+        write_durably(&day_dir, &name, &bytes)?;
         self.remove_entry(&record.table_id, &record.sstable_id)
     }
 
@@ -198,31 +312,29 @@ impl PendingUploadsLog {
 
     /// Return every pending upload record, ordered by table then SSTable.
     ///
-    /// Entries are published by rename, so a crash cannot leave a torn one.
-    /// An entry that still does not parse, or whose content names a different
-    /// SSTable than its file name, is corrupt: it is logged at ERROR, moved to
-    /// quarantine and left out — never replayed as garbage.
+    /// This walks the whole tree; it is for startup replay, never for a
+    /// per-cycle check (use [`Self::contains`]). Entries are published by
+    /// rename, so a crash cannot leave a torn one. An entry that still does
+    /// not parse, or that is filed under a different table or SSTable than it
+    /// names, is corrupt: it is logged at ERROR, moved to quarantine and left
+    /// out — never replayed as garbage.
     pub fn pending_records(&self) -> std::io::Result<Vec<PendingUploadRecord>> {
         let mut records = Vec::new();
         for entry in std::fs::read_dir(&self.dir)? {
             let entry = entry?;
             let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                self.quarantine_corrupt_file(&entry.path(), "file name is not UTF-8");
-                continue;
-            };
-            if name.starts_with('.') || !name.ends_with(ENTRY_SUFFIX) {
+            if name == QUARANTINE_DIR || name.to_string_lossy().starts_with('.') {
                 continue;
             }
-            match read_entry(&entry.path(), name) {
-                Ok(Some(record)) => records.push(record),
-                // Removed by a concurrent writer between the listing and the read.
-                Ok(None) => {}
-                Err(EntryError::Io(e)) => return Err(e),
-                Err(EntryError::Corrupt(reason)) => {
-                    self.quarantine_corrupt_file(&entry.path(), &reason)
-                }
+            if !entry.file_type()?.is_dir() {
+                tracing::warn!(
+                    path = %entry.path().display(),
+                    "pending upload ledger: file outside any table directory is not an entry; \
+                     migration at engine open converts the flat layout"
+                );
+                continue;
             }
+            self.collect_table_records(&entry.path(), &name.to_string_lossy(), &mut records)?;
         }
         records.sort_by(|a, b| {
             (a.table_id.as_str(), a.sstable_id.as_str())
@@ -231,37 +343,231 @@ impl PendingUploadsLog {
         Ok(records)
     }
 
+    fn collect_table_records(
+        &self,
+        table_dir: &Path,
+        table_dir_name: &str,
+        records: &mut Vec<PendingUploadRecord>,
+    ) -> std::io::Result<()> {
+        let entries = match std::fs::read_dir(table_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !name.ends_with(ENTRY_SUFFIX) {
+                continue;
+            }
+            match read_entry(&entry.path()) {
+                Ok(Some(record)) => {
+                    let filed_as = (table_dir_name, name.as_str());
+                    let names = (
+                        encode_component(&record.table_id),
+                        entry_file_name(&record.sstable_id),
+                    );
+                    if filed_as == (names.0.as_str(), names.1.as_str()) {
+                        records.push(record);
+                    } else {
+                        self.quarantine_corrupt_file(
+                            &entry.path(),
+                            &format!(
+                                "entry names {}/{} but is filed as {table_dir_name}/{name}",
+                                record.table_id, record.sstable_id
+                            ),
+                        );
+                    }
+                }
+                // Removed by a concurrent writer between the listing and the read.
+                Ok(None) => {}
+                Err(EntryError::Io(e)) => return Err(e),
+                Err(EntryError::Corrupt(reason)) => {
+                    self.quarantine_corrupt_file(&entry.path(), &reason)
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Archive whole quarantine days past `retention`, oldest first: every
+    /// day older than `max_age_days`, then the oldest days while more than
+    /// `max_entries` entries remain. Each archived day's entries are appended
+    /// to `quarantine/archive/{day}.jsonl` before its files are removed, so
+    /// nothing is dropped. Reaching the bound is logged at ERROR and counted
+    /// in `pending_upload_quarantine_archived_total`; each archived day is
+    /// logged with the entries it held. `now_unix_secs` is a parameter so a
+    /// test can choose the day.
+    pub fn prune_quarantine(
+        &self,
+        retention: &QuarantineRetention,
+        now_unix_secs: u64,
+    ) -> std::io::Result<QuarantinePrune> {
+        let days = self.quarantine_days()?;
+        let cutoff = utc_date(
+            now_unix_secs.saturating_sub(retention.max_age_days.saturating_mul(SECS_PER_DAY)),
+        );
+        let mut remaining: usize = days.iter().map(|(_, count)| count).sum();
+        let mut outcome = QuarantinePrune::default();
+        for (day, count) in days {
+            let too_old = day < cutoff;
+            if !too_old && remaining <= retention.max_entries {
+                break;
+            }
+            self.archive_quarantine_day(&day)?;
+            remaining -= count;
+            outcome.archived_entries += count;
+            outcome.archived_days.push(day);
+        }
+        if !outcome.archived_days.is_empty() {
+            crate::metrics::add_pending_upload_quarantine_archived(outcome.archived_entries as u64);
+            tracing::error!(
+                archived_days = ?outcome.archived_days,
+                archived_entries = outcome.archived_entries,
+                remaining_entries = remaining,
+                max_entries = retention.max_entries,
+                max_age_days = retention.max_age_days,
+                archive = %self.quarantine_dir().join(QUARANTINE_ARCHIVE_DIR).display(),
+                "pending upload quarantine reached its retention bound; archived whole days, \
+                 nothing dropped. Quarantined uploads mean lost or untracked SSTables: inspect them"
+            );
+        }
+        Ok(outcome)
+    }
+
+    /// Unarchived quarantine days with their entry counts, oldest first.
+    fn quarantine_days(&self) -> std::io::Result<Vec<(String, usize)>> {
+        let mut days = Vec::new();
+        let listing = match std::fs::read_dir(self.quarantine_dir()) {
+            Ok(listing) => listing,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(days),
+            Err(e) => return Err(e),
+        };
+        for entry in listing {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !entry.file_type()?.is_dir() || !is_utc_date(&name) {
+                continue;
+            }
+            let count = std::fs::read_dir(entry.path())?.count();
+            days.push((name, count));
+        }
+        days.sort();
+        Ok(days)
+    }
+
+    /// Append every entry of quarantine day `day` to its archive file, fsync
+    /// it, then remove the day's files and directory.
+    fn archive_quarantine_day(&self, day: &str) -> std::io::Result<()> {
+        let day_dir = self.quarantine_dir().join(day);
+        let mut files: Vec<PathBuf> = std::fs::read_dir(&day_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<_>>()?;
+        files.sort();
+        let archive_dir = ensure_subdir(&self.quarantine_dir(), QUARANTINE_ARCHIVE_DIR)?;
+        let archive_path = archive_dir.join(format!("{day}.jsonl"));
+        let mut archive = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&archive_path)?;
+        let mut names = Vec::with_capacity(files.len());
+        for path in &files {
+            let mut content = Vec::new();
+            File::open(path)?
+                .take(MAX_ENTRY_BYTES)
+                .read_to_end(&mut content)?;
+            let name = path
+                .file_name()
+                .map_or_else(String::new, |name| name.to_string_lossy().into_owned());
+            let line = serde_json::json!({
+                "file": name,
+                "content": String::from_utf8_lossy(&content),
+            });
+            archive.write_all(line.to_string().as_bytes())?;
+            archive.write_all(b"\n")?;
+            names.push(name);
+        }
+        archive.sync_all()?;
+        sync_dir(&archive_dir)?;
+        for path in &files {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::remove_dir(&day_dir)?;
+        sync_dir(&self.quarantine_dir())?;
+        tracing::info!(
+            day,
+            archive = %archive_path.display(),
+            entries = ?names,
+            "pending upload quarantine: archived a day and removed its files"
+        );
+        Ok(())
+    }
+
     fn entry_path(&self, table_id: &str, sstable_id: &str) -> PathBuf {
-        self.dir.join(entry_file_name(table_id, sstable_id))
+        self.dir
+            .join(encode_component(table_id))
+            .join(entry_file_name(sstable_id))
+    }
+
+    /// `quarantine/{YYYY-MM-DD}` for `unix_secs`, created durably.
+    fn quarantine_day_dir(&self, unix_secs: u64) -> std::io::Result<PathBuf> {
+        let quarantine = ensure_subdir(&self.dir, QUARANTINE_DIR)?;
+        ensure_subdir(&quarantine, &utc_date(unix_secs))
+    }
+
+    /// Write an entry where [`Self::write_entry`] would, without any fsync,
+    /// so a test can lay down thousands of entries quickly.
+    #[cfg(test)]
+    pub(crate) fn write_entry_unsynced_for_test(&self, table_id: &str, sstable_id: &str) {
+        let path = self.entry_path(table_id, sstable_id);
+        std::fs::create_dir_all(path.parent().expect("entry has a parent")).unwrap();
+        let record = PendingUploadRecord {
+            table_id: table_id.to_string(),
+            sstable_id: sstable_id.to_string(),
+            compaction: None,
+        };
+        std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
     }
 
     fn write_entry(&self, record: &PendingUploadRecord) -> std::io::Result<()> {
+        let table_dir_name = encode_component(&record.table_id);
+        if table_dir_name == QUARANTINE_DIR {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "table id {:?} collides with the ledger's quarantine directory",
+                    record.table_id
+                ),
+            ));
+        }
         let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-        write_durably(
-            &self.dir,
-            &entry_file_name(&record.table_id, &record.sstable_id),
-            &bytes,
-        )
+        let table_dir = ensure_subdir(&self.dir, &table_dir_name)?;
+        write_durably(&table_dir, &entry_file_name(&record.sstable_id), &bytes)
     }
 
-    /// Move a corrupt entry file into quarantine, loudly. Failing to move it
-    /// is logged too: the entry is still left out of the records, and the next
-    /// read reports it again.
+    /// Move a corrupt entry file into today's quarantine, loudly. Failing to
+    /// move it is logged too: the entry is still left out of the records, and
+    /// the next read reports it again.
     fn quarantine_corrupt_file(&self, path: &Path, reason: &str) {
         crate::metrics::inc_pending_upload_ledger_corrupt_entries();
-        let target = self.quarantine_dir().join(format!(
-            "{}.corrupt.{}",
-            path.file_name().map_or_else(
-                || "unnamed".into(),
-                |name| name.to_string_lossy().into_owned()
-            ),
+        let component = |p: Option<&std::ffi::OsStr>| {
+            p.map_or_else(|| "unnamed".into(), |n| n.to_string_lossy().into_owned())
+        };
+        let source_dir = path.parent().unwrap_or(&self.dir).to_path_buf();
+        let name = format!(
+            "{}~{}.corrupt.{}",
+            component(source_dir.file_name()),
+            component(path.file_name()),
             unix_secs()
-        ));
-        let moved = std::fs::create_dir_all(self.quarantine_dir())
-            .and_then(|()| std::fs::rename(path, &target))
-            .and_then(|()| sync_dir(&self.dir));
+        );
+        let moved = self.quarantine_day_dir(unix_secs()).and_then(|day_dir| {
+            let target = day_dir.join(&name);
+            std::fs::rename(path, &target)?;
+            sync_dir(&source_dir)?;
+            Ok(target)
+        });
         match moved {
-            Ok(()) => tracing::error!(
+            Ok(target) => tracing::error!(
                 path = %path.display(),
                 quarantined_to = %target.display(),
                 reason,
@@ -284,8 +590,24 @@ enum EntryError {
     Corrupt(String),
 }
 
-/// Read and validate one entry file. `Ok(None)` when it no longer exists.
-fn read_entry(path: &Path, name: &str) -> Result<Option<PendingUploadRecord>, EntryError> {
+#[cfg(test)]
+thread_local! {
+    /// Entry files this thread has opened, so a test can prove a code path
+    /// reads none (the eviction guard must cost O(1) per candidate).
+    static ENTRY_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Entry files the calling thread has opened through [`read_entry`].
+#[cfg(test)]
+pub(crate) fn entry_reads_on_this_thread() -> u64 {
+    ENTRY_READS.with(std::cell::Cell::get)
+}
+
+/// Read and parse one entry file. `Ok(None)` when it no longer exists. The
+/// caller checks that it is filed where it says it belongs.
+fn read_entry(path: &Path) -> Result<Option<PendingUploadRecord>, EntryError> {
+    #[cfg(test)]
+    ENTRY_READS.with(|reads| reads.set(reads.get() + 1));
     let file = match File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -300,21 +622,18 @@ fn read_entry(path: &Path, name: &str) -> Result<Option<PendingUploadRecord>, En
             "entry is larger than {MAX_ENTRY_BYTES} bytes"
         )));
     }
-    let record: PendingUploadRecord = serde_json::from_slice(&bytes)
-        .map_err(|e| EntryError::Corrupt(format!("entry does not parse: {e}")))?;
-    let expected = entry_file_name(&record.table_id, &record.sstable_id);
-    if expected != name {
-        return Err(EntryError::Corrupt(format!(
-            "entry names {}/{} but is filed as {name}",
-            record.table_id, record.sstable_id
-        )));
-    }
-    Ok(Some(record))
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|e| EntryError::Corrupt(format!("entry does not parse: {e}")))
 }
 
-/// `{table}~{sstable}.pending`, each part percent-encoded so it is one path
-/// component and `~` separates them unambiguously.
-fn entry_file_name(table_id: &str, sstable_id: &str) -> String {
+/// `{sstable}.pending`, percent-encoded.
+fn entry_file_name(sstable_id: &str) -> String {
+    format!("{}{ENTRY_SUFFIX}", encode_component(sstable_id))
+}
+
+/// The name the flat layout gave an entry: `{table}~{sstable}.pending`.
+fn flat_entry_file_name(table_id: &str, sstable_id: &str) -> String {
     format!(
         "{}~{}{ENTRY_SUFFIX}",
         encode_component(table_id),
@@ -322,10 +641,14 @@ fn entry_file_name(table_id: &str, sstable_id: &str) -> String {
     )
 }
 
+/// Percent-encode everything but `[A-Za-z0-9._-]`, and a leading `.`, so the
+/// result is one path component that is never `.`, `..` or a hidden name
+/// (the walk skips hidden names: they are temp files).
 fn encode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+    for (i, b) in s.bytes().enumerate() {
+        let plain = b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') || (b == b'.' && i > 0);
+        if plain {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{b:02X}"));
@@ -334,10 +657,27 @@ fn encode_component(s: &str) -> String {
     out
 }
 
+/// Make sure `parent/name` exists and its directory entry is durable.
+///
+/// Creating it fsyncs the new directory, and `parent` is fsynced every time:
+/// a caller that finds the directory already there cannot tell whether its
+/// creator's fsync of `parent` has finished, and returning before it has
+/// would let a crash lose the entry about to be written inside.
+fn ensure_subdir(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
+    let dir = parent.join(name);
+    match std::fs::create_dir(&dir) {
+        Ok(()) => sync_dir(&dir)?,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    sync_dir(parent)?;
+    Ok(dir)
+}
+
 /// Write `bytes` to `dir/name` so that a crash leaves either the old file or
 /// the complete new one: unique temp file, fsync, rename, fsync the directory.
+/// `dir` must exist.
 fn write_durably(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(
         ".{name}.{}.{}.tmp",
         std::process::id(),
@@ -364,30 +704,79 @@ fn sync_dir(dir: &Path) -> std::io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-fn unix_secs() -> u64 {
+/// Seconds since the Unix epoch; 0 if the clock is before it.
+pub(crate) fn unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_secs())
 }
 
-/// What [`migrate_legacy_log`] did with a legacy ledger.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct LegacyMigration {
-    /// Records carried into the ledger directory as they were.
-    pub migrated: usize,
-    /// NUL-prefixed records carried over under the name after the hole.
-    pub salvaged: usize,
-    /// Lines that could not be parsed and were quarantined, not carried over.
-    pub quarantined: usize,
+/// `YYYY-MM-DD` (UTC) of `unix_secs`.
+fn utc_date(unix_secs: u64) -> String {
+    let (year, month, day) = crate::commitlog::archiver::days_to_ymd(unix_secs / SECS_PER_DAY);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Convert `{data_dir}/pending-uploads.log` into the ledger directory, once.
+/// Whether `name` has the `YYYY-MM-DD` shape a quarantine day directory has.
+fn is_utc_date(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            4 | 7 => *b == b'-',
+            _ => b.is_ascii_digit(),
+        })
+}
+
+/// What [`migrate_ledger`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct LedgerMigration {
+    /// Legacy-log records carried into the tree as they were.
+    pub migrated: usize,
+    /// Damaged legacy records (NUL-prefixed, unreadable context) kept pending.
+    pub salvaged: usize,
+    /// Legacy lines that could not be parsed and were quarantined.
+    pub quarantined: usize,
+    /// Flat-layout entries moved into the tree.
+    pub flat_migrated: usize,
+    /// Flat-layout entries that did not parse and were quarantined.
+    pub flat_quarantined: usize,
+    /// Quarantine files outside any day directory moved into today's.
+    pub quarantine_files_dated: usize,
+    /// Empty table directories removed.
+    pub empty_table_dirs_removed: usize,
+}
+
+/// Bring `data_dir`'s ledger to the tree layout: convert a legacy log, then
+/// any flat-layout entries and undated quarantine files, then remove empty
+/// table directories.
 ///
 /// Must run before anything else in the process mutates the ledger — the
-/// engine calls it from its constructors, before it exists to be used.
-/// Re-running after a crash part-way is safe: an entry is written by rename,
-/// so writing it twice leaves one copy, and the log is renamed away last.
-pub fn migrate_legacy_log(data_dir: &Path) -> std::io::Result<LegacyMigration> {
+/// engine calls it from its constructors, before it exists to be used — which
+/// is also what makes removing empty table directories safe here. Re-running
+/// after a crash part-way is safe: an entry is written by rename, so writing
+/// it twice leaves one copy, and each source is removed only after its copy
+/// is durable.
+pub fn migrate_ledger(data_dir: &Path) -> std::io::Result<LedgerMigration> {
+    let mut outcome = LedgerMigration::default();
+    migrate_legacy_log(data_dir, &mut outcome)?;
+    if !data_dir.join(LEDGER_DIR).is_dir() {
+        return Ok(outcome);
+    }
+    let ledger = PendingUploadsLog::open(data_dir)?;
+    migrate_flat_entries(&ledger, &mut outcome)?;
+    date_flat_quarantine_files(&ledger, &mut outcome)?;
+    remove_empty_table_dirs(&ledger, &mut outcome)?;
+    if outcome != LedgerMigration::default() {
+        tracing::info!(
+            ?outcome,
+            "pending upload ledger: migrated to the tree layout"
+        );
+    }
+    Ok(outcome)
+}
+
+/// Convert `{data_dir}/pending-uploads.log` straight into the tree.
+fn migrate_legacy_log(data_dir: &Path, outcome: &mut LedgerMigration) -> std::io::Result<()> {
     let legacy = data_dir.join(LEGACY_LOG_FILE);
     let bytes = match File::open(&legacy) {
         Ok(file) => {
@@ -403,52 +792,29 @@ pub fn migrate_legacy_log(data_dir: &Path) -> std::io::Result<LegacyMigration> {
             }
             bytes
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(LegacyMigration::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
     let ledger = PendingUploadsLog::open(data_dir)?;
-    let mut outcome = LegacyMigration::default();
     let mut quarantined_lines: Vec<u8> = Vec::new();
     for raw in bytes.split(|&b| b == b'\n') {
         if raw.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-        match parse_legacy_line(raw) {
-            LegacyLine::Record(record) => {
-                ledger.write_entry(&record)?;
-                outcome.migrated += 1;
-            }
-            LegacyLine::Salvaged { record, why } => {
-                tracing::error!(
-                    table = record.table_id,
-                    sstable = record.sstable_id,
-                    why,
-                    "pending upload ledger: damaged legacy record kept pending so eviction still \
-                     protects its SSTable; raw line quarantined (t_c14245f9)"
-                );
-                crate::metrics::inc_pending_upload_ledger_corrupt_entries();
-                ledger.write_entry(&record)?;
-                quarantined_lines.extend_from_slice(raw);
-                quarantined_lines.push(b'\n');
-                outcome.salvaged += 1;
-            }
-            LegacyLine::Corrupt(reason) => {
-                tracing::error!(
-                    reason,
-                    line = %String::from_utf8_lossy(raw).escape_debug(),
-                    "pending upload ledger: corrupt legacy line quarantined; it will not be replayed"
-                );
-                crate::metrics::inc_pending_upload_ledger_corrupt_entries();
-                quarantined_lines.extend_from_slice(raw);
-                quarantined_lines.push(b'\n');
-                outcome.quarantined += 1;
-            }
+        let line = parse_legacy_line(raw);
+        let damaged = !matches!(line, LegacyLine::Record(_));
+        if let Some(record) = migrate_legacy_line(line, raw, outcome) {
+            ledger.write_entry(&record)?;
+        }
+        if damaged {
+            quarantined_lines.extend_from_slice(raw);
+            quarantined_lines.push(b'\n');
         }
     }
     let stamp = unix_secs();
     if !quarantined_lines.is_empty() {
         write_durably(
-            &ledger.quarantine_dir(),
+            &ledger.quarantine_day_dir(stamp)?,
             &format!("{LEGACY_LOG_FILE}.{stamp}.lines"),
             &quarantined_lines,
         )?;
@@ -457,19 +823,134 @@ pub fn migrate_legacy_log(data_dir: &Path) -> std::io::Result<LegacyMigration> {
         &legacy,
         data_dir.join(format!("{LEGACY_LOG_FILE}.migrated-{stamp}")),
     )?;
-    sync_dir(data_dir)?;
-    tracing::info!(
-        migrated = outcome.migrated,
-        salvaged = outcome.salvaged,
-        quarantined = outcome.quarantined,
-        "pending upload ledger: migrated the legacy single-file log to one entry per upload"
-    );
-    Ok(outcome)
+    sync_dir(data_dir)
 }
 
-/// A legacy log is one short line per pending upload; the largest live one
-/// was 5 KB. Anything near this is not a ledger.
-const MAX_LEGACY_LOG_BYTES: u64 = 64 << 20;
+/// Report one parsed legacy line and return the record to keep pending, if
+/// any.
+fn migrate_legacy_line(
+    line: LegacyLine,
+    raw: &[u8],
+    outcome: &mut LedgerMigration,
+) -> Option<PendingUploadRecord> {
+    match line {
+        LegacyLine::Record(record) => {
+            outcome.migrated += 1;
+            Some(record)
+        }
+        LegacyLine::Salvaged { record, why } => {
+            tracing::error!(
+                table = record.table_id,
+                sstable = record.sstable_id,
+                why,
+                "pending upload ledger: damaged legacy record kept pending so eviction still \
+                 protects its SSTable; raw line quarantined (t_c14245f9)"
+            );
+            crate::metrics::inc_pending_upload_ledger_corrupt_entries();
+            outcome.salvaged += 1;
+            Some(record)
+        }
+        LegacyLine::Corrupt(reason) => {
+            tracing::error!(
+                reason,
+                line = %String::from_utf8_lossy(raw).escape_debug(),
+                "pending upload ledger: corrupt legacy line quarantined; it will not be replayed"
+            );
+            crate::metrics::inc_pending_upload_ledger_corrupt_entries();
+            outcome.quarantined += 1;
+            None
+        }
+    }
+}
+
+/// Move flat-layout `{table}~{sstable}.pending` files at the ledger root into
+/// the tree; quarantine any that do not parse or are misnamed.
+fn migrate_flat_entries(
+    ledger: &PendingUploadsLog,
+    outcome: &mut LedgerMigration,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(&ledger.dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !entry.file_type()?.is_file() || name.starts_with('.') || !name.ends_with(ENTRY_SUFFIX) {
+            continue;
+        }
+        match read_entry(&entry.path()) {
+            Ok(Some(record))
+                if flat_entry_file_name(&record.table_id, &record.sstable_id) == name =>
+            {
+                ledger.write_entry(&record)?;
+                std::fs::remove_file(entry.path())?;
+                outcome.flat_migrated += 1;
+            }
+            Ok(Some(_)) => {
+                ledger.quarantine_corrupt_file(&entry.path(), "flat entry names another SSTable");
+                outcome.flat_quarantined += 1;
+            }
+            Ok(None) => {}
+            Err(EntryError::Io(e)) => return Err(e),
+            Err(EntryError::Corrupt(reason)) => {
+                ledger.quarantine_corrupt_file(&entry.path(), &reason);
+                outcome.flat_quarantined += 1;
+            }
+        }
+    }
+    sync_dir(&ledger.dir)
+}
+
+/// Move quarantine files that sit outside any day directory (the flat layout
+/// kept them there) into today's day directory.
+fn date_flat_quarantine_files(
+    ledger: &PendingUploadsLog,
+    outcome: &mut LedgerMigration,
+) -> std::io::Result<()> {
+    let quarantine = ledger.quarantine_dir();
+    let listing = match std::fs::read_dir(&quarantine) {
+        Ok(listing) => listing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let mut undated = Vec::new();
+    for entry in listing {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            undated.push(entry);
+        }
+    }
+    if undated.is_empty() {
+        return Ok(());
+    }
+    let day_dir = ledger.quarantine_day_dir(unix_secs())?;
+    for entry in undated {
+        std::fs::rename(entry.path(), day_dir.join(entry.file_name()))?;
+        outcome.quarantine_files_dated += 1;
+    }
+    sync_dir(&day_dir)?;
+    sync_dir(&quarantine)
+}
+
+/// Remove table directories holding no entries. Safe only while nothing else
+/// can add to the ledger, which is why only [`migrate_ledger`] calls it.
+fn remove_empty_table_dirs(
+    ledger: &PendingUploadsLog,
+    outcome: &mut LedgerMigration,
+) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(&ledger.dir)? {
+        let entry = entry?;
+        if entry.file_name() == QUARANTINE_DIR || !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if std::fs::read_dir(entry.path())?.next().is_some() {
+            continue;
+        }
+        std::fs::remove_dir(entry.path())?;
+        outcome.empty_table_dirs_removed += 1;
+    }
+    if outcome.empty_table_dirs_removed > 0 {
+        sync_dir(&ledger.dir)?;
+    }
+    Ok(())
+}
 
 enum LegacyLine {
     Record(PendingUploadRecord),
@@ -758,6 +1239,207 @@ mod tests {
         }
     }
 
+    /// The tree layout: one directory per table, one file per SSTable. An
+    /// entry survives a reopen (a restart), a removal takes only its own
+    /// file, and the emptied table directory stays for the next add.
+    #[test]
+    fn tree_layout_round_trips_through_add_remove_and_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let log = PendingUploadsLog::open(dir.path()).unwrap();
+            log.add_compaction_entry("ks.t", "5", compaction_context("5"))
+                .unwrap();
+            log.add_entry("ks.t", "6").unwrap();
+            log.add_entry("ks.u", "7").unwrap();
+        }
+        let tree = dir.path().join(LEDGER_DIR);
+        assert!(tree.join("ks.t").join("5.pending").is_file());
+        assert!(tree.join("ks.t").join("6.pending").is_file());
+        assert!(tree.join("ks.u").join("7.pending").is_file());
+
+        let log = PendingUploadsLog::open(dir.path()).unwrap();
+        assert!(log.contains("ks.t", "5").unwrap());
+        assert!(!log.contains("ks.t", "8").unwrap());
+        log.remove_entry("ks.u", "7").unwrap();
+        assert!(!log.contains("ks.u", "7").unwrap());
+        assert!(
+            tree.join("ks.u").is_dir(),
+            "an emptied table dir stays in place"
+        );
+
+        let reopened = PendingUploadsLog::open(dir.path()).unwrap();
+        let records = reopened.pending_records().unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| (r.table_id.as_str(), r.sstable_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("ks.t", "5"), ("ks.t", "6")]
+        );
+        assert_eq!(records[0].compaction, Some(compaction_context("5")));
+    }
+
+    /// Many writers creating the same new table directory at once, adding
+    /// and removing entries in it: every add that returned must be visible,
+    /// and no removal may take another writer's entry.
+    #[test]
+    fn concurrent_adds_and_removes_in_one_new_table_dir_all_survive() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 25;
+        let dir = tempdir().unwrap();
+        let log = std::sync::Arc::new(PendingUploadsLog::open(dir.path()).unwrap());
+        let start = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let log = std::sync::Arc::clone(&log);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for i in 0..PER_THREAD {
+                        log.add_entry("ks.shared", &format!("{thread}-{i}-kept"))
+                            .unwrap();
+                        let removed = format!("{thread}-{i}-removed");
+                        log.add_entry("ks.shared", &removed).unwrap();
+                        log.remove_entry("ks.shared", &removed).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let mut kept = log.pending_entries().unwrap();
+        kept.sort();
+        let mut expected: Vec<(String, String)> = (0..THREADS)
+            .flat_map(|t| {
+                (0..PER_THREAD).map(move |i| ("ks.shared".to_string(), format!("{t}-{i}-kept")))
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(kept, expected);
+    }
+
+    /// Quarantine is kept per day and bounded. Past the age or count bound a
+    /// day is archived into one file, loudly, never dropped.
+    #[test]
+    fn quarantine_prune_archives_days_beyond_the_age_and_count_bounds() {
+        let dir = tempdir().unwrap();
+        let log = PendingUploadsLog::open(dir.path()).unwrap();
+        let day = 86_400;
+        let now = 20_000 * day; // 2024-10-04
+        for (age_days, files) in [(40u64, 2usize), (3, 3), (2, 4), (0, 1)] {
+            let day_dir = log.quarantine_dir().join(utc_date(now - age_days * day));
+            std::fs::create_dir_all(&day_dir).unwrap();
+            for i in 0..files {
+                std::fs::write(
+                    day_dir.join(format!("entry-{i}.json")),
+                    format!("{{\"n\":{i}}}"),
+                )
+                .unwrap();
+            }
+        }
+
+        let outcome = log
+            .prune_quarantine(
+                &QuarantineRetention {
+                    max_entries: 6,
+                    max_age_days: 30,
+                },
+                now,
+            )
+            .unwrap();
+
+        // The 40-day-old day goes on age; then 3+4+1 = 8 > 6 sends the oldest
+        // remaining day (3 files) too, leaving 5.
+        assert_eq!(
+            outcome,
+            QuarantinePrune {
+                archived_days: vec![utc_date(now - 40 * day), utc_date(now - 3 * day)],
+                archived_entries: 5,
+            }
+        );
+        let remaining: usize = std::fs::read_dir(log.quarantine_dir())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name() != QUARANTINE_ARCHIVE_DIR)
+            .map(|e| std::fs::read_dir(e.path()).unwrap().count())
+            .sum();
+        assert_eq!(remaining, 5);
+        let archived = std::fs::read_to_string(
+            log.quarantine_dir()
+                .join(QUARANTINE_ARCHIVE_DIR)
+                .join(format!("{}.jsonl", utc_date(now - 40 * day))),
+        )
+        .unwrap();
+        assert_eq!(
+            archived.lines().count(),
+            2,
+            "an archived day keeps every entry"
+        );
+
+        assert_eq!(
+            log.prune_quarantine(
+                &QuarantineRetention {
+                    max_entries: 6,
+                    max_age_days: 30,
+                },
+                now,
+            )
+            .unwrap(),
+            QuarantinePrune::default(),
+            "a pruned quarantine is within its bounds"
+        );
+    }
+
+    /// The flat layout (one directory, `{table}~{sstable}.pending`) existed
+    /// only on an unmerged branch; any data directory that ran it converts to
+    /// the tree, and converting twice changes nothing.
+    #[test]
+    fn flat_layout_migrates_to_the_tree_idempotently() {
+        let dir = tempdir().unwrap();
+        let flat = dir.path().join(LEDGER_DIR);
+        std::fs::create_dir_all(flat.join(QUARANTINE_DIR)).unwrap();
+        for (table, sstable, compaction) in [
+            ("ks.t", "10", Some(compaction_context("10"))),
+            ("ks.u", "11", None),
+        ] {
+            let record = PendingUploadRecord {
+                table_id: table.to_string(),
+                sstable_id: sstable.to_string(),
+                compaction,
+            };
+            std::fs::write(
+                flat.join(format!("{table}~{sstable}.pending")),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(flat.join("ks.t~12.pending"), b"garbage").unwrap();
+        std::fs::write(flat.join(QUARANTINE_DIR).join("old.json"), b"{}").unwrap();
+
+        let first = migrate_ledger(dir.path()).unwrap();
+        assert_eq!(first.flat_migrated, 2);
+        assert_eq!(first.flat_quarantined, 1);
+        let log = PendingUploadsLog::open(dir.path()).unwrap();
+        assert!(flat.join("ks.t").join("10.pending").is_file());
+        assert!(flat.join("ks.u").join("11.pending").is_file());
+        assert!(!flat.join("ks.t~10.pending").exists());
+        assert_eq!(
+            log.pending_records().unwrap()[0].compaction,
+            Some(compaction_context("10"))
+        );
+        assert!(
+            !flat.join(QUARANTINE_DIR).join("old.json").exists(),
+            "flat quarantine files move under a day directory"
+        );
+
+        assert_eq!(
+            migrate_ledger(dir.path()).unwrap(),
+            LedgerMigration::default()
+        );
+        assert_eq!(log.pending_entries().unwrap().len(), 2);
+    }
+
     /// A ledger entry that does not parse is reported and moved to
     /// quarantine, never returned for replay — and never fatal to the read.
     #[test]
@@ -765,15 +1447,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let log = PendingUploadsLog::open(dir.path()).unwrap();
         log.add_entry("ks.t", "1").unwrap();
-        let corrupt = dir
-            .path()
-            .join(LEDGER_DIR)
-            .join(entry_file_name("ks.t", "2"));
+        let table_dir = dir.path().join(LEDGER_DIR).join("ks.t");
+        let corrupt = table_dir.join(entry_file_name("2"));
         std::fs::write(&corrupt, b"\0\0\0 not json").unwrap();
-        let misfiled = dir
-            .path()
-            .join(LEDGER_DIR)
-            .join(entry_file_name("ks.t", "3"));
+        let misfiled = table_dir.join(entry_file_name("3"));
         std::fs::write(
             &misfiled,
             serde_json::to_vec(&PendingUploadRecord {
@@ -793,7 +1470,31 @@ mod tests {
             !corrupt.exists() && !misfiled.exists(),
             "corrupt entries left live"
         );
-        assert_eq!(std::fs::read_dir(log.quarantine_dir()).unwrap().count(), 2);
+        assert_eq!(quarantined_files(&log).len(), 2);
+    }
+
+    /// Every file under the quarantine's day directories, oldest day first.
+    fn quarantined_files(log: &PendingUploadsLog) -> Vec<PathBuf> {
+        let mut days: Vec<PathBuf> = std::fs::read_dir(log.quarantine_dir())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_name() != QUARANTINE_ARCHIVE_DIR)
+            .map(|e| e.path())
+            .collect();
+        days.sort();
+        for day in &days {
+            assert!(
+                is_utc_date(&day.file_name().unwrap().to_string_lossy()),
+                "quarantine holds something outside a day directory: {}",
+                day.display()
+            );
+        }
+        let mut files: Vec<PathBuf> = days
+            .iter()
+            .flat_map(|day| std::fs::read_dir(day).unwrap().map(|e| e.unwrap().path()))
+            .collect();
+        files.sort();
+        files
     }
 
     /// `quarantine` takes a record out of the live ledger and keeps it, with
@@ -809,9 +1510,9 @@ mod tests {
         log.quarantine(&record, "files are gone").unwrap();
 
         assert!(log.pending_records().unwrap().is_empty());
-        let kept: Vec<_> = std::fs::read_dir(log.quarantine_dir())
-            .unwrap()
-            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        let kept: Vec<_> = quarantined_files(&log)
+            .iter()
+            .map(|path| std::fs::read_to_string(path).unwrap())
             .collect();
         assert_eq!(kept.len(), 1);
         let kept: QuarantinedRecord = serde_json::from_str(&kept[0]).unwrap();
@@ -836,15 +1537,21 @@ mod tests {
         legacy.extend_from_slice(b"ks.t\t\0inner\n\n");
         std::fs::write(dir.path().join(LEGACY_LOG_FILE), &legacy).unwrap();
 
-        let outcome = migrate_legacy_log(dir.path()).unwrap();
+        let outcome = migrate_ledger(dir.path()).unwrap();
 
         assert_eq!(
             outcome,
-            LegacyMigration {
+            LedgerMigration {
                 migrated: 2,
                 salvaged: 1,
                 quarantined: 2,
+                ..LedgerMigration::default()
             }
+        );
+        let tree = dir.path().join(LEDGER_DIR);
+        assert!(
+            tree.join("ks.t").join("12.pending").is_file(),
+            "the legacy log migrates straight into the tree"
         );
         let log = PendingUploadsLog::open(dir.path()).unwrap();
         let records = log.pending_records().unwrap();
@@ -868,11 +1575,9 @@ mod tests {
             .filter(|name| name.starts_with("pending-uploads.log.migrated-"))
             .collect();
         assert_eq!(evidence.len(), 1, "the migrated log is kept as evidence");
-        let quarantined: Vec<u8> = std::fs::read_dir(log.quarantine_dir())
-            .unwrap()
-            .map(|e| std::fs::read(e.unwrap().path()).unwrap())
-            .next()
-            .unwrap();
+        let quarantined = quarantined_files(&log);
+        assert_eq!(quarantined.len(), 1);
+        let quarantined = std::fs::read(&quarantined[0]).unwrap();
         assert_eq!(
             quarantined
                 .split(|&b| b == b'\n')
@@ -883,8 +1588,8 @@ mod tests {
         );
 
         assert_eq!(
-            migrate_legacy_log(dir.path()).unwrap(),
-            LegacyMigration::default(),
+            migrate_ledger(dir.path()).unwrap(),
+            LedgerMigration::default(),
             "a migrated data directory has nothing left to migrate"
         );
     }

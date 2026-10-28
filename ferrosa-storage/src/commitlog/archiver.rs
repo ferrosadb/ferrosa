@@ -187,7 +187,7 @@ fn now_iso8601() -> String {
 }
 
 /// Converts days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+pub(crate) fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     // Algorithm from Howard Hinnant's chrono-compatible date library.
     let z = days + 719468;
     let era = z / 146097;

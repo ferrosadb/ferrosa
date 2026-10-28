@@ -501,6 +501,10 @@ static PENDING_UPLOAD_LEDGER_CORRUPT_ENTRIES_TOTAL: AtomicU64 = AtomicU64::new(0
 /// local disk nor in the S3 manifest. Non-zero means a flush or compaction
 /// output was lost or retired without its ledger entry; alert on it.
 static PENDING_UPLOAD_UNREPLAYABLE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Quarantined pending-upload entries archived because the quarantine reached
+/// its retention bound. Non-zero means uploads have been failing for long
+/// enough to fill it; the archive keeps every entry.
+static PENDING_UPLOAD_QUARANTINE_ARCHIVED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Compactions rolled back after their replacement record committed but before
 /// retirement (reader-open, sidecar-merge, or swap failure) -- T-022.
 static COMPACTION_INTENT_ROLLBACK_TOTAL: AtomicU64 = AtomicU64::new(0);
@@ -797,6 +801,16 @@ pub fn inc_pending_upload_unreplayable() {
 /// Pending uploads quarantined as unreplayable since startup.
 pub fn pending_upload_unreplayable_total() -> u64 {
     PENDING_UPLOAD_UNREPLAYABLE_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Record `entries` quarantined pending uploads moved to the archive.
+pub fn add_pending_upload_quarantine_archived(entries: u64) {
+    PENDING_UPLOAD_QUARANTINE_ARCHIVED_TOTAL.fetch_add(entries, Ordering::Relaxed);
+}
+
+/// Quarantined pending uploads archived since startup.
+pub fn pending_upload_quarantine_archived_total() -> u64 {
+    PENDING_UPLOAD_QUARANTINE_ARCHIVED_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Total deletion markers dropped by compaction since startup.
@@ -1809,6 +1823,12 @@ queues (sum over registered observers); depth / capacity is the saturation ratio
     out.push_str(&format!(
         "ferrosa_storage_pending_upload_unreplayable_total {}\n",
         PENDING_UPLOAD_UNREPLAYABLE_TOTAL.load(Ordering::Relaxed)
+    ));
+    out.push_str("# HELP ferrosa_storage_pending_upload_quarantine_archived_total Quarantined pending uploads archived because the quarantine reached its retention bound; nothing is dropped.\n");
+    out.push_str("# TYPE ferrosa_storage_pending_upload_quarantine_archived_total counter\n");
+    out.push_str(&format!(
+        "ferrosa_storage_pending_upload_quarantine_archived_total {}\n",
+        PENDING_UPLOAD_QUARANTINE_ARCHIVED_TOTAL.load(Ordering::Relaxed)
     ));
     out.push_str("# HELP ferrosa_storage_compaction_input_bytes_total Input bytes read by completed compactions.\n");
     out.push_str("# TYPE ferrosa_storage_compaction_input_bytes_total counter\n");

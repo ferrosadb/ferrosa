@@ -395,25 +395,48 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   corruption, not an optional gap — the generation is withheld and never uploaded,
   never worked around (ST-91).
   **Wired into the flush path.**
-  **Pending-upload ledger** (`upload/pending_log.rs`, FMEA ST-99): one JSON
-  file per unconfirmed upload under `{data_dir}/pending-uploads/`, published by
-  temp file + fsync + rename + directory fsync and removed by unlink. No
-  mutation reads or rewrites another entry, so concurrent compaction
-  finalizers and replay tasks need no lock. It replaces the single
-  `pending-uploads.log`, whose in-place rewrite on every removal lost
-  concurrent adds, stripped every other entry's compaction context, and left
-  NUL holes that became table names (t_c14245f9). Engine constructors migrate a
-  legacy log once, before the engine exists: NUL-prefixed records are salvaged
-  under the name after the hole, unparseable lines are quarantined to
-  `pending-uploads/quarantine/`, and the old log is kept as
-  `pending-uploads.log.migrated-<unix secs>`. A corrupt entry file is
-  quarantined at ERROR on read, never replayed. At replay, an entry whose files
-  are not on local disk is retired if the S3 manifest lists its generation
-  (upload completed, removal lost) and otherwise quarantined at ERROR (nothing
-  left to upload); it no longer warns "cannot replay" on every startup.
+  **Pending-upload ledger** (`upload/pending_log.rs`, FMEA ST-99): a tree,
+  `{data_dir}/pending-uploads/{enc(table)}/{enc(sstable)}.pending`, one JSON
+  file per unconfirmed upload (ids percent-encoded to one path component).
+  An add creates the table directory if needed (fsyncing it) and always
+  fsyncs the ledger directory, then publishes the entry by temp file + fsync
+  + rename + table-directory fsync; a removal unlinks and fsyncs the table
+  directory. No mutation reads or rewrites another entry, so concurrent
+  compaction finalizers and replay tasks need no lock. **An emptied table
+  directory is left in place**: removing it would race a concurrent add
+  (the add finds the directory, the `rmdir` wins, the add's temp file
+  fails), and the count is bounded by the number of tables; empty ones are
+  removed only by the migration at engine open, when nothing else writes.
+  The eviction guard checks each candidate with one `stat` of its own entry
+  path (`PendingUploadsLog::contains`), never a listing or parse, so its cost
+  does not grow with the ledger; a stat error other than NotFound withholds
+  that candidate from eviction and is reported once per cycle. Only startup
+  replay walks the tree.
+  It replaces the single `pending-uploads.log`, whose in-place rewrite on
+  every removal lost concurrent adds, stripped every other entry's compaction
+  context, and left NUL holes that became table names (t_c14245f9). Engine
+  constructors run `migrate_ledger` once, before the engine exists: a legacy
+  log goes straight into the tree (NUL-prefixed records salvaged under the
+  name after the hole, unparseable lines quarantined, the old log kept as
+  `pending-uploads.log.migrated-<unix secs>`); entries in the interim flat
+  `{table}~{sstable}.pending` layout move into the tree; both steps are
+  idempotent. A corrupt or misfiled entry is quarantined at ERROR on read,
+  never replayed. At replay, an entry whose files are not on local disk is
+  retired if the S3 manifest lists its generation (upload completed, removal
+  lost) and otherwise quarantined at ERROR (nothing left to upload).
+  **Quarantine** is kept per UTC day, `pending-uploads/quarantine/{YYYY-MM-DD}/`,
+  and bounded at each startup replay: days older than
+  `FERROSA_PENDING_UPLOAD_QUARANTINE_MAX_AGE_DAYS` (default 30), then the
+  oldest days while more than `FERROSA_PENDING_UPLOAD_QUARANTINE_MAX_ENTRIES`
+  (default 1000) entries remain, are archived whole to
+  `quarantine/archive/{YYYY-MM-DD}.jsonl` (one line per entry) before their
+  files are removed. Archiving logs every entry name at INFO, and reaching
+  the bound logs at ERROR and counts
+  `pending_upload_quarantine_archived_total`. Archives are never deleted.
   Metrics: `pending_upload_ledger_corrupt_entries_total`,
-  `pending_upload_unreplayable_total`. A binary older than this change reads
-  only the legacy log, so after a downgrade it sees no pending uploads.
+  `pending_upload_unreplayable_total`,
+  `pending_upload_quarantine_archived_total`. A binary older than this change
+  reads only the legacy log, so after a downgrade it sees no pending uploads.
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
   Set `FERROSA_LOCAL_STORE_PATH` (or `[s3].local_path` in `ferrosa.toml`) to use

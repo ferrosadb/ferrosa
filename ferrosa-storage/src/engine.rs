@@ -2233,6 +2233,34 @@ fn hot_block_edge(flag: &AtomicBool, blocked_now: bool) -> HotBlockEdge {
     }
 }
 
+/// Eviction candidates withheld in one cycle because a check could not be
+/// made: fail closed, and report once per cycle rather than once per
+/// generation.
+#[derive(Default)]
+struct WithheldCandidates {
+    count: usize,
+    first: Option<String>,
+}
+
+impl WithheldCandidates {
+    fn record(&mut self, table: &str, sstable_id: &str, check: &str, error: &std::io::Error) {
+        self.count += 1;
+        if self.first.is_none() {
+            self.first = Some(format!("{table}/{sstable_id}: {check} failed: {error}"));
+        }
+    }
+
+    fn report(&self) {
+        if let Some(first) = &self.first {
+            tracing::warn!(
+                withheld = self.count,
+                first,
+                "s3-sync: withheld SSTables from eviction because their durability or size could not be checked"
+            );
+        }
+    }
+}
+
 /// Result of [`StorageEngine::collect_uploaded_local_sstables`].
 #[derive(Default)]
 struct CollectedCandidates {
@@ -3165,17 +3193,17 @@ impl StorageEngine {
         })
     }
 
-    /// Convert a legacy single-file pending-upload log into the ledger
-    /// directory before the engine exists, so nothing else in the process can
-    /// be mutating the ledger while it runs. A failure is fatal: starting with
-    /// a ledger half read would let eviction delete SSTables whose uploads are
-    /// unconfirmed.
+    /// Bring the pending-upload ledger to its tree layout (legacy log, flat
+    /// layout, empty table directories) before the engine exists, so nothing
+    /// else in the process can be mutating the ledger while it runs. A failure
+    /// is fatal: starting with a ledger half read would let eviction delete
+    /// SSTables whose uploads are unconfirmed.
     fn migrate_pending_upload_ledger(config: &StorageEngineConfig) -> ferrosa_common::Result<()> {
-        crate::upload::pending_log::migrate_legacy_log(&config.data_dir)
+        crate::upload::pending_log::migrate_ledger(&config.data_dir)
             .map(|_outcome| ())
             .map_err(|e| {
                 ferrosa_common::Error::InvalidFormat(format!(
-                    "failed to migrate the legacy pending upload log in {}: {e}",
+                    "failed to migrate the pending upload ledger in {}: {e}",
                     config.data_dir.display()
                 ))
             })
@@ -4411,6 +4439,14 @@ impl StorageEngine {
                 return;
             }
         };
+        // Only this startup pass adds to the quarantine, so bounding it here
+        // bounds it. A failed prune leaves the quarantine larger, not wrong.
+        if let Err(e) = pending_log.prune_quarantine(
+            &crate::upload::pending_log::QuarantineRetention::from_env(),
+            crate::upload::pending_log::unix_secs(),
+        ) {
+            tracing::error!(%e, quarantine = %pending_log.quarantine_dir().display(), "could not prune the pending upload quarantine; it stays over its retention bound");
+        }
         self.prune_local_only_compaction_intents();
         self.prepare_compaction_s3_replay(&pending_log);
 
@@ -14664,29 +14700,28 @@ impl StorageEngine {
         &self,
         manifest: &crate::manifest::Manifest,
     ) -> CollectedCandidates {
-        // Generations still listed in the pending-upload log are flushed locally
+        // Generations still in the pending-upload ledger are flushed locally
         // but NOT yet confirmed durable in S3 (the entry is removed only after S3
         // confirms). Evicting their only local copy is the #235 data-loss path,
-        // so they must never be eviction candidates. If the pending set cannot be
-        // read, fail closed: evict nothing rather than risk deleting an SSTable
-        // whose durability we cannot confirm.
-        let pending: std::collections::HashSet<(String, String)> =
-            match crate::upload::PendingUploadsLog::open(&self.config.data_dir)
-                .and_then(|log| log.pending_entries())
-            {
-                Ok(pending_entries) => pending_entries.into_iter().collect(),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "s3-sync: cannot read pending-upload log; skipping uploaded-cache eviction to avoid deleting not-yet-durable SSTables"
-                    );
-                    return CollectedCandidates::default();
-                }
-            };
+        // so they must never be eviction candidates. The check is one `stat` of
+        // the generation's own ledger path: the cost does not grow with the
+        // ledger, which grows exactly when S3 is failing and disk is filling.
+        // If the ledger cannot be opened, fail closed: evict nothing.
+        let ledger = match crate::upload::PendingUploadsLog::open(&self.config.data_dir) {
+            Ok(ledger) => ledger,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "s3-sync: cannot open the pending-upload ledger; skipping uploaded-cache eviction to avoid deleting not-yet-durable SSTables"
+                );
+                return CollectedCandidates::default();
+            }
+        };
 
         let mut entries = Vec::new();
         let mut manifest_bytes = 0u64;
         let mut duplicate_entries = 0usize;
+        let mut withheld = WithheldCandidates::default();
         let mut seen: std::collections::HashSet<(&str, &str)> = std::collections::HashSet::new();
         for (table_id, manifest_entries) in &manifest.sstables {
             // System keyspaces (system_schema, system_auth, graph adjacency)
@@ -14698,10 +14733,15 @@ impl StorageEngine {
             }
             let table_dir = self.config.data_dir.join("sstables").join(table_id);
             for entry in manifest_entries {
-                if pending.contains(&(table_id.clone(), entry.id.clone())) {
-                    // Flushed but not yet durable in S3 — the local copy is the
+                match ledger.contains(table_id, &entry.id) {
+                    // Flushed but not yet durable in S3: the local copy is the
                     // only copy; never evict it.
-                    continue;
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(e) => {
+                        withheld.record(table_id, &entry.id, "pending-upload ledger stat", &e);
+                        continue;
+                    }
                 }
                 let Ok(gen) = entry.id.parse::<u64>() else {
                     continue;
@@ -14723,18 +14763,13 @@ impl StorageEngine {
                     continue;
                 }
 
-                let mut size = 0u64;
-                let mut last_modified = std::time::UNIX_EPOCH;
-                for path in component_paths {
-                    let Ok(metadata) = std::fs::metadata(&path) else {
+                let (size, last_modified) = match Self::measure_generation(&component_paths) {
+                    Ok(measured) => measured,
+                    Err(e) => {
+                        withheld.record(table_id, &entry.id, "component stat", &e);
                         continue;
-                    };
-                    size = size.saturating_add(metadata.len());
-                    if let Ok(modified) = metadata.modified() {
-                        last_modified = last_modified.max(modified);
                     }
-                }
-
+                };
                 if size > 0 {
                     entries.push(crate::eviction_plan::EvictionCandidate {
                         table: table_id.clone(),
@@ -14746,12 +14781,39 @@ impl StorageEngine {
                 }
             }
         }
+        withheld.report();
 
         CollectedCandidates {
             candidates: entries,
             manifest_bytes,
             duplicate_entries,
         }
+    }
+
+    /// Total size and newest modification time of a generation's components.
+    /// A component that vanished since the listing counts as nothing; any
+    /// other stat error is returned so the caller withholds the generation
+    /// from eviction rather than size it from a partial view.
+    fn measure_generation(
+        component_paths: &[PathBuf],
+    ) -> std::io::Result<(u64, std::time::SystemTime)> {
+        let mut size = 0u64;
+        let mut last_modified = std::time::UNIX_EPOCH;
+        for path in component_paths {
+            let metadata = match std::fs::metadata(path) {
+                Ok(metadata) => metadata,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("{}: {e}", path.display()),
+                    ))
+                }
+            };
+            size = size.saturating_add(metadata.len());
+            last_modified = last_modified.max(metadata.modified()?);
+        }
+        Ok((size, last_modified))
     }
 
     /// Last foreground read of every registered table, keyed by the manifest
@@ -17513,6 +17575,138 @@ mod tests {
             .unwrap();
         replay_runtime.block_on(engine.replay_pending_uploads());
         (engine, upload_runtime)
+    }
+
+    /// The eviction guard runs every sync cycle, and an S3 outage is exactly
+    /// when the ledger grows and disk is under pressure. It must check each
+    /// candidate with one stat of its own entry, never open or parse the
+    /// ledger: 10,000 pending entries must cost the cycle no entry reads.
+    #[test]
+    fn eviction_guard_reads_no_ledger_entries_with_ten_thousand_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table_id = "agent_memory.entity_store";
+        let ledger = crate::upload::PendingUploadsLog::open(&config.data_dir).unwrap();
+        for gen in 0..10_000u64 {
+            ledger.write_entry_unsynced_for_test(table_id, &format!("{}", 500_000 + gen));
+        }
+        // Two local generations listed in the manifest: one still pending
+        // (the ledger names it), one durable.
+        let table_dir = config.data_dir.join("sstables").join(table_id);
+        let mut manifest = crate::manifest::Manifest::new();
+        for gen in [500_001u64, 900_001] {
+            let gen_dir = table_dir.join(gen.to_string());
+            std::fs::create_dir_all(&gen_dir).unwrap();
+            std::fs::write(gen_dir.join(format!("{gen}-Data.db")), b"data").unwrap();
+            manifest.add_sstable(
+                table_id,
+                crate::manifest::ManifestEntry {
+                    id: gen.to_string(),
+                    size: 4,
+                    min_token: -1,
+                    max_token: 1,
+                    min_timestamp: 1,
+                    max_timestamp: 2,
+                },
+            );
+        }
+        let engine = StorageEngine::new(config, None).unwrap();
+
+        let reads_before = crate::upload::pending_log::entry_reads_on_this_thread();
+        let collected = engine.collect_uploaded_local_sstables(&manifest);
+        let reads = crate::upload::pending_log::entry_reads_on_this_thread() - reads_before;
+
+        assert_eq!(reads, 0, "the eviction guard opened {reads} ledger entries");
+        let ids: Vec<&str> = collected
+            .candidates
+            .iter()
+            .map(|candidate| candidate.sstable_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["900001"],
+            "only the durable generation is evictable"
+        );
+    }
+
+    /// Startup replay is the only pass that adds to the quarantine, so it is
+    /// where the quarantine's retention bound is applied.
+    #[test]
+    fn replay_archives_quarantine_days_past_the_retention_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let ledger = crate::upload::PendingUploadsLog::open(&config.data_dir).unwrap();
+        let old_day = ledger.quarantine_dir().join("2020-01-01");
+        std::fs::create_dir_all(&old_day).unwrap();
+        std::fs::write(old_day.join("ks.t~1.1577836800.json"), b"{}").unwrap();
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let (_engine, _upload_runtime) = replay_with_idle_uploader(config, store);
+
+        assert!(
+            !old_day.exists(),
+            "a day past the age bound stayed unarchived"
+        );
+        let archive = ledger
+            .quarantine_dir()
+            .join(crate::upload::pending_log::QUARANTINE_ARCHIVE_DIR)
+            .join("2020-01-01.jsonl");
+        assert_eq!(
+            std::fs::read_to_string(&archive).unwrap().lines().count(),
+            1,
+            "the archived day keeps its entry"
+        );
+    }
+
+    /// A ledger stat that fails for any reason but "not found" proves
+    /// nothing about durability: the candidate is withheld, not evicted.
+    #[test]
+    fn eviction_guard_withholds_a_candidate_whose_ledger_stat_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageEngineConfig::test_config(dir.path());
+        let table_id = "ks.t";
+        let gen = 700_001u64;
+        let gen_dir = config
+            .data_dir
+            .join("sstables")
+            .join(table_id)
+            .join(gen.to_string());
+        std::fs::create_dir_all(&gen_dir).unwrap();
+        std::fs::write(gen_dir.join(format!("{gen}-Data.db")), b"data").unwrap();
+        let mut manifest = crate::manifest::Manifest::new();
+        manifest.add_sstable(
+            table_id,
+            crate::manifest::ManifestEntry {
+                id: gen.to_string(),
+                size: 4,
+                min_token: -1,
+                max_token: 1,
+                min_timestamp: 1,
+                max_timestamp: 2,
+            },
+        );
+        let data_dir = config.data_dir.clone();
+        let engine = StorageEngine::new(config, None).unwrap();
+        // A regular file where the table's ledger directory belongs: the stat
+        // of the entry inside it fails with "not a directory", which works
+        // the same when the tests run as root (a permission bit would not).
+        crate::upload::PendingUploadsLog::open(&data_dir).unwrap();
+        let table_ledger = data_dir
+            .join(crate::upload::pending_log::LEDGER_DIR)
+            .join(table_id);
+        std::fs::write(&table_ledger, b"not a directory").unwrap();
+        let stat = std::fs::symlink_metadata(table_ledger.join(format!("{gen}.pending")));
+        assert!(
+            matches!(&stat, Err(e) if e.kind() != std::io::ErrorKind::NotFound),
+            "the setup must make the ledger stat fail with something other than NotFound: {stat:?}"
+        );
+
+        let collected = engine.collect_uploaded_local_sstables(&manifest);
+
+        assert!(
+            collected.candidates.is_empty(),
+            "a generation whose ledger stat failed was offered for eviction"
+        );
     }
 
     /// A record whose files are neither on local disk nor in the S3 manifest
