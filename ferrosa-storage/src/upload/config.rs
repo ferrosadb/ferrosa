@@ -1085,7 +1085,11 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&self.0.lock().expect("log buffer")).into_owned()
         }
 
+        /// A subscriber writing into this capture. It first installs the
+        /// crate's always-interested global default, so a callsite a parallel
+        /// test hit with no subscriber is never interned as disabled here.
         pub(crate) fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            crate::test_span_collector::ensure_installed();
             tracing_subscriber::fmt()
                 .with_writer(self.clone())
                 .with_max_level(tracing::Level::INFO)
