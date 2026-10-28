@@ -340,91 +340,10 @@ expires = "2026-12-31"
 # (a) t_6068a9af — bulk-transfer paths clone every row before wire serialization.
 
 [[allow]]
-path = "ferrosa-cluster/src/controller/cluster.rs"
-rule = "cloned-stream-elements"
-symbol = "partition"
-reason = "t_6068a9af: snapshot send builds RowWire from cloned rows; fix = From<&Row>."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cluster/src/controller/membership.rs"
-rule = "cloned-stream-elements"
-symbol = "partition"
-reason = "t_6068a9af: membership transfer builds RowWire from cloned rows; fix = From<&Row>."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cluster/src/rebalance.rs"
-rule = "cloned-stream-elements"
-symbol = "partition"
-reason = "t_6068a9af: rebalance transfer builds RowWire from cloned rows; fix = From<&Row>."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cluster/src/repair/rpc.rs"
-rule = "cloned-stream-elements"
-symbol = "chunk"
-reason = "t_6068a9af: repair send clones each partition for partition_to_wire; fix = borrow variant."
-owner = "bkearns"
-expires = "2026-11-15"
-
-# (a) t_87042a74 — repair leaf/hinted-replay/IVF-build per-element clones.  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cluster/src/repair/mod.rs"
-rule = "cloned-stream-elements"
-symbol = "parts_"
-reason = "t_87042a74: Merkle repair clones Vec<Partition> subsets per divergent leaf; use borrows/indices."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cluster/src/coordinator/read.rs"
-rule = "cloned-stream-elements"
-symbol = "mutation"
-reason = "t_bc54e3dc: hinted replay clones mutation rows per stale host (bounded per mutation); move on last use."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cql/src/router.rs"
-rule = "cloned-stream-elements"
-symbol = "row"
-reason = "t_480c91fe: per-row single-cell Option clone while rows are borrowed; retire with page-by-page move streaming."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
 path = "ferrosa-storage/src/store.rs"
 rule = "server-side-result-cap"
 reason = "t_1f2485ef: INDEX_RESULT_CAP + RANGE_READ_MATERIALIZATION_CAP fail-loud refusal caps; stream instead."
 owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-storage/src/engine.rs"
-rule = "server-side-result-cap"
-reason = "t_1ec2e3fc: MAX_{INDEXES,TYPES,FUNCTIONS}_TO_READ silently truncate system-schema listings past 10k; stream or fail loud."
-owner = "bkearns"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-cluster/src/controller/bootstrap/bootstrap_stream.rs"
-rule = "server-side-result-cap"
-reason = "t_1ec2e3fc: BOUNDED_ROW_FALLBACK_LIMIT is documented as a fallback-SELECTION bound (not truncation); verify refusal past limit with a test, then stream the fallback."
-owner = "bkearns"
-expires = "2026-11-15"
-
-# By-design bounds (not result caps in context).  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-flight/src/convert.rs"
-rule = "cqlvalue-row-accumulation"
-reason = "t_a49d88c3 TRIAGED: BOUNDED - VERIFIED: decode/build of ONE inbound Arrow RecordBatch; outer dim is tuple/UDT arity. query_to_batch uses page_size=1 (schema only), so no single giant batch."
-owner = "storage"
 expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
 
 [[allow]]
@@ -475,40 +394,5 @@ expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it 
 path = "ferrosa-sparql/src/property_path.rs"
 rule = "stream-push-accumulation"
 reason = "t_a49d88c3 TRIAGED: BOUNDED: the scan streams; the pairs buffer is bounded by max_rows with a loud error. A BFS transitive closure must buffer."
-owner = "storage"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-sstable/src/reader.rs"
-rule = "copies-row-data-arg"
-reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: Arc::clone(chunk) is a refcount bump, not a data copy."
-owner = "storage"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-sstable/src/reader.rs"
-rule = "returns-vec-partition-or-row"
-reason = "t_a49d88c3 TRIAGED: BOUNDED: read_partitions_limited/_rows are bounded by their limit args; the streaming partitions_iter exists and the docs steer full-table callers to it."
-owner = "storage"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-sstable/src/reader.rs"
-rule = "server-side-result-cap"
-reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE - INVERTED: PARTITION_TOKEN_SUMMARY_MAX_ENTRIES DOWNSAMPLES the token summary so reader memory does NOT scale with table size. It is a memory-bounding ceiling, the opposite of a result cap."
-owner = "storage"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-sstable/src/reader.rs"
-rule = "with-capacity-limit"
-reason = "t_a49d88c3 TRIAGED: BOUNDED: with_capacity(limit) matching the same caller-supplied limit."
-owner = "storage"
-expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
-
-[[allow]]
-path = "ferrosa-sstable/src/trie/walker.rs"
-rule = "server-side-result-cap"
-reason = "t_a49d88c3 TRIAGED: FALSE POSITIVE: MAX_NODE_READ=2560 is a fixed single-trie-node read buffer size, unrelated to result counts."
 owner = "storage"
 expires = "2026-11-15"  # t_eb344b9c: remaining P0-OOM work; short expiry so it re-fires.
