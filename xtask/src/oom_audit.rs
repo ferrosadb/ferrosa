@@ -1203,9 +1203,14 @@ impl<'a> Auditor<'a> {
                 self.fns.arc_handle_idents.iter().any(|a| a == id)
                     || self.fns.chunk_loop_vars.iter().any(|a| a == id)
             });
+            // `Arc::clone(x)` / `Rc::clone(x)` is the explicit refcount-bump
+            // spelling (the form clippy's `clone_on_ref_ptr` asks for): it
+            // copies a pointer, never the pointee, whatever `x` is named.
+            let refcount_bump = segs.iter().any(|s| s == "Arc" || s == "Rc");
             if (type_seg_is_row || arg_is_row)
                 && !self.fns.index_position_value_fn
                 && !arg_is_handle
+                && !refcount_bump
             {
                 let sym = arg_ident.unwrap_or_else(|| segs.join("::"));
                 self.push_with_symbol(
@@ -3778,6 +3783,24 @@ mod tests {
             .filter(|x| x.rule == rule::COPIES_ROW_DATA_ARG)
             .count();
         assert_eq!(count, 2, "UFCS clones of row data fire: {f:?}");
+    }
+
+    #[test]
+    fn rule_copies_row_data_arg_does_not_fire_on_refcount_bumps() {
+        // `Arc::clone(&chunk)` bumps a refcount; the chunk bytes are shared,
+        // not copied. The row-data NAME of the argument must not change that.
+        let src = r#"
+            fn a(chunk: Arc<Vec<u8>>, partition: Rc<P>) {
+                let x = Arc::clone(&chunk);
+                let y = std::sync::Arc::clone(&chunk);
+                let z = Rc::clone(&partition);
+            }
+        "#;
+        let f = audit_source("x.rs", src, &no_allow());
+        assert!(
+            !f.iter().any(|x| x.rule == rule::COPIES_ROW_DATA_ARG),
+            "Arc/Rc refcount bumps must not fire: {f:?}"
+        );
     }
 
     #[test]

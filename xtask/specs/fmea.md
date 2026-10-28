@@ -17,6 +17,7 @@ having had it. The warn-ahead addition is therefore deliberately one-directional
 | X-8 | A red nightly is not noticed | The signal exists but nobody reads it (the 2026-09-30 case) | 7 | 5 | 5 | 175 | `nightly-fuzz.yml`'s `fuzz` job files a tracking issue on failure, after the unchanged red verdict. Pinned by `test_the_nightly_fuzz_workflow_surfaces_a_red_run_as_an_issue`. **Honest limit:** the issue is only visible if the repo is watched; this is a same-day signal, not a pager. |
 | X-9 | A new rule false-positives and blocks unrelated PRs | The audit is disabled out of frustration | 5 | 3 | 4 | 60 | An allow entry with reason/owner/expiry is the escape hatch; `--warn-within` keeps the renewal visible. Warn-mode (`--today` without `--enforce`) is the default, so a diagnosis never needs a red build. |
 | X-10 | The allowlist grows an entry nobody owns | The gate is quietly waived | 6 | 3 | 5 | 90 | `owner` is required by the schema and named in every warning; `invariant_expired_entry_detection_is_unchanged` proves every entry still expires. |
+| X-11 | `copies-row-data-arg` fires on a refcount bump | `Arc::clone(&chunk)` read as a data copy; the only remedy was an allow entry | 3 | 4 | 2 | 24 | `Arc::clone` / `Rc::clone` are exempt from the UFCS rule; every other `X::clone(row-data)` still fires. Pinned by `rule_copies_row_data_arg_does_not_fire_on_refcount_bumps`. |
 
 ## Notes
 

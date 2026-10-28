@@ -8,7 +8,9 @@ The static AST audit (Layer 1) of the P0 OOM guard — see
 [`specs/p0-oom-guard/blueprint.md`](../specs/p0-oom-guard/blueprint.md). It parses
 every audited crate's `src/` with `syn` and reports read-path materialization
 shapes (`Vec<Partition>`/`Vec<Row>` returns, `.collect::<Vec<..>>()` over a scan,
-`read_range(None, None, ..)`, row-data clones, hardcoded result caps, …). It is
+`read_range(None, None, ..)`, row-data clones, hardcoded result caps, …).
+`Arc::clone` / `Rc::clone` are refcount bumps, not copies, and are not
+row-data clones. It is
 **AST-based on purpose**: a source-grep test is what certified the original OOM.
 See the module header of [`src/oom_audit.rs`](src/oom_audit.rs) and decision D2
 in the blueprint.
