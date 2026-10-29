@@ -34,7 +34,7 @@ here so storage and schema share it without a cycle through `ferrosa-sstable`.
 
 | Module | LoC | Responsibility |
 |--------|-----|----------------|
-| `accord` (`src/accord.rs`) | 1177 | Accord `Timestamp`, `TxnId`, ballot newtypes, `HybridLogicalClock` (lock-free, drift-checked `merge`), `BallotGenerator`, `TxnPhase`/`TxnState` |
+| `accord` (`src/accord.rs`) | 1177 | Accord `Timestamp`, `TxnId`, ballot newtypes, `HybridLogicalClock` (coherent time/sequence locking, drift-checked `merge`), `BallotGenerator`, `TxnPhase`/`TxnState` |
 | `cancel` (`src/cancel.rs`) | ~260 | `CancelToken`/`CancelReason`/`Cancelled` (T-021): a `Relaxed`-atomic flag plus a crossbeam `closed()` channel a `select!` blocks on without polling |
 | `schema` (`src/schema.rs`) | 637 | `TableSchema`, `ColumnDefinition`, `PinConfig`; fail-loud `fixed_width_for_marshal_type` / `validate_cell_bytes` / `validate_clustering_shape`; legacy column-order detector |
 | `geometry` (`src/geometry.rs`) | 436 | `Geometry` (Point + single-ring Polygon), WKB `marshal_wkb` / `parse_wkb` |
@@ -142,3 +142,13 @@ allocations fell from 2,400 (6.25/row) to 1,632 (4.25/row).
 ## Immutable scalar scan values
 
 Runtime `CqlValue::Text`/`Ascii` use immutable `SharedText`, and `Blob` uses `CellBytes`. Clones share payload ownership. `SharedText::from_cell` validates UTF-8 once while retaining the original `CellBytes` owner through `bytes::Bytes`/`bytestring::ByteString`; it does not copy the payload when another storage owner is alive. Adopting text allocates an ownership handle, so this is not allocation-free. String constructors transfer their buffer with `.into()`. Retained backing capacity is tracked separately from byte-based equality, ordering, hashing and string serialization. Blob serialization retains the existing strict byte-array representation.
+
+The HLC updates its `(time, sequence)` pair under one short synchronous mutex in
+`now` and `merge`, so concurrent callers cannot reuse a transaction ID through
+a torn pair of atomic operations. Timestamp fields and their serialized encoding
+are unchanged. Sequence exhaustion fails loudly rather than reusing an ID.
+`witness` merges then mints through those same synchronized operations. No I/O or
+await occurs while holding the lock except reading the system clock. Callers
+sharing one node clock may contend; an end-to-end latency budget has not been
+measured. Concurrent uniqueness and the existing drift/monotonicity tests cover
+the clock contract.
