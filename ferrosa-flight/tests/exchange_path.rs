@@ -47,7 +47,7 @@ fn one_row_batch(id: i32, name: &str) -> arrow::record_batch::RecordBatch {
         &[CqlType::Int, CqlType::Varchar],
         &[vec![
             Some(CqlValue::Int(id)),
-            Some(CqlValue::Text(name.to_string())),
+            Some(CqlValue::Text(name.to_string().into())),
         ]],
     )
     .unwrap()

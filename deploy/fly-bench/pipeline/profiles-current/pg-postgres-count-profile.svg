@@ -1,0 +1,1726 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="438" onload="init(evt)" viewBox="0 0 1200 438" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="438.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >pipeline_bolt_protocol_139_profile_pg-postgres-count-profile CPU</text>
+<text id="details" x="10.00" y="421" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="421" > </text>
+<g id="frames">
+<g >
+<title>AllocSetAlloc (1 samples, 0.05%)</title><rect x="1113.3" y="197" width="0.7" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="1116.34" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (10 samples, 0.53%)</title><rect x="1091.4" y="133" width="6.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1094.35" y="143.5" ></text>
+</g>
+<g >
+<title>[postgres] (6 samples, 0.32%)</title><rect x="630.8" y="117" width="3.8" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="633.79" y="127.5" ></text>
+</g>
+<g >
+<title>GetUserId (2 samples, 0.11%)</title><rect x="36.4" y="197" width="1.2" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="39.39" y="207.5" ></text>
+</g>
+<g >
+<title>getTypeInputInfo (1 samples, 0.05%)</title><rect x="1107.7" y="181" width="0.6" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="1110.69" y="191.5" ></text>
+</g>
+<g >
+<title>MemoryContextReset (16 samples, 0.85%)</title><rect x="54.0" y="197" width="10.0" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="56.98" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="1105.8" y="181" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1108.80" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (5 samples, 0.27%)</title><rect x="1159.8" y="213" width="3.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1162.84" y="223.5" ></text>
+</g>
+<g >
+<title>StartReadBuffers (10 samples, 0.53%)</title><rect x="949.4" y="69" width="6.2" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="952.35" y="79.5" ></text>
+</g>
+<g >
+<title>heap_page_prune_opt (5 samples, 0.27%)</title><rect x="895.3" y="101" width="3.2" height="15.0" fill="rgb(211,29,7)" rx="2" ry="2" />
+<text  x="898.31" y="111.5" ></text>
+</g>
+<g >
+<title>UnregisterSnapshot (2 samples, 0.11%)</title><rect x="1130.3" y="117" width="1.3" height="15.0" fill="rgb(212,33,7)" rx="2" ry="2" />
+<text  x="1133.31" y="127.5" ></text>
+</g>
+<g >
+<title>pgstat_count_io_op (3 samples, 0.16%)</title><rect x="946.2" y="85" width="1.9" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="949.21" y="95.5" ></text>
+</g>
+<g >
+<title>main (1,871 samples, 99.63%)</title><rect x="10.0" y="341" width="1175.6" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="13.00" y="351.5" >main</text>
+</g>
+<g >
+<title>palloc (1 samples, 0.05%)</title><rect x="1158.0" y="245" width="0.6" height="15.0" fill="rgb(211,29,7)" rx="2" ry="2" />
+<text  x="1160.96" y="255.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (7 samples, 0.37%)</title><rect x="1185.6" y="341" width="4.4" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1188.60" y="351.5" ></text>
+</g>
+<g >
+<title>[postgres] (18 samples, 0.96%)</title><rect x="32.6" y="229" width="11.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="35.62" y="239.5" ></text>
+</g>
+<g >
+<title>relation_open (6 samples, 0.32%)</title><rect x="1099.5" y="101" width="3.8" height="15.0" fill="rgb(227,105,25)" rx="2" ry="2" />
+<text  x="1102.52" y="111.5" ></text>
+</g>
+<g >
+<title>ExecInitRangeTable (1 samples, 0.05%)</title><rect x="1113.3" y="213" width="0.7" height="15.0" fill="rgb(253,224,53)" rx="2" ry="2" />
+<text  x="1116.34" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1107.7" y="165" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1110.69" y="175.5" ></text>
+</g>
+<g >
+<title>LockRelationOid (2 samples, 0.11%)</title><rect x="34.5" y="213" width="1.3" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="37.50" y="223.5" ></text>
+</g>
+<g >
+<title>IsTransactionOrTransactionBlock (1 samples, 0.05%)</title><rect x="15.0" y="261" width="0.7" height="15.0" fill="rgb(219,66,15)" rx="2" ry="2" />
+<text  x="18.03" y="271.5" ></text>
+</g>
+<g >
+<title>[unknown] (7 samples, 0.37%)</title><rect x="1185.6" y="357" width="4.4" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1188.60" y="367.5" ></text>
+</g>
+<g >
+<title>pq_getmsgint (1 samples, 0.05%)</title><rect x="1185.0" y="261" width="0.6" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="1187.97" y="271.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="1095.1" y="85" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1098.12" y="95.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerEnlarge (1 samples, 0.05%)</title><rect x="926.1" y="85" width="0.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="929.10" y="95.5" ></text>
+</g>
+<g >
+<title>[postgres] (1,601 samples, 85.25%)</title><rect x="64.7" y="197" width="1005.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="67.66" y="207.5" >[postgres]</text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1098.9" y="133" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1101.89" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (18 samples, 0.96%)</title><rect x="1164.9" y="197" width="11.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1167.87" y="207.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerCreate (1 samples, 0.05%)</title><rect x="1151.7" y="197" width="0.6" height="15.0" fill="rgb(208,16,3)" rx="2" ry="2" />
+<text  x="1154.67" y="207.5" ></text>
+</g>
+<g >
+<title>PortalDefineQuery (1 samples, 0.05%)</title><rect x="15.7" y="261" width="0.6" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="18.65" y="271.5" ></text>
+</g>
+<g >
+<title>[postgres] (1,368 samples, 72.84%)</title><rect x="161.4" y="181" width="859.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="164.43" y="191.5" >[postgres]</text>
+</g>
+<g >
+<title>ReadyForQuery (2 samples, 0.11%)</title><rect x="1115.2" y="245" width="1.3" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="1118.23" y="255.5" ></text>
+</g>
+<g >
+<title>ExecAssignExprContext (3 samples, 0.16%)</title><rect x="1080.0" y="181" width="1.9" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="1083.04" y="191.5" ></text>
+</g>
+<g >
+<title>StartTransactionCommand (10 samples, 0.53%)</title><rect x="1146.0" y="229" width="6.3" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1149.02" y="239.5" ></text>
+</g>
+<g >
+<title>standard_ExecutorStart (2 samples, 0.11%)</title><rect x="1180.6" y="245" width="1.2" height="15.0" fill="rgb(245,188,45)" rx="2" ry="2" />
+<text  x="1183.58" y="255.5" ></text>
+</g>
+<g >
+<title>resetStringInfo (1 samples, 0.05%)</title><rect x="1179.9" y="245" width="0.7" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="1182.95" y="255.5" ></text>
+</g>
+<g >
+<title>[postgres] (30 samples, 1.60%)</title><rect x="1159.2" y="229" width="18.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1162.21" y="239.5" ></text>
+</g>
+<g >
+<title>exprTypmod (1 samples, 0.05%)</title><rect x="1097.6" y="133" width="0.7" height="15.0" fill="rgb(211,27,6)" rx="2" ry="2" />
+<text  x="1100.64" y="143.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (1 samples, 0.05%)</title><rect x="159.5" y="165" width="0.7" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="162.54" y="175.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="1021.0" y="165" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1023.98" y="175.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerEnlarge (1 samples, 0.05%)</title><rect x="739.5" y="117" width="0.6" height="15.0" fill="rgb(223,86,20)" rx="2" ry="2" />
+<text  x="742.49" y="127.5" ></text>
+</g>
+<g >
+<title>relation_close (1 samples, 0.05%)</title><rect x="1136.6" y="117" width="0.6" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="1139.59" y="127.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1114.6" y="229" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1117.60" y="239.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="10.0" y="229" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="239.5" ></text>
+</g>
+<g >
+<title>palloc0 (1 samples, 0.05%)</title><rect x="1070.6" y="197" width="0.6" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="1073.62" y="207.5" ></text>
+</g>
+<g >
+<title>LWLockAcquire (1 samples, 0.05%)</title><rect x="1151.0" y="197" width="0.7" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1154.04" y="207.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerForget (3 samples, 0.16%)</title><rect x="740.1" y="117" width="1.9" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="743.12" y="127.5" ></text>
+</g>
+<g >
+<title>ExecInterpExprStillValid (2 samples, 0.11%)</title><rect x="495.1" y="165" width="1.2" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="498.07" y="175.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="1080.0" y="165" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1083.04" y="175.5" ></text>
+</g>
+<g >
+<title>pq_getbyte (31 samples, 1.65%)</title><rect x="1159.2" y="245" width="19.5" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1162.21" y="255.5" ></text>
+</g>
+<g >
+<title>GetAwaitedLock (1 samples, 0.05%)</title><rect x="1139.1" y="149" width="0.6" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="1142.11" y="159.5" ></text>
+</g>
+<g >
+<title>pq_sendcountedtext (1 samples, 0.05%)</title><rect x="1070.0" y="181" width="0.6" height="15.0" fill="rgb(247,194,46)" rx="2" ry="2" />
+<text  x="1072.99" y="191.5" ></text>
+</g>
+<g >
+<title>heap_getnextslot (91 samples, 4.85%)</title><rect x="963.8" y="165" width="57.2" height="15.0" fill="rgb(213,40,9)" rx="2" ry="2" />
+<text  x="966.80" y="175.5" >heap_g..</text>
+</g>
+<g >
+<title>ModifyWaitEvent (1 samples, 0.05%)</title><rect x="1159.2" y="213" width="0.6" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="1162.21" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (4 samples, 0.21%)</title><rect x="1094.5" y="101" width="2.5" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1097.49" y="111.5" ></text>
+</g>
+<g >
+<title>secure_read (24 samples, 1.28%)</title><rect x="1163.0" y="213" width="15.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="1165.98" y="223.5" ></text>
+</g>
+<g >
+<title>ExecResetTupleTable (3 samples, 0.16%)</title><rect x="1133.5" y="117" width="1.8" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="1136.45" y="127.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (2 samples, 0.11%)</title><rect x="27.0" y="229" width="1.2" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="29.96" y="239.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerForget (1 samples, 0.05%)</title><rect x="1136.0" y="101" width="0.6" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="1138.96" y="111.5" ></text>
+</g>
+<g >
+<title>read_stream_begin_relation (8 samples, 0.43%)</title><rect x="629.5" y="133" width="5.1" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="632.53" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="26.3" y="213" width="0.7" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="29.34" y="223.5" ></text>
+</g>
+<g >
+<title>smgrnblocks (3 samples, 0.16%)</title><rect x="627.6" y="85" width="1.9" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="630.65" y="95.5" ></text>
+</g>
+<g >
+<title>[postgres] (1,870 samples, 99.57%)</title><rect x="10.6" y="277" width="1175.0" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.63" y="287.5" >[postgres]</text>
+</g>
+<g >
+<title>[postgres] (58 samples, 3.09%)</title><rect x="1119.0" y="245" width="36.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1122.00" y="255.5" >[po..</text>
+</g>
+<g >
+<title>hash_search (1 samples, 0.05%)</title><rect x="26.3" y="229" width="0.7" height="15.0" fill="rgb(216,55,13)" rx="2" ry="2" />
+<text  x="29.34" y="239.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (1 samples, 0.05%)</title><rect x="1151.7" y="181" width="0.6" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="1154.67" y="191.5" ></text>
+</g>
+<g >
+<title>ExecReadyInterpretedExpr (3 samples, 0.16%)</title><rect x="1081.9" y="149" width="1.9" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="1084.93" y="159.5" ></text>
+</g>
+<g >
+<title>AtEOXact_SPI (2 samples, 0.11%)</title><rect x="1125.3" y="197" width="1.2" height="15.0" fill="rgb(216,50,12)" rx="2" ry="2" />
+<text  x="1128.28" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (4 samples, 0.21%)</title><rect x="1149.8" y="213" width="2.5" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1152.79" y="223.5" ></text>
+</g>
+<g >
+<title>AtEOXact_Snapshot (1 samples, 0.05%)</title><rect x="1126.5" y="197" width="0.7" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1129.54" y="207.5" ></text>
+</g>
+<g >
+<title>PreCommit_Portals (14 samples, 0.75%)</title><rect x="1129.1" y="181" width="8.7" height="15.0" fill="rgb(221,76,18)" rx="2" ry="2" />
+<text  x="1132.05" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="632.7" y="69" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="635.67" y="79.5" ></text>
+</g>
+<g >
+<title>get_tablespace_io_concurrency (3 samples, 0.16%)</title><rect x="632.7" y="101" width="1.9" height="15.0" fill="rgb(246,189,45)" rx="2" ry="2" />
+<text  x="635.67" y="111.5" ></text>
+</g>
+<g >
+<title>LockReleaseAll (4 samples, 0.21%)</title><rect x="1139.7" y="149" width="2.5" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="1142.73" y="159.5" ></text>
+</g>
+<g >
+<title>heap_getnextslot (523 samples, 27.85%)</title><rect x="634.6" y="149" width="328.6" height="15.0" fill="rgb(213,40,9)" rx="2" ry="2" />
+<text  x="637.56" y="159.5" >heap_getnextslot</text>
+</g>
+<g >
+<title>build_aggregate_transfn_expr (1 samples, 0.05%)</title><rect x="1107.1" y="165" width="0.6" height="15.0" fill="rgb(248,201,48)" rx="2" ry="2" />
+<text  x="1110.06" y="175.5" ></text>
+</g>
+<g >
+<title>ReceiveSharedInvalidMessages (1 samples, 0.05%)</title><rect x="1147.9" y="213" width="0.6" height="15.0" fill="rgb(211,27,6)" rx="2" ry="2" />
+<text  x="1150.90" y="223.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerForget (1 samples, 0.05%)</title><rect x="1093.2" y="101" width="0.7" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="1096.24" y="111.5" ></text>
+</g>
+<g >
+<title>SearchPathMatchesCurrentEnvironment (3 samples, 0.16%)</title><rect x="35.8" y="213" width="1.8" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="38.76" y="223.5" ></text>
+</g>
+<g >
+<title>AcceptInvalidationMessages (1 samples, 0.05%)</title><rect x="1146.6" y="213" width="0.7" height="15.0" fill="rgb(241,167,40)" rx="2" ry="2" />
+<text  x="1149.65" y="223.5" ></text>
+</g>
+<g >
+<title>pgaio_enter_batchmode (4 samples, 0.21%)</title><rect x="959.4" y="101" width="2.5" height="15.0" fill="rgb(234,133,32)" rx="2" ry="2" />
+<text  x="962.40" y="111.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (1 samples, 0.05%)</title><rect x="1079.4" y="181" width="0.6" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="1082.41" y="191.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="625.1" y="149" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="628.13" y="159.5" ></text>
+</g>
+<g >
+<title>secure_write (2 samples, 0.11%)</title><rect x="1154.2" y="213" width="1.2" height="15.0" fill="rgb(235,138,33)" rx="2" ry="2" />
+<text  x="1157.19" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (4 samples, 0.21%)</title><rect x="1075.0" y="181" width="2.5" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1078.02" y="191.5" ></text>
+</g>
+<g >
+<title>pq_getmsgint (1 samples, 0.05%)</title><rect x="1178.7" y="245" width="0.6" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="1181.69" y="255.5" ></text>
+</g>
+<g >
+<title>pq_endmessage (1 samples, 0.05%)</title><rect x="1115.9" y="229" width="0.6" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="1118.86" y="239.5" ></text>
+</g>
+<g >
+<title>pgstat_count_backend_io_op (1 samples, 0.05%)</title><rect x="955.0" y="53" width="0.6" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="958.01" y="63.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="734.5" y="101" width="1.8" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="737.46" y="111.5" ></text>
+</g>
+<g >
+<title>[postgres] (1,871 samples, 99.63%)</title><rect x="10.0" y="309" width="1175.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="319.5" >[postgres]</text>
+</g>
+<g >
+<title>ExecShutdownNode (1 samples, 0.05%)</title><rect x="49.0" y="213" width="0.6" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="51.96" y="223.5" ></text>
+</g>
+<g >
+<title>PortalCleanup (1 samples, 0.05%)</title><rect x="1129.1" y="165" width="0.6" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="1132.05" y="175.5" ></text>
+</g>
+<g >
+<title>[postgres] (10 samples, 0.53%)</title><rect x="37.6" y="213" width="6.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="40.65" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (2 samples, 0.11%)</title><rect x="1088.2" y="133" width="1.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1091.21" y="143.5" ></text>
+</g>
+<g >
+<title>GetNextLocalTransactionId (1 samples, 0.05%)</title><rect x="1147.3" y="213" width="0.6" height="15.0" fill="rgb(252,217,52)" rx="2" ry="2" />
+<text  x="1150.27" y="223.5" ></text>
+</g>
+<g >
+<title>MemoryContextReset (43 samples, 2.29%)</title><rect x="598.1" y="149" width="27.0" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="601.12" y="159.5" >M..</text>
+</g>
+<g >
+<title>UnregisterSnapshot (1 samples, 0.05%)</title><rect x="1136.0" y="117" width="0.6" height="15.0" fill="rgb(212,33,7)" rx="2" ry="2" />
+<text  x="1138.96" y="127.5" ></text>
+</g>
+<g >
+<title>FetchPreparedStatement (1 samples, 0.05%)</title><rect x="12.5" y="261" width="0.6" height="15.0" fill="rgb(227,101,24)" rx="2" ry="2" />
+<text  x="15.51" y="271.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1069.4" y="149" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1072.36" y="159.5" ></text>
+</g>
+<g >
+<title>[postgres] (6 samples, 0.32%)</title><rect x="747.7" y="101" width="3.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="750.66" y="111.5" ></text>
+</g>
+<g >
+<title>IsSharedRelation (1 samples, 0.05%)</title><rect x="39.5" y="181" width="0.7" height="15.0" fill="rgb(217,59,14)" rx="2" ry="2" />
+<text  x="42.53" y="191.5" ></text>
+</g>
+<g >
+<title>ExecInitScanTupleSlot (2 samples, 0.11%)</title><rect x="1098.3" y="149" width="1.2" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="1101.26" y="159.5" ></text>
+</g>
+<g >
+<title>GetCachedPlan (1 samples, 0.05%)</title><rect x="13.1" y="261" width="0.7" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="16.14" y="271.5" ></text>
+</g>
+<g >
+<title>PostgresMain (1,855 samples, 98.78%)</title><rect x="16.3" y="261" width="1165.5" height="15.0" fill="rgb(227,103,24)" rx="2" ry="2" />
+<text  x="19.28" y="271.5" >PostgresMain</text>
+</g>
+<g >
+<title>getTypeOutputInfo (3 samples, 0.16%)</title><rect x="1021.0" y="181" width="1.9" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1023.98" y="191.5" ></text>
+</g>
+<g >
+<title>[postgres] (2 samples, 0.11%)</title><rect x="1085.1" y="149" width="1.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1088.07" y="159.5" ></text>
+</g>
+<g >
+<title>palloc0 (1 samples, 0.05%)</title><rect x="1103.9" y="149" width="0.6" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="1106.92" y="159.5" ></text>
+</g>
+<g >
+<title>ReleaseBuffer (5 samples, 0.27%)</title><rect x="865.2" y="117" width="3.1" height="15.0" fill="rgb(220,71,17)" rx="2" ry="2" />
+<text  x="868.15" y="127.5" ></text>
+</g>
+<g >
+<title>SetCurrentStatementStartTimestamp (2 samples, 0.11%)</title><rect x="1116.5" y="245" width="1.2" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="1119.49" y="255.5" ></text>
+</g>
+<g >
+<title>ExecStoreBufferHeapTuple (15 samples, 0.80%)</title><rect x="588.7" y="149" width="9.4" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="591.69" y="159.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="632.0" y="101" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="635.04" y="111.5" ></text>
+</g>
+<g >
+<title>[postgres] (5 samples, 0.27%)</title><rect x="951.9" y="53" width="3.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="954.86" y="63.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="46.4" y="213" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="49.44" y="223.5" ></text>
+</g>
+<g >
+<title>ExecBuildAggTrans (5 samples, 0.27%)</title><rect x="1083.8" y="181" width="3.2" height="15.0" fill="rgb(236,146,34)" rx="2" ry="2" />
+<text  x="1086.81" y="191.5" ></text>
+</g>
+<g >
+<title>VirtualXactLockTableInsert (1 samples, 0.05%)</title><rect x="1149.2" y="213" width="0.6" height="15.0" fill="rgb(225,94,22)" rx="2" ry="2" />
+<text  x="1152.16" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="1118.4" y="245" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1121.37" y="255.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="10.0" y="213" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="223.5" ></text>
+</g>
+<g >
+<title>AtCommit_Notify (1 samples, 0.05%)</title><rect x="1120.9" y="197" width="0.6" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="1123.88" y="207.5" ></text>
+</g>
+<g >
+<title>ReleaseCatCache (1 samples, 0.05%)</title><rect x="1093.2" y="117" width="0.7" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="1096.24" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="1114.0" y="213" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1116.97" y="223.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (1 samples, 0.05%)</title><rect x="30.1" y="229" width="0.6" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="33.11" y="239.5" ></text>
+</g>
+<g >
+<title>AtEOXact_Aio (1 samples, 0.05%)</title><rect x="1121.5" y="197" width="0.6" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="1124.51" y="207.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (3 samples, 0.16%)</title><rect x="906.0" y="69" width="1.9" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="909.00" y="79.5" ></text>
+</g>
+<g >
+<title>ReleaseBuffer (5 samples, 0.27%)</title><rect x="736.3" y="117" width="3.2" height="15.0" fill="rgb(220,71,17)" rx="2" ry="2" />
+<text  x="739.35" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.11%)</title><rect x="1152.3" y="213" width="1.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1155.30" y="223.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (2 samples, 0.11%)</title><rect x="25.1" y="213" width="1.2" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="28.08" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (41 samples, 2.18%)</title><rect x="1120.3" y="213" width="25.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1123.26" y="223.5" >[..</text>
+</g>
+<g >
+<title>llseek (3 samples, 0.16%)</title><rect x="627.6" y="69" width="1.9" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="630.65" y="79.5" ></text>
+</g>
+<g >
+<title>PostmasterMain (1,871 samples, 99.63%)</title><rect x="10.0" y="325" width="1175.6" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="13.00" y="335.5" >PostmasterMain</text>
+</g>
+<g >
+<title>RelationGetNumberOfBlocksInFork (4 samples, 0.21%)</title><rect x="627.0" y="117" width="2.5" height="15.0" fill="rgb(242,173,41)" rx="2" ry="2" />
+<text  x="630.02" y="127.5" ></text>
+</g>
+<g >
+<title>planstate_tree_walker_impl (1 samples, 0.05%)</title><rect x="1069.4" y="133" width="0.6" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="1072.36" y="143.5" ></text>
+</g>
+<g >
+<title>LockRelationOid (6 samples, 0.32%)</title><rect x="40.2" y="181" width="3.7" height="15.0" fill="rgb(228,108,25)" rx="2" ry="2" />
+<text  x="43.16" y="191.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1134.7" y="101" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1137.71" y="111.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerCreate (1 samples, 0.05%)</title><rect x="1148.5" y="213" width="0.7" height="15.0" fill="rgb(208,16,3)" rx="2" ry="2" />
+<text  x="1151.53" y="223.5" ></text>
+</g>
+<g >
+<title>hash_search (1 samples, 0.05%)</title><rect x="43.3" y="149" width="0.6" height="15.0" fill="rgb(216,55,13)" rx="2" ry="2" />
+<text  x="46.30" y="159.5" ></text>
+</g>
+<g >
+<title>[postgres] (9 samples, 0.48%)</title><rect x="1137.8" y="181" width="5.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1140.85" y="191.5" ></text>
+</g>
+<g >
+<title>PortalDrop (13 samples, 0.69%)</title><rect x="1129.7" y="165" width="8.1" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="1132.68" y="175.5" ></text>
+</g>
+<g >
+<title>BufTableLookup (3 samples, 0.16%)</title><rect x="950.0" y="53" width="1.9" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="952.98" y="63.5" ></text>
+</g>
+<g >
+<title>LWLockRelease (5 samples, 0.27%)</title><rect x="862.0" y="117" width="3.2" height="15.0" fill="rgb(217,58,13)" rx="2" ry="2" />
+<text  x="865.01" y="127.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="863.3" y="101" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="866.27" y="111.5" ></text>
+</g>
+<g >
+<title>GetCommandTagNameAndLen (2 samples, 0.11%)</title><rect x="13.8" y="261" width="1.2" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="16.77" y="271.5" ></text>
+</g>
+<g >
+<title>OidInputFunctionCall (2 samples, 0.11%)</title><rect x="1110.8" y="197" width="1.3" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="1113.83" y="207.5" ></text>
+</g>
+<g >
+<title>MemoryContextReset (29 samples, 1.54%)</title><rect x="141.3" y="181" width="18.2" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="144.32" y="191.5" ></text>
+</g>
+<g >
+<title>ExecGetRangeTableRelation (6 samples, 0.32%)</title><rect x="1099.5" y="133" width="3.8" height="15.0" fill="rgb(241,167,39)" rx="2" ry="2" />
+<text  x="1102.52" y="143.5" ></text>
+</g>
+<g >
+<title>PredicateLockRelation (1 samples, 0.05%)</title><rect x="625.8" y="133" width="0.6" height="15.0" fill="rgb(215,47,11)" rx="2" ry="2" />
+<text  x="628.76" y="143.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1137.2" y="149" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1140.22" y="159.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1142.2" y="149" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1145.25" y="159.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerRemember (1 samples, 0.05%)</title><rect x="752.7" y="133" width="0.6" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="755.68" y="143.5" ></text>
+</g>
+<g >
+<title>ExecCheckPermissions (6 samples, 0.32%)</title><rect x="1073.8" y="213" width="3.7" height="15.0" fill="rgb(240,161,38)" rx="2" ry="2" />
+<text  x="1076.76" y="223.5" ></text>
+</g>
+<g >
+<title>table_open (1 samples, 0.05%)</title><rect x="1103.3" y="133" width="0.6" height="15.0" fill="rgb(237,147,35)" rx="2" ry="2" />
+<text  x="1106.29" y="143.5" ></text>
+</g>
+<g >
+<title>GetSnapshotData (1 samples, 0.05%)</title><rect x="46.4" y="229" width="0.7" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="49.44" y="239.5" ></text>
+</g>
+<g >
+<title>CommitTransactionCommand (41 samples, 2.18%)</title><rect x="1120.3" y="229" width="25.7" height="15.0" fill="rgb(205,4,1)" rx="2" ry="2" />
+<text  x="1123.26" y="239.5" >C..</text>
+</g>
+<g >
+<title>heap_beginscan (14 samples, 0.75%)</title><rect x="625.8" y="149" width="8.8" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="628.76" y="159.5" ></text>
+</g>
+<g >
+<title>PortalCleanup (11 samples, 0.59%)</title><rect x="1130.3" y="149" width="6.9" height="15.0" fill="rgb(220,69,16)" rx="2" ry="2" />
+<text  x="1133.31" y="159.5" ></text>
+</g>
+<g >
+<title>RelationIdGetRelation (5 samples, 0.27%)</title><rect x="1100.1" y="85" width="3.2" height="15.0" fill="rgb(212,32,7)" rx="2" ry="2" />
+<text  x="1103.15" y="95.5" ></text>
+</g>
+<g >
+<title>AtEOXact_LogicalRepWorkers (1 samples, 0.05%)</title><rect x="1122.8" y="197" width="0.6" height="15.0" fill="rgb(231,119,28)" rx="2" ry="2" />
+<text  x="1125.77" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="1075.6" y="165" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1078.64" y="175.5" ></text>
+</g>
+<g >
+<title>[postgres] (30 samples, 1.60%)</title><rect x="1127.2" y="197" width="18.8" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1130.17" y="207.5" ></text>
+</g>
+<g >
+<title>pg_server_to_client (1 samples, 0.05%)</title><rect x="1068.7" y="181" width="0.7" height="15.0" fill="rgb(206,6,1)" rx="2" ry="2" />
+<text  x="1071.73" y="191.5" ></text>
+</g>
+<g >
+<title>LockAcquireExtended (6 samples, 0.32%)</title><rect x="40.2" y="165" width="3.7" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="43.16" y="175.5" ></text>
+</g>
+<g >
+<title>postgres (1,878 samples, 100.00%)</title><rect x="10.0" y="373" width="1180.0" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="13.00" y="383.5" >postgres</text>
+</g>
+<g >
+<title>LockReleaseAll (1 samples, 0.05%)</title><rect x="1138.5" y="165" width="0.6" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="1141.48" y="175.5" ></text>
+</g>
+<g >
+<title>pq_getbyte (1 samples, 0.05%)</title><rect x="1184.3" y="261" width="0.7" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="1187.35" y="271.5" ></text>
+</g>
+<g >
+<title>SysCacheGetAttr (1 samples, 0.05%)</title><rect x="1104.5" y="181" width="0.7" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="1107.55" y="191.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="10.0" y="197" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="207.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.05%)</title><rect x="1086.3" y="149" width="0.7" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1089.33" y="159.5" ></text>
+</g>
+<g >
+<title>[postgres] (334 samples, 17.78%)</title><rect x="753.3" y="133" width="209.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="756.31" y="143.5" >[postgres]</text>
+</g>
+<g >
+<title>heap_prepare_pagescan (43 samples, 2.29%)</title><rect x="871.4" y="117" width="27.1" height="15.0" fill="rgb(222,82,19)" rx="2" ry="2" />
+<text  x="874.44" y="127.5" >h..</text>
+</g>
+<g >
+<title>CreateCheckPoint (1 samples, 0.05%)</title><rect x="10.0" y="261" width="0.6" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="13.00" y="271.5" ></text>
+</g>
+<g >
+<title>analyze_requires_snapshot (1 samples, 0.05%)</title><rect x="1183.7" y="261" width="0.6" height="15.0" fill="rgb(233,129,30)" rx="2" ry="2" />
+<text  x="1186.72" y="271.5" ></text>
+</g>
+<g >
+<title>CreateTemplateTupleDesc (2 samples, 0.11%)</title><rect x="1092.0" y="117" width="1.2" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="1094.98" y="127.5" ></text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="632.7" y="85" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="635.67" y="95.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (1 samples, 0.05%)</title><rect x="1084.4" y="165" width="0.7" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="1087.44" y="175.5" ></text>
+</g>
+<g >
+<title>CheckpointerMain (1 samples, 0.05%)</title><rect x="10.0" y="277" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="287.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerCreate (3 samples, 0.16%)</title><rect x="24.5" y="229" width="1.8" height="15.0" fill="rgb(208,16,3)" rx="2" ry="2" />
+<text  x="27.45" y="239.5" ></text>
+</g>
+<g >
+<title>ExecInitSeqScan (26 samples, 1.38%)</title><rect x="1088.2" y="165" width="16.3" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1091.21" y="175.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="64.0" y="197" width="0.7" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="67.04" y="207.5" ></text>
+</g>
+<g >
+<title>secure_read (1 samples, 0.05%)</title><rect x="1178.1" y="229" width="0.6" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="1181.06" y="239.5" ></text>
+</g>
+<g >
+<title>tag_hash (1 samples, 0.05%)</title><rect x="962.5" y="101" width="0.7" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="965.55" y="111.5" ></text>
+</g>
+<g >
+<title>[postgres] (11 samples, 0.59%)</title><rect x="949.4" y="85" width="6.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="952.35" y="95.5" ></text>
+</g>
+<g >
+<title>pq_getmsgstring (1 samples, 0.05%)</title><rect x="1179.3" y="245" width="0.6" height="15.0" fill="rgb(233,133,31)" rx="2" ry="2" />
+<text  x="1182.32" y="255.5" ></text>
+</g>
+<g >
+<title>IsCatalogRelation (1 samples, 0.05%)</title><rect x="630.2" y="117" width="0.6" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="633.16" y="127.5" ></text>
+</g>
+<g >
+<title>AllocSetContextCreateInternal (1 samples, 0.05%)</title><rect x="1080.0" y="149" width="0.7" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="1083.04" y="159.5" ></text>
+</g>
+<g >
+<title>ProcReleaseLocks (6 samples, 0.32%)</title><rect x="1139.1" y="165" width="3.8" height="15.0" fill="rgb(217,59,14)" rx="2" ry="2" />
+<text  x="1142.11" y="175.5" ></text>
+</g>
+<g >
+<title>StartReadBuffer (73 samples, 3.89%)</title><rect x="902.2" y="101" width="45.9" height="15.0" fill="rgb(222,78,18)" rx="2" ry="2" />
+<text  x="905.23" y="111.5" >Star..</text>
+</g>
+<g >
+<title>[postgres] (3 samples, 0.16%)</title><rect x="943.7" y="69" width="1.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="946.70" y="79.5" ></text>
+</g>
+<g >
+<title>AllocSetFree (1 samples, 0.05%)</title><rect x="1130.9" y="101" width="0.7" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1133.94" y="111.5" ></text>
+</g>
+<g >
+<title>TransactionBlockStatusCode (1 samples, 0.05%)</title><rect x="1115.2" y="229" width="0.7" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="1118.23" y="239.5" ></text>
+</g>
+<g >
+<title>PushActiveSnapshotWithLevel (1 samples, 0.05%)</title><rect x="1114.6" y="245" width="0.6" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="1117.60" y="255.5" ></text>
+</g>
+<g >
+<title>ExprEvalPushStep (3 samples, 0.16%)</title><rect x="1085.1" y="165" width="1.9" height="15.0" fill="rgb(251,214,51)" rx="2" ry="2" />
+<text  x="1088.07" y="175.5" ></text>
+</g>
+<g >
+<title>[postgres] (5 samples, 0.27%)</title><rect x="626.4" y="133" width="3.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="629.39" y="143.5" ></text>
+</g>
+<g >
+<title>planstate_tree_walker_impl (1 samples, 0.05%)</title><rect x="1069.4" y="181" width="0.6" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="1072.36" y="191.5" ></text>
+</g>
+<g >
+<title>palloc0 (3 samples, 0.16%)</title><rect x="1108.9" y="181" width="1.9" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="1111.95" y="191.5" ></text>
+</g>
+<g >
+<title>uint32_hash (1 samples, 0.05%)</title><rect x="1102.7" y="69" width="0.6" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="1105.66" y="79.5" ></text>
+</g>
+<g >
+<title>ExecInitNode (28 samples, 1.49%)</title><rect x="1087.0" y="181" width="17.5" height="15.0" fill="rgb(221,75,18)" rx="2" ry="2" />
+<text  x="1089.95" y="191.5" ></text>
+</g>
+<g >
+<title>ExecutorRun (1 samples, 0.05%)</title><rect x="48.3" y="229" width="0.7" height="15.0" fill="rgb(245,188,45)" rx="2" ry="2" />
+<text  x="51.33" y="239.5" ></text>
+</g>
+<g >
+<title>hash_search (1 samples, 0.05%)</title><rect x="633.3" y="69" width="0.6" height="15.0" fill="rgb(216,55,13)" rx="2" ry="2" />
+<text  x="636.30" y="79.5" ></text>
+</g>
+<g >
+<title>ExecCheckOneRelPerms (5 samples, 0.27%)</title><rect x="1074.4" y="197" width="3.1" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="1077.39" y="207.5" ></text>
+</g>
+<g >
+<title>ExecInitResultTypeTL (14 samples, 0.75%)</title><rect x="1089.5" y="149" width="8.8" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="1092.47" y="159.5" ></text>
+</g>
+<g >
+<title>strlcpy (1 samples, 0.05%)</title><rect x="28.2" y="229" width="0.6" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="31.22" y="239.5" ></text>
+</g>
+<g >
+<title>SearchSysCache1 (1 samples, 0.05%)</title><rect x="1074.4" y="181" width="0.6" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="1077.39" y="191.5" ></text>
+</g>
+<g >
+<title>ReleaseBuffer (1 samples, 0.05%)</title><rect x="752.1" y="133" width="0.6" height="15.0" fill="rgb(220,71,17)" rx="2" ry="2" />
+<text  x="755.06" y="143.5" ></text>
+</g>
+<g >
+<title>LWLockRelease (2 samples, 0.11%)</title><rect x="901.0" y="101" width="1.2" height="15.0" fill="rgb(217,58,13)" rx="2" ry="2" />
+<text  x="903.97" y="111.5" ></text>
+</g>
+<g >
+<title>ExecEndAgg (1 samples, 0.05%)</title><rect x="1132.8" y="117" width="0.7" height="15.0" fill="rgb(247,196,46)" rx="2" ry="2" />
+<text  x="1135.82" y="127.5" ></text>
+</g>
+<g >
+<title>get_hash_value (1 samples, 0.05%)</title><rect x="956.3" y="101" width="0.6" height="15.0" fill="rgb(211,27,6)" rx="2" ry="2" />
+<text  x="959.26" y="111.5" ></text>
+</g>
+<g >
+<title>get_aggregate_argtypes (1 samples, 0.05%)</title><rect x="1112.1" y="197" width="0.6" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="1115.09" y="207.5" ></text>
+</g>
+<g >
+<title>__send (1 samples, 0.05%)</title><rect x="1153.6" y="213" width="0.6" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="1156.56" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="35.1" y="197" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="38.13" y="207.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (2 samples, 0.11%)</title><rect x="10.6" y="261" width="1.3" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="13.63" y="271.5" ></text>
+</g>
+<g >
+<title>ExecConditionalAssignProjectionInfo (1 samples, 0.05%)</title><rect x="1087.6" y="165" width="0.6" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1090.58" y="175.5" ></text>
+</g>
+<g >
+<title>read_stream_begin_relation (1 samples, 0.05%)</title><rect x="963.2" y="149" width="0.6" height="15.0" fill="rgb(240,165,39)" rx="2" ry="2" />
+<text  x="966.17" y="159.5" ></text>
+</g>
+<g >
+<title>RelationDecrementReferenceCount (1 samples, 0.05%)</title><rect x="1135.3" y="117" width="0.7" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1138.34" y="127.5" ></text>
+</g>
+<g >
+<title>IncrBufferRefCount (3 samples, 0.16%)</title><rect x="734.5" y="117" width="1.8" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="737.46" y="127.5" ></text>
+</g>
+<g >
+<title>BuildQueryCompletionString (1 samples, 0.05%)</title><rect x="28.8" y="229" width="0.7" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="31.85" y="239.5" ></text>
+</g>
+<g >
+<title>CommandCounterIncrement (1 samples, 0.05%)</title><rect x="11.9" y="261" width="0.6" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="14.88" y="271.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1069.4" y="165" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1072.36" y="175.5" ></text>
+</g>
+<g >
+<title>string_hash (1 samples, 0.05%)</title><rect x="30.7" y="229" width="0.7" height="15.0" fill="rgb(253,224,53)" rx="2" ry="2" />
+<text  x="33.73" y="239.5" ></text>
+</g>
+<g >
+<title>[postgres] (30 samples, 1.60%)</title><rect x="926.7" y="85" width="18.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="929.73" y="95.5" ></text>
+</g>
+<g >
+<title>epoll_wait (1 samples, 0.05%)</title><rect x="1177.4" y="197" width="0.7" height="15.0" fill="rgb(238,154,36)" rx="2" ry="2" />
+<text  x="1180.43" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (2 samples, 0.11%)</title><rect x="1182.5" y="261" width="1.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1185.46" y="271.5" ></text>
+</g>
+<g >
+<title>hash_search (1 samples, 0.05%)</title><rect x="29.5" y="229" width="0.6" height="15.0" fill="rgb(216,55,13)" rx="2" ry="2" />
+<text  x="32.48" y="239.5" ></text>
+</g>
+<g >
+<title>LWLockRelease (2 samples, 0.11%)</title><rect x="924.8" y="85" width="1.3" height="15.0" fill="rgb(217,58,13)" rx="2" ry="2" />
+<text  x="927.85" y="95.5" ></text>
+</g>
+<g >
+<title>ExecAssignProjectionInfo (3 samples, 0.16%)</title><rect x="1081.9" y="181" width="1.9" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="1084.93" y="191.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="955.6" y="69" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="958.63" y="79.5" ></text>
+</g>
+<g >
+<title>ExecInitNode (1 samples, 0.05%)</title><rect x="1072.5" y="229" width="0.6" height="15.0" fill="rgb(221,75,18)" rx="2" ry="2" />
+<text  x="1075.50" y="239.5" ></text>
+</g>
+<g >
+<title>[postgres] (13 samples, 0.69%)</title><rect x="948.1" y="101" width="8.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="951.09" y="111.5" ></text>
+</g>
+<g >
+<title>LWLockRelease (1 samples, 0.05%)</title><rect x="751.4" y="133" width="0.7" height="15.0" fill="rgb(217,58,13)" rx="2" ry="2" />
+<text  x="754.43" y="143.5" ></text>
+</g>
+<g >
+<title>standard_ExecutorEnd (8 samples, 0.43%)</title><rect x="1132.2" y="133" width="5.0" height="15.0" fill="rgb(241,168,40)" rx="2" ry="2" />
+<text  x="1135.19" y="143.5" ></text>
+</g>
+<g >
+<title>pq_endmessage_reuse (1 samples, 0.05%)</title><rect x="1071.2" y="197" width="0.7" height="15.0" fill="rgb(246,192,46)" rx="2" ry="2" />
+<text  x="1074.25" y="207.5" ></text>
+</g>
+<g >
+<title>FetchPreparedStatement (3 samples, 0.16%)</title><rect x="29.5" y="245" width="1.9" height="15.0" fill="rgb(227,101,24)" rx="2" ry="2" />
+<text  x="32.48" y="255.5" ></text>
+</g>
+<g >
+<title>IncrTupleDescRefCount (1 samples, 0.05%)</title><rect x="1098.3" y="133" width="0.6" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="1101.26" y="143.5" ></text>
+</g>
+<g >
+<title>get_typlenbyval (1 samples, 0.05%)</title><rect x="1108.3" y="181" width="0.6" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="1111.32" y="191.5" ></text>
+</g>
+<g >
+<title>smgrdestroyall (1 samples, 0.05%)</title><rect x="1145.4" y="181" width="0.6" height="15.0" fill="rgb(216,55,13)" rx="2" ry="2" />
+<text  x="1148.39" y="191.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="160.8" y="181" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="163.80" y="191.5" ></text>
+</g>
+<g >
+<title>AtEOXact_RelationCache (1 samples, 0.05%)</title><rect x="1128.4" y="181" width="0.7" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="1131.42" y="191.5" ></text>
+</g>
+<g >
+<title>ExecStoreBufferHeapTuple (94 samples, 5.01%)</title><rect x="692.4" y="133" width="59.0" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="695.36" y="143.5" >ExecSt..</text>
+</g>
+<g >
+<title>[postgres] (8 samples, 0.43%)</title><rect x="38.9" y="197" width="5.0" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="41.90" y="207.5" ></text>
+</g>
+<g >
+<title>ExecInitAgg (52 samples, 2.77%)</title><rect x="1078.2" y="197" width="32.6" height="15.0" fill="rgb(240,162,38)" rx="2" ry="2" />
+<text  x="1081.16" y="207.5" >Ex..</text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1142.9" y="165" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1145.88" y="175.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1022.2" y="149" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1025.24" y="159.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="160.2" y="165" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="163.17" y="175.5" ></text>
+</g>
+<g >
+<title>ExecTargetListLength (1 samples, 0.05%)</title><rect x="1090.7" y="133" width="0.7" height="15.0" fill="rgb(225,95,22)" rx="2" ry="2" />
+<text  x="1093.72" y="143.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1106.4" y="165" width="0.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1109.43" y="175.5" ></text>
+</g>
+<g >
+<title>GetCachedPlan (20 samples, 1.06%)</title><rect x="31.4" y="245" width="12.5" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="34.36" y="255.5" ></text>
+</g>
+<g >
+<title>CheckExprStillValid (2 samples, 0.11%)</title><rect x="495.1" y="149" width="1.2" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="498.07" y="159.5" ></text>
+</g>
+<g >
+<title>__sigsetjmp (2 samples, 0.11%)</title><rect x="1155.4" y="245" width="1.3" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="1158.44" y="255.5" ></text>
+</g>
+<g >
+<title>__vdso_gettimeofday (2 samples, 0.11%)</title><rect x="1116.5" y="229" width="1.2" height="15.0" fill="rgb(222,81,19)" rx="2" ry="2" />
+<text  x="1119.49" y="239.5" ></text>
+</g>
+<g >
+<title>[postgres] (2 samples, 0.11%)</title><rect x="1080.7" y="149" width="1.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1083.67" y="159.5" ></text>
+</g>
+<g >
+<title>ExecAssignExprContext (2 samples, 0.11%)</title><rect x="1088.2" y="149" width="1.3" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="1091.21" y="159.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (3 samples, 0.16%)</title><rect x="950.0" y="37" width="1.9" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="952.98" y="47.5" ></text>
+</g>
+<g >
+<title>AtEOXact_MultiXact (2 samples, 0.11%)</title><rect x="1123.4" y="197" width="1.3" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="1126.40" y="207.5" ></text>
+</g>
+<g >
+<title>read_stream_next_buffer (103 samples, 5.48%)</title><rect x="898.5" y="117" width="64.7" height="15.0" fill="rgb(216,50,12)" rx="2" ry="2" />
+<text  x="901.46" y="127.5" >read_st..</text>
+</g>
+<g >
+<title>OutputFunctionCall (2 samples, 0.11%)</title><rect x="159.5" y="181" width="1.3" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="162.54" y="191.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (2 samples, 0.11%)</title><rect x="1101.4" y="69" width="1.3" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="1104.41" y="79.5" ></text>
+</g>
+<g >
+<title>FreeQueryDesc (1 samples, 0.05%)</title><rect x="1129.7" y="149" width="0.6" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="1132.68" y="159.5" ></text>
+</g>
+<g >
+<title>GetSnapshotData (1 samples, 0.05%)</title><rect x="1073.1" y="213" width="0.7" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="1076.13" y="223.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="894.7" y="101" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="897.69" y="111.5" ></text>
+</g>
+<g >
+<title>ExecBuildProjectionInfo (3 samples, 0.16%)</title><rect x="1081.9" y="165" width="1.9" height="15.0" fill="rgb(236,143,34)" rx="2" ry="2" />
+<text  x="1084.93" y="175.5" ></text>
+</g>
+<g >
+<title>__errno_location (1 samples, 0.05%)</title><rect x="1154.8" y="197" width="0.6" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="1157.81" y="207.5" ></text>
+</g>
+<g >
+<title>pgstat_count_io_op (1 samples, 0.05%)</title><rect x="961.9" y="101" width="0.6" height="15.0" fill="rgb(207,10,2)" rx="2" ry="2" />
+<text  x="964.92" y="111.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (3 samples, 0.16%)</title><rect x="20.7" y="245" width="1.9" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="23.68" y="255.5" ></text>
+</g>
+<g >
+<title>table_block_relation_size (3 samples, 0.16%)</title><rect x="627.6" y="101" width="1.9" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="630.65" y="111.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="10.0" y="245" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="13.00" y="255.5" ></text>
+</g>
+<g >
+<title>[postgres] (2 samples, 0.11%)</title><rect x="924.8" y="69" width="1.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="927.85" y="79.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (1 samples, 0.05%)</title><rect x="34.5" y="181" width="0.6" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="37.50" y="191.5" ></text>
+</g>
+<g >
+<title>enlargeStringInfo (2 samples, 0.11%)</title><rect x="1156.7" y="245" width="1.3" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="1159.70" y="255.5" ></text>
+</g>
+<g >
+<title>[postgres] (1,628 samples, 86.69%)</title><rect x="49.0" y="229" width="1022.9" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="51.96" y="239.5" >[postgres]</text>
+</g>
+<g >
+<title>BufTableLookup (30 samples, 1.60%)</title><rect x="906.0" y="85" width="18.8" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="909.00" y="95.5" ></text>
+</g>
+<g >
+<title>LWLockRelease (2 samples, 0.11%)</title><rect x="1141.0" y="133" width="1.2" height="15.0" fill="rgb(217,58,13)" rx="2" ry="2" />
+<text  x="1143.99" y="143.5" ></text>
+</g>
+<g >
+<title>[postgres] (742 samples, 39.51%)</title><rect x="497.6" y="165" width="466.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="500.58" y="175.5" >[postgres]</text>
+</g>
+<g >
+<title>SetCurrentStatementStartTimestamp (1 samples, 0.05%)</title><rect x="1181.8" y="261" width="0.7" height="15.0" fill="rgb(249,204,48)" rx="2" ry="2" />
+<text  x="1184.83" y="271.5" ></text>
+</g>
+<g >
+<title>EndCommand (1 samples, 0.05%)</title><rect x="28.8" y="245" width="0.7" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="31.85" y="255.5" ></text>
+</g>
+<g >
+<title>pairingheap_remove (1 samples, 0.05%)</title><rect x="1131.6" y="117" width="0.6" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="1134.57" y="127.5" ></text>
+</g>
+<g >
+<title>ExecInitNode (57 samples, 3.04%)</title><rect x="1077.5" y="213" width="35.8" height="15.0" fill="rgb(221,75,18)" rx="2" ry="2" />
+<text  x="1080.53" y="223.5" >Exe..</text>
+</g>
+<g >
+<title>int8inc (73 samples, 3.89%)</title><rect x="1022.9" y="181" width="45.8" height="15.0" fill="rgb(235,138,33)" rx="2" ry="2" />
+<text  x="1025.86" y="191.5" >int8..</text>
+</g>
+<g >
+<title>hash_bytes (4 samples, 0.21%)</title><rect x="956.9" y="101" width="2.5" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="959.89" y="111.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (1 samples, 0.05%)</title><rect x="633.9" y="69" width="0.7" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="636.93" y="79.5" ></text>
+</g>
+<g >
+<title>LockAcquireExtended (1 samples, 0.05%)</title><rect x="34.5" y="197" width="0.6" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="37.50" y="207.5" ></text>
+</g>
+<g >
+<title>AllocSetContextCreateInternal (2 samples, 0.11%)</title><rect x="1088.2" y="117" width="1.3" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="1091.21" y="127.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerForget (2 samples, 0.11%)</title><rect x="867.0" y="101" width="1.3" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="870.04" y="111.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (27 samples, 1.44%)</title><rect x="907.9" y="69" width="16.9" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="910.88" y="79.5" ></text>
+</g>
+<g >
+<title>all (1,878 samples, 100%)</title><rect x="10.0" y="389" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="399.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1141.6" y="117" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1144.62" y="127.5" ></text>
+</g>
+<g >
+<title>GetAdditionalPinLimit (1 samples, 0.05%)</title><rect x="948.7" y="85" width="0.7" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="951.72" y="95.5" ></text>
+</g>
+<g >
+<title>WaitEventSetWait (2 samples, 0.11%)</title><rect x="1163.6" y="197" width="1.3" height="15.0" fill="rgb(222,81,19)" rx="2" ry="2" />
+<text  x="1166.61" y="207.5" ></text>
+</g>
+<g >
+<title>ExecInterpExprStillValid (1 samples, 0.05%)</title><rect x="53.4" y="197" width="0.6" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="56.35" y="207.5" ></text>
+</g>
+<g >
+<title>GetTransactionSnapshot (1 samples, 0.05%)</title><rect x="1073.1" y="229" width="0.7" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="1076.13" y="239.5" ></text>
+</g>
+<g >
+<title>exprTypmod (1 samples, 0.05%)</title><rect x="1097.0" y="117" width="0.6" height="15.0" fill="rgb(211,27,6)" rx="2" ry="2" />
+<text  x="1100.01" y="127.5" ></text>
+</g>
+<g >
+<title>standard_ExecutorStart (65 samples, 3.46%)</title><rect x="1073.8" y="229" width="40.8" height="15.0" fill="rgb(245,188,45)" rx="2" ry="2" />
+<text  x="1076.76" y="239.5" >sta..</text>
+</g>
+<g >
+<title>pgstat_get_transactional_drops (3 samples, 0.16%)</title><rect x="1143.5" y="181" width="1.9" height="15.0" fill="rgb(220,72,17)" rx="2" ry="2" />
+<text  x="1146.50" y="191.5" ></text>
+</g>
+<g >
+<title>AllocSetAlloc (1 samples, 0.05%)</title><rect x="140.7" y="181" width="0.6" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="143.69" y="191.5" ></text>
+</g>
+<g >
+<title>BufferGetBlockNumber (3 samples, 0.16%)</title><rect x="690.5" y="133" width="1.9" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="693.48" y="143.5" ></text>
+</g>
+<g >
+<title>table_open (6 samples, 0.32%)</title><rect x="1099.5" y="117" width="3.8" height="15.0" fill="rgb(237,147,35)" rx="2" ry="2" />
+<text  x="1102.52" y="127.5" ></text>
+</g>
+<g >
+<title>AtEOXact_Namespace (1 samples, 0.05%)</title><rect x="1124.7" y="197" width="0.6" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="1127.65" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (5 samples, 0.27%)</title><rect x="868.3" y="117" width="3.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="871.30" y="127.5" ></text>
+</g>
+<g >
+<title>[postgres] (1 samples, 0.05%)</title><rect x="1108.3" y="165" width="0.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1111.32" y="175.5" ></text>
+</g>
+<g >
+<title>CreateTemplateTupleDesc (1 samples, 0.05%)</title><rect x="1090.1" y="133" width="0.6" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="1093.10" y="143.5" ></text>
+</g>
+<g >
+<title>GetTransactionSnapshot (2 samples, 0.11%)</title><rect x="45.8" y="245" width="1.3" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="48.81" y="255.5" ></text>
+</g>
+<g >
+<title>[postgres] (15 samples, 0.80%)</title><rect x="742.0" y="117" width="9.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="745.00" y="127.5" ></text>
+</g>
+<g >
+<title>PortalStart (68 samples, 3.62%)</title><rect x="1071.9" y="245" width="42.7" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="1074.87" y="255.5" >Port..</text>
+</g>
+<g >
+<title>GetSnapshotData (3 samples, 0.16%)</title><rect x="43.9" y="245" width="1.9" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="46.93" y="255.5" ></text>
+</g>
+<g >
+<title>[postgres] (5 samples, 0.27%)</title><rect x="1152.3" y="229" width="3.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1155.30" y="239.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="1105.2" y="181" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1108.18" y="191.5" ></text>
+</g>
+<g >
+<title>CreatePortal (10 samples, 0.53%)</title><rect x="22.6" y="245" width="6.2" height="15.0" fill="rgb(219,66,16)" rx="2" ry="2" />
+<text  x="25.57" y="255.5" ></text>
+</g>
+<g >
+<title>MemoryContextReset (2 samples, 0.11%)</title><rect x="496.3" y="165" width="1.3" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="499.33" y="175.5" ></text>
+</g>
+<g >
+<title>AtEOXact_LargeObject (1 samples, 0.05%)</title><rect x="1122.1" y="197" width="0.7" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="1125.14" y="207.5" ></text>
+</g>
+<g >
+<title>[postgres] (2 samples, 0.11%)</title><rect x="49.6" y="213" width="1.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="52.58" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.05%)</title><rect x="1115.9" y="213" width="0.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1118.86" y="223.5" ></text>
+</g>
+<g >
+<title>ExecOpenScanRelation (7 samples, 0.37%)</title><rect x="1099.5" y="149" width="4.4" height="15.0" fill="rgb(229,111,26)" rx="2" ry="2" />
+<text  x="1102.52" y="159.5" ></text>
+</g>
+<g >
+<title>ResourceOwnerForget (4 samples, 0.21%)</title><rect x="737.0" y="101" width="2.5" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="739.98" y="111.5" ></text>
+</g>
+<g >
+<title>standard_ExecutorRun (1,625 samples, 86.53%)</title><rect x="50.8" y="213" width="1021.1" height="15.0" fill="rgb(247,196,47)" rx="2" ry="2" />
+<text  x="53.84" y="223.5" >standard_ExecutorRun</text>
+</g>
+<g >
+<title>postmaster_child_launch (1,871 samples, 99.63%)</title><rect x="10.0" y="293" width="1175.6" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="13.00" y="303.5" >postmaster_child_launch</text>
+</g>
+<g >
+<title>pgstat_report_stat (1 samples, 0.05%)</title><rect x="1158.6" y="245" width="0.6" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="1161.58" y="255.5" ></text>
+</g>
+<g >
+<title>FreeQueryDesc (3 samples, 0.16%)</title><rect x="1130.3" y="133" width="1.9" height="15.0" fill="rgb(246,190,45)" rx="2" ry="2" />
+<text  x="1133.31" y="143.5" ></text>
+</g>
+<g >
+<title>LWLockAcquire (4 samples, 0.21%)</title><rect x="892.2" y="101" width="2.5" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="895.17" y="111.5" ></text>
+</g>
+<g >
+<title>PortalRun (1,631 samples, 86.85%)</title><rect x="47.1" y="245" width="1024.8" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="50.07" y="255.5" >PortalRun</text>
+</g>
+<g >
+<title>text_to_cstring (1 samples, 0.05%)</title><rect x="1112.7" y="197" width="0.6" height="15.0" fill="rgb(221,73,17)" rx="2" ry="2" />
+<text  x="1115.72" y="207.5" ></text>
+</g>
+<g >
+<title>__errno_location (2 samples, 0.11%)</title><rect x="1176.2" y="197" width="1.2" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="1179.18" y="207.5" ></text>
+</g>
+<g >
+<title>hash_search_with_hash_value (1 samples, 0.05%)</title><rect x="945.6" y="85" width="0.6" height="15.0" fill="rgb(249,205,49)" rx="2" ry="2" />
+<text  x="948.58" y="95.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1,871 samples, 99.63%)</title><rect x="10.0" y="357" width="1175.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="13.00" y="367.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>AllocSetFree (1 samples, 0.05%)</title><rect x="1134.7" y="85" width="0.6" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1137.71" y="95.5" ></text>
+</g>
+<g >
+<title>TupleDescInitEntry (5 samples, 0.27%)</title><rect x="1093.9" y="117" width="3.1" height="15.0" fill="rgb(233,132,31)" rx="2" ry="2" />
+<text  x="1096.87" y="127.5" ></text>
+</g>
+<g >
+<title>StartTransactionCommand (1 samples, 0.05%)</title><rect x="1117.7" y="245" width="0.7" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="1120.74" y="255.5" ></text>
+</g>
+</g>
+</svg>

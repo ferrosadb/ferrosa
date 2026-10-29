@@ -105,6 +105,17 @@ decomposes partitions to rows via the re-exported
 column mapping), applies projection/LIMIT/paging, and `result.rs` encodes the
 Rows RESULT frame (with `paging_state` when more pages remain).
 
+Scan-order full scans use raw partition/clustering continuation, including when
+`LIMIT` or `ALLOW FILTERING` is present. The limited cursor records the original
+limit and cumulative returned rows; the collector receives only the remaining
+limit. A paged response retains one page and uses one-row lookahead only when
+more rows could be returned. Reaching the global limit needs no lookahead or cursor.
+This avoids both a fetch-size result cap and restarting the scan for each page.
+The configurable 5,000 default is an internal cursor/FTS batch size, not a total
+ordinary-scan limit. Unpaged queries return their complete requested result in
+one protocol response, so their output buffer scales with that result; they
+never advertise a paging state.
+
 Global scalar secondary-index plans use `WritePath::index_read_stream`.
 COUNT folds directly over the bounded-per-hop stream, and a plain `LIMIT` stops
 the consumer at the requested row count. Multi-index AND plans retain only
@@ -255,3 +266,13 @@ jsonb has no CQL literal binding yet: `term_to_cql_value` refuses every literal 
 Storage cells expose immutable `CellBytes` slices. Typed result decoding
 borrows these bytes; legacy blob result values still explicitly own vectors at
 the `CqlValue::Blob` boundary.
+
+Limited scan continuations use a signed, versioned outer envelope (`FF 4C 53`,
+version 1) around the raw scan position and cumulative LIMIT progress. Older
+coordinators reject this envelope instead of interpreting its key as an offset.
+Resume an in-flight limited query from its first page if a coordinator rejects
+its token after an upgrade; unlimited scan tokens retain their existing format.
+
+## Immutable scalar scan values
+
+Plain scalar projection consumes decoded page rows. Identity projection retains the page and row buffers; reordered projection moves cells, and repeated immutable payloads share backing. LIMIT and paging move selected rows rather than cloning a page. Function/UDF/toJson evaluation retains the established evaluation path. Scalar text/blob decoding shares immutable storage backing; wire framing still appends bytes into bounded response buffers. This does not promise end-to-end zero-copy network writes. Page sizes, cursors, row ordering and total-query LIMIT semantics remain unchanged.

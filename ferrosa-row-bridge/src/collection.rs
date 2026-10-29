@@ -383,6 +383,29 @@ pub fn assemble_udt(
     Ok(CqlValue::Udt(out))
 }
 
+pub(crate) fn assemble_owned_simple_cell(
+    col_type: &CqlType,
+    cell: CellValue,
+    now_secs: i32,
+) -> Result<Option<CqlValue>, AssembleError> {
+    if !crate::row::cell_is_live(&cell, now_secs) {
+        return Ok(None);
+    }
+    let Some(bytes) = cell.value else {
+        return Ok(None);
+    };
+    let length = bytes.len();
+    crate::codec::decode_value_owned(col_type, bytes)
+        .map(Some)
+        .map_err(|error| {
+            CORRUPT_ELEMENT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            AssembleError {
+                jsonb: error.jsonb_fault().cloned(),
+                reason: format!("decode simple cell ({length} bytes) as {col_type:?}: {error}"),
+            }
+        })
+}
+
 /// Read-path assembly of a single column's cells into its value — the one place
 /// both the primary SELECT path (`crate::row::decode_output_row`) and the
 /// metadata variant (`ferrosa_cql::bridge`) share, so their collection handling
@@ -518,16 +541,18 @@ pub fn assemble_column_cells(
         return Ok(None);
     }
     match &newest.value {
-        Some(bytes) => decode_value(col_type, bytes).map(Some).map_err(|e| {
-            CORRUPT_ELEMENT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            AssembleError {
-                jsonb: e.jsonb_fault().cloned(),
-                reason: format!(
-                    "decode simple cell ({} bytes) as {col_type:?}: {e}",
-                    bytes.len()
-                ),
-            }
-        }),
+        Some(bytes) => crate::codec::decode_value_owned(col_type, bytes.clone())
+            .map(Some)
+            .map_err(|e| {
+                CORRUPT_ELEMENT_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                AssembleError {
+                    jsonb: e.jsonb_fault().cloned(),
+                    reason: format!(
+                        "decode simple cell ({} bytes) as {col_type:?}: {e}",
+                        bytes.len()
+                    ),
+                }
+            }),
         None => Ok(None),
     }
 }
@@ -537,7 +562,7 @@ mod tests {
     use super::*;
 
     fn t(v: &str) -> CqlValue {
-        CqlValue::Text(v.to_string())
+        CqlValue::Text(v.to_string().into())
     }
 
     /// FM-78 / JB-T8: a corrupt element in a whole-value list, a per-element map

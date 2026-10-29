@@ -97,6 +97,8 @@ pub enum ExecError {
     /// purpose: a lost run would silently shorten the result, so the query
     /// fails rather than returning rows it cannot vouch for.
     Spill(SpillError),
+    /// A provider's exact-count operation failed. Never substitute a scan or zero.
+    Source(String),
     /// A comparison term carries a `::` cast the pure engine cannot resolve. A
     /// cast target's meaning (a relation name to a `pg_class.oid`) lives in the
     /// PostgreSQL front end, which rewrites every cast before planning; reaching
@@ -137,6 +139,7 @@ impl fmt::Display for ExecError {
                 write!(f, "there is no parameter ${n}")
             }
             ExecError::Spill(e) => write!(f, "{e}"),
+            ExecError::Source(message) => write!(f, "{message}"),
             ExecError::UnresolvedCast(ty) => write!(
                 f,
                 "a `::{}` cast was not resolved before planning (the PostgreSQL front end \
@@ -373,6 +376,21 @@ pub fn open_cursor(
     let (scope, combined_schema) = resolve_scope(stmt, catalog, default_schema)?;
 
     let from = resolve_table(catalog, &stmt.from, default_schema)?;
+    if count_all_shape(stmt) {
+        let columns = aggregate_output_columns(stmt, &scope, &combined_schema)?;
+        if let Some(count) = from.count_all() {
+            let count = i64::try_from(count.map_err(ExecError::Source)?)
+                .map_err(|_| ExecError::AggregateOutOfRange("COUNT exceeds bigint range".into()))?;
+            return Ok(RowCursor {
+                columns,
+                rows: limit_offset(
+                    Box::new(std::iter::once(Ok(Row(vec![Value::Int(count)])))),
+                    stmt.offset.unwrap_or(0) as usize,
+                    stmt.limit.map(|n| n as usize),
+                ),
+            });
+        }
+    }
     let join = match &stmt.join {
         Some(j) => Some(resolve_table(catalog, &j.table, default_schema)?),
         None => None,
@@ -384,6 +402,17 @@ pub fn open_cursor(
     let params: Arc<[Value]> = params.into();
     let (columns, rows) = build_pipeline(stmt, &scope, &combined_schema, sources, params, ctx)?;
     Ok(RowCursor { columns, rows })
+}
+
+fn count_all_shape(stmt: &SelectStmt) -> bool {
+    !stmt.distinct
+        && stmt.join.is_none()
+        && stmt.filter.is_none()
+        && stmt.group_by.is_empty()
+        && stmt.having.is_none()
+        && stmt.order_by.is_empty()
+        && matches!(&stmt.projection, Projection::Items(items)
+            if matches!(items.as_slice(), [SelectItem::Aggregate { func: AggFunc::Count, arg: AggArg::Star, .. }]))
 }
 
 /// The scan sources of one query. Their scans own what they read, so the
@@ -1372,7 +1401,7 @@ mod tests {
             .rows
             .iter()
             .map(|row| match row.get(0) {
-                Value::Text(s) => s.clone(),
+                Value::Text(s) => s.to_string(),
                 other => panic!("expected text, got {other:?}"),
             })
             .collect();

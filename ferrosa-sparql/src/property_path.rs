@@ -3,6 +3,9 @@
 //! Implements SPARQL 1.1 property path operators (`+`, `*`, `?`) by
 //! walking the adjacency structure of the triple store. Fixes the
 //! silent single-hop degradation bug (BUG-S7).
+//! Correctness: legacy RDF identity tests and COUNT/JSON/protocol regressions.
+//! Last revised: 2026-10-27
+//! Last changed: Preserve typed scalar term identity through path results.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -18,7 +21,7 @@ use crate::results::Binding;
 use crate::triple_store;
 
 /// Result of evaluating a property path: pairs of (start_node, end_node).
-pub type PathResult = Vec<(String, String)>;
+pub type PathResult = Vec<(Binding, Binding)>;
 
 /// Evaluate a property path pattern against storage.
 ///
@@ -101,6 +104,11 @@ async fn evaluate_closure(
         let reachable = bfs_reachable(start, &adjacency, include_start);
         let filtered = filter_reachable_by_object(object, start, &reachable);
         results.extend(filtered);
+        if results.len() > limits.max_rows {
+            return Err(SparqlError::Execution(
+                "property path result exceeds row bound".into(),
+            ));
+        }
     }
     Ok(results)
 }
@@ -128,6 +136,11 @@ async fn evaluate_zero_or_one(
         for (s, o) in &adjacency {
             if s == start && matches_endpoint(object, o) {
                 results.push((s.clone(), o.clone()));
+                if results.len() > limits.max_rows {
+                    return Err(SparqlError::Execution(
+                        "property path result exceeds row bound".into(),
+                    ));
+                }
             }
         }
     }
@@ -137,15 +150,19 @@ async fn evaluate_zero_or_one(
 /// BFS from a start node, collecting all reachable nodes.
 ///
 /// Uses a visited set for cycle detection.
-fn bfs_reachable(start: &str, adjacency: &[(String, String)], include_start: bool) -> Vec<String> {
+fn bfs_reachable<T: Clone + Eq + std::hash::Hash>(
+    start: &T,
+    adjacency: &[(T, T)],
+    include_start: bool,
+) -> Vec<T> {
     let mut visited = HashSet::new();
     let mut queue = VecDeque::new();
     let mut reachable = Vec::new();
 
     if include_start {
-        reachable.push(start.to_string());
+        reachable.push(start.clone());
     }
-    visited.insert(start.to_string());
+    visited.insert(start.clone());
 
     // Seed queue with direct neighbors.
     for (s, o) in adjacency {
@@ -196,7 +213,7 @@ async fn fetch_triples_for_predicate(
     predicate: &str,
     write_path: &Arc<WritePath>,
     limits: &ExecutionLimits,
-) -> Result<Vec<(String, String)>, SparqlError> {
+) -> Result<PathResult, SparqlError> {
     let table_id = triple_store::triples_table_id(&scope.keyspace);
     let mut partitions = write_path.range_read_stream_all(&table_id, 0).await?;
 
@@ -204,7 +221,11 @@ async fn fetch_triples_for_predicate(
     let mut rows_read: usize = 0;
     while let Some(partition) = partitions.next().await {
         let partition = partition?;
-        let subject = crate::executor::extract_subject_from_key(&partition);
+        let (graph, subject) = triple_store::decode_partition(partition.key.key.as_bytes())?;
+        if scope.isolated_graph && graph != scope.graph {
+            continue;
+        }
+        let subject = node_term(&subject);
         for row in &partition.rows {
             rows_read += 1;
             if rows_read > limits.max_rows {
@@ -216,10 +237,10 @@ async fn fetch_triples_for_predicate(
                     limits.max_rows
                 )));
             }
-            let pred = crate::executor::clustering_component(&row.clustering, 0);
-            if pred == predicate {
-                let obj = crate::executor::clustering_component(&row.clustering, 1);
-                pairs.push((subject.clone(), obj));
+            if let Some((pred, obj)) = triple_store::decode_v2_row(row)? {
+                if pred == predicate {
+                    pairs.push((subject.clone(), obj));
+                }
             }
         }
     }
@@ -227,12 +248,13 @@ async fn fetch_triples_for_predicate(
 }
 
 /// Determine start nodes from the subject pattern.
-fn collect_start_nodes(subject: &TermPattern, adjacency: &[(String, String)]) -> Vec<String> {
+fn collect_start_nodes(subject: &TermPattern, adjacency: &[(Binding, Binding)]) -> Vec<Binding> {
     match subject {
-        TermPattern::NamedNode(n) => vec![n.as_str().to_string()],
+        TermPattern::NamedNode(n) => vec![node_term(n.as_str())],
+        TermPattern::Literal(l) => vec![literal_term(l)],
         _ => {
             // Variable subject: collect all unique subjects from adjacency.
-            let mut starts: Vec<String> = adjacency.iter().map(|(s, _)| s.clone()).collect();
+            let mut starts: Vec<Binding> = adjacency.iter().map(|(s, _)| s.clone()).collect();
             starts.sort();
             starts.dedup();
             starts
@@ -241,11 +263,13 @@ fn collect_start_nodes(subject: &TermPattern, adjacency: &[(String, String)]) ->
 }
 
 /// Check whether a node matches an endpoint pattern.
-fn matches_endpoint(pattern: &TermPattern, node: &str) -> bool {
+fn matches_endpoint(pattern: &TermPattern, node: &Binding) -> bool {
     match pattern {
-        TermPattern::NamedNode(n) => n.as_str() == node,
+        TermPattern::NamedNode(n) => {
+            node.kind() == "uri" && node.scalar_value() == Some(n.as_str())
+        }
         TermPattern::Variable(_) => true,
-        TermPattern::Literal(l) => l.value() == node,
+        TermPattern::Literal(l) => literal_term(l) == *node,
         _ => true,
     }
 }
@@ -253,13 +277,13 @@ fn matches_endpoint(pattern: &TermPattern, node: &str) -> bool {
 /// Filter BFS reachable nodes against the object pattern.
 fn filter_reachable_by_object(
     object: &TermPattern,
-    start: &str,
-    reachable: &[String],
-) -> Vec<(String, String)> {
+    start: &Binding,
+    reachable: &[Binding],
+) -> PathResult {
     reachable
         .iter()
         .filter(|node| matches_endpoint(object, node))
-        .map(|node| (start.to_string(), node.clone()))
+        .map(|node| (start.clone(), node.clone()))
         .collect()
 }
 
@@ -267,7 +291,7 @@ fn filter_reachable_by_object(
 fn filter_by_endpoints(
     subject: &TermPattern,
     object: &TermPattern,
-    triples: &[(String, String)],
+    triples: &[(Binding, Binding)],
 ) -> Result<PathResult, SparqlError> {
     let results = triples
         .iter()
@@ -285,33 +309,31 @@ pub fn path_results_to_bindings(
 ) -> Vec<std::collections::HashMap<String, Binding>> {
     results
         .iter()
-        .map(|(s, o)| {
+        .filter_map(|(s, o)| {
             let mut row = std::collections::HashMap::new();
             if let TermPattern::Variable(var) = subject {
-                row.insert(
-                    var.as_str().to_string(),
-                    Binding {
-                        binding_type: "uri".into(),
-                        value: s.clone(),
-                        datatype: None,
-                        lang: None,
-                    },
-                );
+                row.insert(var.as_str().to_string(), s.clone());
             }
             if let TermPattern::Variable(var) = object {
-                row.insert(
-                    var.as_str().to_string(),
-                    Binding {
-                        binding_type: "uri".into(),
-                        value: o.clone(),
-                        datatype: None,
-                        lang: None,
-                    },
-                );
+                if row.get(var.as_str()).is_some_and(|existing| existing != o) {
+                    return None;
+                }
+                row.insert(var.as_str().to_string(), o.clone());
             }
-            row
+            Some(row)
         })
         .collect()
+}
+
+fn node_term(value: &str) -> Binding {
+    if value.starts_with("_:") {
+        Binding::blank_node(value)
+    } else {
+        Binding::uri(value)
+    }
+}
+fn literal_term(literal: &spargebra::term::Literal) -> Binding {
+    Binding::from_literal(literal)
 }
 
 #[cfg(test)]
@@ -323,12 +345,12 @@ mod tests {
     #[test]
     fn bfs_reachable_detects_cycle() {
         // Graph: A -> B -> C -> A (cycle)
-        let adjacency = vec![
+        let adjacency: Vec<(String, String)> = vec![
             ("A".into(), "B".into()),
             ("B".into(), "C".into()),
             ("C".into(), "A".into()),
         ];
-        let reachable = bfs_reachable("A", &adjacency, false);
+        let reachable = bfs_reachable(&"A".to_string(), &adjacency, false);
         // Should find B and C (and A via cycle), but not loop forever.
         assert!(reachable.contains(&"B".to_string()));
         assert!(reachable.contains(&"C".to_string()));
@@ -341,8 +363,9 @@ mod tests {
 
     #[test]
     fn bfs_reachable_zero_or_more_includes_start() {
-        let adjacency = vec![("A".into(), "B".into()), ("B".into(), "C".into())];
-        let reachable = bfs_reachable("A", &adjacency, true);
+        let adjacency: Vec<(String, String)> =
+            vec![("A".into(), "B".into()), ("B".into(), "C".into())];
+        let reachable = bfs_reachable(&"A".to_string(), &adjacency, true);
         assert!(
             reachable.contains(&"A".to_string()),
             "ZeroOrMore includes start"
@@ -356,12 +379,12 @@ mod tests {
     #[test]
     fn bfs_multi_hop_returns_transitive_nodes() {
         // Graph: alice -> bob -> carol -> dave
-        let adjacency = vec![
+        let adjacency: Vec<(String, String)> = vec![
             ("alice".into(), "bob".into()),
             ("bob".into(), "carol".into()),
             ("carol".into(), "dave".into()),
         ];
-        let reachable = bfs_reachable("alice", &adjacency, false);
+        let reachable = bfs_reachable(&"alice".to_string(), &adjacency, false);
         assert_eq!(reachable.len(), 3);
         assert!(reachable.contains(&"bob".to_string()));
         assert!(reachable.contains(&"carol".to_string()));
@@ -371,7 +394,7 @@ mod tests {
     #[test]
     fn bfs_single_node_no_edges() {
         let adjacency: Vec<(String, String)> = vec![];
-        let reachable = bfs_reachable("lonely", &adjacency, false);
+        let reachable = bfs_reachable(&"lonely".to_string(), &adjacency, false);
         assert!(
             reachable.is_empty(),
             "no outgoing edges means no reachable nodes"
@@ -381,13 +404,13 @@ mod tests {
     #[test]
     fn bfs_diamond_graph_no_duplicates() {
         // Diamond: A -> B, A -> C, B -> D, C -> D
-        let adjacency = vec![
+        let adjacency: Vec<(String, String)> = vec![
             ("A".into(), "B".into()),
             ("A".into(), "C".into()),
             ("B".into(), "D".into()),
             ("C".into(), "D".into()),
         ];
-        let reachable = bfs_reachable("A", &adjacency, false);
+        let reachable = bfs_reachable(&"A".to_string(), &adjacency, false);
         // D should appear only once despite two paths.
         let d_count = reachable.iter().filter(|n| *n == "D").count();
         assert_eq!(d_count, 1, "diamond graph must not produce duplicate D");
@@ -400,14 +423,14 @@ mod tests {
     fn matches_endpoint_named_node() {
         let pattern =
             TermPattern::NamedNode(spargebra::term::NamedNode::new_unchecked("http://ex/alice"));
-        assert!(matches_endpoint(&pattern, "http://ex/alice"));
-        assert!(!matches_endpoint(&pattern, "http://ex/bob"));
+        assert!(matches_endpoint(&pattern, &node_term("http://ex/alice")));
+        assert!(!matches_endpoint(&pattern, &node_term("http://ex/bob")));
     }
 
     #[test]
     fn matches_endpoint_variable_matches_anything() {
         let pattern = TermPattern::Variable(spargebra::term::Variable::new_unchecked("x"));
-        assert!(matches_endpoint(&pattern, "anything"));
+        assert!(matches_endpoint(&pattern, &node_term("anything")));
     }
 
     // --- extract_single_predicate ---
@@ -436,20 +459,34 @@ mod tests {
     fn collect_start_nodes_bound_subject() {
         let subject =
             TermPattern::NamedNode(spargebra::term::NamedNode::new_unchecked("http://ex/alice"));
-        let adjacency = vec![("other".into(), "x".into())];
-        let starts = collect_start_nodes(&subject, &adjacency);
+        let adjacency: Vec<(String, String)> = vec![("other".into(), "x".into())];
+        let adjacency: Vec<_> = adjacency
+            .iter()
+            .map(|(s, o)| (node_term(s), node_term(o)))
+            .collect();
+        let starts = collect_start_nodes(&subject, &adjacency)
+            .into_iter()
+            .map(|b| b.scalar_value().unwrap().to_owned())
+            .collect::<Vec<_>>();
         assert_eq!(starts, vec!["http://ex/alice"]);
     }
 
     #[test]
     fn collect_start_nodes_variable_subject() {
         let subject = TermPattern::Variable(spargebra::term::Variable::new_unchecked("s"));
-        let adjacency = vec![
+        let adjacency: Vec<(String, String)> = vec![
             ("alice".into(), "bob".into()),
             ("bob".into(), "carol".into()),
             ("alice".into(), "carol".into()),
         ];
-        let starts = collect_start_nodes(&subject, &adjacency);
+        let adjacency: Vec<_> = adjacency
+            .iter()
+            .map(|(s, o)| (node_term(s), node_term(o)))
+            .collect();
+        let starts = collect_start_nodes(&subject, &adjacency)
+            .into_iter()
+            .map(|b| b.scalar_value().unwrap().to_owned())
+            .collect::<Vec<_>>();
         assert_eq!(starts, vec!["alice", "bob"]);
     }
 }

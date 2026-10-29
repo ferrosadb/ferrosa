@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bytes = "1"
+bytestring = { version = "1", features = ["serde"] }
 # `CancelToken`'s `closed` channel (decisions.md D7): the sole mechanism a
 # blocked `select!` uses to wake on cancellation without polling. Lives here
 # (not ferrosa-storage) so a future ferrosa-sstable write pump can share the

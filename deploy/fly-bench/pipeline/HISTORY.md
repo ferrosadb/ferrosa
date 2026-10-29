@@ -1,8 +1,31 @@
 # Experiment record and performance history
 
 Detailed measurements, placement controls and earlier checkpoints.
-Use [current PR #613 results](RESULTS.md) for the final engine comparison.
+Use [current measurement status](RESULTS.md) for the final engine comparison.
 Each experiment below retains its recorded revision and workload.
+
+## Combined protocol and default-write work — PR #625
+
+The follow-up combines automatic scalar-column/index preparation for ordinary
+Bolt writes with the protocol foundation in #625. Explicit transactions retain
+staged read-your-writes, durable commit and rollback; structural label/column
+creation is rejected before metadata can escape the row transaction. A merge
+regression caught a new-column SET succeeding inside BEGIN; the guard now
+rejects it and preserves RESET, rollback and writer release.
+
+A separate live CQL census inserted and counted 20,000 rows but returned only
+5,000 through the driver's normal iteration. The limited scan capped its input
+at the fetch size, then omitted continuation. Scan-order paging now retains raw
+key position plus cumulative LIMIT progress. Fourteen local pagination guards
+cover page boundaries, wide partitions, v4 wire parameters, filtering, changing
+fetch size and authenticated token validation. A signed outer format makes older
+coordinators reject the token instead of treating its key as an offset.
+
+The combined source passes 33 focused Bolt server tests and those 14 pagination
+guards. These are correctness results, not new performance measurements. The
+matched rerun must use independently seeded writable fixtures: #625 adds a
+transaction WAL envelope and RDF v2 identity format that older binaries cannot
+be assumed to replay. Earlier timing tables below remain historical.
 
 ## PostgreSQL findings at the recorded runtime
 
@@ -411,3 +434,173 @@ attribution. Profiled throughput is excluded from the table.
 
 At that checkpoint, the read gap remained open. This change targets INSERT metadata; it
 does not establish bounded MVCC residency or eliminate query/protocol handoffs.
+
+
+## Bolt default-index follow-up after #613 (2026-10-26)
+
+PR #613 merged at `48083a244`. Its graph timing evidence used explicitly declared
+indexes; that does not prove an ordinary Bolt client gets the indexed path.
+The follow-up starts from `9c9dbde02` and removes that benchmark dependency.
+
+TDD first reproduced an ordinary Bolt CREATE creating no scalar indexes. The
+new path creates them on first access, shares setup across connections, and
+refreshes after immutable schema snapshot or write-path replacement. Schema UUIDs
+alone were insufficient: internal table/index mutations can replace the snapshot
+without changing its UUID. Weak snapshot identity avoids retaining old schema maps.
+
+Separate REDs found text, boolean and floating-point equality still decoding all
+64 fixture vertices even with declared indexes. The new scalar probe stream covers
+the evaluator's finite byte aliases and decodes only matching vertices. It retains
+a range fallback for dense epsilon comparisons rather than returning incomplete
+results. Guards also cover concurrent first access, permission-checked table
+scope, backfill, timeout, pre-write failure and retry, index drops, added columns
+and engine recreation. A bounded cluster probe initializes all sources before
+accepting the first result; later topology/readiness changes remain checked by
+ordinary reads.
+
+The public Ferrosa fixture now uses only keyspace CQL DDL plus an ordinary Bolt
+CREATE and targeted sentinel deletion. It cannot conceal default-path regressions
+with manual table/index declarations. Neo4j still requires all three property
+indexes ONLINE. Fresh comparison results must identify the final follow-up runtime;
+none of the earlier timing tables measure this automatic setup path.
+
+
+## First-write Bolt schema follow-up
+
+The first ordinary-write Fly preflight rejected a negative bootstrap value,
+exposing that signed numeric constants were represented as arithmetic instead of
+literals. A regression now covers that path through Bolt. Existing-label writes
+also discarded undeclared properties; first-write scalar column creation now uses
+coordinated ALTER before index initialization and data writes.
+
+The expanded tests exposed an older storage rotation error: sidecar extraction
+used new column ordinals against old frozen rows after adding an earlier-sorting
+column. Target definitions now map into the frozen schema by name, reusing valid
+postings and producing no entries for absent columns. No new performance results
+are claimed until the final binary completes matched-placement validation.
+
+
+## 2026-10-27: combined code, COUNT and JSON 1.2
+
+Current code is `c24cad554`; see [the current comparison](RESULTS.md) and
+[all observations](current-results.json). The previous combined-code record is
+[5b8356172](baseline-5b835-results.json); older checkpoints below retain their
+original revision and workload limits. They are not current product numbers.
+
+- Matched eight-writer PostgreSQL loading failed with SQLSTATE 40P01. That failure
+  is retained; current load comparisons are explicitly matched one-writer runs.
+- Resident count copied Row/Cell metadata although payloads were already shared.
+  The 32-row one/256-column fixture changed from 5,467/462,427 requested bytes to
+  1,083/1,083; predicate count changed from 3,275/231,755 to 1,083/1,083. The old
+  payload-size controls already passed. This isolates an allocation fix; it is
+  not a causal claim about wall-clock count improvements in different epochs.
+- SPARQL COUNT previously failed on unsupported Group algebra. It now produces
+  real server aggregates; current 2,000-record COUNT is 11.536 ms versus
+  Oxigraph 1.333 ms. No client scan is substituted for COUNT timing.
+- Recursive triple/directional SPARQL Results JSON, version-aware negotiation,
+  strict operation cardinality, explicit dataset refusal and service base IRI
+  handling have real HTTP/engine regressions. Persisted RDF 1.2 and full W3C
+  conformance remain outside this increment.
+- Local checks pass 10,242 selected tests with 95 existing configured skips and
+  14 isolated cluster tests; 31 focused cases are included. Independent verification
+  repeated 29 earlier cases and 13 final COUNT/allocation cases, with source review
+  closing two additional findings. Coverage is 96.8% for COUNT, 95.3% negotiation,
+  92.9% protocol and 92.1% serialization; the COUNT streaming helper is 100%.
+- Short point-read rates are close in the current driver. Counts/scans remain
+  real gaps. The lower 30-second profiled PostgreSQL read rate is explicitly
+  separated from short unprofiled results; an instrumentation/duration control
+  is pending. CPU stacks and raw scheduling/RSS/disk/network evidence are retained.
+
+## 2026-10-27: count and scan ownership (a2709e100)
+
+Removed scalar SQL aggregate sorting/spilling, moved owned SQL projection
+payloads, and indexed borrowed shared-subject join keys after reproducing
+rejected-pair allocation growth. Requested allocations at 128 records fell
+18,498,367 → 1,916,787 bytes; 32 → 128 records grew 12.24x before versus 3.78x
+after. The scalar aggregate peak stayed 296 bytes at 100k and 1m rows.
+Pointer-preservation, bag/repeated-variable, input-error and short-row
+regressions pass.
+
+All four products were rerun on matched same-VM pairs with runtime a2709e100.
+SPARQL scans measured 29,937 versus Oxigraph 74,329 rows/s, compared with the
+earlier Ferrosa 1,816 rows/s observation. These are separate benchmark epochs;
+the allocation fixture is the isolated causal proof. SQL COUNT/scan remain
+43.967 ms and 92,742 rows/s versus native 0.865 ms and 420,447 rows/s. Copy/sort
+elimination did not close that gap: the provider still decodes, reconciles MVCC
+and delivers rows. SPARQL predicate scans still scan the table per pattern.
+
+Full local gate: 10,249 passed plus 14 isolated process tests, 95 existing
+skips; changed SQL executable-line coverage 100%, SPARQL 94.23%. Raw observations
+and [ownership evidence](SCAN_COUNTS.md) retain attribution limits. The
+preserved eight-writer 40P01 remains unresolved.
+
+This ownership wave changes read/aggregate paths. Insert-rate differences across
+benchmark epochs are not attributed to these fixes; all observations remain.
+
+## Immutable scalar ownership and COUNT metadata — 2026-10-27
+
+
+Production runtime `2286f389a` combines metadata COUNT and the subsequent scalar
+ownership work. The current table uses one complete balanced matched-VM cohort,
+not the best rate from earlier diagnostic attempts.
+
+## PostgreSQL
+
+| Operation | Before `a2709e100` | Current `2286f389a` | PostgreSQL |
+| --- | ---: | ---: | ---: |
+| INSERT, logical rows/s | 27,535 | 32,641 | 38,993 |
+| Point reads, ops/s | 9,633 | 9,836 | 10,571 |
+| Point-read p50, ms | 0.727 | 0.715 | 0.593 |
+| COUNT p50, ms | 45.716 | 5.496 | 0.672 |
+| Bounded scan, logical rows/s | 98,575 | 98,713 | 487,618 |
+
+One writer, eight point readers, 5,000 rows.
+
+## Cassandra / CQL
+
+| Operation | Before `a2709e100` | Current `2286f389a` | Cassandra |
+| --- | ---: | ---: | ---: |
+| INSERT, logical rows/s | 16,400 | 16,019 | 13,795 |
+| Point reads, ops/s | 3,729 | 3,784 | 3,461 |
+| Point-read p50, ms | 1.811 | 1.782 | 1.945 |
+| COUNT p50, ms | 6.693 | 7.010 | 75.202 |
+| Bounded scan, logical rows/s | 69,816 | 78,713 | 153,079 |
+
+Eight writers/point readers, 20,000 rows; bounded scan returns 10,000 rows. Complete key/value census passed.
+
+
+The CQL row-movement checkpoint removed two clone boundaries before changing
+scalar representation. The later SharedText/CellBytes migration retained stored
+payload pointers through CQL/SQL/clones and preserved legacy serialization. A
+lazy owned iterator replaced the initial decoded-partition Vec after the read
+memory guard rejected that materialization. The guard was fixed, not waived.
+
+PG partial diagnostic cohorts showed scan means91.5k→106.1k and105.3k→110.7k;
+the final cohort is essentially flat. Those differences do not establish a stable
+PG scan gain. CQL's final mean rises12.7%, while both protocols
+still trail native scans. Native and Ferrosa short INSERT rates also vary; every
+leg and range is retained in current-results.json.
+
+The first context-switch recorder emitted GiB-sized text and competed with the
+workload while decoding, eventually exhausting scratch disk before CQL completed.
+A later SSH timeout interrupted profiling. Those incomplete attempts remain
+private evidence. The accepted harness uses sample period 100,64 MiB context-file
+caps, explicit workload stop before decoding, verified download/cleanup,1 GiB
+free-space guards and idempotent profiler start/readback.
+
+Validation: 10,279 main tests + 14 isolated tests passed, 95 existing main-suite
+skips; strict formatting/clippy/docs and repository/read guards passed. A distinct
+verifier passed 9 focused tests. Targeted library coverage passed 278 tests; the new
+SharedText module passed the default 80% gate at 87.4%. Portable benchmark contracts
+passed 9 tests. No new skips/waivers were added. A reconnect test's simultaneous
+peer-return/outage assertion was ordered with a gate, retaining its timing bounds.
+
+See [current comparison](RESULTS.md), [ownership scope](SCAN_COUNTS.md) and
+[profiles](profiles-current/README.md). Bolt/SPARQL remain the older `a270` snapshot.
+
+The published cohort retains one native PostgreSQL leg flagged 2.83% CPU steal
+over three sampled seconds. The native comparison is provisional; no slower
+observation was discarded. Three CQL CPU captures and native PG COUNT completed;
+five PG captures were interrupted by Fly SSH control timeouts. Their absence is
+explicitly recorded, rather than presenting earlier confounded profiles as current.
+All six benchmark machines were verified stopped after the interruption; volumes remain.

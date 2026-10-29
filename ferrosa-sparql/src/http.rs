@@ -13,7 +13,6 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use serde::Deserialize;
 
 use base64::Engine as _;
 use ferrosa_schema::auth::permission::{Permission, Resource};
@@ -63,6 +62,9 @@ pub async fn start_sparql_http(config: &SparqlHttpConfig, state: AppState) -> st
 /// configured, built by the shared `ferrosa_net::tls` builder (one crypto
 /// provider for every listener). `require_tls` without a certificate, or only
 /// one of cert/key, is an error rather than a plaintext fallback.
+#[derive(Clone, Copy)]
+struct ServiceScheme(&'static str);
+
 async fn serve_app(config: &SparqlHttpConfig, app: Router) -> std::io::Result<()> {
     let tls = ferrosa_net::tls::optional_server_config(
         "SPARQL",
@@ -72,6 +74,11 @@ async fn serve_app(config: &SparqlHttpConfig, app: Router) -> std::io::Result<()
         ferrosa_net::tls::HTTP_ALPN,
     )
     .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let app = app.layer(axum::Extension(ServiceScheme(if tls.is_some() {
+        "https"
+    } else {
+        "http"
+    })));
     match tls {
         Some(tls) => {
             tracing::info!(addr = %config.bind_addr, "SPARQL HTTPS server listening");
@@ -187,12 +194,25 @@ fn authorize_keyspace(
 /// and updates alike.
 async fn handle_sparql_post(
     State(state): State<AppState>,
+    uri: axum::http::Uri,
+    scheme: Option<axum::Extension<ServiceScheme>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
     let auth = match authenticate_sparql(state.auth_disabled, &state.schema, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
+    };
+    if let Err(e) = crate::protocol::validate_post_options(&headers, &uri, &body) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
+    let base = match crate::protocol::service_base(
+        &headers,
+        &uri,
+        scheme.as_ref().map_or("http", |s| s.0 .0),
+    ) {
+        Ok(base) => base,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
     let request = match extract_request_from_post(&headers, &body) {
         Ok(r) => r,
@@ -208,41 +228,66 @@ async fn handle_sparql_post(
                 return resp;
             }
             let accept = accept_from_headers(&headers);
-            execute_and_respond(&state, &query, keyspace, accept).await
+            execute_and_respond(&state, &query, keyspace, accept, Some(&base)).await
         }
-        SparqlRequest::Update(update) => run_update(&state, &auth, keyspace, &update).await,
+        SparqlRequest::Update(update) => {
+            // Body is capped at 1 MiB. One prefix preserves a single parser base
+            // for updates; an explicit subsequent BASE still overrides it.
+            let update = format!("BASE <{base}>\n{update}");
+            run_update(&state, &auth, keyspace, &update).await
+        }
     }
 }
 
 /// GET /sparql?query=... — execute a SPARQL query via URL parameter.
-#[derive(Deserialize)]
-struct SparqlGetParams {
-    query: String,
-    #[serde(default = "default_keyspace")]
-    keyspace: String,
-}
-
-fn default_keyspace() -> String {
-    "rdf".into()
-}
-
 async fn handle_sparql_get(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
-    AxumQuery(params): AxumQuery<SparqlGetParams>,
+    uri: axum::http::Uri,
+    scheme: Option<axum::Extension<ServiceScheme>>,
+    AxumQuery(params): AxumQuery<crate::protocol::Parameters>,
 ) -> Response {
     let auth = match authenticate_sparql(state.auth_disabled, &state.schema, &headers) {
         Ok(a) => a,
         Err(resp) => return resp,
     };
-    if let Err(resp) =
-        authorize_keyspace(&state.schema, &auth, &params.keyspace, Permission::Select)
+    if let Err(e) = crate::protocol::validate(&params) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
+    let query = match crate::protocol::one(&params, "query") {
+        Ok(Some(query)) => query,
+        _ => return error_response(StatusCode::BAD_REQUEST, "GET requires exactly one query"),
+    };
+    if crate::protocol::one(&params, "update")
+        .ok()
+        .flatten()
+        .is_some()
     {
+        return error_response(StatusCode::BAD_REQUEST, "GET cannot execute updates");
+    }
+    let keyspace = crate::protocol::one(&params, "keyspace")
+        .ok()
+        .flatten()
+        .unwrap_or("rdf");
+    if let Err(resp) = authorize_keyspace(&state.schema, &auth, keyspace, Permission::Select) {
         return resp;
     }
-
-    let accept = accept_from_headers(&headers);
-    execute_and_respond(&state, &params.query, &params.keyspace, accept).await
+    let base = match crate::protocol::service_base(
+        &headers,
+        &uri,
+        scheme.as_ref().map_or("http", |s| s.0 .0),
+    ) {
+        Ok(base) => base,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
+    execute_and_respond(
+        &state,
+        query,
+        keyspace,
+        accept_from_headers(&headers),
+        Some(&base),
+    )
+    .await
 }
 
 /// POST /sparql/update — execute a SPARQL UPDATE.
@@ -252,6 +297,8 @@ async fn handle_sparql_get(
 /// the endpoint's original behaviour — the `query` parameter or a raw body.
 async fn handle_sparql_update(
     State(state): State<AppState>,
+    uri: axum::http::Uri,
+    scheme: Option<axum::Extension<ServiceScheme>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
@@ -259,12 +306,24 @@ async fn handle_sparql_update(
         Ok(a) => a,
         Err(resp) => return resp,
     };
+    if let Err(e) = crate::protocol::validate_post_options(&headers, &uri, &body) {
+        return error_response(StatusCode::BAD_REQUEST, &e);
+    }
+    let base = match crate::protocol::service_base(
+        &headers,
+        &uri,
+        scheme.as_ref().map_or("http", |s| s.0 .0),
+    ) {
+        Ok(base) => base,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
+    };
     let update_str = match extract_update_from_post(&headers, &body) {
         Ok(u) => u,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e),
     };
 
     let keyspace = keyspace_from_headers(&headers);
+    let update_str = format!("BASE <{base}>\n{update_str}");
     run_update(&state, &auth, keyspace, &update_str).await
 }
 
@@ -341,22 +400,29 @@ async fn execute_and_respond(
     query: &str,
     keyspace: &str,
     accept: &str,
+    base: Option<&str>,
 ) -> Response {
-    let format = crate::results::ResultFormat::from_accept(accept);
-
-    match state.engine.execute(query, keyspace).await {
-        Ok(result) => match result.serialize(format) {
-            Ok(bytes) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, format.content_type())],
-                bytes,
-            )
-                .into_response(),
-            Err(e) => error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("serialization error: {e}"),
-            ),
-        },
+    match state.engine.execute_with_base(query, keyspace, base).await {
+        Ok(result) => {
+            let Some(format) = crate::negotiation::negotiate(accept, &result) else {
+                return error_response(
+                    StatusCode::NOT_ACCEPTABLE,
+                    "no acceptable representation for this query form and RDF terms",
+                );
+            };
+            match result.serialize(format) {
+                Ok(bytes) => (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, format.content_type())],
+                    bytes,
+                )
+                    .into_response(),
+                Err(e) => error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("serialization error: {e}"),
+                ),
+            }
+        }
         Err(crate::error::SparqlError::Parse(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
         Err(crate::error::SparqlError::Plan(msg)) => error_response(StatusCode::BAD_REQUEST, &msg),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
@@ -388,16 +454,18 @@ fn extract_request_from_post(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let content_type = content_type.split(';').next().unwrap_or("").trim();
 
-    if content_type.contains("application/sparql-query") {
+    if content_type.eq_ignore_ascii_case("application/sparql-query") {
         return Ok(SparqlRequest::Query(raw_body_text(body)?));
     }
-    if content_type.contains("application/sparql-update") {
+    if content_type.eq_ignore_ascii_case("application/sparql-update") {
         return Ok(SparqlRequest::Update(raw_body_text(body)?));
     }
-    if content_type.contains("application/x-www-form-urlencoded") {
+    if content_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
         let params: Vec<(String, String)> =
             serde_urlencoded::from_bytes(body).map_err(|e| format!("form parse error: {e}"))?;
+        crate::protocol::validate(&params)?;
         if let Some((_, v)) = params.iter().find(|(k, _)| k == "update") {
             return Ok(SparqlRequest::Update(v.clone()));
         }
@@ -406,9 +474,12 @@ fn extract_request_from_post(
         }
         return Err("SPARQL POST body must name an 'update' or 'query' parameter".into());
     }
-    if content_type.contains("application/json") {
+    if content_type.eq_ignore_ascii_case("application/json") {
         let parsed: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| format!("JSON parse error: {e}"))?;
+        if parsed["query"].is_string() && parsed["update"].is_string() {
+            return Err("JSON body must name exactly one operation".into());
+        }
         if let Some(u) = parsed["update"].as_str() {
             return Ok(SparqlRequest::Update(u.to_string()));
         }

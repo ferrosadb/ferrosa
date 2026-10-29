@@ -1,7 +1,7 @@
 ---
 crate: ferrosa-sql
 status: implemented
-last_updated: 2026-10-09
+last_updated: 2026-10-26
 executive_summary: >
   The bespoke relational query engine (lexer + recursive-descent parser, binder/
   planner, Volcano-style physical operators) behind Ferrosa's Postgres front-end.
@@ -9,7 +9,7 @@ executive_summary: >
   three-valued NULL (Kleene) logic, and C-collation ordering so semantics are
   auditable end-to-end. Its blocking operators (sort, hash aggregate, join build,
   DISTINCT dedup) spill to disk through ferrosa-storage's bounded external merge
-  sort, which is its only ferrosa-* dependency edge (ferrosa-storage).
+  sort, and uses ferrosa-jsonb for validated JSON values.
 ---
 
 # ferrosa-sql — Architecture Overview
@@ -93,7 +93,37 @@ and `ParameterDescription` before binding parameters.
 
 ## Position in the dependency graph
 
-True leaf: **zero** `ferrosa-*` dependencies (verified against `Cargo.toml` —
-only `ordered-float`, `num-bigint`, `uuid`, `chrono`). Depended on by
+Depends on `ferrosa-storage` for spilling and `ferrosa-jsonb` for validated JSON
+values, plus `ordered-float`, `num-bigint`, `uuid`, `chrono`, `serde`, `serde_json`,
+and `tracing`. Depended on by
 `ferrosa-postgres`. See the [root crate index](../../specs/crates.md) for the
 full graph.
+
+## Transaction clock syntax and types (t_6b946676)
+
+The no-FROM scalar grammar recognizes bare `CURRENT_TIMESTAMP` alongside zero-arg
+`now()`, including mixed lists and aliases. It preserves function AST nodes:
+parsing never reads a clock. The PostgreSQL frontend owns transaction/statement
+clock evaluation. `ColumnType::TimestampTz` distinguishes timestamp-with-time-zone
+results from `ColumnType::Timestamp`; both carry `Value::Timestamp` microseconds,
+with the column type supplying temporal interpretation and wire typing. This
+adds no new dependency. Table projections and precision arguments are unchanged.
+
+### Scalar accumulation and projection ownership
+
+Without GROUP BY, `hash_aggregate` updates one accumulator set while borrowing
+each owned row, then releases that row. It performs no sort or spill, including
+over empty input; source and arithmetic errors remain errors. Upstream storage
+still decodes rows and applies MVCC, so COUNT is not a constant-time metadata
+lookup. Grouped aggregation continues to spill under its memory budget.
+Projection transfers owned values into their final output occurrence. Repeated
+columns fork only additional occurrences; identity-prefix projections reuse the
+input row vector. This removes payload copies on ordinary bounded SQL scans.
+
+## Single-row COUNT pushdown
+
+Eligible unfiltered, single-table `COUNT(*)` calls the optional `TableProvider::count_all` capability before opening a row cursor. Aliases, BIGINT overflow checking, LIMIT and OFFSET retain normal semantics. WHERE, joins, grouping, HAVING, DISTINCT, ORDER BY and COUNT(expression) use the ordinary executor. Unsupported capabilities return `None`; a source error fails the statement rather than falling back to a potentially different answer.
+
+## Immutable scalar scan values
+
+`Value::Text` is immutable `ferrosa_common::SharedText`; `Value::Bytea` is immutable `CellBytes`. Clone and repeated projection share payload backing. Comparisons, ordering, hashing and JSON spill representation retain value semantics, with legacy string/byte-array fixtures. Construct owned strings and vectors with `.into()` to transfer their buffers. Mutable string/byte transformations create new values explicitly. The direct dependency on ferrosa-common supplies these shared value types.

@@ -293,6 +293,38 @@ pub(crate) struct SstableDescriptor {
     /// Whether either persisted key bound uses the legacy non-byte-comparable
     /// encoding and therefore needs a sorting rewrite.
     pub legacy_format: bool,
+    /// What compaction planning last reported about this generation's local
+    /// components, shared by every clone of the descriptor so a view swap
+    /// does not reset it. Planning runs over every SSTable on every pass, so
+    /// it reports a change of state, never the state itself (t_c14245f9).
+    planning_report: Arc<std::sync::atomic::AtomicU8>,
+}
+
+/// Compaction planning's view of one generation's local components, as stored
+/// in [`SstableDescriptor::planning_report`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum PlanningComponents {
+    /// Every required component is on local disk (the initial state).
+    Local = 0,
+    /// Local components are missing but `Data.db` has a remote length, so the
+    /// generation is evicted and execution can rehydrate it.
+    Evicted = 1,
+    /// Missing locally and no remote length: planning skips it.
+    Unplannable = 2,
+}
+
+impl PlanningComponents {
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            0 => Self::Local,
+            1 => Self::Evicted,
+            2 => Self::Unplannable,
+            other => {
+                unreachable!("planning_report holds only PlanningComponents values, got {other}")
+            }
+        }
+    }
 }
 
 /// Normalise every last-write-wins timestamp `row` carries (cells, primary-key
@@ -383,7 +415,20 @@ impl SstableDescriptor {
             max_timestamp: header.max_timestamp,
             partition_count: reader.key_count(),
             legacy_format,
+            planning_report: Arc::new(std::sync::atomic::AtomicU8::new(
+                PlanningComponents::Local as u8,
+            )),
         }
+    }
+
+    /// Record that planning now sees this generation's components as `now`,
+    /// returning the state it saw before. Equal values mean nothing changed
+    /// and nothing is reported.
+    fn swap_planning_report(&self, now: PlanningComponents) -> PlanningComponents {
+        PlanningComponents::from_u8(
+            self.planning_report
+                .swap(now as u8, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     fn compaction_metadata(
@@ -420,23 +465,49 @@ impl SstableDescriptor {
         if self.dir.as_os_str().is_empty() {
             return Some(metadata);
         }
+        // Planning runs over every SSTable on every maintenance pass, so each
+        // branch reports only when this generation's state CHANGES: once when
+        // it is evicted, once when it is local again, once when it becomes
+        // unplannable. A per-pass warning logged the same evicted generations
+        // 18–72 times a minute on every dev node (t_c14245f9).
         match sstable_compaction_component_size(&metadata.path, &metadata.id) {
-            Some(size_bytes) => metadata.size_bytes = size_bytes,
+            Some(size_bytes) => {
+                metadata.size_bytes = size_bytes;
+                let before = self.swap_planning_report(PlanningComponents::Local);
+                if before != PlanningComponents::Local {
+                    tracing::info!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        previously = ?before,
+                        "compaction planning: SSTable local components are present again"
+                    );
+                }
+            }
             None if sstable_compaction_remote_component_available(&metadata.path, &metadata.id) => {
-                tracing::warn!(
-                    sstable_id = %metadata.id,
-                    table_dir = ?metadata.path,
-                    size_bytes = metadata.size_bytes,
-                    "compaction planning: SSTable local components are missing or empty; \
-                     using cached verified-reader size and allowing execution to rehydrate inputs"
-                );
+                if self.swap_planning_report(PlanningComponents::Evicted)
+                    != PlanningComponents::Evicted
+                {
+                    tracing::warn!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        size_bytes = metadata.size_bytes,
+                        "compaction planning: SSTable local components are missing or empty; \
+                         using cached verified-reader size and allowing execution to rehydrate inputs \
+                         (reported once per eviction, not per planning pass)"
+                    );
+                }
             }
             None => {
-                tracing::warn!(
-                    sstable_id = %metadata.id,
-                    table_dir = ?metadata.path,
-                    "compaction planning: skipping SSTable because required components are missing or empty and no remote length is registered"
-                );
+                if self.swap_planning_report(PlanningComponents::Unplannable)
+                    != PlanningComponents::Unplannable
+                {
+                    tracing::warn!(
+                        sstable_id = %metadata.id,
+                        table_dir = ?metadata.path,
+                        "compaction planning: skipping SSTable because required components are missing \
+                         or empty and no remote length is registered (reported once, not per planning pass)"
+                    );
+                }
                 return None;
             }
         }
@@ -845,7 +916,7 @@ impl IndexCatalog {
     }
 
     /// This catalog with every column ordinal remapped from `old_schema`'s
-    /// regular-column layout onto `new_schema`'s.
+    /// flat static-plus-regular column layout onto `new_schema`'s.
     ///
     /// Regular columns are ordered by Cassandra's column-name comparator, so
     /// `ALTER TABLE ADD` of a column that sorts before an indexed column
@@ -858,7 +929,10 @@ impl IndexCatalog {
     fn remapped_onto(&self, old_schema: &TableSchema, new_schema: &TableSchema) -> Self {
         let mut catalog = self.clone();
         let remap = |index_name: &str, pos: &mut usize| {
-            let Some(old_col) = old_schema.regular_columns.get(*pos) else {
+            let Some(old_col) = u16::try_from(*pos)
+                .ok()
+                .and_then(|ordinal| old_schema.column_at_ordinal(ordinal))
+            else {
                 tracing::error!(
                     index = index_name,
                     position = *pos,
@@ -867,11 +941,7 @@ impl IndexCatalog {
                 );
                 return;
             };
-            match new_schema
-                .regular_columns
-                .iter()
-                .position(|c| c.name == old_col.name)
-            {
+            match new_schema.column_index(&old_col.name).map(usize::from) {
                 Some(new_pos) => {
                     if new_pos != *pos {
                         tracing::info!(
@@ -981,6 +1051,37 @@ impl IndexCatalog {
             self.index_type_for(index_name),
             self.index_filter_predicates.get(index_name),
         ))
+    }
+
+    /// Interpret target index definitions against a frozen row layout.
+    /// A column absent from that layout has no cells: its sentinel ordinal
+    /// cannot equal any u16 cell tag, so extraction produces no postings.
+    /// This catalog is local to sidecar building, never published to writers.
+    fn for_source_schema(&self, target: &TableSchema, source: &TableSchema) -> Self {
+        let mut catalog = self.clone();
+        let remap = |position: &mut usize| {
+            *position = u16::try_from(*position)
+                .ok()
+                .and_then(|ordinal| target.column_at_ordinal(ordinal))
+                .and_then(|column| source.column_index(&column.name))
+                .map(usize::from)
+                .unwrap_or(usize::MAX);
+        };
+        for (_, position) in &mut catalog.indexed_columns {
+            remap(position);
+        }
+        for (_, position) in &mut catalog.fulltext_indexes {
+            remap(position);
+        }
+        for config in &mut catalog.vector_index_configs {
+            remap(&mut config.column_position);
+        }
+        for predicate in catalog.index_filter_predicates.values_mut() {
+            for clause in &mut predicate.clauses {
+                remap(&mut clause.column_position);
+            }
+        }
+        catalog
     }
 
     /// Whether this catalog declares an index named `index_name`, of any kind.
@@ -5521,7 +5622,7 @@ impl<F: FlushTarget> TableStore<F> {
         // reloads the view.
         let new_active: Arc<dyn Memtable> = new_memtable();
         let phase_start = Instant::now();
-        let target_catalog = {
+        let (target_catalog, target_schema) = {
             let old_view = self.view.load_full();
             let flush_schema = Arc::clone(&old_view.indexes.schema);
             let flush_catalog = Arc::clone(&old_view.indexes.catalog);
@@ -5532,7 +5633,8 @@ impl<F: FlushTarget> TableStore<F> {
             if !Arc::ptr_eq(&target_schema, &flush_schema) {
                 self.schema.store(Arc::clone(&target_schema));
             }
-            let fresh_indexes = new_indexes(Arc::clone(&target_catalog), target_schema);
+            let fresh_indexes =
+                new_indexes(Arc::clone(&target_catalog), Arc::clone(&target_schema));
             let fresh_vector_indexes = new_vector_indexes(&target_catalog.vector_index_configs);
             let frozen_active = Arc::clone(&old_view.active);
             let old_indexes = Arc::clone(&old_view.indexes);
@@ -5580,7 +5682,7 @@ impl<F: FlushTarget> TableStore<F> {
             // Writers that load the view from here on write to the new
             // memtable; seal the old one and wait out the writes inside it.
             old_indexes.gate.seal_and_drain(MEMTABLE_SEAL_DEADLINE)?;
-            target_catalog
+            (target_catalog, target_schema)
         };
         crate::metrics::observe_flush_phase(
             crate::metrics::FlushPhase::SwapMemtable,
@@ -5605,7 +5707,8 @@ impl<F: FlushTarget> TableStore<F> {
         }
         let mut outcome = FlushOutcome::NothingToFlush;
         for memtable in &sealed {
-            if self.flush_sealed(memtable, &target_catalog, total_start)? == FlushOutcome::Published
+            if self.flush_sealed(memtable, &target_catalog, &target_schema, total_start)?
+                == FlushOutcome::Published
             {
                 outcome = FlushOutcome::Published;
             }
@@ -5620,6 +5723,7 @@ impl<F: FlushTarget> TableStore<F> {
         &self,
         sealed: &Arc<SealedMemtable>,
         target_catalog: &Arc<IndexCatalog>,
+        target_schema: &Arc<TableSchema>,
         total_start: Instant,
     ) -> Result<FlushOutcome> {
         let old_active = Arc::clone(&sealed.memtable);
@@ -5739,12 +5843,17 @@ impl<F: FlushTarget> TableStore<F> {
             );
         }
 
-        // Step 5a': the memtable speaks flat ordinals (statics first, static
-        // cells inside clustered rows); an SSTable numbers statics and regulars
-        // separately and holds statics in the static row. Convert here, in
-        // place, before any header is built (t_65661473).
-        for p in partitions.iter_mut() {
-            crate::ordinal_space::flat_into_sstable_space(p, schema.static_columns.len())?;
+        // Sidecars consume memtable FLAT cell ordinals. Indexed flushes
+        // convert in place only after extraction; early unindexed branches
+        // already need SSTable ordinal space for their writers.
+        let indexed_flush = flush_catalog.declares_any() || target_catalog.declares_any();
+        if !indexed_flush {
+            for partition in &mut partitions {
+                crate::ordinal_space::flat_into_sstable_space(
+                    partition,
+                    schema.static_columns.len(),
+                )?;
+            }
         }
 
         if partitions.is_empty() {
@@ -5786,7 +5895,7 @@ impl<F: FlushTarget> TableStore<F> {
                 )));
             }
             Some(Ok(config)) => {
-                if flush_catalog.declares_any() || target_catalog.declares_any() {
+                if indexed_flush {
                     return Err(ferrosa_common::Error::InvalidData(format!(
                         "{}.{} sets {} so a flush writes one generation per window, but the \
                          table declares a secondary, vector or full-text index: a memtable's \
@@ -5819,7 +5928,7 @@ impl<F: FlushTarget> TableStore<F> {
         // fulltext/vector steps stay exactly as-is.
         // Sidecars are written for the target catalog (see Step 5b), so a
         // flush whose rotation added an index must take the indexed path.
-        let can_shard = !flush_catalog.declares_any() && !target_catalog.declares_any();
+        let can_shard = !indexed_flush;
         let num_shards = flush::desired_flush_shards(
             partitions.len(),
             can_shard,
@@ -5848,7 +5957,16 @@ impl<F: FlushTarget> TableStore<F> {
         // memtable to get here: an index it dropped gets no sidecar, and an
         // index it added is posted now from the frozen rows, which no write
         // can reach any more.
-        let sidecar_indexes = self.flush_sidecar_indexes(&old_indexes, target_catalog, &partitions);
+        // Catalog edits use the target layout; frozen rows keep their original
+        // ordinals. Normalize definitions once, without remapping/copying rows.
+        // Ordinary flushes borrow the catalog and allocate nothing here.
+        let source_catalog = if Arc::ptr_eq(&flush_schema, target_schema) {
+            std::borrow::Cow::Borrowed(target_catalog.as_ref())
+        } else {
+            std::borrow::Cow::Owned(target_catalog.for_source_schema(target_schema, &flush_schema))
+        };
+        let sidecar_indexes =
+            self.flush_sidecar_indexes(&old_indexes, &source_catalog, &partitions);
         // Serve exactly these postings for the flushing memtable until the
         // sidecar is installed: an index the rotating DDL added now reads the
         // frozen rows too, and one it dropped no longer answers from them.
@@ -5858,7 +5976,7 @@ impl<F: FlushTarget> TableStore<F> {
         // its own index, or one built from the rows for an index the rotating
         // DDL added. The same map feeds the vector sidecars below.
         let flush_vector_indexes: Arc<HashMap<String, Arc<VectorMemtableIndex>>> = Arc::new(
-            target_catalog
+            source_catalog
                 .vector_index_configs
                 .iter()
                 .map(|cfg| {
@@ -5877,12 +5995,7 @@ impl<F: FlushTarget> TableStore<F> {
         // when it declares the index). Built before encoding, from the rows as
         // the memtable holds them; written once the generation is known.
         let mut fti_sidecars: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
-        for (index_name, target_pos) in &target_catalog.fulltext_indexes {
-            let col_pos = flush_catalog
-                .fulltext_indexes
-                .iter()
-                .find(|(name, _)| name == index_name)
-                .map_or(target_pos, |(_, frozen_pos)| frozen_pos);
+        for (index_name, col_pos) in &source_catalog.fulltext_indexes {
             let mut fti_builder = ferrosa_index::fulltext::builder::FullTextIndexBuilder::new();
             for partition in &partitions {
                 let pk_bytes = partition.key.key.as_bytes();
@@ -5915,6 +6028,15 @@ impl<F: FlushTarget> TableStore<F> {
                 index_name.clone(),
                 fti_builder.finish().map_err(|e| e.to_string()),
             ));
+        }
+
+        if indexed_flush {
+            for partition in &mut partitions {
+                crate::ordinal_space::flat_into_sstable_space(
+                    partition,
+                    schema.static_columns.len(),
+                )?;
+            }
         }
 
         let header = flush::header_for_flush(&schema, &partitions);
@@ -6840,6 +6962,26 @@ impl<F: FlushTarget> TableStore<F> {
         end: Option<&DecoratedKey>,
         matches: &dyn Fn(&DecoratedKey) -> bool,
     ) -> Result<u64> {
+        self.count_range_matching_impl(start, end, matches, false)
+    }
+
+    /// Exact single-row liveness count; TTL/deletion cases retain full cell LWW.
+    pub fn count_live_single_row_range_matching(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+    ) -> Result<u64> {
+        self.count_range_matching_impl(start, end, matches, true)
+    }
+
+    fn count_range_matching_impl(
+        &self,
+        start: Option<&DecoratedKey>,
+        end: Option<&DecoratedKey>,
+        matches: &dyn Fn(&DecoratedKey) -> bool,
+        live_single_row: bool,
+    ) -> Result<u64> {
         let view = self.view.load_full();
         let start_owned = start.cloned();
         let end_owned = end.cloned();
@@ -6864,14 +7006,6 @@ impl<F: FlushTarget> TableStore<F> {
         )?;
         let sstables_slice = &sst_readers[..];
 
-        let mut merger = crate::range_merger::merger_for_metadata_sources(
-            active_iter,
-            flushing_iters,
-            sstables_slice,
-            start_owned,
-            end_owned,
-        )?;
-
         let mut total: u64 = 0;
         // Each row in the merged partition contributes 1 to the
         // count unless its tombstone marker covers it.
@@ -6893,8 +7027,33 @@ impl<F: FlushTarget> TableStore<F> {
                 c.max_token,
             ));
         }
+        let schema = self.schema.load_full();
+        let mut merger = if live_single_row {
+            crate::range_merger::merger_for_live_single_row_count(
+                active_iter,
+                flushing_iters,
+                sstables_slice,
+                start_owned,
+                end_owned,
+                &schema,
+                !table_delete.is_live(),
+            )?
+        } else {
+            crate::range_merger::merger_for_metadata_sources(
+                active_iter,
+                flushing_iters,
+                sstables_slice,
+                start_owned,
+                end_owned,
+            )?
+        };
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            .min(i32::MAX as u64) as i32;
         while let Some(p) = merger.next_merged_partition()? {
-            if !matches(&p.key) || crate::table_tombstone::is_table_tombstone_key(&p.key) {
+            if crate::table_tombstone::is_table_tombstone_key(&p.key) {
                 continue;
             }
             let p = if !table_delete.is_live()
@@ -6902,11 +7061,23 @@ impl<F: FlushTarget> TableStore<F> {
             {
                 let mut owned = Arc::unwrap_or_clone(p);
                 merge::apply_table_deletion(&mut owned, table_delete);
-                owned
+                std::borrow::Cow::Owned(owned)
             } else {
-                Arc::unwrap_or_clone(p)
+                // Counting observes row metadata; it does not need an owned
+                // copy of every resident cell. Keep the merger's shared view.
+                std::borrow::Cow::Borrowed(p.as_ref())
             };
-            total = total.saturating_add(p.rows.len() as u64);
+            // Resolve snapshot predicates only after this pinned physical image
+            // (including any exceptional cell reads) has been obtained.
+            if !matches(&p.key) {
+                continue;
+            }
+            let rows = if live_single_row {
+                p.rows.iter().filter(|r| r.is_visible_at(now_secs)).count()
+            } else {
+                p.rows.len()
+            };
+            total = total.saturating_add(rows as u64);
             if p.static_row.is_some() {
                 total = total.saturating_add(1);
             }
@@ -16963,6 +17134,96 @@ mod tests {
         );
     }
 
+    /// Count the lines of `logs` that carry `needle`.
+    fn log_lines_with(logs: &crate::upload::config::tests::CapturedLogs, needle: &str) -> usize {
+        logs.text()
+            .lines()
+            .filter(|line| line.contains(needle))
+            .count()
+    }
+
+    /// An evicted generation (Data.db in S3, not on disk) is a designed steady
+    /// state, and every maintenance pass plans over every SSTable of every
+    /// table. Warning on each pass logged the same three to thirty-six
+    /// generations 18–72 times a minute on every dev node for days
+    /// (t_c14245f9). The planner must still plan the generation each pass, but
+    /// report it once per transition: evicted, local again, evicted again.
+    #[test]
+    fn compaction_planning_reports_an_evicted_sstable_on_each_transition_not_each_pass() {
+        const EVICTED: &str = "compaction planning: SSTable local components are missing or empty";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        store
+            .write(&make_key("evicted-planning"), make_row(b"v1", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let gen = store.last_flush_generation();
+        let data_path = tmp.path().join(format!("{gen}-Data.db"));
+        let data = std::fs::read(&data_path).unwrap();
+        let remote_path = data_path.clone();
+        let remote_len = data.len() as u64;
+        ferrosa_sstable::io::register_file_read_len_hook(Arc::new(move |path| {
+            Ok((path == remote_path.as_path()).then_some(remote_len))
+        }));
+
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            std::fs::remove_file(&data_path).unwrap();
+            for _ in 0..5 {
+                assert_eq!(
+                    store.sstable_metadata(tmp.path()).len(),
+                    1,
+                    "an evicted generation with a remote Data.db stays plannable"
+                );
+            }
+            assert_eq!(
+                log_lines_with(&logs, EVICTED),
+                1,
+                "one report per eviction:\n{}",
+                logs.text()
+            );
+
+            std::fs::write(&data_path, &data).unwrap();
+            for _ in 0..3 {
+                assert_eq!(store.sstable_metadata(tmp.path()).len(), 1);
+            }
+            std::fs::remove_file(&data_path).unwrap();
+            for _ in 0..5 {
+                assert_eq!(store.sstable_metadata(tmp.path()).len(), 1);
+            }
+        });
+        assert_eq!(
+            log_lines_with(&logs, EVICTED),
+            2,
+            "a second eviction is a new edge and reports again:\n{}",
+            logs.text()
+        );
+    }
+
+    /// The other half of the same edge rule: a generation with no local
+    /// components and no remote length is skipped by every pass, and is
+    /// reported once, not on each of them.
+    #[test]
+    fn compaction_planning_reports_an_unplannable_sstable_once_not_each_pass() {
+        const SKIPPED: &str = "compaction planning: skipping SSTable because required components";
+        let tmp = tempfile::tempdir().unwrap();
+        let store = file_backed_test_store(tmp.path());
+        store
+            .write(&make_key("unplannable"), make_row(b"v1", 1000))
+            .unwrap();
+        store.flush().unwrap();
+        let gen = store.last_flush_generation();
+        std::fs::remove_file(tmp.path().join(format!("{gen}-Data.db"))).unwrap();
+
+        let logs = crate::upload::config::tests::CapturedLogs::default();
+        tracing::subscriber::with_default(logs.subscriber(), || {
+            for _ in 0..5 {
+                assert!(store.sstable_metadata(tmp.path()).is_empty());
+            }
+        });
+        assert_eq!(log_lines_with(&logs, SKIPPED), 1, "{}", logs.text());
+    }
+
     #[test]
     fn sstable_metadata_does_not_scan_data_stream_order() {
         let tmp = tempfile::tempdir().unwrap();
@@ -19992,6 +20253,147 @@ mod tests {
         assert!(
             missing.is_empty(),
             "partitions dropped by the pauses: {missing:?}"
+        );
+    }
+    #[test]
+    fn a_schema_and_index_rotation_keeps_old_postings_and_does_not_invent_new_cells() {
+        let old_schema = two_column_schema("pk", "zulu");
+        let store = TableStore::new_with_indexes(
+            old_schema.clone(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..Default::default()
+            },
+            vec![("pk_idx".into(), 0)],
+        );
+        store
+            .write(
+                &make_key("old"),
+                make_two_column_row(b"match", b"kept", 1000),
+            )
+            .unwrap();
+        let mut new_schema = old_schema;
+        new_schema.regular_columns.insert(
+            0,
+            ColumnDefinition {
+                name: "alpha".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            },
+        );
+        let _rotation: FlushOutcome = store
+            .flush_rotating(
+                |catalog, schema| {
+                    let mut target = catalog.remapped_onto(schema, &new_schema);
+                    target.indexed_columns.push(("alpha_idx".into(), 0));
+                    target
+                        .index_types
+                        .insert("alpha_idx".into(), IndexType::BTree);
+                    (Arc::new(target), Arc::new(new_schema))
+                },
+                || {},
+            )
+            .unwrap();
+        let key = IndexKey(b"match".to_vec());
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &key).unwrap().len(),
+            1,
+            "an ordinal shift must reuse semantically unchanged postings"
+        );
+        assert!(
+            collect_index_results(&store, "alpha_idx", &key)
+                .unwrap()
+                .is_empty(),
+            "a column absent from frozen rows must not inherit another column's values"
+        );
+    }
+    #[test]
+    fn schema_and_index_rotation_with_static_columns_keeps_flat_ordinals() {
+        let mut old_schema = two_column_schema("pk", "zulu");
+        old_schema.static_columns.push(ColumnDefinition {
+            name: "s".into(),
+            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+        });
+        let store = TableStore::new_with_indexes(
+            old_schema.clone(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..Default::default()
+            },
+            vec![("pk_idx".into(), 1)],
+        );
+        let mut row = make_two_column_row(b"match", b"kept", 1000);
+        for (position, _) in &mut row.cells {
+            *position += 1;
+        }
+        store.write(&make_key("old"), row).unwrap();
+        let mut new_schema = old_schema;
+        new_schema.regular_columns.insert(
+            1,
+            ColumnDefinition {
+                name: "score".into(),
+                type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+            },
+        );
+        let _rotation: FlushOutcome = store
+            .flush_rotating(
+                |catalog, schema| {
+                    let mut target = catalog.remapped_onto(schema, &new_schema);
+                    target.indexed_columns.push(("score_idx".into(), 2));
+                    target
+                        .index_types
+                        .insert("score_idx".into(), IndexType::BTree);
+                    target.indexed_columns.push(("zulu_idx".into(), 3));
+                    target
+                        .index_types
+                        .insert("zulu_idx".into(), IndexType::BTree);
+                    (Arc::new(target), Arc::new(new_schema))
+                },
+                || {},
+            )
+            .unwrap();
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &IndexKey(b"match".to_vec()))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            collect_index_results(&store, "score_idx", &IndexKey(b"match".to_vec()))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            collect_index_results(&store, "zulu_idx", &IndexKey(b"kept".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "new index extraction must use the frozen flat row layout before SSTable conversion"
+        );
+        let row = Row {
+            clustering: 1_i32.to_be_bytes().to_vec(),
+            cells: vec![
+                (1, CellValue::live(b"fresh".to_vec(), 2000)),
+                (2, CellValue::live(b"new score".to_vec(), 2000)),
+                (3, CellValue::live(b"more".to_vec(), 2000)),
+            ],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(2000),
+        };
+        store.write(&make_key("new"), row).unwrap();
+        assert_eq!(
+            collect_index_results(&store, "pk_idx", &IndexKey(b"fresh".to_vec()))
+                .unwrap()
+                .len(),
+            1,
+            "static columns occupy the prefix of the shared cell-ordinal space"
+        );
+        assert_eq!(
+            collect_index_results(&store, "score_idx", &IndexKey(b"new score".to_vec()))
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

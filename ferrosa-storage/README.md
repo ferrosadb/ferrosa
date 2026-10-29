@@ -17,6 +17,22 @@ Every query front-end (CQL, Postgres, SPARQL, Graph) and the cluster layer reach
 data through this crate, almost always via the `Arc<dyn DataStore>` indirection
 (`LocalDataStore` in standalone/pair mode; a cluster-routing impl otherwise).
 
+## Count allocation
+
+Single-source resident counts borrow the immutable Arc-pinned partition instead
+of cloning its Row/Cell metadata. The table-deletion branch still owns its
+filtered value, and overlap/TTL/tombstone handling is unchanged. The allocation
+regression varies row width independently of payload size; this removes metadata
+copies and does not introduce an O(1) row counter.
+
+At baseline `5b8356172`, the 32-row allocation fixture requested 5,467 bytes for
+one column and 462,427 for 256 columns. After borrowing the pinned partition,
+both requested 1,083 bytes. The predicate-count fixture changed from
+3,275/231,755 to 1,083/1,083 bytes. These are requested allocator bytes in a
+warmed fixture, not RSS or an end-to-end latency claim. The separate payload-size
+controls already passed before the fix (`tests/count_payload_alloc.rs`).
+
+
 ## What's implemented
 
 - **Write observers** — synchronous derivation borrows the write's mutation;
@@ -253,6 +269,13 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   set depends on maximum row width and fan-in, rather than partition length. `FERROSA_MAX_CONCURRENT_COMPACTIONS` /
   `FERROSA_COMPACTION_WORKERS` still override; the resolved values are logged at
   startup.
+  **Evicted inputs in planning (FMEA ST-100):** every maintenance pass plans
+  over every SSTable. A generation whose local components are gone but whose
+  `Data.db` has a remote length is evicted, not broken: it stays plannable at
+  its cached verified-reader size and execution rehydrates it. Planning reports
+  each generation's state on change only — evicted, local again, or
+  unplannable (no remote length, skipped) — through a state shared by every
+  clone of its descriptor, not once per pass.
   **Direct-read + read-ahead input (on by default):** compaction
   opens each input `Data.db` as a private cache-bypassing scan
   (`FileReadAt::open_scan`: O_DIRECT / `F_NOCACHE`) with a background read-ahead of
@@ -388,6 +411,25 @@ data through this crate, almost always via the `Arc<dyn DataStore>` indirection
   corruption, not an optional gap — the generation is withheld and never uploaded,
   never worked around (ST-91).
   **Wired into the flush path.**
+  **Pending-upload ledger** (`upload/pending_log.rs`, FMEA ST-99): one JSON
+  file per unconfirmed upload under `{data_dir}/pending-uploads/`, published by
+  temp file + fsync + rename + directory fsync and removed by unlink. No
+  mutation reads or rewrites another entry, so concurrent compaction
+  finalizers and replay tasks need no lock. It replaces the single
+  `pending-uploads.log`, whose in-place rewrite on every removal lost
+  concurrent adds, stripped every other entry's compaction context, and left
+  NUL holes that became table names (t_c14245f9). Engine constructors migrate a
+  legacy log once, before the engine exists: NUL-prefixed records are salvaged
+  under the name after the hole, unparseable lines are quarantined to
+  `pending-uploads/quarantine/`, and the old log is kept as
+  `pending-uploads.log.migrated-<unix secs>`. A corrupt entry file is
+  quarantined at ERROR on read, never replayed. At replay, an entry whose files
+  are not on local disk is retired if the S3 manifest lists its generation
+  (upload completed, removal lost) and otherwise quarantined at ERROR (nothing
+  left to upload); it no longer warns "cannot replay" on every startup.
+  Metrics: `pending_upload_ledger_corrupt_entries_total`,
+  `pending_upload_unreplayable_total`. A binary older than this change reads
+  only the legacy log, so after a downgrade it sees no pending uploads.
 - **Object-store backend** (`upload/config.rs`) — `ObjectStoreConfig` selects
   the durable backend. Default is S3-compatible (`AmazonS3Builder`, ETag CAS).
   Set `FERROSA_LOCAL_STORE_PATH` (or `[s3].local_path` in `ferrosa.toml`) to use
@@ -1630,3 +1672,88 @@ immutable payloads. Commit-log and spill encodings retain their byte sequences.
 Published cell bytes are shared across row copies. Readers recover only unique
 scratch capacity; retained older payloads remain immutable. Memory estimates
 charge the full retained backing and a conservative shared-owner allowance.
+
+
+Schema rotations build index sidecars in the frozen rows' column layout. Target
+index definitions are mapped by column name once per schema change; unchanged
+postings are reused, and columns absent from old rows produce no entries. Ordinary
+flushes borrow the existing catalog. This preserves indexed reads when ALTER adds
+a column that sorts before an indexed property, without copying the row batch.
+
+## Bounded local transaction records
+
+`apply_batch` / `BatchTxn::commit` now encode the complete resident mutation set
+in one CRC-protected commit-log envelope and force fsync before memtable apply.
+A torn envelope replays no prefix. The whole record must fit a fresh segment;
+preflight rejection applies and logs nothing. Existing ordinary records remain
+readable. This format uses a reserved internal keyspace marker and requires the
+new reader; older binaries cannot recover these transaction records.
+
+Replay expands a validated envelope into ordinary mutations with distinct,
+ordered virtual positions inside its physical record. Per-table dirty positions
+and CDC cursors use those positions, preserving checkpoints within a batch.
+Live CDC emits each real mutation after durable apply, never the envelope.
+Durable CDC retains the decoded envelope while paging its individual members. The separate
+streaming `write_atomic_batch` path retains its existing per-mutation WAL format.
+The storage primitive does not itself provide a cross-table read snapshot; the
+Bolt caller supplies a graph query publication barrier. Fsync failure after
+append has an uncertain durable outcome even though no memtable apply occurred.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+`PostgresMvccApplyObserver::acquire_postgres_apply` provides an owned lifecycle lease for the caller to retain through metadata preparation, atomic storage apply and publication. Production PostgreSQL observers validate every bound table UUID before returning a lease; all error paths release it by RAII. Storage continues to treat PostgreSQL metadata as opaque and adds no schema dependency. The default no-op hook preserves non-PostgreSQL/test observer compatibility; an observer protecting PostgreSQL incarnations must override it.
+
+
+### Offline recovery admission (2026-10-26)
+
+`StorageEngine::assert_table_recovery_complete(&TableId) -> ferrosa_common::Result<()>`
+is the storage-owned admission check for offline migration of a registered,
+quiesced local Direct table. Submit all pending mutations returned by `open` and
+finish deferred registration/replay before checking. It rejects any observed
+replay rejection, pending handoff/deferred/set-aside data, unreadable recovery
+status, and detectable table or stale-WAL quarantine artifacts. It is not a
+cluster fence: deployment must exclude old readers/writers and other nodes.
+
+Rejected replay records one bounded atomic JSON summary per table under
+`recovery-incomplete/`, outside lifecycle-managed SSTable directories. The summary
+contains no row payload or event history; forensic rows remain in the existing
+quarantine files. Recording precedes quarantine/checkpoint eligibility. Failed
+recording or quarantine returns an error and preserves the original/relogged
+frame; successful salvage can start the engine but cannot admit migration.
+Explicit/deferred failures keep the failed item and unattempted suffix queued.
+Incomplete tables do not advance WAL flush checkpoints, even after later valid
+writes. Repeated replay/restart never clears the summary. No automatic clearing,
+repair, or deletion is provided; this conservative retention can grow WAL disk
+usage until an operator chooses an authoritative recovery procedure.
+
+This contract covers recovery under this implementation plus observable older
+pending/quarantine artifacts. It cannot certify data silently discarded by older
+binaries with no remaining evidence; those datasets need an authoritative
+checkpoint or reimport. Dependencies and dependents are unchanged; SPARQL can
+use this public API without parsing storage files.
+
+Reader rejection is also covered: CRC failures, undecodable payloads, malformed
+transaction envelopes and nonempty rejected tails persist unknown-source evidence
+before survivors are delivered or a source segment can retire. Such evidence
+blocks admission for every table and survives restart. Normal empty padding and
+torn creation headers do not create false rejection evidence. Persistence failure
+returns an error and keeps the source bytes. Replay/checkpoint locking prevents
+flush from crossing an unhandled replay frame.
+
+Existing WAL must be recovered via `StorageEngine::open`. Constructors using
+`new` detect pre-existing WAL artifacts and refuse admission for that engine,
+without decoding or reimplementing WAL recovery. Fresh `new` engines can admit
+clean tables.
+
+Set-aside replay retains the exclusive recovery checkpoint gate through its
+durability flush. It uses the guarded flush body directly, avoiding recursive
+read-lock acquisition while retaining the SSTable and WAL durability ordering.
+
+## Single-row COUNT pushdown
+
+`count_live_single_row_range_matching` is a separate exact liveness counter for partitions containing at most one non-clustered row and no static row. Stable primary-key liveness uses SSTable row metadata and shared resident partitions. TTL, row/partition deletions and table tombstones trigger full reads of all overlapping pinned source partitions before LWW reconciliation; this preserves value-based ties and source column mappings. Source refill happens after these reads. The callback runs after the pinned physical image is obtained. Exceptional rows can read payload bytes; this API does not promise zero payload I/O for TTL/deletion cases. Existing `count_range_matching` remains unchanged in its liveness contract.
+
+## Immutable scalar scan values
+
+CQL values consumed by sorting/test adapters carry shared immutable text/blob payloads. Storage cell payload ownership remains `CellBytes`; cloning it shares immutable backing. Existing external-sort, spill and read formats are unchanged by the runtime-value representation, and shared decoded values do not imply that storage metadata or final response buffers are allocation-free.

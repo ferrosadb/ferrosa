@@ -161,6 +161,30 @@ fn empty_aggregate_value(expr: &Expr) -> serde_json::Value {
     }
 }
 
+/// Classify the bound AST before any data-dependent evaluation. Exhaustiveness
+/// makes new statement variants require an explicit admission decision.
+fn statement_writes(statement: &Statement) -> bool {
+    match statement {
+        Statement::Create { .. }
+        | Statement::Set { .. }
+        | Statement::Remove { .. }
+        | Statement::Delete { .. }
+        | Statement::Merge { .. } => true,
+        Statement::Unwind { write, .. } => write.as_deref().is_some_and(statement_writes),
+        Statement::Union { arms, .. } => arms.iter().any(statement_writes),
+        Statement::Foreach { body, .. } => body.iter().any(statement_writes),
+        Statement::CallSubquery { outer, inner, .. } => {
+            statement_writes(outer) || statement_writes(inner)
+        }
+        Statement::Subscribe { inner, .. } => statement_writes(inner),
+        Statement::Match { .. }
+        | Statement::MatchWith { .. }
+        | Statement::MatchWithOptional { .. }
+        | Statement::Return { .. }
+        | Statement::Unsubscribe { .. } => false,
+    }
+}
+
 fn pattern_requires_adjacency(pattern: &Pattern) -> bool {
     match pattern {
         Pattern::Rel { .. } => true,
@@ -390,6 +414,29 @@ pub trait GraphSchemaCoordinator: Send + Sync {
         &self,
         table: ferrosa_schema::metadata::table::TableMetadata,
     ) -> Result<()>;
+
+    /// Add first-write scalar columns and update this node's storage schema.
+    async fn apply_add_columns(
+        &self,
+        _keyspace: &str,
+        _table: &str,
+        _columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        _storage: &Arc<StorageEngine>,
+    ) -> Result<()> {
+        Err(GraphError::Validation(
+            "graph schema coordinator does not support column DDL".into(),
+        ))
+    }
+
+    /// Create a derived scalar index through the same replicated DDL path.
+    async fn apply_create_index(
+        &self,
+        _index: ferrosa_schema::metadata::index::IndexMetadata,
+    ) -> Result<()> {
+        Err(GraphError::Validation(
+            "graph schema coordinator does not support index DDL".into(),
+        ))
+    }
 }
 
 /// Local-only coordinator. Single-node / unit-test default — applies
@@ -408,6 +455,41 @@ impl LocalGraphSchemaCoordinator {
 
 #[async_trait]
 impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
+    async fn apply_add_columns(
+        &self,
+        keyspace: &str,
+        table: &str,
+        columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        storage: &Arc<StorageEngine>,
+    ) -> Result<()> {
+        self.schema
+            .alter_table_internal(keyspace, table, column_additions(columns))
+            .map_err(|error| GraphError::Validation(format!("add scalar columns: {error}")))?;
+        let snapshot = self.schema.snapshot();
+        let metadata = snapshot
+            .tables
+            .get(&(keyspace.into(), table.into()))
+            .ok_or_else(|| {
+                GraphError::Validation(format!(
+                    "table {keyspace}.{table} disappeared during column setup"
+                ))
+            })?;
+        storage
+            .update_table_schema(
+                &ferrosa_storage::TableId::new(keyspace, table),
+                metadata.to_storage_schema(),
+            )
+            .map_err(GraphError::Storage)
+    }
+
+    async fn apply_create_index(
+        &self,
+        index: ferrosa_schema::metadata::index::IndexMetadata,
+    ) -> Result<()> {
+        self.schema
+            .create_index_internal(index)
+            .map_err(|error| GraphError::Validation(format!("create_index_internal: {error}")))
+    }
     async fn apply_create_keyspace(
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
@@ -424,6 +506,17 @@ impl GraphSchemaCoordinator for LocalGraphSchemaCoordinator {
         self.schema
             .create_table_internal(table)
             .map_err(|e| GraphError::Validation(format!("create_table_internal: {e}")))
+    }
+}
+
+fn column_additions(
+    columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+) -> ferrosa_schema::metadata::table::TableUpdates {
+    ferrosa_schema::metadata::table::TableUpdates {
+        params: None,
+        add_columns: columns,
+        drop_columns: vec![],
+        extensions: None,
     }
 }
 
@@ -446,6 +539,36 @@ impl ClusterGraphSchemaCoordinator {
 
 #[async_trait]
 impl GraphSchemaCoordinator for ClusterGraphSchemaCoordinator {
+    async fn apply_add_columns(
+        &self,
+        keyspace: &str,
+        table: &str,
+        columns: Vec<ferrosa_schema::metadata::column::ColumnMetadata>,
+        _storage: &Arc<StorageEngine>,
+    ) -> Result<()> {
+        self.ddl_path
+            .load()
+            .execute(ferrosa_cluster::pair::ddl::DdlOperation::AlterTable {
+                keyspace: keyspace.into(),
+                table: table.into(),
+                updates: Box::new(column_additions(columns)),
+            })
+            .await
+            .map_err(|error| {
+                GraphError::Validation(format!("cluster DDL add scalar columns: {error}"))
+            })
+    }
+
+    async fn apply_create_index(
+        &self,
+        index: ferrosa_schema::metadata::index::IndexMetadata,
+    ) -> Result<()> {
+        self.ddl_path
+            .load()
+            .execute(ferrosa_cluster::pair::ddl::DdlOperation::CreateIndex(index))
+            .await
+            .map_err(|error| GraphError::Validation(format!("cluster DDL CreateIndex: {error}")))
+    }
     async fn apply_create_keyspace(
         &self,
         ks: ferrosa_schema::metadata::keyspace::KeyspaceMetadata,
@@ -743,8 +866,51 @@ async fn heal_adjacency(
     Ok(())
 }
 
+mod bolt_indexes;
+
+#[derive(Clone, Copy)]
+struct QueryRequest<'a> {
+    keyspace: &'a str,
+    auth: &'a AuthContext,
+    bolt_indexes: bool,
+}
+
+/// Scheduling probe for deterministic integration tests of query execution.
+/// Only debug builds expose this seam; no probe is installed by normal callers.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+#[async_trait]
+pub trait QueryExecutionTestProbe: Send + Sync {
+    /// Called after an execution future is polled, including a pending lock wait.
+    fn after_poll(&self, ready: bool);
+
+    /// Called only after polling writer admission returns Pending.
+    fn writer_waiting(&self) {}
+
+    /// Called after SET has read/evaluated its RHS, before writing the property.
+    async fn before_property_write(&self) {}
+}
+
+#[cfg(debug_assertions)]
+tokio::task_local! {
+    static QUERY_EXECUTION_TEST_PROBE: Arc<dyn QueryExecutionTestProbe>;
+}
+
+#[cfg(debug_assertions)]
+pub(crate) async fn before_property_write_for_test() {
+    if let Ok(probe) = QUERY_EXECUTION_TEST_PROBE.try_with(Arc::clone) {
+        probe.before_property_write().await;
+    }
+}
+
 /// Central coordinator for graph query processing.
 pub struct GraphEngine {
+    publication: Arc<tokio::sync::RwLock<()>>,
+    // One FIFO writer domain for every keyspace/key through this engine. Always
+    // acquire BEFORE publication; a queued writer cannot delay its owner's COMMIT.
+    writer_admission: Arc<tokio::sync::Mutex<()>>,
+    #[cfg(debug_assertions)]
+    query_test_probes: Mutex<HashMap<String, Arc<dyn QueryExecutionTestProbe>>>,
     schema: Arc<Schema>,
     /// Adjacency registration and observers, and the data dir that holds the
     /// heal record.
@@ -775,6 +941,7 @@ pub struct GraphEngine {
     /// table fails its apply. Held only around the creation, never around a
     /// write.
     implicit_schema_gate: tokio::sync::Mutex<()>,
+    bolt_indexes: bolt_indexes::BoltIndexSetup,
     /// Cached at construction so the lazy adjacency-registration path
     /// (`ensure_adjacency_storage_for_keyspace`) can spawn the
     /// reconciliation loop with the configured cadence on first use of
@@ -863,6 +1030,10 @@ impl GraphEngine {
         // the lazy path; nothing here is so urgent that it can't wait
         // for the first query.
         Self {
+            publication: Arc::new(tokio::sync::RwLock::new(())),
+            writer_admission: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(debug_assertions)]
+            query_test_probes: Mutex::new(HashMap::new()),
             schema,
             storage,
             write_path,
@@ -874,6 +1045,7 @@ impl GraphEngine {
             adjacency_heals: ArcSwap::from_pointee(HashMap::new()),
             schema_coordinator,
             implicit_schema_gate: tokio::sync::Mutex::new(()),
+            bolt_indexes: bolt_indexes::BoltIndexSetup::new(),
             reconciliation_interval,
         }
     }
@@ -1171,11 +1343,318 @@ impl GraphEngine {
         auth: &AuthContext,
         params: &HashMap<String, Value>,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        self.execute_stream_with_params_policy(query, keyspace, auth, params, false)
+            .await
+    }
+
+    /// Bolt setup shares the guarded execution pipeline with every transport.
+    pub async fn execute_bolt_stream_with_params(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        self.execute_stream_with_params_policy(query, keyspace, auth, params, true)
+            .await
+    }
+
+    async fn execute_stream_with_params_policy(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+        bolt_indexes: bool,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        #[cfg(debug_assertions)]
+        {
+            let probe = self.query_test_probes.lock().unwrap().get(query).cloned();
+            if let Some(probe) = probe {
+                return QUERY_EXECUTION_TEST_PROBE
+                    .scope(probe.clone(), async {
+                        let mut execute = Box::pin(self.execute_stream_with_params_inner(
+                            query,
+                            keyspace,
+                            auth,
+                            params,
+                            bolt_indexes,
+                        ));
+                        futures::future::poll_fn(|cx| {
+                            let result = std::future::Future::poll(execute.as_mut(), cx);
+                            probe.after_poll(result.is_ready());
+                            result
+                        })
+                        .await
+                    })
+                    .await;
+            }
+        }
+        self.execute_stream_with_params_inner(query, keyspace, auth, params, bolt_indexes)
+            .await
+    }
+
+    /// Install an instance-local probe for an exact query, without global state.
+    /// It covers execution setup (including the currently buffered SET operator),
+    /// not subsequent lazy row-stream polling by the transport.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn set_query_execution_probe_for_test(
+        &self,
+        query: &str,
+        probe: Arc<dyn QueryExecutionTestProbe>,
+    ) {
+        self.query_test_probes
+            .lock()
+            .unwrap()
+            .insert(query.to_string(), probe);
+    }
+
+    async fn acquire_writer(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        let acquire = self.writer_admission.clone().lock_owned();
+        tokio::pin!(acquire);
+        futures::future::poll_fn(|cx| {
+            let result = std::future::Future::poll(acquire.as_mut(), cx);
+            #[cfg(debug_assertions)]
+            if result.is_pending() {
+                let _ = QUERY_EXECUTION_TEST_PROBE.try_with(|probe| probe.writer_waiting());
+            }
+            result
+        })
+        .await
+    }
+
+    async fn execute_stream_with_params_inner(
+        &self,
+        query: &str,
+        keyspace: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+        bolt_indexes: bool,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        let transaction = crate::transaction::TRANSACTION_IO.try_with(Arc::clone).ok();
+        let query_deadline = tokio::time::Instant::now() + self.config.query_timeout;
+        let deadline = transaction.as_ref().map_or(query_deadline, |tx| {
+            query_deadline.min(tokio::time::Instant::from_std(tx.deadline))
+        });
         let statement = bind_statement_params(parse(query)?, params)?;
-        if let Statement::Foreach { var, list, body } = statement {
-            let result = self
-                .execute_foreach(&var, &list, &body, keyspace, auth)
+        let subscription = matches!(statement, Statement::Subscribe { .. });
+        let writing = statement_writes(&statement);
+        if subscription && (transaction.is_some() || writing) {
+            return Err(GraphError::Validation(
+                "SUBSCRIBE requires a read-only query outside an explicit transaction".into(),
+            ));
+        }
+        let setup = async {
+            // BEGIN and read-only RUN do not acquire admission. Explicit ownership
+            // lives in the transaction; autocommit ownership lives in the stream.
+            let writer = if writing {
+                if let Some(tx) = &transaction {
+                    let mut owned = tx.writer_admission.lock().await;
+                    if owned.is_none() {
+                        *owned = Some(self.acquire_writer().await);
+                    }
+                    None
+                } else {
+                    Some(self.acquire_writer().await)
+                }
+            } else {
+                None
+            };
+            // A waiter owns no publication read guard. Nested executions call the
+            // private statement pipeline, inheriting this outer admission scope.
+            let publication = if subscription {
+                None
+            } else {
+                Some(self.publication.clone().read_owned().await)
+            };
+            // timeout_at polls a ready future before its timer; reject an
+            // already-expired admission before any data-dependent work too.
+            if tokio::time::Instant::now() >= deadline {
+                return Err(GraphError::Timeout);
+            }
+            let (columns, rows, stats) = self
+                .execute_bound_stream(
+                    statement,
+                    QueryRequest {
+                        keyspace,
+                        auth,
+                        bolt_indexes,
+                    },
+                )
                 .await?;
+            Ok::<_, GraphError>((columns, rows, stats, writer, publication))
+        };
+        let (columns, mut rows, stats, writer, publication) =
+            tokio::time::timeout_at(deadline, setup)
+                .await
+                .map_err(|_| GraphError::Timeout)??;
+        // Tuple fields drop in order even if the stream has never been polled.
+        // This makes publication-before-admission release independent of generator
+        // capture order, as well as normal completion/error paths.
+        let guards = (publication, writer);
+        let rows = Box::pin(async_stream::stream! {
+            let guards = guards;
+            let error = loop {
+                if !subscription && tokio::time::Instant::now() >= deadline {
+                    break Some(GraphError::Timeout);
+                }
+                let next = if subscription {
+                    Ok(futures::StreamExt::next(&mut rows).await)
+                } else {
+                    tokio::time::timeout_at(deadline, futures::StreamExt::next(&mut rows)).await
+                };
+                match next {
+                    Ok(Some(Ok(row))) => yield Ok(row),
+                    Ok(Some(Err(error))) => break Some(error),
+                    Err(_) => break Some(GraphError::Timeout),
+                    Ok(None) => break None,
+                }
+            };
+            // Drop the lazy executor too: it can retain transaction I/O. Release
+            // BEFORE yielding a terminal error, even if the consumer keeps us.
+            drop(rows);
+            drop(guards);
+            if let Some(error) = error { yield Err(error); }
+        });
+        Ok((columns, rows, stats))
+    }
+
+    pub(crate) async fn begin_transaction(
+        &self,
+        keyspace: String,
+        timeout: Duration,
+    ) -> Result<Arc<crate::transaction::LocalTransaction>> {
+        if !self.schema.snapshot().keyspaces.contains_key(&keyspace) {
+            return Err(GraphError::Validation(format!(
+                "database '{keyspace}' does not exist"
+            )));
+        }
+        let transaction = crate::transaction::LocalTransaction::new(
+            self.write_path.load_full(),
+            keyspace.clone(),
+            timeout,
+        )?;
+        // Complete committed adjacency setup before any pending edge exists.
+        self.ensure_adjacency_ready(&keyspace).await?;
+        Ok(Arc::new(transaction))
+    }
+
+    pub(crate) async fn execute_transaction(
+        &self,
+        transaction: Arc<crate::transaction::LocalTransaction>,
+        query: &str,
+        auth: &AuthContext,
+        params: &HashMap<String, Value>,
+    ) -> Result<GraphResult> {
+        transaction.check_deadline()?;
+        let keyspace = transaction.keyspace.clone();
+        let remaining = transaction
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let execute = crate::transaction::TRANSACTION_IO.scope(transaction.clone(), async {
+            let (columns, mut stream, stats) = self
+                .execute_bolt_stream_with_params(query, &keyspace, auth, params)
+                .await?;
+            let mut rows = Vec::new();
+            let mut bytes = 0usize;
+            while let Some(row) = futures::StreamExt::next(&mut stream).await {
+                let row = row?;
+                bytes = bytes
+                    .saturating_add(
+                        serde_json::to_vec(&row)
+                            .map_err(|e| GraphError::Internal(e.to_string()))?
+                            .len(),
+                    )
+                    .saturating_add(row.len().saturating_mul(64) + 64);
+                if bytes > crate::transaction::MAX_PENDING_BYTES {
+                    return Err(GraphError::Validation(
+                        "transaction result memory limit exceeded (8 MiB)".into(),
+                    ));
+                }
+                rows.push(row);
+            }
+            transaction.check_deadline()?;
+            Ok(GraphResult {
+                columns,
+                rows,
+                stats,
+            })
+        });
+        tokio::time::timeout(remaining, execute)
+            .await
+            .map_err(|_| GraphError::Validation("transaction timeout expired".into()))?
+    }
+
+    pub(crate) async fn commit_transaction(
+        &self,
+        transaction: &crate::transaction::LocalTransaction,
+    ) -> Result<()> {
+        let remaining = transaction
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let _guard = tokio::time::timeout(remaining, self.publication.write())
+            .await
+            .map_err(|_| {
+                GraphError::Validation("transaction timeout expired waiting to commit".into())
+            })?;
+        if !Arc::ptr_eq(&transaction.path, &self.write_path.load_full()) {
+            return Err(GraphError::Unavailable(
+                "write topology changed during the transaction; retry on the current coordinator"
+                    .into(),
+            ));
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    async fn ensure_bolt_indexes(
+        &self,
+        logical: &crate::planner::logical::LogicalPlan,
+    ) -> Result<()> {
+        // Validation already checked permissions on these bindings. Do not touch
+        // unrelated tables just because they share a keyspace.
+        for table in logical
+            .bindings
+            .values()
+            .chain(logical.arm_bindings.iter().flat_map(|arm| arm.values()))
+        {
+            self.bolt_indexes
+                .ensure(
+                    &table.keyspace,
+                    &table.table,
+                    bolt_indexes::Context {
+                        schema: &self.schema,
+                        storage: &self.storage,
+                        path: self.write_path.load_full(),
+                        coordinator: &*self.schema_coordinator,
+                        timeout: self.config.query_timeout,
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_bolt_index_setup_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.bolt_indexes.gate.lock().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bolt_index_initializations_for_test(&self) -> usize {
+        self.bolt_indexes
+            .initializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn execute_bound_stream(
+        &self,
+        statement: Statement,
+        request: QueryRequest<'_>,
+    ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        if let Statement::Foreach { var, list, body } = statement {
+            let result = self.execute_foreach(&var, &list, &body, request).await?;
             return Ok(buffered_as_stream(result));
         }
         if let Statement::CallSubquery {
@@ -1186,7 +1665,7 @@ impl GraphEngine {
         } = statement
         {
             let result = self
-                .execute_call_subquery(*outer, &imports, *inner, return_clause, keyspace, auth)
+                .execute_call_subquery(*outer, &imports, *inner, return_clause, request)
                 .await?;
             return Ok(buffered_as_stream(result));
         }
@@ -1197,13 +1676,10 @@ impl GraphEngine {
             ..
         } = &statement
         {
-            let result = self
-                .execute_unwind_write(expr, var, inner, keyspace, auth)
-                .await?;
+            let result = self.execute_unwind_write(expr, var, inner, request).await?;
             return Ok(buffered_as_stream(result));
         }
-        self.execute_statement_streaming(statement, keyspace, auth)
-            .await
+        self.execute_statement_streaming(statement, request).await
     }
 
     /// Validate, plan, and execute a single non-orchestrated statement (i.e. not
@@ -1214,12 +1690,9 @@ impl GraphEngine {
     async fn execute_statement(
         &self,
         statement: Statement,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
-        let (columns, rows, stats) = self
-            .execute_statement_streaming(statement, keyspace, auth)
-            .await?;
+        let (columns, rows, stats) = self.execute_statement_streaming(statement, request).await?;
         collect_to_graph_result(columns, rows, stats, usize::MAX).await
     }
 
@@ -1248,6 +1721,10 @@ impl GraphEngine {
         .is_empty()
         {
             return Ok(());
+        }
+
+        if crate::transaction::TRANSACTION_IO.try_with(|_| ()).is_ok() {
+            return Err(GraphError::Validation("create graph labels before BEGIN; schema changes are not part of the row transaction".into()));
         }
 
         let _gate = self.implicit_schema_gate.lock().await;
@@ -1345,18 +1822,73 @@ impl GraphEngine {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn hold_bolt_schema_setup_for_test(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.implicit_schema_gate.lock().await
+    }
+
+    async fn ensure_bolt_columns(
+        &self,
+        statement: &Statement,
+        keyspace: &str,
+        auth: &AuthContext,
+    ) -> Result<()> {
+        use crate::planner::implicit::columns_needing_declarations;
+        if columns_needing_declarations(&self.schema.snapshot(), keyspace, statement)?.is_empty() {
+            return Ok(());
+        }
+        if crate::transaction::TRANSACTION_IO.try_with(|_| ()).is_ok() {
+            return Err(GraphError::Validation(
+                "declare graph properties before BEGIN; schema changes are not part of the row transaction".into(),
+            ));
+        }
+        tokio::time::timeout(self.config.query_timeout, async {
+        let _gate = self.implicit_schema_gate.lock().await;
+        let snapshot = self.schema.snapshot();
+        let additions = columns_needing_declarations(&snapshot, keyspace, statement)?;
+        // Check all schema permissions before applying any changes.
+        for table in additions.keys() {
+            check_permission(
+                &snapshot,
+                auth,
+                Permission::Alter,
+                &Resource::Table(keyspace.into(), table.clone()),
+            )
+            .map_err(|error| {
+                GraphError::PermissionDenied(format!(
+                    "first-write columns require ALTER on {keyspace}.{table}: {error}"
+                ))
+            })?;
+        }
+        for (table, columns) in additions {
+            self.schema_coordinator
+                .apply_add_columns(keyspace, &table, columns, &self.storage)
+                .await?;
+        }
+        Ok(())
+        }).await.map_err(|_|GraphError::Validation(format!(
+            "first-write scalar columns for keyspace '{keyspace}' are not ready after {:?}; retry",self.config.query_timeout)))?
+    }
+
     /// The streaming half of [`GraphEngine::execute_statement`].
     async fn execute_statement_streaming(
         &self,
         statement: Statement,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<(Vec<String>, RowStream<'static>, QueryStats)> {
+        let QueryRequest {
+            keyspace,
+            auth,
+            bolt_indexes,
+        } = request;
         // Create any table this write implies BEFORE the adjacency setup: that setup
         // only brings up a keyspace's adjacency index once the keyspace has an edge
         // table, so a first edge write has to exist first or it derives adjacency
         // rows into a table that was never registered.
         self.ensure_write_tables(&statement, keyspace, auth).await?;
+        if bolt_indexes {
+            self.ensure_bolt_columns(&statement, keyspace, auth).await?;
+        }
         if statement_requires_adjacency(&statement) {
             self.ensure_adjacency_ready(keyspace).await?;
         }
@@ -1371,6 +1903,9 @@ impl GraphEngine {
             }
             Err(e) => return Err(e),
         };
+        if bolt_indexes {
+            self.ensure_bolt_indexes(&logical).await?;
+        }
         let physical = plan(logical)?;
         execute_streaming_owned(physical, self.owned_exec_ctx(keyspace)).await
     }
@@ -1383,7 +1918,9 @@ impl GraphEngine {
     /// stream from outliving the handler that started it.
     fn owned_exec_ctx(&self, keyspace: &str) -> OwnedExecCtx {
         OwnedExecCtx {
-            write_path: self.write_path.load_full(),
+            write_path: crate::transaction::TRANSACTION_IO
+                .try_with(|tx| tx.clone() as Arc<dyn crate::executor::io::GraphWrite>)
+                .unwrap_or_else(|_| self.write_path.load_full()),
             keyspace: keyspace.to_string(),
             config: Arc::new(self.config.clone()),
             virtual_tables: Some(self.schema.virtual_tables_arc()),
@@ -1411,8 +1948,7 @@ impl GraphEngine {
         expr: &Expr,
         var: &str,
         inner: &Statement,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
         let list_value = eval_expr(expr, &HashMap::new())
             .map_err(|e| GraphError::Validation(format!("UNWIND list expression: {e}")))?;
@@ -1432,7 +1968,7 @@ impl GraphEngine {
         for element in &elements {
             let replacement = value_to_expr(element)?;
             let bound = subst_var_statement(inner.clone(), var, &replacement);
-            let result = self.execute_statement(bound, keyspace, auth).await?;
+            let result = self.execute_statement(bound, request).await?;
             stats.vertices_written += result.stats.vertices_written;
             stats.vertices_read += result.stats.vertices_read;
             stats.edges_read += result.stats.edges_read;
@@ -1471,18 +2007,18 @@ impl GraphEngine {
         var: &str,
         list: &Expr,
         body: &[Statement],
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
+        let keyspace = request.keyspace;
         // Phase 1 — recursively plan the entire FOREACH tree. Any validation/plan
         // failure (at any depth) aborts here, before a single write.
-        let planned = self.plan_foreach(var, list, body, keyspace, auth).await?;
+        let planned = self.plan_foreach(var, list, body, request).await?;
         let element_count = planned.element_count;
 
         // Phase 2 — execute the pre-planned clauses in source order.
         let mut stats = QueryStats::default();
         for physical in planned.plans {
-            let wp = self.write_path.load();
+            let wp = self.owned_exec_ctx(keyspace).write_path;
             let result = execute(
                 physical,
                 &wp,
@@ -1515,9 +2051,13 @@ impl GraphEngine {
         var: &str,
         list: &Expr,
         body: &[Statement],
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<PlannedForeach> {
+        let QueryRequest {
+            keyspace,
+            auth,
+            bolt_indexes,
+        } = request;
         let list_value = eval_expr(list, &HashMap::new())
             .map_err(|e| GraphError::Validation(format!("FOREACH list expression: {e}")))?;
         let elements = match list_value {
@@ -1546,19 +2086,24 @@ impl GraphEngine {
                             &inner_var,
                             &inner_list,
                             &inner_body,
-                            keyspace,
-                            auth,
+                            request,
                         ))
                         .await?;
                         plans.extend(nested.plans);
                     }
                     leaf => {
                         self.ensure_write_tables(&leaf, keyspace, auth).await?;
+                        if bolt_indexes {
+                            self.ensure_bolt_columns(&leaf, keyspace, auth).await?;
+                        }
                         if statement_requires_adjacency(&leaf) {
                             self.ensure_adjacency_ready(keyspace).await?;
                         }
                         let snap = self.schema.snapshot();
                         let logical = validate(&snap, auth, keyspace, leaf)?;
+                        if bolt_indexes {
+                            self.ensure_bolt_indexes(&logical).await?;
+                        }
                         plans.push(plan(logical)?);
                     }
                 }
@@ -1598,14 +2143,13 @@ impl GraphEngine {
         imports: &[String],
         inner: Statement,
         return_clause: Option<ReturnClause>,
-        keyspace: &str,
-        auth: &AuthContext,
+        request: QueryRequest<'_>,
     ) -> Result<GraphResult> {
         // 1. Run the outer query, projecting each imported variable as a column so
         //    we can bind it per row. The outer is the MATCH built by the parser with
         //    an empty RETURN; we replace it with `RETURN <imports...>`.
         let outer = project_imports(outer, imports)?;
-        let outer_result = self.execute_statement(outer, keyspace, auth).await?;
+        let outer_result = self.execute_statement(outer, request).await?;
         let import_cols = outer_result.columns.clone();
 
         let inner_returns = statement_is_returning(&inner);
@@ -1638,7 +2182,7 @@ impl GraphEngine {
             }
             let bound_inner = fold_constants_statement(bound_inner)?;
 
-            let inner_result = self.execute_statement(bound_inner, keyspace, auth).await?;
+            let inner_result = self.execute_statement(bound_inner, request).await?;
             stats.vertices_written += inner_result.stats.vertices_written;
             stats.vertices_deleted += inner_result.stats.vertices_deleted;
             stats.vertices_read += inner_result.stats.vertices_read;
@@ -1736,7 +2280,7 @@ impl GraphEngine {
         };
 
         // Execute the initial snapshot.
-        let wp = self.write_path.load();
+        let wp = self.owned_exec_ctx(keyspace).write_path;
         let result = execute(
             physical,
             &wp,

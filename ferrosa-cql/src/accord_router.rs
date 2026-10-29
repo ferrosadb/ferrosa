@@ -486,7 +486,7 @@ pub fn encode_batch_cas_result(
 /// For full type-aware conversion, the bridge module is used instead.
 fn term_to_cql_value_simple(term: &Term) -> Option<CqlValue> {
     match term {
-        Term::StringLiteral(s) => Some(CqlValue::Text(s.clone())),
+        Term::StringLiteral(s) => Some(CqlValue::Text(s.clone().into())),
         Term::IntegerLiteral(n) => Some(CqlValue::Int(*n as i32)),
         Term::FloatLiteral(f) => Some(CqlValue::Double(f.to_bits())),
         Term::BoolLiteral(b) => Some(CqlValue::Boolean(*b)),

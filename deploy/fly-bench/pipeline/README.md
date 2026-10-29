@@ -1,10 +1,24 @@
 # Pipeline performance experiments
 
-[Measurement status for PR #613](RESULTS.md): the candidate now routes eligible
-graph property equality through CQL-declared secondary indexes, counts physical
-vertices through metadata and compares integer keys exactly. Fresh timings for
-that code are pending; older tables are explicitly labelled as a baseline.
-Cypher index DDL remains unsupported.
+Latest PG/CQL measurements use production code `2286f389a`, including metadata
+COUNT and immutable scalar ownership. [Current results](RESULTS.md) retain all
+observations, one native PG CPU-steal flag, and the incomplete PG profiling scope.
+Bolt/SPARQL tables are explicitly older `a2709e100` measurements.
+
+[Delivery timing observations](scan-delivery-results.json) use a separate probe:
+PG single-row streaming and CQL 5,000-row pages at one/eight readers. These are
+not maximum capacity or profiler-overhead controls. The measured
+[profiling helper](instruments/scan144_profiler.py) samples bounded recordings
+and decodes them after workload completion; [usage](instruments/README.md).
+
+[Measurement status](RESULTS.md): PR #625 combines automatic Bolt scalar schema
+and index setup, streaming CQL LIMIT pages, and protocol transaction/RDF fixes.
+Current matched-VM comparisons are recorded in RESULTS.md and current-results.json;
+historical tables retain their measured runtime identity. Explicit Cypher index DDL remains unsupported.
+
+Old and new binaries must use independent writable data and object-store
+fixtures. The new transaction WAL envelope and RDF v2 cutover are not safe
+cross-version fixture interchange formats.
 
 The current-results page contains comparator tables, the exact engine revision
 and workload limits. [Experiment details and earlier checkpoints](HISTORY.md)
@@ -27,11 +41,15 @@ python3 deploy/fly-bench/pipeline/workload.py --help
 
 `validated_multimetric_bench.py` supplies the common insert/count/point-read/scan
 workload for all four front ends. CQL pins native protocol v4 with compression
-off. Bolt requires `--bolt-backend ferrosa|neo4j`: both fixtures declare indexes
-on `pk`, `bucket` and `payload`; Neo4j must report all three RANGE indexes ONLINE
-with the correct label/property definitions. Ferrosa declares indexes through
-CQL and uses UUID `id` as its native key, so regular `pk` reads exercise 2i.
-Use `--cql-port`, `--cql-user` and `--cql-password` when that setup needs them.
+off. Bolt requires `--bolt-backend ferrosa|neo4j`. Neo4j must report RANGE indexes
+on `pk`, `bucket` and `payload` ONLINE with their correct label/property definitions.
+Ferrosa creates only the keyspace through CQL, then sends ordinary Bolt CREATE
+and deletes its owned sentinel. Table and scalar-index setup must be automatic;
+the fixture must not predeclare them. A generated UUID `id` remains the native
+key, so regular `pk` reads exercise secondary indexes. Use a fresh benchmark
+keyspace/database; existing rows are not erased. `--cql-port`, `--cql-user` and
+`--cql-password` control keyspace bootstrap. Scans project and validate all three
+fields, just like point reads.
 
 SPARQL requires `--sparql-backend ferrosa|oxigraph`. Each logical record is three
 triples in the isolated graph `urn:ferrosa:benchmark`; payloads, keys and buckets
@@ -96,3 +114,50 @@ Software sampling caused 11–28% overhead in the recorded rig; sampled timings
 are diagnostic only. Hardware PMU tracing distorted this VM much more and is
 excluded from the accepted comparisons. See [RESULTS.md](RESULTS.md) for the
 measured scope and limitations.
+
+
+The current comparison uses the portable probes below (install `psycopg[binary]`,
+`neo4j` and `cassandra-driver` in the same client environment for both products).
+`protocol_probe.py` config entries name targets such as `ferrosa_pg`/`postgres`,
+`ferrosa_cql`/`cassandra`, or `ferrosa_sparql`/`oxigraph`. A fresh `--scope` owns
+its benchmark table; SPARQL owns and clears only its benchmark graph. These
+commands write fixture data and belong on a dedicated benchmark database.
+
+```sh
+python3 deploy/fly-bench/pipeline/protocol_probe.py \
+  --config /run/private/protocols.json --target ferrosa_pg --protocol pg \
+  --scope bench_repro --rows 5000 --reads 20000 --write-concurrency 1 \
+  --out /tmp/ferrosa-pg.json
+python3 deploy/fly-bench/pipeline/bolt_probe.py \
+  --runtime-config /run/private/benchmark.json --target ferrosa \
+  --action measure --reads 20000 --serial-reads 500 --out /tmp/ferrosa-bolt.json
+```
+
+For CQL use 20,000 rows/eight writers; for SPARQL use 2,000 records/eight writers.
+Bolt first needs `--action seed` for each of `--label BenchRow` and
+`--label BenchWrite`, and `--action access` records index/count access proof.
+Run native/Ferrosa/Ferrosa/native twice, with no concurrent benchmark work.
+`resources_low_overhead.sh` is the one-process 1 Hz OS collector used by this run;
+CPU stack profiling is a separate phase. `--profile` in the protocol probe
+selects a 30-second duration loop; CPU profiler attachment belongs to the controller.
+
+The [count/scan ownership audit](SCAN_COUNTS.md) records the three follow-up
+changes, their regression evidence, the observed scan improvement and the
+remaining SQL/SPARQL count and predicate-access gaps.
+
+`profile_operation_probe.py` runs the count/scan diagnostic loops used for the
+current CPU captures. It shares the existing adapters and deterministic payloads;
+`--profile` is required. Use the same existing fixture scope and configure CPU
+profiler attachment separately after the ready gate:
+
+```sh
+python3 deploy/fly-bench/pipeline/profile_operation_probe.py \
+  --config /path/to/benchmark-config.json --target ferrosa_pg --protocol pg \
+  --scope existing_fixture --rows 5000 --profile --diagnostic-operation count \
+  --out /tmp/count.json --ready-file /tmp/count.ready --go-file /tmp/count.go
+# Start the process CPU recorder after /tmp/count.ready, then touch /tmp/count.go.
+# Use --diagnostic-operation scan for a complete key/value-validated scan loop.
+```
+
+Each diagnostic loop has eight workers and a 30-second deadline. Full scan
+validation consumes client CPU; these rates are excluded from primary tables.

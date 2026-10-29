@@ -48,6 +48,9 @@ network listeners, so consistency and DoS modes dominate.
 | G-12 | **One edge row per adjacency entry** — `hydrate_hop_neighbor` binds the FIRST edge row matching (source, target); an entry is keyed by label, not by non-endpoint key columns (typed_edges' `edge_type`) | A pair linked by two edge types answers with one (ferrosa-memory's forget cascade misses an edge); without `edge_type` in the pattern each hop scans the whole edge table | 7 | 5 | 6 | 210 | **Open (t_9049eab1).** Deletion is handled (`DELETE r` restores a surviving sibling's entry; reconcile judges an entry on all its edge rows). Binding all matching rows is the fix. |
 | G-13 | **Schema-unaware MERGE sets part of a table's key union** — a `MERGE` whose match/create/set properties cover some but not all of the backing table's key columns (partition key ∪ clustering key) resolves a different key than the caller intends | A partial key silently targets the wrong row (or collapses sibling rows onto one key). Authorization-adjacent and schema-contract-facing: external clients (a separate repository's memory server) writing vertices/edges through Cypher must supply every key column | 8 | 2 | 3 | 48 | **Refused (control added, 2026-10-15).** A schema-unaware MERGE that sets *some but not all* key columns is rejected with `GraphError::Validation` naming the table (`executor/expand.rs:4059-4065`; guard `schema_merge_requires_hidden_key_resolution`, `executor/expand.rs:4956-5029`). A MERGE that sets none (the schema infers the full key) or all (the caller supplies the full key) is allowed. Not previously documented — see `specs/security/threat-model-graph.md` boundary B9. |
 | G-14 | **The deploy heal reruns on every restart and holds the hot path** — the completed heal was held in memory only, and every adjacency query on the keyspace awaits it (t_504435aa) | After each restart every edge MATCH/MERGE waits for a whole-keyspace CL ALL rewrite (about 5 min on the memory cluster, 2026-10-19); ferrosa-memory's 10 s graph client reports the engine unreachable and fai refuses to save results | 7 | 8 | 4 | 224 | **Mitigated (2026-10-19).** A heal with zero errors is recorded per node in `<data_dir>/graph-adjacency-heals.json` (`adjacency::heal_record`, keyspace → `HEAL_VERSION`), and a start that finds the current version serves at once. An unparseable record is not trusted: the node heals, logs at ERROR, and does not overwrite the file. Tests: `adjacency_deploy_heal::{a_restart_after_a_completed_heal_does_not_heal_again, an_incomplete_heal_is_not_recorded_and_the_next_start_heals, an_unreadable_heal_record_heals_rather_than_skips}`, `heal_record::tests`. **Mitigated further (2026-10-20, t_d0dacb7a):** a query waits on a running heal for at most `HEAL_WAIT_BUDGET` (1 s), then is refused retryably (counted in `_queries_refused_during_heal_total`) while the heal goes on in its own task (test: `cluster::a_query_is_refused_retryably_instead_of_waiting_out_a_long_heal`, replica answering in 400 ms). **Corrected (2026-10-20):** the heal is also the backfill for edges written before the process registered its adjacency observer (CQL INSERTs, forwarded replica writes). #589's record skipped it on restart, so such edges were never indexed, and #590's first cut also skipped it for new keyspaces (Driver Smoke red). A recorded start now skips only the cluster-wide Rewrite and runs a local Repair catch-up (`catch_up_adjacency`; tests: `edges_inserted_before_the_first_graph_query_are_traversable`, `edges_inserted_after_a_restart_before_the_first_graph_query_are_traversable`). **Gap:** a node that never receives a graph query never registers its observer or runs the catch-up, so its local adjacency copy misses forwarded edge writes (t_17765000). The heal was never a materialization problem: it streams both scans, keeps at most 32 entries in flight and caps its retry list; it is long because of round trips, and the defect was holding queries for it. **Remaining:** during the first heal on a legacy node, adjacency queries fail retryably for its whole duration; one down replica fails the heal (CL ALL); the record is per node; the heal's 32 in-flight CL ALL writes compete with client traffic and are not paced. |
+| G-15 | **Repeated or stale Bolt scalar-index setup** — connection-local DDL work, schema UUID reuse, or publishing an index before backfill | Repeated first-query latency, unindexed new properties, or incomplete answers | 8 | 3 | 3 | 72 | **Mitigated.** Shared per-table snapshot/path identity cache; cold-only gate and bounded timeout; only validated table bindings trigger replicated index DDL. Backfill and initial cluster sources are checked before setup succeeds; failure is not memoized and precedes leaf data writes. Later reads retain readiness checks. Tests: `bolt::server::auto_index_tests`, cluster `index_readiness_probe_*`. **Limits:** later topology/readiness changes can still reject a read; broad epsilon predicates retain range scans. |
+| G-16 | **Undeclared properties on an existing label** — missing columns caused CREATE to discard new scalar values | Lost properties and unindexed lookups | 8 | 4 | 7 | 224 | **Mitigated for Bolt scalar writes.** First-write columns use coordinated ALTER before data writes, with ALTER permission checks and retryable failures. CREATE/SET/UNWIND and production-DDL tests retain old rows and index matches when column order shifts. Initial values must be non-null scalar literals or bound parameters; unsupported inference fails clearly. **Remaining:** HTTP/embedded CREATE still omits undeclared fields; those callers must declare columns explicitly. |
+
 
 ## Top risks to act on
 
@@ -88,3 +91,58 @@ network listeners, so consistency and DoS modes dominate.
   the exported series are `_entries_{repaired,removed,rewritten}_total`,
   `_reconcile_errors_total`, `_reconcile_passes_total`,
   `_heals_completed_total`, `_heals_failed_total` (`adjacency/reconcile.rs:104-134`).
+
+## Explicit transaction boundaries (2026-10-26, t_a4712717)
+
+- Pending writes leaking on error/disconnect: connection owns only memory; all
+  FAILURE paths clear it and enter failed state until RESET. Idle timeout clears
+  memory without sending an unsolicited protocol reply.
+- Own reads missing pending keys/index updates: transaction reads reconcile the
+  overlay and use scan fallback rather than committed index postings.
+- Partial graph visibility at COMMIT: finite graph query streams share a
+  publication barrier. Slow/unconsumed streams can delay a commit until its
+  deadline. This does not protect independent CQL readers or another GraphEngine.
+- Lost property-dependent updates through one GraphEngine: a shared FIFO writer
+  gate admits writing bound ASTs before MATCH/predicates/RHS/imported bindings.
+  Explicit ownership lasts through COMMIT/abort, autocommit through stream
+  exhaustion/drop. Process-local monotonic mutation timestamps prevent same-tick
+  or regressing-clock reconciliation from discarding successors. A separate read
+  RUN followed by a constant SET still needs a read-set/conflict protocol.
+- Admission/publication deadlock: acquire admission before publication read;
+  queued writers hold no publication guard. COMMIT retains admission then takes
+  publication write, releasing publication first. Query/transaction deadlines
+  bound waits. Pending guards drop on errors/cancellation and observed terminals.
+- Coarse admission limits performance: all keys/databases in one engine serialize.
+  Think time and slow consumers extend ownership; approximate ceiling is 1/H.
+  An unpolled autocommit result holds until polling/drop. This is a deliberate
+  baseline tradeoff, not equivalent row-level concurrency; prioritize narrower
+  ownership with safe update-read refresh.
+- Transport cancellation: RESET/EOF releases on observation, but Bolt cannot
+  observe either while awaiting queued RUN. Prompt observation is still pending;
+  bounded execution deadlines and partial-frame behavior are preserved.
+- Schema/topology changes: new labels are refused inside BEGIN; changed routing
+  aborts COMMIT. DROP/recreate incarnation fencing remains a separate required
+  correctness boundary before production; the fresh-schema baseline excludes
+  concurrent DDL. Pair/cluster execution still needs Accord integration. CQL,
+  raw WritePath calls and other GraphEngines do not share writer admission.
+- Durability: preflight rejection writes nothing; a complete WAL envelope is
+  replayed all-or-none after a torn record. An I/O/fsync error after append is
+  an uncertain outcome, not proof of a successful rollback.
+
+Regression coverage: `graph_http_integration::single_node_explicit_transaction_*`
+exercises commit/rollback, CREATE/MATCH, SET/DELETE own reads, external isolation,
+error, RESET, disconnect, timeout, memory rejection and adjacency publication.
+
+`bolt_rmw_regressions::bolt_rmw_*` adds conserved increments, both mixed-mode
+orders, owner/waiter/reader overlap, observed terminal release, bounded waiter
+expiration, cancelled reservations, stream exhaustion/drop, nested write
+classification and intentional independent-key blocking. Gate probes acknowledge
+actual Pending admission rather than relying on sleeps or generic scan polling.
+
+### Automatic scalar columns during an explicit transaction
+
+A first-property SET must not perform immediate column DDL while row mutations
+are staged for rollback. `ensure_bolt_columns` rejects missing columns inside
+`TRANSACTION_IO` before acquiring the schema gate or rotating storage. The Bolt
+transaction regression covers staged-row discard, unchanged columns, RESET and
+writer release; warm existing-column writes keep automatic index preparation.

@@ -45,7 +45,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
   36329758452). General range predicates, resumed-replica catch-up, process
   crashes, and mixed CQL/PostgreSQL histories remain outside that evidence.
 - `SET`/`RESET` session GUCs (simple-query path returns `0A000`).
-- Function calls in DML `VALUES`; most scalar functions beyond
+- DML functions other than `CURRENT_TIMESTAMP`/`now()`; most scalar functions beyond
   `version()`/`current_database()`/`current_schema()`.
 - Query cancellation (`BackendKeyData` is a `(0,0)` placeholder). TLS is
   supported (t_e1c819ad); mutual TLS / client certificates are not.
@@ -74,7 +74,7 @@ actual code (`src/query.rs`, `src/server.rs`, `src/storage_provider.rs`,
 | PG-6 | **Missing table served as empty relation** | A typo'd table silently returns zero rows instead of erroring | 8 | 1 | 3 | 24 | **R15 guard:** `load_table` checks schema metadata first → `NoSuchTable` (`42P01`), distinct from an existing empty table. Covered by `load_table_missing_table_is_no_such_table`. |
 | PG-READ-01 | **A `SELECT` answered from this node's LOCAL storage only.** `storage_provider::produce_scan` opened `StorageEngine::range_iter` on the local `TableStore` and never fanned a scan across the ring, so a read was complete only while the keyspace was replicated to EVERY node it could be served from AND every owner was up holding its partitions. | At `RF < node_count`, or from a down / mid-join / partition-losing node, a scan returns a FRACTION of the committed rows — **silently**, because an under-return is indistinguishable from a legitimately smaller table. | 9 | 4 | 4 | 144 → 16 | **Fixed.** Every `SELECT` opens the cluster range read (`WritePath::range_read_stream_all_with`) at `ConsistencyLevel::Quorum` (`DEFAULT_READ_CONSISTENCY`) through the new `ClusterRead` seam (`cluster_read.rs`, `ClusterRangeRead`), which the binary wires to the live `WritePath`; a standalone node or a unit test (`ClusterRead::disabled()`) keeps the local path, which IS complete there. A read that cannot meet the level **fails loud** (`ScanFailure` → `58000`) and is **never** downgraded to a local-only scan. `QUORUM` read + `QUORUM` Accord write give `W + R > RF`, so `RF = quorum` is coherent and the factor need not be the whole cluster. Process red: `ferrosa/tests/pg_select_cluster_read_process.rs` (a `SELECT` from each of three nodes returns every committed row by value and order; with an owner stopped it is complete-or-loud). |
 | PG-7 | **Binary `numeric` unsupported** — a client requests binary parameters or results | The query could misdecode numeric values or emit invalid wire bytes | 5 | 2 | 2 | 20 | Checked Bind decoding returns an explicit `0A000`. `encode_value` refuses a `numeric`-declared column by the DECLARED type, so a computed `sum(int8)`/`sum(numeric)`/`avg(int…)` result that PostgreSQL types as `numeric` can no longer slip `int`/`float` bytes under OID 1700 (it was keyed on the value before, and the engine carries those results as `Int`/`Float`). Implement binary numeric (roadmap Next). |
-| PG-8 | **No query cancel** — `BackendKeyData` is `(0,0)` | `CancelRequest` closes the connection but cannot target a running query | 4 | 3 | 2 | 24 | TLS is implemented (t_e1c819ad: `SSLRequest` → `S` + rustls, `[postgres] require_tls` refuses plaintext with `28000`, pipelined-bytes-after-`SSLRequest` refused). A real cancel key is roadmap. Threat-model note: `UnknownRole` is a user-enumeration oracle (run dummy verifier — follow-up). |
+| PG-8 | **No query cancel** — `BackendKeyData` is `(0,0)` | `CancelRequest` closes the connection but cannot target a running query | 4 | 3 | 2 | 24 | TLS is implemented (t_e1c819ad: `SSLRequest` → `S` + rustls, `[postgres] require_tls` refuses plaintext with `28000`, pipelined-bytes-after-`SSLRequest` refused). Real cancel keys and prompt EOF/Terminate during blocked execution are tracked by t_b254fd86. Execution-future/drop tests do not prove wire cancellation. Threat-model note: `UnknownRole` is a user-enumeration oracle (run dummy verifier — follow-up). |
 | PG-12 | **Statement runs without authorization** — a role reads/writes a table it has no grant on | Privilege escalation over the PG listener | 9 | 1 | 2 | 18 | **Mitigated (t_e1c819ad).** `authz` checks `Schema::check_permission` on simple query, `Describe` and `Execute`; `42501` on denial. Exhaustive statement match — an unmapped kind does not compile. Covered by `tests/security_live.rs` (sabotage-verified). |
 | PG-13 | **Brute-force over PG bypasses the login limiter** | Unlimited password guessing; a CQL lockout does not protect the PG port | 8 | 1 | 2 | 16 | **Mitigated (t_e1c819ad).** `VerifierStore::admit/record_failure/record_success` route through the schema's shared per-user limiter; lockout is cross-protocol. The limiter is per node and in memory — a restart or another node resets the count (same as CQL). |
 | PG-9 | **Float/numeric text-format parity with Postgres** — floats use Rust `{}` shortest-form | A benign formatting difference vs PG (`1.5` vs `1.5000…`) | 3 | 4 | 4 | 48 | The differential oracle compares `f64`-parseable cells numerically with tolerance, so this is not a false alarm; exact text parity is follow-up. |
@@ -234,3 +234,89 @@ row materialization, while physical CQL decoding and the owned MVCC image copy
 remain. Tests pin zero-allocation payload validation, conversion-error parity, and
 a corrupt physical payload failing even when MVCC holds a valid replacement.
 The [experiment record](../../deploy/fly-bench/pipeline/HISTORY.md) retains the staged measurements.
+
+
+### Transaction clock regression coverage
+
+`t_6b946676`: wire regressions pin BEGIN time before first use, equality across
+rows/statements and aliases, COMMIT/ROLLBACK reset, Execute rather than Describe
+timing, and timestamp versus timestamptz OIDs/text/binary encodings. Storage
+precision remains milliseconds; tests distinguish persisted values from RETURNING.
+
+
+### PostgreSQL table incarnation isolation (2026-10-26)
+
+PostgreSQL MVCC uses `(qualified table name, TableMetadata.id)` for images, row conflicts, scan epochs and reservations. Statement-bound UUIDs accompany buffered writes and survive write-set spill. Local COMMIT validates the entire set before storage effects while holding a synchronous shared schema lifecycle lease; a retired incarnation aborts the transaction with SQLSTATE `40001`, including its unrelated writes. Reads bind the same UUID and refuse rebinding a retained snapshot to a replacement. Unrelated table histories remain intact.
+
+Accord partition metadata and row images carry the UUID in the canonical Cap'n Proto schema. The replica apply lease spans validation, storage apply and MVCC publication. Missing/invalid legacy UUID metadata is rejected, including replay; it is never assigned the current table ID. Upgrade requires draining/checkpointing legacy PostgreSQL Accord work and upgrading all participating readers/writers together. Additive fields alone do not make mixed old/new binaries safe: old readers ignore the UUID. This change does not rewrite historical metadata or introduce a storage-WAL migration.
+
+The existing distributed TRUNCATE all-serving fan-out bypasses Accord MVCC observers. Its raw marker protocol is unchanged; although buffered/local incarnation checks apply, this change does not fence that remote fan-out against concurrent remote DROP.
+
+
+### Index DDL readiness (t_9fba4678)
+
+Previously ADD PRIMARY KEY could acknowledge a pending index, then indexed
+UPDATE failed with `58000`. Direct now waits for complete tracker readiness;
+permanent builder errors retain their cause, missing registration/retired table
+UUID/path transition fail, and pending/deferred backfill has a 30-second deadline.
+SSTable compaction replacement work remains pending until the tracker establishes
+coverage. The storage read guard is unchanged. Cancellation of the future cannot
+mark postings current; it leaves applied schema and background build work intact.
+Failures do not roll back the key extension already written by ALTER.
+
+Remaining integration: Pair/cluster index DDL is refused until readiness covers
+eligible replica read sources, not just local apply. Wire CancelRequest and SQL
+CREATE INDEX parsing are not added. Tests use real builder failure/backfill and
+indexed UPDATE; SELECT can use MVCC complete rows, so it is not claimed as indexed
+SELECT validation. These limits are separate from the timestamp/MVCC issues above.
+
+Binding a replacement lazily reclaims only retired-incarnation MVCC heads and scan keys. Active snapshots retain their immutable historical roots until release/expiry; unrelated tables are not cleared.
+
+## PG-RC-01 — Direct hot-row READ COMMITTED compatibility
+
+Previously, default transactions could compute the same old value and force one
+writer to abort with `40001`; explicit READ COMMITTED was refused. The local path
+now owns table-UUID/partition hash stripes before row evaluation, rechecks only
+initially selected candidates against committed winners, and retains ownership
+through atomic apply and MVCC publication. Candidate selection shares SELECT's
+snapshot/own-write overlay. Failure and task cancellation discard the staged set;
+failed explicit transactions cannot escape through extended Sync or Parse errors.
+
+Bounds: 1,024 stripes per live table, at most 1,024 guards per touched table per
+transaction, 16,384 live identities and 262,144 held/pending references per manager
+(`53200` on exhaustion). These are resource limits, not exact byte accounting.
+Default lock timeout is disabled; proven FIFO dependency cycles fail the closing
+requester with `40P01`. Iterative cycle checks and RAII queue/grant cleanup bound
+bookkeeping, and empty entries are removed. Collisions can
+serialize disjoint partitions in one table; unrelated tables remain independent.
+The existing scan key metadata and own-write readback residency limits described
+above still apply; bounded row channels and payload spill are preserved.
+
+Required remaining work: distributed ownership/statement snapshots for cluster
+RC, COPY contention beyond its conservative late-ownership conflict validation,
+and PostgreSQL wire cancellation. Local futures are cancellation-safe; this does
+not imply CancelRequest routing. Non-PG writers do not join local ownership.
+Tests: pg_stock_contention; server cancellation/publication regressions; existing
+SERIALIZABLE and pg_drop_recreate_mvcc tests. Root independent GREEN verification
+is required before declaring the broader baseline task complete.
+
+## PG-WAIT-01 — default waiting and active lifetime (t_87e93bce)
+
+Removed the arbitrary five-second failure for acyclic writer waits. Explicit FIFO
+predecessor dependencies and stable transaction identity detect actual cycles.
+Small injected-limit tests exercise both admission budgets, failure rollback and
+reclamation; cancellation tests cover queued removal and grant-before-observation.
+
+Original BEGIN age, including RC commit refresh, bounds abandoned local ownership
+under the existing 600-second default snapshot policy. Idle expiry drops staged
+writes/leases; waiting expiry wakes with `40001`. The reaper signals only after a
+successful CAS and never steals durable-commit locks. Tests expire immediately
+before apply and after physical apply: the former rolls back, the latter completes
+coherent publication while ownership remains held. Task cancellation cannot suspend
+the synchronous local apply/publication region. Disconnect around commit retains
+response ambiguity; no fictitious rollback is reported by the lifetime handler.
+
+Remaining: positive lock_timeout SET/RESET/SHOW (t_cc11529a), native CancelRequest
+and prompt blocked EOF/Terminate (t_b254fd86), distributed RC (t_b6306006), and early
+COPY contention semantics (t_4c825e03). Snapshot maximum age is a Ferrosa resource
+policy, not native PostgreSQL default transaction-timeout parity.

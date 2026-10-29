@@ -249,8 +249,8 @@ fn decode_column(arr: &ArrayRef, dt: &DataType) -> Result<Vec<Option<CqlValue>>,
         DataType::Boolean => scalar!(BooleanArray, CqlValue::Boolean),
         DataType::Float32 => scalar!(Float32Array, |v: f32| CqlValue::Float(v.to_bits())),
         DataType::Float64 => scalar!(Float64Array, |v: f64| CqlValue::Double(v.to_bits())),
-        DataType::Utf8 => scalar!(StringArray, |v: &str| CqlValue::Text(v.to_string())),
-        DataType::Binary => scalar!(BinaryArray, |v: &[u8]| CqlValue::Blob(v.to_vec())),
+        DataType::Utf8 => scalar!(StringArray, |v: &str| CqlValue::Text(v.to_string().into())),
+        DataType::Binary => scalar!(BinaryArray, |v: &[u8]| CqlValue::Blob(v.to_vec().into())),
         DataType::Timestamp(TimeUnit::Millisecond, _) => {
             scalar!(TimestampMillisecondArray, CqlValue::Timestamp)
         }
@@ -331,8 +331,8 @@ fn build_values(
         }
         CqlType::Ascii | CqlType::Varchar => string_col!(
             "text",
-            CqlValue::Ascii(s) => s.clone(),
-            CqlValue::Text(s) => s.clone(),
+            CqlValue::Ascii(s) => s.to_string(),
+            CqlValue::Text(s) => s.to_string(),
         ),
         CqlType::Uuid | CqlType::Timeuuid => string_col!(
             "uuid",
@@ -349,7 +349,7 @@ fn build_values(
                 for v in values {
                     match v.as_ref() {
                         None | Some(CqlValue::Null) => out.push(None),
-                        Some(CqlValue::Blob(b)) => out.push(Some(b.clone())),
+                        Some(CqlValue::Blob(b)) => out.push(Some(b.to_vec())),
                         Some(_) => {
                             return Err(ConvertError::TypeMismatch {
                                 column,

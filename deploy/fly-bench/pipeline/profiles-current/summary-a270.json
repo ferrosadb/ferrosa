@@ -1,0 +1,7135 @@
+{
+  "runtime": {
+    "revision": "a2709e100cb016e46b51df7b2052a468c8ef16a2",
+    "image": "registry.fly.io/ferrosa-bench-main@sha256:a06ef6fa78d730de7c93cb5a322804645b44c38db48b20b8bc6b2effbcaa2f54",
+    "binary_sha256": "9c96b03a5c6abc886f2c6f3365a64c8b8f8c0d15f60202ebd4cfddb0087e9eeb",
+    "capsule_sha256": "6e17ac2420099189921a03c72b14a66b1e69221179047d28daa0b92d72b44787",
+    "only_changed_member": "usr/local/bin/ferrosa"
+  },
+  "diagnostic_scope": "Eight-reader CPU profiles; PostgreSQL/SPARQL include separate count and full-scan loops with complete value validation. Primary rates exclude these recordings.",
+  "cpu": {
+    "bolt-B": {
+      "cpu_samples": 238,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          44
+        ],
+        [
+          "syscall",
+          8
+        ],
+        [
+          "malloc",
+          8
+        ],
+        [
+          "sdallocx",
+          7
+        ],
+        [
+          "ferrosa_graph::bolt::server::process_message_inner::{closure#0}",
+          5
+        ],
+        [
+          "core::ptr::drop_glue::<[ferrosa_graph::bolt::codec::PackValue]>",
+          4
+        ],
+        [
+          "calloc",
+          4
+        ],
+        [
+          "<hashbrown::raw::RawTable<",
+          3
+        ],
+        [
+          "<std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&str>",
+          3
+        ],
+        [
+          "do_rallocx",
+          3
+        ],
+        [
+          "__rustc::__rust_dealloc",
+          3
+        ],
+        [
+          "ferrosa_storage::index::sidecar::read_field",
+          3
+        ],
+        [
+          "<parking_lot::condvar::Condvar>::wait_until_internal",
+          2
+        ],
+        [
+          "core::ptr::drop_glue::<ferrosa_graph::bolt::codec::PackValue>",
+          2
+        ],
+        [
+          "<async_stream::async_stream::AsyncStream<core::result::Result<alloc::vec::Vec<serde_json::value::Value>, ferrosa_graph::error::GraphError>, <ferrosa_graph::engine::GraphEngine>::execute_stream_with_params_inner::{closure#0}::{closure#3}> as futures_core::stream::Stream>::poll_next",
+          2
+        ],
+        [
+          "<async_stream::async_stream::AsyncStream<core::result::Result<ferrosa_graph::executor::expand::OwnedStreamItem, ferrosa_graph::error::GraphError>, ferrosa_graph::executor::expand::owned_stream_items::{closure#0}> as futures_core::stream::Stream>::poll_next",
+          2
+        ],
+        [
+          "<ferrosa_graph::engine::GraphEngine>::execute_statement_streaming::{closure#0}",
+          2
+        ],
+        [
+          "ferrosa_graph::executor::expand::expand_to_states::{closure#0}",
+          2
+        ],
+        [
+          "[[vdso]]",
+          2
+        ],
+        [
+          "<ferrosa_storage::index::tracker::IndexStateTracker>::get_state",
+          2
+        ]
+      ],
+      "server_resources": {
+        "samples": 31,
+        "sample_window_s": 30.035870790481567,
+        "sampled_process_cpu_s_lower_bound": 10.39,
+        "summed_observed_thread_runqueue_s": 25.670963391,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1212416
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 11408797,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 632,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          12392,
+          23464,
+          81196,
+          458916
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            2791
+          ],
+          [
+            "ep_poll",
+            414
+          ],
+          [
+            "0",
+            68
+          ],
+          [
+            "hrtimer_nanosleep",
+            62
+          ],
+          [
+            "do_poll.constprop.0",
+            31
+          ],
+          [
+            "inet_csk_accept",
+            31
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 8,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 3032,
+            "write_ms": 7,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 53,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 26,
+            "weighted_io_ms": 8,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 1552384,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.2692307692307692,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 358663,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 358663,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 17469929,
+            "rx_packets": 117799,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 32728995,
+            "tx_packets": 177725,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 31,
+        "sample_window_s": 30.007144451141357,
+        "sampled_process_cpu_s_lower_bound": 33.09,
+        "summed_observed_thread_runqueue_s": 44.973433204,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 425984
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 12539336,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 399,
+          "full": 191
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21316,
+          75120
+        ],
+        "sampled_wchan_counts": [
+          [
+            "0",
+            125
+          ],
+          [
+            "futex_wait_queue",
+            123
+          ],
+          [
+            "wait_woken",
+            85
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1144,
+            "write_ms": 4,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 21,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 24,
+            "weighted_io_ms": 4,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 585728,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.16666666666666666,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 31878272,
+            "rx_packets": 177902,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 17582528,
+            "tx_packets": 118425,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "bolt-B-count": {
+      "cpu_samples": 906,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "<ferrosa_sstable::reader::ChunkCache>::get",
+          287
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkedCompressedData<ferrosa_sstable::io::FileReadAt> as ferrosa_sstable::io::ReadAt>::read_at",
+          201
+        ],
+        [
+          "<std::sys::sync::mutex::futex::Mutex>::lock_contended",
+          115
+        ],
+        [
+          "[libc.so.6]",
+          46
+        ],
+        [
+          "sdallocx",
+          23
+        ],
+        [
+          "<ferrosa_sstable::data::DataReader<ferrosa_sstable::reader::ReadSource<ferrosa_sstable::io::FileReadAt>>>::read_partition_metadata",
+          22
+        ],
+        [
+          "malloc",
+          19
+        ],
+        [
+          "ferrosa_common::murmur3::hash3_x64_128",
+          19
+        ],
+        [
+          "<ferrosa_storage::range_merger::MergeSource<ferrosa_sstable::io::FileReadAt>>::pop_partition",
+          14
+        ],
+        [
+          "ferrosa_common::murmur3::get_block_i64",
+          14
+        ],
+        [
+          "<ferrosa_sstable::reader::ReadSource<ferrosa_sstable::io::FileReadAt> as ferrosa_sstable::io::ReadAt>::read_exact_at",
+          14
+        ],
+        [
+          "<ferrosa_storage::range_merger::RangeMerger<ferrosa_sstable::io::FileReadAt>>::refill_source",
+          14
+        ],
+        [
+          "calloc",
+          13
+        ],
+        [
+          "<ferrosa_sstable::data::DataReader<ferrosa_sstable::reader::ReadSource<ferrosa_sstable::io::FileReadAt>>>::read_partition_header",
+          12
+        ],
+        [
+          "<alloc::collections::binary_heap::BinaryHeap<ferrosa_storage::memtable::sharded::ShardHeapEntry>>::pop",
+          11
+        ],
+        [
+          "<alloc::collections::binary_heap::BinaryHeap<ferrosa_storage::range_merger::HeapEntry>>::push",
+          11
+        ],
+        [
+          "<ferrosa_storage::store::TableStore<ferrosa_storage::flush::FileFlushTarget>>::count_range_matching",
+          10
+        ],
+        [
+          "__rustc::__rust_dealloc",
+          9
+        ],
+        [
+          "<ferrosa_storage::range_merger::RangeMerger<ferrosa_sstable::io::FileReadAt>>::next_merged_partition",
+          8
+        ],
+        [
+          "<ferrosa_sstable::data::DataReader<ferrosa_sstable::reader::ReadSource<ferrosa_sstable::io::FileReadAt>>>::peek_partition_key",
+          8
+        ]
+      ],
+      "server_resources": {
+        "samples": 34,
+        "sample_window_s": 33.02892231941223,
+        "sampled_process_cpu_s_lower_bound": 18.92,
+        "summed_observed_thread_runqueue_s": 51.502378016,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1327104
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 26522792,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1270,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          12316,
+          23776,
+          92744,
+          506360
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            3234
+          ],
+          [
+            "ep_poll",
+            441
+          ],
+          [
+            "0",
+            107
+          ],
+          [
+            "hrtimer_nanosleep",
+            68
+          ],
+          [
+            "do_poll.constprop.0",
+            34
+          ],
+          [
+            "inet_csk_accept",
+            34
+          ],
+          [
+            "__skb_wait_for_more_packets",
+            34
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 10944,
+            "write_ms": 23,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 56,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 73,
+            "weighted_io_ms": 23,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 5603328,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.3150684931506849,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 478391,
+            "rx_packets": 56,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 478391,
+            "tx_packets": 56,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 413862,
+            "rx_packets": 2833,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 3048777,
+            "tx_packets": 5563,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 34,
+        "sample_window_s": 33.00675559043884,
+        "sampled_process_cpu_s_lower_bound": 0.76,
+        "summed_observed_thread_runqueue_s": 0.00046156,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 462848
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 42434,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 345,
+          "full": 345
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21316,
+          70044
+        ],
+        "sampled_wchan_counts": [
+          [
+            "wait_woken",
+            241
+          ],
+          [
+            "futex_wait_queue",
+            61
+          ],
+          [
+            "0",
+            34
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 904,
+            "write_ms": 2,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 22,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 20,
+            "weighted_io_ms": 3,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 462848,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.1,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 2980440,
+            "rx_packets": 5317,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 374969,
+            "tx_packets": 2987,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "bolt-neo4j": {
+      "cpu_samples": 1880,
+      "cpu_leaf_unknown_percent": 0.05319148936170213,
+      "cpu_top_leaves": [
+        [
+          "[perf-650.map]",
+          973
+        ],
+        [
+          "[libc.so.6]",
+          36
+        ],
+        [
+          "Node::dominates",
+          22
+        ],
+        [
+          "PhaseChaitin::Split",
+          21
+        ],
+        [
+          "PhaseChaitin::elide_copy",
+          20
+        ],
+        [
+          "void OopOopIterateDispatch<G1CMOopClosure>::Table::oop_oop_iterate<InstanceKlass, narrowOop>",
+          19
+        ],
+        [
+          "PhaseChaitin::interfere_with_live",
+          16
+        ],
+        [
+          "PhaseLive::compute",
+          13
+        ],
+        [
+          "IndexSetIterator::advance_and_next",
+          12
+        ],
+        [
+          "CompilationPolicy::select_task",
+          11
+        ],
+        [
+          "PhaseChaitin::post_allocate_copy_removal",
+          11
+        ],
+        [
+          "PhaseChaitin::gather_lrg_masks",
+          10
+        ],
+        [
+          "IndexSet::initialize",
+          9
+        ],
+        [
+          "Dict::Insert",
+          9
+        ],
+        [
+          "PhaseIdealLoop::build_loop_late_post_work",
+          9
+        ],
+        [
+          "Arena::contains",
+          7
+        ],
+        [
+          "__tls_get_addr",
+          7
+        ],
+        [
+          "PhaseChaitin::build_ifg_physical",
+          7
+        ],
+        [
+          "PhaseIdealLoop::build_loop_late",
+          7
+        ],
+        [
+          "PhaseIterGVN::subsume_node",
+          7
+        ]
+      ],
+      "server_resources": {
+        "samples": 31,
+        "sample_window_s": 30.026774644851685,
+        "sampled_process_cpu_s_lower_bound": 48.83,
+        "summed_observed_thread_runqueue_s": 102.067472818,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 6668288
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 17968276,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1610,
+          "full": 367
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          12628,
+          23768,
+          80744,
+          515612
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            2889
+          ],
+          [
+            "ep_poll",
+            383
+          ],
+          [
+            "0",
+            201
+          ],
+          [
+            "hrtimer_nanosleep",
+            90
+          ],
+          [
+            "do_poll.constprop.0",
+            31
+          ],
+          [
+            "inet_csk_accept",
+            31
+          ],
+          [
+            "__skb_wait_for_more_packets",
+            31
+          ],
+          [
+            "__schedule",
+            1
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 8,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 24280,
+            "write_ms": 37,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 67,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 92,
+            "weighted_io_ms": 38,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 12431360,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.40217391304347827,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 358678,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 358678,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 19800988,
+            "rx_packets": 117542,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 29298874,
+            "tx_packets": 117907,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 30,
+        "sample_window_s": 29.006696701049805,
+        "sampled_process_cpu_s_lower_bound": 32.34,
+        "summed_observed_thread_runqueue_s": 41.902653762,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 409600
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 11836799,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 439,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21316,
+          69608
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            121
+          ],
+          [
+            "0",
+            109
+          ],
+          [
+            "do_poll.constprop.0",
+            100
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1080,
+            "write_ms": 3,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 12,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 22,
+            "weighted_io_ms": 3,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 552960,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.13636363636363635,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 28280921,
+            "rx_packets": 116355,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 19551395,
+            "tx_packets": 116296,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "bolt-neo4j-count": {
+      "cpu_samples": 786,
+      "cpu_leaf_unknown_percent": 0.3816793893129771,
+      "cpu_top_leaves": [
+        [
+          "[perf-650.map]",
+          418
+        ],
+        [
+          "[libc.so.6]",
+          42
+        ],
+        [
+          "void OopOopIterateDispatch<G1CMOopClosure>::Table::oop_oop_iterate<InstanceKlass, narrowOop>",
+          25
+        ],
+        [
+          "void OopOopIterateDispatch<G1CMOopClosure>::Table::oop_oop_iterate<ObjArrayKlass, narrowOop>",
+          10
+        ],
+        [
+          "Node::dominates",
+          9
+        ],
+        [
+          "java_lang_Throwable::fill_in_stack_trace",
+          8
+        ],
+        [
+          "void OopOopIterateDispatch<G1RebuildRemSetClosure>::Table::oop_oop_iterate<InstanceKlass, narrowOop>",
+          7
+        ],
+        [
+          "JfrStackTrace::record",
+          7
+        ],
+        [
+          "IndexSetIterator::advance_and_next",
+          6
+        ],
+        [
+          "prctl",
+          6
+        ],
+        [
+          "PhaseLive::compute",
+          5
+        ],
+        [
+          "PhaseChaitin::elide_copy",
+          5
+        ],
+        [
+          "G1CMTask::do_marking_step",
+          5
+        ],
+        [
+          "void G1CMTask::process_grey_task_entry<true>",
+          5
+        ],
+        [
+          "[[vdso]]",
+          5
+        ],
+        [
+          "PhaseChaitin::interfere_with_live",
+          4
+        ],
+        [
+          "void OopOopIterateDispatch<G1CMOopClosure>::Table::oop_oop_iterate<InstanceMirrorKlass, narrowOop>",
+          4
+        ],
+        [
+          "CodeHeap::find_blob",
+          4
+        ],
+        [
+          "JfrStackTrace::equals",
+          4
+        ],
+        [
+          "BacktraceBuilder::push",
+          4
+        ]
+      ],
+      "server_resources": {
+        "samples": 32,
+        "sample_window_s": 31.007495880126953,
+        "sampled_process_cpu_s_lower_bound": 25.14,
+        "summed_observed_thread_runqueue_s": 18.298310372,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 4919296
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 5356551,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 2914,
+          "full": 1429
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          12728,
+          23796,
+          80684,
+          508556
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            2971
+          ],
+          [
+            "ep_poll",
+            412
+          ],
+          [
+            "0",
+            109
+          ],
+          [
+            "hrtimer_nanosleep",
+            94
+          ],
+          [
+            "do_poll.constprop.0",
+            32
+          ],
+          [
+            "inet_csk_accept",
+            32
+          ],
+          [
+            "__skb_wait_for_more_packets",
+            32
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 37344,
+            "write_ms": 71,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 55,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 150,
+            "weighted_io_ms": 71,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 19120128,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.47333333333333333,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 358732,
+            "rx_packets": 41,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 358732,
+            "tx_packets": 41,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 18963943,
+            "rx_packets": 134747,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 27308132,
+            "tx_packets": 136055,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.007799863815308,
+        "sampled_process_cpu_s_lower_bound": 40.97,
+        "summed_observed_thread_runqueue_s": 70.574101012,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 446464
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 17799592,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 411,
+          "full": 94
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21316,
+          69684
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            184
+          ],
+          [
+            "0",
+            111
+          ],
+          [
+            "do_poll.constprop.0",
+            38
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 8,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1088,
+            "write_ms": 4,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 13,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 21,
+            "weighted_io_ms": 4,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 557056,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.19047619047619047,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 27451754,
+            "rx_packets": 136775,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 19092671,
+            "tx_packets": 135923,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "cql-cassandra-profile": {
+      "cpu_samples": 550,
+      "cpu_leaf_unknown_percent": 0.18181818181818182,
+      "cpu_top_leaves": [
+        [
+          "[perf-2069.map]",
+          314
+        ],
+        [
+          "[libc.so.6]",
+          133
+        ],
+        [
+          "Unsafe_Park",
+          15
+        ],
+        [
+          "Parker::park",
+          13
+        ],
+        [
+          "[[vdso]]",
+          11
+        ],
+        [
+          "java_lang_Thread::set_thread_status",
+          9
+        ],
+        [
+          "AccessInternal::PostRuntimeDispatch<G1BarrierSet::AccessBarrier<548964ul, G1BarrierSet>, ",
+          4
+        ],
+        [
+          "PhaseChaitin::interfere_with_live",
+          3
+        ],
+        [
+          "pthread_mutex_unlock",
+          3
+        ],
+        [
+          "PhaseChaitin::Split",
+          2
+        ],
+        [
+          "PhaseChaitin::post_allocate_copy_removal",
+          2
+        ],
+        [
+          "__vdso_clock_gettime",
+          2
+        ],
+        [
+          "pthread_cond_timedwait",
+          2
+        ],
+        [
+          "pthread_mutex_trylock",
+          2
+        ],
+        [
+          "pthread_cond_signal",
+          2
+        ],
+        [
+          "ciObjectFactory::get_metadata",
+          1
+        ],
+        [
+          "Arena::destruct_contents",
+          1
+        ],
+        [
+          "PhaseCFG::schedule_pinned_nodes",
+          1
+        ],
+        [
+          "PhaseChaitin::elide_copy",
+          1
+        ],
+        [
+          "NTarjan::DFS",
+          1
+        ]
+      ],
+      "server_resources": {
+        "samples": 31,
+        "sample_window_s": 30.008463144302368,
+        "sampled_process_cpu_s_lower_bound": 24.74,
+        "summed_observed_thread_runqueue_s": 32.69813383,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 2052096
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 10023480,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1421,
+          "full": 621
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11956,
+          15036,
+          22348,
+          31060,
+          81080,
+          2062288
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            4763
+          ],
+          [
+            "ep_poll",
+            634
+          ],
+          [
+            "0",
+            110
+          ],
+          [
+            "inet_csk_accept",
+            62
+          ],
+          [
+            "hrtimer_nanosleep",
+            62
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 12488,
+            "write_ms": 33,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 60,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 80,
+            "weighted_io_ms": 32,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 6393856,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.4125,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 355437,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 355437,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 15701378,
+            "rx_packets": 112752,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 35420859,
+            "tx_packets": 114070,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 30,
+        "sample_window_s": 29.005131483078003,
+        "sampled_process_cpu_s_lower_bound": 27.24,
+        "summed_observed_thread_runqueue_s": 1.112098915,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 425984
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 799650,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 354,
+          "full": 107
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21108,
+          50968
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            390
+          ],
+          [
+            "0",
+            85
+          ],
+          [
+            "do_select",
+            5
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1360,
+            "write_ms": 5,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 26,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 29,
+            "weighted_io_ms": 5,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 696320,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.1724137931034483,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 32327504,
+            "rx_packets": 110730,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 15295214,
+            "tx_packets": 110670,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "cql-ferrosa_cql-profile": {
+      "cpu_samples": 194,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          24
+        ],
+        [
+          "syscall",
+          8
+        ],
+        [
+          "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write",
+          6
+        ],
+        [
+          "do_rallocx",
+          5
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkCache>::get",
+          5
+        ],
+        [
+          "ferrosa_sstable::trie::node::read_node_header",
+          5
+        ],
+        [
+          "<tokio::runtime::scheduler::multi_thread::worker::Context>::run",
+          4
+        ],
+        [
+          "ferrosa_cql::connection::handle_execute::{closure#0}",
+          3
+        ],
+        [
+          "malloc",
+          3
+        ],
+        [
+          "<indexmap::map::IndexMap<alloc::string::String, ferrosa_schema::metadata::column::ColumnMetadata>>::get_index_of::<alloc::string::String>",
+          3
+        ],
+        [
+          "ferrosa_cql::connection::handle_connection::<tokio::net::tcp::stream::TcpStream>::{closure#0}",
+          2
+        ],
+        [
+          "<core::future::poll_fn::PollFn<ferrosa_cql::connection::handle_connection<tokio::net::tcp::stream::TcpStream>::{closure#0}::{closure#3}> as core::future::future::Future>::poll",
+          2
+        ],
+        [
+          "<tokio::sync::mpsc::list::Rx<ferrosa_cql::frame::CqlFrame>>::pop",
+          2
+        ],
+        [
+          "<tokio::time::sleep::Sleep as core::future::future::Future>::poll",
+          2
+        ],
+        [
+          "tcache_try_gc_bin",
+          2
+        ],
+        [
+          "ferrosa_cql::connection::handle_connection::<tokio::net::tcp::stream::TcpStream>::{closure#0}::{closure#0}",
+          2
+        ],
+        [
+          "<ferrosa_cql::prepared::PreparedCache>::get",
+          2
+        ],
+        [
+          "<ferrosa_sstable::data::DataReader<ferrosa_sstable::reader::ReadSource<ferrosa_sstable::io::FileReadAt>>>::read_row_into",
+          2
+        ],
+        [
+          "__rustc::__rust_no_alloc_shim_is_unstable_v2",
+          2
+        ],
+        [
+          "crossbeam_epoch::default::with_handle::<crossbeam_epoch::default::pin::{closure#0}, crossbeam_epoch::guard::Guard>",
+          2
+        ]
+      ],
+      "server_resources": {
+        "samples": 32,
+        "sample_window_s": 31.029943466186523,
+        "sampled_process_cpu_s_lower_bound": 8.87,
+        "summed_observed_thread_runqueue_s": 19.390529853,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 2023424
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 8411864,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 895,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11756,
+          15036,
+          22572,
+          31060,
+          85268,
+          2062064
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            4824
+          ],
+          [
+            "ep_poll",
+            656
+          ],
+          [
+            "0",
+            67
+          ],
+          [
+            "inet_csk_accept",
+            64
+          ],
+          [
+            "hrtimer_nanosleep",
+            64
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 8088,
+            "write_ms": 24,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 39,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 57,
+            "weighted_io_ms": 23,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 4141056,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.42105263157894735,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 367495,
+            "rx_packets": 41,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 367495,
+            "tx_packets": 41,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 14008283,
+            "rx_packets": 100426,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 31865203,
+            "tx_packets": 101892,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.006105661392212,
+        "sampled_process_cpu_s_lower_bound": 25.18,
+        "summed_observed_thread_runqueue_s": 1.172569674,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 454656
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 808726,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 247,
+          "full": 100
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21124,
+          56412
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            378
+          ],
+          [
+            "0",
+            90
+          ],
+          [
+            "do_select",
+            13
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1480,
+            "write_ms": 7,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 9,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 27,
+            "weighted_io_ms": 7,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 757760,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.25925925925925924,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 31671393,
+            "rx_packets": 101436,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 13867457,
+            "tx_packets": 100446,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "pg-ferrosa_pg-count-profile": {
+      "cpu_samples": 1382,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          176
+        ],
+        [
+          "<imbl::nodes::hamt::GenericSimdNode<",
+          66
+        ],
+        [
+          "syscall",
+          63
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkCache>::get",
+          61
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkedCompressedData<ferrosa_sstable::io::FileReadAt> as ferrosa_sstable::io::ReadAt>::read_at",
+          50
+        ],
+        [
+          "_rjem_je_arena_ptr_array_flush",
+          37
+        ],
+        [
+          "[[vdso]]",
+          33
+        ],
+        [
+          "<ferrosa_sql::types::Value as core::hash::Hash>::hash_slice::<std::hash::random::DefaultHasher>",
+          31
+        ],
+        [
+          "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write",
+          28
+        ],
+        [
+          "<ferrosa_sql::types::Value as core::cmp::PartialEq>::eq",
+          28
+        ],
+        [
+          "core::ptr::drop_glue::<ferrosa_sql::types::Value>",
+          24
+        ],
+        [
+          "<tokio::sync::mpsc::bounded::Sender<ferrosa_sql::types::Row>>::send::{closure#0}",
+          20
+        ],
+        [
+          "<tokio::runtime::scheduler::multi_thread::worker::Context>::run",
+          18
+        ],
+        [
+          "<tokio::runtime::scheduler::multi_thread::worker::Context>::park_internal",
+          17
+        ],
+        [
+          "<parking_lot::condvar::Condvar>::wait_until_internal",
+          17
+        ],
+        [
+          "malloc",
+          17
+        ],
+        [
+          "<core::panic::unwind_safe::AssertUnwindSafe<ferrosa_postgres::storage_provider::produce_scan::{closure#0}> as core::future::future::Future>::poll",
+          16
+        ],
+        [
+          "<imbl::nodes::hamt::HamtNode<",
+          16
+        ],
+        [
+          "sdallocx",
+          16
+        ],
+        [
+          "<tokio::sync::mpsc::list::Rx<ferrosa_sql::types::Row>>::pop",
+          16
+        ]
+      ],
+      "server_resources": {
+        "samples": 32,
+        "sample_window_s": 31.006086111068726,
+        "sampled_process_cpu_s_lower_bound": 48.97,
+        "summed_observed_thread_runqueue_s": 35.71509552,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1789952
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 15299201,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 2099,
+          "full": 136
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11844,
+          15036,
+          22328,
+          31060,
+          80100
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1300
+          ],
+          [
+            "ep_poll",
+            492
+          ],
+          [
+            "0",
+            128
+          ],
+          [
+            "hrtimer_nanosleep",
+            64
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 13864,
+            "write_ms": 30,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 50,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 93,
+            "weighted_io_ms": 30,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 7098368,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.3225806451612903,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 348047,
+            "rx_packets": 42,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 348047,
+            "tx_packets": 42,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 239998,
+            "rx_packets": 1040,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 975344,
+            "tx_packets": 2169,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.007012605667114,
+        "sampled_process_cpu_s_lower_bound": 0.4,
+        "summed_observed_thread_runqueue_s": 0.000530709,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 438272
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 48145,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 458,
+          "full": 458
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21068,
+          40696
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            242
+          ],
+          [
+            "futex_wait_queue",
+            68
+          ],
+          [
+            "0",
+            32
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 752,
+            "write_ms": 4,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 17,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 24,
+            "weighted_io_ms": 4,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 385024,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.16666666666666666,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 889586,
+            "rx_packets": 2094,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 169237,
+            "tx_packets": 1161,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "pg-ferrosa_pg-profile": {
+      "cpu_samples": 450,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          68
+        ],
+        [
+          "syscall",
+          19
+        ],
+        [
+          "<arc_swap::debt::Debt>::pay_all::<alloc::sync::Arc<ferrosa_postgres::mvcc::State>, <arc_swap::strategy::hybrid::HybridStrategy<arc_swap::strategy::hybrid::DefaultConfig> as arc_swap::strategy::sealed::InnerStrategy<alloc::sync::Arc<ferrosa_postgres::mvcc::State>>>::wait_for_readers::{closure#0}>::{closure#0}",
+          13
+        ],
+        [
+          "malloc",
+          7
+        ],
+        [
+          "do_rallocx",
+          6
+        ],
+        [
+          "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write",
+          6
+        ],
+        [
+          "sdallocx",
+          6
+        ],
+        [
+          "<hashbrown::raw::RawTable<",
+          6
+        ],
+        [
+          "<imbl::nodes::hamt::HamtNode<",
+          6
+        ],
+        [
+          "__rustc::__rust_no_alloc_shim_is_unstable_v2",
+          4
+        ],
+        [
+          "<imbl::nodes::hamt::Entry<",
+          4
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkCache>::get",
+          4
+        ],
+        [
+          "ferrosa_row_bridge::codec::decode_value",
+          4
+        ],
+        [
+          "_rjem_je_sdallocx_default",
+          4
+        ],
+        [
+          "getenv",
+          4
+        ],
+        [
+          "clock_gettime",
+          3
+        ],
+        [
+          "<alloc::sync::Arc<ferrosa_postgres::storage_provider::ScanContext>>::drop_slow",
+          3
+        ],
+        [
+          "ferrosa_common::cql_type::names::scalar_from_name",
+          3
+        ],
+        [
+          "<ferrosa_postgres::result_stream::ResultStream>::pump::<ferrosa_postgres::server::SocketSink<tokio::net::tcp::stream::TcpStream>>::{closure#0}",
+          3
+        ],
+        [
+          "<ferrosa_postgres::result_stream::ResultStream>::next_batch::{closure#0}",
+          3
+        ]
+      ],
+      "server_resources": {
+        "samples": 34,
+        "sample_window_s": 33.01941180229187,
+        "sampled_process_cpu_s_lower_bound": 17.8,
+        "summed_observed_thread_runqueue_s": 61.47604836,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1622016
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 20085330,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1091,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6044,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11924,
+          22036,
+          31060,
+          77636
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1349
+          ],
+          [
+            "ep_poll",
+            517
+          ],
+          [
+            "0",
+            119
+          ],
+          [
+            "hrtimer_nanosleep",
+            68
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 4776,
+            "write_ms": 20,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 64,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 53,
+            "weighted_io_ms": 20,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 2445312,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.37735849056603776,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 347913,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 347913,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 13215242,
+            "rx_packets": 96463,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 30576508,
+            "tx_packets": 96857,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 34,
+        "sample_window_s": 33.00640940666199,
+        "sampled_process_cpu_s_lower_bound": 10.56,
+        "summed_observed_thread_runqueue_s": 6.351180826,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 458752
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 2644711,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 362,
+          "full": 361
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21064,
+          45676
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            191
+          ],
+          [
+            "0",
+            73
+          ],
+          [
+            "futex_wait_queue",
+            62
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1864,
+            "write_ms": 7,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 16,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 28,
+            "weighted_io_ms": 7,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 954368,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.25,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 30623978,
+            "rx_packets": 96944,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 13258783,
+            "tx_packets": 96659,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "pg-ferrosa_pg-scan-profile": {
+      "cpu_samples": 1365,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          169
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkCache>::get",
+          72
+        ],
+        [
+          "syscall",
+          70
+        ],
+        [
+          "<imbl::nodes::hamt::GenericSimdNode<",
+          49
+        ],
+        [
+          "<ferrosa_sstable::reader::ChunkedCompressedData<ferrosa_sstable::io::FileReadAt> as ferrosa_sstable::io::ReadAt>::read_at",
+          48
+        ],
+        [
+          "<ferrosa_sql::types::Value as core::cmp::PartialEq>::eq",
+          39
+        ],
+        [
+          "<ferrosa_sql::types::Value as core::hash::Hash>::hash_slice::<std::hash::random::DefaultHasher>",
+          35
+        ],
+        [
+          "<tokio::runtime::scheduler::multi_thread::worker::Context>::run",
+          26
+        ],
+        [
+          "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write",
+          26
+        ],
+        [
+          "<imbl::nodes::hamt::HamtNode<",
+          25
+        ],
+        [
+          "[[vdso]]",
+          24
+        ],
+        [
+          "<ferrosa_sql::types::Value as core::clone::Clone>::clone",
+          24
+        ],
+        [
+          "sdallocx",
+          19
+        ],
+        [
+          "<core::panic::unwind_safe::AssertUnwindSafe<ferrosa_postgres::storage_provider::produce_scan::{closure#0}> as core::future::future::Future>::poll",
+          18
+        ],
+        [
+          "malloc",
+          18
+        ],
+        [
+          "<ferrosa_postgres::mvcc::MvccTableView>::ensure_active",
+          17
+        ],
+        [
+          "<tokio::sync::mpsc::bounded::Sender<ferrosa_sql::types::Row>>::send::{closure#0}",
+          16
+        ],
+        [
+          "_rjem_je_arena_ptr_array_flush",
+          14
+        ],
+        [
+          "<ferrosa_schema::registry::Schema>::snapshot",
+          13
+        ],
+        [
+          "ferrosa_row_bridge::row::decode_output_row",
+          12
+        ]
+      ],
+      "server_resources": {
+        "samples": 34,
+        "sample_window_s": 33.007572412490845,
+        "sampled_process_cpu_s_lower_bound": 47.14,
+        "summed_observed_thread_runqueue_s": 27.638222532,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1630208
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 12509182,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 780,
+          "full": 210
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11780,
+          15036,
+          22740,
+          31060,
+          83020
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1393
+          ],
+          [
+            "ep_poll",
+            526
+          ],
+          [
+            "0",
+            121
+          ],
+          [
+            "hrtimer_nanosleep",
+            68
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 4248,
+            "write_ms": 14,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 40,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 51,
+            "weighted_io_ms": 14,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 2174976,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.27450980392156865,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 363373,
+            "rx_packets": 53,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 363373,
+            "tx_packets": 53,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 8475867,
+            "rx_packets": 95330,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 467879112,
+            "tx_packets": 372105,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 34,
+        "sample_window_s": 33.00708246231079,
+        "sampled_process_cpu_s_lower_bound": 5.71,
+        "summed_observed_thread_runqueue_s": 0.443025361,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 458752
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 601448,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 496,
+          "full": 313
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21080,
+          62564
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            233
+          ],
+          [
+            "futex_wait_queue",
+            62
+          ],
+          [
+            "0",
+            41
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1256,
+            "write_ms": 5,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 17,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 27,
+            "weighted_io_ms": 5,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 643072,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.18518518518518517,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 459689260,
+            "rx_packets": 277354,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 8270921,
+            "tx_packets": 95380,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "pg-postgres-count-profile": {
+      "cpu_samples": 1878,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[postgres]",
+          1088
+        ],
+        [
+          "heap_getnextslot",
+          180
+        ],
+        [
+          "MemoryContextReset",
+          90
+        ],
+        [
+          "ExecStoreBufferHeapTuple",
+          82
+        ],
+        [
+          "int8inc",
+          73
+        ],
+        [
+          "[libc.so.6]",
+          44
+        ],
+        [
+          "hash_search_with_hash_value",
+          38
+        ],
+        [
+          "heap_prepare_pagescan",
+          33
+        ],
+        [
+          "AllocSetAlloc",
+          13
+        ],
+        [
+          "ResourceOwnerForget",
+          11
+        ],
+        [
+          "PostgresMain",
+          7
+        ],
+        [
+          "LWLockRelease",
+          6
+        ],
+        [
+          "StartReadBuffer",
+          6
+        ],
+        [
+          "LockAcquireExtended",
+          5
+        ],
+        [
+          "ReleaseBuffer",
+          5
+        ],
+        [
+          "LWLockAcquire",
+          5
+        ],
+        [
+          "heap_page_prune_opt",
+          5
+        ],
+        [
+          "palloc0",
+          5
+        ],
+        [
+          "GetSnapshotData",
+          4
+        ],
+        [
+          "standard_ExecutorRun",
+          4
+        ]
+      ],
+      "server_resources": {
+        "samples": 32,
+        "sample_window_s": 31.011909246444702,
+        "sampled_process_cpu_s_lower_bound": 52.61,
+        "summed_observed_thread_runqueue_s": 72.889798694,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 4632576
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 20365221,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 2159,
+          "full": 113
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11940,
+          12748,
+          18564,
+          18568,
+          18568,
+          18576,
+          18584,
+          18592,
+          18596,
+          18596,
+          18872,
+          22320,
+          31060,
+          77432
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1312
+          ],
+          [
+            "ep_poll",
+            623
+          ],
+          [
+            "0",
+            191
+          ],
+          [
+            "hrtimer_nanosleep",
+            64
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 10824,
+            "write_ms": 40,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 66,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 111,
+            "weighted_io_ms": 40,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 5541888,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.36036036036036034,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 347923,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 347923,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 30847095,
+            "rx_packets": 237439,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 38141965,
+            "tx_packets": 237755,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.00652766227722,
+        "sampled_process_cpu_s_lower_bound": 19.23,
+        "summed_observed_thread_runqueue_s": 5.100045507,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 434176
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 2711376,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 317,
+          "full": 251
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21068,
+          49768
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            186
+          ],
+          [
+            "0",
+            78
+          ],
+          [
+            "futex_wait_queue",
+            68
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1160,
+            "write_ms": 5,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 13,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 23,
+            "weighted_io_ms": 5,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 593920,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.21739130434782608,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 37939688,
+            "rx_packets": 237754,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 30662872,
+            "tx_packets": 237538,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "pg-postgres-profile": {
+      "cpu_samples": 392,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[postgres]",
+          69
+        ],
+        [
+          "[libc.so.6]",
+          53
+        ],
+        [
+          "hash_search_with_hash_value",
+          25
+        ],
+        [
+          "PostgresMain",
+          15
+        ],
+        [
+          "_bt_compare",
+          7
+        ],
+        [
+          "hash_search",
+          6
+        ],
+        [
+          "LockAcquireExtended",
+          5
+        ],
+        [
+          "heap_hot_search_buffer",
+          5
+        ],
+        [
+          "AllocSetAlloc",
+          4
+        ],
+        [
+          "PortalStart",
+          4
+        ],
+        [
+          "check_stack_depth",
+          4
+        ],
+        [
+          "AtEOXact_LogicalRepWorkers",
+          4
+        ],
+        [
+          "hash_seq_search",
+          4
+        ],
+        [
+          "AllocSetFree",
+          3
+        ],
+        [
+          "MemoryContextAllocZero",
+          3
+        ],
+        [
+          "hash_bytes",
+          3
+        ],
+        [
+          "LWLockAcquire",
+          3
+        ],
+        [
+          "ReceiveSharedInvalidMessages",
+          3
+        ],
+        [
+          "GetCurrentTimestamp",
+          3
+        ],
+        [
+          "GetSnapshotData",
+          3
+        ]
+      ],
+      "server_resources": {
+        "samples": 34,
+        "sample_window_s": 33.00723600387573,
+        "sampled_process_cpu_s_lower_bound": 17.71,
+        "summed_observed_thread_runqueue_s": 4.19418689,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 2174976
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 2325731,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1610,
+          "full": 787
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6044,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11812,
+          18276,
+          18296,
+          18296,
+          18296,
+          18340,
+          18344,
+          18360,
+          18404,
+          18736,
+          22032,
+          31060,
+          76008
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1391
+          ],
+          [
+            "ep_poll",
+            751
+          ],
+          [
+            "0",
+            100
+          ],
+          [
+            "hrtimer_nanosleep",
+            68
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 9488,
+            "write_ms": 36,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 73,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 76,
+            "weighted_io_ms": 36,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 4857856,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.47368421052631576,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 347849,
+            "rx_packets": 39,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 347849,
+            "tx_packets": 39,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 41388613,
+            "rx_packets": 301355,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 94309099,
+            "tx_packets": 301671,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 34,
+        "sample_window_s": 33.007174253463745,
+        "sampled_process_cpu_s_lower_bound": 37.03,
+        "summed_observed_thread_runqueue_s": 59.163194726,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 454656
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 17568574,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 513,
+          "full": 141
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21060,
+          52200
+        ],
+        "sampled_wchan_counts": [
+          [
+            "0",
+            127
+          ],
+          [
+            "do_poll.constprop.0",
+            127
+          ],
+          [
+            "futex_wait_queue",
+            80
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1416,
+            "write_ms": 6,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 25,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 29,
+            "weighted_io_ms": 6,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 724992,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.20689655172413793,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 94221658,
+            "rx_packets": 301671,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 41310571,
+            "tx_packets": 301427,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "pg-postgres-scan-profile": {
+      "cpu_samples": 152,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[postgres]",
+          50
+        ],
+        [
+          "[libc.so.6]",
+          37
+        ],
+        [
+          "OutputFunctionCall",
+          6
+        ],
+        [
+          "enlargeStringInfo",
+          6
+        ],
+        [
+          "AllocSetAlloc",
+          4
+        ],
+        [
+          "int4out",
+          4
+        ],
+        [
+          "palloc",
+          4
+        ],
+        [
+          "pg_server_to_client",
+          4
+        ],
+        [
+          "standard_ExecutorRun",
+          3
+        ],
+        [
+          "AllocSetReset",
+          3
+        ],
+        [
+          "heap_page_prune_opt",
+          3
+        ],
+        [
+          "pg_ltoa",
+          2
+        ],
+        [
+          "heap_prepare_pagescan",
+          2
+        ],
+        [
+          "pgaio_enter_batchmode",
+          2
+        ],
+        [
+          "resetStringInfo",
+          2
+        ],
+        [
+          "slot_getsomeattrs_int",
+          2
+        ],
+        [
+          "MemoryContextAllocZero",
+          1
+        ],
+        [
+          "AllocSetContextCreateInternal",
+          1
+        ],
+        [
+          "text_to_cstring",
+          1
+        ],
+        [
+          "MemoryContextReset",
+          1
+        ]
+      ],
+      "server_resources": {
+        "samples": 30,
+        "sample_window_s": 29.006632089614868,
+        "sampled_process_cpu_s_lower_bound": 4.22,
+        "summed_observed_thread_runqueue_s": 0.260487218,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1994752
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 366392,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1870,
+          "full": 1713
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11860,
+          15036,
+          18412,
+          18412,
+          18416,
+          18420,
+          18436,
+          18436,
+          18440,
+          18444,
+          18868,
+          22336,
+          31060,
+          76496
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1228
+          ],
+          [
+            "ep_poll",
+            747
+          ],
+          [
+            "hrtimer_nanosleep",
+            60
+          ],
+          [
+            "0",
+            35
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 17256,
+            "write_ms": 42,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 40,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 93,
+            "weighted_io_ms": 42,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 8835072,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.45161290322580644,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 532214,
+            "rx_packets": 183,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 532214,
+            "tx_packets": 183,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 15742591,
+            "rx_packets": 174965,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 2393088501,
+            "tx_packets": 1733574,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 30,
+        "sample_window_s": 29.007181882858276,
+        "sampled_process_cpu_s_lower_bound": 24.05,
+        "summed_observed_thread_runqueue_s": 12.65212817,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 409600
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 4382269,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 351,
+          "full": 82
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21068,
+          63708
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            132
+          ],
+          [
+            "futex_wait_queue",
+            115
+          ],
+          [
+            "0",
+            83
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1040,
+            "write_ms": 4,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 15,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 19,
+            "weighted_io_ms": 4,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 532480,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.21052631578947367,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 2343595733,
+            "rx_packets": 1164869,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 15218739,
+            "tx_packets": 174692,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "sparql-ferrosa_sparql-count-profile": {
+      "cpu_samples": 364,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          88
+        ],
+        [
+          "<alloc::vec::Vec<",
+          22
+        ],
+        [
+          "<crossbeam_skiplist::base::RefIter<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>>::next",
+          22
+        ],
+        [
+          "malloc",
+          13
+        ],
+        [
+          "<ferrosa_common::cell_bytes::CellBytes as core::convert::AsRef<[u8]>>::as_ref",
+          12
+        ],
+        [
+          "<core::iter::adapters::map::Map<core::iter::adapters::filter::Filter<crossbeam_skiplist::map::Iter<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>, <ferrosa_storage::memtable::skiplist::SkipListMemtable as ferrosa_storage::memtable::Memtable>::range_iter::{closure#0}>, <ferrosa_storage::memtable::skiplist::SkipListMemtable as ferrosa_storage::memtable::Memtable>::range_iter::{closure#1}> as core::iter::traits::iterator::Iterator>::next",
+          11
+        ],
+        [
+          "[[vdso]]",
+          10
+        ],
+        [
+          "syscall",
+          7
+        ],
+        [
+          "sdallocx",
+          7
+        ],
+        [
+          "ferrosa_sparql::triple_store::encode_clustering",
+          7
+        ],
+        [
+          "do_rallocx",
+          7
+        ],
+        [
+          "_rjem_je_arena_ralloc",
+          6
+        ],
+        [
+          "<tokio::runtime::scheduler::multi_thread::worker::Context>::run",
+          5
+        ],
+        [
+          "<tokio::runtime::io::driver::Driver>::turn",
+          4
+        ],
+        [
+          "<ferrosa_sparql::executor::Scan<ferrosa_sparql::executor::evaluate_counts::{closure#0}::{closure#0}>>::feed",
+          4
+        ],
+        [
+          "__rustc::__rust_alloc",
+          4
+        ],
+        [
+          "__rustc::__rust_dealloc",
+          4
+        ],
+        [
+          "__rustc::__rust_no_alloc_shim_is_unstable_v2",
+          4
+        ],
+        [
+          "ferrosa_sparql::executor::decode_triple",
+          4
+        ],
+        [
+          "ferrosa_sparql::triple_store::decode_v2_row",
+          4
+        ]
+      ],
+      "server_resources": {
+        "samples": 32,
+        "sample_window_s": 31.031670093536377,
+        "sampled_process_cpu_s_lower_bound": 13.36,
+        "summed_observed_thread_runqueue_s": 30.574592119,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1609728
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 17629153,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 655,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11864,
+          15036,
+          22836,
+          31060,
+          68684,
+          72144
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1431
+          ],
+          [
+            "ep_poll",
+            492
+          ],
+          [
+            "0",
+            93
+          ],
+          [
+            "hrtimer_nanosleep",
+            64
+          ],
+          [
+            "inet_csk_accept",
+            32
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 5472,
+            "write_ms": 12,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 37,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 36,
+            "weighted_io_ms": 13,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 2801664,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.3333333333333333,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 336278,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 336278,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 576916,
+            "rx_packets": 1421,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 1398347,
+            "tx_packets": 1991,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.006713390350342,
+        "sampled_process_cpu_s_lower_bound": 0.31,
+        "summed_observed_thread_runqueue_s": 0.000275497,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 438272
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 40136,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 140,
+          "full": 140
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21296,
+          23716
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            241
+          ],
+          [
+            "futex_wait_queue",
+            61
+          ],
+          [
+            "0",
+            32
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1104,
+            "write_ms": 4,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 22,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 26,
+            "weighted_io_ms": 4,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 1,
+            "read_bytes": 0,
+            "write_bytes": 565248,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.15384615384615385,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 1107409,
+            "rx_packets": 1818,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 318459,
+            "tx_packets": 1397,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "sparql-ferrosa_sparql-profile": {
+      "cpu_samples": 409,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          43
+        ],
+        [
+          "<crossbeam_skiplist::base::SkipList<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>>::search_bound::<ferrosa_common::key::DecoratedKey>",
+          16
+        ],
+        [
+          "do_rallocx",
+          12
+        ],
+        [
+          "malloc",
+          10
+        ],
+        [
+          "<hyper_util::server::conn::auto::UpgradeableConnection<hyper_util::rt::tokio::TokioIo<tokio::net::tcp::stream::TcpStream>, hyper_util::service::glue::TowerToHyperService<tower::util::map_request::MapRequest<axum::routing::Router, axum::serve::handle_connection<tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router>::{closure#0}::{closure#2}>>, hyper_util::rt::tokio::TokioExecutor> as core::future::future::Future>::poll",
+          8
+        ],
+        [
+          "__rustc::__rust_dealloc",
+          7
+        ],
+        [
+          "<alloc::raw_vec::RawVecInner<_>>::reserve::do_reserve_and_handle::<alloc::alloc::Global>",
+          6
+        ],
+        [
+          "<alloc::vec::Vec<",
+          6
+        ],
+        [
+          "[[vdso]]",
+          5
+        ],
+        [
+          "sdallocx",
+          5
+        ],
+        [
+          "spargebra::parser::parser::__parse_i",
+          5
+        ],
+        [
+          "<alloc::string::String as core::clone::Clone>::clone",
+          4
+        ],
+        [
+          "__rustc::__rust_alloc",
+          4
+        ],
+        [
+          "__rustc::__rust_no_alloc_shim_is_unstable_v2",
+          4
+        ],
+        [
+          "core::fmt::write",
+          4
+        ],
+        [
+          "spargebra::parser::parser::__parse_PN_CHARS_BASE",
+          4
+        ],
+        [
+          "<ferrosa_sparql::executor::Scan<ferrosa_sparql::executor::evaluate_standard_op::{closure#0}::{closure#0}>>::feed",
+          4
+        ],
+        [
+          "<core::future::poll_fn::PollFn<axum::serve::handle_connection<tokio::net::tcp::listener::TcpListener, axum::routing::Router, axum::routing::Router>::{closure#0}::{closure#3}::{closure#0}> as core::future::future::Future>::poll",
+          3
+        ],
+        [
+          "<hyper_util::common::rewind::Rewind<hyper_util::rt::tokio::TokioIo<tokio::net::tcp::stream::TcpStream>> as hyper::rt::io::Read>::poll_read",
+          3
+        ],
+        [
+          "<http::header::name::StandardHeader>::from_bytes",
+          3
+        ]
+      ],
+      "server_resources": {
+        "samples": 32,
+        "sample_window_s": 31.03012204170227,
+        "sampled_process_cpu_s_lower_bound": 16.35,
+        "summed_observed_thread_runqueue_s": 27.289996966,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1601536
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 17750809,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 687,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11716,
+          15036,
+          22424,
+          31060,
+          70516,
+          72144
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1394
+          ],
+          [
+            "ep_poll",
+            484
+          ],
+          [
+            "0",
+            84
+          ],
+          [
+            "hrtimer_nanosleep",
+            64
+          ],
+          [
+            "inet_csk_accept",
+            32
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 5352,
+            "write_ms": 14,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 46,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 38,
+            "weighted_io_ms": 14,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 2740224,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.3684210526315789,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 336196,
+            "rx_packets": 39,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 336196,
+            "tx_packets": 39,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 62936268,
+            "rx_packets": 211768,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 79584586,
+            "tx_packets": 212165,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.007466316223145,
+        "sampled_process_cpu_s_lower_bound": 22.95,
+        "summed_observed_thread_runqueue_s": 26.084315034,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 442368
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 8143881,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 385,
+          "full": 252
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21296,
+          26228
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            172
+          ],
+          [
+            "0",
+            81
+          ],
+          [
+            "futex_wait_queue",
+            80
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1080,
+            "write_ms": 3,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 14,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 24,
+            "weighted_io_ms": 3,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 552960,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.125,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 76947268,
+            "rx_packets": 205635,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 60804594,
+            "tx_packets": 205404,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "sparql-ferrosa_sparql-scan-profile": {
+      "cpu_samples": 1587,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          337
+        ],
+        [
+          "<alloc::vec::Vec<",
+          84
+        ],
+        [
+          "do_rallocx",
+          48
+        ],
+        [
+          "<core::iter::adapters::map::Map<core::iter::adapters::filter::Filter<crossbeam_skiplist::map::Iter<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>, <ferrosa_storage::memtable::skiplist::SkipListMemtable as ferrosa_storage::memtable::Memtable>::range_iter::{closure#0}>, <ferrosa_storage::memtable::skiplist::SkipListMemtable as ferrosa_storage::memtable::Memtable>::range_iter::{closure#1}> as core::iter::traits::iterator::Iterator>::next",
+          40
+        ],
+        [
+          "[[vdso]]",
+          39
+        ],
+        [
+          "_rjem_je_arena_ptr_array_flush",
+          38
+        ],
+        [
+          "<ferrosa_sparql::executor::Scan<ferrosa_sparql::executor::evaluate_standard_op::{closure#0}::{closure#0}>>::feed",
+          36
+        ],
+        [
+          "malloc",
+          34
+        ],
+        [
+          "<hashbrown::raw::RawTable<",
+          33
+        ],
+        [
+          "<crossbeam_skiplist::base::RefIter<ferrosa_common::key::DecoratedKey, lock_api::rwlock::RwLock<parking_lot::raw_rwlock::RawRwLock, alloc::sync::Arc<ferrosa_sstable::types::Partition>>>>::next",
+          32
+        ],
+        [
+          "ferrosa_sparql::triple_store::decode_v2_row",
+          31
+        ],
+        [
+          "syscall",
+          28
+        ],
+        [
+          "core::str::converts::from_utf8",
+          28
+        ],
+        [
+          "<tokio::runtime::scheduler::multi_thread::worker::Context>::run",
+          27
+        ],
+        [
+          "ferrosa_sparql::executor::evaluate_steps::{closure#0}",
+          25
+        ],
+        [
+          "serde_json::ser::format_escaped_str::<&mut alloc::vec::Vec<u8>, serde_json::ser::CompactFormatter>",
+          24
+        ],
+        [
+          "sdallocx",
+          23
+        ],
+        [
+          "<ferrosa_common::cell_bytes::CellBytes as core::convert::AsRef<[u8]>>::as_ref",
+          23
+        ],
+        [
+          "_rjem_je_arena_ralloc",
+          22
+        ],
+        [
+          "ferrosa_sparql::executor::bound_subject_index",
+          20
+        ]
+      ],
+      "server_resources": {
+        "samples": 33,
+        "sample_window_s": 32.00985407829285,
+        "sampled_process_cpu_s_lower_bound": 45.51,
+        "summed_observed_thread_runqueue_s": 17.436160948,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1650688
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 8819626,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 693,
+          "full": 156
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11944,
+          15036,
+          22840,
+          31060,
+          72144,
+          91932
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1468
+          ],
+          [
+            "ep_poll",
+            507
+          ],
+          [
+            "0",
+            104
+          ],
+          [
+            "hrtimer_nanosleep",
+            66
+          ],
+          [
+            "inet_csk_accept",
+            33
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 3512,
+            "write_ms": 8,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 27,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 33,
+            "weighted_io_ms": 8,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 1798144,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.24242424242424243,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 459219,
+            "rx_packets": 137,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 459219,
+            "tx_packets": 137,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 5410646,
+            "rx_packets": 58609,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 510385876,
+            "tx_packets": 370553,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 34,
+        "sample_window_s": 33.00800395011902,
+        "sampled_process_cpu_s_lower_bound": 6.89,
+        "summed_observed_thread_runqueue_s": 0.460323988,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 466944
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 315378,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 477,
+          "full": 371
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21316,
+          35212
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            229
+          ],
+          [
+            "futex_wait_queue",
+            62
+          ],
+          [
+            "0",
+            44
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1088,
+            "write_ms": 6,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 22,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 22,
+            "weighted_io_ms": 6,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 1,
+            "read_bytes": 0,
+            "write_bytes": 557056,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.2727272727272727,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 508365394,
+            "rx_packets": 255301,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 5434793,
+            "tx_packets": 59755,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "sparql-oxigraph-count-profile": {
+      "cpu_samples": 2575,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "rocksdb::MemTableIterator::NextAndGetResult",
+          387
+        ],
+        [
+          "<oxigraph::storage::rocksdb::RocksDbDecodingQuadIterator as core::iter::traits::iterator::Iterator>::next",
+          289
+        ],
+        [
+          "rocksdb::DBIter::ParseKey",
+          252
+        ],
+        [
+          "[libc.so.6]",
+          244
+        ],
+        [
+          "rocksdb::DBIter::FindNextUserEntryInternal",
+          242
+        ],
+        [
+          "<core::iter::adapters::map::Map<core::iter::adapters::map::Map<oxigraph::storage::DecodingQuadIterator, <oxigraph::sparql::dataset::DatasetView as spareval::dataset::QueryableDataset>::internal_quads_for_pattern::{closure#1}>, <spareval::eval::EvalDataset<oxigraph::sparql::dataset::DatasetView>>::underlying_internal_quads_for_pattern::{closure#0}> as core::iter::traits::iterator::Iterator>::next",
+          107
+        ],
+        [
+          "<spareval::eval::InternalTuple<oxigraph::storage::numeric_encoder::EncodedTerm>>::set",
+          107
+        ],
+        [
+          "<spareval::eval::SimpleEvaluator<oxigraph::sparql::dataset::DatasetView>>::build_graph_pattern_evaluator::{closure#3}::{closure#1}",
+          106
+        ],
+        [
+          "<oxigraph::storage::numeric_encoder::EncodedTerm as core::cmp::PartialEq>::eq",
+          75
+        ],
+        [
+          "rocksdb::(anonymous namespace)::BytewiseComparatorImpl::CompareWithoutTimestamp",
+          72
+        ],
+        [
+          "<core::iter::adapters::filter_map::FilterMap<core::iter::adapters::map::Map<alloc::boxed::Box<dyn core::iter::traits::iterator::Iterator<Item = core::result::Result<spareval::dataset::InternalQuad<oxigraph::storage::numeric_encoder::EncodedTerm>, spareval::error::QueryEvaluationError>>>, <spareval::eval::SimpleEvaluator<oxigraph::sparql::dataset::DatasetView>>::build_graph_pattern_evaluator::{closure#3}::{closure#1}>, <core::result::Result<core::option::Option<spareval::eval::InternalTuple<oxigraph::storage::numeric_encoder::EncodedTerm>>, spareval::error::QueryEvaluationError>>::transpose> as core::iter::traits::iterator::Iterator>::next",
+          52
+        ],
+        [
+          "<spareval::eval::SimpleEvaluator<oxigraph::sparql::dataset::DatasetView>>::build_graph_pattern_evaluator::{closure#32}",
+          45
+        ],
+        [
+          "rocksdb::DBIter::IsVisible",
+          44
+        ],
+        [
+          "TLS init function for rocksdb::perf_context",
+          37
+        ],
+        [
+          "<&[u8] as oxigraph::storage::binary_encoder::TermReader>::read_term",
+          36
+        ],
+        [
+          "rocksdb::(anonymous namespace)::SkipListRep::Iterator::Valid",
+          35
+        ],
+        [
+          "rocksdb::(anonymous namespace)::SkipListRep::Iterator::Next",
+          34
+        ],
+        [
+          "rocksdb::(anonymous namespace)::SkipListRep::Iterator::key",
+          33
+        ],
+        [
+          "spareval::eval::put_pattern_value::<oxigraph::sparql::dataset::DatasetView>",
+          32
+        ],
+        [
+          "cfree",
+          25
+        ]
+      ],
+      "server_resources": {
+        "samples": 30,
+        "sample_window_s": 29.05392050743103,
+        "sampled_process_cpu_s_lower_bound": 57.45,
+        "summed_observed_thread_runqueue_s": 146.87681121,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1548288
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 28574418,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 707,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11920,
+          15036,
+          22428,
+          31060,
+          68496,
+          72612
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1320
+          ],
+          [
+            "ep_poll",
+            478
+          ],
+          [
+            "0",
+            266
+          ],
+          [
+            "hrtimer_nanosleep",
+            60
+          ],
+          [
+            "wait_woken",
+            36
+          ],
+          [
+            "inet_csk_accept",
+            30
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 3696,
+            "write_ms": 9,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 21,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 34,
+            "weighted_io_ms": 9,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 1892352,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.2647058823529412,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 336362,
+            "rx_packets": 42,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 336362,
+            "tx_packets": 42,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 25962438,
+            "rx_packets": 109783,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 24367876,
+            "tx_packets": 109774,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 30,
+        "sample_window_s": 29.00510597229004,
+        "sampled_process_cpu_s_lower_bound": 8.96,
+        "summed_observed_thread_runqueue_s": 0.731649166,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 417792
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 521612,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 447,
+          "full": 322
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21296,
+          24888
+        ],
+        "sampled_wchan_counts": [
+          [
+            "do_poll.constprop.0",
+            224
+          ],
+          [
+            "futex_wait_queue",
+            58
+          ],
+          [
+            "0",
+            39
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 1160,
+            "write_ms": 4,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 9,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 21,
+            "weighted_io_ms": 4,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 593920,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.19047619047619047,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 24966179,
+            "rx_packets": 109740,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 25857577,
+            "tx_packets": 109493,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "sparql-oxigraph-profile": {
+      "cpu_samples": 742,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          133
+        ],
+        [
+          "rocksdb::InlineSkipList<rocksdb::MemTableRep::KeyComparator const&>::FindGreaterOrEqual",
+          71
+        ],
+        [
+          "oxsdatatypes::date_time::date_time_plus_duration",
+          46
+        ],
+        [
+          "malloc",
+          35
+        ],
+        [
+          "cfree",
+          28
+        ],
+        [
+          "[fdaa:79:e2c:a7",
+          15
+        ],
+        [
+          "<json_event_parser::write::LowLevelJsonSerializer>::serialize_event::<&mut oxigraph::ReadForWriteWriter>",
+          13
+        ],
+        [
+          "std::sys::backtrace::__rust_begin_short_backtrace::<<oxhttp::server::Server>::spawn::{closure#0}::{closure#0}::{closure#1}, ",
+          13
+        ],
+        [
+          "rocksdb::MemTableIterator::NextAndGetResult",
+          9
+        ],
+        [
+          "<core::str::pattern::CharSearcher as core::str::pattern::Searcher>::next_match",
+          8
+        ],
+        [
+          "<hashbrown::map::HashMap<oxrdf::named_node::NamedNode, alloc::sync::Arc<dyn for<a> core::ops::function::Fn<",
+          8
+        ],
+        [
+          "spargebra::parser::parser::__parse_i",
+          8
+        ],
+        [
+          "spargebra::parser::parser::__parse_GroupGraphPattern",
+          7
+        ],
+        [
+          "<oxiri::IriParser<alloc::string::String, false>>::parse_path::<false>",
+          6
+        ],
+        [
+          "rocksdb::MemTable::KeyComparator::operator",
+          6
+        ],
+        [
+          "rocksdb::SaveValue",
+          6
+        ],
+        [
+          "spargebra::parser::parser::__parse_IRIREF",
+          6
+        ],
+        [
+          "rocksdb::MemTable::Get",
+          5
+        ],
+        [
+          "spargebra::parser::parser::__parse__",
+          5
+        ],
+        [
+          "<core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write",
+          4
+        ]
+      ],
+      "server_resources": {
+        "samples": 33,
+        "sample_window_s": 32.01126670837402,
+        "sampled_process_cpu_s_lower_bound": 28.83,
+        "summed_observed_thread_runqueue_s": 14.29539606,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1667072
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 5922838,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 654,
+          "full": 160
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11948,
+          15036,
+          22136,
+          31060,
+          68748,
+          72612
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1452
+          ],
+          [
+            "ep_poll",
+            527
+          ],
+          [
+            "0",
+            179
+          ],
+          [
+            "wait_woken",
+            125
+          ],
+          [
+            "hrtimer_nanosleep",
+            66
+          ],
+          [
+            "inet_csk_accept",
+            33
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 4432,
+            "write_ms": 15,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 36,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 37,
+            "weighted_io_ms": 15,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 2269184,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.40540540540540543,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 336237,
+            "rx_packets": 40,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 336237,
+            "tx_packets": 40,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 97889217,
+            "rx_packets": 330881,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 115910443,
+            "tx_packets": 331187,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 32,
+        "sample_window_s": 31.008284330368042,
+        "sampled_process_cpu_s_lower_bound": 35.7,
+        "summed_observed_thread_runqueue_s": 54.282765435,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 442368
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 15520290,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 695,
+          "full": 237
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21296,
+          28544
+        ],
+        "sampled_wchan_counts": [
+          [
+            "0",
+            133
+          ],
+          [
+            "futex_wait_queue",
+            112
+          ],
+          [
+            "do_poll.constprop.0",
+            88
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 832,
+            "write_ms": 6,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 23,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 27,
+            "weighted_io_ms": 5,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 425984,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.2222222222222222,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 113616685,
+            "rx_packets": 324851,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 95930228,
+            "tx_packets": 324571,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    },
+    "sparql-oxigraph-scan-profile": {
+      "cpu_samples": 2339,
+      "cpu_leaf_unknown_percent": 0.0,
+      "cpu_top_leaves": [
+        [
+          "[libc.so.6]",
+          366
+        ],
+        [
+          "rocksdb::InlineSkipList<rocksdb::MemTableRep::KeyComparator const&>::FindGreaterOrEqual",
+          352
+        ],
+        [
+          "<json_event_parser::write::LowLevelJsonSerializer>::serialize_event::<&mut oxigraph::ReadForWriteWriter>",
+          202
+        ],
+        [
+          "rocksdb::MemTableIterator::NextAndGetResult",
+          187
+        ],
+        [
+          "rocksdb::DBIter::ParseKey",
+          85
+        ],
+        [
+          "malloc",
+          70
+        ],
+        [
+          "cfree",
+          67
+        ],
+        [
+          "rocksdb::MemTable::KeyComparator::operator",
+          60
+        ],
+        [
+          "rocksdb::DBIter::FindNextUserEntryInternal",
+          58
+        ],
+        [
+          "<oxigraph::storage::rocksdb::RocksDbDecodingQuadIterator as core::iter::traits::iterator::Iterator>::next",
+          48
+        ],
+        [
+          "[fdaa:79:e2c:a7",
+          41
+        ],
+        [
+          "non-virtual thunk to rocksdb::(anonymous namespace)::BytewiseComparatorImpl::Compare",
+          39
+        ],
+        [
+          "<alloc::boxed::Box<core::iter::adapters::map::Map<alloc::boxed::Box<dyn core::iter::traits::iterator::Iterator<Item = core::result::Result<spareval::eval::InternalTuple<oxigraph::storage::numeric_encoder::EncodedTerm>, spareval::error::QueryEvaluationError>>>, spareval::eval::decode_bindings<oxigraph::sparql::dataset::DatasetView>::{closure#0}>> as core::iter::traits::iterator::Iterator>::next",
+          33
+        ],
+        [
+          "<core::iter::adapters::map::Map<core::iter::adapters::map::Map<oxigraph::storage::DecodingQuadIterator, <oxigraph::sparql::dataset::DatasetView as spareval::dataset::QueryableDataset>::internal_quads_for_pattern::{closure#1}>, <spareval::eval::EvalDataset<oxigraph::sparql::dataset::DatasetView>>::underlying_internal_quads_for_pattern::{closure#0}> as core::iter::traits::iterator::Iterator>::next",
+          31
+        ],
+        [
+          "rocksdb::NewArenaWrappedDbIterator",
+          27
+        ],
+        [
+          "<spareval::eval::SimpleEvaluator<oxigraph::sparql::dataset::DatasetView>>::build_graph_pattern_evaluator::{closure#3}",
+          24
+        ],
+        [
+          "TLS init function for rocksdb::perf_context",
+          22
+        ],
+        [
+          "<oxhttp::model::body::SimpleChunkedTransferEncoding<oxigraph::ReadForWrite<",
+          20
+        ],
+        [
+          "rocksdb::DBImpl::GetImpl",
+          19
+        ],
+        [
+          "<spareval::eval::SimpleEvaluator<oxigraph::sparql::dataset::DatasetView>>::build_graph_pattern_evaluator::{closure#3}::{closure#1}",
+          18
+        ]
+      ],
+      "server_resources": {
+        "samples": 33,
+        "sample_window_s": 32.05201745033264,
+        "sampled_process_cpu_s_lower_bound": 49.98,
+        "summed_observed_thread_runqueue_s": 48.876685374,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 1671168
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 14356523,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 1310,
+          "full": 0
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          5984,
+          6632,
+          8040,
+          8472,
+          9444,
+          9572,
+          10476,
+          11912,
+          15036,
+          22436,
+          31060,
+          68580,
+          72612
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            1449
+          ],
+          [
+            "ep_poll",
+            528
+          ],
+          [
+            "wait_woken",
+            161
+          ],
+          [
+            "0",
+            145
+          ],
+          [
+            "hrtimer_nanosleep",
+            66
+          ],
+          [
+            "inet_csk_accept",
+            33
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 4,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 9360,
+            "write_ms": 27,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 34,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 55,
+            "weighted_io_ms": 27,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 4792320,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.4909090909090909,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 397671,
+            "rx_packets": 87,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 397671,
+            "tx_packets": 87,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 6059911,
+            "rx_packets": 54859,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 1954049745,
+            "tx_packets": 1458983,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      },
+      "client_resources": {
+        "samples": 33,
+        "sample_window_s": 32.013335943222046,
+        "sampled_process_cpu_s_lower_bound": 33.37,
+        "summed_observed_thread_runqueue_s": 42.506207228,
+        "sampled_process_io_bytes_lower_bound": {
+          "read_bytes": 0,
+          "write_bytes": 458752
+        },
+        "psi_cpu_total_us_delta": {
+          "some": 10359437,
+          "full": 0
+        },
+        "psi_io_total_us_delta": {
+          "some": 491,
+          "full": 105
+        },
+        "psi_memory_total_us_delta": {
+          "some": 0,
+          "full": 0
+        },
+        "individual_process_peak_rss_kib": [
+          21316,
+          39620
+        ],
+        "sampled_wchan_counts": [
+          [
+            "futex_wait_queue",
+            211
+          ],
+          [
+            "0",
+            100
+          ],
+          [
+            "do_poll.constprop.0",
+            23
+          ]
+        ],
+        "disk": {
+          "vdb": {
+            "valid": true,
+            "discard_sectors": 0,
+            "io_ms": 0,
+            "discards": 0,
+            "discard_ms": 0,
+            "discard_merges": 0,
+            "write_sectors": 928,
+            "write_ms": 7,
+            "flushes": 0,
+            "read_merges": 0,
+            "write_merges": 19,
+            "read_sectors": 0,
+            "flush_ms": 0,
+            "writes": 25,
+            "weighted_io_ms": 7,
+            "reads": 0,
+            "read_ms": 0,
+            "inflight_after": 0,
+            "read_bytes": 0,
+            "write_bytes": 475136,
+            "mean_read_ms": null,
+            "mean_write_ms": 0.28,
+            "mean_flush_ms": null
+          }
+        },
+        "network": {
+          "teql0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "lo": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "dummy0": {
+            "valid": true,
+            "rx_bytes": 0,
+            "rx_packets": 0,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 0,
+            "tx_packets": 0,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          },
+          "eth0": {
+            "valid": true,
+            "rx_bytes": 1951857884,
+            "rx_packets": 1069735,
+            "rx_errors": 0,
+            "rx_drops": 0,
+            "rx_fifo": 0,
+            "rx_frame": 0,
+            "rx_compressed": 0,
+            "rx_multicast": 0,
+            "tx_bytes": 6003721,
+            "tx_packets": 56119,
+            "tx_errors": 0,
+            "tx_drops": 0,
+            "tx_fifo": 0,
+            "collisions": 0,
+            "carrier": 0,
+            "tx_compressed": 0
+          }
+        }
+      }
+    }
+  },
+  "limits": [
+    "CPU widths are sample counts, not elapsed request time.",
+    "RSS is sampled per-process resident memory, not allocation volume. Do not sum process peaks/shared pages.",
+    "Scheduler runqueue delay and wchan samples do not measure individual mutex wait.",
+    "Resource windows include setup/census and sampling overhead; primary rate measurements exclude profiling.",
+    "Server OS counters include all monitored colocated processes, so their CPU totals are not engine-only CPU.",
+    "Native/JVM and shared-library frames may lack function names even when unknown-leaf percentage is zero; retain raw recordings and Neo4j JFR privately."
+  ]
+}

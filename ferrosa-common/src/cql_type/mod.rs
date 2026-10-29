@@ -102,9 +102,9 @@ impl CqlType {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CqlValue {
     Null,
-    Ascii(String),
+    Ascii(crate::SharedText),
     Bigint(i64),
-    Blob(Vec<u8>),
+    Blob(crate::cell_bytes::CellBytes),
     Boolean(bool),
     Counter(i64),
     Decimal {
@@ -117,7 +117,7 @@ pub enum CqlValue {
     Int(i32),
     Timestamp(i64),
     Uuid(uuid::Uuid),
-    Text(String), // varchar
+    Text(crate::SharedText), // varchar
     #[serde(with = "bigint_serde")]
     Varint(BigInt),
     Timeuuid(uuid::Uuid),
@@ -340,7 +340,7 @@ mod tests {
         let val = CqlValue::Udt(vec![
             (
                 "street".to_string(),
-                Some(CqlValue::Text("123 Main".to_string())),
+                Some(CqlValue::Text("123 Main".to_string().into())),
             ),
             ("zip".to_string(), Some(CqlValue::Int(62701))),
         ]);
@@ -394,7 +394,10 @@ mod tests {
             (CqlValue::Null, CqlValue::Null),
             (CqlValue::Ascii("a".into()), CqlValue::Ascii("b".into())),
             (CqlValue::Bigint(1), CqlValue::Bigint(2)),
-            (CqlValue::Blob(vec![1]), CqlValue::Blob(vec![2])),
+            (
+                CqlValue::Blob(vec![1].into()),
+                CqlValue::Blob(vec![2].into()),
+            ),
             (CqlValue::Boolean(false), CqlValue::Boolean(true)),
             (CqlValue::Counter(1), CqlValue::Counter(2)),
             (

@@ -36,7 +36,7 @@ class Adapter:
         return pk, pk % 64, self.payloads[pk % len(self.payloads)]
 
     def scan(self, limit):
-        return [(pk,) for pk in range(limit)]
+        return [(pk, pk % 64, self.payloads[pk % len(self.payloads)]) for pk in range(limit)]
 
 
 class ContractTests(unittest.TestCase):

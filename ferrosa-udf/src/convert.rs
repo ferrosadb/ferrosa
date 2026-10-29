@@ -68,9 +68,9 @@ pub fn cql_to_wit(value: &CqlValue) -> Result<WitCqlValue, UdfError> {
         CqlValue::Float(v) => WitCqlValue::FloatVal(f32::from_bits(*v)),
         CqlValue::Double(v) => WitCqlValue::DoubleVal(f64::from_bits(*v)),
         CqlValue::Boolean(v) => WitCqlValue::BooleanVal(*v),
-        CqlValue::Text(v) => WitCqlValue::TextVal(v.clone()),
-        CqlValue::Ascii(v) => WitCqlValue::AsciiVal(v.clone()),
-        CqlValue::Blob(v) => WitCqlValue::BlobVal(v.clone()),
+        CqlValue::Text(v) => WitCqlValue::TextVal(v.to_string()),
+        CqlValue::Ascii(v) => WitCqlValue::AsciiVal(v.to_string()),
+        CqlValue::Blob(v) => WitCqlValue::BlobVal(v.to_vec()),
         CqlValue::Uuid(v) => WitCqlValue::UuidVal(v.to_string()),
         CqlValue::Timeuuid(v) => WitCqlValue::TimeuuidVal(v.to_string()),
         CqlValue::Timestamp(v) => WitCqlValue::TimestampVal(*v),
@@ -140,9 +140,9 @@ pub fn wit_to_cql(value: &WitCqlValue, target_type: &CqlType) -> Result<CqlValue
         WitCqlValue::FloatVal(v) => Ok(CqlValue::Float(v.to_bits())),
         WitCqlValue::DoubleVal(v) => Ok(CqlValue::Double(v.to_bits())),
         WitCqlValue::BooleanVal(v) => Ok(CqlValue::Boolean(*v)),
-        WitCqlValue::TextVal(v) => Ok(CqlValue::Text(v.clone())),
-        WitCqlValue::AsciiVal(v) => Ok(CqlValue::Ascii(v.clone())),
-        WitCqlValue::BlobVal(v) => Ok(CqlValue::Blob(v.clone())),
+        WitCqlValue::TextVal(v) => Ok(CqlValue::Text(v.clone().into())),
+        WitCqlValue::AsciiVal(v) => Ok(CqlValue::Ascii(v.clone().into())),
+        WitCqlValue::BlobVal(v) => Ok(CqlValue::Blob(v.clone().into())),
         WitCqlValue::UuidVal(v) => {
             let u = uuid::Uuid::parse_str(v)
                 .map_err(|e| UdfError::TypeMismatch(format!("invalid UUID: {e}")))?;
@@ -308,7 +308,7 @@ mod tests {
 
     #[test]
     fn roundtrip_text() {
-        let orig = CqlValue::Text("hello world".to_string());
+        let orig = CqlValue::Text("hello world".to_string().into());
         let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::TextVal("hello world".to_string()));
         let back = wit_to_cql(&wit, &CqlType::Varchar).unwrap();
@@ -317,7 +317,7 @@ mod tests {
 
     #[test]
     fn roundtrip_ascii() {
-        let orig = CqlValue::Ascii("ASCII".to_string());
+        let orig = CqlValue::Ascii("ASCII".to_string().into());
         let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::AsciiVal("ASCII".to_string()));
         let back = wit_to_cql(&wit, &CqlType::Ascii).unwrap();
@@ -326,7 +326,7 @@ mod tests {
 
     #[test]
     fn roundtrip_blob() {
-        let orig = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+        let orig = CqlValue::Blob(vec![0xDE, 0xAD, 0xBE, 0xEF].into());
         let wit = cql_to_wit(&orig).expect("convertible");
         assert_eq!(wit, WitCqlValue::BlobVal(vec![0xDE, 0xAD, 0xBE, 0xEF]));
         let back = wit_to_cql(&wit, &CqlType::Blob).unwrap();

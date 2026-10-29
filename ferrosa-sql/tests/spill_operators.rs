@@ -510,7 +510,7 @@ fn a_whole_query_spills_and_still_returns_every_row() {
             Column::new("name", ColumnType::Text),
         ]),
         (0..N)
-            .map(|i| row(vec![Value::Int(i), Value::Text(format!("user{i}"))]))
+            .map(|i| row(vec![Value::Int(i), Value::Text(format!("user{i}").into())]))
             .collect(),
     );
     // Two orders per user, so the join output is 2N rows and every group has two.

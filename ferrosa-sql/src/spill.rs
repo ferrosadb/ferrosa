@@ -950,7 +950,7 @@ mod tests {
             Value::float(1.0),
             Value::Text("1".into()),
             Value::Text("a".into()),
-            Value::Bytea(vec![1]),
+            Value::Bytea(vec![1].into()),
             Value::Timestamp(1),
             Value::Date(1),
             Value::Time(1),

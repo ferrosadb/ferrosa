@@ -1,0 +1,2530 @@
+<?xml version="1.0" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg version="1.1" width="1200" height="726" onload="init(evt)" viewBox="0 0 1200 726" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<!-- Flame graph stack visualization. See https://github.com/brendangregg/FlameGraph for latest version, and http://www.brendangregg.com/flamegraphs.html for examples. -->
+<!-- NOTES:  -->
+<defs>
+	<linearGradient id="background" y1="0" y2="1" x1="0" x2="0" >
+		<stop stop-color="#eeeeee" offset="5%" />
+		<stop stop-color="#eeeeb0" offset="95%" />
+	</linearGradient>
+</defs>
+<style type="text/css">
+	text { font-family:Verdana; font-size:12px; fill:rgb(0,0,0); }
+	#search, #ignorecase { opacity:0.1; cursor:pointer; }
+	#search:hover, #search.show, #ignorecase:hover, #ignorecase.show { opacity:1; }
+	#subtitle { text-anchor:middle; font-color:rgb(160,160,160); }
+	#title { text-anchor:middle; font-size:17px}
+	#unzoom { cursor:pointer; }
+	#frames > *:hover { stroke:black; stroke-width:0.5; cursor:pointer; }
+	.hide { display:none; }
+	.parent { opacity:0.5; }
+</style>
+<script type="text/ecmascript">
+<![CDATA[
+	"use strict";
+	var details, searchbtn, unzoombtn, matchedtxt, svg, searching, currentSearchTerm, ignorecase, ignorecaseBtn;
+	function init(evt) {
+		details = document.getElementById("details").firstChild;
+		searchbtn = document.getElementById("search");
+		ignorecaseBtn = document.getElementById("ignorecase");
+		unzoombtn = document.getElementById("unzoom");
+		matchedtxt = document.getElementById("matched");
+		svg = document.getElementsByTagName("svg")[0];
+		searching = 0;
+		currentSearchTerm = null;
+
+		// use GET parameters to restore a flamegraphs state.
+		var params = get_params();
+		if (params.x && params.y)
+			zoom(find_group(document.querySelector('[x="' + params.x + '"][y="' + params.y + '"]')));
+                if (params.s) search(params.s);
+	}
+
+	// event listeners
+	window.addEventListener("click", function(e) {
+		var target = find_group(e.target);
+		if (target) {
+			if (target.nodeName == "a") {
+				if (e.ctrlKey === false) return;
+				e.preventDefault();
+			}
+			if (target.classList.contains("parent")) unzoom(true);
+			zoom(target);
+			if (!document.querySelector('.parent')) {
+				// we have basically done a clearzoom so clear the url
+				var params = get_params();
+				if (params.x) delete params.x;
+				if (params.y) delete params.y;
+				history.replaceState(null, null, parse_params(params));
+				unzoombtn.classList.add("hide");
+				return;
+			}
+
+			// set parameters for zoom state
+			var el = target.querySelector("rect");
+			if (el && el.attributes && el.attributes.y && el.attributes._orig_x) {
+				var params = get_params()
+				params.x = el.attributes._orig_x.value;
+				params.y = el.attributes.y.value;
+				history.replaceState(null, null, parse_params(params));
+			}
+		}
+		else if (e.target.id == "unzoom") clearzoom();
+		else if (e.target.id == "search") search_prompt();
+		else if (e.target.id == "ignorecase") toggle_ignorecase();
+	}, false)
+
+	// mouse-over for info
+	// show
+	window.addEventListener("mouseover", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = "Function: " + g_to_text(target);
+	}, false)
+
+	// clear
+	window.addEventListener("mouseout", function(e) {
+		var target = find_group(e.target);
+		if (target) details.nodeValue = ' ';
+	}, false)
+
+	// ctrl-F for search
+	// ctrl-I to toggle case-sensitive search
+	window.addEventListener("keydown",function (e) {
+		if (e.keyCode === 114 || (e.ctrlKey && e.keyCode === 70)) {
+			e.preventDefault();
+			search_prompt();
+		}
+		else if (e.ctrlKey && e.keyCode === 73) {
+			e.preventDefault();
+			toggle_ignorecase();
+		}
+	}, false)
+
+	// functions
+	function get_params() {
+		var params = {};
+		var paramsarr = window.location.search.substr(1).split('&');
+		for (var i = 0; i < paramsarr.length; ++i) {
+			var tmp = paramsarr[i].split("=");
+			if (!tmp[0] || !tmp[1]) continue;
+			params[tmp[0]]  = decodeURIComponent(tmp[1]);
+		}
+		return params;
+	}
+	function parse_params(params) {
+		var uri = "?";
+		for (var key in params) {
+			uri += key + '=' + encodeURIComponent(params[key]) + '&';
+		}
+		if (uri.slice(-1) == "&")
+			uri = uri.substring(0, uri.length - 1);
+		if (uri == '?')
+			uri = window.location.href.split('?')[0];
+		return uri;
+	}
+	function find_child(node, selector) {
+		var children = node.querySelectorAll(selector);
+		if (children.length) return children[0];
+	}
+	function find_group(node) {
+		var parent = node.parentElement;
+		if (!parent) return;
+		if (parent.id == "frames") return node;
+		return find_group(parent);
+	}
+	function orig_save(e, attr, val) {
+		if (e.attributes["_orig_" + attr] != undefined) return;
+		if (e.attributes[attr] == undefined) return;
+		if (val == undefined) val = e.attributes[attr].value;
+		e.setAttribute("_orig_" + attr, val);
+	}
+	function orig_load(e, attr) {
+		if (e.attributes["_orig_"+attr] == undefined) return;
+		e.attributes[attr].value = e.attributes["_orig_" + attr].value;
+		e.removeAttribute("_orig_"+attr);
+	}
+	function g_to_text(e) {
+		var text = find_child(e, "title").firstChild.nodeValue;
+		return (text)
+	}
+	function g_to_func(e) {
+		var func = g_to_text(e);
+		// if there's any manipulation we want to do to the function
+		// name before it's searched, do it here before returning.
+		return (func);
+	}
+	function update_text(e) {
+		var r = find_child(e, "rect");
+		var t = find_child(e, "text");
+		var w = parseFloat(r.attributes.width.value) -3;
+		var txt = find_child(e, "title").textContent.replace(/\([^(]*\)$/,"");
+		t.attributes.x.value = parseFloat(r.attributes.x.value) + 3;
+
+		// Smaller than this size won't fit anything
+		if (w < 2 * 12 * 0.59) {
+			t.textContent = "";
+			return;
+		}
+
+		t.textContent = txt;
+		var sl = t.getSubStringLength(0, txt.length);
+		// check if only whitespace or if we can fit the entire string into width w
+		if (/^ *$/.test(txt) || sl < w)
+			return;
+
+		// this isn't perfect, but gives a good starting point
+		// and avoids calling getSubStringLength too often
+		var start = Math.floor((w/sl) * txt.length);
+		for (var x = start; x > 0; x = x-2) {
+			if (t.getSubStringLength(0, x + 2) <= w) {
+				t.textContent = txt.substring(0, x) + "..";
+				return;
+			}
+		}
+		t.textContent = "";
+	}
+
+	// zoom
+	function zoom_reset(e) {
+		if (e.attributes != undefined) {
+			orig_load(e, "x");
+			orig_load(e, "width");
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_reset(c[i]);
+		}
+	}
+	function zoom_child(e, x, ratio) {
+		if (e.attributes != undefined) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = (parseFloat(e.attributes.x.value) - x - 10) * ratio + 10;
+				if (e.tagName == "text")
+					e.attributes.x.value = find_child(e.parentNode, "rect[x]").attributes.x.value + 3;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseFloat(e.attributes.width.value) * ratio;
+			}
+		}
+
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_child(c[i], x - 10, ratio);
+		}
+	}
+	function zoom_parent(e) {
+		if (e.attributes) {
+			if (e.attributes.x != undefined) {
+				orig_save(e, "x");
+				e.attributes.x.value = 10;
+			}
+			if (e.attributes.width != undefined) {
+				orig_save(e, "width");
+				e.attributes.width.value = parseInt(svg.width.baseVal.value) - (10 * 2);
+			}
+		}
+		if (e.childNodes == undefined) return;
+		for (var i = 0, c = e.childNodes; i < c.length; i++) {
+			zoom_parent(c[i]);
+		}
+	}
+	function zoom(node) {
+		var attr = find_child(node, "rect").attributes;
+		var width = parseFloat(attr.width.value);
+		var xmin = parseFloat(attr.x.value);
+		var xmax = parseFloat(xmin + width);
+		var ymin = parseFloat(attr.y.value);
+		var ratio = (svg.width.baseVal.value - 2 * 10) / width;
+
+		// XXX: Workaround for JavaScript float issues (fix me)
+		var fudge = 0.0001;
+
+		unzoombtn.classList.remove("hide");
+
+		var el = document.getElementById("frames").children;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var a = find_child(e, "rect").attributes;
+			var ex = parseFloat(a.x.value);
+			var ew = parseFloat(a.width.value);
+			var upstack;
+			// Is it an ancestor
+			if (0 == 0) {
+				upstack = parseFloat(a.y.value) > ymin;
+			} else {
+				upstack = parseFloat(a.y.value) < ymin;
+			}
+			if (upstack) {
+				// Direct ancestor
+				if (ex <= xmin && (ex+ew+fudge) >= xmax) {
+					e.classList.add("parent");
+					zoom_parent(e);
+					update_text(e);
+				}
+				// not in current path
+				else
+					e.classList.add("hide");
+			}
+			// Children maybe
+			else {
+				// no common path
+				if (ex < xmin || ex + fudge >= xmax) {
+					e.classList.add("hide");
+				}
+				else {
+					zoom_child(e, xmin, ratio);
+					update_text(e);
+				}
+			}
+		}
+		search();
+	}
+	function unzoom(dont_update_text) {
+		unzoombtn.classList.add("hide");
+		var el = document.getElementById("frames").children;
+		for(var i = 0; i < el.length; i++) {
+			el[i].classList.remove("parent");
+			el[i].classList.remove("hide");
+			zoom_reset(el[i]);
+			if(!dont_update_text) update_text(el[i]);
+		}
+		search();
+	}
+	function clearzoom() {
+		unzoom();
+
+		// remove zoom state
+		var params = get_params();
+		if (params.x) delete params.x;
+		if (params.y) delete params.y;
+		history.replaceState(null, null, parse_params(params));
+	}
+
+	// search
+	function toggle_ignorecase() {
+		ignorecase = !ignorecase;
+		if (ignorecase) {
+			ignorecaseBtn.classList.add("show");
+		} else {
+			ignorecaseBtn.classList.remove("show");
+		}
+		reset_search();
+		search();
+	}
+	function reset_search() {
+		var el = document.querySelectorAll("#frames rect");
+		for (var i = 0; i < el.length; i++) {
+			orig_load(el[i], "fill")
+		}
+		var params = get_params();
+		delete params.s;
+		history.replaceState(null, null, parse_params(params));
+	}
+	function search_prompt() {
+		if (!searching) {
+			var term = prompt("Enter a search term (regexp " +
+			    "allowed, eg: ^ext4_)"
+			    + (ignorecase ? ", ignoring case" : "")
+			    + "\nPress Ctrl-i to toggle case sensitivity", "");
+			if (term != null) search(term);
+		} else {
+			reset_search();
+			searching = 0;
+			currentSearchTerm = null;
+			searchbtn.classList.remove("show");
+			searchbtn.firstChild.nodeValue = "Search"
+			matchedtxt.classList.add("hide");
+			matchedtxt.firstChild.nodeValue = ""
+		}
+	}
+	function search(term) {
+		if (term) currentSearchTerm = term;
+		if (currentSearchTerm === null) return;
+
+		var re = new RegExp(currentSearchTerm, ignorecase ? 'i' : '');
+		var el = document.getElementById("frames").children;
+		var matches = new Object();
+		var maxwidth = 0;
+		for (var i = 0; i < el.length; i++) {
+			var e = el[i];
+			var func = g_to_func(e);
+			var rect = find_child(e, "rect");
+			if (func == null || rect == null)
+				continue;
+
+			// Save max width. Only works as we have a root frame
+			var w = parseFloat(rect.attributes.width.value);
+			if (w > maxwidth)
+				maxwidth = w;
+
+			if (func.match(re)) {
+				// highlight
+				var x = parseFloat(rect.attributes.x.value);
+				orig_save(rect, "fill");
+				rect.attributes.fill.value = "rgb(230,0,230)";
+
+				// remember matches
+				if (matches[x] == undefined) {
+					matches[x] = w;
+				} else {
+					if (w > matches[x]) {
+						// overwrite with parent
+						matches[x] = w;
+					}
+				}
+				searching = 1;
+			}
+		}
+		if (!searching)
+			return;
+		var params = get_params();
+		params.s = currentSearchTerm;
+		history.replaceState(null, null, parse_params(params));
+
+		searchbtn.classList.add("show");
+		searchbtn.firstChild.nodeValue = "Reset Search";
+
+		// calculate percent matched, excluding vertical overlap
+		var count = 0;
+		var lastx = -1;
+		var lastw = 0;
+		var keys = Array();
+		for (k in matches) {
+			if (matches.hasOwnProperty(k))
+				keys.push(k);
+		}
+		// sort the matched frames by their x location
+		// ascending, then width descending
+		keys.sort(function(a, b){
+			return a - b;
+		});
+		// Step through frames saving only the biggest bottom-up frames
+		// thanks to the sort order. This relies on the tree property
+		// where children are always smaller than their parents.
+		var fudge = 0.0001;	// JavaScript floating point
+		for (var k in keys) {
+			var x = parseFloat(keys[k]);
+			var w = matches[keys[k]];
+			if (x >= lastx + lastw - fudge) {
+				count += w;
+				lastx = x;
+				lastw = w;
+			}
+		}
+		// display matched percent
+		matchedtxt.classList.remove("hide");
+		var pct = 100 * count / maxwidth;
+		if (pct != 100) pct = pct.toFixed(1)
+		matchedtxt.firstChild.nodeValue = "Matched: " + pct + "%";
+	}
+]]>
+</script>
+<rect x="0.0" y="0" width="1200.0" height="726.0" fill="url(#background)"  />
+<text id="title" x="600.00" y="24" >pipeline_bolt_protocol_144_profile_cql-ferrosa_cql-A-scan-profile CPU</text>
+<text id="details" x="10.00" y="709" > </text>
+<text id="unzoom" x="10.00" y="24" class="hide">Reset Zoom</text>
+<text id="search" x="1090.00" y="24" >Search</text>
+<text id="ignorecase" x="1174.00" y="24" >ic</text>
+<text id="matched" x="1090.00" y="709" > </text>
+<g id="frames">
+<g >
+<title>emap_try_acquire_edata_neighbor_impl (4 samples, 0.71%)</title><rect x="404.7" y="101" width="8.4" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="407.73" y="111.5" ></text>
+</g>
+<g >
+<title>emap_try_acquire_edata_neighbor_impl (1 samples, 0.18%)</title><rect x="438.3" y="149" width="2.1" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="441.33" y="159.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_alloc_small_hard (1 samples, 0.18%)</title><rect x="482.4" y="197" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="485.42" y="207.5" ></text>
+</g>
+<g >
+<title>tcache_try_gc_bin (1 samples, 0.18%)</title><rect x="998.9" y="437" width="2.1" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="1001.93" y="447.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pac_decay_all (1 samples, 0.18%)</title><rect x="998.9" y="357" width="2.1" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="1001.93" y="367.5" ></text>
+</g>
+<g >
+<title>ferrosa_sstable::marshal::value_length_if_fixed (7 samples, 1.25%)</title><rect x="837.3" y="389" width="14.7" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="840.26" y="399.5" ></text>
+</g>
+<g >
+<title>clock_gettime (2 samples, 0.36%)</title><rect x="576.9" y="453" width="4.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="579.90" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (6 samples, 1.07%)</title><rect x="1028.3" y="437" width="12.6" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="1031.33" y="447.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_split_prepare (1 samples, 0.18%)</title><rect x="980.0" y="341" width="2.1" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="983.04" y="351.5" ></text>
+</g>
+<g >
+<title>&lt;tracing::instrument::Instrumented&lt;ferrosa_cql::connection::handle_connection&lt;tokio_rustls::server::TlsStream&lt;tokio::net::tcp::stream::TcpStream&gt;&gt;::{closure#0}::{closure#1}&gt; as core::future::future::Future&gt;::poll (181 samples, 32.21%)</title><rect x="148.6" y="373" width="380.0" height="15.0" fill="rgb(210,23,5)" rx="2" ry="2" />
+<text  x="151.58" y="383.5" >&lt;tracing::instrument::Instrumented&lt;ferrosa_cql::con..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (1 samples, 0.18%)</title><rect x="539.1" y="389" width="2.1" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="542.11" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::context::scoped::Scoped&lt;tokio::runtime::scheduler::Context&gt;&gt;::set::&lt;tokio::runtime::scheduler::multi_thread::worker::run::{closure#0}::{closure#0},  (273 samples, 48.58%)</title><rect x="12.1" y="485" width="573.2" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="15.10" y="495.5" >&lt;tokio::runtime::context::scoped::Scoped&lt;tokio::runtime::scheduler::Context&gt;&gt;:..</text>
+</g>
+<g >
+<title>extent_recycle (17 samples, 3.02%)</title><rect x="946.4" y="373" width="35.7" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="949.44" y="383.5" >ext..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_cell_into (47 samples, 8.36%)</title><rect x="753.3" y="405" width="98.7" height="15.0" fill="rgb(207,12,3)" rx="2" ry="2" />
+<text  x="756.27" y="415.5" >&lt;ferrosa_ss..</text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::range_merger::MergeSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::pop_partition (42 samples, 7.47%)</title><rect x="1040.9" y="469" width="88.2" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="1043.93" y="479.5" >&lt;ferrosa_s..</text>
+</g>
+<g >
+<title>_rjem_je_pa_alloc (1 samples, 0.18%)</title><rect x="482.4" y="149" width="2.1" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="485.42" y="159.5" ></text>
+</g>
+<g >
+<title>clock_gettime (1 samples, 0.18%)</title><rect x="83.5" y="421" width="2.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="86.49" y="431.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::route_select_user_table_inner::{closure#0} (1 samples, 0.18%)</title><rect x="526.5" y="293" width="2.1" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="529.51" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_cell_into (22 samples, 3.91%)</title><rect x="1070.3" y="405" width="46.2" height="15.0" fill="rgb(207,12,3)" rx="2" ry="2" />
+<text  x="1073.32" y="415.5" >&lt;fer..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (14 samples, 2.49%)</title><rect x="534.9" y="437" width="29.4" height="15.0" fill="rgb(254,226,54)" rx="2" ry="2" />
+<text  x="537.91" y="447.5" >&lt;t..</text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_remove_first (1 samples, 0.18%)</title><rect x="780.6" y="293" width="2.1" height="15.0" fill="rgb(250,209,49)" rx="2" ry="2" />
+<text  x="783.57" y="303.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (4 samples, 0.71%)</title><rect x="801.6" y="357" width="8.4" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="804.57" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_fill_small (3 samples, 0.53%)</title><rect x="780.6" y="325" width="6.3" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="783.57" y="335.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_update_edata_state (1 samples, 0.18%)</title><rect x="157.0" y="69" width="2.1" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="159.98" y="79.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="921.2" y="421" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="924.25" y="431.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl (1 samples, 0.18%)</title><rect x="998.9" y="373" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="1001.93" y="383.5" ></text>
+</g>
+<g >
+<title>ferrosa_row_bridge::codec::decode_value (1 samples, 0.18%)</title><rect x="488.7" y="229" width="2.1" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="491.72" y="239.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="927.5" y="469" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="930.54" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::net::tcp::stream::TcpStream as tokio::io::async_write::AsyncWrite&gt;::poll_write_vectored (1 samples, 0.18%)</title><rect x="146.5" y="341" width="2.1" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="149.48" y="351.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::park::Unparker&gt;::unpark (2 samples, 0.36%)</title><rect x="1148.0" y="421" width="4.2" height="15.0" fill="rgb(214,44,10)" rx="2" ry="2" />
+<text  x="1151.01" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (5 samples, 0.89%)</title><rect x="232.6" y="245" width="10.5" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="235.56" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;bytes::bytes_mut::BytesMut as bytes::buf::buf_mut::BufMut&gt;::put_slice (1 samples, 0.18%)</title><rect x="165.4" y="245" width="2.1" height="15.0" fill="rgb(224,90,21)" rx="2" ry="2" />
+<text  x="168.37" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (5 samples, 0.89%)</title><rect x="740.7" y="389" width="10.5" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="743.68" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_large_dalloc (74 samples, 13.17%)</title><rect x="285.1" y="229" width="155.3" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="288.05" y="239.5" >_rjem_je_large_dalloc</text>
+</g>
+<g >
+<title>&lt;core::str::pattern::CharSearcher as core::str::pattern::ReverseSearcher&gt;::next_match_back (1 samples, 0.18%)</title><rect x="1114.4" y="357" width="2.1" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="1117.41" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run (271 samples, 48.22%)</title><rect x="14.2" y="469" width="569.0" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="17.20" y="479.5" >&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::state::State&gt;::unset_waker_after_complete (1 samples, 0.18%)</title><rect x="127.6" y="405" width="2.1" height="15.0" fill="rgb(206,7,1)" rx="2" ry="2" />
+<text  x="130.58" y="415.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.18%)</title><rect x="31.0" y="421" width="2.1" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="34.00" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVec&lt;&amp;ferrosa_common::cell::CellValue&gt;&gt;::grow_one (3 samples, 0.53%)</title><rect x="476.1" y="229" width="6.3" height="15.0" fill="rgb(230,115,27)" rx="2" ry="2" />
+<text  x="479.12" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (4 samples, 0.71%)</title><rect x="879.3" y="437" width="8.4" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="882.25" y="447.5" ></text>
+</g>
+<g >
+<title>clock_gettime (2 samples, 0.36%)</title><rect x="625.2" y="469" width="4.2" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="628.20" y="479.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_split_wrapper (2 samples, 0.36%)</title><rect x="988.4" y="389" width="4.2" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="991.43" y="399.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (1 samples, 0.18%)</title><rect x="448.8" y="69" width="2.1" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="451.83" y="79.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_insert (5 samples, 0.89%)</title><rect x="392.1" y="133" width="10.5" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="395.14" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::task::atomic_waker::AtomicWaker&gt;::wake (1 samples, 0.18%)</title><rect x="1141.7" y="469" width="2.1" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="1144.71" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (5 samples, 0.89%)</title><rect x="1085.0" y="341" width="10.5" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1088.02" y="351.5" ></text>
+</g>
+<g >
+<title>__madvise (1 samples, 0.18%)</title><rect x="238.9" y="117" width="2.1" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="241.86" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt;&gt; as core::clone::Clone&gt;::clone (2 samples, 0.36%)</title><rect x="182.2" y="245" width="4.2" height="15.0" fill="rgb(207,12,2)" rx="2" ry="2" />
+<text  x="185.17" y="255.5" ></text>
+</g>
+<g >
+<title>clock_gettime (1 samples, 0.18%)</title><rect x="440.4" y="197" width="2.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="443.43" y="207.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (3 samples, 0.53%)</title><rect x="543.3" y="389" width="6.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="546.31" y="399.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (12 samples, 2.14%)</title><rect x="404.7" y="133" width="25.2" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="407.73" y="143.5" >e..</text>
+</g>
+<g >
+<title>_rjem_je_eset_remove (1 samples, 0.18%)</title><rect x="241.0" y="101" width="2.1" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="243.96" y="111.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="810.0" y="373" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="812.96" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (273 samples, 48.58%)</title><rect x="12.1" y="629" width="573.2" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="15.10" y="639.5" >&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text>
+</g>
+<g >
+<title>&lt;futures_util::stream::stream::filter_map::FilterMap&lt;futures_util::stream::stream::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;ferrosa_sstable::types::Partition, ferrosa_cluster::error::ClusterError&gt;&gt; + core::marker::Send&gt;&gt;, ferrosa_cluster::write_path::resume_filtered_stream::{closure#0}&gt;, ferrosa_cluster::write_path::resume_filtered_stream::{closure#1}::{closure#0}, ferrosa_cluster::write_path::resume_filtered_stream::{closure#1}&gt; as futures_core::stream::Stream&gt;::poll_next (2 samples, 0.36%)</title><rect x="173.8" y="277" width="4.2" height="15.0" fill="rgb(229,112,26)" rx="2" ry="2" />
+<text  x="176.77" y="287.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.18%)</title><rect x="83.5" y="405" width="2.1" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="86.49" y="415.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="1005.2" y="485" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1008.23" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::IntoIter&lt;usize, alloc::vec::Vec&lt;&amp;ferrosa_common::cell::CellValue&gt;&gt;&gt;::dying_next (1 samples, 0.18%)</title><rect x="272.5" y="245" width="2.1" height="15.0" fill="rgb(247,197,47)" rx="2" ry="2" />
+<text  x="275.46" y="255.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.36%)</title><rect x="96.1" y="405" width="4.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="99.09" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pa_dalloc (1 samples, 0.18%)</title><rect x="434.1" y="213" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="437.13" y="223.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_alloc_small_hard (3 samples, 0.53%)</title><rect x="780.6" y="341" width="6.3" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="783.57" y="351.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pac_decay_all (3 samples, 0.53%)</title><rect x="236.8" y="165" width="6.3" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="239.76" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;mio::poll::Poll&gt;::poll (1 samples, 0.18%)</title><rect x="70.9" y="405" width="2.1" height="15.0" fill="rgb(226,101,24)" rx="2" ry="2" />
+<text  x="73.89" y="415.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;[ (1 samples, 0.18%)</title><rect x="1024.1" y="421" width="2.1" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="1027.13" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_ecache_alloc_grow (1 samples, 0.18%)</title><rect x="482.4" y="101" width="2.1" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="485.42" y="111.5" ></text>
+</g>
+<g >
+<title>extent_recycle (1 samples, 0.18%)</title><rect x="482.4" y="85" width="2.1" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="485.42" y="95.5" ></text>
+</g>
+<g >
+<title>pac_decay_to_limit.part.0.isra.0 (1 samples, 0.18%)</title><rect x="998.9" y="341" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="1001.93" y="351.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_partition_header (7 samples, 1.25%)</title><rect x="1026.2" y="453" width="14.7" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1029.23" y="463.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (1 samples, 0.18%)</title><rect x="241.0" y="117" width="2.1" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="243.96" y="127.5" ></text>
+</g>
+<g >
+<title>extent_split_impl.isra.0 (1 samples, 0.18%)</title><rect x="482.4" y="69" width="2.1" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="485.42" y="79.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::batch_semaphore::Acquire as core::ops::drop::Drop&gt;::drop (1 samples, 0.18%)</title><rect x="541.2" y="389" width="2.1" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="544.21" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_update_edata_state (2 samples, 0.36%)</title><rect x="408.9" y="85" width="4.2" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="411.93" y="95.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_insert (1 samples, 0.18%)</title><rect x="986.3" y="357" width="2.1" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="989.33" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;parking_lot::condvar::Condvar&gt;::notify_one_slow (1 samples, 0.18%)</title><rect x="1143.8" y="421" width="2.1" height="15.0" fill="rgb(217,59,14)" rx="2" ry="2" />
+<text  x="1146.81" y="431.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::raw::try_read_output::&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (1 samples, 0.18%)</title><rect x="549.6" y="389" width="2.1" height="15.0" fill="rgb(208,18,4)" rx="2" ry="2" />
+<text  x="552.61" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::ScanSlot&gt;::tick (5 samples, 0.89%)</title><rect x="621.0" y="501" width="10.5" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="624.00" y="511.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_insert (2 samples, 0.36%)</title><rect x="959.0" y="357" width="4.2" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="962.04" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::BTreeMap&lt; (1 samples, 0.18%)</title><rect x="100.3" y="325" width="2.1" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="103.28" y="335.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytes&gt;::into_scratch (2 samples, 0.36%)</title><rect x="768.0" y="373" width="4.2" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="770.97" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (1 samples, 0.18%)</title><rect x="154.9" y="229" width="2.1" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="157.88" y="239.5" ></text>
+</g>
+<g >
+<title>std::sys::env::unix::getenv::{closure#0} (2 samples, 0.36%)</title><rect x="247.3" y="213" width="4.2" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="250.26" y="223.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sz_psz_quantize_floor (1 samples, 0.18%)</title><rect x="402.6" y="133" width="2.1" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="405.63" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (4 samples, 0.71%)</title><rect x="1009.4" y="501" width="8.4" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1012.43" y="511.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.18%)</title><rect x="1131.2" y="469" width="2.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="1134.21" y="479.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.18%)</title><rect x="1166.9" y="501" width="2.1" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="1169.90" y="511.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_remove (1 samples, 0.18%)</title><rect x="301.9" y="133" width="2.1" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="304.85" y="143.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::waker::wake_by_val (6 samples, 1.07%)</title><rect x="1143.8" y="469" width="12.6" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="1146.81" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cql_type::CqlValue as core::clone::Clone&gt;::clone (1 samples, 0.18%)</title><rect x="255.7" y="213" width="2.1" height="15.0" fill="rgb(241,170,40)" rx="2" ry="2" />
+<text  x="258.66" y="223.5" ></text>
+</g>
+<g >
+<title>pac_decay_to_limit.part.0.isra.0 (1 samples, 0.18%)</title><rect x="448.8" y="101" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="451.83" y="111.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (35 samples, 6.23%)</title><rect x="931.7" y="485" width="73.5" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="934.74" y="495.5" >_rjem_je..</text>
+</g>
+<g >
+<title>_rjem_je_extent_record (3 samples, 0.53%)</title><rect x="982.1" y="389" width="6.3" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="985.14" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_partition_header (11 samples, 1.96%)</title><rect x="900.2" y="437" width="23.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="903.25" y="447.5" >&lt;..</text>
+</g>
+<g >
+<title>ferrosa_cql::connection::handle_connection::&lt;tokio::net::tcp::stream::TcpStream&gt;::{closure#0} (2 samples, 0.36%)</title><rect x="528.6" y="405" width="4.2" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="531.61" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::store::Delivered&gt;::advance (1 samples, 0.18%)</title><rect x="1007.3" y="501" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1010.33" y="511.5" ></text>
+</g>
+<g >
+<title>ferrosa_sstable::marshal::value_length_if_fixed (1 samples, 0.18%)</title><rect x="1114.4" y="389" width="2.1" height="15.0" fill="rgb(248,198,47)" rx="2" ry="2" />
+<text  x="1117.41" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_fit (4 samples, 0.71%)</title><rect x="950.6" y="357" width="8.4" height="15.0" fill="rgb(210,23,5)" rx="2" ry="2" />
+<text  x="953.64" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (13 samples, 2.31%)</title><rect x="100.3" y="421" width="27.3" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="103.28" y="431.5" >&lt;..</text>
+</g>
+<g >
+<title>tcache_try_gc_bin (1 samples, 0.18%)</title><rect x="553.8" y="293" width="2.1" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="556.81" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;parking_lot::condvar::Condvar&gt;::notify_one_slow (1 samples, 0.18%)</title><rect x="94.0" y="437" width="2.1" height="15.0" fill="rgb(217,59,14)" rx="2" ry="2" />
+<text  x="96.99" y="447.5" ></text>
+</g>
+<g >
+<title>tcache_gc_event (1 samples, 0.18%)</title><rect x="553.8" y="309" width="2.1" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="556.81" y="319.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::result::encode_cell (5 samples, 0.89%)</title><rect x="161.2" y="261" width="10.5" height="15.0" fill="rgb(209,21,5)" rx="2" ry="2" />
+<text  x="164.17" y="271.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_no_alloc_shim_is_unstable_v2 (1 samples, 0.18%)</title><rect x="276.7" y="245" width="2.1" height="15.0" fill="rgb(240,164,39)" rx="2" ry="2" />
+<text  x="279.65" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;&gt;::drop_slow (2 samples, 0.36%)</title><rect x="1022.0" y="469" width="4.2" height="15.0" fill="rgb(236,145,34)" rx="2" ry="2" />
+<text  x="1025.03" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (2 samples, 0.36%)</title><rect x="881.4" y="405" width="4.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="884.35" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (3 samples, 0.53%)</title><rect x="780.6" y="357" width="6.3" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="783.57" y="367.5" ></text>
+</g>
+<g >
+<title>ferrosa-scan (284 samples, 50.53%)</title><rect x="593.7" y="661" width="596.3" height="15.0" fill="rgb(232,126,30)" rx="2" ry="2" />
+<text  x="596.70" y="671.5" >ferrosa-scan</text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.18%)</title><rect x="455.1" y="229" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="458.12" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;std::thread::lifecycle::spawn_unchecked&lt;ferrosa_storage::commitlog::sync::spawn_sync_thread&lt;&lt;ferrosa_storage::commitlog::sync::PeriodicSync&gt;::spawn::{closure#0}, &lt;ferrosa_storage::commitlog::sync::PeriodicSync&gt;::spawn::{closure#1}&gt;::{closure#0},  (1 samples, 0.18%)</title><rect x="10.0" y="613" width="2.1" height="15.0" fill="rgb(209,22,5)" rx="2" ry="2" />
+<text  x="13.00" y="623.5" ></text>
+</g>
+<g >
+<title>clock_gettime (1 samples, 0.18%)</title><rect x="629.4" y="485" width="2.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="632.40" y="495.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::mpsc::list::Tx&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt;&gt;::find_block (1 samples, 0.18%)</title><rect x="1139.6" y="469" width="2.1" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="1142.61" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;&lt;ferrosa_cql::server::CqlServer&gt;::start_background::{closure#0}::{closure#0}::{closure#0}&gt;&gt;, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (190 samples, 33.81%)</title><rect x="136.0" y="437" width="398.9" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="138.98" y="447.5" >&lt;tokio::runtime::task::harness::Harness&lt;core::pin::Pin..</text>
+</g>
+<g >
+<title>&lt;u16 as core::slice::cmp::SliceContains&gt;::slice_contains (1 samples, 0.18%)</title><rect x="875.1" y="421" width="2.1" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="878.05" y="431.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="1145.9" y="389" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1148.91" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;ferrosa_common::cell_bytes::Backing&gt;&gt;::drop_slow (1 samples, 0.18%)</title><rect x="1024.1" y="405" width="2.1" height="15.0" fill="rgb(253,222,53)" rx="2" ry="2" />
+<text  x="1027.13" y="415.5" ></text>
+</g>
+<g >
+<title>__popcountdi2 (1 samples, 0.18%)</title><rect x="992.6" y="437" width="2.1" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="995.63" y="447.5" ></text>
+</g>
+<g >
+<title>malloc (4 samples, 0.71%)</title><rect x="1156.4" y="501" width="8.4" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1159.41" y="511.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::route_select_user_table::{closure#0} (169 samples, 30.07%)</title><rect x="171.7" y="293" width="354.8" height="15.0" fill="rgb(253,221,53)" rx="2" ry="2" />
+<text  x="174.67" y="303.5" >ferrosa_cql::router::route_select_user_table::{c..</text>
+</g>
+<g >
+<title>_rjem_je_edata_cache_get (1 samples, 0.18%)</title><rect x="482.4" y="53" width="2.1" height="15.0" fill="rgb(232,124,29)" rx="2" ry="2" />
+<text  x="485.42" y="63.5" ></text>
+</g>
+<g >
+<title>&lt;core::str::iter::SplitInternal&lt;char&gt;&gt;::next_back (1 samples, 0.18%)</title><rect x="753.3" y="389" width="2.1" height="15.0" fill="rgb(243,174,41)" rx="2" ry="2" />
+<text  x="756.27" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (6 samples, 1.07%)</title><rect x="789.0" y="357" width="12.6" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="791.97" y="367.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="285.1" y="213" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="288.05" y="223.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.36%)</title><rect x="167.5" y="245" width="4.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="170.47" y="255.5" ></text>
+</g>
+<g >
+<title>_rjem_je_ecache_alloc_grow (17 samples, 3.02%)</title><rect x="946.4" y="389" width="35.7" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="949.44" y="399.5" >_rj..</text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::commitlog::sync::PeriodicShared&gt;::run (1 samples, 0.18%)</title><rect x="10.0" y="581" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="13.00" y="591.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt; as core::future::future::Future&gt;::poll (273 samples, 48.58%)</title><rect x="12.1" y="533" width="573.2" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="15.10" y="543.5" >&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::mult..</text>
+</g>
+<g >
+<title>clock_gettime (1 samples, 0.18%)</title><rect x="1166.9" y="517" width="2.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="1169.90" y="527.5" ></text>
+</g>
+<g >
+<title>pac_alloc_real (23 samples, 4.09%)</title><rect x="944.3" y="405" width="48.3" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="947.34" y="415.5" >pac_..</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;alloc::vec::Vec&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt;&gt;&gt; (2 samples, 0.36%)</title><rect x="243.1" y="245" width="4.2" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="246.06" y="255.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="112.9" y="357" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="115.88" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.18%)</title><rect x="553.8" y="325" width="2.1" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="556.81" y="335.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (7 samples, 1.25%)</title><rect x="1080.8" y="357" width="14.7" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="1083.82" y="367.5" ></text>
+</g>
+<g >
+<title>cql-rt (277 samples, 49.29%)</title><rect x="12.1" y="661" width="581.6" height="15.0" fill="rgb(219,68,16)" rx="2" ry="2" />
+<text  x="15.10" y="671.5" >cql-rt</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;[ferrosa_sstable::types::Row]&gt; (2 samples, 0.36%)</title><rect x="1022.0" y="437" width="4.2" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="1025.03" y="447.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (3 samples, 0.53%)</title><rect x="868.8" y="405" width="6.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="871.75" y="415.5" ></text>
+</g>
+<g >
+<title>tokio::task::spawn::spawn::&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (5 samples, 0.89%)</title><rect x="551.7" y="389" width="10.5" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="554.71" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Cell&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (1 samples, 0.18%)</title><rect x="553.8" y="357" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="556.81" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::sink::feed::Feed&lt;tokio_util::codec::framed::Framed&lt;tokio::net::tcp::stream::TcpStream, ferrosa_cql::frame::CqlCodec&gt;, ferrosa_cql::frame::CqlFrame&gt; as core::future::future::Future&gt;::poll (1 samples, 0.18%)</title><rect x="144.4" y="357" width="2.1" height="15.0" fill="rgb(237,148,35)" rx="2" ry="2" />
+<text  x="147.38" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytes as core::convert::AsRef&lt;[u8]&gt;&gt;::as_ref (2 samples, 0.36%)</title><rect x="484.5" y="229" width="4.2" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="487.52" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;parking_lot::condvar::Condvar&gt;::wait_until_internal (1 samples, 0.18%)</title><rect x="10.0" y="565" width="2.1" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="13.00" y="575.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::park::Inner&gt;::park_condvar (1 samples, 0.18%)</title><rect x="37.3" y="453" width="2.1" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="40.30" y="463.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (5 samples, 0.89%)</title><rect x="73.0" y="405" width="10.5" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="75.99" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;hashbrown::map::HashMap&lt;u64, alloc::sync::Arc&lt;tokio::sync::notify::Notify&gt;, std::hash::random::RandomState&gt;&gt;::remove::&lt;u64&gt; (1 samples, 0.18%)</title><rect x="104.5" y="389" width="2.1" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="107.48" y="399.5" ></text>
+</g>
+<g >
+<title>core::slice::memchr::memrchr (1 samples, 0.18%)</title><rect x="1114.4" y="341" width="2.1" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="1117.41" y="351.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.18%)</title><rect x="929.6" y="485" width="2.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="932.64" y="495.5" ></text>
+</g>
+<g >
+<title>tokio::task::coop::stop (1 samples, 0.18%)</title><rect x="1171.1" y="533" width="2.1" height="15.0" fill="rgb(222,80,19)" rx="2" ry="2" />
+<text  x="1174.10" y="543.5" ></text>
+</g>
+<g >
+<title>&lt;mio::sys::unix::waker::Waker&gt;::wake (1 samples, 0.18%)</title><rect x="551.7" y="309" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="554.71" y="319.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_trylock (2 samples, 0.36%)</title><rect x="1185.8" y="645" width="4.2" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="1188.80" y="655.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (1 samples, 0.18%)</title><rect x="738.6" y="405" width="2.1" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="741.58" y="415.5" ></text>
+</g>
+<g >
+<title>pac_alloc_real (1 samples, 0.18%)</title><rect x="482.4" y="117" width="2.1" height="15.0" fill="rgb(254,229,54)" rx="2" ry="2" />
+<text  x="485.42" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_blocking::&lt;ferrosa_sched::run_admitted&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (6 samples, 1.07%)</title><rect x="106.6" y="373" width="12.6" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="109.58" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_partition_header_only (14 samples, 2.49%)</title><rect x="696.6" y="485" width="29.4" height="15.0" fill="rgb(224,90,21)" rx="2" ry="2" />
+<text  x="699.58" y="495.5" >&lt;f..</text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (1 samples, 0.18%)</title><rect x="188.5" y="133" width="2.1" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="191.47" y="143.5" ></text>
+</g>
+<g >
+<title>ferrosa_row_bridge::row::decode_output_row (25 samples, 4.45%)</title><rect x="459.3" y="245" width="52.5" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="462.32" y="255.5" >ferro..</text>
+</g>
+<g >
+<title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;ferrosa_storage::commitlog::sync::spawn_sync_thread&lt;&lt;ferrosa_storage::commitlog::sync::PeriodicSync&gt;::spawn::{closure#0}, &lt;ferrosa_storage::commitlog::sync::PeriodicSync&gt;::spawn::{closure#1}&gt;::{closure#0},  (1 samples, 0.18%)</title><rect x="10.0" y="597" width="2.1" height="15.0" fill="rgb(207,9,2)" rx="2" ry="2" />
+<text  x="13.00" y="607.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.36%)</title><rect x="478.2" y="213" width="4.2" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="481.22" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;[alloc::vec::Vec&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt;&gt;]&gt;::to_vec (3 samples, 0.53%)</title><rect x="180.1" y="261" width="6.3" height="15.0" fill="rgb(206,8,2)" rx="2" ry="2" />
+<text  x="183.07" y="271.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl (3 samples, 0.53%)</title><rect x="236.8" y="181" width="6.3" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="239.76" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::fair_admit::FairAdmit&gt;::dispatch (1 samples, 0.18%)</title><rect x="100.3" y="373" width="2.1" height="15.0" fill="rgb(252,220,52)" rx="2" ry="2" />
+<text  x="103.28" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_try_acquire_edata_neighbor (3 samples, 0.53%)</title><rect x="306.0" y="117" width="6.3" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="309.05" y="127.5" ></text>
+</g>
+<g >
+<title>pac_decay_to_limit.part.0.isra.0 (65 samples, 11.57%)</title><rect x="297.7" y="165" width="136.4" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="300.65" y="175.5" >pac_decay_to_limi..</text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (3 samples, 0.53%)</title><rect x="444.6" y="181" width="6.3" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="447.63" y="191.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::store::deliver_or_pause (10 samples, 1.78%)</title><rect x="1135.4" y="501" width="21.0" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="1138.41" y="511.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (7 samples, 1.25%)</title><rect x="705.0" y="437" width="14.7" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="707.98" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (4 samples, 0.71%)</title><rect x="860.4" y="389" width="8.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="863.36" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (3 samples, 0.53%)</title><rect x="994.7" y="469" width="6.3" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="997.73" y="479.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pac_decay_all (66 samples, 11.74%)</title><rect x="295.6" y="181" width="138.5" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="298.55" y="191.5" >_rjem_je_pac_deca..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_cell (48 samples, 8.54%)</title><rect x="751.2" y="421" width="100.8" height="15.0" fill="rgb(226,100,23)" rx="2" ry="2" />
+<text  x="754.17" y="431.5" >&lt;ferrosa_sst..</text>
+</g>
+<g >
+<title>&lt;std::time::Instant&gt;::elapsed (1 samples, 0.18%)</title><rect x="12.1" y="469" width="2.1" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="15.10" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::range_merger::RangeMerger&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::retire_active_partition (19 samples, 3.38%)</title><rect x="889.8" y="485" width="39.8" height="15.0" fill="rgb(248,199,47)" rx="2" ry="2" />
+<text  x="892.75" y="495.5" >&lt;fe..</text>
+</g>
+<g >
+<title>_rjem_je_arena_handle_deferred_work (3 samples, 0.53%)</title><rect x="236.8" y="197" width="6.3" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="239.76" y="207.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_dalloc_wrapper (1 samples, 0.18%)</title><rect x="238.9" y="133" width="2.1" height="15.0" fill="rgb(248,200,47)" rx="2" ry="2" />
+<text  x="241.86" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (2 samples, 0.36%)</title><rect x="1059.8" y="373" width="4.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1062.82" y="383.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::connection::handle_query::{closure#0} (181 samples, 32.21%)</title><rect x="148.6" y="341" width="380.0" height="15.0" fill="rgb(233,132,31)" rx="2" ry="2" />
+<text  x="151.58" y="351.5" >ferrosa_cql::connection::handle_query::{closure#0}</text>
+</g>
+<g >
+<title>arena_slab_alloc (1 samples, 0.18%)</title><rect x="482.4" y="165" width="2.1" height="15.0" fill="rgb(254,228,54)" rx="2" ry="2" />
+<text  x="485.42" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;::bind_new_task::&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (5 samples, 0.89%)</title><rect x="551.7" y="373" width="10.5" height="15.0" fill="rgb(253,224,53)" rx="2" ry="2" />
+<text  x="554.71" y="383.5" ></text>
+</g>
+<g >
+<title>emap_try_acquire_edata_neighbor_impl (1 samples, 0.18%)</title><rect x="157.0" y="85" width="2.1" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="159.98" y="95.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (1 samples, 0.18%)</title><rect x="438.3" y="181" width="2.1" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="441.33" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt;&gt;::poll (273 samples, 48.58%)</title><rect x="12.1" y="549" width="573.2" height="15.0" fill="rgb(245,186,44)" rx="2" ry="2" />
+<text  x="15.10" y="559.5" >&lt;tokio::runtime::task::core::Core&lt;tokio::runtime::blocking::task::BlockingTask..</text>
+</g>
+<g >
+<title>tokio::runtime::context::runtime::enter_runtime::&lt;tokio::runtime::scheduler::multi_thread::worker::run::{closure#0},  (273 samples, 48.58%)</title><rect x="12.1" y="501" width="573.2" height="15.0" fill="rgb(218,59,14)" rx="2" ry="2" />
+<text  x="15.10" y="511.5" >tokio::runtime::context::runtime::enter_runtime::&lt;tokio::runtime::scheduler::m..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::BlockingTask&lt;ferrosa_sched::run_admitted&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (1 samples, 0.18%)</title><rect x="119.2" y="373" width="2.1" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="122.18" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pac_decay_all (1 samples, 0.18%)</title><rect x="448.8" y="117" width="2.1" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="451.83" y="127.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_remove (1 samples, 0.18%)</title><rect x="448.8" y="53" width="2.1" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="451.83" y="63.5" ></text>
+</g>
+<g >
+<title>tcache_gc_event (1 samples, 0.18%)</title><rect x="450.9" y="229" width="2.1" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="453.93" y="239.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.18%)</title><rect x="154.9" y="261" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="157.88" y="271.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_dalloc_wrapper (38 samples, 6.76%)</title><rect x="312.3" y="149" width="79.8" height="15.0" fill="rgb(248,200,47)" rx="2" ry="2" />
+<text  x="315.35" y="159.5" >_rjem_je_..</text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::IntoIter&lt;usize, alloc::vec::Vec&lt;&amp;ferrosa_common::cell::CellValue&gt;&gt;&gt;::dying_next (1 samples, 0.18%)</title><rect x="467.7" y="229" width="2.1" height="15.0" fill="rgb(247,197,47)" rx="2" ry="2" />
+<text  x="470.72" y="239.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.36%)</title><rect x="971.6" y="341" width="4.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="974.64" y="351.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (273 samples, 48.58%)</title><rect x="12.1" y="645" width="573.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="15.10" y="655.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>&lt;futures_util::sink::send::Send&lt;tokio_util::codec::framed::Framed&lt;tokio::net::tcp::stream::TcpStream, ferrosa_cql::frame::CqlCodec&gt;, ferrosa_cql::frame::CqlFrame&gt; as core::future::future::Future&gt;::poll (2 samples, 0.36%)</title><rect x="144.4" y="373" width="4.2" height="15.0" fill="rgb(253,221,52)" rx="2" ry="2" />
+<text  x="147.38" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_fill_small (1 samples, 0.18%)</title><rect x="482.4" y="181" width="2.1" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="485.42" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;parking_lot::condvar::Condvar&gt;::wait_until_internal (3 samples, 0.53%)</title><rect x="43.6" y="421" width="6.3" height="15.0" fill="rgb(243,176,42)" rx="2" ry="2" />
+<text  x="46.59" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_bin_slab_reg_alloc_batch (2 samples, 0.36%)</title><rect x="782.7" y="309" width="4.2" height="15.0" fill="rgb(227,103,24)" rx="2" ry="2" />
+<text  x="785.67" y="319.5" ></text>
+</g>
+<g >
+<title>syscall (5 samples, 0.89%)</title><rect x="566.4" y="437" width="10.5" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="569.41" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::mpsc::chan::Rx&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;, tokio::sync::mpsc::bounded::Semaphore&gt;&gt;::recv (4 samples, 0.71%)</title><rect x="201.1" y="213" width="8.4" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="204.07" y="223.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (1 samples, 0.18%)</title><rect x="154.9" y="245" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="157.88" y="255.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_remove (3 samples, 0.53%)</title><rect x="413.1" y="117" width="6.3" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="416.13" y="127.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (2 samples, 0.36%)</title><rect x="1124.9" y="405" width="4.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1127.91" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (1 samples, 0.18%)</title><rect x="698.7" y="453" width="2.1" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="701.68" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::stream::stream::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt; + core::marker::Send&gt;&gt;, ferrosa_cluster::write_path::local_projected_range_stream_from::{closure#1}&gt; as futures_core::stream::Stream&gt;::poll_next (1 samples, 0.18%)</title><rect x="217.9" y="261" width="2.1" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="220.86" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::state::State&gt;::transition_to_running (1 samples, 0.18%)</title><rect x="532.8" y="421" width="2.1" height="15.0" fill="rgb(233,130,31)" rx="2" ry="2" />
+<text  x="535.81" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt; as tokio::runtime::task::Schedule&gt;::schedule (5 samples, 0.89%)</title><rect x="1143.8" y="453" width="10.5" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="1146.81" y="463.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_cache_get (1 samples, 0.18%)</title><rect x="988.4" y="373" width="2.1" height="15.0" fill="rgb(232,124,29)" rx="2" ry="2" />
+<text  x="991.43" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (12 samples, 2.14%)</title><rect x="812.1" y="373" width="25.2" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="815.06" y="383.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;futures_util::stream::unfold::Unfold&lt;tokio::sync::mpsc::bounded::Receiver&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt;, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::range_scan_stream::{closure#2}, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::range_scan_stream::{closure#2}::{closure#0}&gt; as futures_core::stream::Stream&gt;::poll_next (6 samples, 1.07%)</title><rect x="196.9" y="229" width="12.6" height="15.0" fill="rgb(217,56,13)" rx="2" ry="2" />
+<text  x="199.87" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (6 samples, 1.07%)</title><rect x="1051.4" y="405" width="12.6" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="1054.42" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_large_palloc (27 samples, 4.80%)</title><rect x="935.9" y="469" width="56.7" height="15.0" fill="rgb(213,38,9)" rx="2" ry="2" />
+<text  x="938.94" y="479.5" >_rjem_..</text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (1 samples, 0.18%)</title><rect x="154.9" y="133" width="2.1" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="157.88" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_row_projected (71 samples, 12.63%)</title><rect x="730.2" y="437" width="149.1" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="733.18" y="447.5" >&lt;ferrosa_sstable::d..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="295.6" y="165" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="298.55" y="175.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_enumerate_next (2 samples, 0.36%)</title><rect x="954.8" y="341" width="4.2" height="15.0" fill="rgb(213,37,9)" rx="2" ry="2" />
+<text  x="957.84" y="351.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pa_alloc (27 samples, 4.80%)</title><rect x="935.9" y="437" width="56.7" height="15.0" fill="rgb(215,46,11)" rx="2" ry="2" />
+<text  x="938.94" y="447.5" >_rjem_..</text>
+</g>
+<g >
+<title>ferrosa_row_bridge::codec::decode_value (2 samples, 0.36%)</title><rect x="505.5" y="213" width="4.2" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="508.52" y="223.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::connection::handle_frame::{closure#0} (181 samples, 32.21%)</title><rect x="148.6" y="357" width="380.0" height="15.0" fill="rgb(211,30,7)" rx="2" ry="2" />
+<text  x="151.58" y="367.5" >ferrosa_cql::connection::handle_frame::{closure#0}</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="925.4" y="469" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="928.44" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_partition_header (1 samples, 0.18%)</title><rect x="1045.1" y="437" width="2.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1048.12" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (3 samples, 0.53%)</title><rect x="1108.1" y="357" width="6.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1111.11" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (3 samples, 0.53%)</title><rect x="1116.5" y="405" width="6.3" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="1119.51" y="415.5" ></text>
+</g>
+<g >
+<title>clock_gettime (4 samples, 0.71%)</title><rect x="511.8" y="229" width="8.4" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="514.81" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (13 samples, 2.31%)</title><rect x="534.9" y="421" width="27.3" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="537.91" y="431.5" >&lt;..</text>
+</g>
+<g >
+<title>tokio::runtime::task::waker::wake_by_val (1 samples, 0.18%)</title><rect x="205.3" y="181" width="2.1" height="15.0" fill="rgb(223,83,19)" rx="2" ry="2" />
+<text  x="208.27" y="191.5" ></text>
+</g>
+<g >
+<title>ferrosa_row_bridge::row::decode_key_component (4 samples, 0.71%)</title><rect x="501.3" y="229" width="8.4" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="504.32" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (8 samples, 1.42%)</title><rect x="1097.6" y="389" width="16.8" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="1100.62" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0},  (282 samples, 50.18%)</title><rect x="593.7" y="613" width="592.1" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="596.70" y="623.5" >&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner..</text>
+</g>
+<g >
+<title>&lt;ferrosa_common::key::DecoratedKey&gt;::new (1 samples, 0.18%)</title><rect x="898.1" y="437" width="2.1" height="15.0" fill="rgb(215,49,11)" rx="2" ry="2" />
+<text  x="901.15" y="447.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (282 samples, 50.18%)</title><rect x="593.7" y="645" width="592.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="596.70" y="655.5" >[libc.so.6]</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (11 samples, 1.96%)</title><rect x="786.9" y="373" width="23.1" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="789.87" y="383.5" >&lt;..</text>
+</g>
+<g >
+<title>_rjem_je_extent_record (1 samples, 0.18%)</title><rect x="154.9" y="149" width="2.1" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="157.88" y="159.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytes as core::default::Default&gt;::default (5 samples, 0.89%)</title><rect x="755.4" y="389" width="10.5" height="15.0" fill="rgb(226,97,23)" rx="2" ry="2" />
+<text  x="758.37" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_handle_deferred_work (1 samples, 0.18%)</title><rect x="448.8" y="149" width="2.1" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="451.83" y="159.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (1 samples, 0.18%)</title><rect x="998.9" y="421" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="1001.93" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (8 samples, 1.42%)</title><rect x="820.5" y="357" width="16.8" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="823.46" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (8 samples, 1.42%)</title><rect x="902.3" y="405" width="16.8" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="905.35" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (6 samples, 1.07%)</title><rect x="707.1" y="421" width="12.6" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="710.08" y="431.5" ></text>
+</g>
+<g >
+<title>ferrosa_sched::scan_carrier (1 samples, 0.18%)</title><rect x="123.4" y="389" width="2.1" height="15.0" fill="rgb(237,150,35)" rx="2" ry="2" />
+<text  x="126.38" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (83 samples, 14.77%)</title><rect x="278.8" y="245" width="174.2" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="281.75" y="255.5" >_rjem_je_sdallocx_defa..</text>
+</g>
+<g >
+<title>ferrosa_row_bridge::collection::assemble_column_cells (5 samples, 0.89%)</title><rect x="490.8" y="229" width="10.5" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="493.82" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::batch_semaphore::Semaphore&gt;::add_permits_locked (3 samples, 0.53%)</title><rect x="201.1" y="197" width="6.3" height="15.0" fill="rgb(241,168,40)" rx="2" ry="2" />
+<text  x="204.07" y="207.5" ></text>
+</g>
+<g >
+<title>__madvise (1 samples, 0.18%)</title><rect x="998.9" y="309" width="2.1" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="1001.93" y="319.5" ></text>
+</g>
+<g >
+<title>&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;&lt;ferrosa_cql::server::CqlServer&gt;::start_background::{closure#0}::{closure#0}::{closure#0}&gt;&gt; as core::future::future::Future&gt;::poll (186 samples, 33.10%)</title><rect x="138.1" y="405" width="390.5" height="15.0" fill="rgb(250,211,50)" rx="2" ry="2" />
+<text  x="141.08" y="415.5" >&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;&lt;ferrosa_cql::serve..</text>
+</g>
+<g >
+<title>_rjem_je_emap_update_edata_state (1 samples, 0.18%)</title><rect x="438.3" y="133" width="2.1" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="441.33" y="143.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="1133.3" y="469" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1136.31" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_task (2 samples, 0.36%)</title><rect x="108.7" y="357" width="4.2" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="111.68" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_handle_deferred_work (1 samples, 0.18%)</title><rect x="154.9" y="213" width="2.1" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="157.88" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::TaskIdGuard&gt;::enter (1 samples, 0.18%)</title><rect x="562.2" y="421" width="2.1" height="15.0" fill="rgb(237,149,35)" rx="2" ry="2" />
+<text  x="565.21" y="431.5" ></text>
+</g>
+<g >
+<title>pac_dalloc_impl (2 samples, 0.36%)</title><rect x="436.2" y="213" width="4.2" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="439.23" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::driver::Driver&gt;::turn (6 samples, 1.07%)</title><rect x="70.9" y="421" width="12.6" height="15.0" fill="rgb(224,88,21)" rx="2" ry="2" />
+<text  x="73.89" y="431.5" ></text>
+</g>
+<g >
+<title>commitlog-perio (1 samples, 0.18%)</title><rect x="10.0" y="661" width="2.1" height="15.0" fill="rgb(242,172,41)" rx="2" ry="2" />
+<text  x="13.00" y="671.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_next_clustered_row_projected (77 samples, 13.70%)</title><rect x="728.1" y="453" width="161.7" height="15.0" fill="rgb(239,157,37)" rx="2" ry="2" />
+<text  x="731.08" y="463.5" >&lt;ferrosa_sstable::da..</text>
+</g>
+<g >
+<title>ferrosa_sched::run_admitted::&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (8 samples, 1.42%)</title><rect x="106.6" y="389" width="16.8" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="109.58" y="399.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_dealloc (1 samples, 0.18%)</title><rect x="539.1" y="373" width="2.1" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="542.11" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_avail_remove (1 samples, 0.18%)</title><rect x="988.4" y="357" width="2.1" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="991.43" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::list::OwnedTasks&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::bind_inner (3 samples, 0.53%)</title><rect x="555.9" y="357" width="6.3" height="15.0" fill="rgb(215,48,11)" rx="2" ry="2" />
+<text  x="558.91" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (8 samples, 1.42%)</title><rect x="852.0" y="405" width="16.8" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="854.96" y="415.5" ></text>
+</g>
+<g >
+<title>sdallocx (3 samples, 0.53%)</title><rect x="520.2" y="261" width="6.3" height="15.0" fill="rgb(220,73,17)" rx="2" ry="2" />
+<text  x="523.21" y="271.5" ></text>
+</g>
+<g >
+<title>syscall (2 samples, 0.36%)</title><rect x="115.0" y="357" width="4.2" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="117.98" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (1 samples, 0.18%)</title><rect x="455.1" y="213" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="458.12" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;core::str::pattern::CharSearcher as core::str::pattern::ReverseSearcher&gt;::next_match_back (1 samples, 0.18%)</title><rect x="841.5" y="357" width="2.1" height="15.0" fill="rgb(205,1,0)" rx="2" ry="2" />
+<text  x="844.46" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::range_merger::RangeMerger&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::refill_source (17 samples, 3.02%)</title><rect x="889.8" y="469" width="35.6" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="892.75" y="479.5" >&lt;fe..</text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::range_merger::RangeMerger&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::refill_source (55 samples, 9.79%)</title><rect x="1019.9" y="485" width="115.5" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="1022.93" y="495.5" >&lt;ferrosa_stora..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (3 samples, 0.53%)</title><rect x="719.7" y="469" width="6.3" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="722.68" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt; as &lt;[_]&gt;::to_vec_in::ConvertVec&gt;::to_vec::&lt;alloc::alloc::Global&gt; (3 samples, 0.53%)</title><rect x="251.5" y="229" width="6.3" height="15.0" fill="rgb(221,75,18)" rx="2" ry="2" />
+<text  x="254.46" y="239.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (3 samples, 0.53%)</title><rect x="843.6" y="357" width="6.3" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="846.56" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (4 samples, 0.71%)</title><rect x="793.2" y="341" width="8.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="796.17" y="351.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::io::registration::Registration&gt;::poll_io::&lt;usize, &lt;tokio::io::poll_evented::PollEvented&lt;mio::net::tcp::stream::TcpStream&gt;&gt;::poll_write_vectored::{closure#0}&gt; (1 samples, 0.18%)</title><rect x="146.5" y="325" width="2.1" height="15.0" fill="rgb(250,209,50)" rx="2" ry="2" />
+<text  x="149.48" y="335.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl (69 samples, 12.28%)</title><rect x="289.3" y="197" width="144.8" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="292.25" y="207.5" >arena_decay_impl</text>
+</g>
+<g >
+<title>_rjem_je_arena_extent_alloc_large (27 samples, 4.80%)</title><rect x="935.9" y="453" width="56.7" height="15.0" fill="rgb(217,56,13)" rx="2" ry="2" />
+<text  x="938.94" y="463.5" >_rjem_..</text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (1 samples, 0.18%)</title><rect x="188.5" y="149" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="191.47" y="159.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;alloc::vec::Vec&lt;alloc::vec::Vec&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt;&gt;&gt;&gt; (7 samples, 1.25%)</title><rect x="232.6" y="261" width="14.7" height="15.0" fill="rgb(251,213,51)" rx="2" ry="2" />
+<text  x="235.56" y="271.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.36%)</title><rect x="585.3" y="613" width="4.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="588.30" y="623.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytesMut&gt;::resize (2 samples, 0.36%)</title><rect x="1076.6" y="373" width="4.2" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="1079.62" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::batch_semaphore::Semaphore&gt;::try_acquire (1 samples, 0.18%)</title><rect x="1137.5" y="485" width="2.1" height="15.0" fill="rgb(218,61,14)" rx="2" ry="2" />
+<text  x="1140.51" y="495.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_fill_small (1 samples, 0.18%)</title><rect x="738.6" y="373" width="2.1" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="741.58" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (1 samples, 0.18%)</title><rect x="157.0" y="213" width="2.1" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="159.98" y="223.5" ></text>
+</g>
+<g >
+<title>_rjem_je_malloc_default (1 samples, 0.18%)</title><rect x="482.4" y="213" width="2.1" height="15.0" fill="rgb(224,89,21)" rx="2" ry="2" />
+<text  x="485.42" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::idle::Idle&gt;::transition_worker_to_parked (2 samples, 0.36%)</title><rect x="33.1" y="453" width="4.2" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="36.10" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::runqueue::RunQueue&gt;::pick_next (1 samples, 0.18%)</title><rect x="100.3" y="341" width="2.1" height="15.0" fill="rgb(221,75,17)" rx="2" ry="2" />
+<text  x="103.28" y="351.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_record (1 samples, 0.18%)</title><rect x="241.0" y="133" width="2.1" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="243.96" y="143.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_try_acquire_edata_neighbor (1 samples, 0.18%)</title><rect x="236.8" y="101" width="2.1" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="239.76" y="111.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (5 samples, 0.89%)</title><rect x="232.6" y="213" width="10.5" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="235.56" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::group_runqueue::GroupRunQueue&gt;::pick_next (1 samples, 0.18%)</title><rect x="100.3" y="357" width="2.1" height="15.0" fill="rgb(218,59,14)" rx="2" ry="2" />
+<text  x="103.28" y="367.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::raw::poll::&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;&lt;ferrosa_cql::server::CqlServer&gt;::start_background::{closure#0}::{closure#0}::{closure#0}&gt;&gt;, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (1 samples, 0.18%)</title><rect x="581.1" y="453" width="2.1" height="15.0" fill="rgb(224,87,21)" rx="2" ry="2" />
+<text  x="584.10" y="463.5" ></text>
+</g>
+<g >
+<title>parking_lot_core::parking_lot::lock_bucket_pair (1 samples, 0.18%)</title><rect x="94.0" y="421" width="2.1" height="15.0" fill="rgb(227,101,24)" rx="2" ry="2" />
+<text  x="96.99" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_remove (1 samples, 0.18%)</title><rect x="448.8" y="37" width="2.1" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="451.83" y="47.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::maybe_skip_legacy_empty_clustering_prefix (5 samples, 0.89%)</title><rect x="740.7" y="421" width="10.5" height="15.0" fill="rgb(209,20,5)" rx="2" ry="2" />
+<text  x="743.68" y="431.5" ></text>
+</g>
+<g >
+<title>pac_decay_to_limit.part.0.isra.0 (3 samples, 0.53%)</title><rect x="236.8" y="149" width="6.3" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="239.76" y="159.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::scheduler::multi_thread::worker::run (273 samples, 48.58%)</title><rect x="12.1" y="517" width="573.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="15.10" y="527.5" >tokio::runtime::scheduler::multi_thread::worker::run</text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan::&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (12 samples, 2.14%)</title><rect x="100.3" y="405" width="25.2" height="15.0" fill="rgb(232,128,30)" rx="2" ry="2" />
+<text  x="103.28" y="415.5" >&lt;..</text>
+</g>
+<g >
+<title>_rjem_je_sz_psz_quantize_ceil (1 samples, 0.18%)</title><rect x="967.4" y="357" width="2.1" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="970.44" y="367.5" ></text>
+</g>
+<g >
+<title>ferrosa_row_bridge::row::read_now_secs (4 samples, 0.71%)</title><rect x="511.8" y="245" width="8.4" height="15.0" fill="rgb(247,196,47)" rx="2" ry="2" />
+<text  x="514.81" y="255.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.18%)</title><rect x="188.5" y="197" width="2.1" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="191.47" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (17 samples, 3.02%)</title><rect x="100.3" y="437" width="35.7" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="103.28" y="447.5" >&lt;to..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::pool::Inner&gt;::run (279 samples, 49.64%)</title><rect x="593.7" y="581" width="585.8" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="596.70" y="591.5" >&lt;tokio::runtime::blocking::pool::Inner&gt;::run</text>
+</g>
+<g >
+<title>_rjem_je_sz_psz_quantize_floor (1 samples, 0.18%)</title><rect x="154.9" y="117" width="2.1" height="15.0" fill="rgb(212,35,8)" rx="2" ry="2" />
+<text  x="157.88" y="127.5" ></text>
+</g>
+<g >
+<title>pac_decay_to_limit.part.0.isra.0 (1 samples, 0.18%)</title><rect x="154.9" y="165" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="157.88" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (9 samples, 1.60%)</title><rect x="902.3" y="421" width="18.9" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="905.35" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytesMut&gt;::resize (7 samples, 1.25%)</title><rect x="772.2" y="373" width="14.7" height="15.0" fill="rgb(253,223,53)" rx="2" ry="2" />
+<text  x="775.17" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (7 samples, 1.25%)</title><rect x="1080.8" y="373" width="14.7" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="1083.82" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_insert (2 samples, 0.36%)</title><rect x="984.2" y="373" width="4.2" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="987.23" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::raw_vec::RawVecInner&gt;::try_allocate_in (1 samples, 0.18%)</title><rect x="738.6" y="421" width="2.1" height="15.0" fill="rgb(254,227,54)" rx="2" ry="2" />
+<text  x="741.58" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (4 samples, 0.71%)</title><rect x="1032.5" y="421" width="8.4" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="1035.53" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::entry::VacantEntry&lt; (1 samples, 0.18%)</title><rect x="102.4" y="357" width="2.1" height="15.0" fill="rgb(230,118,28)" rx="2" ry="2" />
+<text  x="105.38" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::peek_partition_key (14 samples, 2.49%)</title><rect x="896.0" y="453" width="29.4" height="15.0" fill="rgb(247,195,46)" rx="2" ry="2" />
+<text  x="899.05" y="463.5" >&lt;f..</text>
+</g>
+<g >
+<title>extent_merge_impl.isra.0 (5 samples, 0.89%)</title><rect x="419.4" y="117" width="10.5" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="422.43" y="127.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_alloc_zeroed (1 samples, 0.18%)</title><rect x="923.3" y="437" width="2.1" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="926.35" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt; as alloc::vec::spec_from_elem::SpecFromElem&gt;::from_elem::&lt;alloc::alloc::Global&gt; (1 samples, 0.18%)</title><rect x="482.4" y="229" width="2.1" height="15.0" fill="rgb(252,216,51)" rx="2" ry="2" />
+<text  x="485.42" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;mio::sys::unix::waker::Waker&gt;::wake (2 samples, 0.36%)</title><rect x="96.1" y="421" width="4.2" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="99.09" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pac_decay_all (1 samples, 0.18%)</title><rect x="154.9" y="181" width="2.1" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="157.88" y="191.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::cooperative_scan_yield_every_partitions (1 samples, 0.18%)</title><rect x="178.0" y="277" width="2.1" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="180.97" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;std::sys::pal::unix::time::Timespec&gt;::now (1 samples, 0.18%)</title><rect x="623.1" y="469" width="2.1" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="626.10" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (3 samples, 0.53%)</title><rect x="1122.8" y="437" width="6.3" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="1125.81" y="447.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_update_edata_state (2 samples, 0.36%)</title><rect x="297.7" y="133" width="4.2" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="300.65" y="143.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;alloc::vec::Vec&lt;core::option::Option&lt;ferrosa_common::cql_type::CqlValue&gt;&gt;&gt; (1 samples, 0.18%)</title><rect x="157.0" y="261" width="2.1" height="15.0" fill="rgb(218,62,14)" rx="2" ry="2" />
+<text  x="159.98" y="271.5" ></text>
+</g>
+<g >
+<title>malloc (2 samples, 0.36%)</title><rect x="497.1" y="213" width="4.2" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="500.12" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::park::Inner&gt;::park_condvar (11 samples, 1.96%)</title><rect x="41.5" y="437" width="23.1" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="44.49" y="447.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::driver::IoHandle&gt;::unpark (1 samples, 0.18%)</title><rect x="1145.9" y="421" width="2.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1148.91" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::peek_partition_key (7 samples, 1.25%)</title><rect x="1026.2" y="469" width="14.7" height="15.0" fill="rgb(247,195,46)" rx="2" ry="2" />
+<text  x="1029.23" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (3 samples, 0.53%)</title><rect x="879.3" y="421" width="6.3" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="882.25" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (4 samples, 0.71%)</title><rect x="1032.5" y="405" width="8.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1035.53" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytes&gt;::into_scratch (1 samples, 0.18%)</title><rect x="1074.5" y="373" width="2.1" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="1077.52" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;parking_lot::raw_mutex::RawMutex&gt;::unlock_slow (1 samples, 0.18%)</title><rect x="110.8" y="341" width="2.1" height="15.0" fill="rgb(228,106,25)" rx="2" ry="2" />
+<text  x="113.78" y="351.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (2 samples, 0.36%)</title><rect x="209.5" y="213" width="4.2" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="212.47" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::BlockingTask&lt;&lt;tokio::runtime::scheduler::multi_thread::worker::Launch&gt;::launch::{closure#0}&gt;, tokio::runtime::blocking::schedule::BlockingSchedule&gt;&gt;::poll (273 samples, 48.58%)</title><rect x="12.1" y="565" width="573.2" height="15.0" fill="rgb(219,64,15)" rx="2" ry="2" />
+<text  x="15.10" y="575.5" >&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::Blocki..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (7 samples, 1.25%)</title><rect x="1099.7" y="373" width="14.7" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="1102.72" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (1 samples, 0.18%)</title><rect x="157.0" y="229" width="2.1" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="159.98" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::util::sharded_list::ShardedList&lt;tokio::runtime::task::Task&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;&gt;::remove (1 samples, 0.18%)</title><rect x="129.7" y="405" width="2.1" height="15.0" fill="rgb(207,13,3)" rx="2" ry="2" />
+<text  x="132.68" y="415.5" ></text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.36%)</title><rect x="585.3" y="645" width="4.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="588.30" y="655.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (12 samples, 2.14%)</title><rect x="812.1" y="389" width="25.2" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="815.06" y="399.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;ferrosa_common::cell_bytes::CellBytesMut as ferrosa_common::cell_bytes::CellReadBuffer&gt;::resize_for_read (1 samples, 0.18%)</title><rect x="1070.3" y="389" width="2.1" height="15.0" fill="rgb(209,19,4)" rx="2" ry="2" />
+<text  x="1073.32" y="399.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.18%)</title><rect x="188.5" y="213" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="191.47" y="223.5" ></text>
+</g>
+<g >
+<title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0},  (282 samples, 50.18%)</title><rect x="593.7" y="597" width="592.1" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="596.70" y="607.5" >std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::po..</text>
+</g>
+<g >
+<title>_rjem_je_emap_try_acquire_edata_neighbor (1 samples, 0.18%)</title><rect x="157.0" y="101" width="2.1" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="159.98" y="111.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_update_edata_state (2 samples, 0.36%)</title><rect x="946.4" y="357" width="4.2" height="15.0" fill="rgb(234,135,32)" rx="2" ry="2" />
+<text  x="949.44" y="367.5" ></text>
+</g>
+<g >
+<title>&lt;bytes::bytes_mut::BytesMut as bytes::buf::buf_mut::BufMut&gt;::put_slice (1 samples, 0.18%)</title><rect x="159.1" y="261" width="2.1" height="15.0" fill="rgb(224,90,21)" rx="2" ry="2" />
+<text  x="162.07" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::blocking::pool::Inner&gt;::run (273 samples, 48.58%)</title><rect x="12.1" y="581" width="573.2" height="15.0" fill="rgb(216,51,12)" rx="2" ry="2" />
+<text  x="15.10" y="591.5" >&lt;tokio::runtime::blocking::pool::Inner&gt;::run</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="551.7" y="293" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="554.71" y="303.5" ></text>
+</g>
+<g >
+<title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (1 samples, 0.18%)</title><rect x="10.0" y="629" width="2.1" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="13.00" y="639.5" ></text>
+</g>
+<g >
+<title>ferrosa_row_bridge::row::consume_partition_rows_with_clustering::&lt;ferrosa_cql::router::collect_page_from_partition_stream::{closure#0}::{closure#0}&gt; (123 samples, 21.89%)</title><rect x="262.0" y="261" width="258.2" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="264.96" y="271.5" >ferrosa_row_bridge::row::consume_p..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;&lt;ferrosa_cql::server::CqlServer&gt;::start_background::{closure#0}::{closure#0}::{closure#0}&gt;&gt;, alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt;&gt;::poll (188 samples, 33.45%)</title><rect x="138.1" y="421" width="394.7" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="141.08" y="431.5" >&lt;tokio::runtime::task::core::Core&lt;core::pin::Pin&lt;allo..</text>
+</g>
+<g >
+<title>_rjem_je_bin_refill_slabcur_no_fresh_slab (1 samples, 0.18%)</title><rect x="780.6" y="309" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="783.57" y="319.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::group_runqueue::GroupRunQueue&gt;::enqueue (1 samples, 0.18%)</title><rect x="102.4" y="373" width="2.1" height="15.0" fill="rgb(242,171,41)" rx="2" ry="2" />
+<text  x="105.38" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_remove (1 samples, 0.18%)</title><rect x="301.9" y="117" width="2.1" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="304.85" y="127.5" ></text>
+</g>
+<g >
+<title>tcache_try_gc_bin (4 samples, 0.71%)</title><rect x="442.5" y="197" width="8.4" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="445.53" y="207.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_avail_remove (2 samples, 0.36%)</title><rect x="975.8" y="325" width="4.2" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="978.84" y="335.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::mpsc::bounded::Sender&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt;&gt;::try_send (8 samples, 1.42%)</title><rect x="1139.6" y="485" width="16.8" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="1142.61" y="495.5" ></text>
+</g>
+<g >
+<title>ferrosa_sched::run_admitted::&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (272 samples, 48.40%)</title><rect x="600.0" y="533" width="571.1" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="603.00" y="543.5" >ferrosa_sched::run_admitted::&lt;ferrosa_storage::store::spawn_resumable_range_sc..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (3 samples, 0.53%)</title><rect x="1116.5" y="421" width="6.3" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="1119.51" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (1 samples, 0.18%)</title><rect x="209.5" y="197" width="2.1" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="212.47" y="207.5" ></text>
+</g>
+<g >
+<title>[libm.so.6] (1 samples, 0.18%)</title><rect x="583.2" y="469" width="2.1" height="15.0" fill="rgb(208,16,4)" rx="2" ry="2" />
+<text  x="586.20" y="479.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::select_columns (4 samples, 0.71%)</title><rect x="251.5" y="245" width="8.4" height="15.0" fill="rgb(250,207,49)" rx="2" ry="2" />
+<text  x="254.46" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (11 samples, 1.96%)</title><rect x="852.0" y="421" width="23.1" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="854.96" y="431.5" >&lt;..</text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="509.7" y="229" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="512.72" y="239.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_handle_deferred_work (1 samples, 0.18%)</title><rect x="998.9" y="389" width="2.1" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="1001.93" y="399.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_sstable::types::Partition&gt; (2 samples, 0.36%)</title><rect x="1022.0" y="453" width="4.2" height="15.0" fill="rgb(224,87,21)" rx="2" ry="2" />
+<text  x="1025.03" y="463.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_cache_get (2 samples, 0.36%)</title><rect x="975.8" y="341" width="4.2" height="15.0" fill="rgb(232,124,29)" rx="2" ry="2" />
+<text  x="978.84" y="351.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::store::spawn_resumable_range_scan::&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0} (13 samples, 2.31%)</title><rect x="534.9" y="405" width="27.3" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="537.91" y="415.5" >f..</text>
+</g>
+<g >
+<title>tokio::runtime::context::with_scheduler::&lt; (1 samples, 0.18%)</title><rect x="551.7" y="341" width="2.1" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="554.71" y="351.5" ></text>
+</g>
+<g >
+<title>tcache_gc_event (1 samples, 0.18%)</title><rect x="188.5" y="181" width="2.1" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="191.47" y="191.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;[ (1 samples, 0.18%)</title><rect x="455.1" y="245" width="2.1" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="458.12" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (4 samples, 0.71%)</title><rect x="742.8" y="373" width="8.4" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="745.78" y="383.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.18%)</title><rect x="629.4" y="469" width="2.1" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="632.40" y="479.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::raw::schedule::&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;&gt; (1 samples, 0.18%)</title><rect x="203.2" y="181" width="2.1" height="15.0" fill="rgb(235,141,33)" rx="2" ry="2" />
+<text  x="206.17" y="191.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Trailer&gt;::set_waker (1 samples, 0.18%)</title><rect x="119.2" y="357" width="2.1" height="15.0" fill="rgb(228,110,26)" rx="2" ry="2" />
+<text  x="122.18" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_ecache_evict (7 samples, 1.25%)</title><rect x="297.7" y="149" width="14.6" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="300.65" y="159.5" ></text>
+</g>
+<g >
+<title>ticker_geom_fixup (1 samples, 0.18%)</title><rect x="455.1" y="197" width="2.1" height="15.0" fill="rgb(208,14,3)" rx="2" ry="2" />
+<text  x="458.12" y="207.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="1169.0" y="517" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1172.00" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (5 samples, 0.89%)</title><rect x="740.7" y="405" width="10.5" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="743.68" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_try_acquire_edata_neighbor (4 samples, 0.71%)</title><rect x="404.7" y="117" width="8.4" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="407.73" y="127.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_record (2 samples, 0.36%)</title><rect x="436.2" y="197" width="4.2" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="439.23" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;core::str::iter::SplitInternal&lt;char&gt;&gt;::next_back (1 samples, 0.18%)</title><rect x="1114.4" y="373" width="2.1" height="15.0" fill="rgb(243,174,41)" rx="2" ry="2" />
+<text  x="1117.41" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_partition_projected (40 samples, 7.12%)</title><rect x="1045.1" y="453" width="84.0" height="15.0" fill="rgb(229,112,26)" rx="2" ry="2" />
+<text  x="1048.12" y="463.5" >&lt;ferrosa_..</text>
+</g>
+<g >
+<title>arena_decay_impl (1 samples, 0.18%)</title><rect x="157.0" y="181" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="159.98" y="191.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="1095.5" y="373" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="1098.52" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_bin_choose (1 samples, 0.18%)</title><rect x="996.8" y="437" width="2.1" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="999.83" y="447.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::cooperative_scan_yield_every_partitions (2 samples, 0.36%)</title><rect x="247.3" y="261" width="4.2" height="15.0" fill="rgb(232,127,30)" rx="2" ry="2" />
+<text  x="250.26" y="271.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::connection::handle_connection::&lt;tokio::net::tcp::stream::TcpStream&gt;::{closure#0} (185 samples, 32.92%)</title><rect x="140.2" y="389" width="388.4" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="143.18" y="399.5" >ferrosa_cql::connection::handle_connection::&lt;tokio::..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::park_internal (22 samples, 3.91%)</title><rect x="39.4" y="453" width="46.2" height="15.0" fill="rgb(220,70,16)" rx="2" ry="2" />
+<text  x="42.40" y="463.5" >&lt;tok..</text>
+</g>
+<g >
+<title>&lt;ferrosa_cluster::write_path::resume_filtered_stream::{closure#0} as futures_util::fns::FnMut1&lt;core::result::Result&lt;ferrosa_sstable::types::Partition, ferrosa_cluster::error::ClusterError&gt;&gt;&gt;::call_mut (2 samples, 0.36%)</title><rect x="186.4" y="245" width="4.2" height="15.0" fill="rgb(217,58,14)" rx="2" ry="2" />
+<text  x="189.37" y="255.5" ></text>
+</g>
+<g >
+<title>ferrosa_storage::range_merger::build_merger_with_runs::&lt;ferrosa_sstable::io::FileReadAt&gt; (55 samples, 9.79%)</title><rect x="1019.9" y="501" width="115.5" height="15.0" fill="rgb(209,20,4)" rx="2" ry="2" />
+<text  x="1022.93" y="511.5" >ferrosa_storag..</text>
+</g>
+<g >
+<title>&lt;std::time::Instant&gt;::elapsed (1 samples, 0.18%)</title><rect x="31.0" y="453" width="2.1" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="34.00" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;&lt;ferrosa_sched::SchedPool&gt;::resubmit_scan&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (2 samples, 0.36%)</title><rect x="127.6" y="421" width="4.2" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="130.58" y="431.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (4 samples, 0.71%)</title><rect x="304.0" y="133" width="8.3" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="306.95" y="143.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (1 samples, 0.18%)</title><rect x="157.0" y="117" width="2.1" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="159.98" y="127.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (2 samples, 0.36%)</title><rect x="625.2" y="453" width="4.2" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="628.20" y="463.5" ></text>
+</g>
+<g >
+<title>tcache_gc_event (5 samples, 0.89%)</title><rect x="440.4" y="213" width="10.5" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="443.43" y="223.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_bin_flush_small (5 samples, 0.89%)</title><rect x="232.6" y="229" width="10.5" height="15.0" fill="rgb(219,65,15)" rx="2" ry="2" />
+<text  x="235.56" y="239.5" ></text>
+</g>
+<g >
+<title>tokio::runtime::task::raw::poll::&lt;tokio::runtime::blocking::task::BlockingTask&lt;ferrosa_sched::run_admitted&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (3 samples, 0.53%)</title><rect x="1179.5" y="581" width="6.3" height="15.0" fill="rgb(232,124,29)" rx="2" ry="2" />
+<text  x="1182.50" y="591.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (2 samples, 0.36%)</title><rect x="131.8" y="421" width="4.2" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="134.78" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;core::option::Option&lt;ferrosa_sstable::types::Row&gt;&gt;&gt;::extend_with (1 samples, 0.18%)</title><rect x="694.5" y="469" width="2.1" height="15.0" fill="rgb(230,117,28)" rx="2" ry="2" />
+<text  x="697.48" y="479.5" ></text>
+</g>
+<g >
+<title>emap_try_acquire_edata_neighbor_impl (1 samples, 0.18%)</title><rect x="236.8" y="85" width="2.1" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="239.76" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::time::Driver&gt;::park_internal (10 samples, 1.78%)</title><rect x="64.6" y="437" width="21.0" height="15.0" fill="rgb(245,185,44)" rx="2" ry="2" />
+<text  x="67.59" y="447.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_try_acquire_edata_neighbor (1 samples, 0.18%)</title><rect x="438.3" y="165" width="2.1" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="441.33" y="175.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_user_event_enabled (2 samples, 0.36%)</title><rect x="1001.0" y="469" width="4.2" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="1004.03" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::stream::stream::filter_map::FilterMap&lt;futures_util::stream::stream::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;ferrosa_sstable::types::Partition, ferrosa_cluster::error::ClusterError&gt;&gt; + core::marker::Send&gt;&gt;, ferrosa_cluster::write_path::resume_filtered_stream::{closure#0}&gt;, ferrosa_cluster::write_path::resume_filtered_stream::{closure#1}::{closure#0}, ferrosa_cluster::write_path::resume_filtered_stream::{closure#1}&gt; as futures_core::stream::Stream&gt;::poll_next (15 samples, 2.67%)</title><rect x="186.4" y="261" width="31.5" height="15.0" fill="rgb(229,112,26)" rx="2" ry="2" />
+<text  x="189.37" y="271.5" >&lt;f..</text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_cql::router::SelectRawResult&gt; (2 samples, 0.36%)</title><rect x="154.9" y="277" width="4.2" height="15.0" fill="rgb(236,144,34)" rx="2" ry="2" />
+<text  x="157.88" y="287.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (5 samples, 0.89%)</title><rect x="440.4" y="229" width="10.5" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="443.43" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::core::Core&lt;tokio::runtime::blocking::task::BlockingTask&lt;ferrosa_sched::run_admitted&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (274 samples, 48.75%)</title><rect x="597.9" y="549" width="575.3" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="600.90" y="559.5" >&lt;tokio::runtime::task::core::Core&lt;tokio::runtime::blocking::task::BlockingTask&lt;..</text>
+</g>
+<g >
+<title>tokio::runtime::context::with_scheduler::&lt; (5 samples, 0.89%)</title><rect x="1143.8" y="437" width="10.5" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="1146.81" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::range_merger::RangeMerger&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::next_cursor_row (78 samples, 13.88%)</title><rect x="726.0" y="485" width="163.8" height="15.0" fill="rgb(243,178,42)" rx="2" ry="2" />
+<text  x="728.98" y="495.5" >&lt;ferrosa_storage::ran..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_value_or_span (22 samples, 3.91%)</title><rect x="765.9" y="389" width="46.2" height="15.0" fill="rgb(234,137,32)" rx="2" ry="2" />
+<text  x="768.87" y="399.5" >&lt;fer..</text>
+</g>
+<g >
+<title>&lt;ferrosa_cql::router::SelectRawResult&gt;::encode (8 samples, 1.42%)</title><rect x="154.9" y="293" width="16.8" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="157.88" y="303.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pages_purge_forced (1 samples, 0.18%)</title><rect x="432.0" y="149" width="2.1" height="15.0" fill="rgb(235,139,33)" rx="2" ry="2" />
+<text  x="435.03" y="159.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pages_decommit (1 samples, 0.18%)</title><rect x="429.9" y="149" width="2.1" height="15.0" fill="rgb(242,170,40)" rx="2" ry="2" />
+<text  x="432.93" y="159.5" ></text>
+</g>
+<g >
+<title>pac_decay_to_limit.part.0.isra.0 (1 samples, 0.18%)</title><rect x="157.0" y="149" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="159.98" y="159.5" ></text>
+</g>
+<g >
+<title>ferrosa_cluster::write_path::filter_resumed_fragment (1 samples, 0.18%)</title><rect x="188.5" y="229" width="2.1" height="15.0" fill="rgb(241,168,40)" rx="2" ry="2" />
+<text  x="191.47" y="239.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (3 samples, 0.53%)</title><rect x="1116.5" y="389" width="6.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="1119.51" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;core::option::Option&lt;ferrosa_sstable::types::Row&gt; as alloc::vec::spec_from_elem::SpecFromElem&gt;::from_elem::&lt;alloc::alloc::Global&gt; (1 samples, 0.18%)</title><rect x="694.5" y="485" width="2.1" height="15.0" fill="rgb(220,71,17)" rx="2" ry="2" />
+<text  x="697.48" y="495.5" ></text>
+</g>
+<g >
+<title>mallocx (1 samples, 0.18%)</title><rect x="553.8" y="341" width="2.1" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="556.81" y="351.5" ></text>
+</g>
+<g >
+<title>ferrosa_row_bridge::collection::assemble_column_cells (1 samples, 0.18%)</title><rect x="457.2" y="245" width="2.1" height="15.0" fill="rgb(249,203,48)" rx="2" ry="2" />
+<text  x="460.22" y="255.5" ></text>
+</g>
+<g >
+<title>_rjem_je_eset_remove (2 samples, 0.36%)</title><rect x="963.2" y="357" width="4.2" height="15.0" fill="rgb(221,77,18)" rx="2" ry="2" />
+<text  x="966.24" y="367.5" ></text>
+</g>
+<g >
+<title>tcache_gc_event (3 samples, 0.53%)</title><rect x="994.7" y="453" width="6.3" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="997.73" y="463.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_split_prepare (1 samples, 0.18%)</title><rect x="990.5" y="373" width="2.1" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="993.53" y="383.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (3 samples, 0.53%)</title><rect x="912.8" y="389" width="6.3" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="915.85" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::stream::stream::map::Map&lt;core::pin::Pin&lt;alloc::boxed::Box&lt;dyn futures_core::stream::Stream&lt;Item = core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt; + core::marker::Send&gt;&gt;, ferrosa_cluster::write_path::local_projected_range_stream_from::{closure#1}&gt; as futures_core::stream::Stream&gt;::poll_next (11 samples, 1.96%)</title><rect x="190.6" y="245" width="23.1" height="15.0" fill="rgb(244,182,43)" rx="2" ry="2" />
+<text  x="193.57" y="255.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;std::time::Instant&gt;::elapsed (3 samples, 0.53%)</title><rect x="623.1" y="485" width="6.3" height="15.0" fill="rgb(252,218,52)" rx="2" ry="2" />
+<text  x="626.10" y="495.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::route_select::{closure#0} (178 samples, 31.67%)</title><rect x="154.9" y="309" width="373.7" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="157.88" y="319.5" >ferrosa_cql::router::route_select::{closure#0}</text>
+</g>
+<g >
+<title>_rjem_je_emap_merge_prepare (2 samples, 0.36%)</title><rect x="425.7" y="101" width="4.2" height="15.0" fill="rgb(211,28,6)" rx="2" ry="2" />
+<text  x="428.73" y="111.5" ></text>
+</g>
+<g >
+<title>&lt;mio::sys::unix::waker::Waker&gt;::wake (1 samples, 0.18%)</title><rect x="1145.9" y="405" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="1148.91" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sched::fair_admit::FairAdmit&gt;::enqueue_waiter (2 samples, 0.36%)</title><rect x="100.3" y="389" width="4.2" height="15.0" fill="rgb(245,187,44)" rx="2" ry="2" />
+<text  x="103.28" y="399.5" ></text>
+</g>
+<g >
+<title>clock_gettime (1 samples, 0.18%)</title><rect x="31.0" y="437" width="2.1" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="34.00" y="447.5" ></text>
+</g>
+<g >
+<title>core::ptr::drop_glue::&lt;ferrosa_common::cql_type::CqlValue&gt; (1 samples, 0.18%)</title><rect x="245.2" y="229" width="2.1" height="15.0" fill="rgb(252,219,52)" rx="2" ry="2" />
+<text  x="248.16" y="239.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_fill_small (1 samples, 0.18%)</title><rect x="992.6" y="453" width="2.1" height="15.0" fill="rgb(231,122,29)" rx="2" ry="2" />
+<text  x="995.63" y="463.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="10.0" y="645" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="13.00" y="655.5" ></text>
+</g>
+<g >
+<title>core::slice::memchr::memrchr (1 samples, 0.18%)</title><rect x="841.5" y="341" width="2.1" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="844.46" y="351.5" ></text>
+</g>
+<g >
+<title>std::sys::env::unix::getenv (2 samples, 0.36%)</title><rect x="247.3" y="229" width="4.2" height="15.0" fill="rgb(222,82,19)" rx="2" ry="2" />
+<text  x="250.26" y="239.5" ></text>
+</g>
+<g >
+<title>_rjem_je_pac_decay_all (1 samples, 0.18%)</title><rect x="157.0" y="165" width="2.1" height="15.0" fill="rgb(222,79,19)" rx="2" ry="2" />
+<text  x="159.98" y="175.5" ></text>
+</g>
+<g >
+<title>&lt;core::str::iter::SplitInternal&lt;char&gt;&gt;::next_back (5 samples, 0.89%)</title><rect x="841.5" y="373" width="10.5" height="15.0" fill="rgb(243,174,41)" rx="2" ry="2" />
+<text  x="844.46" y="383.5" ></text>
+</g>
+<g >
+<title>__rustc::__rust_alloc (1 samples, 0.18%)</title><rect x="257.8" y="229" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="260.76" y="239.5" ></text>
+</g>
+<g >
+<title>extent_try_coalesce_impl (1 samples, 0.18%)</title><rect x="236.8" y="117" width="2.1" height="15.0" fill="rgb(243,179,42)" rx="2" ry="2" />
+<text  x="239.76" y="127.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="125.5" y="405" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="128.48" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_alloc_small_hard (1 samples, 0.18%)</title><rect x="738.6" y="389" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="741.58" y="399.5" ></text>
+</g>
+<g >
+<title>std::env::var::inner (2 samples, 0.36%)</title><rect x="247.3" y="245" width="4.2" height="15.0" fill="rgb(238,153,36)" rx="2" ry="2" />
+<text  x="250.26" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_cql::frame::CqlCodec as tokio_util::codec::encoder::Encoder&lt;ferrosa_cql::frame::CqlFrame&gt;&gt;::encode (1 samples, 0.18%)</title><rect x="144.4" y="341" width="2.1" height="15.0" fill="rgb(206,5,1)" rx="2" ry="2" />
+<text  x="147.38" y="351.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.18%)</title><rect x="1017.8" y="501" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="1020.83" y="511.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="885.6" y="421" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="888.55" y="431.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl (1 samples, 0.18%)</title><rect x="448.8" y="133" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="451.83" y="143.5" ></text>
+</g>
+<g >
+<title>std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0},  (273 samples, 48.58%)</title><rect x="12.1" y="597" width="573.2" height="15.0" fill="rgb(216,54,13)" rx="2" ry="2" />
+<text  x="15.10" y="607.5" >std::sys::backtrace::__rust_begin_short_backtrace::&lt;&lt;tokio::runtime::blocking:..</text>
+</g>
+<g >
+<title>&lt;std::sys::thread::unix::Thread&gt;::new::thread_start (282 samples, 50.18%)</title><rect x="593.7" y="629" width="592.1" height="15.0" fill="rgb(212,34,8)" rx="2" ry="2" />
+<text  x="596.70" y="639.5" >&lt;std::sys::thread::unix::Thread&gt;::new::thread_start</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (3 samples, 0.53%)</title><rect x="719.7" y="453" width="6.3" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="722.68" y="463.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::maybe_skip_legacy_empty_clustering_prefix (7 samples, 1.25%)</title><rect x="1049.3" y="421" width="14.7" height="15.0" fill="rgb(209,20,5)" rx="2" ry="2" />
+<text  x="1052.32" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_dalloc_wrapper (1 samples, 0.18%)</title><rect x="998.9" y="325" width="2.1" height="15.0" fill="rgb(248,200,47)" rx="2" ry="2" />
+<text  x="1001.93" y="335.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkCache&gt;::get (2 samples, 0.36%)</title><rect x="721.8" y="437" width="4.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="724.78" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::range_merger::RangeMerger&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::next_fragment (179 samples, 31.85%)</title><rect x="631.5" y="501" width="375.8" height="15.0" fill="rgb(254,225,53)" rx="2" ry="2" />
+<text  x="634.49" y="511.5" >&lt;ferrosa_storage::range_merger::RangeMerger&lt;ferrosa..</text>
+</g>
+<g >
+<title>parking_lot_core::parking_lot::lock_bucket_pair (1 samples, 0.18%)</title><rect x="1143.8" y="405" width="2.1" height="15.0" fill="rgb(227,101,24)" rx="2" ry="2" />
+<text  x="1146.81" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.18%)</title><rect x="121.3" y="373" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="124.28" y="383.5" ></text>
+</g>
+<g >
+<title>emap_try_acquire_edata_neighbor_impl (3 samples, 0.53%)</title><rect x="306.0" y="101" width="6.3" height="15.0" fill="rgb(232,125,29)" rx="2" ry="2" />
+<text  x="309.05" y="111.5" ></text>
+</g>
+<g >
+<title>_rjem_je_ecache_evict (1 samples, 0.18%)</title><rect x="236.8" y="133" width="2.1" height="15.0" fill="rgb(229,113,27)" rx="2" ry="2" />
+<text  x="239.76" y="143.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="1129.1" y="469" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1132.11" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_partition_header (10 samples, 1.78%)</title><rect x="698.7" y="469" width="21.0" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="701.68" y="479.5" ></text>
+</g>
+<g >
+<title>&lt;&amp;std::net::tcp::TcpStream as std::io::Write&gt;::write_vectored (1 samples, 0.18%)</title><rect x="146.5" y="309" width="2.1" height="15.0" fill="rgb(210,26,6)" rx="2" ry="2" />
+<text  x="149.48" y="319.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="144.4" y="325" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="147.38" y="335.5" ></text>
+</g>
+<g >
+<title>malloc (1 samples, 0.18%)</title><rect x="877.2" y="421" width="2.1" height="15.0" fill="rgb(230,119,28)" rx="2" ry="2" />
+<text  x="880.15" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_record (1 samples, 0.18%)</title><rect x="157.0" y="133" width="2.1" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="159.98" y="143.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_empty (1 samples, 0.18%)</title><rect x="982.1" y="373" width="2.1" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="985.14" y="383.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (2 samples, 0.36%)</title><rect x="209.5" y="229" width="4.2" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="212.47" y="239.5" ></text>
+</g>
+<g >
+<title>extent_split_impl.isra.0 (6 samples, 1.07%)</title><rect x="969.5" y="357" width="12.6" height="15.0" fill="rgb(212,36,8)" rx="2" ry="2" />
+<text  x="972.54" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (3 samples, 0.53%)</title><rect x="444.6" y="165" width="6.3" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="447.63" y="175.5" ></text>
+</g>
+<g >
+<title>all (562 samples, 100%)</title><rect x="10.0" y="677" width="1180.0" height="15.0" fill="rgb(213,39,9)" rx="2" ry="2" />
+<text  x="13.00" y="687.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;::schedule_option_task_without_yield (1 samples, 0.18%)</title><rect x="551.7" y="357" width="2.1" height="15.0" fill="rgb(243,177,42)" rx="2" ry="2" />
+<text  x="554.71" y="367.5" ></text>
+</g>
+<g >
+<title>pac_alloc_impl (1 samples, 0.18%)</title><rect x="482.4" y="133" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="485.42" y="143.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_row_projected (36 samples, 6.41%)</title><rect x="1047.2" y="437" width="75.6" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="1050.22" y="447.5" >&lt;ferrosa..</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="274.6" y="245" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="277.56" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;std::sys::pal::unix::time::Timespec&gt;::now (1 samples, 0.18%)</title><rect x="621.0" y="485" width="2.1" height="15.0" fill="rgb(239,159,38)" rx="2" ry="2" />
+<text  x="624.00" y="495.5" ></text>
+</g>
+<g >
+<title>syscall (7 samples, 1.25%)</title><rect x="49.9" y="421" width="14.7" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="52.89" y="431.5" ></text>
+</g>
+<g >
+<title>_rjem_je_emap_remap (1 samples, 0.18%)</title><rect x="938.0" y="421" width="2.1" height="15.0" fill="rgb(244,179,42)" rx="2" ry="2" />
+<text  x="941.04" y="431.5" ></text>
+</g>
+<g >
+<title>tokio_util::util::poll_buf::poll_write_buf::&lt;tokio::net::tcp::stream::TcpStream, bytes::bytes_mut::BytesMut&gt; (1 samples, 0.18%)</title><rect x="146.5" y="357" width="2.1" height="15.0" fill="rgb(221,74,17)" rx="2" ry="2" />
+<text  x="149.48" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_ptr_array_flush (1 samples, 0.18%)</title><rect x="998.9" y="405" width="2.1" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="1001.93" y="415.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_remove (2 samples, 0.36%)</title><rect x="415.2" y="101" width="4.2" height="15.0" fill="rgb(229,114,27)" rx="2" ry="2" />
+<text  x="418.23" y="111.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_record (18 samples, 3.20%)</title><rect x="392.1" y="149" width="37.8" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="395.14" y="159.5" >_rj..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_exact_at (9 samples, 1.60%)</title><rect x="700.8" y="453" width="18.9" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="703.78" y="463.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_handle_deferred_work (70 samples, 12.46%)</title><rect x="287.2" y="213" width="146.9" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="290.15" y="223.5" >_rjem_je_arena_han..</text>
+</g>
+<g >
+<title>syscall (3 samples, 0.53%)</title><rect x="1173.2" y="565" width="6.3" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1176.20" y="575.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_value_or_span (12 samples, 2.14%)</title><rect x="1072.4" y="389" width="25.2" height="15.0" fill="rgb(234,137,32)" rx="2" ry="2" />
+<text  x="1075.42" y="399.5" >&lt;..</text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::BlockingTask&lt;ferrosa_sched::run_admitted&lt;ferrosa_storage::store::spawn_resumable_range_scan&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::{closure#0}::{closure#1}, core::option::Option&lt; (274 samples, 48.75%)</title><rect x="597.9" y="565" width="575.3" height="15.0" fill="rgb(250,210,50)" rx="2" ry="2" />
+<text  x="600.90" y="575.5" >&lt;tokio::runtime::task::harness::Harness&lt;tokio::runtime::blocking::task::Blockin..</text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (3 samples, 0.53%)</title><rect x="1122.8" y="421" width="6.3" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="1125.81" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;mio::sys::unix::waker::Waker&gt;::wake (1 samples, 0.18%)</title><rect x="91.9" y="437" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="94.89" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt;::schedule_local (1 samples, 0.18%)</title><rect x="205.3" y="149" width="2.1" height="15.0" fill="rgb(208,15,3)" rx="2" ry="2" />
+<text  x="208.27" y="159.5" ></text>
+</g>
+<g >
+<title>_rjem_je_extent_record (1 samples, 0.18%)</title><rect x="448.8" y="85" width="2.1" height="15.0" fill="rgb(226,99,23)" rx="2" ry="2" />
+<text  x="451.83" y="95.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::sync::Arc&lt;tokio::runtime::scheduler::multi_thread::handle::Handle&gt; as tokio::runtime::task::Schedule&gt;::schedule (1 samples, 0.18%)</title><rect x="205.3" y="165" width="2.1" height="15.0" fill="rgb(231,124,29)" rx="2" ry="2" />
+<text  x="208.27" y="175.5" ></text>
+</g>
+<g >
+<title>_rjem_je_sdallocx_default (1 samples, 0.18%)</title><rect x="157.0" y="245" width="2.1" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="159.98" y="255.5" ></text>
+</g>
+<g >
+<title>tcache_try_gc_bin (1 samples, 0.18%)</title><rect x="188.5" y="165" width="2.1" height="15.0" fill="rgb(248,202,48)" rx="2" ry="2" />
+<text  x="191.47" y="175.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_unlock (1 samples, 0.18%)</title><rect x="211.6" y="197" width="2.1" height="15.0" fill="rgb(231,120,28)" rx="2" ry="2" />
+<text  x="214.57" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::driver::IoHandle&gt;::unpark (2 samples, 0.36%)</title><rect x="96.1" y="437" width="4.2" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="99.09" y="447.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::route_select_user_table_inner::{closure#0} (165 samples, 29.36%)</title><rect x="180.1" y="277" width="346.4" height="15.0" fill="rgb(251,212,50)" rx="2" ry="2" />
+<text  x="183.07" y="287.5" >ferrosa_cql::router::route_select_user_table_i..</text>
+</g>
+<g >
+<title>[unknown] (2 samples, 0.36%)</title><rect x="585.3" y="629" width="4.2" height="15.0" fill="rgb(210,24,5)" rx="2" ry="2" />
+<text  x="588.30" y="639.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt; as ferrosa_storage::store::PausableScan&gt;::run (265 samples, 47.15%)</title><rect x="608.4" y="517" width="556.4" height="15.0" fill="rgb(222,81,19)" rx="2" ry="2" />
+<text  x="611.40" y="527.5" >&lt;ferrosa_storage::store::RangeScan&lt;ferrosa_storage::flush::FileFlushTarget&gt; ..</text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::node::Handle&lt;alloc::collections::btree::node::NodeRef&lt;alloc::collections::btree::node::marker::Mut, usize, alloc::vec::Vec&lt;&amp;ferrosa_common::cell::CellValue&gt;, alloc::collections::btree::node::marker::Leaf&gt;, alloc::collections::btree::node::marker::Edge&gt;&gt;::insert_recursing::&lt;alloc::alloc::Global, &lt;alloc::collections::btree::map::entry::VacantEntry&lt;usize, alloc::vec::Vec&lt;&amp;ferrosa_common::cell::CellValue&gt;&gt;&gt;::insert_entry::{closure#0}&gt; (1 samples, 0.18%)</title><rect x="474.0" y="213" width="2.1" height="15.0" fill="rgb(250,208,49)" rx="2" ry="2" />
+<text  x="477.02" y="223.5" ></text>
+</g>
+<g >
+<title>arena_decay_impl (1 samples, 0.18%)</title><rect x="154.9" y="197" width="2.1" height="15.0" fill="rgb(233,131,31)" rx="2" ry="2" />
+<text  x="157.88" y="207.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_handle_deferred_work (1 samples, 0.18%)</title><rect x="157.0" y="197" width="2.1" height="15.0" fill="rgb(214,42,10)" rx="2" ry="2" />
+<text  x="159.98" y="207.5" ></text>
+</g>
+<g >
+<title>&lt;futures_util::stream::unfold::Unfold&lt;tokio::sync::mpsc::bounded::Receiver&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt;, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::range_scan_stream::{closure#2}, &lt;ferrosa_storage::store::TableStore&lt;ferrosa_storage::flush::FileFlushTarget&gt;&gt;::range_scan_stream::{closure#2}::{closure#0}&gt; as futures_core::stream::Stream&gt;::poll_next (2 samples, 0.36%)</title><rect x="213.7" y="245" width="4.2" height="15.0" fill="rgb(217,56,13)" rx="2" ry="2" />
+<text  x="216.67" y="255.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::task::state::State&gt;::transition_to_notified_by_val (1 samples, 0.18%)</title><rect x="1154.3" y="453" width="2.1" height="15.0" fill="rgb(231,121,29)" rx="2" ry="2" />
+<text  x="1157.31" y="463.5" ></text>
+</g>
+<g >
+<title>syscall (1 samples, 0.18%)</title><rect x="1152.2" y="421" width="2.1" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="1155.21" y="431.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::driver::IoHandle&gt;::unpark (1 samples, 0.18%)</title><rect x="551.7" y="325" width="2.1" height="15.0" fill="rgb(245,184,44)" rx="2" ry="2" />
+<text  x="554.71" y="335.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="919.1" y="405" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="922.15" y="415.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::sync::mpsc::list::Rx&lt;core::result::Result&lt;alloc::sync::Arc&lt;ferrosa_sstable::types::Partition&gt;, ferrosa_common::error::Error&gt;&gt;&gt;::pop (1 samples, 0.18%)</title><rect x="207.4" y="197" width="2.1" height="15.0" fill="rgb(227,102,24)" rx="2" ry="2" />
+<text  x="210.37" y="207.5" ></text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="564.3" y="437" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="567.31" y="447.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::projection_storage_ordinals_for_select_scan (1 samples, 0.18%)</title><rect x="259.9" y="261" width="2.1" height="15.0" fill="rgb(226,98,23)" rx="2" ry="2" />
+<text  x="262.86" y="271.5" ></text>
+</g>
+<g >
+<title>_rjem_je_edata_heap_insert (3 samples, 0.53%)</title><rect x="396.3" y="117" width="6.3" height="15.0" fill="rgb(234,136,32)" rx="2" ry="2" />
+<text  x="399.33" y="127.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::result::encode_rows_paged (6 samples, 1.07%)</title><rect x="159.1" y="277" width="12.6" height="15.0" fill="rgb(254,226,54)" rx="2" ry="2" />
+<text  x="162.07" y="287.5" ></text>
+</g>
+<g >
+<title>&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task (234 samples, 41.64%)</title><rect x="85.6" y="453" width="491.3" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="88.59" y="463.5" >&lt;tokio::runtime::scheduler::multi_thread::worker::Context&gt;::run_task</text>
+</g>
+<g >
+<title>&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spawner&gt;::spawn_thread::{closure#0},  (273 samples, 48.58%)</title><rect x="12.1" y="613" width="573.2" height="15.0" fill="rgb(219,67,16)" rx="2" ry="2" />
+<text  x="15.10" y="623.5" >&lt;std::thread::lifecycle::spawn_unchecked&lt;&lt;tokio::runtime::blocking::pool::Spaw..</text>
+</g>
+<g >
+<title>pac_alloc_impl (25 samples, 4.45%)</title><rect x="940.1" y="421" width="52.5" height="15.0" fill="rgb(214,43,10)" rx="2" ry="2" />
+<text  x="943.14" y="431.5" >pac_a..</text>
+</g>
+<g >
+<title>&lt;tokio::process::imp::orphan::OrphanQueueImpl&lt;std::process::Child&gt;&gt;::reap_orphans (2 samples, 0.36%)</title><rect x="66.7" y="421" width="4.2" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="69.69" y="431.5" ></text>
+</g>
+<g >
+<title>__madvise (33 samples, 5.87%)</title><rect x="322.8" y="133" width="69.3" height="15.0" fill="rgb(223,85,20)" rx="2" ry="2" />
+<text  x="325.85" y="143.5" >__madvise</text>
+</g>
+<g >
+<title>[libc.so.6] (1 samples, 0.18%)</title><rect x="1164.8" y="517" width="2.1" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="1167.80" y="527.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::PartitionIter&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;::next_clustered_row_projected (77 samples, 13.70%)</title><rect x="728.1" y="469" width="161.7" height="15.0" fill="rgb(234,134,32)" rx="2" ry="2" />
+<text  x="731.08" y="479.5" >&lt;ferrosa_sstable::re..</text>
+</g>
+<g >
+<title>_rjem_je_edata_avail_insert (3 samples, 0.53%)</title><rect x="419.4" y="101" width="6.3" height="15.0" fill="rgb(217,58,13)" rx="2" ry="2" />
+<text  x="422.43" y="111.5" ></text>
+</g>
+<g >
+<title>_rjem_je_te_event_trigger (1 samples, 0.18%)</title><rect x="453.0" y="245" width="2.1" height="15.0" fill="rgb(217,57,13)" rx="2" ry="2" />
+<text  x="456.02" y="255.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (4 samples, 0.71%)</title><rect x="511.8" y="213" width="8.4" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="514.81" y="223.5" ></text>
+</g>
+<g >
+<title>core::slice::memchr::memrchr (1 samples, 0.18%)</title><rect x="849.9" y="357" width="2.1" height="15.0" fill="rgb(205,3,0)" rx="2" ry="2" />
+<text  x="852.86" y="367.5" ></text>
+</g>
+<g >
+<title>_rjem_je_tcache_alloc_small_hard (1 samples, 0.18%)</title><rect x="992.6" y="469" width="2.1" height="15.0" fill="rgb(208,17,4)" rx="2" ry="2" />
+<text  x="995.63" y="479.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (2 samples, 0.36%)</title><rect x="576.9" y="437" width="4.2" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="579.90" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;u16 as core::slice::cmp::SliceContains&gt;::slice_contains (1 samples, 0.18%)</title><rect x="887.7" y="437" width="2.1" height="15.0" fill="rgb(228,109,26)" rx="2" ry="2" />
+<text  x="890.65" y="447.5" ></text>
+</g>
+<g >
+<title>[[vdso]] (1 samples, 0.18%)</title><rect x="994.7" y="437" width="2.1" height="15.0" fill="rgb(218,60,14)" rx="2" ry="2" />
+<text  x="997.73" y="447.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::reader::ChunkedCompressedData&lt;ferrosa_sstable::io::FileReadAt&gt; as ferrosa_sstable::io::ReadAt&gt;::read_at (6 samples, 1.07%)</title><rect x="1051.4" y="389" width="12.6" height="15.0" fill="rgb(247,193,46)" rx="2" ry="2" />
+<text  x="1054.42" y="399.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::collections::binary_heap::BinaryHeap&lt;ferrosa_storage::memtable::sharded::ShardHeapEntry&gt;&gt;::pop (1 samples, 0.18%)</title><rect x="692.4" y="485" width="2.1" height="15.0" fill="rgb(249,206,49)" rx="2" ry="2" />
+<text  x="695.38" y="495.5" ></text>
+</g>
+<g >
+<title>pthread_mutex_trylock (2 samples, 0.36%)</title><rect x="589.5" y="645" width="4.2" height="15.0" fill="rgb(230,116,27)" rx="2" ry="2" />
+<text  x="592.50" y="655.5" ></text>
+</g>
+<g >
+<title>core::str::converts::from_utf8 (1 samples, 0.18%)</title><rect x="495.0" y="213" width="2.1" height="15.0" fill="rgb(224,91,21)" rx="2" ry="2" />
+<text  x="498.02" y="223.5" ></text>
+</g>
+<g >
+<title>&lt;ferrosa_sstable::data::DataReader&lt;ferrosa_sstable::reader::ReadSource&lt;ferrosa_sstable::io::FileReadAt&gt;&gt;&gt;::read_cell (25 samples, 4.45%)</title><rect x="1064.0" y="421" width="52.5" height="15.0" fill="rgb(226,100,23)" rx="2" ry="2" />
+<text  x="1067.02" y="431.5" >&lt;ferr..</text>
+</g>
+<g >
+<title>&lt;alloc::collections::btree::map::entry::Entry&lt;usize, alloc::vec::Vec&lt;&amp;ferrosa_common::cell::CellValue&gt;&gt;&gt;::or_default (3 samples, 0.53%)</title><rect x="469.8" y="229" width="6.3" height="15.0" fill="rgb(231,123,29)" rx="2" ry="2" />
+<text  x="472.82" y="239.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::project_select_rows (4 samples, 0.71%)</title><rect x="251.5" y="261" width="8.4" height="15.0" fill="rgb(235,142,33)" rx="2" ry="2" />
+<text  x="254.46" y="271.5" ></text>
+</g>
+<g >
+<title>&lt;alloc::vec::Vec&lt;&amp;ferrosa_schema::metadata::column::ColumnMetadata&gt; as alloc::vec::spec_from_iter_nested::SpecFromIterNested&lt;&amp;ferrosa_schema::metadata::column::ColumnMetadata, core::iter::adapters::filter::Filter&lt;indexmap::map::iter::Values&lt;alloc::string::String, ferrosa_schema::metadata::column::ColumnMetadata&gt;, ferrosa_cql::router::projection_storage_ordinals::{closure#1}&gt;&gt;&gt;::from_iter (1 samples, 0.18%)</title><rect x="259.9" y="245" width="2.1" height="15.0" fill="rgb(240,163,39)" rx="2" ry="2" />
+<text  x="262.86" y="255.5" ></text>
+</g>
+<g >
+<title>ferrosa_cql::router::route::{closure#0} (180 samples, 32.03%)</title><rect x="150.7" y="325" width="377.9" height="15.0" fill="rgb(225,93,22)" rx="2" ry="2" />
+<text  x="153.68" y="335.5" >ferrosa_cql::router::route::{closure#0}</text>
+</g>
+<g >
+<title>[libc.so.6] (6 samples, 1.07%)</title><rect x="220.0" y="261" width="12.6" height="15.0" fill="rgb(223,84,20)" rx="2" ry="2" />
+<text  x="222.96" y="271.5" ></text>
+</g>
+<g >
+<title>_rjem_je_arena_malloc_hard (1 samples, 0.18%)</title><rect x="933.8" y="469" width="2.1" height="15.0" fill="rgb(213,41,9)" rx="2" ry="2" />
+<text  x="936.84" y="479.5" ></text>
+</g>
+</g>
+</svg>

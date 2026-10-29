@@ -91,7 +91,7 @@ fn render_value(value: &SqlValue) -> Result<Option<Vec<u8>>, EncodeError> {
     let text = match value {
         SqlValue::Null => return Ok(None),
         SqlValue::Int(i) => i.to_string().into_bytes(),
-        SqlValue::Text(s) => s.clone().into_bytes(),
+        SqlValue::Text(s) => s.as_bytes().to_vec(),
         SqlValue::Bool(b) => {
             if *b {
                 b"t".to_vec()
@@ -333,8 +333,8 @@ impl ParamError {
 
 /// Parameter type OIDs the decoder maps. Anything else (except `0`,
 /// unspecified) is refused rather than decoded as text.
-const SUPPORTED_PARAM_OIDS: [i32; 18] = [
-    16, 17, 19, 20, 21, 23, 25, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1700, 2950, 3802,
+const SUPPORTED_PARAM_OIDS: [i32; 19] = [
+    16, 17, 19, 20, 21, 23, 25, 114, 700, 701, 869, 1043, 1082, 1083, 1114, 1184, 1700, 2950, 3802,
 ];
 
 /// `json` (D11: stored as jsonb) and `jsonb` parameter OIDs.
@@ -425,7 +425,7 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
             }
         }
         // text / varchar / name; OID 0 (unspecified) is text too.
-        0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string())),
+        0 | 25 | 1043 | 19 => Ok(SqlValue::Text(s.to_string().into())),
         16 => decode_bool_text(s).ok_or_else(|| bad("not a boolean")),
         700 | 701 => s
             .trim()
@@ -438,6 +438,7 @@ fn decode_param_text(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError> 
         // bytea: a `\x<hex>` string decodes to raw bytes.
         17 => decode_bytea_hex_text(s).ok_or_else(|| bad("not a hex-format bytea")),
         1114 => parse_timestamp_text(s).ok_or_else(|| bad("not a timestamp")),
+        1184 => parse_timestamptz_text(s).ok_or_else(|| bad("not a timestamptz")),
         1082 => parse_date_text(s).ok_or_else(|| bad("not a date")),
         1083 => parse_time_text(s).ok_or_else(|| bad("not a time")),
         869 => s
@@ -466,6 +467,17 @@ fn parse_timestamp_text(s: &str) -> Option<SqlValue> {
         .ok()?;
     let micros = naive.and_utc().timestamp_micros();
     Some(SqlValue::Timestamp(micros))
+}
+
+/// Decode an explicit offset to UTC. Offset-free input uses the supported UTC
+/// session timezone; named timezone/session conversion is not implemented.
+fn parse_timestamptz_text(s: &str) -> Option<SqlValue> {
+    let s = s.trim();
+    chrono::DateTime::parse_from_rfc3339(s)
+        .or_else(|_| chrono::DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%#z"))
+        .map(|instant| SqlValue::Timestamp(instant.timestamp_micros()))
+        .ok()
+        .or_else(|| parse_timestamp_text(s))
 }
 
 /// Parse Postgres `date` text (`YYYY-MM-DD`) into [`SqlValue::Date`] (days since
@@ -556,7 +568,7 @@ fn decode_bytea_hex_text(s: &str) -> Option<SqlValue> {
         let lo = hex_value(pair[1])?;
         bytes.push((hi << 4) | lo);
     }
-    Some(SqlValue::Bytea(bytes))
+    Some(SqlValue::Bytea(bytes.into()))
 }
 
 /// Parse a single ASCII hex digit (case-insensitive) into its 0..=15 value.
@@ -589,7 +601,7 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
         21 => int(2).map(SqlValue::Int),
         // text / varchar / name; OID 0 (unspecified) is text too.
         0 | 25 | 1043 | 19 => std::str::from_utf8(raw)
-            .map(|s| SqlValue::Text(s.to_string()))
+            .map(|s| SqlValue::Text(s.to_string().into()))
             .map_err(|_| bad("value is not valid UTF-8")),
         // bool: exactly one byte, any non-zero byte is true.
         16 => match raw {
@@ -608,10 +620,10 @@ fn decode_param_binary(type_oid: i32, raw: &[u8]) -> Result<SqlValue, ParamError
             .map(SqlValue::Uuid)
             .map_err(|_| bad("wrong length")),
         // bytea: the raw bytes, copied verbatim.
-        17 => Ok(SqlValue::Bytea(raw.to_vec())),
-        // timestamp (1114): BE i64 microseconds since the Postgres epoch
+        17 => Ok(SqlValue::Bytea(raw.to_vec().into())),
+        // timestamp / timestamptz (1114 / 1184): BE i64 micros since the Postgres epoch
         // (2000-01-01). Shift to the Unix-epoch micros our `Value` carries.
-        1114 => int(8)?
+        1114 | 1184 => int(8)?
             .checked_add(PG_EPOCH_MICROS)
             .map(SqlValue::Timestamp)
             .ok_or_else(|| bad("timestamp out of range")),
@@ -727,6 +739,11 @@ pub fn encode_value(
     v: &SqlValue,
 ) -> Result<Option<Vec<u8>>, EncodeError> {
     if format != 1 {
+        if let (ColumnType::TimestampTz, SqlValue::Timestamp(micros)) = (col_type, v) {
+            return Ok(Some(
+                format!("{}+00", render_timestamp_text(*micros)).into_bytes(),
+            ));
+        }
         return render_value(v); // text format: reuse the existing renderer
     }
     // SQL NULL has no bytes in any format.
@@ -751,14 +768,14 @@ pub fn encode_value(
     Ok(match v {
         SqlValue::Null => None,
         SqlValue::Int(i) => Some(encode_int_binary(col_type, *i)?),
-        SqlValue::Text(s) => Some(s.clone().into_bytes()),
+        SqlValue::Text(s) => Some(s.as_bytes().to_vec()),
         SqlValue::Bool(b) => Some(vec![u8::from(*b)]),
         // Floats are advertised as float8 (OID 701); emit 8-byte BE bits.
         SqlValue::Float(of) => Some(of.0.to_be_bytes().to_vec()),
         // uuid (OID 2950): its 16 big-endian bytes.
         SqlValue::Uuid(u) => Some(u.as_bytes().to_vec()),
         // bytea (OID 17): the raw bytes verbatim.
-        SqlValue::Bytea(bytes) => Some(bytes.clone()),
+        SqlValue::Bytea(bytes) => Some(bytes.to_vec()),
         // timestamp (OID 1114): BE i64 micros since the POSTGRES epoch
         // (2000-01-01) — shift our Unix-epoch micros down by the epoch delta.
         SqlValue::Timestamp(micros) => Some(
@@ -826,6 +843,7 @@ pub(crate) fn exec_error_response(err: &ExecError) -> BackendMessage {
         // with a short result the client could not distinguish from a complete
         // one (forge t_50d99192).
         ExecError::Spill(_) => ("58030", err.to_string()),
+        ExecError::Source(_) => ("58000", err.to_string()),
         // An exact aggregate total that does not fit its PostgreSQL result type
         // (sum(int2|int4) is int8). numeric_value_out_of_range, matching
         // PostgreSQL's `bigint out of range`.
@@ -913,6 +931,7 @@ pub async fn execute_query(
 ) -> Vec<BackendMessage> {
     let disabled_cluster_read = crate::ClusterRead::disabled();
     let env = ReadEnv {
+        timestamp_micros: wall_clock_micros(),
         engine,
         schema,
         default_schema,
@@ -1033,6 +1052,7 @@ pub(crate) async fn execute_query_streaming<O: ReplySink>(
 /// in, and the MVCC snapshot it sees.
 #[derive(Clone, Copy)]
 pub(crate) struct ReadEnv<'a> {
+    pub(crate) timestamp_micros: i64,
     pub(crate) engine: &'a Arc<StorageEngine>,
     pub(crate) schema: &'a Schema,
     pub(crate) default_schema: &'a str,
@@ -1360,7 +1380,7 @@ mod direct_row_tests {
     #[test]
     fn direct_scalar_row_reuses_output_without_allocations() {
         let row = Row(vec![
-            SqlValue::Text("payload".repeat(12)),
+            SqlValue::Text("payload".repeat(12).into()),
             SqlValue::Int(123),
             SqlValue::Bool(true),
             SqlValue::Null,
@@ -1396,7 +1416,7 @@ mod direct_row_tests {
             (SqlValue::Int(7), ColumnType::Int),
             (SqlValue::Bool(false), ColumnType::Bool),
             (SqlValue::Null, ColumnType::Numeric),
-            (SqlValue::Bytea(vec![0, 255]), ColumnType::Bytea),
+            (SqlValue::Bytea(vec![0, 255].into()), ColumnType::Bytea),
             (SqlValue::Int(i64::MAX), ColumnType::Int),
             (SqlValue::Int(42), ColumnType::Numeric),
         ];
@@ -1461,6 +1481,7 @@ async fn execute_statement(
     mut txn: Option<&mut TxnWriteSet>,
 ) -> Vec<BackendMessage> {
     let ReadEnv {
+        timestamp_micros,
         engine,
         schema,
         default_schema,
@@ -1647,6 +1668,7 @@ async fn execute_statement(
         Statement::Insert(ins) => {
             execute_insert(
                 DmlContext {
+                    timestamp_micros,
                     engine,
                     mvcc,
                     schema,
@@ -1662,6 +1684,7 @@ async fn execute_statement(
         }
         Statement::Update(upd) => {
             let context = DmlContext {
+                timestamp_micros,
                 engine,
                 mvcc,
                 schema,
@@ -1673,6 +1696,7 @@ async fn execute_statement(
         }
         Statement::Delete(del) => {
             let context = DmlContext {
+                timestamp_micros,
                 engine,
                 mvcc,
                 schema,
@@ -1699,7 +1723,7 @@ async fn apply_or_buffer(
     schema: &Schema,
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
-    mutation: Mutation,
+    mutation: PgWrite,
     ok_tag: &str,
 ) -> Vec<BackendMessage> {
     match apply_or_buffer_silent(engine, schema, mvcc, txn, mutation).await {
@@ -1730,51 +1754,16 @@ async fn apply_or_buffer_silent(
     schema: &Schema,
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
-    mutation: Mutation,
+    mutation: PgWrite,
 ) -> Result<(), Vec<BackendMessage>> {
     match txn {
-        Some(buffer) => {
-            // NO capacity refusal. A write-set larger than the staging buffer
-            // SPILLS to disk; it is never refused for being large, so the old
-            // `FERROSA_POSTGRES_MAX_TXN_WRITES` / `53400` limit is gone (PG-12).
-            buffer.push(PgWrite(mutation)).map_err(|error| {
-                vec![error_response(
-                    "58000",
-                    &format!("transaction write-set staging failed: {error}"),
-                )]
-            })?;
-            Ok(())
-        }
-        None => match mvcc {
-            Some(mvcc) => {
-                match commit_mutations(
-                    engine,
-                    schema,
-                    mvcc,
-                    &mvcc.snapshot(),
-                    &std::collections::HashSet::new(),
-                    vec![mutation],
-                ) {
-                    Ok(_) => Ok(()),
-                    Err(MvccCommitError::SerializationFailure) => Err(vec![error_response(
-                        "40001",
-                        "could not serialize PostgreSQL transaction",
-                    )]),
-                    // Now that `Storage` carries the typed error, a commit
-                    // refused for backpressure answers 53000 like the direct
-                    // write path, instead of collapsing into 58000.
-                    Err(MvccCommitError::Storage(error)) => Err(vec![write_error_response(&error)]),
-                    Err(error) => Err(vec![error_response(
-                        "58000",
-                        &format!("write failed: {error:?}"),
-                    )]),
-                }
-            }
-            None => match engine.write_atomic_batch(vec![mutation]) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(vec![write_error_response(&e)]),
-            },
-        },
+        Some(buffer) => buffer.push(mutation).map_err(|error| {
+            vec![error_response(
+                "58000",
+                &format!("transaction write-set staging failed: {error}"),
+            )]
+        }),
+        None => apply_batch_or_buffer_silent(engine, schema, mvcc, None, vec![mutation]).await,
     }
 }
 
@@ -1795,7 +1784,7 @@ async fn apply_batch_or_buffer(
     schema: &Schema,
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
-    mutations: Vec<Mutation>,
+    mutations: Vec<PgWrite>,
     ok_tag: &str,
 ) -> Vec<BackendMessage> {
     match apply_batch_or_buffer_silent(engine, schema, mvcc, txn, mutations).await {
@@ -1814,14 +1803,14 @@ async fn apply_batch_or_buffer_silent(
     schema: &Schema,
     mvcc: Option<&MvccManager>,
     txn: Option<&mut TxnWriteSet>,
-    mutations: Vec<Mutation>,
+    mutations: Vec<PgWrite>,
 ) -> Result<(), Vec<BackendMessage>> {
     match txn {
         Some(buffer) => {
             // NO capacity refusal: the write-set spills past its buffer, it is never
             // declined for being large (FMEA PG-12).
             for mutation in mutations {
-                buffer.push(PgWrite(mutation)).map_err(|error| {
+                buffer.push(mutation).map_err(|error| {
                     vec![error_response(
                         "58000",
                         &format!("transaction write-set staging failed: {error}"),
@@ -1830,33 +1819,50 @@ async fn apply_batch_or_buffer_silent(
             }
             Ok(())
         }
-        None => match mvcc {
-            Some(mvcc) => {
-                match commit_mutations(
-                    engine,
-                    schema,
-                    mvcc,
-                    &mvcc.snapshot(),
-                    &std::collections::HashSet::new(),
-                    mutations,
-                ) {
-                    Ok(_) => Ok(()),
-                    Err(MvccCommitError::SerializationFailure) => Err(vec![error_response(
-                        "40001",
-                        "could not serialize PostgreSQL transaction",
-                    )]),
-                    Err(MvccCommitError::Storage(error)) => Err(vec![write_error_response(&error)]),
-                    Err(error) => Err(vec![error_response(
-                        "58000",
-                        &format!("write failed: {error:?}"),
-                    )]),
-                }
+        None => {
+            let _lifecycle = schema.lifecycle_read();
+            let snap = schema.snapshot();
+            if mutations.iter().any(|write| {
+                snap.tables
+                    .get(&(write.0.keyspace.clone(), write.0.table.clone()))
+                    .is_none_or(|table| table.id != write.1)
+            }) {
+                return Err(vec![error_response(
+                    "40001",
+                    "table incarnation changed before commit",
+                )]);
             }
-            None => match engine.write_atomic_batch(mutations) {
-                Ok(()) => Ok(()),
-                Err(e) => Err(vec![write_error_response(&e)]),
-            },
-        },
+            let mutations: Vec<Mutation> = mutations.into_iter().map(|write| write.0).collect();
+            match mvcc {
+                Some(mvcc) => {
+                    match commit_mutations(
+                        engine,
+                        schema,
+                        mvcc,
+                        &mvcc.snapshot(),
+                        &std::collections::HashSet::new(),
+                        mutations,
+                    ) {
+                        Ok(_) => Ok(()),
+                        Err(MvccCommitError::SerializationFailure) => Err(vec![error_response(
+                            "40001",
+                            "could not serialize PostgreSQL transaction",
+                        )]),
+                        Err(MvccCommitError::Storage(error)) => {
+                            Err(vec![write_error_response(&error)])
+                        }
+                        Err(error) => Err(vec![error_response(
+                            "58000",
+                            &format!("write failed: {error:?}"),
+                        )]),
+                    }
+                }
+                None => match engine.write_atomic_batch(mutations) {
+                    Ok(()) => Ok(()),
+                    Err(e) => Err(vec![write_error_response(&e)]),
+                },
+            }
+        }
     }
 }
 
@@ -1905,23 +1911,36 @@ pub(crate) async fn execute_truncate(
 
     // Resolve and validate every name first: a missing table must not truncate the
     // tables named before it, so a refused TRUNCATE writes nothing at all.
-    let mut resolved: Vec<(String, String)> = Vec::with_capacity(stmt.tables.len());
+    let mut resolved: Vec<(String, String, uuid::Uuid)> = Vec::with_capacity(stmt.tables.len());
     for target in &stmt.tables {
         let keyspace = target.schema.as_deref().unwrap_or(default_schema);
-        if !schema
-            .snapshot()
+        let snapshot = schema.snapshot();
+        let Some(meta) = snapshot
             .tables
-            .contains_key(&(keyspace.to_string(), target.table.clone()))
-        {
+            .get(&(keyspace.to_string(), target.table.clone()))
+        else {
             return vec![error_response(
                 "42P01",
                 &format!("relation \"{}\" does not exist", target.table),
             )];
-        }
-        resolved.push((keyspace.to_string(), target.table.clone()));
+        };
+        resolved.push((keyspace.to_string(), target.table.clone(), meta.id));
     }
 
-    for (keyspace, table) in resolved {
+    for (keyspace, table, table_id) in resolved {
+        if let (Some(manager), Some(buffer)) =
+            (mvcc, txn.as_deref_mut().filter(|set| set.read_committed))
+        {
+            for slot in 0..crate::mvcc::writer_ownership::STRIPES {
+                if let Err(error) = buffer
+                    .writers
+                    .acquire(&manager.writers, table_id, slot)
+                    .await
+                {
+                    return vec![error];
+                }
+            }
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| (d.as_micros() as i64, d.as_secs() as u32))
@@ -1938,8 +1957,14 @@ pub(crate) async fn execute_truncate(
             vec![marker],
             marked_for_delete_at,
         );
-        if let Err(messages) =
-            apply_or_buffer_silent(engine, schema, mvcc, txn.as_deref_mut(), mutation).await
+        if let Err(messages) = apply_or_buffer_silent(
+            engine,
+            schema,
+            mvcc,
+            txn.as_deref_mut(),
+            PgWrite(mutation, table_id),
+        )
+        .await
         {
             return messages;
         }
@@ -1953,7 +1978,7 @@ pub(crate) async fn execute_truncate(
 /// Apply a PostgreSQL write batch atomically and publish row versions only after
 /// storage confirms the entire batch. This path is independent of Cassandra's
 /// Cassandra Accord transaction protocol.
-pub(crate) fn commit_mutations<S: ferrosa_storage::write_set_stage::WriteSetSource>(
+pub(crate) fn commit_mutations<S: crate::txn_write_set::PgWriteSource>(
     engine: &StorageEngine,
     schema: &Schema,
     mvcc: &MvccManager,
@@ -1964,16 +1989,24 @@ pub(crate) fn commit_mutations<S: ferrosa_storage::write_set_stage::WriteSetSour
     if source.is_empty_set() {
         return Ok(mvcc.current_commit_seq());
     }
+    let _lifecycle = schema.lifecycle_read();
+    source.validate_incarnations(schema)?;
+    mvcc.validate_relations(schema, snapshot)?;
     let changes = prepare_row_changes_from_source(engine, schema, &source)?;
     // A write reads the row it writes: record each written key row-granularly, so
     // two transactions writing the SAME key conflict while two writing DISJOINT
     // keys of one table do NOT (RT-2). The table-level check is retained only for
     // SCANS, which cannot enumerate their rows.
+    let mut bound_relations = std::collections::HashSet::new();
     for change in &changes {
+        if bound_relations.insert((&change.table, change.table_id)) {
+            mvcc.bind_relation(snapshot, &change.table, change.table_id)?;
+        }
         mvcc.record_point_read(
             snapshot,
             crate::mvcc::RowKey {
                 table: change.table.clone(),
+                table_id: change.table_id,
                 key: change.key.clone(),
             },
         );
@@ -1994,13 +2027,13 @@ pub(crate) fn commit_mutations<S: ferrosa_storage::write_set_stage::WriteSetSour
 /// resolves before-images for touched rows. The materialized set is dropped
 /// before durable apply streams the source again. Bounding row-image preparation
 /// and total retained MVCC state remains a follow-up for FMEA PG-12/#2.
-pub(crate) fn prepare_row_changes_from_source<
-    S: ferrosa_storage::write_set_stage::WriteSetSource,
->(
+pub(crate) fn prepare_row_changes_from_source<S: crate::txn_write_set::PgWriteSource>(
     engine: &StorageEngine,
     schema: &Schema,
     source: &S,
 ) -> Result<Vec<RowChange>, MvccCommitError> {
+    let _lifecycle = schema.lifecycle_read();
+    source.validate_incarnations(schema)?;
     let mut mutations: Vec<Mutation> = Vec::with_capacity(source.mutation_count());
     source
         .for_each_mutation(&mut |mutation| {
@@ -2107,6 +2140,7 @@ pub(crate) fn prepare_row_changes(
             for (key, after) in after_rows {
                 changes.push(RowChange {
                     table: format!("{keyspace}.{table}"),
+                    table_id: codecs[&(keyspace.clone(), table.clone())].table_id,
                     partition_key: partition_keys.get(&key).cloned().ok_or_else(|| {
                         ferrosa_common::Error::InvalidData(
                             "could not map PostgreSQL row version to its partition".to_string(),
@@ -2202,8 +2236,10 @@ pub(crate) fn prepare_accord_writes_streaming<S>(
     sink: &mut dyn FnMut(ferrosa_storage::accord::TransactionWrite) -> ferrosa_common::Result<()>,
 ) -> Result<usize, MvccCommitError>
 where
-    S: ferrosa_storage::write_set_stage::WriteSetSource + ?Sized,
+    S: crate::txn_write_set::PgWriteSource + ?Sized,
 {
+    let _lifecycle = schema.lifecycle_read();
+    source.validate_incarnations(schema)?;
     let mut builder = AccordWriteSetBuilder::new(engine, schema);
     let mut pending: Vec<Mutation> =
         Vec::with_capacity(AccordWriteSetBuilder::BEFORE_IMAGE_PREFETCH_CHUNK);
@@ -2400,7 +2436,14 @@ impl<'a> AccordWriteSetBuilder<'a> {
             let mutation_bytes = if partition_keys.is_empty() {
                 // The shared serialize buffer is reused, so this rare no-row path takes
                 // a copy (a bulk `COPY` always carries rows, so it is not the hot path).
-                self.bytes.clone()
+                let metadata = crate::row_change_codec::encode_table_partition(
+                    &format!("{}.{}", table.0, table.1),
+                    codec.table_id,
+                    &[],
+                )
+                .map_err(ferrosa_common::Error::InvalidData)?;
+                ferrosa_storage::accord::encode_postgres_mvcc_mutation(&self.bytes, &metadata)
+                    .map_err(ferrosa_common::Error::InvalidData)?
             } else {
                 // Each partition's SQL key and partition bytes are MOVED out of
                 // `partition_keys` (dropped at the end of this iteration) rather than
@@ -2412,6 +2455,7 @@ impl<'a> AccordWriteSetBuilder<'a> {
                         let after = overlay.get(&key).cloned().flatten();
                         RowChange {
                             table: format!("{}.{}", table.0, table.1),
+                            table_id: codec.table_id,
                             key,
                             partition_key: partition_bytes,
                             before,
@@ -2462,15 +2506,33 @@ impl<'a> AccordWriteSetBuilder<'a> {
     }
 }
 
+fn is_transaction_clock(name: &str) -> bool {
+    matches!(name, "CURRENT_TIMESTAMP" | "NOW")
+}
+
+/// Current Unix-epoch microseconds; the session captures this once per statement.
+pub(crate) fn wall_clock_micros() -> i64 {
+    let micros = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => duration.as_micros() as i128,
+        Err(error) => -(error.duration().as_micros() as i128),
+    };
+    i64::try_from(micros).expect("system clock outside SQL timestamp range")
+}
+
 /// Resolve a DML scalar to a concrete [`SqlValue`], substituting bound
 /// parameters from `params` (1-based, the Postgres `$N` numbering). A literal
 /// passes through; a `$N` indexes `params`. FAILS LOUD (`08P01`,
 /// protocol_violation) when `$N` has no bound value — never a silent default, so
-/// a parameter the client failed to bind can never become NULL. Function calls
-/// in DML values are unsupported (`0A000`). A `||` is concatenated the same way a
-/// select-list one is (the DML value grammar never produces it today; the arm
+/// a parameter the client failed to bind can never become NULL. Only
+/// CURRENT_TIMESTAMP/now() are evaluated against the supplied clock; other DML
+/// function calls remain unsupported (`0A000`). A `||` is concatenated like a
+/// select-list one (the DML value grammar never produces it today; the arm
 /// keeps the semantics uniform rather than unreachable).
-fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, BackendMessage> {
+fn substitute_param(
+    sv: &ScalarValue,
+    params: &[SqlValue],
+    timestamp_micros: i64,
+) -> Result<SqlValue, BackendMessage> {
     match sv {
         ScalarValue::Literal(v) => Ok(v.clone()),
         ScalarValue::Param(n) => {
@@ -2482,13 +2544,16 @@ fn substitute_param(sv: &ScalarValue, params: &[SqlValue]) -> Result<SqlValue, B
                 )
             })
         }
+        ScalarValue::Func(name) if is_transaction_clock(name) => {
+            Ok(SqlValue::Timestamp(timestamp_micros))
+        }
         ScalarValue::Func(_) => Err(error_response(
             "0A000",
             "function calls in DML values are not supported",
         )),
         ScalarValue::Concat { left, right } => {
-            let left = substitute_param(left, params)?;
-            let right = substitute_param(right, params)?;
+            let left = substitute_param(left, params, timestamp_micros)?;
+            let right = substitute_param(right, params, timestamp_micros)?;
             concat_text(&left, &right)
         }
         // The DML/`VALUES` grammar never builds a cast (`parse_scalar_value` has no
@@ -2584,7 +2649,7 @@ fn text_to_sql_value(ty: &CqlType, text: &str) -> Result<SqlValue, BackendMessag
                 };
                 bytes.push(byte);
             }
-            Ok(SqlValue::Bytea(bytes))
+            Ok(SqlValue::Bytea(bytes.into()))
         }
         // Types whose text form is NOT implemented here. Refused by name rather than guessed,
         // and deliberately not routed through the `42804` catch-all so the message says which
@@ -2752,7 +2817,8 @@ pub(crate) struct ReturningOpts<'a> {
 
 /// Shared storage and transaction state for one PostgreSQL DML statement.
 pub(crate) struct DmlContext<'a> {
-    pub engine: &'a StorageEngine,
+    pub(crate) timestamp_micros: i64,
+    pub engine: &'a Arc<StorageEngine>,
     pub mvcc: Option<&'a MvccManager>,
     pub schema: &'a Schema,
     pub default_schema: &'a str,
@@ -2806,11 +2872,12 @@ pub(crate) async fn execute_insert(
     use std::collections::HashMap;
 
     let DmlContext {
+        timestamp_micros,
         engine,
         mvcc,
         schema,
         default_schema,
-        txn,
+        mut txn,
         jsonb_limits,
     } = context;
 
@@ -2835,7 +2902,7 @@ pub(crate) async fn execute_insert(
     let mut combined_returning: Option<QueryResult> = None;
     // Every row's mutation, built and VALIDATED BEFORE any is applied — statement
     // atomicity (see the function doc).
-    let mut mutations: Vec<Mutation> = Vec::with_capacity(ins.rows.len());
+    let mut mutations: Vec<PgWrite> = Vec::with_capacity(ins.rows.len());
 
     for row_index in 0..ins.rows.len() {
         // Resolve THIS row's named columns (per CQL type), substituting bound params;
@@ -2858,6 +2925,7 @@ pub(crate) async fn execute_insert(
                 col_name,
                 &ins.rows[row_index][i],
                 ParamCtx {
+                    timestamp_micros,
                     params,
                     jsonb_limits,
                 },
@@ -2917,6 +2985,10 @@ pub(crate) async fn execute_insert(
             }
         }
 
+        if let Err(error) = own_row(mvcc, txn.as_deref_mut(), meta.id, &pk_values).await {
+            return vec![error];
+        }
+
         // Build the RETURNING result BEFORE the write, from the in-memory values, so
         // a missing RETURNING column fails loud without a half-applied side effect.
         let returning = match ins.returning.as_ref() {
@@ -2938,12 +3010,15 @@ pub(crate) async fn execute_insert(
             Err(e) => return vec![error_response("22000", &e.to_string())],
         };
         let row = ferrosa_row_bridge::build_row(&regular_cells, &ck_values, timestamp, None);
-        mutations.push(Mutation::new(
-            ks.to_string(),
-            ins.table.table.clone(),
-            key,
-            vec![row],
-            timestamp,
+        mutations.push(PgWrite(
+            Mutation::new(
+                ks.to_string(),
+                ins.table.table.clone(),
+                key,
+                vec![row],
+                timestamp,
+            ),
+            meta.id,
         ));
 
         if let Some(result) = returning {
@@ -3311,6 +3386,7 @@ fn render_dml_returning(
 /// ingest limits that gate text coerced into a jsonb column.
 #[derive(Clone, Copy)]
 struct ParamCtx<'a> {
+    timestamp_micros: i64,
     params: &'a [SqlValue],
     jsonb_limits: &'a ferrosa_jsonb::Limits,
 }
@@ -3340,7 +3416,7 @@ fn resolve_dml_value<'a>(
     let cql_type =
         ferrosa_row_bridge::parse_cql_type_in_keyspace(&col_meta.column_type, ks, schema)
             .map_err(|e| error_response("42704", &e.to_string()))?;
-    let sql_value = substitute_param(sv, bound.params)?;
+    let sql_value = substitute_param(sv, bound.params, bound.timestamp_micros)?;
     let value = value_to_cql(&sql_value, &cql_type, bound.jsonb_limits)?;
     Ok((col_meta, sql_value, value))
 }
@@ -3367,7 +3443,8 @@ enum WherePlan {
 
 /// The context a resolved-row `UPDATE` write runs against.
 struct UpdateTarget<'a> {
-    engine: &'a StorageEngine,
+    timestamp_micros: i64,
+    engine: &'a Arc<StorageEngine>,
     schema: &'a Schema,
     mvcc: Option<&'a MvccManager>,
     meta: &'a ferrosa_schema::TableMetadata,
@@ -3380,7 +3457,8 @@ struct UpdateTarget<'a> {
 
 /// The context a resolved-row `DELETE` write runs against.
 struct DeleteTarget<'a> {
-    engine: &'a StorageEngine,
+    jsonb_limits: &'a ferrosa_jsonb::Limits,
+    engine: &'a Arc<StorageEngine>,
     schema: &'a Schema,
     mvcc: Option<&'a MvccManager>,
     meta: &'a ferrosa_schema::TableMetadata,
@@ -3656,7 +3734,7 @@ fn build_update_mutation(
             ctx.schema,
         )
         .map_err(|error| error_response("42704", &error.to_string()))?;
-        let sql_value = eval_set_expr(expr, current, ctx.params)?;
+        let sql_value = eval_set_expr(expr, current, ctx.params, ctx.timestamp_micros)?;
         let value = value_to_cql(&sql_value, &cql_type, ctx.jsonb_limits)?;
         if !matches!(col_meta.kind, ColumnKind::Regular | ColumnKind::Static) {
             return Err(error_response(
@@ -3694,16 +3772,332 @@ fn build_update_mutation(
     ))
 }
 
+/// Initial candidate selection is a statement snapshot plus own writes. The
+/// winner recheck below changes only an already-selected row, never the set of
+/// statements executed or the initial predicate's nonmatching rows.
+struct CandidateContext<'a> {
+    engine: &'a Arc<StorageEngine>,
+    schema: &'a Schema,
+    mvcc: &'a MvccManager,
+    meta: &'a ferrosa_schema::TableMetadata,
+    ks: &'a str,
+    table: &'a str,
+}
+
+impl CandidateContext<'_> {
+    async fn rows(
+        &self,
+        txn: &mut TxnWriteSet,
+        statement: &str,
+        predicate: &std::collections::HashMap<String, CqlValue>,
+    ) -> Result<(tokio::sync::mpsc::Receiver<Row>, ScanFailure), BackendMessage> {
+        let snapshot = self.mvcc.snapshot();
+        let qualified = format!("{}.{}", self.ks, self.table);
+        self.mvcc
+            .bind_relation(&snapshot, &qualified, self.meta.id)
+            .map_err(|_| error_response("40001", "table incarnation changed during statement"))?;
+        let view = self.mvcc.table_view(&snapshot, &qualified, self.meta.id);
+        let pending = txn.pending_writes().map_err(|e| write_error_response(&e))?;
+        let mut overlay = std::collections::HashMap::new();
+        crate::storage_provider::staged_overlay(
+            self.engine,
+            self.schema,
+            self.ks,
+            self.table,
+            &mut overlay,
+            &pending,
+            Some(&view),
+        )
+        .map_err(|error| match error {
+            MvccCommitError::Storage(error) => write_error_response(&error),
+            _ => error_response("40001", "statement snapshot or table incarnation expired"),
+        })?;
+        drop(pending);
+        let failure = ScanFailure::default();
+        let codec = TableCodec::build(self.ks, self.table, self.schema)
+            .map_err(|error| error_response("58000", &error))?;
+        let mut point = None;
+        if storage_key_complete(self.meta, predicate) {
+            let pk: Vec<_> = self
+                .meta
+                .partition_key
+                .iter()
+                .map(|name| predicate[name].clone())
+                .collect();
+            let key = self
+                .meta
+                .partition_key
+                .iter()
+                .chain(self.meta.clustering_key.iter().map(|(name, _)| name))
+                .map(|name| crate::storage_provider::cql_to_value(&predicate[name]))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| error_response("22000", &e))?;
+            point = Some(crate::storage_provider::PointLookup {
+                storage_key: ferrosa_row_bridge::build_decorated_key(&pk, &[])
+                    .map_err(|e| error_response("22000", &e.to_string()))?,
+                row_key: key,
+            });
+        } else if let WherePlan::Index { index_name, column } =
+            plan_dml_where(self.engine, self.meta, self.ks, self.table, predicate)
+        {
+            // Read the index before checking its relation epoch/apply reservations.
+            // A raced physical index cannot stand in for an MVCC snapshot; the
+            // shared snapshot scan reconciles its missing/deleted keys in that case.
+            let by_key =
+                std::collections::HashMap::from([(column.clone(), predicate[&column].clone())]);
+            let indexed = index_rows_for_dml(
+                self.engine,
+                &ferrosa_storage::TableId::new(self.ks, self.table),
+                &index_name,
+                &column,
+                &by_key,
+                &codec,
+            )?;
+            if self
+                .mvcc
+                .relation_stable(&snapshot, &qualified, self.meta.id)
+            {
+                let mut selected = std::collections::HashMap::new();
+                for row in indexed {
+                    let values = codec
+                        .names()
+                        .iter()
+                        .map(|name| crate::storage_provider::cql_to_value(&row.values[name]))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| error_response("22000", &e))?;
+                    let key = codec
+                        .pk()
+                        .iter()
+                        .chain(codec.ck())
+                        .map(|i| values[*i].clone())
+                        .collect();
+                    selected.insert(key, Some(Row::new(values)));
+                }
+                selected.extend(overlay);
+                let (tx, rx) = tokio::sync::mpsc::channel(self.mvcc.scan_buffer_rows());
+                tokio::spawn(async move {
+                    for row in selected.into_values().flatten() {
+                        if tx.send(row).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                return Ok((rx, failure));
+            }
+        }
+        if point.is_none() {
+            warn_scan_fallback(statement, self.ks, self.table, predicate);
+        }
+        let provider = load_table_with_overlay(
+            self.engine,
+            self.schema,
+            self.ks,
+            self.table,
+            failure.clone(),
+            overlay,
+            self.mvcc.scan_buffer_rows(),
+            None,
+        )
+        .await
+        .map_err(|error| error_response("58000", &format!("candidate read failed: {error}")))?
+        .with_mvcc_view(view)
+        .with_point_lookup(point);
+        Ok((provider.rows(), failure))
+    }
+
+    fn resolve(
+        &self,
+        row: Row,
+        limits: &ferrosa_jsonb::Limits,
+    ) -> Result<ResolvedRow, BackendMessage> {
+        let values = row_values(row, self.meta, self.schema, self.ks, limits)?;
+        Ok(ResolvedRow {
+            pk_values: self
+                .meta
+                .partition_key
+                .iter()
+                .map(|name| values[name].clone())
+                .collect(),
+            ck_values: self
+                .meta
+                .clustering_key
+                .iter()
+                .map(|(name, _)| values[name].clone())
+                .collect(),
+            values,
+        })
+    }
+}
+
+async fn update_read_committed(
+    target: &UpdateTarget<'_>,
+    txn: &mut TxnWriteSet,
+    predicate: &std::collections::HashMap<String, CqlValue>,
+) -> Vec<BackendMessage> {
+    let candidates = CandidateContext {
+        engine: target.engine,
+        schema: target.schema,
+        mvcc: target.mvcc.expect("RC has an MVCC manager"),
+        meta: target.meta,
+        ks: target.ks,
+        table: target.table,
+    };
+    let (mut rows, failure) = match candidates.rows(txn, "UPDATE", predicate).await {
+        Ok(rows) => rows,
+        Err(error) => return vec![error],
+    };
+    let mut written = 0;
+    while let Some(row) = rows.recv().await {
+        let row = match candidates.resolve(row, target.jsonb_limits) {
+            Ok(row) => row,
+            Err(error) => return vec![error],
+        };
+        if predicate_matches(&row.values, predicate) {
+            match apply_update_row(target, Some(txn), &row, predicate).await {
+                Ok(changed) => written += usize::from(changed),
+                Err(errors) => return errors,
+            }
+        }
+    }
+    if let Some((code, message)) = failure.take_with_code() {
+        return vec![error_response(code, &message)];
+    }
+    complete_tag("UPDATE", written)
+}
+
+async fn delete_read_committed(
+    target: &DeleteTarget<'_>,
+    txn: &mut TxnWriteSet,
+    predicate: &std::collections::HashMap<String, CqlValue>,
+) -> Vec<BackendMessage> {
+    let candidates = CandidateContext {
+        engine: target.engine,
+        schema: target.schema,
+        mvcc: target.mvcc.expect("RC has an MVCC manager"),
+        meta: target.meta,
+        ks: target.ks,
+        table: target.table,
+    };
+    let (mut rows, failure) = match candidates.rows(txn, "DELETE", predicate).await {
+        Ok(rows) => rows,
+        Err(error) => return vec![error],
+    };
+    let mut written = 0;
+    while let Some(row) = rows.recv().await {
+        let row = match candidates.resolve(row, target.jsonb_limits) {
+            Ok(row) => row,
+            Err(error) => return vec![error],
+        };
+        if predicate_matches(&row.values, predicate) {
+            match apply_delete_row(target, Some(txn), &row, predicate).await {
+                Ok(changed) => written += usize::from(changed),
+                Err(errors) => return errors,
+            }
+        }
+    }
+    if let Some((code, message)) = failure.take_with_code() {
+        return vec![error_response(code, &message)];
+    }
+    complete_tag("DELETE", written)
+}
+
+/// Take local RC ownership before any property-dependent evaluation. Default
+/// lock waiting has no timeout; transaction lifetime is an independent bound.
+async fn own_row(
+    mvcc: Option<&MvccManager>,
+    txn: Option<&mut TxnWriteSet>,
+    id: uuid::Uuid,
+    pk: &[CqlValue],
+) -> Result<bool, BackendMessage> {
+    let Some(buffer) = txn.filter(|buffer| buffer.read_committed) else {
+        return Ok(false);
+    };
+    let manager =
+        mvcc.ok_or_else(|| error_response("XX000", "local writer has no MVCC manager"))?;
+    let key = ferrosa_row_bridge::build_decorated_key(pk, &[])
+        .map_err(|e| error_response("22000", &e.to_string()))?;
+    buffer
+        .writers
+        .acquire(
+            &manager.writers,
+            id,
+            crate::mvcc::writer_ownership::stripe(key.key.as_bytes()),
+        )
+        .await?;
+    Ok(true)
+}
+
+fn row_values(
+    row: Row,
+    meta: &ferrosa_schema::TableMetadata,
+    schema: &Schema,
+    ks: &str,
+    limits: &ferrosa_jsonb::Limits,
+) -> Result<std::collections::HashMap<String, CqlValue>, BackendMessage> {
+    meta.columns
+        .keys()
+        .zip(row.0)
+        .map(|(name, value)| {
+            let ty = ferrosa_row_bridge::parse_cql_type_in_keyspace(
+                &meta.columns[name].column_type,
+                ks,
+                schema,
+            )
+            .map_err(|e| error_response("42704", &e.to_string()))?;
+            Ok((name.clone(), value_to_cql(&value, &ty, limits)?))
+        })
+        .collect()
+}
+
 /// Write ONE resolved-row `UPDATE`; `Err` carries the error response(s) to send.
 async fn apply_update_row(
     ctx: &UpdateTarget<'_>,
-    txn: Option<&mut TxnWriteSet>,
+    mut txn: Option<&mut TxnWriteSet>,
     row: &ResolvedRow,
-) -> Result<(), Vec<BackendMessage>> {
+    predicate: &std::collections::HashMap<String, CqlValue>,
+) -> Result<bool, Vec<BackendMessage>> {
+    let rc = own_row(ctx.mvcc, txn.as_deref_mut(), ctx.meta.id, &row.pk_values)
+        .await
+        .map_err(|e| vec![e])?;
+    let refreshed;
+    let row = if rc {
+        let image = read_current_row_for_update(
+            ctx.engine,
+            ctx.schema,
+            ctx.ks,
+            ctx.table,
+            &row.pk_values,
+            &row.ck_values,
+            txn.as_deref_mut(),
+        )
+        .map_err(|e| vec![e])?;
+        let Some(image) = image else { return Ok(false) };
+        let values = row_values(image, ctx.meta, ctx.schema, ctx.ks, ctx.jsonb_limits)
+            .map_err(|e| vec![e])?;
+        if !predicate_matches(&values, predicate) {
+            return Ok(false);
+        }
+        refreshed = ResolvedRow {
+            pk_values: row.pk_values.clone(),
+            ck_values: row.ck_values.clone(),
+            values,
+        };
+        &refreshed
+    } else {
+        row
+    };
     let image = current_image_for_set(row, ctx.upd).map_err(|message| vec![message])?;
     let mutation = build_update_mutation(ctx, &row.pk_values, &row.ck_values, Some(&image))
         .map_err(|message| vec![message])?;
-    apply_or_buffer_silent(ctx.engine, ctx.schema, ctx.mvcc, txn, mutation).await
+    apply_or_buffer_silent(
+        ctx.engine,
+        ctx.schema,
+        ctx.mvcc,
+        txn,
+        PgWrite(mutation, ctx.meta.id),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Serve an `UPDATE` whose `WHERE` does not name the storage key: resolve the rows it
@@ -3748,10 +4142,10 @@ async fn update_rows_by_predicate(
                 Err(message) => return vec![message],
             };
             for row in &rows {
-                if let Err(messages) = apply_update_row(ctx, txn.as_deref_mut(), row).await {
-                    return messages;
+                match apply_update_row(ctx, txn.as_deref_mut(), row, where_values).await {
+                    Ok(changed) => written += usize::from(changed),
+                    Err(messages) => return messages,
                 }
-                written += 1;
             }
         }
         WherePlan::Scan => {
@@ -3783,10 +4177,10 @@ async fn update_rows_by_predicate(
                     }
                 };
                 for row in &rows {
-                    if let Err(messages) = apply_update_row(ctx, txn.as_deref_mut(), row).await {
-                        return messages;
+                    match apply_update_row(ctx, txn.as_deref_mut(), row, where_values).await {
+                        Ok(changed) => written += usize::from(changed),
+                        Err(messages) => return messages,
                     }
-                    written += 1;
                 }
             }
         }
@@ -3818,9 +4212,40 @@ fn build_delete_mutation(
 /// Write ONE resolved-row `DELETE`; `Err` carries the error response(s) to send.
 async fn apply_delete_row(
     ctx: &DeleteTarget<'_>,
-    txn: Option<&mut TxnWriteSet>,
+    mut txn: Option<&mut TxnWriteSet>,
     row: &ResolvedRow,
-) -> Result<(), Vec<BackendMessage>> {
+    predicate: &std::collections::HashMap<String, CqlValue>,
+) -> Result<bool, Vec<BackendMessage>> {
+    let rc = own_row(ctx.mvcc, txn.as_deref_mut(), ctx.meta.id, &row.pk_values)
+        .await
+        .map_err(|e| vec![e])?;
+    let refreshed;
+    let row = if rc {
+        let image = read_current_row_for_update(
+            ctx.engine,
+            ctx.schema,
+            ctx.ks,
+            ctx.table,
+            &row.pk_values,
+            &row.ck_values,
+            txn.as_deref_mut(),
+        )
+        .map_err(|e| vec![e])?;
+        let Some(image) = image else { return Ok(false) };
+        let values = row_values(image, ctx.meta, ctx.schema, ctx.ks, ctx.jsonb_limits)
+            .map_err(|e| vec![e])?;
+        if !predicate_matches(&values, predicate) {
+            return Ok(false);
+        }
+        refreshed = ResolvedRow {
+            pk_values: row.pk_values.clone(),
+            ck_values: row.ck_values.clone(),
+            values,
+        };
+        &refreshed
+    } else {
+        row
+    };
     // Parent-side enforcement: refuse while any child still references this row.
     if let Err((code, message)) =
         crate::pg_fk::check_parent_row(ctx.engine, ctx.snapshot, ctx.meta, &row.values)
@@ -3829,7 +4254,15 @@ async fn apply_delete_row(
     }
     let mutation = build_delete_mutation(ctx.ks, ctx.table, &row.pk_values, &row.ck_values)
         .map_err(|message| vec![message])?;
-    apply_or_buffer_silent(ctx.engine, ctx.schema, ctx.mvcc, txn, mutation).await
+    apply_or_buffer_silent(
+        ctx.engine,
+        ctx.schema,
+        ctx.mvcc,
+        txn,
+        PgWrite(mutation, ctx.meta.id),
+    )
+    .await?;
+    Ok(true)
 }
 
 /// Serve a `DELETE` whose `WHERE` does not name the storage key: resolve the rows it
@@ -3870,10 +4303,10 @@ async fn delete_rows_by_predicate(
                 Err(message) => return vec![message],
             };
             for row in &rows {
-                if let Err(messages) = apply_delete_row(ctx, txn.as_deref_mut(), row).await {
-                    return messages;
+                match apply_delete_row(ctx, txn.as_deref_mut(), row, where_values).await {
+                    Ok(changed) => written += usize::from(changed),
+                    Err(messages) => return messages,
                 }
-                written += 1;
             }
         }
         WherePlan::Scan => {
@@ -3905,10 +4338,10 @@ async fn delete_rows_by_predicate(
                     }
                 };
                 for row in &rows {
-                    if let Err(messages) = apply_delete_row(ctx, txn.as_deref_mut(), row).await {
-                        return messages;
+                    match apply_delete_row(ctx, txn.as_deref_mut(), row, where_values).await {
+                        Ok(changed) => written += usize::from(changed),
+                        Err(messages) => return messages,
                     }
-                    written += 1;
                 }
             }
         }
@@ -3951,6 +4384,7 @@ pub(crate) async fn execute_update(
     use std::collections::HashMap;
 
     let DmlContext {
+        timestamp_micros,
         engine,
         mvcc,
         schema,
@@ -3996,6 +4430,7 @@ pub(crate) async fn execute_update(
             col_name,
             sv,
             ParamCtx {
+                timestamp_micros,
                 params,
                 jsonb_limits,
             },
@@ -4006,10 +4441,27 @@ pub(crate) async fn execute_update(
         where_values.insert(col_name.clone(), value);
     }
 
+    if let Some(buffer) = txn.as_deref_mut().filter(|buffer| buffer.read_committed) {
+        let target = UpdateTarget {
+            timestamp_micros,
+            engine,
+            schema,
+            mvcc,
+            meta,
+            ks,
+            table,
+            upd,
+            params,
+            jsonb_limits,
+        };
+        return update_read_committed(&target, buffer, &where_values).await;
+    }
+
     // A WHERE naming every storage-key column identifies exactly one row, as it always
     // has. Anything else is resolved to its rows — by lookup, or by a scan.
     if !storage_key_complete(meta, &where_values) {
         let target = UpdateTarget {
+            timestamp_micros,
             engine,
             schema,
             mvcc,
@@ -4022,7 +4474,7 @@ pub(crate) async fn execute_update(
         };
         return update_rows_by_predicate(&target, txn, &where_values).await;
     }
-    let key_values = where_values;
+    let key_values = &where_values;
 
     let mut pk_values = Vec::with_capacity(meta.partition_key.len());
     for name in &meta.partition_key {
@@ -4075,6 +4527,7 @@ pub(crate) async fn execute_update(
     };
 
     let target = UpdateTarget {
+        timestamp_micros,
         engine,
         schema,
         mvcc,
@@ -4089,7 +4542,15 @@ pub(crate) async fn execute_update(
         Ok(mutation) => mutation,
         Err(msg) => return vec![msg],
     };
-    apply_or_buffer(engine, schema, mvcc, txn, mutation, "UPDATE 1").await
+    apply_or_buffer(
+        engine,
+        schema,
+        mvcc,
+        txn,
+        PgWrite(mutation, meta.id),
+        "UPDATE 1",
+    )
+    .await
 }
 
 /// Read the CURRENT row an arithmetic `UPDATE`'s `SET` expression must evaluate
@@ -4193,16 +4654,17 @@ fn eval_set_expr(
     expr: &SetExpr,
     current: Option<&std::collections::HashMap<String, SqlValue>>,
     params: &[SqlValue],
+    timestamp_micros: i64,
 ) -> Result<SqlValue, BackendMessage> {
     match expr {
-        SetExpr::Value(sv) => substitute_param(sv, params),
+        SetExpr::Value(sv) => substitute_param(sv, params, timestamp_micros),
         SetExpr::Column(cr) => Ok(current
             .and_then(|row| row.get(&cr.name))
             .cloned()
             .unwrap_or(SqlValue::Null)),
         SetExpr::Binary { op, left, right } => {
-            let l = eval_set_expr(left, current, params)?;
-            let r = eval_set_expr(right, current, params)?;
+            let l = eval_set_expr(left, current, params, timestamp_micros)?;
+            let r = eval_set_expr(right, current, params, timestamp_micros)?;
             apply_arith(*op, &l, &r)
         }
     }
@@ -4338,11 +4800,12 @@ pub(crate) async fn execute_delete(
     use std::collections::HashMap;
 
     let DmlContext {
+        timestamp_micros,
         engine,
         mvcc,
         schema,
         default_schema,
-        txn,
+        mut txn,
         jsonb_limits,
     } = context;
 
@@ -4380,6 +4843,7 @@ pub(crate) async fn execute_delete(
             col_name,
             sv,
             ParamCtx {
+                timestamp_micros,
                 params,
                 jsonb_limits,
             },
@@ -4390,10 +4854,25 @@ pub(crate) async fn execute_delete(
         where_values.insert(col_name.clone(), value);
     }
 
+    if let Some(buffer) = txn.as_deref_mut().filter(|buffer| buffer.read_committed) {
+        let target = DeleteTarget {
+            jsonb_limits,
+            engine,
+            schema,
+            mvcc,
+            meta,
+            snapshot: &snap,
+            ks,
+            table,
+        };
+        return delete_read_committed(&target, buffer, &where_values).await;
+    }
+
     // A WHERE naming every storage-key column identifies exactly one row, as it always
     // has. Anything else is resolved to its rows — by lookup, or by a scan.
     if !storage_key_complete(meta, &where_values) {
         let target = DeleteTarget {
+            jsonb_limits,
             engine,
             schema,
             mvcc,
@@ -4404,12 +4883,12 @@ pub(crate) async fn execute_delete(
         };
         return delete_rows_by_predicate(&target, txn, &where_values).await;
     }
-    let key_values = where_values;
+    let key_values = &where_values;
 
     // Parent-side enforcement: refuse the DELETE while any child still references this row. The
     // probe is an index lookup on the child's FK index (built by `ADD FOREIGN KEY`), and it is a
     // normal read, so it lands in the read set a serializable COMMIT validates.
-    if let Err((code, message)) = crate::pg_fk::check_parent_row(engine, &snap, meta, &key_values) {
+    if let Err((code, message)) = crate::pg_fk::check_parent_row(engine, &snap, meta, key_values) {
         return vec![error_response(&code, &message)];
     }
 
@@ -4442,7 +4921,15 @@ pub(crate) async fn execute_delete(
         Ok(mutation) => mutation,
         Err(msg) => return vec![msg],
     };
-    apply_or_buffer(engine, schema, mvcc, txn, mutation, "DELETE 1").await
+    apply_or_buffer(
+        engine,
+        schema,
+        mvcc,
+        txn,
+        PgWrite(mutation, meta.id),
+        "DELETE 1",
+    )
+    .await
 }
 
 /// The context a no-`FROM` expression select is evaluated in.
@@ -4455,6 +4942,7 @@ pub(crate) async fn execute_delete(
 /// rather than guessed (the same convention as [`ReadEnv::ddl`]).
 #[derive(Clone, Copy)]
 pub(crate) struct ScalarReadCtx<'a> {
+    pub(crate) timestamp_micros: i64,
     /// The schema name bare table names resolve under, and the value
     /// `current_database()` reports.
     pub(crate) default_schema: &'a str,
@@ -4469,6 +4957,7 @@ impl<'a> ScalarReadCtx<'a> {
     /// The wire path's context: storage available, schema name taken from `env`.
     pub(crate) fn new(env: ReadEnv<'a>, pending_writes: Option<&'a [PgWrite]>) -> Self {
         Self {
+            timestamp_micros: env.timestamp_micros,
             default_schema: env.default_schema,
             read: Some(env),
             pending_writes,
@@ -4524,6 +5013,10 @@ async fn eval_scalar_value(
 ) -> Result<(SqlValue, ColumnType), BackendMessage> {
     match value {
         ScalarValue::Literal(v) => Ok((v.clone(), value_column_type(v))),
+        ScalarValue::Func(name) if is_transaction_clock(name) => Ok((
+            SqlValue::Timestamp(ctx.timestamp_micros),
+            ColumnType::TimestampTz,
+        )),
         ScalarValue::Func(name) => Ok((
             eval_scalar_func(name, ctx.default_schema)?,
             ColumnType::Text,
@@ -4638,7 +5131,7 @@ fn concat_text(left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMes
             "concatenation produced bytes with no text representation",
         )
     })?;
-    Ok(SqlValue::Text(text))
+    Ok(SqlValue::Text(text.into()))
 }
 
 /// Evaluate a zero-arg info/session function. Unsupported names fail loud
@@ -4646,9 +5139,11 @@ fn concat_text(left: &SqlValue, right: &SqlValue) -> Result<SqlValue, BackendMes
 fn eval_scalar_func(name: &str, default_schema: &str) -> Result<SqlValue, BackendMessage> {
     match name {
         // Keep in step with the `server_version` ParameterStatus (connection.rs).
-        "VERSION" => Ok(SqlValue::Text("PostgreSQL 16.0 (ferrosa)".to_string())),
+        "VERSION" => Ok(SqlValue::Text(
+            "PostgreSQL 16.0 (ferrosa)".to_string().into(),
+        )),
         "CURRENT_DATABASE" | "CURRENT_CATALOG" | "CURRENT_SCHEMA" => {
-            Ok(SqlValue::Text(default_schema.to_string()))
+            Ok(SqlValue::Text(default_schema.to_string().into()))
         }
         other => Err(error_response(
             "0A000",
@@ -4878,8 +5373,22 @@ pub(crate) async fn load_catalog_with_mvcc(
             continue;
         }
         let table_name = format!("{keyspace}.{}", table_ref.table);
+        let schema_snapshot = schema.snapshot();
+        let table_id = schema_snapshot
+            .tables
+            .get(&(keyspace.to_owned(), table_ref.table.clone()))
+            .ok_or_else(|| {
+                error_response("42P01", &format!("relation {table_name} does not exist"))
+            })?
+            .id;
         let view = match (mvcc, snapshot) {
-            (Some(mvcc), Some(snapshot)) => Some(mvcc.table_view(snapshot, &table_name)),
+            (Some(mvcc), Some(snapshot)) => {
+                mvcc.bind_relation(snapshot, &table_name, table_id)
+                    .map_err(|_| {
+                        error_response("40001", "table incarnation changed during transaction")
+                    })?;
+                Some(mvcc.table_view(snapshot, &table_name, table_id))
+            }
             _ => None,
         };
         let overlay_error = |error| match error {
@@ -5064,6 +5573,7 @@ mod tests {
     /// over a real engine instead (see `subquery_tests`).
     fn bare_ctx(default_schema: &str) -> ScalarReadCtx<'_> {
         ScalarReadCtx {
+            timestamp_micros: wall_clock_micros(),
             default_schema,
             read: None,
             pending_writes: None,
@@ -5072,10 +5582,10 @@ mod tests {
 
     #[test]
     fn pg_param_unknown_oid_is_refused() {
-        // jsonpath, timestamptz, bpchar, an int4 array and a made-up OID have
+        // jsonpath, bpchar, an int4 array and a made-up OID have
         // no mapping: refused in both formats, never decoded as text. (jsonb
         // and json are mapped since T-161a.)
-        for oid in [4072, 1184, 1042, 1007, 999_999] {
+        for oid in [4072, 1042, 1007, 999_999] {
             for format in [0, 1] {
                 let err = param_err(format, oid, b"{\"a\":1}");
                 assert_eq!(err.sqlstate, "42704", "oid {oid} format {format}");
@@ -5091,7 +5601,7 @@ mod tests {
 
     #[test]
     fn text_param_parse_failures_are_22p02_for_every_mapped_oid() {
-        let cases: [(i32, &[u8]); 16] = [
+        let cases: [(i32, &[u8]); 17] = [
             (23, b"not-an-integer"),
             (23, b"2147483648"),
             (21, b"40000"),
@@ -5103,6 +5613,7 @@ mod tests {
             (17, b"\\xzz"),
             (17, b"deadbeef"),
             (1114, b"yesterday"),
+            (1184, b"yesterday"),
             (1082, b"2024-13-40"),
             (1083, b"25:61:61"),
             (869, b"999.1.1.1"),
@@ -5117,7 +5628,7 @@ mod tests {
 
     #[test]
     fn bin_param_malformations_are_22p03_for_every_mapped_oid() {
-        let cases: [(i32, &[u8]); 12] = [
+        let cases: [(i32, &[u8]); 13] = [
             (23, &[1]),
             (20, &[0; 4]),
             (21, &[0; 4]),
@@ -5127,6 +5638,7 @@ mod tests {
             (701, &[0; 4]),
             (2950, &[0; 15]),
             (1114, &[0; 4]),
+            (1184, &[0; 4]),
             (1082, &[0; 8]),
             (869, &[2, 32]),
             (25, &[0xff, 0xfe]),
@@ -5346,11 +5858,11 @@ mod tests {
     #[test]
     fn bytea_text_render_is_postgres_hex() {
         assert_eq!(
-            rv(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])),
+            rv(&SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef].into())),
             Some(b"\\xdeadbeef".to_vec())
         );
         // Empty bytea ⇒ just the `\x` prefix.
-        assert_eq!(rv(&SqlValue::Bytea(vec![])), Some(b"\\x".to_vec()));
+        assert_eq!(rv(&SqlValue::Bytea(vec![].into())), Some(b"\\x".to_vec()));
     }
 
     #[test]
@@ -5373,9 +5885,9 @@ mod tests {
     #[test]
     fn bytea_binary_encode_is_raw_bytes_and_round_trips() {
         let raw = vec![0x00, 0x01, 0xff, 0x10];
-        let enc = encode_value(1, ColumnType::Bytea, &SqlValue::Bytea(raw.clone())).unwrap();
+        let enc = encode_value(1, ColumnType::Bytea, &SqlValue::Bytea(raw.clone().into())).unwrap();
         assert_eq!(enc, raw);
-        assert_eq!(decode_param(1, 17, Some(&enc)), SqlValue::Bytea(raw));
+        assert_eq!(decode_param(1, 17, Some(&enc)), SqlValue::Bytea(raw.into()));
     }
 
     #[test]
@@ -5391,10 +5903,13 @@ mod tests {
     fn bytea_text_decode_parses_hex_prefixed() {
         assert_eq!(
             decode_param(0, 17, Some(b"\\xdeadbeef")),
-            SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef])
+            SqlValue::Bytea(vec![0xde, 0xad, 0xbe, 0xef].into())
         );
         // Empty hex.
-        assert_eq!(decode_param(0, 17, Some(b"\\x")), SqlValue::Bytea(vec![]));
+        assert_eq!(
+            decode_param(0, 17, Some(b"\\x")),
+            SqlValue::Bytea(vec![].into())
+        );
     }
 
     #[test]
@@ -5786,7 +6301,7 @@ mod tests {
         let row = &result.rows[0].0;
         assert_eq!(row[0], SqlValue::Int(1));
         assert!(matches!(&row[1], SqlValue::Text(s) if s.contains("ferrosa")));
-        assert_eq!(row[2], SqlValue::Text("myks".to_string()));
+        assert_eq!(row[2], SqlValue::Text("myks".to_string().into()));
     }
 
     /// A COPY payload has no types at all: every field arrives as text and the destination COLUMN
@@ -5797,8 +6312,9 @@ mod tests {
     fn text_has_a_form_for_every_scalar_column_type() {
         use ferrosa_common::CqlValue as C;
         let limits = crate::jsonb_wire::test_limits();
-        let c =
-            |text: &str, ty: &CqlType| value_to_cql(&SqlValue::Text(text.to_string()), ty, &limits);
+        let c = |text: &str, ty: &CqlType| {
+            value_to_cql(&SqlValue::Text(text.to_string().into()), ty, &limits)
+        };
         assert_eq!(c("42", &CqlType::Int).unwrap(), C::Int(42));
         assert_eq!(c("-7", &CqlType::Bigint).unwrap(), C::Bigint(-7));
         assert_eq!(c("5", &CqlType::Smallint).unwrap(), C::Smallint(5));
@@ -5822,7 +6338,7 @@ mod tests {
         );
         assert_eq!(
             c("\\x0a0b", &CqlType::Blob).unwrap(),
-            C::Blob(vec![0x0a, 0x0b])
+            C::Blob(vec![0x0a, 0x0b].into())
         );
         // The decimal text form still works, through the same recursion.
         assert!(c("1.5", &CqlType::Decimal).is_ok());
@@ -5841,7 +6357,7 @@ mod tests {
             ("999.1.1.1", CqlType::Inet),
             ("\\x0", CqlType::Blob),
         ] {
-            let err = value_to_cql(&SqlValue::Text(text.to_string()), &ty, &limits)
+            let err = value_to_cql(&SqlValue::Text(text.to_string().into()), &ty, &limits)
                 .expect_err(&format!("`{text}` into {ty:?} must be refused"));
             assert!(
                 format!("{err:?}").contains("22P02"),
@@ -5857,7 +6373,7 @@ mod tests {
     fn a_column_type_without_a_text_form_is_refused_by_name() {
         let limits = crate::jsonb_wire::test_limits();
         let err = value_to_cql(
-            &SqlValue::Text("2024-01-01".to_string()),
+            &SqlValue::Text("2024-01-01".to_string().into()),
             &CqlType::Timestamp,
             &limits,
         )
@@ -5901,7 +6417,7 @@ mod tests {
                 &crate::jsonb_wire::test_limits()
             )
             .unwrap(),
-            C::Text("x".to_string())
+            C::Text("x".to_string().into())
         );
         assert_eq!(
             value_to_cql(
@@ -6003,7 +6519,7 @@ mod tests {
     async fn scalar_select_unsupported_function_fails_loud() {
         // An unmodeled function errors (0A000) rather than guessing a value.
         let items = vec![ScalarItem {
-            value: ScalarValue::Func("NOW".into()),
+            value: ScalarValue::Func("CLOCK_TIMESTAMP".into()),
             alias: None,
         }];
         assert!(execute_scalar_select(&items, bare_ctx("ks")).await.is_err());
@@ -6060,14 +6576,18 @@ mod tests {
             // The column is text even though the value is NULL.
             assert_eq!(column_type_oid(result.columns[0].ty), 25, "{sql}");
             assert_eq!(result.rows[0].0[0], SqlValue::Null, "{sql}");
-            assert_ne!(result.rows[0].0[0], SqlValue::Text(String::new()), "{sql}");
+            assert_ne!(
+                result.rows[0].0[0],
+                SqlValue::Text(String::new().into()),
+                "{sql}"
+            );
         }
         // Control: an empty string really is an empty string.
         let items = parsed_scalar_items("SELECT '' || ''");
         let result = execute_scalar_select(&items, bare_ctx("ks"))
             .await
             .expect("evaluate");
-        assert_eq!(result.rows[0].0[0], SqlValue::Text(String::new()));
+        assert_eq!(result.rows[0].0[0], SqlValue::Text(String::new().into()));
     }
 
     #[tokio::test]
@@ -6114,12 +6634,12 @@ mod tests {
             right: Box::new(ScalarValue::Literal(SqlValue::Text("!".into()))),
         };
         assert_eq!(
-            substitute_param(&concat, &[SqlValue::Text("hi".into())]).unwrap(),
+            substitute_param(&concat, &[SqlValue::Text("hi".into())], 0).unwrap(),
             SqlValue::Text("hi!".into())
         );
         // NULL still propagates through the substitution path.
         assert_eq!(
-            substitute_param(&concat, &[SqlValue::Null]).unwrap(),
+            substitute_param(&concat, &[SqlValue::Null], 0).unwrap(),
             SqlValue::Null
         );
     }
@@ -6462,6 +6982,158 @@ mod txn_buffer_tests {
         engine.register_table(kv_storage_schema()).unwrap();
         let schema = schema_with_kv();
         (dir, engine, schema)
+    }
+
+    /// COUNT needs row liveness, not the representation of an unselected cell.
+    /// The same bad cell must still fail when it is actually selected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_count_star_does_not_decode_unselected_payload() {
+        let (_dir, engine, schema) = new_engine_and_schema().await;
+        let table = ferrosa_storage::TableId::new("public", "kv");
+        let key =
+            ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(b"key".to_vec()));
+        engine
+            .write(
+                &table,
+                &key,
+                ferrosa_sstable::types::Row {
+                    clustering: vec![],
+                    cells: vec![(0, ferrosa_common::cell::CellValue::live(vec![0xff], 1000))],
+                    deletion: ferrosa_sstable::types::DeletionTime::LIVE,
+                    primary_key_liveness: ferrosa_sstable::types::LivenessInfo::with_timestamp(
+                        1000,
+                    ),
+                },
+                1000,
+            )
+            .unwrap();
+        for flushed in [false, true] {
+            if flushed {
+                engine.flush_all().unwrap();
+            }
+            let messages = execute_query(
+                &engine,
+                &schema,
+                "SELECT COUNT(*) AS n FROM kv",
+                "public",
+                &crate::jsonb_wire::test_limits(),
+                None,
+            )
+            .await;
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "COUNT decoded payload (flushed={flushed}): {messages:?}"
+            );
+            assert!(messages.iter().any(|m| matches!(m, BackendMessage::DataRow { columns } if columns == &vec![Some(b"1".to_vec())])), "COUNT must return one: {messages:?}");
+            let selected = execute_query(
+                &engine,
+                &schema,
+                "SELECT v FROM kv",
+                "public",
+                &crate::jsonb_wire::test_limits(),
+                None,
+            )
+            .await;
+            assert!(
+                selected
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })),
+                "selected corrupt cell must fail"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn metadata_count_matches_ttl_delete_and_resurrection_visibility() {
+        use ferrosa_common::cell::CellValue;
+        use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row as StoredRow};
+        let cases = [
+            (
+                LivenessInfo::with_ttl(1000, 1, 1),
+                CellValue::expiring(b"v".to_vec(), 1000, 1, 1),
+                DeletionTime::LIVE,
+                0,
+            ),
+            (
+                LivenessInfo::with_ttl(1000, 1, 1),
+                CellValue::live(b"v".to_vec(), 2000),
+                DeletionTime::LIVE,
+                1,
+            ),
+            (
+                LivenessInfo::with_timestamp(1000),
+                CellValue::live(b"v".to_vec(), 1000),
+                DeletionTime::new(3000, 3),
+                0,
+            ),
+            (
+                LivenessInfo::with_timestamp(4000),
+                CellValue::live(b"v".to_vec(), 4000),
+                DeletionTime::new(3000, 3),
+                1,
+            ),
+        ];
+        for (liveness, cell, deletion, expected) in cases {
+            let (_dir, engine, schema) = new_engine_and_schema().await;
+            let table = ferrosa_storage::TableId::new("public", "kv");
+            let key = ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::new(
+                b"key".to_vec(),
+            ));
+            engine
+                .write(
+                    &table,
+                    &key,
+                    StoredRow {
+                        clustering: vec![],
+                        cells: vec![(0, cell)],
+                        deletion,
+                        primary_key_liveness: liveness,
+                    },
+                    4000,
+                )
+                .unwrap();
+            for flushed in [false, true] {
+                if flushed {
+                    engine.flush_all().unwrap();
+                }
+                let selected = execute_query(
+                    &engine,
+                    &schema,
+                    "SELECT k FROM kv",
+                    "public",
+                    &crate::jsonb_wire::test_limits(),
+                    None,
+                )
+                .await;
+                assert!(!selected
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })));
+                assert_eq!(
+                    selected
+                        .iter()
+                        .filter(|m| matches!(m, BackendMessage::DataRow { .. }))
+                        .count(),
+                    expected,
+                    "SELECT liveness oracle"
+                );
+                let counted = execute_query(
+                    &engine,
+                    &schema,
+                    "SELECT COUNT(*) FROM kv",
+                    "public",
+                    &crate::jsonb_wire::test_limits(),
+                    None,
+                )
+                .await;
+                let value = expected.to_string().into_bytes();
+                assert!(counted.iter().any(|m| matches!(m, BackendMessage::DataRow { columns } if columns == &vec![Some(value.clone())])), "visibility mismatch, flushed={flushed}, expected={expected}: {counted:?}");
+                assert!(!counted
+                    .iter()
+                    .any(|m| matches!(m, BackendMessage::ErrorResponse { .. })));
+            }
+        }
     }
 
     /// The Cassandra marshal name a PostgreSQL `numeric`/`decimal` column stores.
@@ -7369,6 +8041,65 @@ mod txn_buffer_tests {
     }
 
     #[tokio::test]
+    async fn spilled_writes_keep_bound_incarnations_and_reject_the_entire_batch() {
+        let (dir, engine, schema) = new_engine_and_schema().await;
+        let old = schema.snapshot().tables[&("public".into(), "kv".into())].clone();
+        let mut keep = old.clone();
+        keep.name = "keep".into();
+        keep.id = uuid::Uuid::new_v4();
+        schema.create_table_internal(keep.clone()).unwrap();
+        engine.register_table(keep.to_storage_schema()).unwrap();
+        let mut buffer = TxnWriteSet::with_threshold(dir.path().join("spill"), 1);
+        let key =
+            ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("key".into())], &[]).unwrap();
+        for meta in [&old, &keep] {
+            let row = ferrosa_row_bridge::build_row(
+                &[(0, CqlValue::Text("pending".into()))],
+                &[],
+                1,
+                None,
+            );
+            buffer
+                .push(PgWrite(
+                    Mutation::new(
+                        meta.keyspace.clone(),
+                        meta.name.clone(),
+                        key.clone(),
+                        vec![row],
+                        1,
+                    ),
+                    meta.id,
+                ))
+                .unwrap();
+        }
+        assert!(buffer.spilled_to_disk());
+        let staged = buffer.into_staged().unwrap();
+        let mut replacement = old.clone();
+        replacement.id = uuid::Uuid::new_v4();
+        schema.replace_table_internal(replacement).unwrap();
+        let mvcc = MvccManager::default();
+        assert!(matches!(
+            commit_mutations(
+                &engine,
+                &schema,
+                &mvcc,
+                &mvcc.snapshot(),
+                &Default::default(),
+                staged
+            ),
+            Err(MvccCommitError::SerializationFailure)
+        ));
+        for name in ["kv", "keep"] {
+            assert!(engine
+                .read(&ferrosa_storage::TableId::new("public", name), &key)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(mvcc.current_commit_seq(), 0);
+        engine.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn a_write_set_past_the_old_write_cap_is_staged_not_refused() {
         // The old `FERROSA_POSTGRES_MAX_TXN_WRITES` / SQLSTATE `53400` refusal is
         // GONE: a write-set larger than the historical cap is ACCEPTED and staged
@@ -7382,7 +8113,10 @@ mod txn_buffer_tests {
         const OLD_PG_WRITE_CAP: usize = 10_000;
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
-        let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
+        let dummy = PgWrite(
+            Mutation::new("public".into(), "kv".into(), key, vec![], 0),
+            schema.snapshot().tables[&("public".into(), "kv".into())].id,
+        );
         for _ in 0..OLD_PG_WRITE_CAP {
             buffer.push(dummy.clone()).expect("stage a buffered write");
         }
@@ -7493,6 +8227,7 @@ mod txn_buffer_tests {
         for seq in 0..4096u32 {
             let sql = format!("INSERT INTO kv (k, v) VALUES ('mvcc-{seq}', '{payload}')");
             let env = ReadEnv {
+                timestamp_micros: wall_clock_micros(),
                 engine: &engine,
                 schema: &schema,
                 default_schema: "public",
@@ -7539,7 +8274,10 @@ mod txn_buffer_tests {
         let mvcc = MvccManager::default();
         let key =
             ferrosa_row_bridge::build_decorated_key(&[CqlValue::Text("x".into())], &[]).unwrap();
-        let dummy = PgWrite(Mutation::new("public".into(), "kv".into(), key, vec![], 0));
+        let dummy = PgWrite(
+            Mutation::new("public".into(), "kv".into(), key, vec![], 0),
+            schema.snapshot().tables[&("public".into(), "kv".into())].id,
+        );
         let mut buffer = TxnWriteSet::default();
         buffer.push(dummy.clone()).expect("stage");
         buffer.push(dummy).expect("stage");
@@ -7547,6 +8285,7 @@ mod txn_buffer_tests {
         let limits = crate::jsonb_wire::test_limits();
         let disabled_cluster_read = crate::ClusterRead::disabled();
         let env = ReadEnv {
+            timestamp_micros: wall_clock_micros(),
             engine: &engine,
             schema: &schema,
             default_schema: "public",
@@ -9399,6 +10138,7 @@ mod scalar_subquery_tests {
         let disabled = crate::ClusterRead::disabled();
         let limits = crate::jsonb_wire::test_limits();
         let env = ReadEnv {
+            timestamp_micros: wall_clock_micros(),
             engine,
             schema,
             default_schema: "public",
@@ -9811,5 +10551,40 @@ mod scalar_subquery_tests {
         );
 
         engine.shutdown().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod timestamp_regression {
+    use super::*;
+
+    #[test]
+    fn timestamptz_codec_has_utc_text_and_postgres_binary_epoch() {
+        assert_eq!(column_type_oid(ColumnType::TimestampTz), 1184);
+        assert_eq!(
+            crate::pg_types::for_column_type(ColumnType::TimestampTz).typlen,
+            8
+        );
+        let value = SqlValue::Timestamp(PG_EPOCH_MICROS + 123);
+        assert_eq!(
+            encode_value(0, ColumnType::TimestampTz, &value)
+                .unwrap()
+                .unwrap(),
+            b"2000-01-01 00:00:00.000123+00"
+        );
+        assert_eq!(
+            encode_value(1, ColumnType::TimestampTz, &value)
+                .unwrap()
+                .unwrap(),
+            123_i64.to_be_bytes()
+        );
+        assert_eq!(
+            decode_param_binary(1184, &123_i64.to_be_bytes()).unwrap(),
+            value
+        );
+        assert_eq!(
+            decode_param_text(1184, b"2000-01-01 02:00:00.000123+02").unwrap(),
+            value
+        );
     }
 }

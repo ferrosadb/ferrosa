@@ -1282,11 +1282,24 @@ impl<'input> Parser<'input> {
             self.enter_expr()?;
             let inner = self.parse_unary();
             self.exit_expr();
-            // Negate: wrap as 0 - inner.
+            // Keep signed constants literal for schema inference, byte encoding
+            // and index anchoring; only computed expressions need 0 - inner.
+            let inner = inner?;
+            match &inner {
+                Expr::Literal(Literal::Integer(value)) => {
+                    if let Some(negated) = value.checked_neg() {
+                        return Ok(Expr::Literal(Literal::Integer(negated)));
+                    }
+                }
+                Expr::Literal(Literal::Float(value)) => {
+                    return Ok(Expr::Literal(Literal::Float(-value)))
+                }
+                _ => {}
+            }
             Ok(Expr::Arithmetic {
                 left: Box::new(Expr::Literal(Literal::Integer(0))),
                 op: ArithOp::Sub,
-                right: Box::new(inner?),
+                right: Box::new(inner),
             })
         } else {
             self.parse_postfix()

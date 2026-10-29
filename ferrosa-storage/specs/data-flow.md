@@ -135,3 +135,20 @@ moves spans and their original validation indices with cell identities. The publ
 metadata cursor still validates spans eagerly. Large-cell, exact-tie, remapping,
 and corrupt losing/dropped-value tests cover this path alongside fully decoding
 output verification.
+
+
+### Recovery admission flow (2026-10-26)
+
+Retain WAL frame -> apply rows -> on rejection set live incomplete latch ->
+atomically fsync bounded per-table summary -> write and fsync existing forensic
+quarantine. Any recording/quarantine failure returns an error before checkpoint
+eligibility; startup leaves original/relogged WAL, explicit/deferred replay keeps
+unfinished items queued, and set-aside retains its original file. Valid survivors
+remain available. Successful quarantine still leaves permanent incomplete status.
+
+Flush consults the live latch, durable summary, and pending replay ownership
+before advancing the table checkpoint. Offline migration separately calls
+`assert_table_recovery_complete` after quiescing Direct access and draining replay;
+the check includes legacy quarantine and pending artifacts. No second WAL recovery
+implementation or row-history cache is introduced, and no admission check can
+recover history old binaries already discarded without observable evidence.
