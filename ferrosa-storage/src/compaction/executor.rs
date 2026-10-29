@@ -1338,7 +1338,10 @@ impl CompactionExecutor {
             cancel_point!(&pool_table_key, CancelPoint::InputOpen);
             cancel.check().map_err(|c| c.to_string())?;
             let gen = &input.id;
-            let dir = &input.path;
+            // A flushed input restored from S3 lives in `<table>/<gen>/` while
+            // still registered with its table dir; read it where it is.
+            let generation_dir = crate::flush::generation_files_dir(&input.path, gen);
+            let dir = generation_dir.as_path();
 
             let data_path = dir.join(format!("{gen}-Data.db"));
             let data_file_size = ensure_compaction_component(&data_path, true, true)?
@@ -2821,6 +2824,49 @@ mod tests {
             "Compaction must FAIL when an input Data.db is missing. \
              Silent skip + swap = data loss."
         );
+    }
+
+    /// A flushed input registered with its table dir but restored from S3
+    /// into `<table>/<gen>/` (the hot-table restore after an eviction) must
+    /// be compacted from where its files are, not refused as missing.
+    #[test]
+    fn compaction_reads_an_input_restored_into_its_own_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let schema = test_schema_with_columns();
+        let table_dir = tmp.path().join("ks.t");
+        std::fs::create_dir_all(&table_dir).unwrap();
+        let partitions: Vec<_> = (0..3)
+            .map(|i| make_test_partition(&format!("key_{i}"), "value", 1000))
+            .collect();
+        let meta = write_sstable_to_dir(&table_dir, &partitions, &schema);
+
+        let nested = table_dir.join(&meta.id);
+        std::fs::create_dir(&nested).unwrap();
+        let prefix = format!("{}-", meta.id);
+        let mut moved = 0;
+        for entry in std::fs::read_dir(&table_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with(&prefix) {
+                std::fs::rename(entry.path(), nested.join(&name)).unwrap();
+                moved += 1;
+            }
+        }
+        assert!(moved >= 4, "fixture must move the required components");
+        assert_eq!(meta.path, table_dir, "the input stays registered flat");
+
+        let output_dir = tmp.path().join("output");
+        std::fs::create_dir_all(&output_dir).unwrap();
+        let task = CompactionTask {
+            inputs: vec![meta],
+            output_dir,
+            schema,
+            table_id: test_table_id(),
+            purge: None,
+        };
+        let result = CompactionExecutor::execute_task(&task)
+            .expect("an input restored into <table>/<gen>/ must compact");
+        assert_eq!(result.metadata.partition_count, 3);
     }
 
     #[test]
