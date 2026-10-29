@@ -7,6 +7,7 @@ checked: a witness that is renamed, moved, or removed fails the build here.
 import Ferrosa.Unimplemented
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Commons.Hll
+import Ferrosa.Testing.Guarantees
 import Ferrosa.Testing.Histories
 import Ferrosa.Testing.JepsenModels
 import Ferrosa.Testing.Jepsen
@@ -281,3 +282,12 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Testing.Histories.a_write_free_generator_cannot_test_durability
 #check Ferrosa.Testing.Histories.an_ack_before_the_crash_is_a_durability_promise
 #check Ferrosa.Testing.Histories.a_missing_write_after_a_crash_is_only_excusable_if_the_crash_was_logged
+#check Ferrosa.Testing.Guarantees.one_and_all_do_not_share_a_durability_guarantee
+#check Ferrosa.Testing.Guarantees.a_one_and_one_configuration_cannot_report_loss
+#check Ferrosa.Testing.Guarantees.a_quorum_pair_overlaps_on_three_nodes
+#check Ferrosa.Testing.Guarantees.an_all_write_with_a_one_read_still_overlaps
+#check Ferrosa.Testing.Guarantees.a_one_write_with_a_quorum_read_does_not_overlap
+#check Ferrosa.Testing.Guarantees.raising_the_read_level_cannot_remove_a_guarantee
+#check Ferrosa.Testing.Guarantees.a_cross_datacenter_read_defeats_the_overlap
+#check Ferrosa.Testing.Guarantees.a_missing_value_under_one_one_is_not_evidence
+#check Ferrosa.Testing.Guarantees.a_verdict_without_the_profile_is_not_a_verdict

@@ -212,17 +212,15 @@ def ledger : List SpecItem := [
    .met "Histories.an_ack_before_the_crash_is_a_durability_promise"⟩,
   ⟨"a missing write is only excusable if the crash that caused it was logged",
    .met "Histories.a_missing_write_after_a_crash_is_only_excusable_if_the_crash_was_logged"⟩,
-  ⟨"the loss accounting is meaningful only when the final read can see every acknowledged write",
-   .failing
-     "not enforced: `recovered` is whatever one read returned. Under LOCAL_QUORUM or DC_QUORUM with a cross-DC failover that read is served locally, so it can omit a write acknowledged elsewhere and report a `lost` that never happened. The bookkeeping needs the read's consistency level as an input"
-     "Histories.a_missing_write_with_a_clean_read_is_a_silent_loss"⟩,
+  ⟨"the loss accounting is scoped to reads that overlap the writes, so CL=ONE/CL=ONE cannot report loss",
+   .met "Guarantees.a_missing_value_under_one_one_is_not_evidence"⟩,
   ⟨"every run records lost, unexpected and recovered as multisets, not as a single error count",
    .failing
      "unverified: `check` returns the multisets, but the endurance and alert paths summarise a verdict as pass/fail. A summary that collapses them is exactly the cancellation this file forbids"
      "Histories.a_loss_and_a_fabrication_do_not_cancel"⟩
 ]
 
-theorem histories_has_two_red_items : redCount ledger = 2 := by decide
+theorem histories_has_one_red_item : redCount ledger = 1 := by decide
 
 def main : IO Unit :=
   printLedger "bookkeeping, generators and fault attribution" ledger

@@ -62,6 +62,7 @@ import Ferrosa.Commons.FrontEnd
 import Ferrosa.Testing.Jepsen
 import Ferrosa.Testing.JepsenModels
 import Ferrosa.Testing.Histories
+import Ferrosa.Testing.Guarantees
 import Ferrosa.Todo
 import Ferrosa.Broken
 import Ferrosa.Unimplemented

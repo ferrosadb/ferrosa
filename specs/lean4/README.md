@@ -17,7 +17,7 @@ time, no `decide`-by-magic over opaque objects.
 
 ```bash
 cd specs/lean4
-lake build                      # 57 modules, seconds after the toolchain is present
+lake build                      # 58 modules, seconds after the toolchain is present
 lake env lean --run Ferrosa/Accord/RunCheck.lean   # check a real Elle history
 ```
 
@@ -101,7 +101,7 @@ Being explicit about the boundaries keeps the models honest:
 
 ## Status
 
-`lake build` completes over all 57 modules; no `sorry`, no `axiom`, no
+`lake build` completes over all 58 modules; no `sorry`, no `axiom`, no
 dependency outside Lean core. Remaining hygiene step: a `#print axioms` sweep to
 record the same fact as an artifact rather than as an absence of warnings.
 

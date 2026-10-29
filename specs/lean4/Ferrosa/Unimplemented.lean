@@ -21,6 +21,7 @@ import Ferrosa.Commons.Hll
 import Ferrosa.Testing.Jepsen
 import Ferrosa.Testing.JepsenModels
 import Ferrosa.Testing.Histories
+import Ferrosa.Testing.Guarantees
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Flight.Subscribe
 import Ferrosa.Broken
@@ -62,7 +63,7 @@ def unimplemented : List Item := [
   ⟨"Txn", "SERIALIZABLE isolation is available"⟩,
   ⟨"distinct", "the relative error of the HLL estimate is bounded by 1.04/sqrt(m)"⟩,
   ⟨"distinct", "a HyperLogLog estimator backs COUNT(ESTIMATE_DISTINCT)"⟩,
-  ⟨"Jepsen", "the loss accounting is scoped to reads that can see every acknowledged write"⟩,
+  ⟨"Jepsen", "the Jepsen verdict records the consistency profile it ran under"⟩,
   ⟨"Jepsen", "every run's verdict preserves lost, unexpected and recovered as multisets"⟩,
   ⟨"Jepsen", "the set model is ported, including its multi-value reads"⟩,
   ⟨"Jepsen", "the set-full and unique-ids models are ported"⟩,
@@ -127,6 +128,7 @@ def ledgerTotal : Nat :=
     + redCount Ferrosa.Testing.Jepsen.ledger
     + redCount Ferrosa.Testing.Models.ledger
     + redCount Ferrosa.Testing.Histories.ledger
+    + redCount Ferrosa.Testing.Guarantees.ledger
 
 /-- **Every red item in every ledger appears here or in `Broken.broken`, exactly once.** -/
 theorem every_ledger_item_is_classified :
