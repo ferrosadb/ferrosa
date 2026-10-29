@@ -23,6 +23,7 @@
 -/
 import Ferrosa.Core
 import Ferrosa.Ledger
+import Ferrosa.Testing.Guarantees
 
 namespace Ferrosa.Testing.Histories
 
@@ -120,6 +121,77 @@ theorem a_run_without_acknowledged_writes_cannot_lose_anything (r : List Nat) :
 theorem a_run_without_a_final_read_loses_every_acknowledged_write :
     lost ⟨[1, 2], [1, 2], []⟩ = [1, 2] := by decide
 
+/-! ## The verdict, which is a function of the profile -/
+
+/-- Any anomaly at all: something lost or something fabricated. -/
+def anomalous (b : Book) : Bool := !(lost b).isEmpty || !(unexpected b).isEmpty
+
+/-- Why a run could not decide anything. -/
+inductive NotTested where
+  /-- `W + R ≤ RF`: the read need not intersect the write's replica set. -/
+  | readsDoNotOverlapWrites
+  /-- The read may be answered by a datacenter that does not hold the write. -/
+  | crossDatacenterRead
+  deriving DecidableEq, Repr
+
+/-- Three outcomes, not two. Two would force the suite either to over-claim (call an inconclusive run
+    green) or to under-claim (call a semantics consequence a failure). -/
+inductive Verdict where
+  | confirmed
+  | refuted
+  | notTested (why : NotTested)
+  deriving DecidableEq, Repr
+
+/-- **The verdict is a function of `(book, profile)`.** The profile decides whether an anomaly is
+    evidence; the book decides whether there is one. -/
+def verdictFor (p : Guarantees.Profile) (b : Book) : Verdict :=
+  if !Guarantees.readsEveryAckedWrite p then
+    .notTested (if Guarantees.overlap p then .crossDatacenterRead else .readsDoNotOverlapWrites)
+  else if anomalous b then .refuted
+  else .confirmed
+
+/-- **No over-claim**: a run is only ever `confirmed` when its profile could see every acknowledged
+    write. This is the property the suite must have, and it is quantified over every book. -/
+theorem nothing_is_confirmed_that_the_profile_cannot_support
+    (p : Guarantees.Profile) (b : Book) :
+    verdictFor p b = .confirmed → Guarantees.readsEveryAckedWrite p = true := by
+  intro h
+  unfold verdictFor at h
+  split at h
+  · simp at h
+  · rename_i hread
+    split at h
+    · simp at h
+    · simpa using hread
+
+/-- **No under-claim**: when the profile can see every acknowledged write, an anomaly is `refuted`
+    rather than excused. The suite cannot hide a real bug behind a configuration excuse. -/
+theorem nothing_is_excused_that_the_profile_can_convict
+    (p : Guarantees.Profile) (b : Book) (hread : Guarantees.readsEveryAckedWrite p = true)
+    (hanom : anomalous b = true) : verdictFor p b = .refuted := by
+  unfold verdictFor
+  rw [hread, hanom]
+  simp
+
+/-- A run under CL=ONE/CL=ONE on three nodes is not confirmed, however clean the book looks. -/
+theorem a_clean_book_under_one_one_is_not_confirmed :
+    verdictFor (Guarantees.profile 3 .one .one false) ⟨[1], [1], [1]⟩
+      = .notTested .readsDoNotOverlapWrites := by decide
+
+/-- The same book under CL=QUORUM/CL=QUORUM is confirmed. -/
+theorem the_same_clean_book_under_quorum_is_confirmed :
+    verdictFor (Guarantees.profile 3 .quorum .quorum false) ⟨[1], [1], [1]⟩ = .confirmed := by decide
+
+/-- And under CL=ALL/CL=ALL a lost write is refuted, not excused. -/
+theorem a_lost_write_under_all_all_is_refuted :
+    verdictFor (Guarantees.profile 3 .all .all false) ⟨[1, 2], [1, 2], [1]⟩ = .refuted := by decide
+
+/-- A cross-datacenter read is inconclusive even at CL=ALL, and the reason is recorded rather than
+    collapsed into "not tested". -/
+theorem a_cross_datacenter_read_is_inconclusive_at_every_level :
+    verdictFor (Guarantees.profile 3 .all .all true) ⟨[1], [1], [1]⟩
+      = .notTested .crossDatacenterRead := by decide
+
 /-! ## Generators
 
 A generator is a policy over histories, and the policy is part of the claim: a green run excludes
@@ -214,6 +286,8 @@ def ledger : List SpecItem := [
    .met "Histories.a_missing_write_after_a_crash_is_only_excusable_if_the_crash_was_logged"⟩,
   ⟨"the loss accounting is scoped to reads that overlap the writes, so CL=ONE/CL=ONE cannot report loss",
    .met "Guarantees.a_missing_value_under_one_one_is_not_evidence"⟩,
+  ⟨"a verdict never confirms a run whose profile cannot see every acknowledged write",
+   .met "Histories.nothing_is_confirmed_that_the_profile_cannot_support"⟩,
   ⟨"every run records lost, unexpected and recovered as multisets, not as a single error count",
    .failing
      "unverified: `check` returns the multisets, but the endurance and alert paths summarise a verdict as pass/fail. A summary that collapses them is exactly the cancellation this file forbids"

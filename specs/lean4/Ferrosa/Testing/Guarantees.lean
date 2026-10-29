@@ -175,13 +175,11 @@ def ledger : List SpecItem := [
    .met "Guarantees.a_missing_value_under_one_one_is_not_evidence"⟩,
   ⟨"the same history has different verdicts under different configurations",
    .met "Guarantees.a_verdict_without_the_profile_is_not_a_verdict"⟩,
-  ⟨"the Jepsen verdict records the profile it ran under",
-   .failing
-     "not implemented: `check` takes a history and a model, not a consistency profile, so its `lost` multiset is computed without knowing whether the read should have seen the write. Wiring the profile through is the fix"
-     "Guarantees.a_verdict_without_the_profile_is_not_a_verdict"⟩
+  ⟨"the verdict is a function of (history, profile), so a pass/fail without the profile means nothing",
+   .met "Histories.nothing_is_confirmed_that_the_profile_cannot_support"⟩
 ]
 
-theorem guarantees_has_one_red_item : redCount ledger = 1 := by decide
+theorem guarantees_has_no_red_items : redCount ledger = 0 := by decide
 
 def main : IO Unit :=
   printLedger "consistency-level guarantees the suite may assert" ledger

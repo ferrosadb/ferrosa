@@ -301,3 +301,4 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Testing.Guarantees.a_cross_datacenter_read_defeats_the_overlap
 #check Ferrosa.Testing.Guarantees.a_missing_value_under_one_one_is_not_evidence
 #check Ferrosa.Testing.Guarantees.a_verdict_without_the_profile_is_not_a_verdict
+#check Ferrosa.Testing.Histories.nothing_is_confirmed_that_the_profile_cannot_support

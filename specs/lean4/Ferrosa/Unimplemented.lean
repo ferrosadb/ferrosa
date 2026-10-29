@@ -63,7 +63,6 @@ def unimplemented : List Item := [
   ⟨"Txn", "SERIALIZABLE isolation is available"⟩,
   ⟨"distinct", "the relative error of the HLL estimate is bounded by 1.04/sqrt(m)"⟩,
   ⟨"distinct", "a HyperLogLog estimator backs COUNT(ESTIMATE_DISTINCT)"⟩,
-  ⟨"Jepsen", "the Jepsen verdict records the consistency profile it ran under"⟩,
   ⟨"Jepsen", "every run's verdict preserves lost, unexpected and recovered as multisets"⟩,
   ⟨"Jepsen", "the set model is ported, including its multi-value reads"⟩,
   ⟨"Jepsen", "the set-full and unique-ids models are ported"⟩,
@@ -135,7 +134,7 @@ theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
-theorem unimplemented_has_the_right_length : unimplemented.length = 34 := by native_decide
+theorem unimplemented_has_the_right_length : unimplemented.length = 33 := by native_decide
 theorem twelve_are_not_defects : nonDefects.length = 8 := by native_decide
 
 /-- **Live defects now outnumber everything else.**  Thirteen reds against twelve requirements,
