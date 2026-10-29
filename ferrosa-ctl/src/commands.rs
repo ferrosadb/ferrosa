@@ -17,6 +17,7 @@ use ferrosa_cql::client::{CqlClient, QueryResult};
 use ferrosa_cql::error::CqlError;
 use std::io::{BufRead, Read};
 
+pub(crate) mod body;
 pub mod compaction;
 pub mod evicted;
 /// Index health and rebuild (`ferrosa-ctl index ...`). Names the same two
@@ -311,17 +312,12 @@ pub async fn add_node(host: &str, web_port: u16, host_id: &str) -> Result<(), We
         .send()
         .await?;
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        println!("Node {} approved for cluster join.", host_id);
-        if !body.is_empty() {
-            println!("{body}");
-        }
-        Ok(())
+    let mut resp = resp;
+    if resp.status().is_success() {
+        let verdict = format!("Node {host_id} approved for cluster join.");
+        body::print_with_body(&mut resp, &verdict).await
     } else {
-        Err(format!("add-node failed (HTTP {}): {}", status, body).into())
+        Err(body::error_from_body(resp, "add-node failed").await)
     }
 }
 
@@ -353,25 +349,17 @@ pub async fn raft_transfer_leader(
         .send()
         .await?;
 
+    let mut resp = resp;
     let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
     if status.is_success() {
-        println!("Raft leadership transfer to {} initiated.", to_host_id);
-        if !body.is_empty() {
-            println!("{body}");
-        }
-        Ok(())
+        let verdict = format!("Raft leadership transfer to {to_host_id} initiated.");
+        body::print_with_body(&mut resp, &verdict).await
     } else if status.as_u16() == 404 || status.as_u16() == 501 {
-        Err(format!(
-            "raft transfer-leader: server endpoint not yet implemented (HTTP {}). \
-             See specs/in-process/sprint-03-openraft-patches.md (W3.8, W3.9). \
-             Body: {}",
-            status, body
-        )
-        .into())
+        let what = "raft transfer-leader: server endpoint not yet implemented. \
+                    See specs/in-process/sprint-03-openraft-patches.md (W3.8, W3.9)";
+        Err(body::error_from_body(resp, what).await)
     } else {
-        Err(format!("raft transfer-leader failed (HTTP {}): {}", status, body).into())
+        Err(body::error_from_body(resp, "raft transfer-leader failed").await)
     }
 }
 
@@ -443,14 +431,10 @@ pub async fn cluster_downgrade_to_pair(
     let client = reqwest::Client::new();
     let resp = client.post(&url).send().await?;
 
+    let mut resp = resp;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
     if status.is_success() {
-        println!("Node downgraded to pair mode.");
-        if !text.is_empty() {
-            println!("{text}");
-        }
+        body::print_with_body(&mut resp, "Node downgraded to pair mode.").await?;
         // Say plainly what just changed, so the operator is not left thinking
         // this was a routine transition.
         println!(
@@ -458,13 +442,11 @@ pub async fn cluster_downgrade_to_pair(
         );
         Ok(())
     } else if status.as_u16() == 404 {
-        Err(format!(
-            "cluster downgrade-to-pair: server endpoint not wired (HTTP {status}). \
-             The node's binary predates this command. Body: {text}"
-        )
-        .into())
+        let what = "cluster downgrade-to-pair: server endpoint not wired. \
+                    The node's binary predates this command";
+        Err(body::error_from_body(resp, what).await)
     } else {
-        Err(format!("cluster downgrade-to-pair failed (HTTP {status}): {text}").into())
+        Err(body::error_from_body(resp, "cluster downgrade-to-pair failed").await)
     }
 }
 
@@ -485,27 +467,16 @@ pub async fn cluster_add_learner(
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(&body).send().await?;
 
+    let mut resp = resp;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
     if status.is_success() {
-        println!(
-            "Learner {} ({}) added to cluster (owns_tokens={}).",
-            host_id, addr, owns_tokens
-        );
-        if !text.is_empty() {
-            println!("{text}");
-        }
-        Ok(())
+        let verdict =
+            format!("Learner {host_id} ({addr}) added to cluster (owns_tokens={owns_tokens}).");
+        body::print_with_body(&mut resp, &verdict).await
     } else if status.as_u16() == 404 || status.as_u16() == 501 {
-        Err(format!(
-            "cluster add-learner: server endpoint not yet wired (HTTP {status}). \
-             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
-             Body: {text}"
-        )
-        .into())
+        Err(body::error_from_body(resp, &not_wired_w85("add-learner")).await)
     } else {
-        Err(format!("cluster add-learner failed (HTTP {status}): {text}").into())
+        Err(body::error_from_body(resp, "cluster add-learner failed").await)
     }
 }
 
@@ -523,24 +494,15 @@ pub async fn cluster_promote_to_voter(
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(&body).send().await?;
 
+    let mut resp = resp;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
     if status.is_success() {
-        println!("Learner {host_id} promoted to voter.");
-        if !text.is_empty() {
-            println!("{text}");
-        }
-        Ok(())
+        let verdict = format!("Learner {host_id} promoted to voter.");
+        body::print_with_body(&mut resp, &verdict).await
     } else if status.as_u16() == 404 || status.as_u16() == 501 {
-        Err(format!(
-            "cluster promote-to-voter: server endpoint not yet wired (HTTP {status}). \
-             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
-             Body: {text}"
-        )
-        .into())
+        Err(body::error_from_body(resp, &not_wired_w85("promote-to-voter")).await)
     } else {
-        Err(format!("cluster promote-to-voter failed (HTTP {status}): {text}").into())
+        Err(body::error_from_body(resp, "cluster promote-to-voter failed").await)
     }
 }
 
@@ -558,25 +520,24 @@ pub async fn cluster_demote_to_learner(
     let client = reqwest::Client::new();
     let resp = client.post(&url).json(&body).send().await?;
 
+    let mut resp = resp;
     let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
     if status.is_success() {
-        println!("Voter {host_id} demoted to learner.");
-        if !text.is_empty() {
-            println!("{text}");
-        }
-        Ok(())
+        let verdict = format!("Voter {host_id} demoted to learner.");
+        body::print_with_body(&mut resp, &verdict).await
     } else if status.as_u16() == 404 || status.as_u16() == 501 {
-        Err(format!(
-            "cluster demote-to-learner: server endpoint not yet wired (HTTP {status}). \
-             See specs/in-process/sprint-08-learners-endurance.md (W8.5). \
-             Body: {text}"
-        )
-        .into())
+        Err(body::error_from_body(resp, &not_wired_w85("demote-to-learner")).await)
     } else {
-        Err(format!("cluster demote-to-learner failed (HTTP {status}): {text}").into())
+        Err(body::error_from_body(resp, "cluster demote-to-learner failed").await)
     }
+}
+
+/// The error prefix for a W8.5 learner-lifecycle endpoint the node lacks.
+fn not_wired_w85(command: &str) -> String {
+    format!(
+        "cluster {command}: server endpoint not yet wired. \
+         See specs/in-process/sprint-08-learners-endurance.md (W8.5)"
+    )
 }
 
 /// Decommission a node from the cluster.
@@ -596,21 +557,15 @@ pub async fn decommission(
         None => serde_json::json!({}),
     };
 
-    let resp = client.post(&url).json(&body).send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        match host_id {
-            Some(id) => println!("Node {} decommissioned.", id),
-            None => println!("Local node decommissioned."),
-        }
-        if !text.is_empty() {
-            println!("{text}");
-        }
-        Ok(())
+    let mut resp = client.post(&url).json(&body).send().await?;
+    if resp.status().is_success() {
+        let verdict = match host_id {
+            Some(id) => format!("Node {id} decommissioned."),
+            None => "Local node decommissioned.".to_string(),
+        };
+        body::print_with_body(&mut resp, &verdict).await
     } else {
-        Err(format!("decommission failed (HTTP {}): {}", status, text).into())
+        Err(body::error_from_body(resp, "decommission failed").await)
     }
 }
 
@@ -621,60 +576,89 @@ pub async fn ring(host: &str, web_port: u16) -> Result<(), WebError> {
     let url = format!("http://{}:{}/api/cluster/ring", host, web_port);
     let client = reqwest::Client::new();
     let resp = client.get(&url).send().await?;
-    let status = resp.status();
-
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("ring failed (HTTP {}): {}", status, body).into());
+    if !resp.status().is_success() {
+        return Err(body::error_from_body(resp, "ring failed").await);
     }
-
-    let value: serde_json::Value = resp.json().await?;
-
-    // The API is expected to return a JSON array of objects with at least
-    // "host_id", "token", and "status" fields.  We do a best-effort render.
-    if let Some(entries) = value.as_array() {
-        if entries.is_empty() {
-            println!("(ring is empty)");
-            return Ok(());
-        }
-
-        // Collect column names from the union of all keys in the first entry.
-        let columns: Vec<String> = entries
-            .first()
-            .and_then(|v| v.as_object())
-            .map(|obj| obj.keys().cloned().collect())
-            .unwrap_or_default();
-
-        use tabled::builder::Builder;
-        use tabled::settings::Style;
-        let mut builder = Builder::default();
-        builder.push_record(columns.clone());
-
-        for entry in entries {
-            let row: Vec<String> = columns
-                .iter()
-                .map(|col| {
-                    entry
-                        .get(col)
-                        .map(|v| match v {
-                            serde_json::Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_else(|| "NULL".to_string())
-                })
-                .collect();
-            builder.push_record(row);
-        }
-
-        let mut table = builder.build();
-        table.with(Style::sharp());
-        println!("{table}");
-    } else {
-        // If the server returned something other than an array, just pretty-print it.
-        println!("{}", serde_json::to_string_pretty(&value)?);
+    let rows = body::parse_body_with(resp, |reader| {
+        let mut out = std::io::stdout().lock();
+        print_ring_stream(reader, &mut out)
+    })
+    .await?;
+    if rows == 0 {
+        println!("(ring is empty)");
     }
-
     Ok(())
+}
+
+/// Print the ring as it parses, one entry per line, without holding the
+/// response. Columns are the first entry's keys in `serde_json::Map` order
+/// (sorted, as the buffered version printed them); a later entry missing one
+/// shows `NULL`. Returns the entry count.
+///
+/// The API is expected to return a JSON array of objects with at least
+/// `host_id`, `token` and `status`. Anything else is refused: an array of
+/// non-objects would print an empty table that reads as an empty ring.
+fn print_ring_stream(
+    reader: &mut dyn std::io::Read,
+    out: &mut dyn std::io::Write,
+) -> Result<u64, WebError> {
+    use serde::de::{DeserializeSeed, Error as _, SeqAccess, Visitor};
+
+    struct RingRows<'o> {
+        out: &'o mut dyn std::io::Write,
+    }
+
+    impl<'de> Visitor<'de> for RingRows<'_> {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON array of ring entries")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<u64, A::Error> {
+            let mut columns: Option<Vec<String>> = None;
+            let mut rows = 0u64;
+            while let Some(entry) =
+                seq.next_element::<serde_json::Map<String, serde_json::Value>>()?
+            {
+                let columns = columns.get_or_insert_with(|| entry.keys().cloned().collect());
+                if rows == 0 {
+                    writeln!(self.out, "{}", columns.join("  ")).map_err(A::Error::custom)?;
+                }
+                // Cells are written straight out, not joined into a row first.
+                let mut sep = "";
+                let written = columns.iter().try_for_each(|col| {
+                    match entry.get(col) {
+                        Some(serde_json::Value::String(s)) => write!(self.out, "{sep}{s}"),
+                        Some(other) => write!(self.out, "{sep}{other}"),
+                        None => write!(self.out, "{sep}NULL"),
+                    }?;
+                    sep = "  ";
+                    Ok::<(), std::io::Error>(())
+                });
+                written
+                    .and_then(|()| writeln!(self.out))
+                    .map_err(A::Error::custom)?;
+                rows += 1;
+            }
+            Ok(rows)
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for RingRows<'_> {
+        type Value = u64;
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<u64, D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_reader(reader);
+    let rows = RingRows { out }
+        .deserialize(&mut de)
+        .map_err(|e| format!("ring response: {e}"))?;
+    de.end().map_err(|e| format!("ring response: {e}"))?;
+    Ok(rows)
 }
 
 /// Run anti-entropy repair against every peer that replicates `keyspace.table`.
@@ -699,17 +683,12 @@ pub async fn repair(
         .json(&serde_json::json!({}))
         .send()
         .await?;
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        // Pretty-print the JSON summary if we can parse it; otherwise dump raw.
-        match serde_json::from_str::<serde_json::Value>(&body) {
-            Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or(body)),
-            Err(_) => println!("{body}"),
-        }
+    let mut resp = resp;
+    if resp.status().is_success() {
+        body::copy_body(&mut resp, &mut std::io::stdout().lock()).await?;
         Ok(())
     } else {
-        Err(format!("repair failed (HTTP {status}): {body}").into())
+        Err(body::error_from_body(resp, "repair failed").await)
     }
 }
 
@@ -725,17 +704,11 @@ pub async fn rebalance(host: &str, web_port: u16) -> Result<(), WebError> {
         .send()
         .await?;
 
-    let status = resp.status();
-    let body = resp.text().await.unwrap_or_default();
-
-    if status.is_success() {
-        println!("Rebalance initiated.");
-        if !body.is_empty() {
-            println!("{body}");
-        }
-        Ok(())
+    let mut resp = resp;
+    if resp.status().is_success() {
+        body::print_with_body(&mut resp, "Rebalance initiated.").await
     } else {
-        Err(format!("rebalance failed (HTTP {}): {}", status, body).into())
+        Err(body::error_from_body(resp, "rebalance failed").await)
     }
 }
 
@@ -759,42 +732,34 @@ pub async fn snapshot_create(
     if let Some(ttl) = ttl_hours {
         body["ttl_hours"] = serde_json::json!(ttl);
     }
-    let resp = reqwest::Client::new().post(&url).json(&body).send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        println!("Snapshot '{name}' created: {text}");
-        Ok(())
+    let mut resp = reqwest::Client::new().post(&url).json(&body).send().await?;
+    if resp.status().is_success() {
+        body::print_with_body(&mut resp, &format!("Snapshot '{name}' created:")).await
     } else {
-        Err(format!("POST {url}: {status} — {text}").into())
+        Err(body::error_from_body(resp, &format!("POST {url}")).await)
     }
 }
 
 /// List snapshots on the target node.
 pub async fn snapshot_list(host: &str, web_port: u16) -> Result<(), WebError> {
     let url = format!("http://{host}:{web_port}/api/snapshots");
-    let resp = reqwest::Client::new().get(&url).send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        println!("{text}");
+    let mut resp = reqwest::Client::new().get(&url).send().await?;
+    if resp.status().is_success() {
+        body::copy_body(&mut resp, &mut std::io::stdout().lock()).await?;
         Ok(())
     } else {
-        Err(format!("GET {url}: {status} — {text}").into())
+        Err(body::error_from_body(resp, &format!("GET {url}")).await)
     }
 }
 
 /// Delete a snapshot on the target node.
 pub async fn snapshot_delete(host: &str, web_port: u16, name: &str) -> Result<(), WebError> {
     let url = format!("http://{host}:{web_port}/api/snapshots/{name}");
-    let resp = reqwest::Client::new().delete(&url).send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        println!("Snapshot '{name}' deleted.");
-        Ok(())
+    let mut resp = reqwest::Client::new().delete(&url).send().await?;
+    if resp.status().is_success() {
+        body::print_with_body(&mut resp, &format!("Snapshot '{name}' deleted.")).await
     } else {
-        Err(format!("DELETE {url}: {status} — {text}").into())
+        Err(body::error_from_body(resp, &format!("DELETE {url}")).await)
     }
 }
 
@@ -816,14 +781,11 @@ pub async fn restore(
     if let Some(pit) = point_in_time {
         body["point_in_time"] = serde_json::json!(pit);
     }
-    let resp = reqwest::Client::new().post(&url).json(&body).send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if status.is_success() {
-        println!("Restore initiated: {text}");
-        Ok(())
+    let mut resp = reqwest::Client::new().post(&url).json(&body).send().await?;
+    if resp.status().is_success() {
+        body::print_with_body(&mut resp, "Restore initiated:").await
     } else {
-        Err(format!("POST {url}: {status} — {text}").into())
+        Err(body::error_from_body(resp, &format!("POST {url}")).await)
     }
 }
 
@@ -1067,7 +1029,7 @@ async fn fetch_reported_schema_version(
     endpoint: &str,
     username: Option<&str>,
     password: Option<&str>,
-) -> Result<(uuid::Uuid, uuid::Uuid), WebError> {
+) -> Result<(uuid::Uuid, Option<uuid::Uuid>), WebError> {
     let url = format!("http://{endpoint}/admin/membership-snapshot");
     let client = reqwest::Client::new();
     let mut req = client.get(&url);
@@ -1075,21 +1037,42 @@ async fn fetch_reported_schema_version(
         req = req.basic_auth(u, password);
     }
     let resp = req.send().await?;
-    let status = resp.status();
-    let text = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!(
-            "{endpoint} returned HTTP {status}. `/admin/*` is auth-protected: pass \
-             --username (and --password-stdin) for a node with auth enabled. Body: {text}"
-        )
-        .into());
+    if !resp.status().is_success() {
+        let what = format!(
+            "{endpoint}: `/admin/*` is auth-protected; pass --username (and \
+             --password-stdin) to a node with auth enabled"
+        );
+        return Err(body::error_from_body(resp, &what).await);
     }
-    let body: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("{endpoint} returned a non-JSON body: {e}: {text}"))?;
+    let fields: SnapshotFields = body::parse_json_body(resp)
+        .await
+        .map_err(|e| format!("{endpoint} returned an unreadable membership snapshot: {e}"))?;
+    parse_membership_snapshot(endpoint, fields)
+}
+
+/// The two membership-snapshot fields `schema check` reads. Everything else
+/// in the body (maps sized by the cluster) is skipped by the parser.
+#[derive(Debug, Default, serde::Deserialize)]
+struct SnapshotFields {
+    schema_version: Option<serde_json::Value>,
+    reporter_host_id: Option<serde_json::Value>,
+}
+
+/// The schema version and reporter host id from a membership-snapshot body.
+///
+/// The host id only labels the report, so its absence is `None` and prints as
+/// "unknown". A host id that is present but unparsable is an error: it means
+/// the node and this ctl disagree about the shape, and a nil UUID in the
+/// report would read as a real value.
+fn parse_membership_snapshot(
+    endpoint: &str,
+    body: SnapshotFields,
+) -> Result<(uuid::Uuid, Option<uuid::Uuid>), WebError> {
     // A node running an older binary omits this field entirely; say so instead of
     // reporting a parse error, because that is a real and likely operator case.
     let ver = body
-        .get("schema_version")
+        .schema_version
+        .as_ref()
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
             format!(
@@ -1099,11 +1082,17 @@ async fn fetch_reported_schema_version(
         })?;
     let schema_version = uuid::Uuid::parse_str(ver)
         .map_err(|e| format!("{endpoint} reported an unparsable schema_version '{ver}': {e}"))?;
-    let host_id = body
-        .get("reporter_host_id")
-        .and_then(|v| v.as_str())
-        .and_then(|s| uuid::Uuid::parse_str(s).ok())
-        .unwrap_or(uuid::Uuid::nil());
+    let host_id = match &body.reporter_host_id {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => {
+            let text = v
+                .as_str()
+                .ok_or_else(|| format!("{endpoint} reported a non-string reporter_host_id: {v}"))?;
+            Some(uuid::Uuid::parse_str(text).map_err(|e| {
+                format!("{endpoint} reported an unparsable reporter_host_id '{text}': {e}")
+            })?)
+        }
+    };
     Ok((schema_version, host_id))
 }
 
@@ -1153,7 +1142,6 @@ pub async fn schema_check(
     let mut versions: std::collections::BTreeMap<u64, uuid::Uuid> = Default::default();
     let mut labels: std::collections::BTreeMap<u64, (String, Option<uuid::Uuid>)> =
         Default::default();
-    let mut leader_node_id: Option<u64> = None;
 
     for (i, endpoint) in nodes.iter().enumerate() {
         let endpoint = endpoint.trim();
@@ -1164,91 +1152,72 @@ pub async fn schema_check(
         let (schema_version, host_id) =
             fetch_reported_schema_version(endpoint, username, password).await?;
 
-        // Who leads. Best-effort: only used to label the report, never to decide
-        // the outcome, so a missing voter list cannot become a false verdict.
-        if leader_node_id.is_none() {
-            if let Ok(voters) = fetch_openraft_voters(endpoint, username, password).await {
-                if !voters.is_empty() {
-                    leader_node_id = Some(node_id);
-                }
-            }
-        }
-
         versions.insert(node_id, schema_version);
-        labels.insert(node_id, (endpoint.to_string(), Some(host_id)));
+        labels.insert(node_id, (endpoint.to_string(), host_id));
     }
 
     if versions.is_empty() {
         return Err("no usable node endpoints were given".into());
     }
 
+    // The comparison needs a reference node. `/admin/membership-snapshot` does
+    // not say who leads, so the reference is the first endpoint given, and
+    // the report says exactly that rather than calling it the leader.
+    let reference = *versions
+        .keys()
+        .next()
+        .expect("versions is non-empty: checked immediately above");
     let state = ReplaySchemaState {
-        leader_node_id: leader_node_id.unwrap_or(1),
+        leader_node_id: reference,
         node_schema_versions: versions.clone(),
     };
 
     // Name the divergent nodes by endpoint, not by a synthetic ordinal: an
     // operator needs the host to act on.
-    let report = |sink: &mut dyn std::io::Write| {
+    let report = |sink: &mut dyn std::io::Write| -> std::io::Result<()> {
         for (id, (ep, host)) in &labels {
-            let _ = writeln!(
+            writeln!(
                 sink,
                 "  node {id}  {ep}  schema_version={}  host_id={}",
                 versions[id],
                 host.map(|h| h.to_string())
                     .unwrap_or_else(|| "unknown".into())
-            );
+            )?;
         }
+        Ok(())
     };
 
     match postcondition(&state) {
         Ok(()) => {
             let v = versions.values().next().copied().unwrap_or_default();
             println!("schema agrees across {} node(s): {v}", versions.len());
-            report(&mut std::io::stdout());
+            report(&mut std::io::stdout())?;
             Ok(())
         }
         Err(e) => {
-            let leader_version = state.node_schema_versions[&state.leader_node_id];
-            let differing = versions.values().filter(|v| **v != leader_version).count();
+            let reference_version = versions[&reference];
+            let differing = versions
+                .values()
+                .filter(|v| **v != reference_version)
+                .count();
+            let reference_ep = &labels[&reference].0;
             eprintln!("schema DIVERGED across {} node(s): {e}", versions.len());
-            report(&mut std::io::stderr());
+            report(&mut std::io::stderr())?;
             eprintln!(
-                "{differing} of {} node(s) differ from the leader. A node holding a stale \
+                "{differing} of {} node(s) differ from node {reference} ({reference_ep}), the \
+                 first endpoint given; which side is stale is for the operator to judge. \
+                 A node holding a stale \
                  schema makes every fresh session's schema-agreement wait time out, even for \
                  a satisfied IF NOT EXISTS -- while the cluster still reports a healthy \
                  voter count. Restore the lagging node and re-check.",
                 versions.len()
             );
-            Err(format!("schema disagreement: {differing} node(s) differ from the leader").into())
+            Err(format!(
+                "schema disagreement: {differing} node(s) differ from node {reference} ({reference_ep})"
+            )
+            .into())
         }
     }
-}
-
-/// Best-effort read of a node's openraft voter list, used only to label which
-/// endpoint is the leader in the report.
-async fn fetch_openraft_voters(
-    endpoint: &str,
-    username: Option<&str>,
-    password: Option<&str>,
-) -> Result<Vec<String>, WebError> {
-    let url = format!("http://{endpoint}/admin/membership-snapshot");
-    let client = reqwest::Client::new();
-    let mut req = client.get(&url);
-    if let Some(u) = username {
-        req = req.basic_auth(u, password);
-    }
-    let text = req.send().await?.text().await.unwrap_or_default();
-    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
-    Ok(body
-        .get("openraft_voters")
-        .and_then(|v| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default())
 }
 
 #[cfg(test)]
@@ -1256,6 +1225,58 @@ mod tests {
     use ferrosa_cql::client::{QueryResult, ResultRow};
 
     use super::*;
+
+    #[test]
+    fn ring_prints_each_entry_as_it_parses_with_the_first_entrys_columns() {
+        let body = br#"[{"host_id":"a","status":"UP","token":1},{"host_id":"b","status":"DOWN"}]"#;
+        let mut out = Vec::new();
+        let rows = print_ring_stream(&mut body.as_slice(), &mut out).unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "host_id  status  token\na  UP  1\nb  DOWN  NULL\n"
+        );
+    }
+
+    /// An array of non-objects would otherwise print as an empty ring.
+    #[test]
+    fn ring_refuses_an_entry_that_is_not_an_object() {
+        let mut out = Vec::new();
+        let err = print_ring_stream(&mut br#"[{"host_id":"a"}, 7]"#.as_slice(), &mut out)
+            .expect_err("a non-object entry is refused");
+        assert!(err.to_string().starts_with("ring response:"), "{err}");
+    }
+
+    #[test]
+    fn ring_refuses_trailing_garbage_after_the_array() {
+        let err = print_ring_stream(&mut b"[] x".as_slice(), &mut Vec::new())
+            .expect_err("trailing bytes are refused");
+        assert!(err.to_string().starts_with("ring response:"), "{err}");
+    }
+
+    const VER: &str = "6f1c1a52-6a7b-4d1e-9a2b-0c1d2e3f4a5b";
+
+    #[test]
+    fn snapshot_without_a_host_id_reports_it_unknown_not_nil() {
+        let body = serde_json::from_value(serde_json::json!({ "schema_version": VER })).unwrap();
+        let (_ver, host) = parse_membership_snapshot("n1:9090", body).unwrap();
+        assert_eq!(host, None, "an absent host id is unknown, not the nil UUID");
+    }
+
+    #[test]
+    fn snapshot_with_an_unparsable_host_id_is_refused_by_name() {
+        let body = serde_json::from_value(
+            serde_json::json!({ "schema_version": VER, "reporter_host_id": "not-a-uuid" }),
+        )
+        .unwrap();
+        let err = parse_membership_snapshot("n1:9090", body)
+            .expect_err("a garbage host id must not become a nil UUID");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("reporter_host_id") && msg.contains("n1:9090"),
+            "{msg}"
+        );
+    }
 
     /// W1.11: `ferrosa-ctl raft reset` clears a stopped node's persisted
     /// Raft state (log + meta), enabling recovery from the runaway-term

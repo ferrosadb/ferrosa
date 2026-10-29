@@ -76,6 +76,9 @@ pub struct GenInspect {
     pub reachable_partitions: Option<u64>,
     pub data_extent_ok: Option<bool>,
     pub data_extent_error: Option<String>,
+    /// Why the reader could not be opened, when it could not. Every field
+    /// the reader would have filled is `None` in that case.
+    pub open_error: Option<String>,
     pub min_timestamp: Option<i64>,
     pub max_timestamp: Option<i64>,
     pub components: Vec<ComponentInfo>,
@@ -223,18 +226,22 @@ pub fn inspect_report(table_dir: &Path, gen: u64) -> Result<GenInspect, CtlError
     let mut data_extent_error = None;
     let mut min_timestamp = None;
     let mut max_timestamp = None;
-    if let Ok(reader) = open_reader(&dir, gen) {
-        index_partitions = Some(reader.key_count());
-        reachable_partitions = Some(reader.walkable_partition_count());
-        match reader.validate_data_extent() {
-            Ok(()) => data_extent_ok = Some(true),
-            Err(e) => {
-                data_extent_ok = Some(false);
-                data_extent_error = Some(e.to_string());
+    let mut open_error = None;
+    match open_reader(&dir, gen) {
+        Err(e) => open_error = Some(e.to_string()),
+        Ok(reader) => {
+            index_partitions = Some(reader.key_count());
+            reachable_partitions = Some(reader.walkable_partition_count());
+            match reader.validate_data_extent() {
+                Ok(()) => data_extent_ok = Some(true),
+                Err(e) => {
+                    data_extent_ok = Some(false);
+                    data_extent_error = Some(e.to_string());
+                }
             }
+            min_timestamp = Some(reader.header().min_timestamp);
+            max_timestamp = Some(reader.header().max_timestamp);
         }
-        min_timestamp = Some(reader.header().min_timestamp);
-        max_timestamp = Some(reader.header().max_timestamp);
     }
 
     let components = COMPONENTS
@@ -257,6 +264,7 @@ pub fn inspect_report(table_dir: &Path, gen: u64) -> Result<GenInspect, CtlError
         reachable_partitions,
         data_extent_ok,
         data_extent_error,
+        open_error,
         min_timestamp,
         max_timestamp,
         components,
@@ -314,6 +322,9 @@ fn print_inspect(r: &GenInspect) {
         (Some(true), _) => println!("  data extent:        ok"),
         (Some(false), Some(e)) => println!("  data extent:        FAIL — {e}"),
         _ => println!("  data extent:        unknown (did not open)"),
+    }
+    if let Some(e) = &r.open_error {
+        println!("  open error:         {e}");
     }
     println!(
         "  timestamps:         min={} max={}",
@@ -490,6 +501,14 @@ pub struct GenSalvage {
     pub partitions_failed: u64,
     pub rows_recovered: u64,
     pub static_rows_recovered: u64,
+    /// Why the generation could not be opened or salvaged; its counts are
+    /// zero (or partial) because of it, not because nothing is recoverable.
+    pub error: Option<String>,
+    /// Where the partition walk stopped before EOF; later partitions were
+    /// not attempted, so the counts are a floor.
+    pub walk_stopped: Option<String>,
+    /// Why the first partially recovered partition stopped.
+    pub first_partial: Option<String>,
 }
 
 /// Measure recoverable rows across every generation in `table_dir` (and, when
@@ -529,17 +548,25 @@ fn measure_salvage_dir(dir: &Path, location: &str, out: &mut Vec<GenSalvage>) {
             partitions_failed: 0,
             rows_recovered: 0,
             static_rows_recovered: 0,
+            error: None,
+            walk_stopped: None,
+            first_partial: None,
         };
         // salvage with a no-op sink — bounded memory, we only want the stats.
-        if let Ok(reader) = open_reader(dir, gen) {
-            if let Ok(stats) = reader.salvage(|_p| {}) {
+        let stats = open_reader(dir, gen).and_then(|reader| Ok(reader.salvage(|_, _, _| {})?));
+        match stats {
+            Ok(stats) => {
                 entry.partitions_total = stats.partitions_total;
                 entry.partitions_complete = stats.partitions_complete;
                 entry.partitions_partial = stats.partitions_partial;
                 entry.partitions_failed = stats.partitions_failed;
                 entry.rows_recovered = stats.rows_recovered;
                 entry.static_rows_recovered = stats.static_rows_recovered;
+                entry.walk_stopped = stats.walk_stopped;
+                entry.first_partial = stats.first_partial;
+                entry.error = stats.first_failure;
             }
+            Err(e) => entry.error = Some(e.to_string()),
         }
         out.push(entry);
     }
@@ -583,6 +610,19 @@ fn print_salvage_table(reports: &[GenSalvage]) {
     let mut table = builder.build();
     table.with(Style::sharp());
     println!("{table}");
+    // Zero counts for a generation that could not be measured are not "nothing
+    // recoverable"; say which ones and why.
+    for r in reports {
+        if let Some(e) = &r.error {
+            println!("gen {} ({}): {e}", r.gen, r.location);
+        }
+        if let Some(why) = &r.walk_stopped {
+            println!("gen {} ({}): COUNTS ARE A FLOOR — {why}", r.gen, r.location);
+        }
+        if let Some(why) = &r.first_partial {
+            println!("gen {} ({}): first partial: {why}", r.gen, r.location);
+        }
+    }
 }
 
 fn print_salvage_summary(reports: &[GenSalvage], table_dir: &Path) {
@@ -1004,24 +1044,59 @@ pub struct RowInsert {
     pub values: Vec<Option<Vec<u8>>>,
     /// `USING TIMESTAMP` to apply, or `None` to let the server assign.
     pub timestamp: Option<i64>,
+    /// Fixed-width cells dropped for a wrong value length.
+    pub dropped_cells: u32,
 }
 
-/// Reconstruct an INSERT for one salvaged row. Returns `None` when there is no
-/// live regular cell to recover (pure tombstone, or a key-only row), or when
-/// the key/clustering does not split into the expected component count.
+/// Why [`reconstruct_row`] declined a salvaged row. Reingest counts these by
+/// kind, so a skipped row is never just a missing number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum RowSkip {
+    /// The key or clustering does not split into the layout's component count.
+    KeyShape,
+    /// A key component's length does not match its fixed-width type.
+    KeyLength,
+    /// A cell names a column index outside its row kind's header list: the
+    /// row was misread, so none of it can be trusted.
+    UnknownColumn,
+    /// No live cell to recover (tombstones only, or a key-only row).
+    NoLiveCells,
+}
+
+impl std::fmt::Display for RowSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            RowSkip::KeyShape => "key does not split into the table's key columns",
+            RowSkip::KeyLength => "a key component has the wrong length for its type",
+            RowSkip::UnknownColumn => "a cell names a column outside the header",
+            RowSkip::NoLiveCells => "no live cell to recover",
+        })
+    }
+}
+
+/// Reconstruct an INSERT for one salvaged row, or say why not.
+///
+/// A cell's column index counts within its own row kind: the decoder indexes
+/// a static row's cells into `static_columns` and a clustered row's into
+/// `regular_columns`, so `is_static` picks the list. A fixed-width cell whose
+/// length is wrong is dropped and counted in [`RowInsert::dropped_cells`];
+/// the rest of the row is kept.
 fn reconstruct_row(
     layout: &TableLayout,
     header: &SerializationHeader,
     key: &DecoratedKey,
     row: &Row,
-) -> Option<RowInsert> {
+    is_static: bool,
+) -> Result<RowInsert, RowSkip> {
     let pk = ferrosa_cql::bridge::decode_pk(key, layout.partition_key.len());
     if pk.len() != layout.partition_key.len() {
-        return None;
+        return Err(RowSkip::KeyShape);
     }
-    let ck = ferrosa_cql::bridge::decode_clustering(&row.clustering, layout.clustering.len());
-    if ck.len() != layout.clustering.len() {
-        return None;
+    // A static row has no clustering; its key is the partition key alone.
+    let ck_columns: &[String] = if is_static { &[] } else { &layout.clustering };
+    let ck = ferrosa_cql::bridge::decode_clustering(&row.clustering, ck_columns.len());
+    if ck.len() != ck_columns.len() {
+        return Err(RowSkip::KeyShape);
     }
 
     // Reject the whole row if any key component's byte-length doesn't match its
@@ -1030,18 +1105,22 @@ fn reconstruct_row(
     if !key_lengths_valid(&pk, &pk_component_types(&header.key_type))
         || !key_lengths_valid(&ck, &header.clustering_types)
     {
-        return None;
+        return Err(RowSkip::KeyLength);
     }
 
-    let static_count = header.static_columns.len();
-    let mut columns: Vec<String> = Vec::new();
-    let mut values: Vec<Option<Vec<u8>>> = Vec::new();
+    let header_columns = if is_static {
+        &header.static_columns
+    } else {
+        &header.regular_columns
+    };
+    let mut columns: Vec<String> = Vec::with_capacity(pk.len() + ck.len() + row.cells.len());
+    let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(columns.capacity());
 
     for (name, val) in layout.partition_key.iter().zip(pk) {
         columns.push(name.clone());
         values.push(Some(val));
     }
-    for (name, val) in layout.clustering.iter().zip(ck) {
+    for (name, val) in ck_columns.iter().zip(ck) {
         columns.push(name.clone());
         values.push(Some(val));
     }
@@ -1051,43 +1130,38 @@ fn reconstruct_row(
     } else {
         None
     };
-    let mut regular_cells = 0usize;
+    let mut live_cells = 0usize;
+    let mut dropped_cells = 0u32;
     for (col_idx, cell) in &row.cells {
+        let Some((name_bytes, ty)) = header_columns.get(*col_idx as usize) else {
+            return Err(RowSkip::UnknownColumn);
+        };
         // Skip tombstones — a cell with no value is a deletion, not data.
         let Some(value) = &cell.value else { continue };
-        let idx = *col_idx as usize;
-        let column = if idx < static_count {
-            header.static_columns.get(idx)
-        } else {
-            header.regular_columns.get(idx - static_count)
-        };
-        let Some((name_bytes, ty)) = column else {
-            continue;
-        };
-        // Skip a cell whose value byte-length doesn't match its fixed-length
+        // Drop a cell whose value byte-length doesn't match its fixed-length
         // type (drift garbage, or an empty value for a fixed column) — the
         // server would reject it. Variable-length types (text/blob/vector) pass
-        // and are caught by the resilient per-row execute if still invalid.
-        if let Some(n) = value_length_if_fixed(ty) {
-            if value.len() != n {
-                continue;
-            }
+        // and are caught by the per-row execute if still invalid.
+        if value_length_if_fixed(ty).is_some_and(|n| value.len() != n) {
+            dropped_cells += 1;
+            continue;
         }
         columns.push(String::from_utf8_lossy(name_bytes).into_owned());
         values.push(Some(value.to_vec()));
-        regular_cells += 1;
+        live_cells += 1;
         if cell.timestamp != NO_TIMESTAMP {
             timestamp = Some(timestamp.map_or(cell.timestamp, |t| t.max(cell.timestamp)));
         }
     }
 
-    if regular_cells == 0 {
-        return None;
+    if live_cells == 0 {
+        return Err(RowSkip::NoLiveCells);
     }
-    Some(RowInsert {
+    Ok(RowInsert {
         columns,
         values,
         timestamp,
+        dropped_cells,
     })
 }
 
@@ -1270,95 +1344,206 @@ pub async fn sstable_reingest(
         }
     }
 
-    let mut corrupt_gens = 0u64;
-    let mut reconstructed = 0u64;
-    let mut inserted = 0u64;
-    let mut failed = 0u64;
-    let mut prepared: std::collections::HashMap<(String, bool), PreparedStatement> =
-        std::collections::HashMap::new();
-
-    for dir in &dirs {
+    let mut tally = ReingestTally::default();
+    let mut prepared = PreparedCache::default();
+    'gens: for dir in &dirs {
         for gen in StorageEngine::list_generations_in_dir(dir) {
             // Only CORRUPT generations need salvage; healthy ones are already served.
             if StorageEngine::smoke_test_generation(dir, gen).is_ok() {
                 continue;
             }
+            tally.corrupt_gens += 1;
             let reader = match open_reader(dir, gen) {
                 Ok(r) => r,
-                Err(_) => continue,
-            };
-            corrupt_gens += 1;
-            let header = reader.header().clone();
-            let mut row_inserts: Vec<RowInsert> = Vec::new();
-            let _ = reader.salvage(|p| {
-                for row in &p.rows {
-                    if let Some(ins) = reconstruct_row(&layout, &header, &p.key, row) {
-                        row_inserts.push(ins);
-                    }
+                Err(e) => {
+                    tally.unsalvageable_gens += 1;
+                    eprintln!(
+                        "gen {gen} ({}): cannot open for salvage: {e}",
+                        dir.display()
+                    );
+                    continue;
                 }
-            });
-            reconstructed += row_inserts.len() as u64;
-            if apply {
-                for ins in &row_inserts {
-                    if let Some(cap) = limit {
-                        if inserted >= cap {
-                            break;
-                        }
+            };
+            let (mut rows, worker) = spawn_generation_salvage(reader, layout.clone());
+            while let Some(item) = rows.recv().await {
+                let ins = match item {
+                    Ok(ins) => ins,
+                    Err(skip) => {
+                        *tally.skipped.entry(skip).or_default() += 1;
+                        continue;
                     }
-                    // Resilient: a single row the server rejects (e.g. a
-                    // variable-length cell that is still drift garbage) must not
-                    // abort recovery of the rest. Skip it and keep going.
-                    match execute_row_insert(&mut client, &keyspace, &table, ins, &mut prepared)
-                        .await
-                    {
-                        Ok(()) => inserted += 1,
-                        Err(_) => failed += 1,
-                    }
+                };
+                tally.reconstructed += 1;
+                tally.dropped_cells += u64::from(ins.dropped_cells);
+                if !apply {
+                    continue;
+                }
+                if limit.is_some_and(|cap| tally.inserted >= cap) {
+                    break;
+                }
+                // A single row the server rejects (e.g. a variable-length cell
+                // that is still drift garbage) must not abort recovery of the
+                // rest: count it, show why, keep going.
+                match execute_row_insert(&mut client, &keyspace, &table, ins, &mut prepared).await {
+                    Ok(()) => tally.inserted += 1,
+                    Err(e) => tally.reject(gen, &e),
                 }
             }
-        }
-        if let Some(cap) = limit {
-            if inserted >= cap {
-                break;
+            // Closing the receiver tells a still-running salvage to stop
+            // reconstructing rows nobody will read.
+            drop(rows);
+            match worker.await {
+                Ok(Ok(stats)) => {
+                    // Rows past where salvage stopped were never offered; a
+                    // count that silently stops there would read as complete.
+                    let reasons = [
+                        &stats.walk_stopped,
+                        &stats.first_partial,
+                        &stats.first_failure,
+                    ];
+                    for why in reasons.into_iter().flatten() {
+                        eprintln!("gen {gen} ({}): {why}", dir.display());
+                    }
+                    if stats.walk_stopped.is_some() {
+                        tally.unsalvageable_gens += 1;
+                    }
+                }
+                Ok(Err(e)) => {
+                    tally.unsalvageable_gens += 1;
+                    eprintln!("gen {gen} ({}): salvage stopped: {e}", dir.display());
+                }
+                Err(e) => return Err(format!("gen {gen}: salvage task failed: {e}").into()),
+            }
+            if apply && limit.is_some_and(|cap| tally.inserted >= cap) {
+                break 'gens;
             }
         }
     }
 
-    if apply {
-        println!(
-            "{}.{}: re-ingested {inserted} row(s) from {corrupt_gens} corrupt generation(s) \
-             via the live write path ({failed} row(s) skipped as unrecoverable).",
-            keyspace, table
-        );
-    } else {
-        println!(
-            "{}.{}: DRY RUN — {reconstructed} row(s) reconstructable from {corrupt_gens} corrupt \
-             generation(s) would be re-ingested. PK={:?} CK={:?}. Re-run with --apply to write \
-             (data goes through the fixed writer + RF replication).",
-            keyspace, table, layout.partition_key, layout.clustering
-        );
+    tally.print(&keyspace, &table, apply, &layout);
+    if tally.unsalvageable_gens > 0 {
+        return Err(format!(
+            "{} of {} corrupt generation(s) could not be salvaged; the counts above are incomplete",
+            tally.unsalvageable_gens, tally.corrupt_gens
+        )
+        .into());
     }
     Ok(())
 }
 
-/// Prepare (cached) and execute one reconstructed row's INSERT.
+/// Rows in flight between the salvage thread and the inserter. Bounds memory
+/// regardless of generation size, and blocks salvage while inserts catch up.
+const REINGEST_CHANNEL_ROWS: usize = 256;
+
+/// Rejected inserts printed individually before the rest are only counted.
+const REINGEST_REJECTS_SHOWN: u64 = 20;
+
+/// Salvage one generation on a blocking thread, streaming each reconstructed
+/// row (or the reason it was skipped) through a bounded channel. The salvage
+/// result, including a failure partway through, comes back on the handle.
+fn spawn_generation_salvage(
+    reader: SSTableReader<FileReadAt>,
+    layout: TableLayout,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<RowInsert, RowSkip>>,
+    tokio::task::JoinHandle<ferrosa_common::Result<ferrosa_sstable::reader::SalvageStats>>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::channel(REINGEST_CHANNEL_ROWS);
+    let worker = tokio::task::spawn_blocking(move || {
+        let header = reader.header().clone();
+        // Salvage hands over one recovered row at a time from a reused
+        // buffer; each is reconstructed and sent, never collected.
+        reader.salvage(|key, row, is_static| {
+            // A send fails only when the inserter hung up (limit reached);
+            // the receiver is then closed and this check skips the rest.
+            if !tx.is_closed() {
+                let delivered = tx
+                    .blocking_send(reconstruct_row(&layout, &header, key, row, is_static))
+                    .is_ok();
+                debug_assert!(delivered || tx.is_closed());
+            }
+        })
+    });
+    (rx, worker)
+}
+
+/// What `reingest` did, for the closing summary.
+#[derive(Default)]
+struct ReingestTally {
+    corrupt_gens: u64,
+    unsalvageable_gens: u64,
+    reconstructed: u64,
+    inserted: u64,
+    rejected: u64,
+    dropped_cells: u64,
+    skipped: std::collections::BTreeMap<RowSkip, u64>,
+}
+
+impl ReingestTally {
+    fn reject(&mut self, gen: u64, e: &CtlError) {
+        self.rejected += 1;
+        if self.rejected <= REINGEST_REJECTS_SHOWN {
+            eprintln!("gen {gen}: insert rejected: {e}");
+        } else if self.rejected == REINGEST_REJECTS_SHOWN + 1 {
+            eprintln!("(further rejected inserts are counted, not shown)");
+        }
+    }
+
+    fn print(&self, keyspace: &str, table: &str, apply: bool, layout: &TableLayout) {
+        if apply {
+            println!(
+                "{keyspace}.{table}: re-ingested {} row(s) from {} corrupt generation(s) via the \
+                 live write path; {} rejected by the server.",
+                self.inserted, self.corrupt_gens, self.rejected
+            );
+        } else {
+            println!(
+                "{keyspace}.{table}: DRY RUN — {} row(s) reconstructable from {} corrupt \
+                 generation(s) would be re-ingested. PK={:?} CK={:?}. Re-run with --apply to \
+                 write (data goes through the fixed writer + RF replication).",
+                self.reconstructed, self.corrupt_gens, layout.partition_key, layout.clustering
+            );
+        }
+        for (skip, n) in &self.skipped {
+            println!("  skipped {n} row(s): {skip}");
+        }
+        if self.dropped_cells > 0 {
+            println!(
+                "  dropped {} fixed-width cell(s) with a wrong value length",
+                self.dropped_cells
+            );
+        }
+    }
+}
+
+/// Prepared INSERTs keyed by column list, one map per `USING TIMESTAMP`
+/// variant. Looked up by `&[String]`, so a cache hit allocates nothing.
+#[derive(Default)]
+struct PreparedCache {
+    by_columns: [std::collections::HashMap<Vec<String>, PreparedStatement>; 2],
+}
+
+/// Prepare (cached) and execute one reconstructed row's INSERT. Takes the row
+/// by value so its values bind without a copy.
 async fn execute_row_insert(
     client: &mut CqlClient,
     keyspace: &str,
     table: &str,
-    ins: &RowInsert,
-    cache: &mut std::collections::HashMap<(String, bool), PreparedStatement>,
+    ins: RowInsert,
+    cache: &mut PreparedCache,
 ) -> Result<(), CtlError> {
     let with_ts = ins.timestamp.is_some();
-    let key = (ins.columns.join(","), with_ts);
-    if !cache.contains_key(&key) {
+    let statements = &mut cache.by_columns[usize::from(with_ts)];
+    if !statements.contains_key(ins.columns.as_slice()) {
         let cql = insert_cql(keyspace, table, &ins.columns, with_ts);
         let stmt = client.prepare(&cql).await?;
-        cache.insert(key.clone(), stmt);
+        statements.insert(ins.columns.clone(), stmt);
     }
-    let stmt = cache.get(&key).expect("just inserted");
+    let stmt = statements
+        .get(ins.columns.as_slice())
+        .expect("inserted immediately above when absent");
 
-    let mut values = ins.values.clone();
+    let mut values = ins.values;
     if let Some(ts) = ins.timestamp {
         // USING TIMESTAMP ? binds a bigint (8-byte big-endian) in the final slot.
         values.push(Some(ts.to_be_bytes().to_vec()));
@@ -1375,9 +1560,6 @@ async fn execute_row_insert(
 /// layout. **Dry-run by default** — `apply` performs the deletes. Only corrupt
 /// generations are touched; healthy ones are never deleted.
 pub async fn sstable_s3_clean(table_dir: &Path, apply: bool) -> Result<(), CtlError> {
-    use futures::StreamExt;
-    use object_store::ObjectStore;
-
     if !table_dir.is_dir() {
         return Err(format!("not a directory: {}", table_dir.display()).into());
     }
@@ -1403,46 +1585,61 @@ pub async fn sstable_s3_clean(table_dir: &Path, apply: bool) -> Result<(), CtlEr
         }
     }
 
-    let mut listed = 0usize;
-    let mut deleted = 0usize;
+    let mut objects = 0usize;
     for gen in &gens {
         let hex = ferrosa_storage::upload::hex_prefix_for(&gen.to_string());
         let prefix =
             object_store::path::Path::from(format!("{}/{hex}/{table_id}/{gen}", config.prefix));
-        let mut stream = store.list(Some(&prefix));
-        let mut keys = Vec::new();
-        while let Some(item) = stream.next().await {
-            let meta = item.map_err(|e| format!("list under {prefix}: {e}"))?;
-            keys.push(meta.location);
-        }
-        listed += keys.len();
-        if apply {
-            for k in &keys {
-                store
-                    .delete(k)
-                    .await
-                    .map_err(|e| format!("delete {k}: {e}"))?;
-                deleted += 1;
-            }
-        }
+        objects += clean_generation_objects(store.as_ref(), &prefix, apply).await?;
     }
 
     if apply {
         println!(
-            "{table_id}: deleted {deleted} S3 object(s) across {} corrupt generation(s) under \
+            "{table_id}: deleted {objects} S3 object(s) across {} corrupt generation(s) under \
              prefix '{}/' — they will not be re-downloaded on cold restart.",
             gens.len(),
             config.prefix
         );
     } else {
         println!(
-            "{table_id}: DRY RUN — would delete {listed} S3 object(s) across {} corrupt \
+            "{table_id}: DRY RUN — would delete {objects} S3 object(s) across {} corrupt \
              generation(s) under '{}/.../{table_id}/'. Re-run with --apply.",
             gens.len(),
             config.prefix
         );
     }
     Ok(())
+}
+
+/// Count, and with `apply` delete, every object under one generation's prefix.
+///
+/// Streams: the listing feeds `delete_stream` directly (object_store's own
+/// list-then-delete idiom, which batches deletes on S3), so no key list is
+/// held whatever the generation's object count. Prefixes match by path
+/// segment, so generation `12` never reaches `123`. The first list or delete
+/// error stops the clean and is returned with the prefix; the count says how
+/// far it got only on success.
+async fn clean_generation_objects(
+    store: &dyn object_store::ObjectStore,
+    prefix: &object_store::path::Path,
+    apply: bool,
+) -> Result<usize, CtlError> {
+    use futures::{StreamExt as _, TryStreamExt as _};
+    let listed = store.list(Some(prefix));
+    let count = if apply {
+        let locations = listed.map_ok(|meta| meta.location).boxed();
+        store
+            .delete_stream(locations)
+            .try_fold(0usize, |n, _| async move { Ok(n + 1) })
+            .await
+            .map_err(|e| format!("clean under {prefix}: {e}"))?
+    } else {
+        listed
+            .try_fold(0usize, |n, _| async move { Ok(n + 1) })
+            .await
+            .map_err(|e| format!("list under {prefix}: {e}"))?
+    };
+    Ok(count)
 }
 
 // ── shared helpers ──────────────────────────────────────────────────────────────
@@ -1545,12 +1742,19 @@ fn open_reader(dir: &Path, gen: u64) -> Result<SSTableReader<FileReadAt>, CtlErr
     Ok(reader)
 }
 
-/// Length of one component file, or `None` if absent.
+/// Length of one component file, or `None` if absent. A stat that fails for
+/// any reason other than absence is warned about by path, so an unreadable
+/// component is not reported as a missing one without a trace.
 fn component_len(dir: &Path, gen: u64, name: &str) -> Option<u64> {
-    let gdir = resolve_gen_dir(dir, gen)?;
-    std::fs::metadata(gdir.join(format!("{gen}-{name}")))
-        .ok()
-        .map(|m| m.len())
+    let path = resolve_gen_dir(dir, gen)?.join(format!("{gen}-{name}"));
+    match std::fs::metadata(&path) {
+        Ok(m) => Some(m.len()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("warning: cannot stat {}: {e}", path.display());
+            None
+        }
+    }
 }
 
 /// Presence/size of one component file.
@@ -1692,6 +1896,137 @@ mod tests {
             err.to_string().contains("Filter.db"),
             "the error names the component: {err}"
         );
+    }
+
+    async fn put_objects(store: &dyn object_store::ObjectStore, keys: &[&str]) {
+        for k in keys {
+            store
+                .put(&object_store::path::Path::from(*k), b"x".to_vec().into())
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn count_under(store: &dyn object_store::ObjectStore, prefix: &str) -> usize {
+        use futures::TryStreamExt as _;
+        store
+            .list(Some(&object_store::path::Path::from(prefix)))
+            .try_fold(0usize, |n, _| async move { Ok(n + 1) })
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn s3_clean_dry_run_counts_one_generation_and_deletes_nothing() {
+        let store = object_store::memory::InMemory::new();
+        put_objects(
+            &store,
+            &[
+                "p/ab/ks.t/12/12-Data.db",
+                "p/ab/ks.t/12/12-Index.db",
+                "p/ab/ks.t/123/123-Data.db",
+            ],
+        )
+        .await;
+
+        let n = clean_generation_objects(&store, &"p/ab/ks.t/12".into(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 2, "only generation 12's objects, not 123's");
+        assert_eq!(
+            count_under(&store, "p").await,
+            3,
+            "a dry run deletes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_clean_apply_deletes_exactly_that_generation() {
+        let store = object_store::memory::InMemory::new();
+        put_objects(
+            &store,
+            &[
+                "p/ab/ks.t/12/12-Data.db",
+                "p/ab/ks.t/12/12-Index.db",
+                "p/ab/ks.t/123/123-Data.db",
+            ],
+        )
+        .await;
+
+        let n = clean_generation_objects(&store, &"p/ab/ks.t/12".into(), true)
+            .await
+            .unwrap();
+
+        assert_eq!(n, 2);
+        assert_eq!(count_under(&store, "p/ab/ks.t/12").await, 0);
+        assert_eq!(
+            count_under(&store, "p/ab/ks.t/123").await,
+            1,
+            "a sibling generation whose number shares the prefix survives"
+        );
+    }
+
+    /// Salvage streams a generation's rows through the bounded channel and
+    /// reports its own result on the handle.
+    #[tokio::test]
+    async fn salvage_streams_reconstructed_rows_and_reports_its_result() {
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(2);
+        let gen = StorageEngine::list_generations_in_dir(&table_dir)[0];
+        let reader = open_reader(&table_dir, gen).unwrap();
+        let layout = TableLayout {
+            keyspace: "test_ks".into(),
+            table: "test_table".into(),
+            partition_key: vec!["pk".into()],
+            clustering: vec!["ck".into()],
+        };
+
+        let (mut rx, worker) = spawn_generation_salvage(reader, layout);
+        let mut rows = Vec::new();
+        while let Some(item) = rx.recv().await {
+            rows.push(item.expect("fixture rows reconstruct"));
+        }
+        let stats = worker
+            .await
+            .unwrap()
+            .expect("salvage of a healthy generation");
+
+        assert_eq!(
+            rows.len() as u64,
+            stats.rows_recovered,
+            "every recovered row was sent"
+        );
+        assert_eq!(rows.len(), 1, "one row per fixture generation");
+        assert_eq!(rows[0].columns, vec!["pk", "ck", "val"]);
+    }
+
+    /// A generation that cannot be opened says why in both reports, instead of
+    /// reading as zero recoverable rows or a row of dashes.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_and_salvage_report_why_a_generation_did_not_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (_engine, _dir, table_dir) = table_dir_with_n_generations(1);
+        let gen = StorageEngine::list_generations_in_dir(&table_dir)[0];
+        let gdir = resolve_gen_dir(&table_dir, gen).expect("fixture generation");
+        let filter = gdir.join(format!("{gen}-Filter.db"));
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let inspected = inspect_report(&table_dir, gen);
+        let salvaged = salvage_report(&table_dir, false);
+        std::fs::set_permissions(&filter, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let open_error = inspected
+            .unwrap()
+            .open_error
+            .expect("inspect names the open failure");
+        assert!(open_error.contains("Filter.db"), "{open_error}");
+        let measured = salvaged.unwrap();
+        let error = measured[0]
+            .error
+            .as_deref()
+            .expect("salvage names the open failure");
+        assert!(error.contains("Filter.db"), "{error}");
     }
 
     /// Each row kind indexes its cells into its own column list, so a regular
@@ -2109,7 +2444,7 @@ mod tests {
             primary_key_liveness: LivenessInfo::with_timestamp(1234),
         };
 
-        let ins = reconstruct_row(&layout, &header, &key, &row).expect("row reconstructs");
+        let ins = reconstruct_row(&layout, &header, &key, &row, false).expect("row reconstructs");
         assert_eq!(
             ins.columns,
             vec![
@@ -2134,6 +2469,63 @@ mod tests {
             ins.timestamp,
             Some(1240),
             "uses the max cell timestamp (LWW)"
+        );
+    }
+
+    /// The decoder indexes a clustered row's cells into `regular_columns` and a
+    /// static row's into `static_columns`. Reingest named a clustered row's
+    /// cell 0 as STATIC column 0 whenever the table had static columns, so
+    /// `--apply` wrote a regular value into the static column.
+    #[test]
+    fn reconstruct_row_names_cells_from_the_column_list_of_their_own_row_kind() {
+        let utf8 = "org.apache.cassandra.db.marshal.UTF8Type".to_string();
+        let layout = TableLayout {
+            keyspace: "ks".into(),
+            table: "t".into(),
+            partition_key: vec!["k".into()],
+            clustering: vec![],
+        };
+        let header = SerializationHeader {
+            complex_collections: false,
+            min_timestamp: 0,
+            min_local_deletion_time: i32::MAX,
+            min_ttl: 0,
+            max_timestamp: i64::MAX,
+            key_type: utf8.clone(),
+            clustering_types: vec![],
+            static_columns: vec![(b"s".to_vec(), utf8.clone())],
+            regular_columns: vec![(b"r".to_vec(), utf8)],
+        };
+        let key = DecoratedKey::new(PartitionKey::new(b"k1".to_vec()));
+        let row = Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"v".to_vec(), 7))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::NONE,
+        };
+
+        let regular = reconstruct_row(&layout, &header, &key, &row, false).expect("regular row");
+        let static_ = reconstruct_row(&layout, &header, &key, &row, true).expect("static row");
+
+        assert_eq!(
+            regular.columns,
+            vec!["k", "r"],
+            "a clustered row's cell 0 is `r`"
+        );
+        assert_eq!(
+            static_.columns,
+            vec!["k", "s"],
+            "a static row's cell 0 is `s`"
+        );
+
+        let misread = Row {
+            cells: vec![(1, CellValue::live(b"v".to_vec(), 7))],
+            ..row
+        };
+        assert_eq!(
+            reconstruct_row(&layout, &header, &key, &misread, false),
+            Err(RowSkip::UnknownColumn),
+            "a cell outside the header rejects the row, it is not silently dropped"
         );
     }
 
@@ -2163,8 +2555,9 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1234),
         };
-        assert!(
-            reconstruct_row(&layout, &header, &key, &row).is_none(),
+        assert_eq!(
+            reconstruct_row(&layout, &header, &key, &row, false),
+            Err(RowSkip::NoLiveCells),
             "a tombstone-only row yields no insert"
         );
     }
@@ -2186,8 +2579,9 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(1),
         };
-        assert!(
-            reconstruct_row(&layout, &header, &key, &row).is_none(),
+        assert_eq!(
+            reconstruct_row(&layout, &header, &key, &row, false),
+            Err(RowSkip::KeyLength),
             "a wrong-length UUID key component is rejected (never misfiled)"
         );
     }
@@ -2230,7 +2624,7 @@ mod tests {
             deletion: DeletionTime::LIVE,
             primary_key_liveness: LivenessInfo::with_timestamp(5),
         };
-        let ins = reconstruct_row(&layout, &header, &key, &row).expect("good cell remains");
+        let ins = reconstruct_row(&layout, &header, &key, &row, false).expect("good cell remains");
         assert_eq!(
             ins.columns,
             vec!["tenant_id", "label"],
@@ -2240,6 +2634,7 @@ mod tests {
             ins.values,
             vec![Some(vec![0xAB; 16]), Some(b"hot".to_vec())]
         );
+        assert_eq!(ins.dropped_cells, 1, "the dropped cell is counted");
     }
 
     #[test]
