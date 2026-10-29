@@ -1,0 +1,7 @@
+name = "ferrosaSpecs"
+version = "0.1.0"
+defaultTargets = ["Ferrosa"]
+
+[[lean_lib]]
+name = "Ferrosa"
+globs = ["Ferrosa", "Ferrosa.*"]

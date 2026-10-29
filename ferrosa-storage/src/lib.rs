@@ -18,6 +18,7 @@ pub mod accord;
 pub mod batchlog;
 pub mod cache;
 pub mod commitlog;
+pub mod count;
 pub mod compaction;
 pub mod data_store;
 pub mod engine;

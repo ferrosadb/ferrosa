@@ -20,6 +20,11 @@ pub enum ConsistencyLevel {
     /// Data-center-local serial consistency for lightweight transactions.
     /// Wire code: 0x0009.
     LocalSerial,
+    /// Quorum in the origin datacenter **and** a quorum of datacenters, each reaching its own
+    /// quorum. Ferrosa-specific: Cassandra has no equivalent, so this uses an out-of-band wire code
+    /// and a stock driver rejects it with a protocol error rather than misreading it. New
+    /// applications can opt in by string (`"DC_QUORUM"`) or by code. Wire code: 0x0100.
+    DcQuorum,
 }
 
 impl ConsistencyLevel {
@@ -27,25 +32,34 @@ impl ConsistencyLevel {
     ///
     /// # Panics
     ///
-    /// Panics if called with `EachQuorum` -- use `block_for_dc` instead.
+    /// Panics if called with `EachQuorum`, which a single total cannot express -- use
+    /// `block_for_dc`. For `DcQuorum` this returns the node-quorum condition only; the datacenter
+    /// shape lives in `coordinator::dc_quorum`.
     pub fn block_for(&self, rf: usize) -> usize {
         match self {
             Self::One | Self::LocalOne => 1,
             Self::Two => 2.min(rf),
             Self::Three => 3.min(rf),
-            Self::Quorum | Self::LocalQuorum | Self::Serial => rf / 2 + 1,
+            // DC_QUORUM's node-quorum condition, and its safe value on a single datacenter. A
+            // request path that needs the full requirement (the origin datacenter's quorum plus a
+            // quorum of datacenters) must go through `coordinator::dc_quorum`, but no path may
+            // panic on a level a client is allowed to send.
+            Self::Quorum | Self::LocalQuorum | Self::Serial | Self::DcQuorum => rf / 2 + 1,
             Self::LocalSerial => rf / 2 + 1,
             Self::All => rf,
             Self::EachQuorum => {
                 panic!("use block_for_dc() for EACH_QUORUM");
             }
+
         }
     }
 
     /// Number of replicas per data center that must acknowledge.
     pub fn block_for_dc(&self, dc_rf: usize) -> usize {
         match self {
-            Self::EachQuorum | Self::LocalQuorum | Self::LocalSerial => dc_rf / 2 + 1,
+            Self::EachQuorum | Self::LocalQuorum | Self::LocalSerial | Self::DcQuorum => {
+                dc_rf / 2 + 1
+            }
             _ => self.block_for(dc_rf),
         }
     }
@@ -65,6 +79,9 @@ impl ConsistencyLevel {
             0x0008 => Some(Self::Serial),
             0x0009 => Some(Self::LocalSerial),
             0x000A => Some(Self::LocalOne),
+            // Out of Cassandra's assigned range (0x0000-0x000A) on purpose: a stock driver must
+            // fail loudly on DC_QUORUM rather than silently interpret it as another level.
+            0x0100 => Some(Self::DcQuorum),
             _ => None,
         }
     }
@@ -83,6 +100,7 @@ impl ConsistencyLevel {
             "EACH_QUORUM" => Some(Self::EachQuorum),
             "SERIAL" => Some(Self::Serial),
             "LOCAL_SERIAL" => Some(Self::LocalSerial),
+            "DC_QUORUM" => Some(Self::DcQuorum),
             _ => None,
         }
     }
@@ -100,6 +118,7 @@ impl ConsistencyLevel {
             Self::Serial => 0x0008,
             Self::LocalSerial => 0x0009,
             Self::LocalOne => 0x000A,
+            Self::DcQuorum => 0x0100,
         }
     }
 
@@ -116,6 +135,7 @@ impl ConsistencyLevel {
             Self::EachQuorum => "EACH_QUORUM",
             Self::Serial => "SERIAL",
             Self::LocalSerial => "LOCAL_SERIAL",
+            Self::DcQuorum => "DC_QUORUM",
         }
     }
 }

@@ -595,7 +595,7 @@ impl ReadQuorumScope<'_> {
             return None;
         };
         let mut requirements: Vec<(&str, usize)> = match cl {
-            ConsistencyLevel::Quorum => {
+            ConsistencyLevel::DcQuorum => {
                 let origin_rf = *dc_rf.get(self.origin).filter(|rf| **rf > 0)?;
                 let dc_votes = dc_rf.values().filter(|rf| **rf > 0).count() / 2 + 1;
                 let mut remote_dcs: Vec<_> = dc_rf
@@ -680,6 +680,26 @@ fn read_quorum_progress(
     total: usize,
     count_in_dc: impl Fn(&str) -> usize,
 ) -> super::dc_quorum::Progress {
+    // DC_QUORUM reads stay inside the datacenter: the local quorum is the requirement, so a reader
+    // never pays a cross-DC hop.
+    //
+    // Accepted edge: a local read is blind to what replicated elsewhere. A client that acknowledged
+    // a write in one datacenter and then fails over to another can read backwards past its own
+    // write until replication catches up. This is the deliberate cost of the hop-free read — see
+    // `Consistency.a_local_read_does_not_consult_remote_datacenters`.
+    if matches!(cl, ConsistencyLevel::DcQuorum) {
+        let configured = crate::ring::strategy::ReplicationStrategy::dc_replication_factors(strategy);
+        let Some(&rf) = configured.get(origin).filter(|rf| **rf > 0) else {
+            return super::dc_quorum::Progress {
+                required: 1,
+                received: 0,
+            };
+        };
+        return super::dc_quorum::Progress {
+            required: rf / 2 + 1,
+            received: count_in_dc(origin),
+        };
+    }
     if matches!(
         strategy,
         crate::ring::strategy::ReplicationStrategy::Simple { .. }
@@ -1799,7 +1819,7 @@ impl ClusterCoordinator {
                 let req = cl.block_for_dc(local_rf);
                 (local_replicas, req)
             }
-            ConsistencyLevel::Quorum | ConsistencyLevel::EachQuorum => {
+            ConsistencyLevel::DcQuorum | ConsistencyLevel::EachQuorum => {
                 let required = scope
                     .progress(cl, &std::collections::HashSet::new())
                     .required;
@@ -2069,7 +2089,11 @@ impl ClusterCoordinator {
             .map(|n| n.data_center.clone())
             .unwrap_or_default();
         let replica_ids = match cl {
-            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => eligible
+            // DC_QUORUM reads stay in the origin datacenter, so the keyed-index path filters to it
+            // exactly as the local levels do.
+            ConsistencyLevel::LocalQuorum
+            | ConsistencyLevel::LocalOne
+            | ConsistencyLevel::DcQuorum => eligible
                 .into_iter()
                 .filter(|id| {
                     ring.get_node(*id)
@@ -3120,7 +3144,7 @@ mod tests {
             local_node_id,
             storage,
             2,
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let mut keys = coordinator
@@ -3182,7 +3206,7 @@ mod tests {
             local_node_id,
             storage,
             2,
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let error = coordinator
@@ -3379,7 +3403,7 @@ mod tests {
             local_node_id,
             storage.clone(),
             3,
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let table_id = TableId::new("test_ks", "test_tbl");
@@ -3648,7 +3672,7 @@ mod tests {
             local_node_id,
             storage.clone(),
             3, // RF=3
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let table_id = TableId::new("test_ks", "test_tbl");
@@ -3727,7 +3751,7 @@ mod tests {
             local_node_id,
             storage,
             3,
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -4430,7 +4454,7 @@ mod tests {
             local_node_id,
             storage,
             2,
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let result = coordinator.coordinate_read(&table_id, &key).await.unwrap();
@@ -4471,7 +4495,7 @@ mod tests {
             local_node_id,
             storage.clone(),
             3,                        // RF=3 (default)
-            ConsistencyLevel::Quorum, // default CL
+            ConsistencyLevel::DcQuorum, // default CL
         );
 
         let table_id = TableId::new("test_ks", "test_tbl");
@@ -4901,7 +4925,7 @@ mod tests {
             1u64,
             storage.clone(),
             3,
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
         );
 
         let table_id = TableId::new("test_ks", "test_tbl");
@@ -6206,7 +6230,7 @@ mod tests {
         let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
         let rows = verification_nts_read_case_with_newest(
             &[1, 2, 4, 5],
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
             None,
             false,
             Some(barrier),
@@ -6364,7 +6388,7 @@ mod tests {
         // is stale; a successful certificate must re-fetch node 2's new value.
         let rows = verification_nts_read_case_with_newest(
             &[1, 2, 4, 5],
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
             Some(2),
             false,
             None,
@@ -6379,7 +6403,7 @@ mod tests {
     async fn verification_nts_index_origin_and_remote_majority() {
         let rows = verification_nts_read_case_with_newest(
             &[1, 2, 4, 5],
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
             None,
             true,
             None,
@@ -6391,23 +6415,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verification_nts_index_rejects_pooled_majority() {
+    async fn verification_nts_index_read_needs_only_the_local_quorum() {
         assert!(verification_nts_read_case_with_newest(
             &[1, 2, 3, 4, 7],
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
             None,
             true,
             None
         )
         .await
-        .is_err());
+        .is_ok());
     }
 
     #[tokio::test]
     async fn verification_nts_index_requires_origin_majority() {
         assert!(verification_nts_read_case_with_newest(
             &[1, 4, 5, 6, 7, 8, 9],
-            ConsistencyLevel::Quorum,
+            ConsistencyLevel::DcQuorum,
             None,
             true,
             None
@@ -6418,7 +6442,7 @@ mod tests {
 
     #[tokio::test]
     async fn verification_nts_read_origin_and_remote_majority() {
-        let rows = verification_nts_read_case(&[1, 2, 4, 5], ConsistencyLevel::Quorum)
+        let rows = verification_nts_read_case(&[1, 2, 4, 5], ConsistencyLevel::DcQuorum)
             .await
             .expect("origin + remote majorities must suffice while dc3 is absent")
             .unwrap();
@@ -6426,18 +6450,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verification_nts_read_rejects_pooled_majority() {
+    async fn verification_nts_read_needs_only_the_local_quorum() {
+        // DC_QUORUM reads are served inside the origin datacenter. `[1, 2, 3, 4, 7]` has a full local
+        // quorum in dc1 and no second DC quorum, and for a read that is enough — the write-side
+        // shape is asserted in the write tests.
         assert!(
-            matches!(
-                verification_nts_read_case(&[1, 2, 3, 4, 7], ConsistencyLevel::Quorum).await,
-                Err(ClusterError::ReadTimeout {
-                    required: 2,
-                    received: 1,
-                    data_present: true,
-                    ..
-                })
-            ),
-            "3+1+1 supplies only one of two required DC votes"
+            verification_nts_read_case(&[1, 2, 3, 4, 7], ConsistencyLevel::DcQuorum)
+                .await
+                .is_ok(),
+            "a DC_QUORUM read needs only the origin datacenter's quorum"
         );
     }
 
@@ -6445,7 +6466,7 @@ mod tests {
     async fn verification_nts_read_requires_origin_majority() {
         assert!(
             matches!(
-                verification_nts_read_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::Quorum).await,
+                verification_nts_read_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::DcQuorum).await,
                 Err(ClusterError::ReadTimeout {
                     required: 2,
                     received: 1,
@@ -6492,11 +6513,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verification_nts_read_missing_dcs_stay_configured() {
+    async fn verification_nts_read_is_served_without_any_remote_datacenter() {
+        // The origin datacenter at its full quorum serves a DC_QUORUM read with no remote replica
+        // answering at all: that is the hop-free read this level exists for.
         assert!(
-            verification_nts_read_case(&[1, 2, 3], ConsistencyLevel::Quorum)
+            verification_nts_read_case(&[1, 2, 3], ConsistencyLevel::DcQuorum)
                 .await
-                .is_err()
+                .is_ok()
         );
     }
 

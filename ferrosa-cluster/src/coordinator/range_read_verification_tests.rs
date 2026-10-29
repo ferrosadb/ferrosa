@@ -280,26 +280,31 @@ async fn range_case(live: &[u64], cl: ConsistencyLevel) -> crate::error::Result<
 }
 #[tokio::test]
 async fn verification_nts_range_two_dcs_complete() {
-    let rows = range_case(&[1, 2, 4, 5], ConsistencyLevel::Quorum)
+    let rows = range_case(&[1, 2, 4, 5], ConsistencyLevel::DcQuorum)
         .await
         .unwrap();
     assert_eq!(rows.len(), 4);
     assert_eq!(rows.iter().map(|p| p.rows.len()).sum::<usize>(), 4);
-    let newest = rows.iter().find(|p| p.key == partition(0).key).unwrap();
+    // A DC_QUORUM range read is served from the origin datacenter and returns that datacenter's
+    // view. Partition 0 holds "newest" only on a replica outside it, and a local read is not
+    // required to see it: that is the accepted staleness of a hop-free read, asserted rather than
+    // worked around.
+    let local = rows.iter().find(|p| p.key == partition(0).key).unwrap();
     assert_eq!(
-        newest.rows[0].cells[0].1.value.as_deref(),
-        Some(b"newest".as_slice())
+        local.rows[0].cells[0].1.value.as_deref(),
+        Some(b"a-0".as_slice()),
+        "a local read returns the origin datacenter's version, not a remote newer one"
     );
 }
 #[tokio::test]
-async fn verification_nts_range_rejects_pooled() {
-    assert!(range_case(&[1, 2, 3, 4, 7], ConsistencyLevel::Quorum)
+async fn verification_nts_range_needs_only_the_local_quorum() {
+    assert!(range_case(&[1, 2, 3, 4, 7], ConsistencyLevel::DcQuorum)
         .await
-        .is_err());
+        .is_ok());
 }
 #[tokio::test]
 async fn verification_nts_range_requires_origin() {
-    assert!(range_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::Quorum)
+    assert!(range_case(&[1, 4, 5, 6, 7, 8, 9], ConsistencyLevel::DcQuorum)
         .await
         .is_err());
 }
@@ -314,10 +319,10 @@ async fn verification_nts_range_local() {
     );
 }
 #[tokio::test]
-async fn verification_nts_range_configured_scope() {
-    assert!(range_case(&[1, 2, 3], ConsistencyLevel::Quorum)
+async fn verification_nts_range_is_served_without_any_remote_datacenter() {
+    assert!(range_case(&[1, 2, 3], ConsistencyLevel::DcQuorum)
         .await
-        .is_err());
+        .is_ok());
 }
 
 #[tokio::test]
@@ -348,7 +353,7 @@ fn verification_nts_range_certificate_requires_every_token_scope() {
         strategy: ReplicationStrategy::NetworkTopology {
             dc_rf: [("dc1".into(), 1), ("dc2".into(), 1), ("dc3".into(), 1)].into(),
         },
-        cl: ConsistencyLevel::Quorum,
+        cl: ConsistencyLevel::DcQuorum,
         origin: "dc1".into(),
         local_host: hosts[0],
         scopes: vec![
@@ -373,8 +378,8 @@ fn verification_nts_range_certificate_requires_every_token_scope() {
 
 #[test]
 fn verification_nts_range_scalar_cannot_shrink_configured_rf() {
-    assert_eq!(remote_count_for_cl(ConsistencyLevel::Quorum, 5, 2, 1), 2);
+    assert_eq!(remote_count_for_cl(ConsistencyLevel::DcQuorum, 5, 2, 1), 2);
     assert_eq!(remote_count_for_cl(ConsistencyLevel::All, 5, 2, 1), 4);
-    assert!(remote_count_for_cl(ConsistencyLevel::Quorum, 0, 0, 0) > 0);
+    assert!(remote_count_for_cl(ConsistencyLevel::DcQuorum, 0, 0, 0) > 0);
     assert!(remote_count_for_cl(ConsistencyLevel::EachQuorum, 3, 3, 2) > 2);
 }

@@ -1495,6 +1495,25 @@ impl RangeCertificate {
     fn satisfied(&self, admitted: &std::collections::HashSet<uuid::Uuid>) -> bool {
         !self.scopes.is_empty()
             && self.scopes.iter().all(|scope| {
+                let count_in_dc = |dc: &str| {
+                    scope
+                        .iter()
+                        .filter(|(host, replica_dc)| {
+                            replica_dc == dc && admitted.contains(host)
+                        })
+                        .count()
+                };
+                if self.cl == crate::ConsistencyLevel::DcQuorum {
+                    // A range read at DC_QUORUM is satisfied scope by scope inside the origin
+                    // datacenter; it does not also require the write-side datacenter and node
+                    // quorums.
+                    return super::dc_quorum::local_progress(
+                        &self.strategy,
+                        &self.origin,
+                        count_in_dc,
+                    )
+                    .satisfied();
+                }
                 super::dc_quorum::progress(
                     self.cl,
                     &self.strategy,

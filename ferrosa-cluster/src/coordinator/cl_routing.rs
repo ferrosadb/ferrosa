@@ -87,7 +87,8 @@ pub fn replica_policy_for_cl(cl: ConsistencyLevel) -> CLReplicaPolicy {
         | ConsistencyLevel::Three
         | ConsistencyLevel::Quorum
         | ConsistencyLevel::LocalQuorum
-        | ConsistencyLevel::EachQuorum => CLReplicaPolicy::VOTERS_ONLY,
+        | ConsistencyLevel::EachQuorum
+        | ConsistencyLevel::DcQuorum => CLReplicaPolicy::VOTERS_ONLY,
         // ALL — every voter and every learner that owns the token.
         ConsistencyLevel::All => CLReplicaPolicy::ALL_REPLICAS,
         // Strict-consistency CLs — leader round-trip; learners excluded
@@ -251,9 +252,9 @@ pub fn route_for_cl(cl: ConsistencyLevel, dc_count: usize) -> CLRoute {
                 CLRoute::LocalDcOnly
             }
         }
-        ConsistencyLevel::EachQuorum => {
+        ConsistencyLevel::EachQuorum | ConsistencyLevel::DcQuorum => {
             if multi_dc {
-                // Sprint 7 W7.7: cross-DC EACH_QUORUM goes through Accord.
+                // Cross-DC EACH_QUORUM and DC_QUORUM both go through Accord.
                 CLRoute::CrossDcAccord
             } else {
                 CLRoute::LocalDcOnly

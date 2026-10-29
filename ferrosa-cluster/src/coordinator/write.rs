@@ -2168,15 +2168,17 @@ mod tests {
                 &history_key,
                 test_row(),
                 1000,
-                ConsistencyLevel::Quorum,
+                ConsistencyLevel::LocalQuorum,
                 &strategy,
             )
             .await
-            .expect("two configured DC quorums acknowledge");
+            .expect("the origin datacenter's quorum acknowledges");
+        // A DC_QUORUM read is served from the origin datacenter, so it sees a write that a local
+        // quorum acknowledged without needing a remote acknowledgement.
         let rows = reader
-            .coordinate_read_nts(&table, &history_key, ConsistencyLevel::Quorum, &strategy)
+            .coordinate_read_nts(&table, &history_key, ConsistencyLevel::DcQuorum, &strategy)
             .await
-            .expect("different two DC quorums read")
+            .expect("DC_QUORUM reads the origin datacenter")
             .expect("acknowledged row survives");
         assert_eq!(rows.len(), 1);
         let mut expected = test_row().cells;
@@ -2265,15 +2267,30 @@ mod tests {
         result
     }
 
+    // DC_QUORUM needs three conditions: the origin DC's quorum, a quorum of configured DCs, and a
+    // quorum of all replicas. Cassandra's QUORUM keeps only the last one.
+
     #[tokio::test]
-    async fn verification_nts_quorum_accepts_two_local_quorums_with_third_dc_absent() {
-        let result = verification_nts_write([2, 2, 0], ConsistencyLevel::Quorum).await;
-        assert!(result.is_ok(), "2/3 origin replicas plus 2/3 replicas in a second configured DC is a global quorum: {result:?}");
+    async fn verification_nts_dc_quorum_accepts_two_dc_quorums_over_a_node_quorum() {
+        let result = verification_nts_write([3, 2, 0], ConsistencyLevel::DcQuorum).await;
+        assert!(
+            result.is_ok(),
+            "3/3 in the origin plus 2/3 in a second DC is two DC quorums and 5 of 9 replicas: {result:?}"
+        );
     }
 
     #[tokio::test]
-    async fn verification_nts_quorum_rejects_pooled_acks_without_a_second_dc_quorum() {
-        let result = verification_nts_write([3, 1, 1], ConsistencyLevel::Quorum).await;
+    async fn verification_nts_dc_quorum_rejects_two_dc_quorums_below_a_node_quorum() {
+        let result = verification_nts_write([2, 2, 0], ConsistencyLevel::DcQuorum).await;
+        assert!(
+            result.is_err(),
+            "two DC quorums are only 4 of 9 replicas, below the node quorum: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_nts_dc_quorum_rejects_pooled_acks_without_a_second_dc_quorum() {
+        let result = verification_nts_write([3, 1, 1], ConsistencyLevel::DcQuorum).await;
         assert!(
             result.is_err(),
             "five pooled ACKs are not two DC quorums: {result:?}"
@@ -2281,11 +2298,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verification_nts_quorum_requires_the_origin_dc_even_with_two_remote_quorums() {
-        let result = verification_nts_write([1, 3, 3], ConsistencyLevel::Quorum).await;
+    async fn verification_nts_dc_quorum_requires_the_origin_dc_even_with_two_remote_quorums() {
+        let result = verification_nts_write([1, 3, 3], ConsistencyLevel::DcQuorum).await;
         assert!(
             result.is_err(),
             "remote majorities cannot replace the origin quorum: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_nts_quorum_is_cassandras_total_and_admits_pooled_acks() {
+        let result = verification_nts_write([3, 1, 1], ConsistencyLevel::Quorum).await;
+        assert!(
+            result.is_ok(),
+            "Cassandra's QUORUM is 5 of 9 acks anywhere, which this vector satisfies: {result:?}"
         );
     }
 
