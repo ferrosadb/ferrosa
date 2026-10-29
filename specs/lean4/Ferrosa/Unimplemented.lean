@@ -17,6 +17,10 @@
   what `every_ledger_item_is_classified` pins.
 -/
 import Ferrosa.Ledger
+import Ferrosa.Commons.Hll
+import Ferrosa.Testing.Jepsen
+import Ferrosa.Testing.JepsenModels
+import Ferrosa.Testing.Histories
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Flight.Subscribe
 import Ferrosa.Broken
@@ -56,6 +60,16 @@ def unimplemented : List Item := [
   ⟨"SQL", "a multi-statement transaction is atomic"⟩,
   ⟨"Bolt", "queued result streams are bounded"⟩,
   ⟨"Txn", "SERIALIZABLE isolation is available"⟩,
+  ⟨"distinct", "the relative error of the HLL estimate is bounded by 1.04/sqrt(m)"⟩,
+  ⟨"distinct", "a HyperLogLog estimator backs COUNT(ESTIMATE_DISTINCT)"⟩,
+  ⟨"Jepsen", "the loss accounting is scoped to reads that can see every acknowledged write"⟩,
+  ⟨"Jepsen", "every run's verdict preserves lost, unexpected and recovered as multisets"⟩,
+  ⟨"Jepsen", "the set model is ported, including its multi-value reads"⟩,
+  ⟨"Jepsen", "the set-full and unique-ids models are ported"⟩,
+  ⟨"Jepsen", "the generators, nemeses and stats assertions are ported"⟩,
+  ⟨"Jepsen", "the suite asserts strict serializability for multi-key transactions"⟩,
+  ⟨"Jepsen", "the checker runs Elle with read-only transactions in the graph"⟩,
+  ⟨"Jepsen", "a multi-DC run with local reads treats a semantics consequence as a failure"⟩,
   ⟨"MVCC", "versions are stored in the fnf record"⟩,
   ⟨"MVCC", "compaction carries the spill pointer forward"⟩,
   ⟨"Streaming", "buffer memory is one shared pool sized by a shared_memory setting"⟩,
@@ -109,13 +123,17 @@ def ledgerTotal : Nat :=
     + redCount Ferrosa.Flight.ledger
     + redCount Ferrosa.Sql.Consistency.ledger
     + redCount Ferrosa.Storage.Streaming.ledger
+    + redCount Ferrosa.Commons.Hll.ledger
+    + redCount Ferrosa.Testing.Jepsen.ledger
+    + redCount Ferrosa.Testing.Models.ledger
+    + redCount Ferrosa.Testing.Histories.ledger
 
 /-- **Every red item in every ledger appears here or in `Broken.broken`, exactly once.** -/
 theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
-theorem unimplemented_has_the_right_length : unimplemented.length = 24 := by native_decide
+theorem unimplemented_has_the_right_length : unimplemented.length = 34 := by native_decide
 theorem twelve_are_not_defects : nonDefects.length = 8 := by native_decide
 
 /-- **Live defects now outnumber everything else.**  Thirteen reds against twelve requirements,

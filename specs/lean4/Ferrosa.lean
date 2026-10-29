@@ -59,6 +59,9 @@ import Ferrosa.Commons.Hll
 import Ferrosa.Commons.Flow
 import Ferrosa.Commons.Stream
 import Ferrosa.Commons.FrontEnd
+import Ferrosa.Testing.Jepsen
+import Ferrosa.Testing.JepsenModels
+import Ferrosa.Testing.Histories
 import Ferrosa.Todo
 import Ferrosa.Broken
 import Ferrosa.Unimplemented

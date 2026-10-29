@@ -26,6 +26,9 @@ import Ferrosa.Flight.Subscribe
 import Ferrosa.Commons.Tactics
 import Ferrosa.Commons.Hll
 import Ferrosa.Commons.FrontEnd
+import Ferrosa.Testing.Jepsen
+import Ferrosa.Testing.JepsenModels
+import Ferrosa.Testing.Histories
 import Ferrosa.Todo
 import Ferrosa.Broken
 import Ferrosa.Unimplemented
@@ -48,6 +51,12 @@ def main : IO Unit := do
   Ferrosa.Flight.main
   IO.println ""
   Ferrosa.Todo.main
+  IO.println ""
+  Ferrosa.Testing.Jepsen.main
+  IO.println ""
+  Ferrosa.Testing.Models.main
+  IO.println ""
+  Ferrosa.Testing.Histories.main
   IO.println ""
   Ferrosa.Commons.Hll.main
   IO.println ""
