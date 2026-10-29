@@ -515,6 +515,19 @@ fn resolve_graph_bolt_config(
 
 /// Resolve the SPARQL listener with the same explicit opt-in remote exposure
 /// contract as the other HTTP front-ends.
+fn build_sparql_engine(
+    storage: std::sync::Arc<ferrosa_storage::StorageEngine>,
+    write_path: std::sync::Arc<arc_swap::ArcSwap<ferrosa_cluster::write_path::WritePath>>,
+) -> std::sync::Arc<ferrosa_sparql::engine::SparqlEngine> {
+    std::sync::Arc::new(
+        ferrosa_sparql::engine::SparqlEngine::new_with_write_path_source(
+            storage,
+            write_path,
+            ferrosa_sparql::engine::SparqlConfig::default(),
+        ),
+    )
+}
+
 fn resolve_sparql_bind(file_config: &toml::Value) -> std::net::SocketAddr {
     let sparql_bind = config_val(
         "FERROSA_SPARQL_BIND",
@@ -3164,7 +3177,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
             schema: schema.clone(),
             node_config,
             cluster_state: handles.cluster_state,
-            write_path: handles.write_path,
+            write_path: handles.write_path.clone(),
             ddl_path: handles.ddl_path,
             udf_executor,
             mode_controller: Arc::clone(&mode_controller),
@@ -3650,14 +3663,7 @@ async fn run() -> Result<Option<String>, Box<dyn std::error::Error>> {
     if sparql_enabled {
         let sparql_bind = resolve_sparql_bind(&file_config);
 
-        let sparql_write_path = std::sync::Arc::new(
-            ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
-        );
-        let sparql_engine = std::sync::Arc::new(ferrosa_sparql::engine::SparqlEngine::new(
-            storage.clone(),
-            sparql_write_path.clone(),
-            ferrosa_sparql::engine::SparqlConfig::default(),
-        ));
+        let sparql_engine = build_sparql_engine(storage.clone(), handles.write_path.clone());
 
         let sparql_state = ferrosa_sparql::http::AppState {
             engine: sparql_engine,
@@ -4204,6 +4210,153 @@ fn seeds_to_connect(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn sparql_updates_observe_live_pair_replica_authority() {
+        use ferrosa_net::peer::PeerEventListener;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            ferrosa_storage::StorageEngine::new(
+                ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+                None,
+            )
+            .unwrap(),
+        );
+        let net = Arc::new(ferrosa_net::config::NetConfig::default());
+        let local = uuid::Uuid::from_u128(3);
+        let (controller, handles) = ferrosa_cluster::ModeController::new(
+            Arc::new(ferrosa_cluster::config::ClusterConfig::default()),
+            net.clone(),
+            local,
+            storage.clone(),
+            Arc::new(ferrosa_schema::Schema::new(test_schema_config()).unwrap()),
+            Arc::new(ferrosa_net::rpc::HandlerRegistry::new()),
+        );
+        let engine = build_sparql_engine(storage, handles.write_path.clone());
+        engine
+            .execute_update(
+                "INSERT DATA { <urn:first> <urn:predicate> \"first\" }",
+                "default",
+            )
+            .await
+            .expect("standalone writer positive control");
+        let manager = Arc::new(ferrosa_net::peer::PeerManager::with_weak_listener(
+            net,
+            local,
+            controller.as_peer_listener(),
+        ));
+        controller.set_peer_manager(manager);
+        controller.on_peer_connected((uuid::Uuid::from_u128(2), "127.0.0.1:7002".parse().unwrap()));
+        assert_eq!(
+            controller.role(),
+            Some(ferrosa_cluster::pair::PairRole::Secondary)
+        );
+        let result = engine
+            .execute_update(
+                "INSERT DATA { <urn:forbidden> <urn:predicate> \"forbidden\" }",
+                "default",
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "SPARQL retained standalone write authority after pairing"
+        );
+        let result = engine
+            .execute("ASK { <urn:first> <urn:predicate> \"first\" }", "default")
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ferrosa_sparql::engine::SparqlResult::Ask(value) if value.boolean)
+        );
+        let result = engine
+            .execute(
+                "ASK { <urn:forbidden> <urn:predicate> \"forbidden\" }",
+                "default",
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ferrosa_sparql::engine::SparqlResult::Ask(value) if !value.boolean)
+        );
+    }
+
+    #[tokio::test]
+    async fn sparql_updates_reject_unavailable_authority() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            ferrosa_storage::StorageEngine::new(
+                ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+                None,
+            )
+            .unwrap(),
+        );
+        let source = Arc::new(arc_swap::ArcSwap::from_pointee(
+            ferrosa_cluster::write_path::WritePath::direct(storage.clone()),
+        ));
+        let engine = build_sparql_engine(storage, source.clone());
+        source.store(Arc::new(
+            ferrosa_cluster::write_path::WritePath::Unavailable,
+        ));
+        assert!(engine
+            .execute_update("INSERT DATA { <urn:x> <urn:p> \"x\" }", "default")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn sparql_pair_archive_requirement_follows_config() {
+        use ferrosa_net::peer::PeerEventListener;
+        use std::sync::Arc;
+        for strict in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = Arc::new(
+                ferrosa_storage::StorageEngine::new(
+                    ferrosa_storage::StorageEngineConfig::test_config(dir.path()),
+                    None,
+                )
+                .unwrap(),
+            );
+            let net = Arc::new(ferrosa_net::config::NetConfig::default());
+            let local = uuid::Uuid::from_u128(1);
+            let config = ferrosa_cluster::config::ClusterConfig {
+                pair_quorum_strict: strict,
+                ..Default::default()
+            };
+            let (controller, handles) = ferrosa_cluster::ModeController::new(
+                Arc::new(config),
+                net.clone(),
+                local,
+                storage.clone(),
+                Arc::new(ferrosa_schema::Schema::new(test_schema_config()).unwrap()),
+                Arc::new(ferrosa_net::rpc::HandlerRegistry::new()),
+            );
+            let engine = build_sparql_engine(storage, handles.write_path.clone());
+            controller.set_peer_manager(Arc::new(
+                ferrosa_net::peer::PeerManager::with_weak_listener(
+                    net,
+                    local,
+                    controller.as_peer_listener(),
+                ),
+            ));
+            controller
+                .on_peer_connected((uuid::Uuid::from_u128(2), "127.0.0.1:7002".parse().unwrap()));
+            assert_eq!(
+                controller.role(),
+                Some(ferrosa_cluster::pair::PairRole::Primary)
+            );
+            assert_eq!(
+                engine
+                    .execute_update("INSERT DATA { <urn:x> <urn:p> \"x\" }", "default")
+                    .await
+                    .is_err(),
+                strict,
+                "default permits local WAL ACK; strict requires archive"
+            );
+        }
+    }
+
     use super::*;
 
     /// t_396d4c80: `main` spawned two self-heal controllers, one gated on

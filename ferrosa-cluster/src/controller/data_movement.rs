@@ -573,15 +573,79 @@ pub async fn verify_bootstrap(
     Ok(evidence)
 }
 
-/// Bootstrap `joiner`: verify every owned range, then commit
-/// `RecordBootstrapComplete`, then promote it to `Normal`.
+/// Fold only plans whose COMPLETE source set is identical over the full ring.
+/// The plan and executor were built from one pinned ring/schema snapshot.
+/// Partial coverage, gaps, differing tables or differing source sets retain
+/// their exact sessions. Half-open MIN..MAX semantics are unchanged.
+fn compact_full_ring_sources(sessions: Vec<BootstrapSession>) -> Vec<BootstrapSession> {
+    let mut order: Vec<_> = (0..sessions.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        let a = &sessions[a];
+        let b = &sessions[b];
+        (&a.table.keyspace, &a.table.table, a.source, a.start, a.end).cmp(&(
+            &b.table.keyspace,
+            &b.table.table,
+            b.source,
+            b.start,
+            b.end,
+        ))
+    });
+    let mut full: std::collections::HashMap<TableId, bool> = std::collections::HashMap::new();
+    let mut group = 0;
+    while group < order.len() {
+        let first = &sessions[order[group]];
+        let mut cursor = i64::MIN;
+        let mut covered = true;
+        let mut end = group;
+        while end < order.len() {
+            let session = &sessions[order[end]];
+            if session.table != first.table || session.source != first.source {
+                break;
+            }
+            if session.start > cursor {
+                covered = false;
+            }
+            cursor = cursor.max(session.end);
+            end += 1;
+        }
+        let complete = covered && cursor == i64::MAX;
+        full.entry(first.table.clone())
+            .and_modify(|all| *all &= complete)
+            .or_insert(complete);
+        group = end;
+    }
+    let mut emitted: std::collections::HashMap<TableId, std::collections::HashSet<u64>> =
+        std::collections::HashMap::new();
+    let mut compact = Vec::with_capacity(sessions.len());
+    for mut session in sessions {
+        if full.get(&session.table) == Some(&true) {
+            if emitted
+                .get(&session.table)
+                .is_some_and(|sources| sources.contains(&session.source))
+            {
+                continue;
+            }
+            emitted
+                .entry(session.table.clone())
+                .or_default()
+                .insert(session.source);
+            session.start = i64::MIN;
+            session.end = i64::MAX;
+        }
+        compact.push(session);
+    }
+    compact
+}
+
+/// Verify a joining replica's data and commit `RecordBootstrapComplete`.
+/// This leaves it Joining so membership promotion can follow independently.
 ///
 /// This is both the first bootstrap and its resumption after a restart. A
 /// restart can cut a bootstrap off at any point; rerunning every session is
 /// safe because anti-entropy converges (ranges already in sync cost one Merkle
 /// comparison and move nothing). On any failure nothing is recorded and the
 /// node stays `Joining`, out of `replicas()`.
-pub async fn bootstrap_verified(
+pub async fn bootstrap_data_verified(
     proposer: &dyn MembershipProposer,
     ring: &TokenRing,
     joiner: u64,
@@ -589,7 +653,16 @@ pub async fn bootstrap_verified(
     executor: &dyn crate::repair::SessionExecutor,
 ) -> Result<DataMovementEvidence> {
     let outcome = match bootstrap_sessions(ring, joiner, tables) {
-        Ok((sessions, ranges)) => verify_bootstrap(&sessions, ranges, executor).await,
+        Ok((sessions, ranges)) => {
+            let sessions = compact_full_ring_sources(sessions);
+            tracing::info!(
+                joiner,
+                sessions = sessions.len(),
+                ranges,
+                "verifying joining replica ranges"
+            );
+            verify_bootstrap(&sessions, ranges, executor).await
+        }
         Err(e) => Err(e),
     };
     let evidence = match outcome {
@@ -611,19 +684,32 @@ pub async fn bootstrap_verified(
             evidence: evidence.clone(),
         })
         .await?;
+    tracing::info!(
+        joiner,
+        sessions = evidence.sessions,
+        ranges = evidence.ranges,
+        partitions = evidence.partitions,
+        "bootstrap data verified and recorded; membership promotion remains separate"
+    );
+    Ok(evidence)
+}
+
+/// Verify data, record completion, and promote the application replica.
+/// Existing recovery callers retain their original verified promotion sequence.
+pub async fn bootstrap_verified(
+    proposer: &dyn MembershipProposer,
+    ring: &TokenRing,
+    joiner: u64,
+    tables: &[(TableId, ReplicationStrategy)],
+    executor: &dyn crate::repair::SessionExecutor,
+) -> Result<DataMovementEvidence> {
+    let evidence = bootstrap_data_verified(proposer, ring, joiner, tables, executor).await?;
     proposer
         .propose(RaftOp::SetNodeState {
             node_id: joiner,
             state: NodeState::Normal,
         })
         .await?;
-    tracing::info!(
-        joiner,
-        sessions = evidence.sessions,
-        ranges = evidence.ranges,
-        partitions = evidence.partitions,
-        "bootstrap verified and recorded; node promoted to Normal"
-    );
     Ok(evidence)
 }
 
@@ -1081,6 +1167,101 @@ mod tests {
             vec![(201, 301, 3), (201, 301, 1), (301, 401, 1), (301, 401, 2)],
         );
         assert_eq!(ranges, 2);
+    }
+
+    #[test]
+    fn verification_bootstrap_compaction_preserves_wrap_gaps_and_sources() {
+        let session = |source, start, end| BootstrapSession {
+            table: table(),
+            source,
+            start,
+            end,
+        };
+        let original = vec![
+            session(1, 10, i64::MAX),
+            session(2, i64::MIN, 0),
+            session(1, i64::MIN, 10),
+            session(2, 0, i64::MAX),
+        ];
+        let compact = compact_full_ring_sources(original.clone());
+        assert_eq!(compact.len(), 2);
+        let coverage = |sessions: &[BootstrapSession], token: i64| {
+            sessions
+                .iter()
+                .filter(|s| s.start <= token && token < s.end)
+                .map(|s| (s.table.clone(), s.source))
+                .collect::<std::collections::HashSet<_>>()
+        };
+        for token in [i64::MIN, -1, 0, 9, 10, i64::MAX - 1, i64::MAX] {
+            assert_eq!(
+                coverage(&original, token),
+                coverage(&compact, token),
+                "half-open coverage at{token}"
+            );
+        }
+        let gap = vec![session(1, i64::MIN, 0), session(1, 1, i64::MAX)];
+        assert_eq!(
+            compact_full_ring_sources(gap.clone()),
+            gap,
+            "a one-token gap cannot disappear"
+        );
+        let different_sources = vec![session(1, i64::MIN, i64::MAX), session(2, 0, i64::MAX)];
+        assert_eq!(
+            compact_full_ring_sources(different_sources.clone()),
+            different_sources,
+            "changing source sets cannot merge"
+        );
+        let mut different_tables = original;
+        different_tables[0].table = TableId::new("other", "table");
+        assert_eq!(
+            compact_full_ring_sources(different_tables.clone()),
+            different_tables,
+            "coverage cannot cross table identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_bootstrap_full_ring_sessions_are_compacted() {
+        let proposer = RecordingProposer::default();
+        let executor = RecordingExecutor::default();
+        let evidence = bootstrap_data_verified(
+            &proposer,
+            &ring_with_joiner(),
+            4,
+            &[(
+                table(),
+                ReplicationStrategy::Simple {
+                    replication_factor: 5,
+                },
+            )],
+            &executor,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            evidence.sessions, 3,
+            "one full-ring verification per unchanged source identity set"
+        );
+        let calls = executor.calls.lock().unwrap();
+        assert!(calls
+            .iter()
+            .all(|(start, end, _)| (*start, *end) == (i64::MIN, i64::MAX)));
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(_, _, source)| *source)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [1, 2, 3].into()
+        );
+        assert!(
+            proposer
+                .ops
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|op| !matches!(op, RaftOp::SetNodeState { .. })),
+            "data-only verification cannot promote"
+        );
     }
 
     /// P0-4: a bootstrap that a failure cuts off records nothing and promotes

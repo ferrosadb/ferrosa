@@ -34,6 +34,7 @@ pub struct PairNode {
     pub(crate) coordinator: Arc<PairCoordinator>,
     pub(crate) peer_manager: Arc<PeerManager>,
     pub(crate) storage: Arc<StorageEngine>,
+    peer_host_id: Uuid,
 }
 
 /// Listener that logs peer events. PairNode handles events through
@@ -118,7 +119,29 @@ impl PairNode {
         storage: Arc<StorageEngine>,
     ) -> Self {
         #[allow(deprecated)]
-        let role = PairRole::elect(local_host_id, peer_host_id);
+        let role = match super::authority::PairAuthority::read(storage.data_dir(), local_host_id) {
+            Ok(None) => {
+                let elected = PairRole::elect(local_host_id, peer_host_id);
+                let primary = if elected == PairRole::Primary {
+                    local_host_id
+                } else {
+                    peer_host_id
+                };
+                if super::authority::PairAuthority::store(
+                    storage.data_dir(),
+                    local_host_id,
+                    peer_host_id,
+                    primary,
+                )
+                .is_ok()
+                {
+                    elected
+                } else {
+                    PairRole::Secondary
+                }
+            }
+            _ => PairRole::Secondary,
+        };
         let role_arc = Arc::new(ArcSwap::from_pointee(role));
         let state = Arc::new(RwLock::new(PairState::new(role, peer_host_id, peer_addr)));
 
@@ -129,14 +152,18 @@ impl PairNode {
             listener,
         ));
 
-        let coordinator = Arc::new(PairCoordinator::new(
-            role_arc.clone(),
-            peer_host_id,
-            storage.clone(),
-            peer_manager.clone(),
-        ));
+        let coordinator = Arc::new(
+            PairCoordinator::new(
+                role_arc.clone(),
+                peer_host_id,
+                storage.clone(),
+                peer_manager.clone(),
+            )
+            .with_strict_quorum(config.pair_quorum_strict),
+        );
 
         Self {
+            peer_host_id,
             config,
             net_config,
             local_host_id,
@@ -162,11 +189,15 @@ impl PairNode {
         ));
         registry.register(MsgType::PairCatchUp, catchup_handler);
 
-        let role_swap_handler = Arc::new(crate::pair::switchover::RoleSwapHandler::new(
+        let role_swap_handler = Arc::new(crate::pair::switchover::RoleSwapHandler::durable(
             self.local_host_id,
+            self.peer_host_id,
             self.role.clone(),
+            self.storage.data_dir().to_path_buf(),
+            self.coordinator.handoff_gate().clone(),
         ));
-        registry.register(MsgType::RoleSwap, role_swap_handler);
+        registry.register(MsgType::RoleSwap, role_swap_handler.clone());
+        registry.register(MsgType::PairAuthority, role_swap_handler);
 
         registry
     }
@@ -256,12 +287,14 @@ impl PairNode {
     /// Initiate a switchover: swap primary and secondary roles.
     /// Must be called on the current primary.
     pub async fn switchover(&self) -> Result<()> {
+        let _handoff = self.coordinator.handoff_gate().write().await;
         let peer_host_id = self.state.read().await.peer_host_id;
         crate::pair::switchover::initiate_switchover(
             &self.peer_manager,
             self.local_host_id,
             peer_host_id,
             &self.role,
+            self.storage.data_dir(),
         )
         .await
     }

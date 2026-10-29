@@ -198,6 +198,7 @@ pub struct DdlCoordinator {
     pub(crate) schema: Arc<Schema>,
     engine: Arc<StorageEngine>,
     peer_manager: Arc<PeerManager>,
+    handoff_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl DdlCoordinator {
@@ -214,7 +215,13 @@ impl DdlCoordinator {
             schema,
             engine,
             peer_manager,
+            handoff_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
+    }
+
+    pub(crate) fn with_handoff_gate(mut self, gate: Arc<tokio::sync::RwLock<()>>) -> Self {
+        self.handoff_gate = gate;
+        self
     }
 
     /// Route a DDL operation based on current role.
@@ -228,6 +235,7 @@ impl DdlCoordinator {
     /// not accept CQL connections, so this path only runs for internal
     /// operations.
     pub async fn coordinate_ddl(&self, op: DdlOperation) -> Result<()> {
+        let _admitted_ddl = self.handoff_gate.read().await;
         match **self.role.load() {
             PairRole::Primary => {
                 self.apply_ddl_locally(&op).await?;
@@ -238,7 +246,7 @@ impl DdlCoordinator {
                 }
                 Ok(())
             }
-            PairRole::Secondary => self.forward_ddl(&op).await,
+            PairRole::Secondary => Err(ClusterError::NotPrimary),
         }
     }
 
@@ -502,28 +510,6 @@ impl DdlCoordinator {
         )
         .await
         .map_err(|_| ClusterError::Internal("DDL replication timed out".into()))?
-        .map_err(ClusterError::Net)?;
-
-        match resp {
-            Message::PairDdlAck(_) => Ok(()),
-            other => Err(ClusterError::ReplicationFailed(format!(
-                "expected PairDdlAck, got {:?}",
-                other.msg_type()
-            ))),
-        }
-    }
-
-    /// Forward a DDL operation to the primary (as secondary) and wait for ACK
-    /// with timeout.
-    async fn forward_ddl(&self, op: &DdlOperation) -> Result<()> {
-        let body = op.to_bytes()?;
-        let resp = tokio::time::timeout(
-            DDL_RPC_TIMEOUT,
-            self.peer_manager
-                .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data),
-        )
-        .await
-        .map_err(|_| ClusterError::Internal("DDL forward to primary timed out".into()))?
         .map_err(ClusterError::Net)?;
 
         match resp {

@@ -1872,6 +1872,7 @@ impl ModeController {
         // without touching the controller (which this spawned task cannot borrow).
         let connected_peers_for_init = self.connected_peers.clone();
         let peer_dcs_for_init = self.peer_dcs.clone();
+        let peer_racks_for_init = self.peer_racks.clone();
         let seed_claim_for_init = self.seed_initialisation_claimed.clone();
         let ddl_path = self.ddl_path.clone();
         let mode_swap = self.mode.clone();
@@ -1885,7 +1886,7 @@ impl ModeController {
         // member set is fine here because it's only used for bookkeeping
         // (counts + iteration), NOT for token-ring construction (which is
         // now Raft-driven via the seed-authored JoinNode + AssignTokens).
-        let all_node_ids_for_bootstrap: Vec<u64> = std::iter::once(local_node_id)
+        let mut all_node_ids_for_bootstrap: Vec<u64> = std::iter::once(local_node_id)
             .chain(peers.iter().map(|(uuid, _)| uuid_to_node_id(*uuid)))
             .collect();
         let cluster_name = self.config.cluster_name.clone();
@@ -1939,6 +1940,10 @@ impl ModeController {
                 cluster_forward_lazy_raft,
             ),
         );
+        let cluster_forward_handler = Arc::new(super::membership::control::Handler::new(
+            self.self_weak.get().cloned().unwrap_or_default(),
+            cluster_forward_handler,
+        ));
         self.registry
             .register(MsgType::ClusterMembershipForward, cluster_forward_handler);
 
@@ -2702,11 +2707,12 @@ impl ModeController {
             // Non-seed nodes will receive their membership via AppendEntries
             // from the leader. This prevents CF-T17 (membership race from
             // independent initialize() calls with potentially different member lists).
-            let initialized_seed_membership = should_initialize_seed_membership(
+            let mut initialized_seed_membership = should_initialize_seed_membership(
                 was_seed,
                 has_recovered_membership,
                 has_recovered_topology_state,
             );
+            let mut initialized_peers = peers.clone();
             if initialized_seed_membership {
                 if let Err(e) = raft_arc.initialize(members).await {
                     // Some failures are expected (already initialized after a
@@ -2793,14 +2799,20 @@ impl ModeController {
                             "CL-76: this DC's membership completed while waiting for a \
                              leader — initialising the group now"
                         );
-                        if let Err(e) = raft_arc.initialize(members_now).await {
-                            tracing::warn!(
-                                %e,
-                                "CL-76: late raft.initialize failed — releasing the claim \
-                                 so a later iteration can retry"
-                            );
-                            seed_claim_for_init
-                                .store(false, std::sync::atomic::Ordering::Release);
+                        match raft_arc.initialize(members_now).await {
+                            Ok(()) => {
+                                // The exact successfully initialized scope owns topology
+                                // publication too; the earlier transition may know fewer peers.
+                                initialized_seed_membership = true;
+                                initialized_peers = local_peers;
+                                all_node_ids_for_bootstrap = std::iter::once(local_node_id)
+                                    .chain(initialized_peers.iter().map(|(id, _)| uuid_to_node_id(*id)))
+                                    .collect();
+                            }
+                            Err(e) => {
+                                tracing::warn!(%e, "late raft.initialize failed; releasing the claim so a later iteration can retry");
+                                seed_claim_for_init.store(false, std::sync::atomic::Ordering::Release);
+                            }
                         }
                     }
                 }
@@ -2997,17 +3009,18 @@ impl ModeController {
                             );
                         }
 
-                        for (peer_uuid, addr) in &peers {
+                        let initialized_dcs = peer_dcs_for_init.load_full();
+                        let initialized_racks = peer_racks_for_init.load_full();
+                        for (peer_uuid, addr) in &initialized_peers {
                             let peer_node_id = uuid_to_node_id(*peer_uuid);
-                            let peer_internode_broadcast =
-                                peer_internode_broadcasts.get(peer_uuid).cloned().flatten();
+                            let peer_internode_broadcast = peer_manager_for_bootstrap.get_peer_internode_broadcast_sync(*peer_uuid);
                             let node_info = seed_join_node_info(
                                 *peer_uuid,
                                 *addr,
                                 peer_internode_broadcast.as_deref(),
-                                peer_cql_broadcasts.get(peer_uuid).cloned().flatten(),
-                                &peer_dc_map,
-                                &peer_racks,
+                                peer_manager_for_bootstrap.get_peer_cql_broadcast_sync(*peer_uuid),
+                                &initialized_dcs,
+                                &initialized_racks,
                                 (
                                     &config_for_promotion.data_center,
                                     &config_for_promotion.rack,
@@ -3046,10 +3059,25 @@ impl ModeController {
                             }
                         }
                         tracing::info!(
-                            peer_count = peers.len(),
+                            peer_count = initialized_peers.len(),
                             leader = lid,
                             "seed: submitted JoinNode + AssignTokens via Raft for every peer"
                         );
+                    }
+                    if !has_recovered_topology_state {
+                        let voters: Vec<_> = raft_arc.metrics().borrow().membership_config.membership().voter_ids().collect();
+                        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(formation_deadline_secs);
+                        loop {
+                            let topology_ready = ring_for_bootstrap.load().as_ref().as_ref().is_some_and(|ring| {
+                                voters.iter().all(|id| ring.get_node(*id).is_some_and(|info| info.state.is_voter()) && !ring.tokens_for_node(*id).is_empty())
+                            });
+                            if topology_ready { break; }
+                            if tokio::time::Instant::now() >= deadline {
+                                tracing::error!(voters = voters.len(), "initial voter topology did not publish token ownership; refusing client admission");
+                                return;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        }
                     }
                     // Register the cluster DDL forward handler so that when a
                     // non-leader forwards a PairDdlForward to the leader, the
@@ -3060,6 +3088,7 @@ impl ModeController {
                         peer_manager_for_ddl.clone(),
                         node_map_for_ddl.clone(),
                     ));
+                    let cluster_ddl_handler=Arc::new(super::membership::control::DdlHandler(cluster_ddl_handler));
                     registry.register(MsgType::PairDdlForward, cluster_ddl_handler);
 
                     ddl_path.store(Arc::new(DdlPath::Cluster {

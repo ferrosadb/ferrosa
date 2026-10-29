@@ -514,7 +514,11 @@ pub struct CommitLog {
     /// Segment IDs that have been successfully archived to S3.
     /// Used by `discard_completed()` to gate segment deletion when
     /// archiving is enabled.
-    archived: Mutex<HashSet<u64>>,
+    archived: Arc<Mutex<HashSet<u64>>>,
+    /// Serializes rotation through final flush and closed-list publication.
+    rotation: Mutex<()>,
+    /// Strict pair mode retains every unarchived segment before admission.
+    strict_archive: std::sync::atomic::AtomicBool,
 
     /// Channel sender for notifying the archiver of closed segments.
     /// None when archiving is disabled.
@@ -605,7 +609,9 @@ impl CommitLog {
             closed_segments: Mutex::new(Vec::new()),
             sync_strategy,
             next_segment_id: AtomicU64::new(first_segment_id + 1),
-            archived: Mutex::new(HashSet::new()),
+            archived: Arc::new(Mutex::new(HashSet::new())),
+            rotation: Mutex::new(()),
+            strict_archive: std::sync::atomic::AtomicBool::new(false),
             archive_tx: None,
             cdc: ArcSwapOption::empty(),
         })
@@ -1012,37 +1018,25 @@ impl CommitLog {
         // allocate_and_begin_write() increments in_flight_writers BEFORE the CAS,
         // closing the window where flush could read partially-written data.
         let alloc_start = Instant::now();
-        let (segment, offset) = {
-            let seg = self.active.load_full();
-            match seg.allocate_and_begin_write(total_size) {
-                Some(offset) => (seg, offset),
-                None => {
-                    // Segment is full — rotate (serialized) and retry.
-                    drop(seg);
-                    let rotate_start = Instant::now();
-                    self.force_rotate()?;
-                    COMMITLOG_APPEND_ROTATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    observe_duration(
-                        &COMMITLOG_APPEND_ROTATE_MICROS_TOTAL,
-                        &COMMITLOG_APPEND_ROTATE_MICROS_MAX,
-                        rotate_start.elapsed(),
-                    );
-                    let new_seg = self.active.load_full();
-                    let offset = match new_seg.allocate_and_begin_write(total_size) {
-                        Some(o) => o,
-                        None => {
-                            // Entry exceeds segment capacity. This happens when
-                            // a single mutation is larger than segment_size.
-                            // Return an error instead of panicking.
-                            return Err(ferrosa_common::Error::InvalidData(format!(
-                                "commit log entry ({total_size} bytes) exceeds \
-                                 segment capacity; increase segment_size"
-                            )));
-                        }
-                    };
-                    (new_seg, offset)
-                }
+        if total_size > self.max_entry_size() {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "commit log entry ({total_size} bytes) exceeds segment capacity; increase segment_size"
+            )));
+        }
+        let (segment, offset) = loop {
+            let segment = self.active.load_full();
+            if let Some(offset) = segment.allocate_and_begin_write(total_size) {
+                break (segment, offset);
             }
+            drop(segment);
+            let rotate_start = Instant::now();
+            self.force_rotate()?;
+            COMMITLOG_APPEND_ROTATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            observe_duration(
+                &COMMITLOG_APPEND_ROTATE_MICROS_TOTAL,
+                &COMMITLOG_APPEND_ROTATE_MICROS_MAX,
+                rotate_start.elapsed(),
+            );
         };
         observe_duration(
             &COMMITLOG_APPEND_ALLOC_MICROS_TOTAL,
@@ -1129,33 +1123,25 @@ impl CommitLog {
             Segment::entry_total_size_single_row(&table_id.keyspace, &table_id.table, key, row);
 
         let alloc_start = Instant::now();
-        let (segment, offset) = {
-            let seg = self.active.load_full();
-            match seg.allocate_and_begin_write(total_size) {
-                Some(offset) => (seg, offset),
-                None => {
-                    drop(seg);
-                    let rotate_start = Instant::now();
-                    self.force_rotate()?;
-                    COMMITLOG_APPEND_ROTATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    observe_duration(
-                        &COMMITLOG_APPEND_ROTATE_MICROS_TOTAL,
-                        &COMMITLOG_APPEND_ROTATE_MICROS_MAX,
-                        rotate_start.elapsed(),
-                    );
-                    let new_seg = self.active.load_full();
-                    let offset = match new_seg.allocate_and_begin_write(total_size) {
-                        Some(o) => o,
-                        None => {
-                            return Err(ferrosa_common::Error::InvalidData(format!(
-                                "commit log entry ({total_size} bytes) exceeds \
-                                 segment capacity; increase segment_size"
-                            )));
-                        }
-                    };
-                    (new_seg, offset)
-                }
+        if total_size > self.max_entry_size() {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "commit log entry ({total_size} bytes) exceeds segment capacity; increase segment_size"
+            )));
+        }
+        let (segment, offset) = loop {
+            let segment = self.active.load_full();
+            if let Some(offset) = segment.allocate_and_begin_write(total_size) {
+                break (segment, offset);
             }
+            drop(segment);
+            let rotate_start = Instant::now();
+            self.force_rotate()?;
+            COMMITLOG_APPEND_ROTATIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            observe_duration(
+                &COMMITLOG_APPEND_ROTATE_MICROS_TOTAL,
+                &COMMITLOG_APPEND_ROTATE_MICROS_MAX,
+                rotate_start.elapsed(),
+            );
         };
         observe_duration(
             &COMMITLOG_APPEND_ALLOC_MICROS_TOTAL,
@@ -1250,6 +1236,9 @@ impl CommitLog {
             if now_empty && segment.id != active_id {
                 let dominated_by_archive = match &self.config.archive {
                     Some(cfg) if cfg.enabled => self.archived.lock().contains(&segment.id),
+                    _ if self.strict_archive.load(Ordering::Acquire) => {
+                        self.archived.lock().contains(&segment.id)
+                    }
                     _ => true,
                 };
                 if dominated_by_archive {
@@ -1307,6 +1296,9 @@ impl CommitLog {
             }
             let dominated_by_archive = match &self.config.archive {
                 Some(cfg) if cfg.enabled => self.archived.lock().contains(&segment.id),
+                _ if self.strict_archive.load(Ordering::Acquire) => {
+                    self.archived.lock().contains(&segment.id)
+                }
                 _ => true,
             };
             if dominated_by_archive {
@@ -1330,6 +1322,37 @@ impl CommitLog {
         }
 
         Ok(count)
+    }
+
+    /// Enable retention before admitting a strict write. Remains enabled until
+    /// shutdown: a cancelled/failed upload must never unpin an unarchived WAL.
+    pub fn retain_for_archive(&self) {
+        self.strict_archive.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn archive_tracking(&self) -> Arc<Mutex<HashSet<u64>>> {
+        self.archived.clone()
+    }
+
+    /// Rotate and return all retained closed segments awaiting publication.
+    pub fn close_for_archive(&self) -> ferrosa_common::Result<Vec<u64>> {
+        self.force_rotate()?;
+        let closed = self.closed_segments.lock().clone();
+        for segment in &closed {
+            segment.flush_to_disk()?;
+            segment.close_file_handle();
+            segment.release_buffer();
+        }
+        let archived = self.archived.lock();
+        let mut ids: Vec<_> = self
+            .closed_segments
+            .lock()
+            .iter()
+            .map(|segment| segment.id)
+            .filter(|id| !archived.contains(id))
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
     }
 
     /// Marks a segment as archived to S3.
@@ -1415,10 +1438,11 @@ impl CommitLog {
     /// Allocates a new segment, atomically swaps it in via `ArcSwap`, and moves
     /// the old segment to the `closed_segments` list.
     ///
-    /// If multiple threads race here, each creates a segment — the extras are
-    /// empty but harmless. No data is lost because each writer holds its own
-    /// `Arc<Segment>` paired with its CAS-allocated offset (see `append()`).
+    /// Rotation is serialized through the final flush and closed-list update.
+    /// Sealing prevents delayed old `Arc<Segment>` holders from allocating
+    /// after the final snapshot; already admitted writers drain before it.
     pub fn force_rotate(&self) -> ferrosa_common::Result<()> {
+        let _rotation = self.rotation.lock();
         let new_id = self.next_segment_id.fetch_add(1, Ordering::AcqRel);
         let new_segment = Arc::new(Segment::with_sync_mode(
             new_id,
@@ -1429,20 +1453,21 @@ impl CommitLog {
 
         // Swap the new segment in and get the old one.
         let old_segment = self.active.swap(new_segment);
+        old_segment.seal_writes();
 
         // Flush the old segment to disk before archiving, then release the
         // file descriptor and the 32 MB write buffer.  The data is fully on
         // disk; retaining the buffer while waiting for discard_completed() to
         // run GC causes unbounded memory growth when GC stalls (OOM bug).
-        old_segment.flush_to_disk()?;
+        let flushed = old_segment.flush_to_disk();
+        // Publish only after the flush attempt, preserving ordinary GC order.
+        // Failed segments retain their buffer so a later strict barrier retries.
+        self.closed_segments.lock().push(old_segment.clone());
+        flushed?;
         old_segment.close_file_handle();
         old_segment.release_buffer();
 
-        // Move old segment to closed list.
         let old_id = old_segment.id;
-        let mut closed = self.closed_segments.lock();
-        closed.push(old_segment);
-        drop(closed);
 
         // Notify archiver of the closed segment (non-blocking). A segment the
         // archiver never hears about is never archived, and with archiving
@@ -1686,6 +1711,41 @@ mod tests {
             }],
             timestamp: 42_000,
         }
+    }
+
+    #[test]
+    fn strict_archive_rotation_seals_delayed_old_segment_holders() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = CommitLog::new(Config::test_config(dir.path())).unwrap();
+        let delayed = log.active.load_full();
+        log.append(&simple_mutation()).unwrap();
+        log.force_rotate().unwrap();
+        assert!(delayed
+            .allocate_and_begin_write(Segment::entry_total_size(&simple_mutation()))
+            .is_none());
+        log.append(&simple_mutation()).unwrap();
+        log.shutdown().unwrap();
+    }
+
+    #[test]
+    fn strict_archive_retains_wal_without_the_optional_background_archiver() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config::test_config(dir.path());
+        assert!(config.archive.is_none());
+        let log = CommitLog::new(config).unwrap();
+        log.retain_for_archive();
+        let position = log.append(&simple_mutation()).unwrap();
+        let closed_path = log.active.load().path().to_path_buf();
+        log.force_rotate().unwrap();
+        let table = TableId::new("test_ks", "test_table");
+        log.discard_completed(&table, position).unwrap();
+        log.discard_completed_segments().unwrap();
+        assert!(closed_path.exists());
+        assert_eq!(log.close_for_archive().unwrap().len(), 2);
+        log.mark_archived(position.segment_id);
+        log.discard_completed_segments().unwrap();
+        assert!(!closed_path.exists());
+        log.shutdown().unwrap();
     }
 
     #[test]

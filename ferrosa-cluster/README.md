@@ -7,6 +7,18 @@ ID for each encoded mutation. `tests/single_row_encode.rs` checks wire bytes,
 cached key tokens and the borrowed input's identity. Hex diagnostics use a
 table-driven encoder while retaining the previous lowercase, padded output.
 
+`cargo run --release -p ferrosa-cluster --example replica_scope_probe` checks
+in-place replica eligibility selection for allocations, buffer retention and
+release timing. This measures selection only, not complete query latency.
+
+The live archive test `strict_pair_live_s3_ack_replays_exact_mutation` is gated
+by `live-infra-tests`; credential-free PR, nightly fuzz and local mirror lanes
+exclude it explicitly. It requires `FERROSA_TEST_FLY=1`, an explicitly disposable
+`FERROSA_LIVE_S3_TEST_BUCKET` beginning `ferrosa-strict-verify-`,
+`FERROSA_LIVE_S3_TEST_ENDPOINT`, and AWS credentials/region. It verifies two
+strict ACKs, conditional manifest publication and exact remote WAL bytes before
+removing its test-prefix objects. Default tests never provision cloud resources.
+
 > The distribution layer: Raft metadata consensus (openraft), tunable-consistency
 > read/write coordination, the cluster-formation state machine, anti-entropy
 > repair, hinted handoff, and Accord strict-serializable transactions.
@@ -25,6 +37,15 @@ token ring and a Raft-replicated metadata state machine:
 2. **Read/write coordination** (`coordinator/`) — fans writes and reads out to
    replicas with tunable CQL consistency-level (CL) enforcement, write
    backpressure, read repair, batchlog, and range/streaming reads.
+   NTS QUORUM requires a replica majority in the origin DC and replica majorities
+   in a strict majority of configured DCs; LOCAL_QUORUM requires only the origin.
+   Partitions do not reduce these configured denominators. Point reads reconcile
+   differing responder data before returning a quorum result.
+   Configured NTS range scans and COUNT validate origin/DC quorum obligations
+   for every token ownership scope against one pinned ring snapshot, then merge
+   bounded replica fragments; a selected-source interruption fails the scan.
+   NTS read/write targets share CL role eligibility and count each physical host
+   UUID once; conflicting DC labels in a selected scope fail closed.
 3. **Cluster formation** (`controller/`, `mode.rs`, `ring/`, `pair/`) — the
    `ModeController` state machine drives `Standalone → Pair → Forming → Cluster`,
    the token ring computes replicas (SimpleStrategy / NetworkTopologyStrategy),
@@ -1238,3 +1259,57 @@ Storage schemas now persist the authoritative UUID in the reserved `ferrosa.tabl
 ## Single-row COUNT pushdown
 
 The single-row liveness-count route follows the same consistency/replication selection as range reads. When the selected read needs no remote replica it invokes the exact local metadata counter; otherwise it counts the existing consistency-merged partition stream and applies row visibility. Remote errors propagate; they never become a local-only or zero count. Remote reconciliation can still decode payloads: the metadata-only optimization applies to the local route.
+
+
+Pair authority is durable in `pair-authority.json` from initial pairing onward,
+with peer identities, owner and monotonic generation. Every known pair member
+restarts with client writes and DDL fenced; UUID ordering is only initial
+bootstrap selection. A restarted member needs a fresh versioned handoff or
+explicit operator promotion. This deliberately sacrifices automatic recovery
+when offline promotion cannot be ruled out; recorded ownership alone cannot
+prove a peer has not been promoted while this node was down.
+
+Switchover requires capability `CAP_PAIR_AUTHORITY` and uses the distinct
+`PairAuthority` RPC (`0x4C`): prepare a fresh receiver challenge, withdraw and
+persist sender ownership, then grant the next generation. The receiver persists
+before opening its writer and consumes the challenge once. Wrong peers,
+malformed messages, replayed grants and legacy `RoleSwap` cannot promote.
+Timeout/cancellation after withdrawal leaves the sender fenced. The same
+handoff gate drains admitted writes and DDL and is retained across re-pairing.
+Reconnect takes this gate before choosing or installing a role; a busy transfer
+or admitted write defers reconnect without consuming operator promotion state.
+Mixed-version handoff fails with an upgrade error. Replica promotion remains an
+explicit operator decision requiring the previous primary to be unable to write;
+partition detection never automatically promotes it. Automatic reconciliation of
+two restarted peers is not implemented.
+
+
+Pair singleton QUORUM defaults to a local WAL fsync before ACK. Set
+`FERROSA_PAIR_QUORUM_STRICT=true` to require the surviving writable primary to
+upload closed WAL and publish the PITR archive manifest before ACK when the
+follower does not durably ACK. Invalid explicit values fail startup. The flag
+also applies to LOCAL_QUORUM and pair batches; ONE remains local. RF2 ALL/TWO
+still require a durable follower ACK. Authority and handoff fencing apply in
+both modes. A configured shared S3 backend is required for the singleton strict
+barrier; `file://` cannot satisfy it. No separate background-archive opt-in is
+needed. Healthy follower ACKs avoid a forced S3 upload.
+
+Strict mode conservatively retains unarchived WAL for the engine lifetime;
+failed/cancelled publication cannot unpin it. Long healthy-follower periods or
+archive outages can grow retained WAL and eventually trigger disk admission
+limits. Strict latency includes S3 upload and manifest publication. Pair
+`WritePath::write_batch` preserves its existing per-mutation application shape
+while propagating caller consistency; `coordinate_batch_with` applies an atomic
+local batch and requires each replicated mutation to ACK when two copies are
+required. This does not provide a cross-node atomic visibility transaction.
+
+
+Keyed scalar index reads now treat replica postings as candidates. Each candidate tracks its own distinct positive responders under the configured
+consistency/DC certificate. Healthy certified rows use their merged payloads;
+ambiguous positives obtain a canonical exact-row certificate. Both paths check
+the declared predicate. Empty posting responses can
+therefore invalidate stale positives after a quorum-acknowledged value change.
+Fallback verification reads exactly one clustering row at a time. Healthy
+positive certificates add no row-refetch RPCs; ambiguous candidates add canonical
+read/repair work proportional to candidate count.
+The existing point-read planner and wire shapes are unchanged.

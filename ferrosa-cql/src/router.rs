@@ -3155,6 +3155,11 @@ pub async fn route_transactional(
     shim: &mut Option<crate::txn_registry::CqlTxnId>,
     now: std::time::Instant,
 ) -> Option<Result<RouteResult, CqlError>> {
+    if !replica_read_statement(stmt) {
+        if let Some(error) = replica_write_error(state) {
+            return Some(Err(error));
+        }
+    }
     let owner = ctx.auth.role.as_str();
     match stmt {
         Statement::BeginTransaction { timeout_ms } => {
@@ -4059,11 +4064,48 @@ async fn finish_lwt_via_accord(
 // ── Main dispatch ────────────────────────────────────────────────────────
 
 /// Route a parsed statement to the appropriate handler.
+/// Connection admission permits replica reads; mutation authority is checked
+/// before dispatch, including paths that bypass the ordinary write coordinator.
+fn replica_write_error(state: &SharedState) -> Option<CqlError> {
+    use ferrosa_cluster::mode::DeploymentMode;
+    if matches!(
+        state.mode_controller.mode(),
+        DeploymentMode::Pair | DeploymentMode::DegradedPair
+    ) && state.mode_controller.role() != Some(ferrosa_cluster::pair::PairRole::Primary)
+    {
+        Some(CqlError::Overloaded(
+            "writes disallowed on read replica; connect to the primary node".into(),
+        ))
+    } else {
+        None
+    }
+}
+
+fn replica_read_statement(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(_)
+        | Statement::Use(_)
+        | Statement::Explain(_)
+        | Statement::ListRoles { .. }
+        | Statement::ListPermissions { .. }
+        | Statement::Subscribe(_)
+        | Statement::Unsubscribe { .. }
+        | Statement::Rollback { .. } => true,
+        Statement::InTransaction { inner, .. } => replica_read_statement(inner),
+        _ => false,
+    }
+}
+
 pub async fn route(
     state: &SharedState,
     ctx: &RequestContext<'_>,
     stmt: Statement,
 ) -> Result<RouteResult, CqlError> {
+    if !replica_read_statement(&stmt) {
+        if let Some(error) = replica_write_error(state) {
+            return Err(error);
+        }
+    }
     // Classify the statement opcode for metrics before matching.
     let opcode = match &stmt {
         Statement::Select(_) => CqlOpcode::Select,
@@ -9174,6 +9216,9 @@ pub async fn route_prepared_insert_fast(
     s: &InsertStatement,
     bound_terms: &[Term],
 ) -> Option<Result<RouteResult, CqlError>> {
+    if let Some(error) = replica_write_error(state) {
+        return Some(Err(error));
+    }
     if s.if_not_exists || s.columns.len() != s.values.len() {
         return None;
     }
@@ -17461,6 +17506,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_pair_rejects_inline_prepared_and_conditional_mutations_before_execution() {
+        let (mut state, _dir) = setup();
+        let auth = dev_auth();
+        let keyspace = None;
+        let ctx = test_ctx(&auth, &keyspace);
+        for query in [
+            "CREATE KEYSPACE ro WITH replication = {'class':'SimpleStrategy','replication_factor':2}",
+            "CREATE TABLE ro.kv (k int PRIMARY KEY, v int)",
+        ] {
+            route(&state, &ctx, crate::parser::parse(query).unwrap()).await.unwrap();
+        }
+        let net = Arc::new(ferrosa_net::config::NetConfig::default());
+        let local = uuid::Uuid::from_u128(2);
+        let (controller, handles) = ferrosa_cluster::ModeController::new(
+            Arc::new(ferrosa_cluster::ClusterConfig::default()),
+            net.clone(),
+            local,
+            state.engine.clone(),
+            state.schema.clone(),
+            Arc::new(ferrosa_net::rpc::HandlerRegistry::new()),
+        );
+        controller.set_peer_manager(Arc::new(
+            ferrosa_net::peer::PeerManager::with_weak_listener(
+                net,
+                local,
+                controller.as_peer_listener(),
+            ),
+        ));
+        ferrosa_net::peer::PeerEventListener::on_peer_connected(
+            &*controller,
+            (uuid::Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap()),
+        );
+        let core = Arc::get_mut(&mut state.core).expect("fixture has one session core owner");
+        core.mode_controller = controller;
+        core.write_path = handles.write_path;
+        core.ddl_path = handles.ddl_path;
+        core.cluster_state = handles.cluster_state;
+        for query in [
+            "INSERT INTO ro.kv (k,v) VALUES (1,2)",
+            "UPDATE ro.kv SET v=3 WHERE k=1",
+            "DELETE FROM ro.kv WHERE k=1",
+            "INSERT INTO ro.kv (k,v) VALUES (1,2) IF NOT EXISTS",
+            "TRUNCATE ro.kv",
+            "DROP TABLE ro.kv",
+            "CREATE TABLE ro.forbidden (k int PRIMARY KEY)",
+        ] {
+            let result = route(&state, &ctx, crate::parser::parse(query).unwrap()).await;
+            assert!(
+                matches!(&result, Err(CqlError::Overloaded(message)) if message.contains("read replica")),
+                "{query}: replica must reject before executing any mutation: {:?}",
+                result.as_ref().err()
+            );
+        }
+        let Statement::Insert(insert) =
+            crate::parser::parse("INSERT INTO ro.kv (k,v) VALUES (?,?)").unwrap()
+        else {
+            panic!("insert fixture")
+        };
+        let fast = route_prepared_insert_fast(
+            &state,
+            &ctx,
+            &insert,
+            &[Term::IntegerLiteral(1), Term::IntegerLiteral(2)],
+        )
+        .await;
+        assert!(
+            matches!(fast, Some(Err(CqlError::Overloaded(_)))),
+            "prepared fast path must reject replica writes"
+        );
+        let block = crate::parser::parse(
+            "BEGIN TRANSACTION; INSERT INTO ro.kv (k,v) VALUES (2,3); COMMIT;",
+        )
+        .unwrap();
+        let mut shim = None;
+        let transaction =
+            route_transactional(&state, &ctx, &block, &mut shim, std::time::Instant::now()).await;
+        assert!(
+            matches!(transaction, Some(Err(CqlError::Overloaded(_)))),
+            "transaction dispatch must reject replica mutations before staging"
+        );
+        let selected = route(
+            &state,
+            &ctx,
+            crate::parser::parse("SELECT * FROM ro.kv WHERE k=1").unwrap(),
+        )
+        .await;
+        assert!(
+            selected.is_ok(),
+            "replica reads must remain usable: {:?}",
+            selected.as_ref().err()
+        );
+    }
+
+    #[tokio::test]
     async fn ddl_emits_schema_change_event_for_create_keyspace() {
         let (state, _dir) = setup();
         let auth = dev_auth();
@@ -22938,11 +23077,10 @@ mod tests {
         }
     }
 
-    /// T-300 gate REMOVED (CQL-T300-01): jsonb DDL is permitted in EVERY
-    /// deployment mode with no capability input. The former "refused outside
-    /// standalone, naming the mode and the D15a ledger" rule is gone.
+    /// JSONB itself has no deployment-mode capability gate. Pair write
+    /// authority still applies when a fixture has no primary grant.
     #[tokio::test]
-    async fn jsonb_ddl_is_permitted_in_every_deployment_mode() {
+    async fn jsonb_ddl_respects_authority_in_every_deployment_mode() {
         use ferrosa_common::deployment_mode::DeploymentMode;
         let (state, _dir) = jsonb_ddl_setup().await;
         let ks_name: Option<String> = Some("ks".into());
@@ -22982,6 +23120,14 @@ mod tests {
             ];
             for cql in cases {
                 let stmt = crate::parser::parse(&cql).unwrap();
+                if matches!(mode, DeploymentMode::Pair | DeploymentMode::DegradedPair) {
+                    let error = route(&state, &ks_ctx, stmt)
+                        .await
+                        .err()
+                        .expect("pair without primary authority must reject DDL");
+                    assert!(matches!(error, CqlError::Overloaded(_)), "{mode}: {error}");
+                    continue;
+                }
                 route(&state, &ks_ctx, stmt)
                     .await
                     .unwrap_or_else(|e| panic!("{mode}: jsonb DDL must be permitted: {cql}: {e}"));

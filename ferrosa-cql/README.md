@@ -26,6 +26,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 
 ## What's implemented
 
+- Pair read replicas accept native CQL read connections. Inline, prepared,
+  conditional and transactional mutations are rejected with `Overloaded` before
+  execution or forwarding; clients must send writes to the primary. A persisted
+  authority fence still prevents admission until the node is safely recovered.
 - **TCP server** (`server.rs`) — accept loop, per-connection Tokio task, optional
   rustls TLS, per-IP and global connection caps, per-connection in-flight
   semaphore returning `Overloaded` on saturation, `auth_disabled` resolution.

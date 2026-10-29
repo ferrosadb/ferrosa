@@ -374,6 +374,7 @@ jobs:
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
                --skip replicated_jsonb_index_builds_on_every_node \
+               --skip strict_pair_live_s3_ack_replays_exact_mutation \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \

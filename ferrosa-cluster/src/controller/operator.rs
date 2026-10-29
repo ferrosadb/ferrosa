@@ -12,11 +12,90 @@ use crate::write_path::WritePath;
 use super::{ClusterStateHolder, ModeController};
 
 impl ModeController {
-    /// Force-promote this node to standalone primary.
+    /// Operator-confirmed promotion; a former pair remains a logical pair.
     ///
     /// Use when the peer is unreachable and the operator wants to resume writes.
     /// Subsequent peer reconnection will auto re-pair with this node as primary.
     pub fn force_promote(&self) -> Result<()> {
+        let _transition = self.transition_guard.lock();
+        if matches!(
+            self.mode(),
+            DeploymentMode::Cluster | DeploymentMode::DegradedCluster | DeploymentMode::Forming
+        ) {
+            return Err(ClusterError::ModeTransitionRejected(
+                "pair promotion cannot bypass Raft membership".into(),
+            ));
+        }
+        if self.pair_context.lock().is_none() {
+            if let Some(record) = crate::pair::authority::PairAuthority::read(
+                self.storage.data_dir(),
+                self.local_host_id,
+            )? {
+                // A restarted pair is still RF2, even before any peer reconnects.
+                // The address is unknown until connection; no dial is attempted here.
+                if self.peer_manager.load().is_none() {
+                    return Err(ClusterError::PairWriteUnavailable);
+                }
+                self.transition_to_pair(
+                    record.peer,
+                    "0.0.0.0:0".parse().expect("literal address"),
+                    false,
+                );
+                if self.pair_context.lock().is_none() {
+                    return Err(ClusterError::PairWriteUnavailable);
+                }
+            }
+        }
+        let context = self
+            .pair_context
+            .lock()
+            .as_ref()
+            .map(|ctx| (ctx.role.clone(), ctx.peer_host_id));
+        if let Some((role, peer)) = context {
+            let coordinator = match &**self.write_path.load() {
+                WritePath::Pair(coordinator) | WritePath::DegradedPair(coordinator) => {
+                    coordinator.clone()
+                }
+                _ => return Err(ClusterError::PairWriteUnavailable),
+            };
+            let _authority_gate = coordinator.handoff_gate().try_write()
+                .map_err(|_| ClusterError::ModeTransitionRejected("pair authority transfer or admitted write in progress; retry operator promotion".into()))?;
+            let peer_manager = match &**self.peer_manager.load() {
+                Some(peer_manager) => peer_manager.clone(),
+                None => return Err(ClusterError::PairWriteUnavailable),
+            };
+            let ddl = Arc::new(
+                crate::pair::ddl::DdlCoordinator::new(
+                    role.clone(),
+                    peer,
+                    self.schema.clone(),
+                    self.storage.clone(),
+                    peer_manager,
+                )
+                .with_handoff_gate(coordinator.handoff_gate().clone()),
+            );
+            crate::pair::authority::PairAuthority::store(
+                self.storage.data_dir(),
+                self.local_host_id,
+                peer,
+                self.local_host_id,
+            )?;
+            let epoch = self.promote_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+            role.store(Arc::new(crate::pair::PairRole::Primary));
+            self.write_path
+                .store(Arc::new(WritePath::pair(coordinator.clone())));
+            self.ddl_path.store(Arc::new(DdlPath::Pair(ddl)));
+            self.force_mode_override(
+                DeploymentMode::Pair,
+                "operator-confirmed pair promotion; RF retained",
+            );
+            self.force_promoted.store(true, Ordering::Release);
+            tracing::info!(
+                epoch,
+                "operator promoted pair survivor; ALL still requires follower"
+            );
+            return Ok(());
+        }
         let epoch = self.promote_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         self.write_path
             .store(Arc::new(WritePath::direct(self.storage.clone())));
@@ -338,15 +417,13 @@ impl ModeController {
         Ok(())
     }
 
-    /// Returns the current promote epoch (Lamport counter).
-    ///
-    /// Used during reconnect handshake: the node with the higher epoch
-    /// becomes primary. If equal, UUID comparison breaks the tie.
+    /// Returns the process-local operator-promotion counter.
+    /// This telemetry never elects a pair owner on reconnect.
     pub fn promote_epoch(&self) -> u64 {
         self.promote_epoch.load(Ordering::SeqCst)
     }
 
-    /// Set the promote epoch (used when receiving a higher epoch from a peer).
+    /// Set promotion telemetry without changing pair ownership.
     pub fn set_promote_epoch(&self, epoch: u64) {
         self.promote_epoch.store(epoch, Ordering::SeqCst);
     }
@@ -361,6 +438,11 @@ impl ModeController {
     /// Promoting a peer that is behind makes it serve wrong answers -- a
     /// written value read back as null.
     pub async fn switchover(&self) -> Result<()> {
+        let coordinator = match &**self.write_path.load() {
+            WritePath::Pair(coordinator) => coordinator.clone(),
+            _ => return Err(ClusterError::NotPrimary),
+        };
+        let _handoff = coordinator.handoff_gate().write().await;
         let (role_arc, peer_host_id, catch_up) = {
             let ctx = self.pair_context.lock();
             let ctx = ctx.as_ref().ok_or(ClusterError::ModeTransitionRejected(
@@ -390,6 +472,7 @@ impl ModeController {
             self.local_host_id,
             peer_host_id,
             &role_arc,
+            self.storage.data_dir(),
         )
         .await
     }

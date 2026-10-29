@@ -3,6 +3,7 @@
 
 pub mod batch;
 pub mod cl_routing;
+mod dc_quorum;
 pub mod fulltext_coverage;
 pub mod fulltext_stream;
 pub mod metrics;

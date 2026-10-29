@@ -8910,6 +8910,141 @@ impl<F: FlushTarget> TableStore<F> {
         })
     }
 
+    /// Re-evaluate a candidate against the current scalar index declaration.
+    /// Used after canonical row reconciliation as well as local posting lookup.
+    /// The caller supplies a deletion-reconciled row; no data scan occurs here.
+    pub fn index_row_matches(
+        &self,
+        index_name: &str,
+        query: &IndexKey,
+        key: &DecoratedKey,
+        row: &Row,
+    ) -> Result<bool> {
+        let catalog = self.catalog();
+        let (family, position, kind, predicate) =
+            catalog.scalar_definition(index_name).ok_or_else(|| {
+                ferrosa_common::Error::InvalidData(format!(
+                    "index {index_name} has no scalar row predicate"
+                ))
+            })?;
+        if matches!(kind, IndexType::Vector | IndexType::FullText) {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "{kind} cannot verify scalar index rows"
+            )));
+        }
+        let schema = self.schema.load();
+        if !schema.clustering_columns.is_empty() && row.clustering.is_empty() {
+            return Err(ferrosa_common::Error::InvalidData(
+                "empty clustered index rows are unsupported by the current writer contract".into(),
+            ));
+        }
+
+        if family == 0 && position < schema.static_columns.len()
+            || predicate.is_some_and(|p| {
+                p.clauses
+                    .iter()
+                    .any(|clause| clause.column_position < schema.static_columns.len())
+            })
+        {
+            return Err(ferrosa_common::Error::InvalidData(
+                "static-column index predicates require a canonical static-row read".into(),
+            ));
+        }
+        if kind == IndexType::Filtered && predicate.is_none() {
+            return Err(ferrosa_common::Error::InvalidData(format!(
+                "filtered index {index_name} has no predicate"
+            )));
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .min(i32::MAX as u64) as i32;
+        let cell_value = |position: usize| {
+            row.cells
+                .iter()
+                .find(|(ordinal, _)| usize::from(*ordinal) == position)
+                .filter(|(_, cell)| {
+                    cell.timestamp >= row.deletion.marked_for_delete_at
+                        && ferrosa_row_bridge::cell_is_live(cell, now)
+                })
+                .and_then(|(_, cell)| cell.value.as_deref())
+        };
+        if predicate
+            .is_some_and(|predicate| !ferrosa_index::evaluate_predicate_row(predicate, cell_value))
+        {
+            return Ok(false);
+        }
+        let encode_matches = |value: &[u8]| match kind {
+            // These index families use identity encoding. Equality borrows both
+            // sides; allocating two full cell copies here adds no information.
+            IndexType::BTree | IndexType::Hash | IndexType::Composite | IndexType::Filtered => {
+                Ok(value == query.0.as_slice())
+            }
+            IndexType::Phonetic | IndexType::Geo => {
+                let encoded_query = crate::index::scheduler::encode_index_key(kind, &query.0)
+                    .map_err(ferrosa_common::Error::InvalidData)?;
+                let Some(encoded_query) = encoded_query else {
+                    return Ok(false);
+                };
+                crate::index::scheduler::encode_index_key(kind, value)
+                    .map(|encoded| encoded.as_ref() == Some(&encoded_query))
+                    .map_err(ferrosa_common::Error::InvalidData)
+            }
+            IndexType::Vector | IndexType::FullText => Err(ferrosa_common::Error::InvalidData(
+                "non-scalar index does not support scalar equality".into(),
+            )),
+        };
+        match family {
+            0 => {
+                if row
+                    .cells
+                    .iter()
+                    .any(|(ordinal, cell)| usize::from(*ordinal) == position && cell.path.is_some())
+                {
+                    return Err(ferrosa_common::Error::InvalidData(
+                        "complex-cell scalar index predicates are unsupported".into(),
+                    ));
+                }
+                cell_value(position).map_or(Ok(false), encode_matches)
+            }
+            1 | 2 => {
+                let live_key = row.primary_key_liveness.timestamp != i64::MIN
+                    && row.primary_key_liveness.timestamp >= row.deletion.marked_for_delete_at
+                    && !(row.primary_key_liveness.has_ttl()
+                        && ferrosa_row_bridge::ldt_is_expired(
+                            row.primary_key_liveness.local_deletion_time,
+                            now,
+                        ));
+                if !live_key
+                    && !row
+                        .cells
+                        .iter()
+                        .any(|(ordinal, _)| cell_value(usize::from(*ordinal)).is_some())
+                {
+                    return Ok(false);
+                }
+                let components = if family == 1 {
+                    ferrosa_row_bridge::decode_clustering(
+                        &row.clustering,
+                        schema.clustering_columns.len(),
+                    )
+                } else {
+                    ferrosa_row_bridge::decode_pk(key, self.partition_key_column_count())
+                };
+                let value = components.get(position).ok_or_else(|| {
+                    ferrosa_common::Error::InvalidData(format!(
+                        "index {index_name} key component {position} is missing"
+                    ))
+                })?;
+                encode_matches(value)
+            }
+            _ => Err(ferrosa_common::Error::InvalidData(
+                "unknown scalar index key family".into(),
+            )),
+        }
+    }
+
     /// Query by secondary index restricted to ONE partition (t_430c4188):
     /// looks up the index key in the memtable index and all SSTable sidecar
     /// indexes, keeps only the postings whose `RowPosition.partition_key`
@@ -8963,6 +9098,7 @@ impl<F: FlushTarget> TableStore<F> {
                 )));
             }
         };
+        let query_key = key;
         let key = &lookup_key;
 
         let mut positions: Vec<RowPosition> = Vec::new();
@@ -9009,16 +9145,32 @@ impl<F: FlushTarget> TableStore<F> {
         let dk = DecoratedKey::new(ferrosa_common::key::PartitionKey::new(
             partition_key.to_vec(),
         ));
+        let partition_wide = self.partition_key_index_def(index_name).is_some();
+        let clustered = self.clustering_column_count() > 0;
         let mut partitions = Vec::new();
         for pos in &positions {
-            let read = if pos.clustering_key.is_empty() {
+            if clustered && pos.clustering_key.is_empty() && !partition_wide {
+                return Err(ferrosa_common::Error::InvalidData(
+                    "empty clustered index posting is unsupported; refusing a partition-wide fallback".into(),
+                ));
+            }
+            let read = if partition_wide {
                 self.read(&dk)
             } else {
                 self.read_clustering_row(&dk, &pos.clustering_key)
             };
             let partition = read?;
-            if let Some(partition) = partition {
-                partitions.push(partition);
+            if let Some(mut partition) = partition {
+                let mut matching = Vec::with_capacity(partition.rows.len());
+                for row in partition.rows.drain(..) {
+                    if self.index_row_matches(index_name, query_key, &dk, &row)? {
+                        matching.push(row);
+                    }
+                }
+                partition.rows = matching;
+                if !partition.rows.is_empty() {
+                    partitions.push(partition);
+                }
             }
         }
 
@@ -12147,6 +12299,60 @@ mod tests {
             Some(want)
         );
         assert_eq!(sstable_compaction_component_size(table.path(), "12"), None);
+    }
+
+    #[test]
+    fn keyed_index_empty_clustered_posting_refuses_before_partition_fallback() {
+        let store = TableStore::new_with_indexes(
+            test_schema(),
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("val_idx".into(), 0)],
+        );
+        let key = make_key("key");
+        store.write(&key, make_row_with_ck(7, b"X", 10)).unwrap();
+        // Simulate an unsupported/corrupt persisted posting, not an accepted
+        // empty clustering write. It must not trigger a whole partition read.
+        store.get_memtable_index("val_idx").unwrap().insert(
+            IndexKey(b"X".to_vec()),
+            RowPosition {
+                partition_key: key.key.as_bytes().to_vec(),
+                clustering_key: vec![],
+            },
+        );
+        assert!(
+            store
+                .read_by_index_in_partition("val_idx", &IndexKey(b"X".to_vec()), key.key.as_bytes())
+                .is_err(),
+            "an unsupported empty clustered posting must refuse, never broaden its read"
+        );
+    }
+
+    #[test]
+    fn keyed_index_nonclustered_empty_posting_still_reads_the_single_row() {
+        let mut schema = test_schema();
+        schema.clustering_columns.clear();
+        let store = TableStore::new_with_indexes(
+            schema,
+            InMemoryFlushTarget::new(),
+            WriteOptions {
+                compression: None,
+                ..WriteOptions::default()
+            },
+            vec![("val_idx".into(), 0)],
+        );
+        let key = make_key("key");
+        let mut row = make_row(b"X", 10);
+        row.clustering.clear();
+        store.write(&key, row).unwrap();
+        let found = store
+            .read_by_index_in_partition("val_idx", &IndexKey(b"X".to_vec()), key.key.as_bytes())
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rows.len(), 1);
     }
 
     fn test_schema() -> TableSchema {

@@ -152,3 +152,5 @@ PostgreSQL is registered as starting before the web readiness endpoint is
 exposed. It becomes up only after its background TCP bind succeeds; pending or
 failed binds keep readiness false. This closes the startup window where an
 empty listener-status map could briefly make an occupied-port node look ready.
+
+SPARQL startup retains the controller’s shared write-path source. It does not freeze a standalone DirectWritePath before pairing. Subsequent operations observe the current deployment authority.

@@ -69,9 +69,13 @@ pub const CAP_ACCORD_APPLY_REGION_COMPRESSED: u32 = 1 << 5;
 /// understands — a peer on the previous build would fail-loud refuse the frame.
 pub const CAP_RAFT_SCHEMA_CAPNP: u32 = 1 << 7;
 
+/// Versioned, peer-bound pair ownership transfer with receiver challenges.
+pub const CAP_PAIR_AUTHORITY: u32 = 1 << 8;
+
 /// Every capability this build understands, advertised in its Handshake and
 /// HandshakeAck.
-pub const LOCAL_CAPABILITIES: u32 = CAP_RPC_ERROR_REPLY
+pub const LOCAL_CAPABILITIES: u32 = CAP_PAIR_AUTHORITY
+    | CAP_RPC_ERROR_REPLY
     | CAP_RESULT_CURSOR_PAGE
     | CAP_PAIR_DISSOLVE
     | CAP_ACCORD_CAPNP

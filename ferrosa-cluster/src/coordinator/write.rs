@@ -795,8 +795,10 @@ impl ClusterCoordinator {
             })?;
         let permit = TrackedWritePermit::new(permit);
 
+        let local_host_id = self.peer_manager.local_host_id();
         let ring = self.ring.load();
-        let replicas = ring.replicas_for_strategy(key.token.0, strategy);
+        let mut replicas = ring.replicas_for_strategy(key.token.0, strategy);
+        super::cl_routing::retain_eligible_replicas_for_cl(cl, &mut replicas, &ring);
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             let span = tracing::debug_span!(
@@ -813,37 +815,34 @@ impl ClusterCoordinator {
             .map(|n| n.data_center.clone())
             .unwrap_or_default();
 
-        // Compute required ACKs based on CL and strategy.
-        let required = match cl {
-            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => {
-                let local_rf = strategy
-                    .dc_replication_factors()
-                    .get(&local_dc)
-                    .copied()
-                    .unwrap_or(strategy.replication_factor());
-                cl.block_for_dc(local_rf)
-            }
-            ConsistencyLevel::EachQuorum => {
-                // For EACH_QUORUM we need to track per-DC.
-                // Set required to total for the availability check.
-                strategy
-                    .dc_replication_factors()
-                    .values()
-                    .map(|&rf| cl.block_for_dc(rf))
-                    .sum()
-            }
-            _ => cl.block_for(strategy.replication_factor()),
-        };
-
-        if replicas.len() < required {
+        let available = super::dc_quorum::progress(cl, strategy, &local_dc, replicas.len(), |dc| {
+            replicas
+                .iter()
+                .filter(|id| {
+                    ring.get_node(**id)
+                        .is_some_and(|node| node.data_center == dc)
+                })
+                .count()
+        });
+        if !available.satisfied() {
             return Err(ClusterError::Unavailable {
                 consistency: cl.to_string(),
-                required,
-                alive: replicas.len(),
+                required: available.required,
+                alive: available.received,
             });
         }
+        let quorum = |total, acks: &std::collections::HashMap<String, usize>| {
+            super::dc_quorum::progress(cl, strategy, &local_dc, total, |dc| {
+                acks.get(dc).copied().unwrap_or(0)
+            })
+        };
 
-        if replicas.contains(&self.local_node_id) {
+        if replicas.iter().any(|id| {
+            *id == self.local_node_id
+                || ring
+                    .get_node(*id)
+                    .is_some_and(|node| node.host_id == local_host_id)
+        }) {
             self.storage.check_write_admission().map_err(|e| {
                 ClusterError::Overloaded(format!("local replica write admission failed: {e}"))
             })?;
@@ -879,7 +878,11 @@ impl ClusterCoordinator {
         let mut fan_out: FuturesUnordered<NtsReplicaWriteJoin> = replica_targets
             .into_iter()
             .filter_map(|(replica_id, remote, dc)| {
-                let work = if replica_id == self.local_node_id {
+                let work = if replica_id == self.local_node_id
+                    || remote
+                        .as_ref()
+                        .is_some_and(|(host, _)| *host == local_host_id)
+                {
                     let Some(row) = local_row.take() else {
                         tracing::error!(replica_id, "token ring returned local replica twice");
                         return None;
@@ -963,16 +966,8 @@ impl ClusterCoordinator {
             .collect();
 
         // Drain results, track per-DC if EACH_QUORUM.
-        let satisfied = match cl {
-            ConsistencyLevel::EachQuorum => {
-                strategy.dc_replication_factors().iter().all(|(dc, &rf)| {
-                    let acks = dc_acks.get(dc).copied().unwrap_or(0);
-                    acks >= cl.block_for_dc(rf)
-                })
-            }
-            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => total_acks >= required,
-            _ => total_acks >= required,
-        };
+        let progress = quorum(total_acks, &dc_acks);
+        let satisfied = progress.satisfied();
         if satisfied {
             Self::spawn_post_quorum_hint_drain_nts(
                 fan_out,
@@ -1006,18 +1001,8 @@ impl ClusterCoordinator {
                 ReplicaResult::Failure { host_id: None } => {}
             }
 
-            let satisfied = match cl {
-                ConsistencyLevel::EachQuorum => {
-                    strategy.dc_replication_factors().iter().all(|(dc, &rf)| {
-                        let acks = dc_acks.get(dc).copied().unwrap_or(0);
-                        acks >= cl.block_for_dc(rf)
-                    })
-                }
-                ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => {
-                    total_acks >= required
-                }
-                _ => total_acks >= required,
-            };
+            let progress = quorum(total_acks, &dc_acks);
+            let satisfied = progress.satisfied();
             if satisfied {
                 if !failed_replicas.is_empty() {
                     self.store_hints_for_replicas(
@@ -1044,16 +1029,8 @@ impl ClusterCoordinator {
         }
 
         // Check satisfaction.
-        let satisfied = match cl {
-            ConsistencyLevel::EachQuorum => {
-                strategy.dc_replication_factors().iter().all(|(dc, &rf)| {
-                    let acks = dc_acks.get(dc).copied().unwrap_or(0);
-                    acks >= cl.block_for_dc(rf)
-                })
-            }
-            ConsistencyLevel::LocalQuorum | ConsistencyLevel::LocalOne => total_acks >= required,
-            _ => total_acks >= required,
-        };
+        let progress = quorum(total_acks, &dc_acks);
+        let satisfied = progress.satisfied();
 
         // Store hints for ALL failed replicas regardless of quorum outcome.
         // Even when the write fails (below quorum), hints record the mutation
@@ -1074,8 +1051,8 @@ impl ClusterCoordinator {
         } else {
             Err(ClusterError::WriteTimeout {
                 consistency: cl.to_string(),
-                received: total_acks,
-                required,
+                received: progress.received,
+                required: progress.required,
             })
         }
     }
@@ -2060,6 +2037,278 @@ mod tests {
     // -----------------------------------------------------------------------
     // NTS write coordination tests
     // -----------------------------------------------------------------------
+
+    struct HistoryReplica {
+        storage: Arc<StorageEngine>,
+        accepts_write: bool,
+        accepts_read: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RpcHandler for HistoryReplica {
+        async fn handle(&self, from: PeerId, message: Message) -> Option<Message> {
+            match message {
+                Message::MutationForward(_) if self.accepts_write => {
+                    RealStorageMutationHandler {
+                        storage: self.storage.clone(),
+                    }
+                    .handle(from, message)
+                    .await
+                }
+                Message::ReadRequest(_) | Message::PartitionSuffixReadRequest(_)
+                    if self.accepts_read =>
+                {
+                    crate::raft::handlers::ReadRequestHandler::new(self.storage.clone())
+                        .handle(from, message)
+                        .await
+                }
+                _ => None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn verification_nts_acknowledged_write_survives_different_read_quorums() {
+        let dir = tempfile::tempdir().unwrap();
+        let history_key = DecoratedKey::new(PartitionKey::new(vec![1, 2, 3]));
+        let mut ring = TokenRing::new();
+        let mut engines = Vec::new();
+        let mut servers = Vec::new();
+        for id in 1..=9u64 {
+            let storage = test_storage(&dir.path().join(format!("replica-{id}")));
+            storage
+                .register_table(TableSchema {
+                    keyspace: "test_ks".into(),
+                    table: "test_tbl".into(),
+                    key_type: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                    clustering_columns: vec![],
+                    static_columns: vec![],
+                    regular_columns: ["val", "anchor"]
+                        .into_iter()
+                        .map(|name| ColumnDefinition {
+                            name: name.into(),
+                            type_name: "org.apache.cassandra.db.marshal.UTF8Type".into(),
+                        })
+                        .collect(),
+                    extensions: Default::default(),
+                })
+                .unwrap();
+            if id == 3 {
+                let mut stale = test_row();
+                stale.cells = vec![
+                    (0, CellValue::live(b"stale".to_vec(), 10)),
+                    (1, CellValue::live(b"anchor".to_vec(), 2000)),
+                ];
+                stale.primary_key_liveness = LivenessInfo::with_timestamp(2000);
+                storage
+                    .write(
+                        &TableId::new("test_ks", "test_tbl"),
+                        &history_key,
+                        stale,
+                        2000,
+                    )
+                    .unwrap();
+            }
+            let handler = Arc::new(HistoryReplica {
+                storage: storage.clone(),
+                accepts_write: [1, 2, 4, 5].contains(&id),
+                accepts_read: [2, 3, 5, 6].contains(&id),
+            });
+            let registry = Arc::new(HandlerRegistry::new());
+            registry.register(MsgType::MutationForward, handler.clone());
+            registry.register(MsgType::ReadRequest, handler.clone());
+            registry.register(MsgType::PartitionSuffixReadRequest, handler);
+            let host = Uuid::new_v4();
+            let server = Arc::new(RpcServer::new(
+                NetConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    ..NetConfig::default()
+                },
+                host,
+                registry,
+            ));
+            let addr = server.start_and_get_addr().await.unwrap();
+            let mut info = make_node(&addr.to_string());
+            info.host_id = host;
+            info.data_center = format!("dc{}", (id - 1) / 3 + 1);
+            ring.add_node(id, info);
+            ring.assign_tokens(id, &[(id * 100) as i64]);
+            engines.push(storage);
+            servers.push(server);
+        }
+        let ring = Arc::new(ArcSwap::from_pointee(ring));
+        let writer = ClusterCoordinator::new(
+            ring.clone(),
+            short_timeout_peer_manager(),
+            1,
+            engines[0].clone(),
+            9,
+            ConsistencyLevel::Quorum,
+        )
+        .with_hint_store(make_hint_store(dir.path()));
+        let reader = ClusterCoordinator::new(
+            ring,
+            short_timeout_peer_manager(),
+            3,
+            engines[2].clone(),
+            9,
+            ConsistencyLevel::Quorum,
+        );
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
+            dc_rf: ["dc1", "dc2", "dc3"]
+                .into_iter()
+                .map(|dc| (dc.to_owned(), 3))
+                .collect(),
+        };
+        let table = TableId::new("test_ks", "test_tbl");
+        let permits = writer.write_semaphore.available_permits();
+        writer
+            .coordinate_write_nts(
+                &table,
+                &history_key,
+                test_row(),
+                1000,
+                ConsistencyLevel::Quorum,
+                &strategy,
+            )
+            .await
+            .expect("two configured DC quorums acknowledge");
+        let rows = reader
+            .coordinate_read_nts(&table, &history_key, ConsistencyLevel::Quorum, &strategy)
+            .await
+            .expect("different two DC quorums read")
+            .expect("acknowledged row survives");
+        assert_eq!(rows.len(), 1);
+        let mut expected = test_row().cells;
+        expected.push((1, CellValue::live(b"anchor".to_vec(), 2000)));
+        assert_eq!(
+            rows[0].cells, expected,
+            "merge each cell: unrelated newer timestamps cannot hide an acknowledged value"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while writer.write_semaphore.available_permits() != permits {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain post-quorum fanout before deleting storage");
+        for server in servers {
+            server.shutdown(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Exercise the production NTS coordinator with real RPC lanes and backing
+    /// storage. Missing nodes/DCs remain in the configured strategy denominator.
+    async fn verification_nts_write(
+        available: [usize; 3],
+        cl: ConsistencyLevel,
+    ) -> crate::error::Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(&dir.path().join("local"));
+        register_test_table(&storage);
+        let pm = short_timeout_peer_manager();
+        let mut ring = TokenRing::new();
+        let mut servers = Vec::new();
+        let mut next_id = 1u64;
+        for (dc_index, count) in available.into_iter().enumerate() {
+            for _ in 0..count {
+                let mut info = if next_id == 1 {
+                    make_node("127.0.0.1:1")
+                } else {
+                    let remote = test_storage(&dir.path().join(format!("replica-{next_id}")));
+                    register_test_table(&remote);
+                    let (server, addr, host_id) = start_real_storage_rpc_server(remote).await;
+                    servers.push(server);
+                    let mut info = make_node(&addr.to_string());
+                    info.host_id = host_id;
+                    info
+                };
+                info.data_center = format!("dc{}", dc_index + 1);
+                ring.add_node(next_id, info);
+                ring.assign_tokens(next_id, &[(next_id * 100) as i64]);
+                next_id += 1;
+            }
+        }
+        assert!(
+            available[0] > 0,
+            "fixture origin must contain its coordinator"
+        );
+        let coordinator = make_coordinator(ring, pm, 1, storage, 9, cl)
+            .with_hint_store(make_hint_store(dir.path()));
+        let strategy = crate::ring::strategy::ReplicationStrategy::NetworkTopology {
+            dc_rf: ["dc1", "dc2", "dc3"]
+                .into_iter()
+                .map(|dc| (dc.to_string(), 3usize))
+                .collect(),
+        };
+        let permits = coordinator.write_semaphore.available_permits();
+        let result = coordinator
+            .coordinate_write_nts(
+                &TableId::new("test_ks", "test_tbl"),
+                &test_key(),
+                test_row(),
+                1000,
+                cl,
+                &strategy,
+            )
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while coordinator.write_semaphore.available_permits() != permits {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all post-quorum work must finish before fixture storage is removed");
+        for server in servers {
+            server.shutdown(std::time::Duration::from_millis(50)).await;
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn verification_nts_quorum_accepts_two_local_quorums_with_third_dc_absent() {
+        let result = verification_nts_write([2, 2, 0], ConsistencyLevel::Quorum).await;
+        assert!(result.is_ok(), "2/3 origin replicas plus 2/3 replicas in a second configured DC is a global quorum: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn verification_nts_quorum_rejects_pooled_acks_without_a_second_dc_quorum() {
+        let result = verification_nts_write([3, 1, 1], ConsistencyLevel::Quorum).await;
+        assert!(
+            result.is_err(),
+            "five pooled ACKs are not two DC quorums: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_nts_quorum_requires_the_origin_dc_even_with_two_remote_quorums() {
+        let result = verification_nts_write([1, 3, 3], ConsistencyLevel::Quorum).await;
+        assert!(
+            result.is_err(),
+            "remote majorities cannot replace the origin quorum: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_nts_local_quorum_never_counts_remote_acknowledgments() {
+        let result = verification_nts_write([1, 2, 0], ConsistencyLevel::LocalQuorum).await;
+        assert!(
+            result.is_err(),
+            "LOCAL_QUORUM must count origin ACKs only: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verification_nts_partition_never_shrinks_the_configured_dc_scope() {
+        assert!(verification_nts_write([2, 0, 0], ConsistencyLevel::Quorum)
+            .await
+            .is_err());
+        assert!(
+            verification_nts_write([2, 0, 0], ConsistencyLevel::LocalQuorum)
+                .await
+                .is_ok()
+        );
+    }
 
     #[tokio::test]
     async fn coordinate_write_nts_local_quorum_single_dc_local_replica() {

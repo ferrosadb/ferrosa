@@ -527,8 +527,8 @@ impl WritePath {
     pub async fn write_batch(
         &self,
         mutations: Vec<Mutation>,
-        _cl: ConsistencyLevel,
-        _rf: usize,
+        cl: ConsistencyLevel,
+        rf: usize,
     ) -> ferrosa_common::Result<()> {
         if let Some(storage) = self.admission_storage() {
             for mutation in &mutations {
@@ -545,20 +545,19 @@ impl WritePath {
                 "pair mode: primary unavailable, writes rejected until operator promotes".into(),
             )),
             Self::Pair(coordinator) => {
-                // Pair mode: forward each mutation individually.
-                for m in mutations {
+                for mutation in mutations {
                     coordinator
-                        .coordinate_write(&m)
+                        .coordinate_write_with(&mutation, cl, rf)
                         .await
                         .map_err(|e| ferrosa_common::Error::InvalidData(format!("pair: {e}")))?;
-                    if let Some((bus, ev)) = committed_cdc_event(
+                    if let Some((bus, event)) = committed_cdc_event(
                         coordinator.local_storage(),
-                        &TableId::new(&m.keyspace, &m.table),
-                        &m.key,
-                        &m.rows,
-                        m.timestamp,
+                        &TableId::new(&mutation.keyspace, &mutation.table),
+                        &mutation.key,
+                        &mutation.rows,
+                        mutation.timestamp,
                     ) {
-                        bus.publish(ev);
+                        bus.publish(event);
                     }
                 }
                 Ok(())
@@ -893,12 +892,7 @@ impl WritePath {
             Self::Cluster(coordinator) => {
                 if coordinator.streaming_range_reads {
                     coordinator
-                        .coordinate_range_read_stream_all_with(
-                            table_id,
-                            row_limit,
-                            cl,
-                            strategy.replication_factor(),
-                        )
+                        .coordinate_range_read_stream_all_with(table_id, row_limit, cl, strategy)
                         .await
                 } else {
                     Err(crate::error::ClusterError::Internal(
@@ -948,12 +942,7 @@ impl WritePath {
                     ));
                 }
                 coordinator
-                    .coordinate_range_read_stream_from(
-                        table_id,
-                        resume,
-                        cl,
-                        strategy.replication_factor(),
-                    )
+                    .coordinate_range_read_stream_from(table_id, resume, cl, strategy)
                     .await
             }
             Self::Unavailable => Err(crate::error::ClusterError::Internal(
@@ -1001,7 +990,7 @@ impl WritePath {
                         wanted,
                         resume,
                         cl,
-                        strategy.replication_factor(),
+                        strategy,
                     )
                     .await
             }
@@ -1139,7 +1128,7 @@ impl WritePath {
                         table_id,
                         wanted.clone(),
                         cl,
-                        strategy.replication_factor(),
+                        strategy,
                     )
                     .await?;
                 match partition_limit {
@@ -1690,7 +1679,7 @@ impl WritePath {
                     timestamp,
                 );
                 let res = coordinator
-                    .coordinate_write(&mutation)
+                    .coordinate_write_with(&mutation, cl, strategy.replication_factor())
                     .await
                     .map_err(cluster_error_to_common);
                 if res.is_ok() {
