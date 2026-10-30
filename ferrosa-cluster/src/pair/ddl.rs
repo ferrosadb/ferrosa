@@ -246,7 +246,7 @@ impl DdlCoordinator {
                 }
                 Ok(())
             }
-            PairRole::Secondary => Err(ClusterError::NotPrimary),
+            PairRole::Secondary => self.forward_ddl(&op).await,
         }
     }
 
@@ -510,6 +510,30 @@ impl DdlCoordinator {
         )
         .await
         .map_err(|_| ClusterError::Internal("DDL replication timed out".into()))?
+        .map_err(ClusterError::Net)?;
+
+        match resp {
+            Message::PairDdlAck(_) => Ok(()),
+            other => Err(ClusterError::ReplicationFailed(format!(
+                "expected PairDdlAck, got {:?}",
+                other.msg_type()
+            ))),
+        }
+    }
+
+    /// Forward a DDL operation to the primary and wait for its ACK.
+    ///
+    /// Sent as a bare `DdlOperation`: the primary assigns the schema version itself (it also
+    /// replicates the result back), so a version chosen here would be a second, competing one.
+    async fn forward_ddl(&self, op: &DdlOperation) -> Result<()> {
+        let body = op.to_bytes()?;
+        let resp = tokio::time::timeout(
+            DDL_RPC_TIMEOUT,
+            self.peer_manager
+                .send(self.peer_host_id, Message::PairDdlForward(body), Lane::Data),
+        )
+        .await
+        .map_err(|_| ClusterError::Internal("DDL forward to primary timed out".into()))?
         .map_err(ClusterError::Net)?;
 
         match resp {

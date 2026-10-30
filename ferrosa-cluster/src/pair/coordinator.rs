@@ -92,8 +92,12 @@ impl PairCoordinator {
         rf: usize,
     ) -> Result<()> {
         let _admitted_write = self.handoff_gate.read().await;
+        // A secondary does not apply writes on its own authority, but it does not refuse them
+        // either: it hands the write to the primary, which fences it through its own
+        // `handoff_gate` and replicates it back. Answering `NotPrimary` here breaks every client
+        // that has connected to a secondary, which is every client before it discovers the primary.
         if **self.role.load() != PairRole::Primary {
-            return Err(ClusterError::NotPrimary);
+            return self.forward_to_primary(mutation).await;
         }
         let required = match cl {
             ConsistencyLevel::Quorum | ConsistencyLevel::LocalQuorum if rf == 2 => 1,
@@ -175,6 +179,55 @@ impl PairCoordinator {
         }
     }
 
+    /// Forward a write to the primary and wait for its ACK.
+    ///
+    /// The primary applies it under its own authority and replicates it back, so the ACK still means
+    /// two copies — the secondary never confirms a write on its own.
+    async fn forward_to_primary(&self, mutation: &Mutation) -> Result<()> {
+        let body = encode_mutation(mutation);
+        let resp = self
+            .peer_manager
+            .send_with_timeout(
+                self.peer_host_id,
+                Message::PairWriteForward(body),
+                Lane::Data,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(ClusterError::Net)?;
+
+        match resp {
+            Message::PairWriteAck(_) => Ok(()),
+            other => Err(ClusterError::ReplicationFailed(format!(
+                "expected PairWriteAck, got {:?}",
+                other.msg_type()
+            ))),
+        }
+    }
+
+    /// Forward a batch to the primary (secondary -> primary) as one RPC.
+    async fn forward_batch_to_primary(&self, mutations: &[Mutation], batch_id: Uuid) -> Result<()> {
+        let body = encode_batch(batch_id, mutations)?;
+        let resp = self
+            .peer_manager
+            .send_with_timeout(
+                self.peer_host_id,
+                Message::PairBatchForward(body),
+                Lane::Data,
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(ClusterError::Net)?;
+
+        match resp {
+            Message::PairBatchAck(_) => Ok(()),
+            other => Err(ClusterError::ReplicationFailed(format!(
+                "expected PairBatchAck, got {:?}",
+                other.msg_type()
+            ))),
+        }
+    }
+
     /// Coordinate an atomic local batch with RF2 ALL by default.
     pub async fn coordinate_batch(&self, mutations: Vec<Mutation>, batch_id: Uuid) -> Result<()> {
         self.coordinate_batch_with(mutations, batch_id, ConsistencyLevel::All, 2)
@@ -191,8 +244,9 @@ impl PairCoordinator {
         rf: usize,
     ) -> Result<()> {
         let _admitted_write = self.handoff_gate.read().await;
+        // As for single writes: a secondary forwards the batch so the primary applies it atomically.
         if **self.role.load() != PairRole::Primary {
-            return Err(ClusterError::NotPrimary);
+            return self.forward_batch_to_primary(&mutations, _batch_id).await;
         }
         let required = match cl {
             ConsistencyLevel::Quorum | ConsistencyLevel::LocalQuorum if rf == 2 => 1,
