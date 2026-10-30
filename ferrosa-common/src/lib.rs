@@ -30,6 +30,7 @@ pub mod data_type;
 pub mod deployment_mode;
 pub mod error;
 pub mod geometry;
+pub mod hll;
 pub mod key;
 pub mod mem_probe;
 pub mod murmur3;
