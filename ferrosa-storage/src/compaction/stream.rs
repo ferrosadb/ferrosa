@@ -139,7 +139,7 @@ impl SpillOrder<OrderedRow> for ClusteringOrder {
     }
 }
 struct Source<'a> {
-    iter: PartitionIter<'a, FileReadAt>,
+    iter: PartitionIter<FileReadAt>,
     header: Option<Partition>,
     head: Option<Row>,
     spare: Option<Row>,

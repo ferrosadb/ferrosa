@@ -8061,7 +8061,7 @@ impl StorageEngine {
     }
 
     fn validate_sstable_for_startup_repair<R: ferrosa_sstable::io::ReadAt>(
-        reader: &ferrosa_sstable::reader::SSTableReader<R>,
+        reader: &Arc<ferrosa_sstable::reader::SSTableReader<R>>,
     ) -> ferrosa_common::Result<()> {
         use ferrosa_common::NO_TIMESTAMP;
 
@@ -9879,7 +9879,7 @@ impl StorageEngine {
                 }
             }
         }
-        let reader = Self::open_sstable_from_dir(table_dir, &gen_str)?;
+        let reader = Arc::new(Self::open_sstable_from_dir(table_dir, &gen_str)?);
         Self::validate_sstable_for_startup_repair(&reader)
     }
 

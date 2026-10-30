@@ -1587,9 +1587,11 @@ impl CompactionExecutor {
             return Err(c.to_string());
         }
         let local_write_start = Instant::now();
-        let reader = flush_target
-            .flush_deferred_files(output)
-            .map_err(|e| format!("flush output: {e}"))?;
+        let reader = Arc::new(
+            flush_target
+                .flush_deferred_files(output)
+                .map_err(|e| format!("flush output: {e}"))?,
+        );
         crate::metrics::observe_compaction_phase(
             crate::metrics::CompactionPhase::LocalWriteSstable,
             local_write_start.elapsed(),
@@ -2094,7 +2096,7 @@ mod tests {
     }
 
     fn collect_reader_partitions<R: ferrosa_sstable::io::ReadAt>(
-        reader: &ferrosa_sstable::reader::SSTableReader<R>,
+        reader: &Arc<ferrosa_sstable::reader::SSTableReader<R>>,
     ) -> Vec<ferrosa_sstable::types::Partition> {
         let mut partitions = Vec::new();
         let mut iter = reader.partitions_iter().expect("stream partitions");
@@ -2108,19 +2110,24 @@ mod tests {
     fn open_sstable_reader(
         dir: &std::path::Path,
         gen: &str,
-    ) -> ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt> {
+    ) -> Arc<ferrosa_sstable::reader::SSTableReader<ferrosa_sstable::io::FileReadAt>> {
         let openf = |suffix: &str| {
             ferrosa_sstable::io::FileReadAt::open(dir.join(format!("{gen}-{suffix}"))).unwrap()
         };
-        ferrosa_sstable::reader::SSTableReader::open(ferrosa_sstable::reader::SSTableComponents {
-            data: openf("Data.db"),
-            partitions: openf("Partitions.db"),
-            rows: openf("Rows.db"),
-            filter: std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap(),
-            compression_info: std::fs::read(dir.join(format!("{gen}-CompressionInfo.db"))).ok(),
-            statistics: std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap(),
-        })
-        .unwrap()
+        Arc::new(
+            ferrosa_sstable::reader::SSTableReader::open(
+                ferrosa_sstable::reader::SSTableComponents {
+                    data: openf("Data.db"),
+                    partitions: openf("Partitions.db"),
+                    rows: openf("Rows.db"),
+                    filter: std::fs::read(dir.join(format!("{gen}-Filter.db"))).unwrap(),
+                    compression_info: std::fs::read(dir.join(format!("{gen}-CompressionInfo.db")))
+                        .ok(),
+                    statistics: std::fs::read(dir.join(format!("{gen}-Statistics.db"))).unwrap(),
+                },
+            )
+            .unwrap(),
+        )
     }
 
     /// Finding 1 regression (t_a0f922a3): compacting a SINGLE legacy SSTable
@@ -3242,17 +3249,19 @@ mod tests {
         let compression_info =
             std::fs::read(output_dir.join(format!("{gen}-CompressionInfo.db"))).ok();
 
-        let reader = ferrosa_sstable::reader::SSTableReader::open(
-            ferrosa_sstable::reader::SSTableComponents {
-                data,
-                partitions: partitions_file,
-                rows,
-                filter,
-                compression_info,
-                statistics,
-            },
-        )
-        .unwrap();
+        let reader = Arc::new(
+            ferrosa_sstable::reader::SSTableReader::open(
+                ferrosa_sstable::reader::SSTableComponents {
+                    data,
+                    partitions: partitions_file,
+                    rows,
+                    filter,
+                    compression_info,
+                    statistics,
+                },
+            )
+            .unwrap(),
+        );
 
         let output_partitions = collect_reader_partitions(&reader);
         assert_eq!(
@@ -3525,16 +3534,21 @@ mod tests {
         assert_eq!(meta.partition_count, 1);
 
         let gen = &meta.id;
-        let reader = SSTableReader::open(SSTableComponents {
-            data: FileReadAt::open(output_dir.join(format!("{gen}-Data.db"))).unwrap(),
-            partitions: FileReadAt::open(output_dir.join(format!("{gen}-Partitions.db"))).unwrap(),
-            rows: FileReadAt::open(output_dir.join(format!("{gen}-Rows.db"))).unwrap(),
-            filter: std::fs::read(output_dir.join(format!("{gen}-Filter.db"))).unwrap(),
-            compression_info: std::fs::read(output_dir.join(format!("{gen}-CompressionInfo.db")))
+        let reader = Arc::new(
+            SSTableReader::open(SSTableComponents {
+                data: FileReadAt::open(output_dir.join(format!("{gen}-Data.db"))).unwrap(),
+                partitions: FileReadAt::open(output_dir.join(format!("{gen}-Partitions.db")))
+                    .unwrap(),
+                rows: FileReadAt::open(output_dir.join(format!("{gen}-Rows.db"))).unwrap(),
+                filter: std::fs::read(output_dir.join(format!("{gen}-Filter.db"))).unwrap(),
+                compression_info: std::fs::read(
+                    output_dir.join(format!("{gen}-CompressionInfo.db")),
+                )
                 .ok(),
-            statistics: std::fs::read(output_dir.join(format!("{gen}-Statistics.db"))).unwrap(),
-        })
-        .unwrap();
+                statistics: std::fs::read(output_dir.join(format!("{gen}-Statistics.db"))).unwrap(),
+            })
+            .unwrap(),
+        );
         let partitions = collect_reader_partitions(&reader);
         assert_eq!(partitions.len(), 1);
         let cells = &partitions[0].rows[0].cells;

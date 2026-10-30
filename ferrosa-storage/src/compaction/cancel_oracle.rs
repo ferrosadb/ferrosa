@@ -27,6 +27,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferrosa_common::key::{DecoratedKey, PartitionKey};
 use ferrosa_sstable::io::FileReadAt;
@@ -272,15 +273,17 @@ fn open_and_walk_generation(table_dir: &Path, gen: u64) -> Result<(), String> {
     let statistics = std::fs::read(component("Statistics.db")).unwrap_or_default();
     let compression_info = std::fs::read(component("CompressionInfo.db")).ok();
 
-    let reader = SSTableReader::open(SSTableComponents {
-        data,
-        partitions,
-        rows,
-        filter,
-        compression_info,
-        statistics,
-    })
-    .map_err(|e| format!("open: {e}"))?;
+    let reader = Arc::new(
+        SSTableReader::open(SSTableComponents {
+            data,
+            partitions,
+            rows,
+            filter,
+            compression_info,
+            statistics,
+        })
+        .map_err(|e| format!("open: {e}"))?,
+    );
 
     let mut iter = reader
         .partitions_iter()

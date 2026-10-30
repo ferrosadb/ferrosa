@@ -425,7 +425,7 @@ pub enum MergeSource<'a, R: ReadAt> {
     /// and caches the key in `peeked_key`; `pop_partition` decodes
     /// the body from the same offset and clears the cache.
     SsTable {
-        iter: PartitionIter<'a, R>,
+        iter: PartitionIter<R>,
         mode: RunMode<'a>,
         mapping: Option<&'a ColumnOrdinalMapping>,
         peeked_key: Option<DecoratedKey>,
@@ -796,7 +796,7 @@ pub struct SsTableRunIter<'a, R: ReadAt> {
     cursor: usize,
     /// `partitions_iter()` for `sstables[cursor]`; `None` until
     /// first use or after the current table exhausts.
-    current: Option<PartitionIter<'a, R>>,
+    current: Option<PartitionIter<R>>,
 }
 
 #[derive(Clone, Copy)]

@@ -503,7 +503,9 @@ impl LocalBackend {
         // index); the win is not holding the full row payloads alongside it.
         // Reconciliation counters (see `orphan::ScanTally`): the partition
         // count the writer recorded, read BEFORE the iterator borrows the
-        // reader, against what the walk below actually reads.
+        // reader, against what the walk below actually reads. The reader moves
+        // into an `Arc` here because `PartitionIter` owns a handle to it.
+        let reader = Arc::new(reader);
         let partitions_declared = reader.key_count();
         let mut partitions_scanned: u64 = 0;
         let mut partitions_to_index: u64 = 0;

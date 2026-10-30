@@ -2272,7 +2272,7 @@ fn component_expectations<'a>(
     v
 }
 
-fn verify_promoted_sstable(reader: &SSTableReader<FileReadAt>) -> Result<()> {
+fn verify_promoted_sstable(reader: &Arc<SSTableReader<FileReadAt>>) -> Result<()> {
     let mut iter = reader.partitions_iter()?;
     while iter.next_partition_count()?.is_some() {
         // Walk partition framing and count rows without decoding cell payloads.
@@ -2404,6 +2404,7 @@ impl FileFlushTarget {
         let tmp_paths = Self::tmp_component_paths(&paths);
         let readback =
             Self::open_reader_from_paths(&tmp_paths, has_compression_info).and_then(|probe| {
+                let probe = Arc::new(probe);
                 let result = verify_promoted_sstable(&probe);
                 drop(probe);
                 result
@@ -3092,17 +3093,19 @@ mod tests {
                 writer.add_partition(p).unwrap();
             }
             let out = writer.finish().unwrap();
-            let reader = ferrosa_sstable::reader::SSTableReader::open(
-                ferrosa_sstable::reader::SSTableComponents {
-                    data: out.data,
-                    partitions: out.partitions,
-                    rows: out.rows,
-                    filter: out.filter,
-                    compression_info: out.compression_info,
-                    statistics: out.statistics,
-                },
-            )
-            .unwrap();
+            let reader = Arc::new(
+                ferrosa_sstable::reader::SSTableReader::open(
+                    ferrosa_sstable::reader::SSTableComponents {
+                        data: out.data,
+                        partitions: out.partitions,
+                        rows: out.rows,
+                        filter: out.filter,
+                        compression_info: out.compression_info,
+                        statistics: out.statistics,
+                    },
+                )
+                .unwrap(),
+            );
 
             // The startup smoke test and self-heal read with the two-phase
             // streaming path, not `next_partition`. It must agree.
@@ -3929,8 +3932,10 @@ mod tests {
         assert!(moved >= 4, "fixture must move the required components");
         assert!(!dir.path().join(format!("{gen}-Data.db")).exists());
 
-        let reader = open_file_sstable(dir.path(), &gen)
-            .expect("a generation restored into <table>/<gen>/ must open from its table dir");
+        let reader = Arc::new(
+            open_file_sstable(dir.path(), &gen)
+                .expect("a generation restored into <table>/<gen>/ must open from its table dir"),
+        );
         assert_eq!(reader.key_count(), 1);
         let mut iter = reader.partitions_iter().unwrap();
         assert!(iter.next_partition_count().unwrap().is_some());
@@ -4706,20 +4711,22 @@ mod tests {
             make_partition("k2", b"v2", 5001),
         ];
         let (_target, output) = staged_output_for_digest_tests(dir.path(), &partitions);
-        let reader = SSTableReader::open(SSTableComponents {
-            data: FileReadAt::open(&output.data).unwrap(),
-            partitions: FileReadAt::open(&output.partitions).unwrap(),
-            rows: FileReadAt::open(&output.rows).unwrap(),
-            filter: std::fs::read(&output.filter).unwrap(),
-            compression_info: output
-                .compression_info
-                .as_ref()
-                .map(std::fs::read)
-                .transpose()
-                .unwrap(),
-            statistics: std::fs::read(&output.statistics).unwrap(),
-        })
-        .unwrap();
+        let reader = Arc::new(
+            SSTableReader::open(SSTableComponents {
+                data: FileReadAt::open(&output.data).unwrap(),
+                partitions: FileReadAt::open(&output.partitions).unwrap(),
+                rows: FileReadAt::open(&output.rows).unwrap(),
+                filter: std::fs::read(&output.filter).unwrap(),
+                compression_info: output
+                    .compression_info
+                    .as_ref()
+                    .map(std::fs::read)
+                    .transpose()
+                    .unwrap(),
+                statistics: std::fs::read(&output.statistics).unwrap(),
+            })
+            .unwrap(),
+        );
 
         let mut full = reader.partitions_iter().unwrap();
         let mut expected = Vec::new();

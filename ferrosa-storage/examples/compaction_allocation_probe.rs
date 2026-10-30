@@ -6,6 +6,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrosa_common::schema::{ColumnDefinition, TableSchema};
@@ -194,7 +195,7 @@ fn validate(
     complex: bool,
     purge: bool,
 ) {
-    let reader = open_file_sstable(&meta.path, &meta.id).unwrap();
+    let reader = Arc::new(open_file_sstable(&meta.path, &meta.id).unwrap());
     let mut iter = reader.partitions_iter().unwrap();
     let mut keys: Vec<_> = (0..partitions)
         .map(|p| DecoratedKey::new(PartitionKey::new(format!("key-{p:08}").into_bytes())))

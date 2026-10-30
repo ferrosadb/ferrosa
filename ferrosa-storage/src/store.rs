@@ -1172,7 +1172,7 @@ pub(crate) fn fti_sidecar_file_name(gen: &str, index_name: &str) -> String {
 /// rows read so far: a partial index persisted as a sidecar would hide the
 /// remaining rows from every later query.
 fn build_sstable_fti<R: ReadAt>(
-    sstable: &SSTableReader<R>,
+    sstable: &Arc<SSTableReader<R>>,
     schema: &TableSchema,
     column_position: usize,
 ) -> Result<ferrosa_index::fulltext::builder::FullTextIndex> {
@@ -1899,7 +1899,7 @@ fn vector_ready_key(gen: &str, index_name: &str) -> String {
 /// manifest is written, so a partial build is never taken for a complete one.
 fn build_generation_vector_sidecars<F: FlushTarget>(
     flush_target: &F,
-    reader: &SSTableReader<F::Reader>,
+    reader: &Arc<SSTableReader<F::Reader>>,
     schema: &TableSchema,
     gen: u64,
     cfg: &VectorIndexConfig,
@@ -2669,7 +2669,7 @@ fn sstable_column_mappings<R: ReadAt + Send + Sync + 'static>(
 }
 
 fn next_remapped_clustered_row<R: ReadAt + Send + Sync + 'static>(
-    iter: &mut ferrosa_sstable::reader::PartitionIter<'_, R>,
+    iter: &mut ferrosa_sstable::reader::PartitionIter<R>,
     mapping: &ColumnOrdinalMapping,
 ) -> Result<Option<Row>> {
     let mut row = iter.next_clustered_row()?;
@@ -2684,7 +2684,7 @@ fn next_remapped_clustered_row<R: ReadAt + Send + Sync + 'static>(
 /// a failure raised by `on_row` (the caller's sink, not the SSTable) passes
 /// through unchanged: a full hash sink must not quarantine a healthy file.
 fn stream_rows_attributed<R: ReadAt + Send + Sync + 'static>(
-    iter: &mut ferrosa_sstable::reader::PartitionIter<'_, R>,
+    iter: &mut ferrosa_sstable::reader::PartitionIter<R>,
     mut on_row: impl FnMut(&Row) -> Result<()>,
     attribute: impl FnOnce(ferrosa_common::Error) -> ferrosa_common::Error,
 ) -> Result<()> {
@@ -2908,7 +2908,7 @@ impl<F: FlushTarget> Drop for MergeReader<F> {
 /// serves (typed `CorruptSstable` for a table SSTable). Errors from `emit` are
 /// the caller's own and pass through untouched.
 fn merge_sstable_iters<R, Emit, Fail>(
-    iters: &mut [ferrosa_sstable::reader::PartitionIter<'_, R>],
+    iters: &mut [ferrosa_sstable::reader::PartitionIter<R>],
     mappings: &[ColumnOrdinalMapping],
     end_token: i64,
     fail: Fail,
@@ -2971,7 +2971,7 @@ where
 /// of the skip or the peek is an unreadable SSTable and is returned — the
 /// caller must not treat the source as exhausted.
 fn position_iter_at_token<R: ReadAt + Send + Sync + 'static>(
-    iter: &mut ferrosa_sstable::reader::PartitionIter<'_, R>,
+    iter: &mut ferrosa_sstable::reader::PartitionIter<R>,
     start_token: i64,
 ) -> Result<()> {
     if let Err(e) = iter.seek_to_token(start_token) {
@@ -5141,7 +5141,7 @@ impl<F: FlushTarget> TableStore<F> {
         }
 
         let mut sst_sources: Vec<(
-            ferrosa_sstable::reader::PartitionIter<'_, F::Reader>,
+            ferrosa_sstable::reader::PartitionIter<F::Reader>,
             ColumnOrdinalMapping,
         )> = Vec::new();
         for (sstable, desc) in sst_readers.iter() {
@@ -7605,7 +7605,7 @@ impl<F: FlushTarget> TableStore<F> {
             })?);
         }
 
-        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<_>> =
             Vec::with_capacity(sst_readers.len());
         let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(sst_readers.len());
         // Parallel to `sst_iters`: names the SSTable behind each iterator so a
@@ -7878,7 +7878,7 @@ impl<F: FlushTarget> TableStore<F> {
         // Position one streaming iterator per batch reader at the first in-range
         // partition. Iterators borrow the readers, so the readers must outlive
         // this scope — they do (owned by `batch_readers`).
-        let mut iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, F::Reader>> =
+        let mut iters: Vec<ferrosa_sstable::reader::PartitionIter<F::Reader>> =
             Vec::with_capacity(batch_readers.len());
         let mut mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(batch_readers.len());
         for mr in batch_readers.iter() {
@@ -8096,7 +8096,7 @@ impl<F: FlushTarget> TableStore<F> {
             )
         };
 
-        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<_>> =
             Vec::with_capacity(merge_readers.len());
         let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(merge_readers.len());
         for mr in merge_readers.iter() {
@@ -8447,7 +8447,7 @@ impl<F: FlushTarget> TableStore<F> {
 
         // For each input reader: an iter parked at the first in-range partition.
         // We do NOT decode the body — we keep only the peeked DecoratedKey.
-        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<'_, _>> =
+        let mut sst_iters: Vec<ferrosa_sstable::reader::PartitionIter<_>> =
             Vec::with_capacity(merge_readers.len());
         let mut sst_mappings: Vec<ColumnOrdinalMapping> = Vec::with_capacity(merge_readers.len());
         for mr in merge_readers.iter() {
@@ -9526,7 +9526,7 @@ impl<F: FlushTarget> TableStore<F> {
     /// anyone who sees it complete also sees it counted.
     fn build_vector_sidecars_from(
         &self,
-        reader: &SSTableReader<F::Reader>,
+        reader: &Arc<SSTableReader<F::Reader>>,
         gen: u64,
         cfg: &VectorIndexConfig,
         schema: &TableSchema,
@@ -9958,7 +9958,7 @@ impl<F: FlushTarget> TableStore<F> {
     pub fn build_vector_sidecars_for_output(
         &self,
         output_gen: &str,
-        reader: &SSTableReader<F::Reader>,
+        reader: &Arc<SSTableReader<F::Reader>>,
     ) -> VectorRepairOutcome {
         let mut outcome = VectorRepairOutcome::default();
         let catalog = self.catalog();

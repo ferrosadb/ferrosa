@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ferrosa_common::key::DecoratedKey;
 use ferrosa_common::schema::TableSchema;
@@ -90,24 +91,26 @@ pub fn write_sstable(
 }
 
 /// Open an SSTable `generation` in `dir` for reading.
-pub fn open_reader(dir: &Path, generation: &str) -> SSTableReader<FileReadAt> {
+pub fn open_reader(dir: &Path, generation: &str) -> Arc<SSTableReader<FileReadAt>> {
     let open = |suffix: &str| {
         FileReadAt::open(dir.join(format!("{generation}-{suffix}"))).expect("open component")
     };
     let read = |suffix: &str| std::fs::read(dir.join(format!("{generation}-{suffix}")));
 
-    SSTableReader::open(SSTableComponents {
-        data: open("Data.db"),
-        partitions: open("Partitions.db"),
-        rows: open("Rows.db"),
-        filter: read("Filter.db").expect("read filter"),
-        compression_info: read("CompressionInfo.db").ok(),
-        statistics: read("Statistics.db").expect("read statistics"),
-    })
-    .expect("open output reader")
+    Arc::new(
+        SSTableReader::open(SSTableComponents {
+            data: open("Data.db"),
+            partitions: open("Partitions.db"),
+            rows: open("Rows.db"),
+            filter: read("Filter.db").expect("read filter"),
+            compression_info: read("CompressionInfo.db").ok(),
+            statistics: read("Statistics.db").expect("read statistics"),
+        })
+        .expect("open output reader"),
+    )
 }
 
-fn collect_partitions_streaming(reader: &SSTableReader<FileReadAt>) -> Vec<Partition> {
+fn collect_partitions_streaming(reader: &Arc<SSTableReader<FileReadAt>>) -> Vec<Partition> {
     let mut partitions = Vec::new();
     let mut iter = reader.partitions_iter().expect("stream output partitions");
     while let Some(partition) = iter.next_partition().expect("read streamed partition") {
