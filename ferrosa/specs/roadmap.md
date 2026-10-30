@@ -77,3 +77,7 @@ The CQL wiring acceptance test writes compressed and plain tables through a real
 
 - T-025 operator slice: authenticated POST `/api/compaction/stop`, strict JSON
   scope validation, asynchronous cancellation acknowledgement and route tests.
+
+CQL routing and `system_views.table_access` share one `Arc<TableAccessTracker>`
+created by the binary. The counters describe routed CQL reads/writes, including
+prepared statements; they do not represent every protocol or physical disk I/O.

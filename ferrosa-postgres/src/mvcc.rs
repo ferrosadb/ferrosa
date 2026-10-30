@@ -257,7 +257,7 @@ pub(crate) struct RowChange {
 // owns its root through the registry; expiry drops ownership without a sweep.
 type SharedRow = Arc<Option<Row>>;
 type RelationId = (String, uuid::Uuid);
-type TableRows<V> = PersistentMap<RelationId, PersistentMap<Arc<Vec<Value>>, V>>;
+type TableRows<V> = PersistentMap<RelationId, PersistentMap<Arc<[Value]>, V>>;
 type LocalRows = TableRows<LocalVersion>;
 type ClusterRows = TableRows<OrdMap<Timestamp, SharedRow>>;
 
@@ -804,7 +804,7 @@ impl MvccManager {
             .rows()?
             .map(|image| {
                 let (key, row) = image?;
-                Ok(((*key).clone(), (*row).clone()))
+                Ok((key.to_vec(), (*row).clone()))
             })
             .collect()
     }
@@ -827,7 +827,7 @@ impl MvccManager {
                         table_id: change.table_id,
                         key: change.key.clone(),
                     },
-                    Arc::new(change.key),
+                    Arc::from(change.key),
                     Arc::new(change.before),
                     Arc::new(change.after),
                 )
@@ -1045,7 +1045,7 @@ impl MvccTableView {
         }
     }
 
-    pub(crate) fn row(&self, key: &Vec<Value>) -> Result<Option<SharedRow>, MvccCommitError> {
+    pub(crate) fn row(&self, key: &[Value]) -> Result<Option<SharedRow>, MvccCommitError> {
         self.ensure_active()?;
         let state = self.state.load();
         let active = state
@@ -1108,16 +1108,16 @@ impl MvccTableView {
 }
 
 type SnapshotRows =
-    Box<dyn Iterator<Item = Result<(Arc<Vec<Value>>, SharedRow), MvccCommitError>> + Send>;
+    Box<dyn Iterator<Item = Result<(Arc<[Value]>, SharedRow), MvccCommitError>> + Send>;
 
-type ClusterImage = (RelationId, Arc<Vec<Value>>, SharedRow, SharedRow);
+type ClusterImage = (RelationId, Arc<[Value]>, SharedRow, SharedRow);
 fn cluster_images(changes: Vec<RowChange>) -> Vec<ClusterImage> {
     changes
         .into_iter()
         .map(|c| {
             (
                 (c.table, c.table_id),
-                Arc::new(c.key),
+                Arc::from(c.key),
                 Arc::new(c.before),
                 Arc::new(c.after),
             )
@@ -1295,13 +1295,13 @@ fn row_changed(state: &State, snapshot: &MvccSnapshot, row: &RowKey) -> bool {
     state
         .local
         .get(&(row.table.clone(), row.table_id))
-        .and_then(|table| table.get(&row.key))
+        .and_then(|table| table.get(row.key.as_slice()))
         .is_some_and(|v| v.seq > snapshot.read_ts)
         || snapshot.cluster_ts.is_some_and(|ts| {
             state
                 .cluster
                 .get(&(row.table.clone(), row.table_id))
-                .and_then(|table| table.get(&row.key))
+                .and_then(|table| table.get(row.key.as_slice()))
                 .and_then(|v| v.get_max())
                 .is_some_and(|(latest, _)| *latest > ts)
         })
@@ -1763,7 +1763,7 @@ mod tests {
         let during = manager.snapshot();
         let view = manager.table_view(&during, "public.items", uuid::Uuid::nil());
         assert_eq!(
-            view.row(&vec![Value::Int(1)]).unwrap().unwrap().as_ref(),
+            view.row(&[Value::Int(1)]).unwrap().unwrap().as_ref(),
             &Some(row("before"))
         );
         let effects = AtomicU64::new(0);
@@ -1827,7 +1827,7 @@ mod tests {
             Some(&Some(row("disjoint")))
         );
         assert_eq!(
-            view.row(&vec![Value::Int(1)]).unwrap().unwrap().as_ref(),
+            view.row(&[Value::Int(1)]).unwrap().unwrap().as_ref(),
             &Some(row("before"))
         );
     }
@@ -2034,7 +2034,7 @@ mod tests {
         let cloned = old.clone();
         let shared = manager
             .table_view(&old, "public.items", uuid::Uuid::nil())
-            .row(&vec![Value::Int(1)])
+            .row(&[Value::Int(1)])
             .unwrap()
             .unwrap();
         let weak = Arc::downgrade(&shared);
@@ -2080,7 +2080,7 @@ mod tests {
             )
             .unwrap();
         let view = manager.table_view(&expired, "public.items", uuid::Uuid::nil());
-        let shared = view.row(&vec![Value::Int(1)]).unwrap().unwrap();
+        let shared = view.row(&[Value::Int(1)]).unwrap().unwrap();
         let weak = Arc::downgrade(&shared);
         drop(shared);
         assert!(weak.upgrade().is_some());
@@ -2096,7 +2096,7 @@ mod tests {
         ));
         drop(held_iterator);
         assert!(matches!(
-            view.row(&vec![Value::Int(1)]),
+            view.row(&[Value::Int(1)]),
             Err(MvccCommitError::SnapshotExpired)
         ));
     }
@@ -2186,7 +2186,7 @@ mod tests {
         let view = manager.table_view(&stale, "public.items", uuid::Uuid::nil());
         assert!(
             matches!(
-                view.row(&vec![Value::Int(1)]),
+                view.row(&[Value::Int(1)]),
                 Err(MvccCommitError::SnapshotExpired)
             ),
             "missing history must not use the current physical row"
@@ -2226,14 +2226,14 @@ mod tests {
             for snapshot in &held {
                 for key in [0, rows - 1] {
                     let view = manager.table_view(snapshot, "public.items", uuid::Uuid::nil());
-                    let visible = view.row(&vec![Value::Int(key as i64)]).unwrap();
+                    let visible = view.row(&[Value::Int(key as i64)]).unwrap();
                     assert_eq!(visible.as_deref(), Some(&None));
                 }
             }
             let new = manager.snapshot();
             let visible = manager
                 .table_view(&new, "public.items", uuid::Uuid::nil())
-                .row(&vec![Value::Int((rows - 1) as i64)])
+                .row(&[Value::Int((rows - 1) as i64)])
                 .unwrap();
             assert_eq!(visible.as_deref(), Some(&Some(row("inserted"))));
             allocations
@@ -2313,9 +2313,9 @@ mod tests {
                     let view =
                         reader_manager.table_view(snapshot, "public.items", uuid::Uuid::nil());
                     (
-                        view.row(&vec![Value::Int(2)])
+                        view.row(&[Value::Int(2)])
                             .map(|row| row.map(|shared| (*shared).clone())),
-                        view.row(&vec![Value::Int(1)])
+                        view.row(&[Value::Int(1)])
                             .map(|row| row.map(|shared| (*shared).clone())),
                     )
                 })

@@ -799,6 +799,73 @@ fn reconcile_memory_is_independent_of_edge_table_size() {
 
 // --- 5. the operations still return complete answers ---------------------
 
+#[test]
+fn simple_limit_stops_anchor_reads_after_matching_rows() {
+    let _guard = measure_guard();
+    let fx = fixture(LARGE_VERTICES, false);
+    let rt = current_thread_rt();
+    let result = rt
+        .block_on(fx.engine.execute(
+            "MATCH (p:Person) RETURN p.name LIMIT 3",
+            KEYSPACE,
+            &superuser(),
+        ))
+        .unwrap();
+    assert_eq!(result.rows.len(), 3);
+    let names: HashSet<_> = result
+        .rows
+        .iter()
+        .map(|row| row[0].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), 3);
+    assert!(
+        result.stats.vertices_read <= 3,
+        "LIMIT 3 read {} anchor partitions",
+        result.stats.vertices_read
+    );
+
+    // Sorting needs all anchors: the limit must stay after ORDER BY.
+    let ordered = rt
+        .block_on(fx.engine.execute(
+            "MATCH (p:Person) RETURN p.name ORDER BY p.name LIMIT 3",
+            KEYSPACE,
+            &superuser(),
+        ))
+        .unwrap();
+    assert_eq!(ordered.stats.vertices_read, LARGE_VERTICES);
+    assert_eq!(ordered.rows[0][0], serde_json::json!(NEEDLE));
+    assert_eq!(ordered.rows.len(), 3);
+
+    let distinct = rt
+        .block_on(fx.engine.execute(
+            "MATCH (p:Person) RETURN DISTINCT p.name LIMIT 3",
+            KEYSPACE,
+            &superuser(),
+        ))
+        .unwrap();
+    assert_eq!(distinct.rows.len(), 3);
+    assert_eq!(distinct.stats.vertices_read, LARGE_VERTICES);
+
+    let filtered = rt
+        .block_on(fx.engine.execute(
+            "MATCH (p:Person) WHERE p.name = 'needle' RETURN p.name LIMIT 1",
+            KEYSPACE,
+            &superuser(),
+        ))
+        .unwrap();
+    assert_eq!(filtered.rows, vec![vec![serde_json::json!(NEEDLE)]]);
+
+    let zero = rt
+        .block_on(fx.engine.execute(
+            "MATCH (p:Person) RETURN p.name LIMIT 0",
+            KEYSPACE,
+            &superuser(),
+        ))
+        .unwrap();
+    assert!(zero.rows.is_empty());
+    assert_eq!(zero.stats.vertices_read, 0);
+}
+
 /// Guard against "fixing" an OOM by capping the RESULT: a bound on how much
 /// data is resident is legitimate, a bound on how many rows the caller gets is
 /// a silent wrong answer. Every Person must come back from an unfiltered

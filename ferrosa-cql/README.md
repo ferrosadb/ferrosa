@@ -26,6 +26,14 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 
 ## What's implemented
 
+- **Table-access producer wiring.** Ordinary/prepared scalar reads and writes
+  share the tracker's instance with `system_observability.table_access_summary`.
+  Read counters classify the chosen PK, index/token-range or full-scan path;
+  metadata COUNT is a full-range metadata traversal. Writes count successful
+  ordinary mutations (including unlogged batches). These are CQL route counters,
+  not physical disk-operation counters or cross-protocol totals. LOGGED batch
+  and Accord transaction instrumentation remain separate coverage work.
+
 - **TCP server** (`server.rs`) — accept loop, per-connection Tokio task, optional
   rustls TLS, per-IP and global connection caps, per-connection in-flight
   semaphore returning `Overloaded` on saturation, `auth_disabled` resolution.

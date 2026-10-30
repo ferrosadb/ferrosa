@@ -511,8 +511,60 @@ impl SchedPool {
                     cancel,
                 )
                 .await;
-            run_admitted(admitted, waited, admit, io_permits, chunk_budget, f).await
+            run_admitted(admitted, waited, admit, io_permits, chunk_budget, f)
+                .await
+                .expect("scheduler blocking task must not be cancelled")
         })
+    }
+
+    /// Execute admission from an existing async scan supervisor.
+    pub async fn execute_scan<F, R, C>(
+        &self,
+        class: SchedClass,
+        chunk_budget: u32,
+        cancel: C,
+        f: F,
+    ) -> Result<ScanOutcome<R>, tokio::task::JoinError>
+    where
+        F: FnOnce(&mut ScanSlot) -> R + Send + 'static,
+        R: Send + 'static,
+        C: Future<Output = ()> + Send,
+    {
+        let admit = self.admit.clone();
+        let io_permits = self.io_permits.clone();
+        let waited = Instant::now();
+        let admitted = admit
+            .admit(
+                DEFAULT_TENANT_GROUP,
+                group_runqueue::DEFAULT_GROUP_WEIGHT,
+                class,
+                cancel,
+            )
+            .await;
+        run_admitted(admitted, waited, admit, io_permits, chunk_budget, f).await
+    }
+
+    /// Resume admission from an existing async scan supervisor.
+    pub async fn resume_scan<F, R, C>(
+        &self,
+        ticket: ScanTicket,
+        cancel: C,
+        f: F,
+    ) -> Result<ScanOutcome<R>, tokio::task::JoinError>
+    where
+        F: FnOnce(&mut ScanSlot) -> R + Send + 'static,
+        R: Send + 'static,
+        C: Future<Output = ()> + Send,
+    {
+        let admit = self.admit.clone();
+        let io_permits = self.io_permits.clone();
+        let waited = Instant::now();
+        let ScanTicket {
+            suspended,
+            chunk_budget,
+        } = ticket;
+        let admitted = admit.readmit(suspended, cancel).await;
+        run_admitted(admitted, waited, admit, io_permits, chunk_budget, f).await
     }
 
     /// Run the next stretch of a scan that stopped with a [`ScanTicket`] (it
@@ -540,7 +592,9 @@ impl SchedPool {
                 chunk_budget,
             } = ticket;
             let admitted = admit.readmit(suspended, cancel).await;
-            run_admitted(admitted, waited, admit, io_permits, chunk_budget, f).await
+            run_admitted(admitted, waited, admit, io_permits, chunk_budget, f)
+                .await
+                .expect("scheduler blocking task must not be cancelled")
         })
     }
 }
@@ -555,15 +609,15 @@ async fn run_admitted<F, R>(
     io_permits: io_permits::IoPermits,
     chunk_budget: u32,
     f: F,
-) -> ScanOutcome<R>
+) -> Result<ScanOutcome<R>, tokio::task::JoinError>
 where
     F: FnOnce(&mut ScanSlot) -> R + Send + 'static,
     R: Send + 'static,
 {
     let id = match admitted {
         Admitted::Slot(id) => id,
-        Admitted::Overloaded => return ScanOutcome::Overloaded,
-        Admitted::Cancelled => return ScanOutcome::Cancelled,
+        Admitted::Overloaded => return Ok(ScanOutcome::Overloaded),
+        Admitted::Cancelled => return Ok(ScanOutcome::Cancelled),
     };
     record_admission(waited.elapsed());
     // B2 T2.1: hold a bulk-I/O permit while producing (the Lane::Bulk
@@ -593,9 +647,8 @@ where
             slot.finish();
             out
         })
-        .await
-        .expect("scheduler blocking task must not be cancelled");
-    ScanOutcome::Ran(out)
+        .await?;
+    Ok(ScanOutcome::Ran(out))
 }
 
 /// Carrier threads [`scan_carrier`] may run at once: the host's cores. Only
@@ -885,6 +938,78 @@ pub fn global_pool() -> &'static SchedPool {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    async fn admission_uses_supervisor_task(resuming: bool) {
+        let pool = Arc::new(SchedPool::new(Reservation::new(1, 0)));
+        let ticket = if resuming {
+            Some(ran(pool
+                .submit_scan(
+                    SchedClass::Bulk,
+                    DEFAULT_SCAN_CHUNK_BUDGET,
+                    std::future::pending(),
+                    |slot| {
+                        slot.release();
+                        slot.take_ticket().unwrap()
+                    },
+                )
+                .await
+                .unwrap()))
+        } else {
+            None
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let occupied = pool.submit_scan(
+            SchedClass::Bulk,
+            DEFAULT_SCAN_CHUNK_BUDGET,
+            std::future::pending(),
+            move |_| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            },
+        );
+        started_rx.await.unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let observed = Arc::clone(&seen);
+        let pending_pool = Arc::clone(&pool);
+        let queued = tokio::spawn(async move {
+            let caller = tokio::task::id();
+            let cancel = async move {
+                *observed.lock().unwrap() = Some(tokio::task::id());
+            };
+            let outcome = match ticket {
+                Some(ticket) => pending_pool.resume_scan(ticket, cancel, |_| ()).await,
+                None => {
+                    pending_pool
+                        .execute_scan(SchedClass::Bulk, DEFAULT_SCAN_CHUNK_BUDGET, cancel, |_| ())
+                        .await
+                }
+            };
+            (caller, outcome)
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(5), queued).await;
+        // Release the blocking producer before any assertion, including RED.
+        release_tx.send(()).unwrap();
+        ran(occupied.await.unwrap());
+        let (caller, outcome) = outcome.unwrap().unwrap();
+        assert!(matches!(outcome.unwrap(), ScanOutcome::Cancelled));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(caller),
+            "admission spawned an extra async task"
+        );
+        assert_eq!(pool.available_permits(), pool.capacity());
+    }
+
+    #[tokio::test]
+    async fn fresh_scan_admission_stays_in_supervisor_task() {
+        admission_uses_supervisor_task(false).await;
+    }
+
+    #[tokio::test]
+    async fn resumed_scan_admission_stays_in_supervisor_task() {
+        admission_uses_supervisor_task(true).await;
+    }
 
     #[test]
     fn available_is_cores_minus_reserved_floored_at_one() {

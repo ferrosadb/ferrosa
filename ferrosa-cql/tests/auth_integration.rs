@@ -127,6 +127,9 @@ fn setup_state() -> (Arc<SharedState>, TempDir) {
         query_tracker: Arc::new(QueryTracker::new()),
         full_scan_tracker: Arc::new(ferrosa_cql::virtual_tables::FullScanTracker::new()),
         index_usage_tracker: Arc::new(ferrosa_cql::virtual_tables::IndexUsageTracker::new()),
+        table_access_tracker: std::sync::Arc::new(
+            ferrosa_cql::virtual_tables::TableAccessTracker::new(),
+        ),
         event_sender: tokio::sync::broadcast::channel(64).0,
         last_schema_event: tokio::sync::watch::channel(None).0,
         topology_policy: ClientTopologyPolicy::default(),

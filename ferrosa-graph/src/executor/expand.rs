@@ -1513,7 +1513,8 @@ struct ExpandParts {
 /// Execute a `PhysicalPlan::Expand`, streaming the projection when it is safe.
 ///
 /// Phase A (which states survive) is shared verbatim with the buffered path and
-/// is NOT lazy — the hop loop still materializes the frontier, and the
+/// stops early for eligible bounded anchor scans; the hop loop still
+/// materializes the frontier, and the
 /// sequential-vs-concurrent hop split is untouched. What streams is phase B:
 /// one `project_state` per pull, so a `LIMIT k` projects k states instead of
 /// projecting everything and truncating.
@@ -1665,7 +1666,7 @@ async fn execute_expand_streaming<'a>(
 /// MATCH and the WITH pipeline — everything that decides WHICH states survive.
 ///
 /// Shared verbatim by the buffered and streaming tails, so the two can never
-/// disagree about what matched. Nothing here is lazy yet: the hop loop still
+/// disagree about what matched. Eligible anchor LIMITs stop scanning early; the hop loop still
 /// materializes the frontier (later increments), and `max_fan_out_per_hop`
 /// still guards it exactly as before.
 async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<ExpandStates> {
@@ -1708,6 +1709,27 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
         .map(ExpandStates::Virtual);
     }
 
+    // These operators must see the candidate set before limiting. Without
+    // them, a no-hop anchor can stop as soon as enough matching rows survive.
+    // Never cap anchors feeding hops: early anchors may have no matching edges.
+    let limit_is_safe = return_clause.order_by.is_empty()
+        && !return_clause.distinct
+        && with_pipeline.is_none()
+        && post_filters.is_empty()
+        && optional_hops.is_empty();
+    let pushdown_cap = return_clause
+        .limit
+        .filter(|limit| limit_is_safe && *limit > 0)
+        .map(|limit| limit as usize);
+    let anchor_cap = if hops.is_empty() && limit_is_safe {
+        return_clause.limit.map(|limit| limit.max(0) as usize)
+    } else {
+        None
+    };
+    if anchor_cap == Some(0) {
+        return Ok(ExpandStates::Materialized(Vec::new(), stats));
+    }
+
     let (mut current_states, traversal_hops): (Vec<ExpandState>, &[Hop]) = if let Some(states) =
         try_edge_anchored_initial_states(
             write_path,
@@ -1742,10 +1764,10 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
         // so an anchor whose filters select a handful of vertices costs a
         // handful of states no matter how large the table is. `check_timeout`
         // per partition keeps the WORK bounded — deliberately a work bound, not
-        // a result bound: nothing here truncates `states`.
+        // a result bound: only an eligible explicit query LIMIT stops `states`.
         let anchor_var = anchor.var.as_deref().unwrap_or("_anon");
         let mut states: Vec<ExpandState> = Vec::new();
-        while let Some(partition) = anchor_partitions.next().await {
+        'anchor_scan: while let Some(partition) = anchor_partitions.next().await {
             let partition = &partition?;
             stats.vertices_read += 1;
             check_timeout(start, config.query_timeout)?;
@@ -1790,6 +1812,9 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                             current_key,
                             bindings,
                         });
+                        if anchor_cap.is_some_and(|cap| states.len() >= cap) {
+                            break 'anchor_scan;
+                        }
                     }
                 }
             } else {
@@ -1820,6 +1845,9 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
                         current_key: partition.key.clone(),
                         bindings,
                     });
+                    if anchor_cap.is_some_and(|cap| states.len() >= cap) {
+                        break 'anchor_scan;
+                    }
                 }
             }
         }
@@ -1837,14 +1865,6 @@ async fn expand_to_states(plan: ExpandPlan<'_>, ctx: ExpandCtx<'_>) -> Result<Ex
     // may stop expanding (and hydrating) the LAST hop as soon as `limit` rows
     // accumulate, instead of hydrating the whole fan-out and truncating at the
     // end. Aggregates never reach this path (they use PhysicalPlan::Aggregate).
-    let pushdown_cap: Option<usize> = return_clause.limit.and_then(|limit| {
-        let safe = return_clause.order_by.is_empty()
-            && !return_clause.distinct
-            && with_pipeline.is_none()
-            && post_filters.is_empty()
-            && optional_hops.is_empty();
-        (safe && limit > 0).then_some(limit as usize)
-    });
     for hop in traversal_hops.iter() {
         check_timeout(start, config.query_timeout)?;
         // LIMIT short-circuit on EVERY hop, not just the last (t_4ce82a3e
@@ -2377,29 +2397,79 @@ fn project_states_stream<'a>(
     states: Vec<ExpandState>,
     projection: ExpandProjection<'a>,
 ) -> RowStream<'a> {
+    let properties = if projection.needs_graph_projection {
+        None
+    } else {
+        owned_property_layout(projection.return_clause.items.iter().map(|item| &item.expr))
+    };
     Box::pin(futures::stream::unfold(
-        (states.into_iter(), projection, false),
-        |(mut states, projection, failed)| async move {
+        (states.into_iter(), projection, properties, false),
+        |(mut states, projection, properties, failed)| async move {
             // Stop after a failure rather than projecting the rest: a caller
             // that kept pulling would see a partial result follow an error.
             if failed {
                 return None;
             }
             let state = states.next()?;
-            let row = project_state(
-                &projection.return_clause,
-                projection.needs_graph_projection,
-                projection.write_path,
-                projection.keyspace,
-                projection.schema,
-                &projection.anchor_var,
-                &state,
-            )
-            .await;
+            let row = match properties.as_deref() {
+                Some(properties) => Ok(project_owned_properties(state, properties)),
+                None => {
+                    project_state(
+                        &projection.return_clause,
+                        projection.needs_graph_projection,
+                        projection.write_path,
+                        projection.keyspace,
+                        projection.schema,
+                        &projection.anchor_var,
+                        &state,
+                    )
+                    .await
+                }
+            };
             let failed = row.is_err();
-            Some((row, (states, projection, failed)))
+            Some((row, (states, projection, properties, failed)))
         },
     ))
+}
+
+/// Plan moves once per query. Repeated properties clone until their last use.
+fn owned_property_layout<'e>(
+    expressions: impl DoubleEndedIterator<Item = &'e Expr>,
+) -> Option<Vec<(String, String, bool)>> {
+    let mut seen = HashSet::new();
+    let mut properties = Vec::new();
+    for expr in expressions.rev() {
+        let Expr::Property { var, name } = expr else {
+            return None;
+        };
+        let last_use = seen.insert((var.as_str(), name.as_str()));
+        properties.push((var.clone(), name.clone(), last_use));
+    }
+    if properties.is_empty() {
+        return None;
+    }
+    properties.reverse();
+    Some(properties)
+}
+
+/// Project owned state; the stream no longer needs its input bindings afterward.
+fn project_owned_properties(
+    mut state: ExpandState,
+    properties: &[(String, String, bool)],
+) -> Vec<serde_json::Value> {
+    properties
+        .iter()
+        .map(|(var, name, last_use)| {
+            let Some(serde_json::Value::Object(object)) = state.bindings.get_mut(var) else {
+                return serde_json::Value::Null;
+            };
+            if *last_use {
+                object.remove(name).unwrap_or(serde_json::Value::Null)
+            } else {
+                object.get(name).cloned().unwrap_or(serde_json::Value::Null)
+            }
+        })
+        .collect()
 }
 
 fn sort_projected_rows_by_bindings(
@@ -3159,6 +3229,9 @@ fn prop_map_passes(
     props: &[(String, Expr)],
     row_json: &serde_json::Value,
 ) -> Result<bool> {
+    if props.is_empty() {
+        return Ok(true);
+    }
     let mut bindings = HashMap::new();
     bindings.insert(var_name.to_string(), row_json.clone());
     for (name, expr) in props {
@@ -7134,6 +7207,86 @@ pub fn check_timeout(start: Instant, timeout: Duration) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn owned_projection_moves_selected_text_out_of_consumed_state() {
+        let state = super::ExpandState {
+            current_key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::from(
+                &b"node"[..],
+            )),
+            bindings: std::collections::HashMap::from([(
+                "n".to_string(),
+                serde_json::json!({"payload": "x".repeat(1024 * 1024)}),
+            )]),
+        };
+        let properties = vec![("n".to_string(), "payload".to_string(), true)];
+        let (row, bytes) = crate::allocation_test_support::allocated_bytes(|| {
+            super::project_owned_properties(state, &properties)
+        });
+        assert_eq!(row[0].as_str().unwrap().len(), 1024 * 1024);
+        assert!(bytes < 1024, "moving one property allocated {bytes} bytes");
+    }
+
+    #[test]
+    fn owned_property_projection_preserves_duplicates_nulls_and_fallback() {
+        let expressions = [
+            super::Expr::Property {
+                var: "n".into(),
+                name: "name".into(),
+            },
+            super::Expr::Property {
+                var: "n".into(),
+                name: "name".into(),
+            },
+            super::Expr::Property {
+                var: "n".into(),
+                name: "missing".into(),
+            },
+            super::Expr::Property {
+                var: "absent".into(),
+                name: "name".into(),
+            },
+            super::Expr::Property {
+                var: "scalar".into(),
+                name: "name".into(),
+            },
+        ];
+        let layout = super::owned_property_layout(expressions.iter()).unwrap();
+        assert!(!layout[0].2);
+        assert!(layout[1].2);
+        let state = super::ExpandState {
+            current_key: ferrosa_common::DecoratedKey::new(ferrosa_common::PartitionKey::from(
+                &b"node"[..],
+            )),
+            bindings: std::collections::HashMap::from([
+                ("n".into(), serde_json::json!({"name": "Alice"})),
+                ("scalar".into(), serde_json::json!(7)),
+            ]),
+        };
+        assert_eq!(
+            super::project_owned_properties(state, &layout),
+            vec![
+                serde_json::json!("Alice"),
+                serde_json::json!("Alice"),
+                serde_json::Value::Null,
+                serde_json::Value::Null,
+                serde_json::Value::Null
+            ]
+        );
+        let mixed = [expressions[0].clone(), super::Expr::Var("n".into())];
+        assert!(super::owned_property_layout(mixed.iter()).is_none());
+        assert!(super::owned_property_layout([].iter()).is_none());
+    }
+
+    #[test]
+    fn empty_property_map_does_not_allocate_for_the_node() {
+        let node = serde_json::json!({"payload": "x".repeat(1024 * 1024)});
+        let (result, bytes) = crate::allocation_test_support::allocated_bytes(|| {
+            super::prop_map_passes("n", &[], &node)
+        });
+        assert!(result.unwrap());
+        assert_eq!(bytes, 0, "empty predicates allocated {bytes} bytes");
+    }
 
     #[test]
     fn adjacency_hop_does_not_collect_a_partition_sized_neighbor_vector() {

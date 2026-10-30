@@ -16,6 +16,13 @@ Sourced from the FMEA gaps ([fmea.md](fmea.md)), the code review (no in-source
 
 ## Now (highest value)
 
+- **Scan allocation progress.** Empty property predicates avoid node/binding-map
+  clones; scalar property lookup borrows the parent and clones only the selected
+  value. Allocation regressions and null/ownership checks cover these paths.
+  Plain no-hop anchor LIMITs now stop after enough matches, including no reads
+  for LIMIT 0. ORDER BY, DISTINCT, WITH, post-filters and OPTIONAL hops retain
+  their barriers. General lazy anchor/traversal streams remain separate work.
+
 - **Scalar-index follow-ups.** Bolt first-access setup is automatic and memoized;
   integer/UUID, text, boolean and bounded float equality consume current scalar
   indexes. Extend range/predicate support and explicit Cypher index DDL while
@@ -163,3 +170,9 @@ path commits/rolls back after completed RUN and sends no RESET during a queued R
 Separate correctness prerequisite before production (`t_6775b186`): schema-incarnation fencing
 for DROP/recreate. The fresh-schema baseline excludes concurrent DDL. Broader
 CQL/cross-engine/distributed isolation remains outside this local ownership domain.
+
+Owned property-only streaming projections move fields at their last use; earlier
+duplicate references retain their required value copies. Complex projections
+keep the general evaluator. Bolt serialization consumes owned rows and moves
+strings, map keys and nested values into PackStream values. Wire encoding still
+writes output bytes, and unlimited anchor/PULL batches can still materialize.

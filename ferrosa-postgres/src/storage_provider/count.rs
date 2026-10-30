@@ -3,12 +3,14 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use super::{decoded_row_values, read_consistency, ScanContext, ScanFailure, Value};
+use super::{decoded_cell_value, read_consistency, ScanContext, ScanFailure, Value};
 use crate::mvcc::MvccTableView;
 
 #[derive(Default)]
 struct CountState {
-    seen: HashSet<Vec<Value>>,
+    // Eligibility guarantees one partition-key column and no clustering key.
+    // Keep that scalar inline; MVCC/overlay lookups borrow its slice view.
+    seen: HashSet<[Value; 1]>,
     replacements: u64,
     error: Option<String>,
 }
@@ -26,7 +28,7 @@ impl CountState {
         let index = ctx.pk_idx[0];
         let value = ferrosa_row_bridge::decode_value(&ctx.col_types[index], key.key.as_bytes())
             .map_err(|error| format!("count key decode failed: {error}"))?;
-        let key = decoded_row_values(vec![Some(value)])?;
+        let key = [decoded_cell_value(Some(value))?];
         let historical = view
             .map(|view| view.row(&key))
             .transpose()
@@ -35,7 +37,7 @@ impl CountState {
                 "PostgreSQL transaction snapshot expired".to_string()
             })?
             .flatten();
-        let replacement = ctx.overlay.get(&key).or(historical.as_deref());
+        let replacement = ctx.overlay.get(key.as_slice()).or(historical.as_deref());
         let first_visit = self.seen.insert(key);
         if let Some(row) = replacement {
             if first_visit && row.is_some() {
@@ -126,7 +128,7 @@ pub(super) async fn metadata_count(
                 failure.expired();
                 "PostgreSQL transaction snapshot expired"
             })?;
-            if !state.seen.contains(key.as_ref())
+            if !state.seen.contains(&key[..])
                 && !ctx.overlay.contains_key(key.as_ref())
                 && row.is_some()
             {
@@ -135,7 +137,7 @@ pub(super) async fn metadata_count(
         }
     }
     for (key, row) in ctx.overlay.iter() {
-        if !state.seen.contains(key) && row.is_some() {
+        if !state.seen.contains(key.as_slice()) && row.is_some() {
             state.replacements += 1;
         }
     }
@@ -149,6 +151,26 @@ pub(super) async fn metadata_count(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn integer_count_key_does_not_allocate_a_one_element_vector() {
+        let (_dir, mut ctx) = fixture();
+        Arc::get_mut(&mut ctx).unwrap().col_types[0] = CqlType::Int;
+        let key = DecoratedKey::new(PartitionKey::from(&7i32.to_be_bytes()[..]));
+        let failure = ScanFailure::default();
+        let mut state = CountState::default();
+        state.seen.reserve(1);
+        let mut keep = None;
+        let allocations = MvccManager::count_allocations_for_test(|| {
+            keep = Some(state.observe(&ctx, None, &failure, &key));
+        });
+        assert!(keep.unwrap().unwrap());
+        assert_eq!(state.seen.len(), 1);
+        assert_eq!(
+            allocations, 0,
+            "single scalar count key allocated {allocations} times"
+        );
+    }
     use crate::cluster_read::{PartitionStream, RangeRead};
     use crate::mvcc::{MvccManager, RowChange};
     use ferrosa_cluster::consistency::ConsistencyLevel;
