@@ -534,9 +534,31 @@ def math_display(tex: str) -> str:
     )
 
 
-def lean_form(lean: str) -> str:
+def _words(s: str) -> list[str]:
+    """The words of a formula, with LaTeX wrappers and namespace prefixes removed."""
+    s = re.sub(r"\\begin\{[^}]*\}(\[[^\]]*\])?", " ", s)
+    s = re.sub(r"\\end\{[^}]*\}", " ", s)
+    s = re.sub(r"\\[a-zA-Z]+", " ", s)
+    # `ConsistencyLevel.one` and `one` are the same object; the namespace is not part of the reading
+    s = re.sub(r"[A-Za-z0-9_']\.(?:[A-Za-z0-9_']+\.)*[A-Za-z0-9_']+",
+               lambda m: m.group(0).rsplit(".", 1)[-1], s)
+    s = re.sub(r"[^A-Za-z0-9_\s]", " ", s)
+    return sorted(w.split(".")[-1] for w in s.split() if w)
+
+
+def same_statement(tex: str, lean: str) -> bool:
+    """Whether the mathematics and the Lean say the same thing word for word.
+
+    Printing both then is printing the same formula twice, which reads as a mistake — the reader
+    looks for the difference and there is none.
+    """
+    a, b = _words(tex), _words(lean)
+    return bool(a) and a == b
+
+
+def lean_form(lean: str, tex: str = "") -> str:
     """The same statement as Lean printed it, for checking the translation above."""
-    if not lean.strip():
+    if not lean.strip() or same_statement(tex, lean):
         return ""
     return (
         "\\par\\vspace{-1pt}\\noindent{\\scriptsize\\sffamily\\color{quiet}lean}\\par\\nopagebreak\n"
@@ -563,7 +585,7 @@ def claim_block(c: dict, thm: str, tex: str, lean: str, doc: str,
     if tex:
         out.append(math_display(tex))
     if lean:
-        out.append(lean_form(lean))
+        out.append(lean_form(lean, tex))
     if src:
         out.append(rf"\src{{{esc(src)}}}")
     return "\n".join(out)
@@ -619,7 +641,7 @@ def statement_block(name: str, tex: str, lean: str, doc: str, desc: str,
     else:
         body = ""
     body += "".join("\n" + def_block(n, b) for n, b in defs)
-    body += "\n" + math_display(tex) + "\n" + lean_form(lean)
+    body += "\n" + math_display(tex) + "\n" + lean_form(lean, tex)
     return head + body + ("\n" + rf"\src{{{esc(src)}}}" if src else "")
 
 

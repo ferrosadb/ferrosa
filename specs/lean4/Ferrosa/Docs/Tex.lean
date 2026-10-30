@@ -37,11 +37,32 @@ def escape (s : String) : String :=
     | '\'' => "\\prime"
     | _ => c.toString
 
+/-- Greek letters as LaTeX commands. A bare `τ` in a name reaches the math font, which in this
+    document does not carry Greek, and prints as nothing at all. -/
+def greek (c : Char) : Option String :=
+  match c with
+  | 'α' => some "\\alpha"   | 'β' => some "\\beta"    | 'γ' => some "\\gamma"
+  | 'δ' => some "\\delta"   | 'ε' => some "\\epsilon" | 'ζ' => some "\\zeta"
+  | 'η' => some "\\eta"     | 'θ' => some "\\theta"   | 'ι' => some "\\iota"
+  | 'κ' => some "\\kappa"   | 'λ' => some "\\lambda"  | 'μ' => some "\\mu"
+  | 'ν' => some "\\nu"      | 'ξ' => some "\\xi"      | 'π' => some "\\pi"
+  | 'ρ' => some "\\rho"     | 'σ' => some "\\sigma"   | 'τ' => some "\\tau"
+  | 'υ' => some "\\upsilon" | 'φ' => some "\\phi"     | 'χ' => some "\\chi"
+  | 'ψ' => some "\\psi"     | 'ω' => some "\\omega"   | 'Γ' => some "\\Gamma"
+  | 'Δ' => some "\\Delta"   | 'Θ' => some "\\Theta"   | 'Λ' => some "\\Lambda"
+  | 'Π' => some "\\Pi"      | 'Σ' => some "\\Sigma"   | 'Φ' => some "\\Phi"
+  | 'Ψ' => some "\\Psi"     | 'Ω' => some "\\Omega"
+  | _ => none
+
+/-- Replace every Greek letter in a name by its command. -/
+def greekize (s : String) : String :=
+  String.join (s.toList.map (fun c => (greek c).getD c.toString))
+
 /-- The last component of a name, set as a formula: `Readable` is a \texttt{\textbackslash mathrm}
     word, `primary` a \texttt{\textbackslash mathsf} one. That split is the corpus's own: capitalised
     names are predicates and types, lowercase ones are constructors and alternatives. -/
 def texName (n : Name) : String :=
-  let s := n.getString!
+  let s := greekize n.getString!
   let qualified := n.components.length > 1
   match s.toList.head? with
   | some c =>
@@ -62,6 +83,16 @@ def texName (n : Name) : String :=
 def propHeads : Array String :=
   #["Eq", "Ne", "And", "Or", "Not", "Iff", "Exists", "Subtype", "LT.lt", "LE.le",
     "Membership.mem", "Iff", "Or", "Dvd.dvd"]
+
+/-- Constants that look like projections and are not: `OfNat.ofNat`, `HAdd.hAdd`, `Neg.neg`. They
+    are class methods, and printing `1.ofNat` for the numeral 1 is worse than printing nothing. -/
+def classMethod (n : Name) : Bool :=
+  let s := n.toString
+  ["OfNat", "OfScientific", "OfDecimal", "Neg", "HAdd", "HSub", "HMul", "HDiv", "HMod", "HPow",
+   "HAnd", "HOr", "Append", "LT", "LE", "GT", "GE", "Membership", "Dvd", "Inter", "Union",
+   "Subset", "Decidable", "Coe", "CoeT", "OfCoe", "Nat.add", "Nat.mul", "Nat.sub",
+   "Nat.mod", "Nat.div", "Nat.pow", "Bool.and", "Bool.or", "Bool.not"].any (fun p =>
+    s == p || s.startsWith (p ++ "."))
 
 partial def isPropTy (env : Environment) (e : Expr) (depth : Nat := 8) : Bool :=
   if depth == 0 then false else
@@ -97,7 +128,12 @@ def infix? (n : Name) : Option String :=
   else if s.endsWith "Membership.mem" then some "\\in"
   else if s.endsWith "HAdd.hAdd" then some "+"
   else if s.endsWith "HSub.hSub" then some "-"
-  else if s.endsWith "HMul.hMul" then some "\\cdot"
+  else if s.endsWith "HAdd.hAdd" || s.endsWith "Nat.add" then some "+"
+  else if s.endsWith "HSub.hSub" || s.endsWith "Nat.sub" then some "-"
+  else if s.endsWith "HMul.hMul" || s.endsWith "Nat.mul" then some "\\cdot"
+  else if s.endsWith "Append.append" then some "\\mathbin{{+}{+}}"
+  else if s.endsWith "HAnd.hAnd" then some "\\wedge"
+  else if s.endsWith "HOr.hOr" then some "\\vee"
   else if s.endsWith "HDiv.hDiv" then some "/"
   else none
 
@@ -132,13 +168,13 @@ partial def tex (env : Environment) (e : Expr) : String :=
   | .forallE n ty b bi =>
     if bi == .implicit || bi == .instImplicit then tex env b
     else if isPropTy env ty then s!"{tex env ty} \\to {tex env b}"
-    else s!"\\forall {escape n.getString!} : {tex env ty},\\ {tex env b}"
+    else s!"\\forall {greekize (escape n.getString!)} : {tex env ty},\\ {tex env b}"
   | .lam n ty b bi =>
     if bi == .implicit || bi == .instImplicit then tex env b
     else
       let nm := if n.toString == "_" then "x" else n.getString!
       let c := Expr.const (.str .anonymous nm) []
-      s!"\\lambda {escape nm} : {tex env ty},\\ {tex env (b.instantiate1 c)}"
+      s!"\\lambda {greekize (escape nm)} : {tex env ty},\\ {tex env (b.instantiate1 c)}"
   | .letE n _ v b _ => s!"{tex env b}"
   | .bvar i => s!"x\\_{i}"
   | .fvar id => s!"v_{id.name.getString!}"
@@ -161,7 +197,7 @@ partial def texApp (env : Environment) (e : Expr) : String :=
       | .lam nm _ b _ =>
         let nm := if nm.toString == "_" then "x" else nm.getString!
         let c := Expr.const (.str .anonymous nm) []
-        s!"\\exists {escape nm},\\ {tex env (b.instantiate1 c)}"
+        s!"\\exists {greekize (escape nm)},\\ {tex env (b.instantiate1 c)}"
       | other => s!"\\exists {tex env other}"
     else if let some op := infix? n then
       if args.size >= 2 then
@@ -172,7 +208,14 @@ partial def texApp (env : Environment) (e : Expr) : String :=
       let keep := explicitArgs env n args
       let vals := keep.map (fun a => tex env a)
       "\\langle " ++ String.intercalate ", " vals.toList ++ " \\rangle"
+    else if n.toString.endsWith "OfNat.ofNat" && args.size >= 2 then tex env args[1]!
+    else if n.toString.endsWith "OfScientific.ofScientific" && args.size >= 2 then
+      match args[1]! with
+      | .lit (.natVal m) => toString m
+      | _ => tex env args[1]!
+    else if env.find? n |>.any (fun _ => false) then texName n
     else if (explicitArgs env n args).size == 1 && n.components.length >= 2
+            && !classMethod n
             && (n.getString!.toList.head?).any (fun c => c.isLower) then
       -- a projection: `s.acked` reads as mathematics where `acked(s)` reads as code
       tex env (explicitArgs env n args)[0]! ++ ".\\mathsf{" ++ escape n.getString! ++ "}"
@@ -223,7 +266,7 @@ partial def texStatement (env : Environment) (ty : Expr) : String :=
       -- arguments are dropped, because they are proof-irrelevant machinery.
       if bi == .instImplicit then peel b (#[c] ++ subst) vars hyps
       else if isPropTy env t then peel b (#[c] ++ subst) vars (hyps.push (tex env t))
-      else peel b (#[c] ++ subst) (vars.push (escape nm)) hyps
+      else peel b (#[c] ++ subst) (vars.push (greekize (escape nm))) hyps
     | _ => (vars, hyps, e)
   let (vars, hyps, body) := peel ty #[] #[] #[]
   let quant :=

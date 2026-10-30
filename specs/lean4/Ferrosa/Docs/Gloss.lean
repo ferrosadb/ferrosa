@@ -88,12 +88,19 @@ partial def peel (env : Environment) (e : Expr) (subst : Array Expr) (vars : Arr
     let b := b.instantiate (#[c] ++ subst)
     if bi == .instImplicit then peel env b (#[c] ++ subst) vars hyps
     else if Ferrosa.Docs.Tex.isPropTy env t then peel env b (#[c] ++ subst) vars (hyps.push (code env t))
-    else peel env b (#[c] ++ subst) (vars.push ("\\(" ++ Ferrosa.Docs.Tex.escape nm ++ "\\)")) hyps
+    else
+      -- a Greek letter in a variable name has to reach the math font as a command
+      peel env b (#[c] ++ subst)
+        (vars.push ("\\(" ++ Ferrosa.Docs.Tex.greekize (Ferrosa.Docs.Tex.escape nm) ++ "\\)")) hyps
   | _ => (vars, hyps, e)
 
 /-- The statement in English: quantifiers, hypotheses, conclusion, in that order. -/
 def desc (env : Environment) (ty : Expr) : String :=
   let (vars, hyps, body) := peel env ty #[] #[] #[]
+  -- Nothing to say: a bare equation is its own sentence, and repeating it with a full stop
+  -- underneath reads as a rendering fault.
+  if vars.isEmpty && hyps.isEmpty then ""
+  else
   let quant :=
     if vars.isEmpty then ""
     else "For all " ++ String.intercalate " and " vars.toList ++ (if hyps.isEmpty then ": " else ", ")
