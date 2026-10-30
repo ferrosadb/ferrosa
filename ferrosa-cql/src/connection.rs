@@ -28,7 +28,9 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn, Instrument, Level, Span};
 
-use crate::ast::{Assignment, Limit, SelectColumn, SelectStatement, Statement, Term};
+use crate::ast::{
+    AggregateKind, Assignment, Limit, SelectColumn, SelectStatement, Statement, Term,
+};
 use crate::auth::{
     encode_auth_success, encode_authenticate_response, parse_sasl_plain, MAX_AUTH_ATTEMPTS,
 };
@@ -2836,6 +2838,23 @@ fn build_result_columns(
     for sc in select_columns {
         match sc {
             SelectColumn::Star => unreachable!(),
+            // Aggregate node: the same result column the FunctionCall arm below
+            // reports, typed from the node instead of a lowercased name. The
+            // PREPARE metadata a strict driver unmarshals with must not change.
+            SelectColumn::Aggregate(call) => {
+                let cql_type = match (call.kind, table_meta) {
+                    (AggregateKind::Count, _) => CqlType::Bigint,
+                    (_, Some(table_meta)) => crate::router::resolve_aggregate_argument_type(
+                        call, table_meta, table_ks, &state.schema,
+                    )
+                    .unwrap_or(CqlType::Varchar),
+                    (_, None) => match call.argument.column_name() {
+                        Some(name) => resolve(name).unwrap_or(CqlType::Varchar),
+                        None => CqlType::Double,
+                    },
+                };
+                result.push((call.result_name().to_string(), cql_type));
+            }
             SelectColumn::Column(name) => {
                 if let Some(cql_type) = resolve(name) {
                     result.push((name.clone(), cql_type));
