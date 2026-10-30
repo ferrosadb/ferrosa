@@ -41,10 +41,8 @@
 //! impossible (a non-zero counter in steady state means the freeze mitigation is
 //! NOT active on that host and must be investigated).
 
-use std::alloc::{alloc, dealloc, Layout};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ferrosa_common::Result;
@@ -348,20 +346,27 @@ pub fn full_block_prefix(filled: usize, block: usize) -> usize {
 /// A heap buffer aligned to a runtime-chosen power of two, the O_DIRECT
 /// memory-alignment requirement.
 ///
-/// `Vec<u8>` gives no alignment guarantee, so the staging buffer is a manual
-/// aligned allocation. `capacity` is a non-zero multiple of `align`, and
+/// `Vec<u8>` gives no alignment guarantee of its own, so the buffer is
+/// over-allocated by one `align` and the usable window is taken from the first
+/// aligned index — no allocation, no `unsafe`, and the same guarantee the kernel
+/// checks. `capacity` is a non-zero multiple of `align`, and
 /// `align` must be a power of two no smaller than [`MIN_BLOCK`] — the probed
 /// device block (`pump.rs`'s `dio_align` probe, once T-031 lands) can exceed
 /// 4096, and the allocation must satisfy whatever that probe reports.
 pub(crate) struct AlignedBuf {
-    ptr: NonNull<u8>,
+    /// The owning allocation. It is `capacity + align` bytes long; the usable
+    /// window starts at `offset`, the first index whose address is `align`-aligned.
+    ///
+    /// Over-allocating and indexing is how a safe `Vec<u8>` satisfies an
+    /// alignment requirement: there is always an aligned address inside any
+    /// `align`-byte stretch, and a slice that starts at that index is aligned
+    /// because the address, not the allocator, is what the kernel checks.
+    /// `Vec<u8>` is `Send` and `Sync`, so no hand-written impl is needed.
+    buf: Vec<u8>,
+    offset: usize,
     capacity: usize,
     align: usize,
 }
-
-// SAFETY: `AlignedBuf` uniquely owns its allocation; sending it across threads is
-// sound (it is `!Sync` by default via `NonNull`, and we never share `&` mutably).
-unsafe impl Send for AlignedBuf {}
 
 impl AlignedBuf {
     /// Allocate `capacity` bytes aligned to `align`. `align` must be a power
@@ -377,12 +382,17 @@ impl AlignedBuf {
             capacity > 0 && capacity.is_multiple_of(align),
             "capacity must be a positive multiple of align ({align}), got {capacity}"
         );
-        let layout = Layout::from_size_align(capacity, align).expect("valid aligned layout");
-        // SAFETY: layout has non-zero size; we check the returned pointer for null.
-        let raw = unsafe { alloc(layout) };
-        let ptr = NonNull::new(raw).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        let mut buf = vec![0u8; capacity + align];
+        // Distance from the base address to the next aligned one. Base is never
+        // zero, and `align` is a power of two, so this is exactly
+        // `(align - base % align) % align` without a branch.
+        let offset = (buf.as_ptr() as usize).wrapping_neg() % align;
+        // The window the caller sees is the aligned one; the `align - 1` bytes
+        // before it and the ones after `capacity` are never handed out.
+        buf[offset..offset + capacity].fill(0);
         Self {
-            ptr,
+            buf,
+            offset,
             capacity,
             align,
         }
@@ -397,23 +407,13 @@ impl AlignedBuf {
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
-        // SAFETY: `ptr` owns `capacity` initialized-or-writable bytes; callers
-        // only read the prefix they have written.
-        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.capacity) }
+        &self.buf[self.offset..self.offset + self.capacity]
     }
 
     pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: `ptr` owns `capacity` bytes and `&mut self` is exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.capacity) }
-    }
-}
-
-impl Drop for AlignedBuf {
-    fn drop(&mut self) {
-        let layout =
-            Layout::from_size_align(self.capacity, self.align).expect("layout matches new()");
-        // SAFETY: `ptr` came from `alloc` with this exact layout and is freed once.
-        unsafe { dealloc(self.ptr.as_ptr(), layout) };
+        let start = self.offset;
+        let end = start + self.capacity;
+        &mut self.buf[start..end]
     }
 }
 
@@ -770,6 +770,35 @@ mod tests {
         let mut v = Vec::new();
         f.read_to_end(&mut v).expect("read");
         v
+    }
+
+    /// The buffer's whole reason to exist is the address the kernel checks. It is now an
+    /// over-allocated `Vec<u8>` indexed at its first aligned byte rather than a hand-written
+    /// allocation, which is only equivalent if the offset arithmetic is right — so pin the address
+    /// itself, for every block size the device probe can report, not just the default.
+    #[test]
+    fn aligned_buf_hands_out_an_aligned_window() {
+        // 512 is below `MIN_BLOCK` and is rejected by `new`; 4096 is the floor, 65536 the probe's upper range.
+        for align in [MIN_BLOCK, 8192, 65536] {
+            for capacity in [align, 2 * align, 8 * align] {
+                let mut buf = AlignedBuf::new(capacity, align);
+                assert_eq!(buf.capacity(), capacity);
+                assert_eq!(buf.align(), align);
+                assert_eq!(buf.as_slice().len(), capacity);
+                assert_eq!(
+                    (buf.as_slice().as_ptr() as usize) % align,
+                    0,
+                    "capacity {capacity} align {align}: the window must start on an {align}-byte boundary"
+                );
+
+                // The mutable view is the same window, so a write through one is visible in the other.
+                assert_eq!(buf.as_mut_slice().as_ptr(), buf.as_slice().as_ptr());
+                buf.as_mut_slice()[0] = 0xAB;
+                buf.as_mut_slice()[capacity - 1] = 0xCD;
+                assert_eq!(buf.as_slice()[0], 0xAB);
+                assert_eq!(buf.as_slice()[capacity - 1], 0xCD);
+            }
+        }
     }
 
     #[test]
