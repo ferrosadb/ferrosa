@@ -210,6 +210,29 @@ mod tests {
         );
     }
 
+    /// The exact input that panicked the smoke tier: results that never set an assurance, so they
+    /// carry the `NotTested` default. `total - passed - not_tested` underflowed here because every
+    /// one of them counted as both passed and not tested.
+    #[test]
+    fn a_report_of_unassured_runs_does_not_underflow() {
+        let results = vec![make_result("a", "b", true), make_result("c", "d", true)];
+        let mut results = results;
+        for r in &mut results {
+            r.assurance = Default::default();
+        }
+
+        let report = RunReport::from_results("test-004", results);
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.passed, 0, "an untested run is not a pass");
+        assert_eq!(report.failed, 0, "an untested run is not a failure");
+        assert_eq!(report.not_tested, 2);
+        assert_eq!(
+            report.passed + report.failed + report.not_tested,
+            report.total
+        );
+    }
+
     #[test]
     fn report_all_passed() {
         let results = vec![make_result("a", "b", true), make_result("c", "d", true)];
