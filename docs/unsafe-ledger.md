@@ -30,7 +30,7 @@ table below. Adding an `unsafe` site requires adding a row — the count is the 
 
 | Scope | Sites |
 | --- | --- |
-| Production code (`src/`, outside `#[cfg(test)]`) | **65** |
+| Production code (`src/`, outside `#[cfg(test)]`) | **60** |
 | `#[cfg(test)]` modules inside `src/` | 65 |
 | `tests/` and `examples/` | 299 |
 | WASM example bindings (`examples/**/src/`) | 58 |
@@ -41,7 +41,7 @@ Production sites by crate:
 | --- | --- | --- | --- | --- |
 | `ferrosa-storage/src/commitlog/segment.rs` | 11 | `UnsafeCell` shared buffer, manual `Send`/`Sync` | one writer at a time by construction; buffer is not aliased across the FFI boundary | queued |
 | `ferrosa-udf/src/asc.rs` | 10 | FFI to the JS engine (`rquickjs`) | `CtxPtr`/`SendActive` outlive every use; raw handles come from a live context | queued |
-| `ferrosa-sstable/src/direct.rs` | 8 | custom aligned allocator, `O_DIRECT`/`F_NOCACHE` fcntl | `alloc`/`dealloc` receive the same `Layout`; the fd is valid for the call | queued |
+| `ferrosa-sstable/src/direct.rs` | 3 | `F_NOCACHE`, `posix_fadvise`, one `ioctl` | the fd is open for the duration of the call; each call is a hint the kernel may ignore | audited |
 | `ferrosa-sstable/src/pump.rs` | 5 | `preadv`/`pwritev` scatter-gather, raw slice | `iov_base`/`iov_len` describe the same allocation for the whole call | queued |
 | `ferrosa/src/main.rs` | 5 | `GlobalAlloc` implementation over jemalloc | every method forwards the layout unchanged; no double free | queued |
 | `ferrosa/src/jemalloc_tuning.rs` | 4 | `mallctl` FFI | the `name` is NUL-terminated and the out-param matches the type jemalloc expects | queued |
@@ -104,7 +104,7 @@ cheap — are removed instead (`direct.rs`, 8 -> 3).
 
 ## Audit order
 
-Not all 65 sites are equally dangerous. Ranked by the consequences of getting the invariant wrong:
+Not all 60 sites are equally dangerous. Ranked by the consequences of getting the invariant wrong:
 
 1. **`store.rs:2122` — `&'static StoreView` from `Arc::as_ptr`.** A fabricated `'static` is the exact
    class of bug that produces a use-after-free the borrow checker cannot see. The question to answer:
@@ -117,8 +117,12 @@ Not all 65 sites are equally dangerous. Ranked by the consequences of getting th
 3. **`segment.rs` — `UnsafeCell` buffer with hand-written `Send`/`Sync`.** `unsafe impl Send`/`Sync` is
    an assertion that the type's interior mutability is properly synchronised; if it is not, the failure
    is a data race, which is the one bug class the compiler otherwise rules out.
-4. **`direct.rs` — the aligned allocator.** `alloc`/`dealloc` with mismatched layouts is heap
-   corruption; the only defence is that both call sites derive the layout the same way.
+4. **`direct.rs` — three kernel hints.** `F_NOCACHE`, `posix_fadvise(POSIX_FADV_DONTNEED)` and one
+   `ioctl`, each wrapped in `unsafe` only because `libc` is. The contract is narrow and local: the fd
+   is open across the call (it is borrowed from a live `File`), and every one of these is advisory —
+   the kernel is free to ignore it, so a wrong argument costs a cache miss, not memory safety. The
+   aligned allocator that used to sit in this file was removed rather than audited; it is the case
+   where the safe alternative was also the cheaper one.
 5. Everything else — `libc` calls with checked return codes, `GlobalAlloc` forwarding, `mallctl`.
 
 ## Sealed crates
