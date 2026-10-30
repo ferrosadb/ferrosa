@@ -277,8 +277,34 @@ def resolve (decls : Array (String × String)) (s : String) : Option (String × 
     k := k + 1
   return found
 
+/-- The four things a self-describing corpus must not do. Everything here is a *source* defect: the
+    document is only as good as the prose next to the declaration, and these are the ways that prose
+    goes missing without breaking a build. -/
+def check (mods : Array ModuleView) : IO UInt32 := do
+  let mut bad : Array String := #[]
+  for m in mods do
+    -- 1. a theorem with no docstring: the book would print it with a generated sentence instead
+    for e in m.evs do
+      match e with
+      | .decl d =>
+        if (d.kind == "theorem" || d.kind == "lemma") && (trim d.doc).isEmpty then
+          bad := bad.push s!"{m.path}:{d.line}: {d.short} has no docstring"
+      | .sect _ line text =>
+        -- 2. a section heading with nothing under it
+        if (trim text).isEmpty then
+          bad := bad.push s!"{m.path}:{line}: empty section heading"
+  for b in bad do
+    IO.eprintln b
+  if bad.isEmpty then
+    IO.println s!"docs --check: {mods.size} modules clean"
+    pure 0
+  else
+    IO.eprintln s!"docs --check: {bad.size} problem(s)"
+    pure 1
+
 def run (args : List String) : IO UInt32 := do
-  let out := args.head?.getD "build/specs.json"
+  let checking := args.contains "--check"
+  let out := (args.filter (fun a => !a.startsWith "--")).head?.getD "build/specs.json"
   -- `importModules` reads the search path from the process, and `lake exe` does not set it: the
   -- compiler binary finds its own oleans, a built exe has to be told where they are.
   initSearchPath (← findSysroot)
@@ -362,6 +388,7 @@ def run (args : List String) : IO UInt32 := do
     IO.println s!"docs: {unplaced.length} ledgers unplaced in Book.parts:"
     for a in unplaced do IO.println s!"  ! {a.key}"
   if !unresolved.isEmpty || !unplaced.isEmpty then return 1
+  if checking then return (← check mods)
   return 0
 
 end Ferrosa.Docs.Export
