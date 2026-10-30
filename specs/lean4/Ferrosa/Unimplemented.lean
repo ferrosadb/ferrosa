@@ -22,6 +22,7 @@ import Ferrosa.Testing.Jepsen
 import Ferrosa.Testing.JepsenModels
 import Ferrosa.Testing.Histories
 import Ferrosa.Testing.Guarantees
+import Ferrosa.Unsafe.Invariants
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Flight.Subscribe
 import Ferrosa.Broken
@@ -64,6 +65,9 @@ def unimplemented : List Item := [
   ⟨"distinct", "the relative error of the HLL estimate is bounded by 1.04/sqrt(m)"⟩,
   ⟨"distinct", "a HyperLogLog estimator backs COUNT(ESTIMATE_DISTINCT)"⟩,
   ⟨"Jepsen", "every run's verdict preserves lost, unexpected and recovered as multisets"⟩,
+  ⟨"Unsafe", "every unsafe site is discharged by a Kani harness rather than by review"⟩,
+  ⟨"Unsafe", "the truncation contract is enforced in the safe rename and GC paths"⟩,
+  ⟨"Unsafe", "there is a machine-checked route to proving unsafe code, rather than a documented one"⟩,
   ⟨"Jepsen", "the set model is ported, including its multi-value reads"⟩,
   ⟨"Jepsen", "the set-full and unique-ids models are ported"⟩,
   ⟨"Jepsen", "the generators, nemeses and stats assertions are ported"⟩,
@@ -128,13 +132,14 @@ def ledgerTotal : Nat :=
     + redCount Ferrosa.Testing.Models.ledger
     + redCount Ferrosa.Testing.Histories.ledger
     + redCount Ferrosa.Testing.Guarantees.ledger
+    + redCount Ferrosa.Unsafe.ledger
 
 /-- **Every red item in every ledger appears here or in `Broken.broken`, exactly once.** -/
 theorem every_ledger_item_is_classified :
     Ferrosa.Broken.broken.length + unimplemented.length + nonDefects.length = ledgerTotal := by
   native_decide
 
-theorem unimplemented_has_the_right_length : unimplemented.length = 33 := by native_decide
+theorem unimplemented_has_the_right_length : unimplemented.length = 36 := by native_decide
 theorem twelve_are_not_defects : nonDefects.length = 8 := by native_decide
 
 /-- **Live defects now outnumber everything else.**  Thirteen reds against twelve requirements,

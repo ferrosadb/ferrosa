@@ -64,6 +64,7 @@ import Ferrosa.Testing.Jepsen
 import Ferrosa.Testing.JepsenModels
 import Ferrosa.Testing.Histories
 import Ferrosa.Testing.Guarantees
+import Ferrosa.Unsafe.Invariants
 import Ferrosa.Todo
 import Ferrosa.Broken
 import Ferrosa.Unimplemented

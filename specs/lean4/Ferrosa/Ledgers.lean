@@ -30,6 +30,7 @@ import Ferrosa.Testing.Jepsen
 import Ferrosa.Testing.JepsenModels
 import Ferrosa.Testing.Histories
 import Ferrosa.Testing.Guarantees
+import Ferrosa.Unsafe.Invariants
 import Ferrosa.Todo
 import Ferrosa.Broken
 import Ferrosa.Unimplemented
@@ -60,6 +61,8 @@ def main : IO Unit := do
   Ferrosa.Testing.Histories.main
   IO.println ""
   Ferrosa.Testing.Guarantees.main
+  IO.println ""
+  Ferrosa.Unsafe.main
   IO.println ""
   Ferrosa.Commons.Hll.main
   IO.println ""

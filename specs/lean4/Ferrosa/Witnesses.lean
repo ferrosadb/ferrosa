@@ -7,6 +7,7 @@ checked: a witness that is renamed, moved, or removed fails the build here.
 import Ferrosa.Unimplemented
 import Ferrosa.Cdc.Subscribe
 import Ferrosa.Commons.Hll
+import Ferrosa.Unsafe.Invariants
 import Ferrosa.Testing.Guarantees
 import Ferrosa.Testing.Histories
 import Ferrosa.Testing.JepsenModels
@@ -302,3 +303,13 @@ import Ferrosa.Flight.Subscribe
 #check Ferrosa.Testing.Guarantees.a_missing_value_under_one_one_is_not_evidence
 #check Ferrosa.Testing.Guarantees.a_verdict_without_the_profile_is_not_a_verdict
 #check Ferrosa.Testing.Histories.nothing_is_confirmed_that_the_profile_cannot_support
+#check Ferrosa.Unsafe.two_mutable_borrows_cannot_coexist
+#check Ferrosa.Unsafe.a_shared_borrow_racing_a_mutation_is_the_promised_race
+#check Ferrosa.Unsafe.a_reference_used_past_its_owner_is_invalid
+#check Ferrosa.Unsafe.a_static_lifetime_does_not_extend_the_region
+#check Ferrosa.Unsafe.a_truncation_below_a_mapping_makes_the_tail_unreadable
+#check Ferrosa.Unsafe.a_slice_outliving_its_mapping_is_a_dangling_read
+#check Ferrosa.Unsafe.a_block_freed_with_a_different_layout_corrupts_the_heap
+#check Ferrosa.Unsafe.a_failed_syscall_has_no_out_parameter
+#check Ferrosa.Unsafe.overlapping_writers_are_the_race
+#check Ferrosa.Unsafe.a_handle_after_its_context_is_dropped_is_dangling
