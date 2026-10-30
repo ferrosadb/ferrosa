@@ -24,7 +24,17 @@ namespace Ferrosa.Cql
 
 open Ferrosa
 
-/-! ## How a keyspace spreads its replicas, and how many it has -/
+/-! ## How a keyspace spreads its replicas, and how many it has
+
+A keyspace says two things: how many copies of each key exist, and where they live. `Simple` puts a
+fixed number of copies on the ring and does not care which datacenter they land in; `NetworkTopology`
+names a replication factor per datacenter, so a keyspace written for three copies in the east and
+two in the west holds five in total and never fewer than three in the east — the second number is
+what a `LOCAL_QUORUM` read depends on, and it cannot be recovered from the total.
+
+Both are modelled as data rather than as a placement function: the two counts below are all the rest
+of this module needs from a strategy, and keeping the strategy opaque is what lets an ack plan be
+computed without knowing how a partitioner lays keys on the ring. -/
 
 abbrev DcId := String
 
