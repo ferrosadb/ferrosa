@@ -208,6 +208,8 @@ def ledger : List SpecItem := [
    .met "Unsafe.two_mutable_borrows_cannot_coexist"⟩,
   ⟨"a shared borrow racing a mutation is the data race `unsafe impl Sync` denies",
    .met "Unsafe.a_shared_borrow_racing_a_mutation_is_the_promised_race"⟩,
+  ⟨"shared borrows stack, which is what the `&self` readers of the buffer need",
+   .met "Unsafe.shared_borrows_stack"⟩,
   ⟨"using a reference after its owner is freed is invalid, whatever the declared lifetime",
    .met "Unsafe.a_reference_used_past_its_owner_is_invalid"⟩,
   ⟨"a `&'static` does not extend the region: soundness is 'no use after the owner dies'",

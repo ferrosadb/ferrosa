@@ -5,3 +5,8 @@ defaultTargets = ["Ferrosa"]
 [[lean_lib]]
 name = "Ferrosa"
 globs = ["Ferrosa", "Ferrosa.*"]
+
+[[lean_exe]]
+name = "harness"
+root = "Ferrosa.Harness"
+supportInterpreter = true
