@@ -1551,6 +1551,50 @@ mod tests {
         server.shutdown(std::time::Duration::from_millis(50)).await;
     }
 
+    /// Wire code 0x0007 decodes to EACH_QUORUM, so a client can send it to this
+    /// rf-only write path. On a `Simple` strategy there is exactly one datacenter,
+    /// so the level is that datacenter's node quorum -- never a panic.
+    #[tokio::test]
+    async fn each_quorum_write_on_simple_strategy_writes_instead_of_panicking() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        register_test_table(&storage);
+
+        let mut local = make_node("10.0.0.1:7000");
+        local.host_id = Uuid::new_v4();
+        let mut ring = TokenRing::new();
+        ring.add_node(1u64, local);
+        ring.assign_tokens(1u64, &[50]);
+
+        let coordinator = make_coordinator(
+            ring,
+            noop_peer_manager(),
+            1u64,
+            storage.clone(),
+            1,
+            ConsistencyLevel::One,
+        );
+
+        let table_id = TableId::new("test_ks", "test_tbl");
+        let key = test_key();
+        coordinator
+            .coordinate_write_with(
+                &table_id,
+                &key,
+                test_row(),
+                1000,
+                ConsistencyLevel::EachQuorum,
+                1,
+            )
+            .await
+            .expect("EACH_QUORUM on a single-datacenter Simple strategy is the node quorum");
+
+        assert!(
+            storage.read(&table_id, &key).unwrap().is_some(),
+            "the local replica must have accepted the write"
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // Replication symmetry: every replica's STORAGE must contain the write.
     //
