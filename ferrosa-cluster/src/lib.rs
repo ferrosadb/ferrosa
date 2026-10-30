@@ -3,6 +3,8 @@
 //! Last revised: 2026-08-27
 //! Last changed: Exported bounded consensus health supervision.
 
+#![forbid(unsafe_code)]
+
 pub mod accord;
 pub mod addr_cache;
 pub mod config;

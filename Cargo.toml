@@ -29,6 +29,7 @@ members = [
     "ferrosa-index-builder",
     "ferrosa-sim",
     "xtask",
+    "tools/alloc-count",
 ]
 # Dev-only oracle with its own [workspace] and Cargo.lock: parquet-variant 60
 # needs chrono >= 0.4.40, which breaks arrow-arith 53 (ferrosa-flight) at

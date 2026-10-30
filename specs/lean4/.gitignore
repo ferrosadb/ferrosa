@@ -1,0 +1,7 @@
+.lake/
+*.olean
+*.ilean
+*.c
+
+# the book: generated from the sources, never edited
+build/

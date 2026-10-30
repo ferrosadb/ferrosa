@@ -26,6 +26,10 @@ unaffected (see [Bridge re-export](#bridge-re-export-d10)).
 
 ## What's implemented
 
+- Pair read replicas accept native CQL read connections. Inline, prepared,
+  conditional and transactional mutations are rejected with `Overloaded` before
+  execution or forwarding; clients must send writes to the primary. A persisted
+  authority fence still prevents admission until the node is safely recovered.
 - **Table-access producer wiring.** Ordinary/prepared scalar reads and writes
   share the tracker's instance with `system_observability.table_access_summary`.
   Read counters classify the chosen PK, index/token-range or full-scan path;

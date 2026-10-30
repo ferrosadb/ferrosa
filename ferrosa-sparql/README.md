@@ -186,13 +186,12 @@ case the scan runs to completion under the bound instead. `ASK` is planned with
 
 **Calls** (ferrosa crates this depends on):
 
-- **`ferrosa-cluster`** — `write_path::WritePath` for all reads on the
+- **`ferrosa-cluster`** — `write_path::WritePath` for coordinated UPDATE mutations and all reads on the
   query/path side: `read` (point), `index_read` (keyed), and
   `range_read_stream_all` (streaming scan). The `Vec`-returning `range_read` is
   **not** used and a unit tripwire (`sparql_scans_never_call_a_materializing_range_read`)
   fails the build if it is reintroduced.
-- **`ferrosa-storage`** — `engine::StorageEngine` (`write`, `register_table`) for
-  the UPDATE write/tombstone path; `TableId`.
+- **`ferrosa-storage`** — `engine::StorageEngine` for dataset admission and table registration; `TableId`.
 - **`ferrosa-common`** — `CellValue`, `DecoratedKey`/`PartitionKey`, schema
   types (`TableSchema`, `ColumnDefinition`), error type.
 - **`ferrosa-sstable`** — `Partition`, `Row`, `LivenessInfo`, `DeletionTime`
@@ -278,3 +277,7 @@ solutions retain their bag multiplicity. Unbound subjects use the general
 compatibility path. The executor still retains bounded intermediate solutions
 and decodes RDF terms; this is not an end-to-end zero-copy result stream.
 `tests/join_alloc.rs` verifies allocation scaling and full result contents.
+
+The binary constructs `SparqlEngine::new_with_write_path_source` with the node’s shared `ArcSwap<WritePath>`. Each operation loads the current path so later pair and deployment transitions take effect. Pair replicas reject updates before table registration. `new` remains available for callers with a fixed path. The live source uses the `arc-swap` dependency.
+
+All SPARQL inserts and tombstones use the deployment coordinator. Pair updates request RF2 QUORUM, including the configured singleton S3 barrier; unavailable and degraded paths reject writes. Cluster updates use the coordinator’s configured default consistency and replication factor. These are per-row acknowledgments; an update request is not a distributed atomic transaction.

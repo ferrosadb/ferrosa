@@ -1,0 +1,18 @@
+name = "ferrosaSpecs"
+version = "0.1.0"
+defaultTargets = ["Ferrosa"]
+
+[[lean_lib]]
+name = "Ferrosa"
+globs = ["Ferrosa", "Ferrosa.*"]
+
+[[lean_exe]]
+name = "harness"
+root = "Ferrosa.Harness"
+supportInterpreter = true
+
+# The PDF's data. Reads statements from the elaborator and prose from the sources, so the document
+# cannot state a theorem the compiler does not hold. See `docs/render.py`.
+[[lean_exe]]
+name = "docs"
+root = "Ferrosa.Docs.Export"

@@ -20,8 +20,8 @@ executive_summary: >
 `ferrosa-sparql` is the W3C SPARQL front-end. It owns SPARQL parsing, algebra →
 storage planning, query execution, SPARQL UPDATE, and result serialization. It
 does **not** own storage durability, replication, indexing, or schema — it
-delegates reads to `ferrosa-cluster`'s `WritePath` and writes to
-`ferrosa-storage`'s `StorageEngine`.
+delegates reads and mutations to `ferrosa-cluster`'s live write path.
+`ferrosa-storage` supplies dataset admission and table registration.
 
 The RDF data model is mapped onto exactly one CQL table per keyspace:
 
@@ -74,7 +74,7 @@ flowchart TD
     GRAPH --> SER
     SER --> RESP["JSON / XML / N-Triples / Turtle"]
     ENG -->|UPDATE| UVAL["update::validate_update<br/>up-front atomicity check"]
-    UVAL --> UWRITE["StorageEngine write / tombstone"]
+    UVAL --> UWRITE["Coordinated write / tombstone"]
 ```
 
 **Read path.** A bound subject plans to `SubjectLookup` (point read on the
@@ -211,3 +211,7 @@ keys to input positions; matching duplicates remain distinct. If any subject is
 unbound, the executor retains the general compatibility join. Other joins may
 still compare every pair, and intermediate solution vectors remain bounded by
 execution limits rather than fully pipelined.
+
+The binary supplies a shared live `ArcSwap<WritePath>` rather than a permanent standalone path. Each query or update snapshots that source once. Updates reject pair-secondary authority before table registration; the selected pair coordinator also enforces authority during mutation admission.
+
+All SPARQL inserts and tombstones use the deployment coordinator. Pair updates request RF2 QUORUM, including the configured singleton S3 barrier; unavailable and degraded paths reject writes. Cluster updates use the coordinator’s configured default consistency and replication factor. These are per-row acknowledgments; an update request is not a distributed atomic transaction.

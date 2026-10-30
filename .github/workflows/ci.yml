@@ -37,6 +37,10 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --check
+      # `unsafe` is the one part of the codebase no model or proof covers, so the set has to be
+      # enumerated and reviewed by hand. This fails when the enumeration and the source disagree.
+      - name: Check the unsafe ledger matches the source
+        run: python3 -m unittest -q tests.ci.test_unsafe_ledger
       - name: Check Cluster Data Loss workflow contract
         run: python3 -m unittest tests.ci.test_cluster_data_loss_workflow
       - name: Check Install Smoke workflow contract
@@ -374,6 +378,7 @@ jobs:
                --skip differential_oracle \
                --skip fly_multi_node_streaming_scan \
                --skip replicated_jsonb_index_builds_on_every_node \
+               --skip strict_pair_live_s3_ack_replays_exact_mutation \
                --skip real_typed_edges_paged_scan_delivers_every_distinct_row \
                --skip count_range_metadata_merger_dedups_real_typed_edges_sstables \
                --skip promote_dir_fsync_lazyfs_crash_loses_neither_copy \

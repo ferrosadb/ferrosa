@@ -348,6 +348,142 @@ pub enum SelectColumn {
         args: Vec<Term>,
         alias: Option<String>,
     },
+    /// A builtin scalar aggregate: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`.
+    ///
+    /// A separate node, not a [`SelectColumn::FunctionCall`] whose name happens
+    /// to spell an aggregate: the function name is not a decision the execution
+    /// layer should re-derive by string comparison, and two of the aggregates
+    /// carry modifiers (`DISTINCT`, `ESTIMATE_DISTINCT`) that a name alone
+    /// cannot express. The parser is the only place that maps a spelling to
+    /// this node; everything downstream consumes [`AggregateCall::kind`].
+    Aggregate(AggregateCall),
+}
+
+/// The builtin scalar aggregates, recognised once at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggregateKind {
+    /// The aggregate a bare function name spells, or `None` for any other
+    /// function (a UDF/UDA, `toJson`, `writetime`, ...).
+    ///
+    /// This is the ONE place a spelling becomes an aggregate; the router never
+    /// repeats the comparison.
+    pub fn from_name(name: &str) -> Option<Self> {
+        if name.eq_ignore_ascii_case("count") {
+            Some(Self::Count)
+        } else if name.eq_ignore_ascii_case("sum") {
+            Some(Self::Sum)
+        } else if name.eq_ignore_ascii_case("avg") {
+            Some(Self::Avg)
+        } else if name.eq_ignore_ascii_case("min") {
+            Some(Self::Min)
+        } else if name.eq_ignore_ascii_case("max") {
+            Some(Self::Max)
+        } else {
+            None
+        }
+    }
+
+    /// The canonical (lowercase) CQL spelling, used as the result column name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Count => "count",
+            Self::Sum => "sum",
+            Self::Avg => "avg",
+            Self::Min => "min",
+            Self::Max => "max",
+        }
+    }
+}
+
+/// What an aggregate folds.
+///
+/// `COUNT(*)` counts rows and needs no column at all; the other aggregates fold
+/// one column. Keeping the star as its own case stops the old
+/// `Term::StringLiteral("*")` sentinel from looking like a column named `*`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateArgument {
+    /// `COUNT(*)`
+    Star,
+    /// A bare column reference: `COUNT(c)`, `SUM(c)`, ...
+    Column(String),
+    /// Any other term (bind marker, literal, nested scalar function).
+    Term(Term),
+}
+
+impl AggregateArgument {
+    /// The folded column, as written, if this argument is a column reference.
+    pub fn column_name(&self) -> Option<&str> {
+        match self {
+            Self::Column(name) => Some(name.as_str()),
+            Self::Star | Self::Term(_) => None,
+        }
+    }
+
+    /// Classify a parsed argument term.
+    ///
+    /// A bare identifier parses as a zero-argument call in this AST, so in
+    /// argument position that call IS the folded column. A nested aggregate
+    /// never reaches here: the parser rejects it where the inner call is parsed.
+    pub fn from_term(term: Term) -> Self {
+        match term {
+            Term::FunctionCall {
+                keyspace: None,
+                name,
+                ref args,
+            } if args.is_empty() => Self::Column(name),
+            other => Self::Term(other),
+        }
+    }
+}
+
+/// One builtin aggregate projection, e.g. `COUNT(ESTIMATE_DISTINCT c) AS n`.
+///
+/// `distinct` and `estimate_distinct` are mutually exclusive and only
+/// `COUNT` accepts either: `COUNT(DISTINCT c)` is an exact distinct count,
+/// while `COUNT(ESTIMATE_DISTINCT c)` is the bounded-memory **lower bound**
+/// (`Ferrosa/Cql/Aggregate.lean`, `ferrosa-storage/src/count.rs`) — two
+/// different functions, so neither is spelled with the other's flag.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateCall {
+    pub kind: AggregateKind,
+    pub argument: AggregateArgument,
+    /// `COUNT(DISTINCT c)` — exact, de-duplicated.
+    pub distinct: bool,
+    /// `COUNT(ESTIMATE_DISTINCT c)` — approximate lower bound.
+    pub estimate_distinct: bool,
+    pub alias: Option<String>,
+}
+
+impl AggregateCall {
+    /// The canonical lowercase name, or the alias when one was given — the
+    /// result-column name this projection reports.
+    pub fn result_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or_else(|| self.kind.as_str())
+    }
+
+    /// True for the two distinct-flavoured counts, whose result is not the
+    /// number of matched rows.
+    pub fn is_distinct_family(&self) -> bool {
+        self.distinct || self.estimate_distinct
+    }
+}
+
+impl SelectColumn {
+    /// The structural aggregate this projection carries, if it is one.
+    pub fn builtin_aggregate(&self) -> Option<&AggregateCall> {
+        match self {
+            Self::Aggregate(call) => Some(call),
+            Self::Star | Self::Column(_) | Self::FunctionCall { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

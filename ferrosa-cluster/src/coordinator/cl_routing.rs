@@ -87,7 +87,8 @@ pub fn replica_policy_for_cl(cl: ConsistencyLevel) -> CLReplicaPolicy {
         | ConsistencyLevel::Three
         | ConsistencyLevel::Quorum
         | ConsistencyLevel::LocalQuorum
-        | ConsistencyLevel::EachQuorum => CLReplicaPolicy::VOTERS_ONLY,
+        | ConsistencyLevel::EachQuorum
+        | ConsistencyLevel::DcQuorum => CLReplicaPolicy::VOTERS_ONLY,
         // ALL — every voter and every learner that owns the token.
         ConsistencyLevel::All => CLReplicaPolicy::ALL_REPLICAS,
         // Strict-consistency CLs — leader round-trip; learners excluded
@@ -107,33 +108,68 @@ pub fn replica_policy_for_cl(cl: ConsistencyLevel) -> CLReplicaPolicy {
 /// - For `LEADER_ONLY` CLs: drop learners (the actual leader test
 ///   happens at the coordinator's read path, which sends to the
 ///   leader directly).
-/// - For `ANY_REPLICA` and `ALL_REPLICAS`: pass through.
+/// - For `ANY_REPLICA` and `ALL_REPLICAS`: retain eligible owning replicas.
+///
+/// Each physical host UUID appears once. Conflicting DC labels among supplied
+/// aliases invalidate the scope, returning no targets without reducing the
+/// caller's configured consistency denominator.
 pub fn eligible_replicas_for_cl(
     cl: ConsistencyLevel,
     replicas: &[u64],
     ring: &TokenRing,
 ) -> Vec<u64> {
+    let mut selected = replicas.to_vec();
+    retain_eligible_replicas_for_cl(cl, &mut selected, ring);
+    selected
+}
+
+/// Apply the replica policy and canonicalize physical hosts in place.
+/// Retains the allocation and order; conflicting DC aliases clear the scope.
+pub fn retain_eligible_replicas_for_cl(
+    cl: ConsistencyLevel,
+    replicas: &mut Vec<u64>,
+    ring: &TokenRing,
+) {
+    // Validate before compaction: even an ineligible alias must not hide a
+    // conflicting failure-domain label on the same physical responder.
+    for (position, &id) in replicas.iter().enumerate() {
+        let Some(info) = ring.get_node(id) else {
+            continue;
+        };
+        if replicas[..position]
+            .iter()
+            .filter_map(|id| ring.get_node(*id))
+            .any(|prior| prior.host_id == info.host_id && prior.data_center != info.data_center)
+        {
+            replicas.clear();
+            return;
+        }
+    }
     let policy = replica_policy_for_cl(cl);
-    replicas
-        .iter()
-        .copied()
-        .filter(|&n| {
-            let info = match ring.get_node(n) {
-                Some(i) => i,
-                None => return false,
-            };
-            match info.state {
-                NodeState::Normal => policy.include_voters,
-                NodeState::Learner { owns_tokens: true } => {
-                    policy.include_learners && !policy.leader_only
-                }
-                // owns_tokens=false learners are already filtered upstream;
-                // leaving the explicit case for safety.
-                NodeState::Learner { owns_tokens: false } => false,
-                _ => false,
+    let mut retained = 0;
+    for position in 0..replicas.len() {
+        let id = replicas[position];
+        let Some(info) = ring.get_node(id) else {
+            continue;
+        };
+        let eligible = match info.state {
+            NodeState::Normal => policy.include_voters,
+            NodeState::Learner { owns_tokens: true } => {
+                policy.include_learners && !policy.leader_only
             }
-        })
-        .collect()
+            _ => false,
+        };
+        if eligible
+            && !replicas[..retained]
+                .iter()
+                .filter_map(|id| ring.get_node(*id))
+                .any(|prior| prior.host_id == info.host_id)
+        {
+            replicas[retained] = id;
+            retained += 1;
+        }
+    }
+    replicas.truncate(retained);
 }
 
 /// What the coordinator should do for a `(topology, CL)` pair.
@@ -216,9 +252,9 @@ pub fn route_for_cl(cl: ConsistencyLevel, dc_count: usize) -> CLRoute {
                 CLRoute::LocalDcOnly
             }
         }
-        ConsistencyLevel::EachQuorum => {
+        ConsistencyLevel::EachQuorum | ConsistencyLevel::DcQuorum => {
             if multi_dc {
-                // Sprint 7 W7.7: cross-DC EACH_QUORUM goes through Accord.
+                // Cross-DC EACH_QUORUM and DC_QUORUM both go through Accord.
                 CLRoute::CrossDcAccord
             } else {
                 CLRoute::LocalDcOnly
@@ -458,3 +494,7 @@ mod tests {
         assert!(r.is_ok());
     }
 }
+
+#[cfg(test)]
+#[path = "replica_selection_verification_tests.rs"]
+mod verification_tests;

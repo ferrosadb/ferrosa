@@ -15,6 +15,8 @@
 //! - [`http`] — HTTP/JSON endpoint.
 //! - [`bolt`] — Bolt v5 wire protocol for Neo4j driver compatibility.
 
+#![forbid(unsafe_code)]
+
 pub mod adjacency;
 pub mod bolt;
 pub mod engine;

@@ -9,7 +9,8 @@
 //! Paxos-like accept/promise protocol.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
@@ -205,11 +206,11 @@ const DEFAULT_MAX_DRIFT_NS: u64 = 500_000_000;
 /// remote timestamp has just been observed — so the invariant is honored by
 /// construction rather than by convention.
 ///
-/// All operations are lock-free via [`AtomicU64`] / [`AtomicU32`].
+/// Time and sequence share one short critical section: publishing either field
+/// separately can mint duplicate transaction IDs under concurrent callers.
 pub struct HybridLogicalClock {
     node: u64,
-    last_time: AtomicU64,
-    last_seq: AtomicU32,
+    state: Mutex<(u64, u32)>,
     max_drift_ns: u64,
 }
 
@@ -225,8 +226,7 @@ impl HybridLogicalClock {
         };
         Self {
             node,
-            last_time: AtomicU64::new(0),
-            last_seq: AtomicU32::new(0),
+            state: Mutex::new((0, 0)),
             max_drift_ns: drift,
         }
     }
@@ -247,38 +247,21 @@ impl HybridLogicalClock {
     ///   `last_time` and increments `seq`.
     /// - Epoch is always 0 (epoch management is a later milestone).
     pub fn now(&self) -> Timestamp {
-        loop {
-            let phys = Self::wall_clock_ns();
-            let prev_time = self.last_time.load(Ordering::Acquire);
-            let prev_seq = self.last_seq.load(Ordering::Acquire);
-
-            let (new_time, new_seq) = if phys > prev_time {
-                (phys, 0u32)
-            } else {
-                // Wall clock hasn't advanced (or regressed) — bump seq.
-                (prev_time, prev_seq.saturating_add(1))
-            };
-
-            // CAS loop: try to commit the new (time, seq) pair atomically.
-            // We check time first; if another thread beat us, retry.
-            if self
-                .last_time
-                .compare_exchange_weak(prev_time, new_time, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                continue;
-            }
-            // Time CAS succeeded — now update seq.
-            // If time advanced, we want seq=0 regardless of what another thread wrote.
-            // If time stayed the same, we want our incremented value.
-            self.last_seq.store(new_seq, Ordering::Release);
-
-            return Timestamp {
-                epoch: 0,
-                time: new_time,
-                seq: new_seq,
-                node: self.node,
-            };
+        let mut state = self.state.lock().expect("HLC state poisoned");
+        let phys = Self::wall_clock_ns();
+        if phys > state.0 {
+            *state = (phys, 0);
+        } else {
+            state.1 = state
+                .1
+                .checked_add(1)
+                .expect("HLC logical sequence exhausted");
+        }
+        Timestamp {
+            epoch: 0,
+            time: state.0,
+            seq: state.1,
+            node: self.node,
         }
     }
 
@@ -299,36 +282,12 @@ impl HybridLogicalClock {
             });
         }
 
-        // Advance local state past remote if needed.
-        loop {
-            let prev_time = self.last_time.load(Ordering::Acquire);
-            let prev_seq = self.last_seq.load(Ordering::Acquire);
-
-            if remote.time > prev_time {
-                // Remote is ahead — adopt remote time and its seq.
-                if self
-                    .last_time
-                    .compare_exchange_weak(
-                        prev_time,
-                        remote.time,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-                self.last_seq.store(remote.seq, Ordering::Release);
-                return Ok(());
-            } else if remote.time == prev_time && remote.seq > prev_seq {
-                // Same time but remote has higher seq — adopt it.
-                self.last_seq.fetch_max(remote.seq, Ordering::AcqRel);
-                return Ok(());
-            } else {
-                // Local is already ahead or equal — nothing to do.
-                return Ok(());
-            }
+        // Treat (time, seq) as one state transition, also against concurrent now().
+        let mut state = self.state.lock().expect("HLC state poisoned");
+        if (remote.time, remote.seq) > *state {
+            *state = (remote.time, remote.seq);
         }
+        Ok(())
     }
 
     /// Ingest a timestamp `remote` observed from another node, then mint a fresh
@@ -1003,13 +962,48 @@ mod tests {
     }
 
     #[test]
+    fn hlc_concurrent_now_never_reuses_a_transaction_id() {
+        // Hold physical time behind the logical clock, as after witnessing a
+        // peer timestamp. Every actor must claim a distinct logical sequence.
+        const ACTORS: usize = 16;
+        const PER_ACTOR: usize = 2_000;
+        let hlc = HybridLogicalClock::new(1, 0);
+        let future = HybridLogicalClock::wall_clock_ns() + 1_000_000_000_000;
+        hlc.state.lock().unwrap().0 = future;
+        let start = std::sync::Barrier::new(ACTORS);
+        let stamps = std::thread::scope(|scope| {
+            let actors: Vec<_> = (0..ACTORS)
+                .map(|_| {
+                    let hlc = &hlc;
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        (0..PER_ACTOR).map(|_| TxnId(hlc.now())).collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            actors
+                .into_iter()
+                .flat_map(|actor| actor.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let mut unique = HashSet::new();
+        for stamp in stamps {
+            assert!(
+                unique.insert(stamp),
+                "concurrent clock reused transaction ID {stamp:?}"
+            );
+        }
+        assert_eq!(unique.len(), ACTORS * PER_ACTOR);
+    }
+
+    #[test]
     fn hlc_seq_increments_within_same_ns() {
         // Seed last_time to a far-future value so the physical clock can
         // never advance past it, forcing every call to increment seq.
         let hlc = HybridLogicalClock::new(1, 0);
         let far_future = HybridLogicalClock::wall_clock_ns() + 1_000_000_000_000; // +1000s
-        hlc.last_time.store(far_future, Ordering::Release);
-        hlc.last_seq.store(0, Ordering::Release);
+        *hlc.state.lock().unwrap() = (far_future, 0);
 
         let mut prev = hlc.now();
         assert_eq!(prev.time, far_future);

@@ -3,6 +3,8 @@
 //! Re-exports the `commands` module so integration tests can call
 //! the command functions directly against a live test server.
 
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod commands;
 pub mod tui;

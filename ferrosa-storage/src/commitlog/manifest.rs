@@ -130,9 +130,79 @@ impl ArchiveManifest {
         prefix: &str,
         entry: ArchiveSegmentEntry,
     ) -> ferrosa_common::Result<()> {
-        let mut manifest = Self::load(store, prefix).await?;
-        manifest.append_segment(entry);
-        Self::save(store, prefix, &manifest).await
+        let path = ObjectPath::from(format!("{prefix}/{MANIFEST_PATH}"));
+        // Every successful update preserves all prior acknowledged entries,
+        // including concurrent publishers in another engine/process.
+        for _ in 0..8 {
+            let (mut manifest, mode) = match store.get(&path).await {
+                Ok(result) => {
+                    let version = object_store::UpdateVersion {
+                        e_tag: result.meta.e_tag.clone(),
+                        version: result.meta.version.clone(),
+                    };
+                    if version.e_tag.is_none() && version.version.is_none() {
+                        return Err(ferrosa_common::Error::InvalidData(
+                            "archive manifest has no CAS version".into(),
+                        ));
+                    }
+                    let bytes = result.bytes().await.map_err(|error| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "read archive manifest: {error}"
+                        ))
+                    })?;
+                    let manifest: Self = serde_json::from_slice(&bytes).map_err(|error| {
+                        ferrosa_common::Error::InvalidFormat(format!(
+                            "parse archive manifest: {error}"
+                        ))
+                    })?;
+                    (manifest, object_store::PutMode::Update(version))
+                }
+                Err(object_store::Error::NotFound { .. }) => {
+                    (Self::new(), object_store::PutMode::Create)
+                }
+                Err(error) => {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "load archive manifest: {error}"
+                    )))
+                }
+            };
+            if let Some(existing) = manifest
+                .segments
+                .iter()
+                .find(|segment| segment.id == entry.id)
+            {
+                if existing.sha256 == entry.sha256 && existing.size == entry.size {
+                    return Ok(());
+                }
+                return Err(ferrosa_common::Error::InvalidData(format!(
+                    "archive manifest WAL id {} has conflicting bytes",
+                    entry.id
+                )));
+            }
+            manifest.append_segment(entry.clone());
+            manifest.segments.sort_by_key(|segment| segment.id);
+            let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                ferrosa_common::Error::InvalidFormat(format!("serialize archive manifest: {error}"))
+            })?;
+            match store
+                .put_opts(&path, bytes::Bytes::from(bytes).into(), mode.into())
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(
+                    object_store::Error::AlreadyExists { .. }
+                    | object_store::Error::Precondition { .. },
+                ) => continue,
+                Err(error) => {
+                    return Err(ferrosa_common::Error::InvalidFormat(format!(
+                        "CAS archive manifest: {error}"
+                    )))
+                }
+            }
+        }
+        Err(ferrosa_common::Error::InvalidData(
+            "archive manifest CAS contention exceeded retry bound".into(),
+        ))
     }
 }
 

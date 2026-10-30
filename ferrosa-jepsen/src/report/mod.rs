@@ -18,13 +18,37 @@ pub struct RunReport {
     pub total: usize,
     pub passed: usize,
     pub failed: usize,
+    /// Runs whose consistency profile could not support either claim: neither a pass nor a failure.
+    #[serde(default)]
+    pub not_tested: usize,
 }
 
 impl RunReport {
     pub fn from_results(run_id: &str, results: Vec<CombinationResult>) -> Self {
         let total = results.len();
-        let passed = results.iter().filter(|r| r.passed).count();
-        let failed = total - passed;
+        // A run whose profile cannot support a claim is neither a pass nor a failure. Counting it as
+        // either would over-claim (a weak configuration called green) or under-claim (the semantics
+        // of that configuration called a defect).
+        //
+        // Each count is taken by construction rather than derived by subtraction. Deriving `failed`
+        // as `total - passed - not_tested` assumed the three sets were disjoint, and they are not:
+        // a result can be `passed` and inconclusive at the same time, and the subtraction then
+        // underflows and panics the report. Counting the classes directly keeps the partition exact
+        // whatever the inputs say.
+        let not_tested = results.iter().filter(|r| r.is_inconclusive()).count();
+        let passed = results
+            .iter()
+            .filter(|r| r.passed && !r.is_inconclusive())
+            .count();
+        let failed = results
+            .iter()
+            .filter(|r| !r.passed && !r.is_inconclusive())
+            .count();
+        debug_assert_eq!(
+            total,
+            passed + failed + not_tested,
+            "a run must be exactly one of passed, failed, or not tested"
+        );
 
         Self {
             run_id: run_id.to_string(),
@@ -33,11 +57,20 @@ impl RunReport {
             total,
             passed,
             failed,
+            not_tested,
         }
     }
 
+    /// True when nothing failed. Inconclusive runs are not failures — failing them would punish a
+    /// deliberate configuration — but they are not confirmations either; see
+    /// [`Self::fully_confirmed`].
     pub fn all_passed(&self) -> bool {
         self.failed == 0
+    }
+
+    /// True only when every run was confirmed at its profile. This is what a green badge may mean.
+    pub fn fully_confirmed(&self) -> bool {
+        self.failed == 0 && self.not_tested == 0
     }
 
     pub fn failures(&self) -> Vec<&CombinationResult> {
@@ -127,6 +160,14 @@ mod tests {
             setup_error: None,
             duration_secs: 1.0,
             op_count: 10,
+            profile: Default::default(),
+            // An unset assurance means "not tested", which is the right default in production and
+            // the wrong one in a fixture: a fixture has to say what it is an example of.
+            assurance: if passed {
+                crate::checker::profile::Assurance::Confirmed
+            } else {
+                crate::checker::profile::Assurance::Refuted
+            },
         }
     }
 
@@ -139,6 +180,57 @@ mod tests {
         assert_eq!(report.failed, 1);
         assert!(!report.all_passed());
         assert_eq!(report.failures().len(), 1);
+    }
+
+    /// An inconclusive run is neither a pass nor a failure, and the three counts must partition the
+    /// total. A passed run that is also inconclusive used to underflow the subtraction that derived
+    /// `failed`, which panicked the report instead of reporting it.
+    #[test]
+    fn an_inconclusive_run_is_neither_a_pass_nor_a_failure() {
+        let mut inconclusive = make_result("e", "f", true);
+        inconclusive.assurance = crate::checker::profile::Assurance::NotTested(
+            crate::checker::profile::NotTested::ReadsDoNotOverlapWrites,
+        );
+
+        let results = vec![
+            make_result("a", "b", true),
+            make_result("c", "d", false),
+            inconclusive,
+        ];
+        let report = RunReport::from_results("test-003", results);
+
+        assert_eq!(report.total, 3);
+        assert_eq!(report.passed, 1);
+        assert_eq!(report.failed, 1);
+        assert_eq!(report.not_tested, 1);
+        assert_eq!(
+            report.passed + report.failed + report.not_tested,
+            report.total,
+            "every run is exactly one of passed, failed, or not tested"
+        );
+    }
+
+    /// The exact input that panicked the smoke tier: results that never set an assurance, so they
+    /// carry the `NotTested` default. `total - passed - not_tested` underflowed here because every
+    /// one of them counted as both passed and not tested.
+    #[test]
+    fn a_report_of_unassured_runs_does_not_underflow() {
+        let results = vec![make_result("a", "b", true), make_result("c", "d", true)];
+        let mut results = results;
+        for r in &mut results {
+            r.assurance = Default::default();
+        }
+
+        let report = RunReport::from_results("test-004", results);
+
+        assert_eq!(report.total, 2);
+        assert_eq!(report.passed, 0, "an untested run is not a pass");
+        assert_eq!(report.failed, 0, "an untested run is not a failure");
+        assert_eq!(report.not_tested, 2);
+        assert_eq!(
+            report.passed + report.failed + report.not_tested,
+            report.total
+        );
     }
 
     #[test]

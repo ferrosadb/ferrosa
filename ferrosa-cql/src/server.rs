@@ -321,19 +321,19 @@ impl CqlServer {
                             );
                             continue;
                         }
-                        // In pair mode, only the primary accepts CQL connections.
-                        // Secondaries reject with Overloaded so drivers retry on the primary.
+                        // Readable pair replicas accept connections; mutation routing
+                        // enforces writer authority. Fenced restarts reject admission.
                         if !state.mode_controller.accepts_cql_connections() {
                             active.fetch_sub(1, Ordering::Relaxed);
                             tracing::debug!(
-                                "rejecting CQL connection: node is pair-mode secondary"
+                                "rejecting CQL connection: topology is not ready"
                             );
                             spawn_reject(
                                 &accept_task_pool,
                                 stream,
                                 max_frame_size,
                                 CqlError::Overloaded(
-                                    "writes disallowed on read replica; connect to the primary node"
+                                    "node unavailable: topology is not ready; retry another node"
                                         .into(),
                                 ),
                             );
@@ -825,7 +825,7 @@ mod tests {
     }
 
     /// Build a SharedState where the ModeController is pair-mode secondary,
-    /// so `is_cql_ready()` returns false.
+    /// serving reads while mutation routing rejects writes.
     fn setup_secondary_state() -> (Arc<SharedState>, TempDir) {
         let dir = TempDir::new().unwrap();
         let commit_log = CommitLogConfig {
@@ -932,26 +932,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn secondary_rejects_cql_with_overloaded() {
+    async fn secondary_accepts_cql_read_connections() {
+        use bytes::BufMut;
+        use tokio::io::AsyncWriteExt;
+
         let (state, _dir) = setup_secondary_state();
         assert!(
-            !state.mode_controller.is_cql_ready(),
-            "secondary must not be CQL-ready"
+            state.mode_controller.is_cql_ready(),
+            "secondary must serve read-only CQL"
         );
-        let server = CqlServer::new(test_config(10, 64), state);
+        let mut config = test_config(10, 64);
+        config.auth_disabled = true;
+        let server = CqlServer::new(config, state);
         let addr = server.start_background().await.unwrap();
 
         let mut conn = TcpStream::connect(addr).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let mut buf = vec![0u8; 256];
-        let n = conn.read(&mut buf).await.unwrap();
-        assert!(n >= HEADER_SIZE, "expected at least a frame header");
-        let header = FrameHeader::decode(&buf[..HEADER_SIZE]).unwrap();
-        assert_eq!(header.opcode, Opcode::Error);
-        // 0x1001 = Overloaded error code
-        let error_code = i32::from_be_bytes(buf[HEADER_SIZE..HEADER_SIZE + 4].try_into().unwrap());
-        assert_eq!(error_code, 0x1001, "expected Overloaded error code");
+        assert_eq!(
+            startup_and_read_one_frame(&mut conn).await.opcode,
+            Opcode::Ready
+        );
+        for (id, query, expected) in [
+            (1, "SELECT release_version FROM system.local", Opcode::Result),
+            (2, "CREATE KEYSPACE forbidden WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}", Opcode::Error),
+            (3, "SELECT release_version FROM system.local", Opcode::Result),
+        ] {
+            let mut body = bytes::BytesMut::new();
+            body.put_i32(query.len() as i32);
+            body.extend_from_slice(query.as_bytes());
+            body.put_u16(1);
+            body.put_u8(0);
+            let mut request = bytes::BytesMut::new();
+            request.put_u8(4);
+            request.put_u8(0);
+            request.put_i16(id);
+            request.put_u8(7);
+            request.put_u32(body.len() as u32);
+            request.extend_from_slice(&body);
+            conn.write_all(&request).await.unwrap();
+            let mut header_bytes = [0u8; HEADER_SIZE];
+            tokio::time::timeout(std::time::Duration::from_secs(2), conn.read_exact(&mut header_bytes))
+                .await.expect("replica must remain responsive").unwrap();
+            let header = FrameHeader::decode(&header_bytes).unwrap();
+            let mut response = vec![0; header.length as usize];
+            conn.read_exact(&mut response).await.unwrap();
+            assert_eq!(header.opcode, expected, "query: {query}");
+            if expected == Opcode::Error {
+                assert_eq!(i32::from_be_bytes(response[..4].try_into().unwrap()), 0x1001);
+            }
+        }
     }
 
     /// A client connecting after the Raft lane failed can still negotiate the

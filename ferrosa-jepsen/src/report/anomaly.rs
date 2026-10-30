@@ -70,6 +70,8 @@ mod tests {
             setup_error: None,
             duration_secs: 1.0,
             op_count: 10,
+            profile: Default::default(),
+            assurance: Default::default(),
         }
     }
 
@@ -112,6 +114,8 @@ mod tests {
             setup_error: None,
             duration_secs: 1.0,
             op_count: 5,
+            profile: Default::default(),
+            assurance: Default::default(),
         };
         let html = format_anomaly_html(&result);
         assert!(html.contains("NOT linearizable"));

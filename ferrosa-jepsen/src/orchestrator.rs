@@ -232,9 +232,26 @@ pub struct CombinationResult {
     pub setup_error: Option<String>,
     pub duration_secs: f64,
     pub op_count: usize,
+    /// The consistency configuration these assertions are scoped to. A verdict without it is not a
+    /// verdict: the same history is confirmed under QUORUM/QUORUM and inconclusive under ONE/ONE.
+    #[serde(default)]
+    pub profile: crate::checker::profile::ConsistencyProfile,
+    /// What the profile licenses from the observation.
+    #[serde(default)]
+    pub assurance: crate::checker::profile::Assurance,
 }
 
 impl CombinationResult {
+    /// True only when the run observed nothing *and* its profile could have observed something.
+    pub fn claims_pass(&self) -> bool {
+        self.assurance.is_confirmed()
+    }
+
+    /// True when the profile cannot support either claim — the run neither proves nor disproves.
+    pub fn is_inconclusive(&self) -> bool {
+        self.assurance.is_not_tested()
+    }
+
     /// True when this combination failed before producing any history — the
     /// failure says nothing about the database's correctness.
     pub fn is_setup_failure(&self) -> bool {
@@ -348,6 +365,8 @@ pub async fn run(config: &RunConfig) -> Result<RunReport> {
                                     setup_error: Some(e.to_string()),
                                     duration_secs: 0.0,
                                     op_count: 0,
+                                    profile: Default::default(),
+                                    assurance: Default::default(),
                                 });
                             }
                         }
@@ -508,19 +527,25 @@ async fn run_single_combination(
 
     let duration = start.elapsed();
 
+    let profile = crate::checker::profile::ConsistencyProfile::from_env();
+    let observed_clean = all_linear && invariant_passed;
+    let assurance = profile.classify(observed_clean);
+
     Ok(CombinationResult {
         workload: workload_name.into(),
         nemesis: nemesis_name.into(),
         topology: format!("{topology:?}"),
         concurrency: format!("{concurrency:?}"),
         driver: driver_name.into(),
-        passed: all_linear && invariant_passed,
+        passed: observed_clean,
         linearizability,
         invariant_passed,
         invariant_error,
         setup_error: None,
         duration_secs: duration.as_secs_f64(),
         op_count: history.len(),
+        profile,
+        assurance,
     })
 }
 
@@ -543,6 +568,8 @@ mod tests {
             setup_error: None,
             duration_secs: 1.5,
             op_count: 42,
+            profile: Default::default(),
+            assurance: Default::default(),
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: CombinationResult = serde_json::from_str(&json).unwrap();

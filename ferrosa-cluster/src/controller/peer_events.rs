@@ -628,6 +628,24 @@ impl PeerEventListener for ModeController {
     fn on_peer_recovered(&self, peer_id: uuid::Uuid) {
         tracing::info!(%peer_id, "peer recovered — planning invite and hint delivery");
 
+        // A fully failed reconnect removed this peer from the live view. A
+        // successful transport recovery must restore the ordinary connect path.
+        let missing = !self
+            .connected_peers
+            .load()
+            .iter()
+            .any(|(id, _)| *id == peer_id);
+        if missing {
+            let manager = self.peer_manager.load_full();
+            if let Some(addr) = manager
+                .as_ref()
+                .as_ref()
+                .and_then(|pm| pm.peer_socket_addr_sync(peer_id))
+            {
+                self.on_peer_connected((peer_id, addr));
+            }
+        }
+
         let pending_hint_count = self.hint_store.pending_count(peer_id);
         let peer_manager_available = self.peer_manager.load().is_some();
         let plan = peer_plan::plan_peer_recovered(PeerRecoveredPlanInput {
@@ -640,7 +658,17 @@ impl PeerEventListener for ModeController {
     }
 
     fn on_peer_failed(&self, peer_id: uuid::Uuid) {
-        tracing::warn!(%peer_id, "peer failed — excluding from replica set");
+        let peer = self
+            .connected_peers
+            .load()
+            .iter()
+            .find(|(id, _)| *id == peer_id)
+            .copied();
+        if let Some(peer) = peer {
+            // This changes reachability only. The committed voter/replica scope
+            // remains fixed, so a partition cannot lower quorum requirements.
+            self.on_peer_disconnected(peer);
+        }
     }
 }
 

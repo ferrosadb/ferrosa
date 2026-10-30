@@ -36,6 +36,7 @@ use crate::raft::handlers::{
     RangeReadStreamDonePayload, RangeReadStreamHeartbeatPayload, RangeReadStreamRequestPayload,
     StreamResumePositionWire,
 };
+use crate::ring::strategy::ReplicationStrategy;
 use crate::write_path::ScanResume;
 
 /// Idle deadline on the streaming receiver. Reset on every chunk OR
@@ -389,8 +390,7 @@ impl ClusterCoordinator {
         // token range at this CL, so the fast metadata path is exact. Otherwise
         // we MUST fan out across replicas and count the token-deduped result —
         // never the local subset.
-        let rf = strategy.replication_factor();
-        if self.range_read_remotes(cl, rf).needed == 0 {
+        if self.range_read_remotes(cl, strategy).needed == 0 {
             return if live_single_row {
                 self.storage
                     .count_live_single_row_range_matching(table_id, None, None, matches)
@@ -409,7 +409,7 @@ impl ClusterCoordinator {
         // `StorageEngine::count_range`'s COUNT(*) semantics (one per row, plus
         // one for a present static row) but over the WHOLE ring.
         let mut stream = self
-            .coordinate_range_read_stream_all_with(table_id, 0, cl, rf)
+            .coordinate_range_read_stream_all_with(table_id, 0, cl, strategy)
             .await?;
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -470,6 +470,9 @@ fn remote_count_for_cl(
     remote_count: usize,
 ) -> usize {
     use crate::consistency::ConsistencyLevel as CL;
+    if rf == 0 || matches!(cl, CL::EachQuorum | CL::Serial | CL::LocalSerial) {
+        return remote_count + 1;
+    }
     // RF<cluster — fall back to full fan-out for correctness.
     if rf < node_count {
         return remote_count;
@@ -479,14 +482,15 @@ fn remote_count_for_cl(
         CL::One | CL::LocalOne => 0,
         // QUORUM/ALL: contact enough remotes to satisfy CL beyond
         // the local response. For RF=N, QUORUM = floor(N/2)+1.
-        CL::Quorum | CL::LocalQuorum | CL::EachQuorum => {
+        CL::Quorum | CL::LocalQuorum => {
             let needed = rf / 2 + 1; // QUORUM count including local
-            needed.saturating_sub(1).min(remote_count)
+            needed.saturating_sub(1)
         }
-        CL::All => remote_count,
-        // Any/Two/Three are unusual or write-only — keep
-        // conservative full fan-out so we never under-read.
-        _ => remote_count,
+        CL::All => rf.saturating_sub(1),
+        CL::Two => 1,
+        CL::Three => 2,
+        // Unsupported read scopes cannot establish a certificate.
+        _ => remote_count + 1,
     }
 }
 
@@ -1462,6 +1466,74 @@ struct RemoteFanout {
     last_error: Option<String>,
 }
 
+/// Immutable strategy carried by range APIs. Scalar callers retain SimpleStrategy semantics.
+#[derive(Clone, Debug)]
+pub struct RangeReadStrategy(ReplicationStrategy);
+
+impl From<usize> for RangeReadStrategy {
+    fn from(replication_factor: usize) -> Self {
+        Self(ReplicationStrategy::Simple { replication_factor })
+    }
+}
+
+impl From<&ReplicationStrategy> for RangeReadStrategy {
+    fn from(strategy: &ReplicationStrategy) -> Self {
+        Self(strategy.clone())
+    }
+}
+
+struct RangeCertificate {
+    strategy: ReplicationStrategy,
+    cl: crate::consistency::ConsistencyLevel,
+    origin: String,
+    local_host: uuid::Uuid,
+    // Each distinct token ownership scope must independently meet the CL.
+    scopes: Vec<Vec<(uuid::Uuid, String)>>,
+}
+
+impl RangeCertificate {
+    fn satisfied(&self, admitted: &std::collections::HashSet<uuid::Uuid>) -> bool {
+        !self.scopes.is_empty()
+            && self.scopes.iter().all(|scope| {
+                let count_in_dc = |dc: &str| {
+                    scope
+                        .iter()
+                        .filter(|(host, replica_dc)| replica_dc == dc && admitted.contains(host))
+                        .count()
+                };
+                if self.cl == crate::ConsistencyLevel::DcQuorum {
+                    // A range read at DC_QUORUM is satisfied scope by scope inside the origin
+                    // datacenter; it does not also require the write-side datacenter and node
+                    // quorums.
+                    return super::dc_quorum::local_progress(
+                        &self.strategy,
+                        &self.origin,
+                        count_in_dc,
+                    )
+                    .satisfied();
+                }
+                super::dc_quorum::progress(
+                    self.cl,
+                    &self.strategy,
+                    &self.origin,
+                    scope
+                        .iter()
+                        .filter(|(host, _)| admitted.contains(host))
+                        .count(),
+                    |dc| {
+                        scope
+                            .iter()
+                            .filter(|(host, replica_dc)| {
+                                replica_dc == dc && admitted.contains(host)
+                            })
+                            .count()
+                    },
+                )
+                .satisfied()
+            })
+    }
+}
+
 /// The remote replicas a range scan may read, in ring order, and how many of
 /// them the consistency level needs beyond the local read.
 ///
@@ -1470,7 +1542,10 @@ struct RemoteFanout {
 /// three RF=3 replicas down still reads from a live one (t_7c01df7e).
 struct RangeReadReplicas {
     candidates: Vec<(uuid::Uuid, String)>,
+    // Scalar source count, or 0/local and 2/N-way selection hints for a certificate.
+    // NTS admission is determined exclusively by the per-token certificate.
     needed: usize,
+    certificate: Option<RangeCertificate>,
 }
 
 /// Per-replica windowed continuation forwarder (t_a0f922a3 mode 2).
@@ -1763,9 +1838,19 @@ impl ClusterCoordinator {
         let mut streams: Vec<ClusterPartitionStream> = Vec::with_capacity(replicas.needed);
         let mut fire_failures = 0usize;
         let mut last_error = None;
+        let mut admitted = std::collections::HashSet::new();
+        if let Some(cert) = &replicas.certificate {
+            admitted.insert(cert.local_host);
+        }
 
         for (host_id, _addr) in &replicas.candidates {
-            if streams.len() == replicas.needed {
+            if replicas
+                .certificate
+                .as_ref()
+                .map_or(streams.len() == replicas.needed, |cert| {
+                    cert.satisfied(&admitted)
+                })
+            {
                 break;
             }
             match self
@@ -1779,7 +1864,10 @@ impl ClusterCoordinator {
                 )
                 .await
             {
-                Ok(stream) => streams.push(stream),
+                Ok(stream) => {
+                    admitted.insert(*host_id);
+                    streams.push(stream);
+                }
                 Err(e) => {
                     tracing::warn!(
                         peer = %host_id,
@@ -1793,6 +1881,16 @@ impl ClusterCoordinator {
             }
         }
 
+        if replicas
+            .certificate
+            .as_ref()
+            .is_some_and(|cert| !cert.satisfied(&admitted))
+        {
+            return Err(ClusterError::Internal(format!(
+                "streaming range read: partial fan-out does not satisfy the configured consistency level for every token range ({} admitted, {} failed)",
+                streams.len(), fire_failures
+            )));
+        }
         Ok(RemoteFanout {
             streams,
             fire_failures,
@@ -1924,7 +2022,7 @@ impl ClusterCoordinator {
         table_id: &TableId,
         row_limit: usize,
         cl: crate::consistency::ConsistencyLevel,
-        replication_factor: usize,
+        replication_factor: impl Into<RangeReadStrategy>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         self.coordinate_range_read_stream_all_with_projection(
             table_id,
@@ -1941,7 +2039,7 @@ impl ClusterCoordinator {
         table_id: &TableId,
         wanted: Vec<u16>,
         cl: crate::consistency::ConsistencyLevel,
-        replication_factor: usize,
+        replication_factor: impl Into<RangeReadStrategy>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         self.coordinate_range_read_stream_all_with_projection(
             table_id,
@@ -1959,30 +2057,110 @@ impl ClusterCoordinator {
     fn range_read_remotes(
         &self,
         cl: crate::consistency::ConsistencyLevel,
-        replication_factor: usize,
+        replication_factor: impl Into<RangeReadStrategy>,
     ) -> RangeReadReplicas {
+        let strategy = replication_factor.into().0;
         let ring = self.ring.load();
         let node_ids = ring.node_ids();
-        let local_id = self.local_node_id;
-        let node_count = node_ids.len();
-        // A ring entry under another node id that carries THIS node's host_id is
-        // the local replica (t_b78e8e9a). It is served by the local engine
-        // stream the merge always includes; firing to it would go through
-        // `PeerManager`, which has no entry for the local host ("unknown peer").
-        let local_host_id = self.peer_manager.local_host_id();
-        let candidates: Vec<(uuid::Uuid, String)> = node_ids
+        let local_host = self.peer_manager.local_host_id();
+        let mut seen = std::collections::HashSet::from([local_host]);
+        let mut candidates: Vec<_> = node_ids
             .iter()
-            .filter(|&&id| id != local_id)
-            .filter_map(|&id| ring.get_node(id).map(|n| (n.host_id, n.addr.clone())))
-            .filter(|(host_id, _)| *host_id != local_host_id)
+            .filter_map(|&id| ring.get_node(id))
+            .filter(|node| seen.insert(node.host_id))
+            .map(|node| (node.host_id, node.addr.clone()))
             .collect();
-        drop(ring);
-        // Aliases of the local node are not additional replicas.
-        let node_count = node_count.min(candidates.len() + 1);
-
-        let needed = remote_count_for_cl(cl, replication_factor, node_count, candidates.len());
-        debug_assert!(needed <= candidates.len());
-        RangeReadReplicas { candidates, needed }
+        let certificate = if matches!(strategy, ReplicationStrategy::NetworkTopology { .. }) {
+            let origin = ring
+                .get_node(self.local_node_id)
+                .or_else(|| {
+                    node_ids
+                        .iter()
+                        .filter_map(|id| ring.get_node(*id))
+                        .find(|node| node.host_id == local_host)
+                })
+                .map(|node| node.data_center.clone())
+                .unwrap_or_default();
+            let mut scopes = Vec::new();
+            for token in node_ids.iter().flat_map(|id| ring.tokens_for_node(*id)) {
+                let mut hosts = std::collections::BTreeMap::new();
+                let mut replicas = ring.replicas_for_strategy(token, &strategy);
+                super::cl_routing::retain_eligible_replicas_for_cl(cl, &mut replicas, &ring);
+                for id in replicas {
+                    if let Some(node) = ring.get_node(id) {
+                        hosts
+                            .entry(node.host_id)
+                            .or_insert_with(|| node.data_center.clone());
+                    }
+                }
+                let scope: Vec<_> = hosts.into_iter().collect();
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+            candidates.retain(|(host, _)| {
+                scopes
+                    .iter()
+                    .any(|scope| scope.iter().any(|(eligible, _)| eligible == host))
+            });
+            if matches!(
+                cl,
+                crate::consistency::ConsistencyLevel::LocalOne
+                    | crate::consistency::ConsistencyLevel::LocalQuorum
+                    | crate::consistency::ConsistencyLevel::LocalSerial
+            ) {
+                candidates.retain(|(host, _)| {
+                    scopes.iter().any(|scope| {
+                        scope
+                            .iter()
+                            .any(|(eligible, dc)| eligible == host && dc == &origin)
+                    })
+                });
+            }
+            Some(RangeCertificate {
+                strategy: strategy.clone(),
+                cl,
+                origin,
+                local_host,
+                scopes,
+            })
+        } else {
+            None
+        };
+        let unknown_local_scope = certificate.is_none()
+            && matches!(
+                cl,
+                crate::consistency::ConsistencyLevel::LocalOne
+                    | crate::consistency::ConsistencyLevel::LocalQuorum
+            )
+            && node_ids
+                .iter()
+                .filter_map(|id| ring.get_node(*id))
+                .map(|node| node.data_center.as_str())
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1;
+        let needed = if let Some(cert) = &certificate {
+            if cert.satisfied(&std::collections::HashSet::from([local_host])) {
+                0
+            } else {
+                2
+            }
+        } else if unknown_local_scope {
+            candidates.len() + 1
+        } else {
+            remote_count_for_cl(
+                cl,
+                strategy.replication_factor(),
+                node_ids.len().min(candidates.len() + 1),
+                candidates.len(),
+            )
+        };
+        RangeReadReplicas {
+            candidates,
+            needed,
+            certificate,
+        }
     }
 
     /// Drive the local resume-bounded fragmented stream + the CL-selected
@@ -2029,7 +2207,7 @@ impl ClusterCoordinator {
         // The error is the same shape as the total-failure case below so callers
         // see one contract: `every replica fire failed` reports how many were
         // tried when none worked, this reports the shortfall when some did.
-        if fanout.streams.len() < replicas.needed {
+        if replicas.certificate.is_none() && fanout.streams.len() < replicas.needed {
             tracing::warn!(
                 failed = fanout.fire_failures,
                 succeeded = fanout.streams.len(),
@@ -2091,7 +2269,7 @@ impl ClusterCoordinator {
         table_id: &TableId,
         resume: Option<&ScanResume>,
         cl: crate::consistency::ConsistencyLevel,
-        replication_factor: usize,
+        replication_factor: impl Into<RangeReadStrategy>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let replicas = self.range_read_remotes(cl, replication_factor);
 
@@ -2121,7 +2299,7 @@ impl ClusterCoordinator {
         wanted: Vec<u16>,
         resume: Option<&ScanResume>,
         cl: crate::consistency::ConsistencyLevel,
-        replication_factor: usize,
+        replication_factor: impl Into<RangeReadStrategy>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let replicas = self.range_read_remotes(cl, replication_factor);
 
@@ -2232,7 +2410,7 @@ impl ClusterCoordinator {
         table_id: &TableId,
         row_limit: usize,
         cl: crate::consistency::ConsistencyLevel,
-        replication_factor: usize,
+        replication_factor: impl Into<RangeReadStrategy>,
         projected_regular_ordinals: Option<Vec<u16>>,
     ) -> crate::error::Result<ClusterPartitionStream> {
         let replicas = self.range_read_remotes(cl, replication_factor);
@@ -2269,7 +2447,7 @@ impl ClusterCoordinator {
             // Refused, not warned about, for the same reason as the paged path
             // (`paged_multi_replica_stream`): merging fewer sources than the CL
             // needs is a silent read below the requested consistency level.
-            if fanout.streams.len() < expected_done {
+            if replicas.certificate.is_none() && fanout.streams.len() < expected_done {
                 tracing::warn!(
                     failed = fanout.fire_failures,
                     succeeded = fanout.streams.len(),
@@ -4827,3 +5005,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "range_read_verification_tests.rs"]
+mod verification_tests;

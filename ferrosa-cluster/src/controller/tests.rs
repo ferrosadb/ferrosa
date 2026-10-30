@@ -107,6 +107,46 @@ fn starts_in_standalone_mode() {
 }
 
 #[test]
+fn exhausted_peer_reconnect_removes_liveness_without_shrinking_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let (controller, _) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        Arc::new(NetConfig::default()),
+        Uuid::from_u128(1),
+        test_storage(dir.path()),
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    let failed = (Uuid::from_u128(2), "127.0.0.1:7002".parse().unwrap());
+    let survivor = (Uuid::from_u128(3), "127.0.0.1:7003".parse().unwrap());
+    controller
+        .connected_peers
+        .store(Arc::new(vec![failed, survivor]));
+    controller
+        .committed_cluster_size
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    controller.mode.store(Arc::new(DeploymentMode::Cluster));
+    controller.on_peer_failed(failed.0);
+    assert_eq!(controller.connected_peers.load().as_ref(), &vec![survivor]);
+    assert_eq!(
+        controller
+            .committed_cluster_size
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    assert_eq!(controller.mode(), DeploymentMode::Cluster);
+    controller.on_peer_failed(survivor.0);
+    assert!(controller.connected_peers.load().is_empty());
+    assert_eq!(
+        controller
+            .committed_cluster_size
+            .load(std::sync::atomic::Ordering::Relaxed),
+        3
+    );
+    assert_eq!(controller.mode(), DeploymentMode::DegradedCluster);
+}
+
+#[test]
 fn peer_connect_transitions_to_pair() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
@@ -240,9 +280,9 @@ async fn promote_from_degraded_pair_restores_writes() {
     // Pair context preserved
     assert!(controller.role().is_some());
 
-    // Operator promotes → Standalone Primary with direct writes
+    // Operator promotes while retaining the logical pair's consistency policy.
     controller.force_promote().unwrap();
-    assert_eq!(controller.mode(), DeploymentMode::Standalone);
+    assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert!(controller.force_promoted.load(Ordering::Acquire));
     assert!(controller.is_cql_ready());
 
@@ -2643,7 +2683,7 @@ fn is_cql_ready_standalone_returns_true() {
 }
 
 #[test]
-fn is_cql_ready_pair_secondary_returns_false() {
+fn is_cql_ready_pair_secondary_permits_read_only_service() {
     let dir = tempfile::tempdir().unwrap();
     let storage = test_storage(dir.path());
     let schema = test_schema();
@@ -2677,8 +2717,8 @@ fn is_cql_ready_pair_secondary_returns_false() {
     assert_eq!(controller.mode(), DeploymentMode::Pair);
     assert_eq!(controller.role(), Some(PairRole::Secondary));
     assert!(
-        !controller.is_cql_ready(),
-        "pair secondary must NOT accept CQL connections"
+        controller.is_cql_ready(),
+        "pair secondary must accept read-only CQL service"
     );
 }
 
@@ -5077,6 +5117,7 @@ impl RpcHandler for UnconvergedSchemaSync {
 
 struct SwitchoverPeer {
     _server: Arc<RpcServer>,
+    registry: Arc<HandlerRegistry>,
     addr: SocketAddr,
     role: Arc<ArcSwap<PairRole>>,
 }
@@ -5095,16 +5136,20 @@ async fn start_switchover_peer(
     let registry = Arc::new(HandlerRegistry::new());
     registry.register(MsgType::PairSchemaSync, schema_sync);
     registry.register(
-        MsgType::RoleSwap,
-        Arc::new(crate::pair::switchover::RoleSwapHandler::new(
+        MsgType::PairAuthority,
+        Arc::new(crate::pair::switchover::RoleSwapHandler::durable(
             peer_id,
+            Uuid::from_u128(1),
             role.clone(),
+            tempfile::tempdir().unwrap().keep(),
+            Arc::new(tokio::sync::RwLock::new(())),
         )),
     );
-    let server = Arc::new(RpcServer::new(config, peer_id, registry));
+    let server = Arc::new(RpcServer::new(config, peer_id, registry.clone()));
     let addr = server.start_and_get_addr().await.unwrap();
     SwitchoverPeer {
         _server: server,
+        registry,
         addr,
         role,
     }
@@ -5267,6 +5312,590 @@ async fn switchover_converges_the_peer_schema_before_swapping_roles() {
     );
     assert_eq!(**peer.role.load(), PairRole::Primary);
     assert_eq!(controller.role(), Some(PairRole::Secondary));
+}
+
+struct LostRoleSwapReply {
+    inner: crate::pair::switchover::RoleSwapHandler,
+    applied: Arc<tokio::sync::Notify>,
+}
+
+fn verification_mutation() -> ferrosa_storage::Mutation {
+    use ferrosa_common::{CellValue, DecoratedKey, PartitionKey, Token};
+    use ferrosa_sstable::types::{DeletionTime, LivenessInfo, Row};
+    ferrosa_storage::Mutation::new(
+        "smoke_ks".into(),
+        "kv".into(),
+        DecoratedKey {
+            token: Token(42),
+            key: PartitionKey::new(b"pair-key".to_vec()),
+        },
+        vec![Row {
+            clustering: vec![],
+            cells: vec![(0, CellValue::live(b"guaranteed".to_vec(), 1000))],
+            deletion: DeletionTime::LIVE,
+            primary_key_liveness: LivenessInfo::with_timestamp(1000),
+        }],
+        1000,
+    )
+}
+
+fn verification_replica(storage: Arc<StorageEngine>, schema: Arc<Schema>) -> Arc<ModeController> {
+    let net = Arc::new(NetConfig::default());
+    let (controller, _) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        Uuid::from_u128(2),
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    controller.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+        net,
+        Uuid::from_u128(2),
+        controller.as_peer_listener(),
+    )));
+    controller.on_peer_connected((Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap()));
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
+    controller
+}
+
+#[tokio::test]
+async fn read_only_pair_replica_rejects_mutations_before_any_forwarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let net = Arc::new(NetConfig::default());
+    let (controller, handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        Uuid::from_u128(2),
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    controller.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+        net,
+        Uuid::from_u128(2),
+        controller.as_peer_listener(),
+    )));
+    controller.on_peer_connected((Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap()));
+    let coordinator = match &**handles.write_path.load() {
+        WritePath::Pair(coordinator) => coordinator.clone(),
+        _ => panic!("fixture must establish the actual pair coordinator"),
+    };
+    let result = coordinator.coordinate_write(&verification_mutation()).await;
+    assert!(
+        matches!(result, Err(ClusterError::NotPrimary)),
+        "replica must reject at the authority boundary, not attempt forwarding: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn pair_replica_admits_reads_without_admitting_client_writes() {
+    for expected_cluster_size in [0, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = test_storage(dir.path());
+        let schema = test_schema();
+        install_kv(&schema, &storage, false);
+        let mutation = verification_mutation();
+        let table = ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table);
+        // Internal replica apply is allowed; client mutation admission is separate.
+        storage
+            .write(
+                &table,
+                &mutation.key,
+                mutation.rows[0].clone(),
+                mutation.timestamp,
+            )
+            .unwrap();
+        let net = Arc::new(NetConfig::default());
+        let config = Arc::new(ClusterConfig {
+            expected_cluster_size,
+            ..ClusterConfig::default()
+        });
+        let (controller, handles) = ModeController::new(
+            config,
+            net.clone(),
+            Uuid::from_u128(2),
+            storage,
+            schema,
+            Arc::new(HandlerRegistry::new()),
+        );
+        controller.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+            net,
+            Uuid::from_u128(2),
+            controller.as_peer_listener(),
+        )));
+        controller.on_peer_connected((Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap()));
+        assert_eq!(controller.role(), Some(PairRole::Secondary));
+        assert!(controller.accepts_cql_connections(), "read-only pair replica must accept native connections (expected={expected_cluster_size})");
+        assert!(controller.is_cql_ready(), "read-only service is ready");
+        let path = handles.write_path.load_full();
+        let read = path.read(&table, &mutation.key).await.unwrap().unwrap();
+        assert_eq!(read.rows[0].cells, mutation.rows[0].cells);
+        assert!(path
+            .write(
+                &table,
+                &mutation.key,
+                mutation.rows[0].clone(),
+                mutation.timestamp,
+                crate::consistency::ConsistencyLevel::One,
+                &crate::ring::strategy::ReplicationStrategy::Simple {
+                    replication_factor: 2
+                }
+            )
+            .await
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn pair_replica_rejects_ddl_at_authority_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let controller = verification_replica(storage, schema);
+    let coordinator = match &**controller.ddl_path.load() {
+        DdlPath::Pair(coordinator) => coordinator.clone(),
+        _ => panic!("fixture must use real pair DDL dispatch"),
+    };
+    let result = coordinator
+        .coordinate_ddl(crate::pair::ddl::DdlOperation::DropKeyspace(
+            "forbidden".into(),
+        ))
+        .await;
+    assert!(
+        matches!(result, Err(ClusterError::NotPrimary)),
+        "replica DDL must never forward: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn pair_replica_rejects_atomic_batch_at_authority_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let controller = verification_replica(storage, schema);
+    let coordinator = match &**controller.write_path.load() {
+        WritePath::Pair(coordinator) => coordinator.clone(),
+        _ => panic!("fixture must use real pair mutation dispatch"),
+    };
+    let result = coordinator
+        .coordinate_batch(vec![verification_mutation()], Uuid::new_v4())
+        .await;
+    assert!(
+        matches!(result, Err(ClusterError::NotPrimary)),
+        "replica atomic batch must never forward: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn promoted_pair_survivor_refuses_all_rf2_without_a_follower() {
+    use crate::consistency::ConsistencyLevel;
+    use crate::ring::strategy::ReplicationStrategy;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let net = Arc::new(NetConfig::default());
+    let (controller, handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        Uuid::from_u128(2),
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net,
+        Uuid::from_u128(2),
+        controller.as_peer_listener(),
+    ));
+    controller.set_peer_manager(pm);
+    let old_primary = (Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap());
+    controller.on_peer_connected(old_primary);
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
+    controller.on_peer_disconnected(old_primary);
+    // This explicit operator call represents independent confirmation/fencing.
+    controller.force_promote().unwrap();
+    let mutation = verification_mutation();
+    let result = handles
+        .write_path
+        .load_full()
+        .write(
+            &ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table),
+            &mutation.key,
+            mutation.rows[0].clone(),
+            mutation.timestamp,
+            ConsistencyLevel::All,
+            &ReplicationStrategy::Simple {
+                replication_factor: 2,
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "operator promotion must not erase the RF2 ALL requirement: {result:?}"
+    );
+    for cl in [ConsistencyLevel::One, ConsistencyLevel::Quorum] {
+        let path = handles.write_path.load_full();
+        path.write(
+            &ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table),
+            &mutation.key,
+            mutation.rows[0].clone(),
+            mutation.timestamp,
+            cl,
+            &ReplicationStrategy::Simple {
+                replication_factor: 2,
+            },
+        )
+        .await
+        .expect("the authorized survivor must permit guaranteed ONE and QUORUM writes");
+    }
+}
+
+#[tokio::test]
+async fn restarted_old_primary_keeps_its_handoff_fence_before_and_after_rejoin() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        test_schema(),
+        test_storage(peer_dir.path()),
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let old = primary_paired_with(peer_id, &peer, storage.clone(), schema.clone()).await;
+    old.switchover().await.unwrap();
+    assert_eq!(old.role(), Some(PairRole::Secondary));
+    assert_eq!(**peer.role.load(), PairRole::Primary);
+
+    // A fresh controller on the same durable directory models a process restart.
+    // The lower UUID must not regain authority before its peer corrects it.
+    let config = Arc::new(ClusterConfig::default());
+    let net = Arc::new(NetConfig::default());
+    let (restarted, _) = ModeController::new(
+        config,
+        net.clone(),
+        Uuid::from_u128(1),
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    assert!(
+        !restarted.accepts_cql_connections(),
+        "a fenced old primary must not open writable standalone admission on restart"
+    );
+    let pm = Arc::new(PeerManager::with_weak_listener(
+        net,
+        Uuid::from_u128(1),
+        restarted.as_peer_listener(),
+    ));
+    restarted.set_peer_manager(pm);
+    restarted.on_inbound_peer(
+        (peer_id, peer.addr),
+        None,
+        Some(peer.addr.to_string()),
+        0,
+        None,
+        None,
+    );
+    assert_eq!(
+        restarted.role(),
+        Some(PairRole::Secondary),
+        "durable handoff must outrank UUID election when the old primary rejoins"
+    );
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for LostRoleSwapReply {
+    async fn handle(&self, from: PeerId, message: Message) -> Option<Message> {
+        let grant = matches!(&message, Message::PairAuthority(bytes) if std::str::from_utf8(bytes).unwrap().contains("Grant"));
+        let reply = self.inner.handle(from, message).await;
+        if grant {
+            assert!(matches!(reply, Some(Message::PairAuthority(..))));
+            self.applied.notify_one();
+            None // Receiver really applies the transfer; only its reply is lost.
+        } else {
+            reply
+        }
+    }
+}
+
+#[tokio::test]
+async fn lost_role_swap_reply_never_retains_the_old_primary_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let applied = Arc::new(tokio::sync::Notify::new());
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(
+        MsgType::PairSchemaSync,
+        Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+            test_schema(),
+            test_storage(peer_dir.path()),
+            peer_role.clone(),
+        )),
+    );
+    registry.register(
+        MsgType::PairAuthority,
+        Arc::new(LostRoleSwapReply {
+            inner: crate::pair::switchover::RoleSwapHandler::durable(
+                peer_id,
+                Uuid::from_u128(1),
+                peer_role.clone(),
+                peer_dir.path().to_path_buf(),
+                Arc::new(tokio::sync::RwLock::new(())),
+            ),
+            applied: applied.clone(),
+        }),
+    );
+    let server = Arc::new(RpcServer::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        },
+        peer_id,
+        registry.clone(),
+    ));
+    let peer = SwitchoverPeer {
+        addr: server.start_and_get_addr().await.unwrap(),
+        _server: server,
+        registry,
+        role: peer_role,
+    };
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    let swapping = controller.clone();
+    let request = tokio::spawn(async move { swapping.switchover().await });
+    tokio::time::timeout(Duration::from_secs(2), applied.notified())
+        .await
+        .expect("the real receiver must apply the transfer");
+    request.abort(); // Cancellation after the lost reply cannot restore authority.
+    let _ = request.await;
+    assert_eq!(**peer.role.load(), PairRole::Primary);
+    assert_eq!(
+        controller.role(),
+        Some(PairRole::Secondary),
+        "the old primary must withdraw authority before a peer can become primary"
+    );
+}
+
+struct HeldReplicaWrite {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    storage: Arc<StorageEngine>,
+}
+
+struct HeldPairDdl {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    inner: Arc<dyn RpcHandler>,
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for HeldPairDdl {
+    async fn handle(&self, from: PeerId, message: Message) -> Option<Message> {
+        self.started.notify_one();
+        self.release.notified().await;
+        self.inner.handle(from, message).await
+    }
+}
+
+#[tokio::test]
+async fn switchover_drains_admitted_ddl_before_schema_confirmation_and_grant() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let peer_storage = test_storage(peer_dir.path());
+    let peer_schema = test_schema();
+    install_kv(&peer_schema, &peer_storage, false);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        peer_schema.clone(),
+        peer_storage.clone(),
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    let pm = match &**controller.peer_manager.load() {
+        Some(pm) => pm.clone(),
+        None => panic!("peer fixture"),
+    };
+    let replica = Arc::new(crate::pair::ddl::DdlCoordinator::new(
+        peer.role.clone(),
+        Uuid::from_u128(1),
+        peer_schema.clone(),
+        peer_storage,
+        pm,
+    ));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    peer.registry.register(
+        MsgType::PairDdlForward,
+        Arc::new(HeldPairDdl {
+            started: started.clone(),
+            release: release.clone(),
+            inner: Arc::new(crate::pair::ddl::PairDdlForwardHandler::new(
+                peer.role.clone(),
+                replica,
+            )),
+        }),
+    );
+    let path = controller.ddl_path.load_full();
+    let mut table = switchover_kv_table(false);
+    table.name = "before_handoff".into();
+    table.id = Uuid::new_v4();
+    let ddl = tokio::spawn(async move {
+        path.execute(crate::pair::ddl::DdlOperation::CreateTable(Box::new(table)))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(500), controller.switchover()).await;
+    assert!(
+        early.is_err(),
+        "handoff/schema sync raced an admitted DDL operation"
+    );
+    assert_eq!(**peer.role.load(), PairRole::Secondary);
+    release.notify_one();
+    ddl.await.unwrap().unwrap();
+    controller.switchover().await.unwrap();
+    assert_eq!(**peer.role.load(), PairRole::Primary);
+    assert!(peer_schema
+        .snapshot()
+        .tables
+        .contains_key(&("smoke_ks".into(), "before_handoff".into())));
+}
+
+#[tokio::test]
+async fn promoted_pair_handoff_revokes_previously_loaded_ddl_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        test_schema(),
+        test_storage(peer_dir.path()),
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    controller.force_promote().unwrap();
+    let previously_loaded = controller.ddl_path.load_full();
+    controller.switchover().await.unwrap();
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
+    let mut table = switchover_kv_table(false);
+    table.name = "must_not_appear".into();
+    table.id = Uuid::new_v4();
+    let result = previously_loaded
+        .execute(crate::pair::ddl::DdlOperation::CreateTable(Box::new(table)))
+        .await;
+    assert!(
+        result.is_err(),
+        "a promoted pair must not retain Direct DDL authority after demotion"
+    );
+    assert!(!controller
+        .schema
+        .snapshot()
+        .tables
+        .contains_key(&("smoke_ks".into(), "must_not_appear".into())));
+}
+
+#[async_trait::async_trait]
+impl RpcHandler for HeldReplicaWrite {
+    async fn handle(&self, _from: PeerId, message: Message) -> Option<Message> {
+        let Message::PairWriteForward(body) = message else {
+            panic!("write fixture")
+        };
+        let mutation = crate::pair::coordinator::decode_mutation(&body).unwrap();
+        self.started.notify_one();
+        self.release.notified().await;
+        for row in mutation.rows {
+            self.storage
+                .write(
+                    &ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table),
+                    &mutation.key,
+                    row,
+                    mutation.timestamp,
+                )
+                .unwrap();
+        }
+        self.storage.force_commit_log_sync().unwrap();
+        Some(Message::PairWriteAck(bytes::Bytes::new()))
+    }
+}
+
+#[tokio::test]
+async fn switchover_drains_admitted_writes_before_granting_the_peer_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let peer_dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let peer_storage = test_storage(peer_dir.path());
+    let peer_schema = test_schema();
+    install_kv(&peer_schema, &peer_storage, false);
+    let peer_id = Uuid::from_u128(2);
+    let peer_role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let sync = Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+        peer_schema,
+        peer_storage.clone(),
+        peer_role.clone(),
+    ));
+    let peer = start_switchover_peer(peer_id, sync, peer_role).await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    peer.registry.register(
+        MsgType::PairWriteForward,
+        Arc::new(HeldReplicaWrite {
+            started: started.clone(),
+            release: release.clone(),
+            storage: peer_storage.clone(),
+        }),
+    );
+    let controller = primary_paired_with(peer_id, &peer, storage, schema).await;
+    let coordinator = match &**controller.write_path.load() {
+        WritePath::Pair(coordinator) => coordinator.clone(),
+        _ => panic!("pair fixture"),
+    };
+    let mutation = verification_mutation();
+    let written = mutation.clone();
+    let writer = tokio::spawn(async move { coordinator.coordinate_write(&written).await });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let early = tokio::time::timeout(Duration::from_millis(500), controller.switchover()).await;
+    assert!(
+        early.is_err(),
+        "handoff completed before an admitted write was durably replicated"
+    );
+    assert_eq!(**peer.role.load(), PairRole::Secondary);
+    release.notify_one();
+    writer.await.unwrap().unwrap();
+    controller.switchover().await.unwrap();
+    assert_eq!(**peer.role.load(), PairRole::Primary);
+    let read = peer_storage
+        .read(
+            &ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table),
+            &mutation.key,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(read.rows[0].cells, mutation.rows[0].cells);
 }
 
 // ── boot-state consensus gate (2026-10-10 boot decoupling) ────────────────────
@@ -6723,4 +7352,391 @@ mod raft_leader_liveness_after_restart {
         assert_eq!(controller.raft_leader_liveness(&raft), LeaderLiveness::Live);
         raft.shutdown().await.expect("clean shutdown");
     }
+}
+
+#[tokio::test]
+async fn role_swap_from_wrong_peer_cannot_create_primary() {
+    let local = Uuid::from_u128(2);
+    let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let handler = crate::pair::switchover::RoleSwapHandler::new(local, role.clone());
+    let reply = handler
+        .handle(
+            (Uuid::from_u128(99), "127.0.0.1:1".parse().unwrap()),
+            Message::RoleSwap {
+                new_primary: local,
+                new_secondary: Uuid::from_u128(1),
+            },
+        )
+        .await;
+    assert!(
+        reply.is_none(),
+        "an unauthenticated role assignment must be refused"
+    );
+    assert_eq!(**role.load(), PairRole::Secondary);
+}
+
+struct CapturedPairGrant {
+    inner: crate::pair::switchover::RoleSwapHandler,
+    captured: Arc<parking_lot::Mutex<Option<Message>>>,
+}
+#[async_trait::async_trait]
+impl RpcHandler for CapturedPairGrant {
+    async fn handle(&self, from: PeerId, message: Message) -> Option<Message> {
+        if matches!(&message, Message::PairAuthority(bytes) if std::str::from_utf8(bytes).unwrap().contains("Grant"))
+        {
+            *self.captured.lock() = Some(message.clone());
+        }
+        self.inner.handle(from, message).await
+    }
+}
+
+#[tokio::test]
+async fn captured_real_pair_grant_is_durable_and_cannot_reactivate_reconstructed_receiver() {
+    let old_dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let peer_id = Uuid::from_u128(2);
+    let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let peer = start_switchover_peer(
+        peer_id,
+        Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+            test_schema(),
+            test_storage(receiver_dir.path()),
+            role.clone(),
+        )),
+        role.clone(),
+    )
+    .await;
+    let captured = Arc::new(parking_lot::Mutex::new(None));
+    peer.registry.register(
+        MsgType::PairAuthority,
+        Arc::new(CapturedPairGrant {
+            inner: crate::pair::switchover::RoleSwapHandler::durable(
+                peer_id,
+                Uuid::from_u128(1),
+                role.clone(),
+                receiver_dir.path().to_path_buf(),
+                Arc::new(tokio::sync::RwLock::new(())),
+            ),
+            captured: captured.clone(),
+        }),
+    );
+    let controller =
+        primary_paired_with(peer_id, &peer, test_storage(old_dir.path()), test_schema()).await;
+    controller.switchover().await.unwrap();
+    assert_eq!(**role.load(), PairRole::Primary);
+    let grant = captured
+        .lock()
+        .clone()
+        .expect("capture the real initiator grant");
+    let saved = crate::pair::authority::PairAuthority::read(receiver_dir.path(), peer_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.primary, peer_id);
+    // Reverse through the real RPC initiator and the old controller's handler.
+    let reverse_server = Arc::new(RpcServer::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            ..NetConfig::default()
+        },
+        Uuid::from_u128(1),
+        controller.registry.clone(),
+    ));
+    let reverse_addr = reverse_server.start_and_get_addr().await.unwrap();
+    let reverse_pm = PeerManager::with_weak_listener(
+        Arc::new(NetConfig::default()),
+        peer_id,
+        controller.as_peer_listener(),
+    );
+    let pool = ferrosa_net::pool::PriorityPool::connect(
+        Arc::new(NetConfig::default()),
+        peer_id,
+        &reverse_addr.to_string(),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    reverse_pm
+        .add_peer((Uuid::from_u128(1), reverse_addr), pool)
+        .await;
+    crate::pair::switchover::initiate_switchover(
+        &reverse_pm,
+        peer_id,
+        Uuid::from_u128(1),
+        &role,
+        receiver_dir.path(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+    assert_eq!(**role.load(), PairRole::Secondary);
+    let handler = crate::pair::switchover::RoleSwapHandler::durable(
+        peer_id,
+        Uuid::from_u128(1),
+        role.clone(),
+        receiver_dir.path().to_path_buf(),
+        Arc::new(tokio::sync::RwLock::new(())),
+    );
+    assert!(handler
+        .handle((Uuid::from_u128(1), peer.addr), grant.clone())
+        .await
+        .is_none());
+    assert!(handler
+        .handle((Uuid::from_u128(99), peer.addr), grant)
+        .await
+        .is_none());
+    assert!(handler
+        .handle(
+            (Uuid::from_u128(1), peer.addr),
+            Message::PairAuthority(bytes::Bytes::from_static(b"{malformed"))
+        )
+        .await
+        .is_none());
+    assert!(handler
+        .handle(
+            (Uuid::from_u128(1), peer.addr),
+            Message::RoleSwap {
+                new_primary: peer_id,
+                new_secondary: Uuid::from_u128(1)
+            }
+        )
+        .await
+        .is_none());
+    assert_eq!(**role.load(), PairRole::Secondary);
+}
+
+#[tokio::test]
+async fn initially_paired_old_primary_restart_is_fenced_before_rejoin() {
+    let dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let peer_id = Uuid::from_u128(2);
+    let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let peer = start_switchover_peer(
+        peer_id,
+        Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+            test_schema(),
+            test_storage(receiver_dir.path()),
+            role.clone(),
+        )),
+        role,
+    )
+    .await;
+    let storage = test_storage(dir.path());
+    let first = primary_paired_with(peer_id, &peer, storage.clone(), test_schema()).await;
+    assert_eq!(first.role(), Some(PairRole::Primary));
+    let net = Arc::new(NetConfig::default());
+    let (restarted, _) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        Uuid::from_u128(1),
+        storage,
+        test_schema(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    assert!(matches!(
+        &**restarted.write_path.load(),
+        WritePath::Unavailable
+    ));
+    restarted.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+        net,
+        Uuid::from_u128(1),
+        restarted.as_peer_listener(),
+    )));
+    restarted.on_inbound_peer(
+        (peer_id, peer.addr),
+        None,
+        Some(peer.addr.to_string()),
+        0,
+        None,
+        None,
+    );
+    assert_eq!(restarted.role(), Some(PairRole::Secondary));
+}
+
+#[tokio::test]
+async fn restarted_promoted_survivor_operator_action_preserves_rf2_all_requirement() {
+    use crate::consistency::ConsistencyLevel;
+    use crate::ring::strategy::ReplicationStrategy;
+    let dir = tempfile::tempdir().unwrap();
+    let storage = test_storage(dir.path());
+    let schema = test_schema();
+    install_kv(&schema, &storage, false);
+    let net = Arc::new(NetConfig::default());
+    let local = Uuid::from_u128(2);
+    let (first, _) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        local,
+        storage.clone(),
+        schema.clone(),
+        Arc::new(HandlerRegistry::new()),
+    );
+    first.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+        net.clone(),
+        local,
+        first.as_peer_listener(),
+    )));
+    let old = (Uuid::from_u128(1), "127.0.0.1:9".parse().unwrap());
+    first.on_peer_connected(old);
+    first.on_peer_disconnected(old);
+    first.force_promote().unwrap();
+    let (restarted, handles) = ModeController::new(
+        Arc::new(ClusterConfig::default()),
+        net.clone(),
+        local,
+        storage,
+        schema,
+        Arc::new(HandlerRegistry::new()),
+    );
+    assert!(matches!(
+        &**handles.write_path.load(),
+        WritePath::Unavailable
+    ));
+    restarted.set_peer_manager(Arc::new(PeerManager::with_weak_listener(
+        net,
+        local,
+        restarted.as_peer_listener(),
+    )));
+    restarted.force_promote().unwrap();
+    let mutation = verification_mutation();
+    let path = handles.write_path.load_full();
+    let result = path
+        .write(
+            &ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table),
+            &mutation.key,
+            mutation.rows[0].clone(),
+            mutation.timestamp,
+            ConsistencyLevel::All,
+            &ReplicationStrategy::Simple {
+                replication_factor: 2,
+            },
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "restarted operator promotion must retain logical RF2: {result:?}"
+    );
+    for cl in [ConsistencyLevel::One, ConsistencyLevel::Quorum] {
+        path.write(
+            &ferrosa_storage::TableId::new(&mutation.keyspace, &mutation.table),
+            &mutation.key,
+            mutation.rows[0].clone(),
+            mutation.timestamp,
+            cl,
+            &ReplicationStrategy::Simple {
+                replication_factor: 2,
+            },
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn concurrent_pair_handoffs_leave_exactly_one_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let peer_id = Uuid::from_u128(2);
+    let peer = start_switchover_peer(
+        peer_id,
+        Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+            test_schema(),
+            test_storage(receiver_dir.path()),
+            role.clone(),
+        )),
+        role.clone(),
+    )
+    .await;
+    let controller =
+        primary_paired_with(peer_id, &peer, test_storage(dir.path()), test_schema()).await;
+    let (one, two) = tokio::join!(controller.switchover(), controller.switchover());
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    assert_eq!(controller.role(), Some(PairRole::Secondary));
+    assert_eq!(**role.load(), PairRole::Primary);
+}
+
+#[tokio::test]
+async fn mixed_version_handoff_refuses_before_withdrawing_current_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let receiver_dir = tempfile::tempdir().unwrap();
+    let peer_id = Uuid::from_u128(2);
+    let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let registry = Arc::new(HandlerRegistry::new());
+    registry.register(
+        MsgType::PairSchemaSync,
+        Arc::new(crate::pair::ddl::PairSchemaSyncHandler::new(
+            test_schema(),
+            test_storage(receiver_dir.path()),
+            role.clone(),
+        )),
+    );
+    let server = Arc::new(RpcServer::new(
+        NetConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            advertised_capabilities: 0,
+            ..NetConfig::default()
+        },
+        peer_id,
+        registry.clone(),
+    ));
+    let peer = SwitchoverPeer {
+        addr: server.start_and_get_addr().await.unwrap(),
+        _server: server,
+        registry,
+        role: role.clone(),
+    };
+    let controller =
+        primary_paired_with(peer_id, &peer, test_storage(dir.path()), test_schema()).await;
+    let result = controller.switchover().await;
+    assert!(result.unwrap_err().to_string().contains("capability"));
+    assert_eq!(controller.role(), Some(PairRole::Primary));
+    assert_eq!(**role.load(), PairRole::Secondary);
+}
+
+#[tokio::test]
+async fn pair_grant_requires_explicit_supported_version_and_correct_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let local = Uuid::from_u128(2);
+    let peer = Uuid::from_u128(1);
+    let from = (peer, "127.0.0.1:1".parse().unwrap());
+    let role = Arc::new(ArcSwap::from_pointee(PairRole::Secondary));
+    let handler = crate::pair::switchover::RoleSwapHandler::durable(
+        local,
+        peer,
+        role.clone(),
+        dir.path().to_path_buf(),
+        Arc::new(tokio::sync::RwLock::new(())),
+    );
+    let prepare = Message::PairAuthority(bytes::Bytes::from_static(
+        br#"{"version":1,"payload":{"operation":"Prepare"}}"#,
+    ));
+    let response = handler
+        .handle(from, prepare)
+        .await
+        .expect("fresh preparation must work");
+    let Message::PairAuthority(bytes) = response else {
+        panic!("authority reply expected")
+    };
+    let mut grant: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    grant["payload"]["operation"] = "Grant".into();
+    grant["payload"]["generation"] = 1.into();
+    let wire = |value: &serde_json::Value| {
+        Message::PairAuthority(serde_json::to_vec(value).unwrap().into())
+    };
+    grant["version"] = 2.into();
+    assert!(handler.handle(from, wire(&grant)).await.is_none());
+    grant.as_object_mut().unwrap().remove("version");
+    assert!(handler.handle(from, wire(&grant)).await.is_none());
+    grant["version"] = 1.into();
+    assert!(handler
+        .handle((Uuid::from_u128(99), from.1), wire(&grant))
+        .await
+        .is_none());
+    assert_eq!(**role.load(), PairRole::Secondary);
+    assert!(
+        handler.handle(from, wire(&grant)).await.is_some(),
+        "valid grant must remain usable after malformed and wrong-peer attempts"
+    );
+    assert_eq!(**role.load(), PairRole::Primary);
 }

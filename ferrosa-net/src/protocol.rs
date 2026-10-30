@@ -2842,6 +2842,7 @@ fn message_family_for_kind(kind: u16) -> MessageFamily {
             | MsgType::PairWriteAck
             | MsgType::PairCatchUp
             | MsgType::PairCatchUpResponse
+            | MsgType::PairAuthority
             | MsgType::RoleSwap
             | MsgType::PairSchemaSync
             | MsgType::PairDdlForward

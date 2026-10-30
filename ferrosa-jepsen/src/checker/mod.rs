@@ -1,6 +1,7 @@
 pub mod elle;
 pub mod knossos;
 pub mod membership;
+pub mod profile;
 pub mod strict_serializable;
 
 use std::collections::BTreeSet;

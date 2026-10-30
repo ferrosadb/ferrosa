@@ -198,6 +198,7 @@ pub struct DdlCoordinator {
     pub(crate) schema: Arc<Schema>,
     engine: Arc<StorageEngine>,
     peer_manager: Arc<PeerManager>,
+    handoff_gate: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl DdlCoordinator {
@@ -214,7 +215,13 @@ impl DdlCoordinator {
             schema,
             engine,
             peer_manager,
+            handoff_gate: Arc::new(tokio::sync::RwLock::new(())),
         }
+    }
+
+    pub(crate) fn with_handoff_gate(mut self, gate: Arc<tokio::sync::RwLock<()>>) -> Self {
+        self.handoff_gate = gate;
+        self
     }
 
     /// Route a DDL operation based on current role.
@@ -228,6 +235,7 @@ impl DdlCoordinator {
     /// not accept CQL connections, so this path only runs for internal
     /// operations.
     pub async fn coordinate_ddl(&self, op: DdlOperation) -> Result<()> {
+        let _admitted_ddl = self.handoff_gate.read().await;
         match **self.role.load() {
             PairRole::Primary => {
                 self.apply_ddl_locally(&op).await?;
@@ -513,8 +521,10 @@ impl DdlCoordinator {
         }
     }
 
-    /// Forward a DDL operation to the primary (as secondary) and wait for ACK
-    /// with timeout.
+    /// Forward a DDL operation to the primary and wait for its ACK.
+    ///
+    /// Sent as a bare `DdlOperation`: the primary assigns the schema version itself (it also
+    /// replicates the result back), so a version chosen here would be a second, competing one.
     async fn forward_ddl(&self, op: &DdlOperation) -> Result<()> {
         let body = op.to_bytes()?;
         let resp = tokio::time::timeout(
